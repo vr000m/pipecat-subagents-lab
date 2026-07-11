@@ -134,6 +134,8 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 **Validation cmd:** `cd web && bun run lint`
 **Goal:** The browser renders the server-authoritative lab state and makes text-versus-speech divergence visible without becoming a second diagnostic authority.
 
+**Wireframe reference:** `docs/dev_plans/assets/20260711-feature-websearch-subagent-electron/wireframe.html` — a static, non-interactive HTML/CSS mockup (no JS logic, self-contained) covering disconnected/idle, connected mid-turn, barge-in interruption, reconnect, and multi-worker states, plus the full-width cross-worker Result Log described below. This is a design-review artifact, not implementation code; Phase 4's actual `web/` client is built from the requirements below, informed by this mockup's layout/interaction reasoning (inline HTML comments annotate which requirement each region demonstrates).
+
 - Build Connect/Disconnect and microphone controls with the Pipecat JavaScript client and Small WebRTC transport.
 - Test that page initialization and connection do not acquire/publish microphone media before the explicit user gesture, and that disconnect disables capture.
 - Render transcript, current routing state, persistent worker list, per-result worker identity, structured answer, and sources.
@@ -392,7 +394,7 @@ sequenceDiagram
 - Each worker's finalized results accumulate in a persistent, timestamped log surviving reconnect (not just a "latest result" pointer), rendered separately from the live transcript view.
 - No Electron code is implemented under this plan; a follow-up plan is created only after the browser lab establishes stable contracts.
 
-<!-- reviewed: 2026-07-12 @ c1c986514bad1afe437e794c1b8da97ce422bcc5 -->
+<!-- reviewed: 2026-07-12 @ bf73577d603f7197d24b422c9716f41d50367f9b -->
 
 ## Progress
 

@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipecat Subagents Lab — RTVI Client Wireframe</title>
+<style>
+  /* Deliberately utilitarian "instrument panel" styling: monospace, visible seams,
+     status labels everywhere. This is a lab surface, not a product. */
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px; line-height: 1.5;
+    background: #14161a; color: #d6dae0;
+  }
+  h1 { font-size: 15px; margin: 0 0 .25rem; }
+  .subtitle { color: #8a919c; margin-bottom: 2rem; }
+
+  /* Wireframe-only scaffolding: labels each mocked state */
+  .wf-section { border: 2px dashed #4a5262; margin: 2.5rem 0; padding: 1rem; border-radius: 6px; }
+  .wf-label {
+    display: inline-block; background: #4a5262; color: #fff;
+    padding: .15rem .6rem; border-radius: 3px; font-weight: 700;
+    margin-bottom: 1rem; font-size: 12px;
+  }
+  .wf-note { color: #8a919c; font-size: 12px; margin: .25rem 0 1rem; max-width: 70ch; }
+
+  /* ===== App layout ===== */
+  .app { background: #1b1e24; border: 1px solid #2c313a; border-radius: 8px; overflow: hidden; }
+
+  /* Header / controls bar */
+  .topbar {
+    display: flex; align-items: center; gap: .75rem; flex-wrap: wrap;
+    padding: .6rem .9rem; border-bottom: 1px solid #2c313a; background: #20242b;
+  }
+  .topbar .title { font-weight: 700; margin-right: auto; }
+  button {
+    font: inherit; padding: .35rem .9rem; border-radius: 4px; cursor: pointer;
+    border: 1px solid #3a4150; background: #262b34; color: #d6dae0;
+  }
+  button.primary { background: #2f6f4f; border-color: #3c8a63; color: #fff; }
+  button.danger  { background: #6f3a3a; border-color: #8a4c4c; color: #fff; }
+  button[disabled] { opacity: .45; cursor: not-allowed; }
+  .conn-pill { padding: .15rem .6rem; border-radius: 999px; font-size: 12px; border: 1px solid; }
+  .conn-pill.disconnected { color: #9aa1ab; border-color: #3a4150; }
+  .conn-pill.connected    { color: #7fd6a4; border-color: #2f6f4f; }
+  .conn-pill.reconnecting { color: #f0c26a; border-color: #8a6d2e; }
+
+  /* Main grid: transcript (primary) + inspector column (secondary) */
+  .main { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); }
+  @media (max-width: 760px) { .main { grid-template-columns: 1fr; } }
+  .panel { padding: .9rem; }
+  .panel + .panel { border-left: 1px solid #2c313a; }
+  .panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: #8a919c; margin: 0 0 .6rem;
+  }
+
+  /* Transcript */
+  .turn { margin-bottom: 1rem; }
+  .turn .who { font-size: 11px; color: #8a919c; text-transform: uppercase; letter-spacing: .05em; }
+  .utterance {
+    background: #20242b; border: 1px solid #2c313a; border-radius: 6px;
+    padding: .5rem .7rem; margin-top: .2rem;
+  }
+  .utterance .meta { display: flex; gap: .5rem; align-items: center; margin-bottom: .3rem; flex-wrap: wrap; }
+  /* Incomplete / unspoken tail: grey + italic, utterance-level */
+  .unspoken { color: #767e8a; font-style: italic; }
+
+  /* Delivery-state badges: each state gets its own label; only delivery_completed
+     gets the green "completed" treatment. synthesis_ended is amber — never green. */
+  .dstate { font-size: 11px; padding: .1rem .5rem; border-radius: 3px; border: 1px solid; }
+  .dstate.displayed           { color: #9aa1ab; border-color: #3a4150; }
+  .dstate.queued              { color: #9aa1ab; border-color: #3a4150; }
+  .dstate.started             { color: #8ab8e8; border-color: #3a5a7a; }
+  .dstate.synthesis_ended     { color: #f0c26a; border-color: #8a6d2e; }
+  .dstate.delivery_completed  { color: #7fd6a4; border-color: #2f6f4f; }
+  .dstate.interrupted         { color: #e88a8a; border-color: #7a3a3a; }
+  .dstate.interrupted_by_reconnect { color: #e88a8a; border-color: #7a3a3a; background: #2a1f22; }
+
+  /* Router state */
+  .router-box { background: #20242b; border: 1px solid #2c313a; border-radius: 6px; padding: .6rem .7rem; margin-bottom: 1rem; }
+  .route { font-size: 12px; padding: .12rem .55rem; border-radius: 3px; border: 1px solid; margin-right: .3rem; }
+  .route.dim { color: #565e6a; border-color: #2c313a; }
+  .route.active-existing_worker, .route.active-new_worker { color: #b79ae8; border-color: #5f4a8a; background: #241f2e; }
+  .route.active-direct   { color: #7fd6a4; border-color: #2f6f4f; }
+  .route.active-clarify  { color: #f0c26a; border-color: #8a6d2e; }
+  .route.active-unsupported { color: #e88a8a; border-color: #7a3a3a; }
+
+  /* Worker cards */
+  .worker {
+    background: #20242b; border: 1px solid #2c313a; border-radius: 6px;
+    padding: .55rem .7rem; margin-bottom: .6rem;
+  }
+  .worker .wid { font-weight: 700; }
+  .worker dl { margin: .3rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: .1rem .6rem; }
+  .worker dt { color: #8a919c; font-size: 11px; }
+  .worker dd { margin: 0; font-size: 12px; }
+  .wstatus { font-size: 11px; padding: .05rem .45rem; border-radius: 3px; border: 1px solid; }
+  .wstatus.working { color: #f0c26a; border-color: #8a6d2e; }
+  .wstatus.idle    { color: #9aa1ab; border-color: #3a4150; }
+
+  /* Structured result card (inline in transcript, attributed to worker) */
+  .result-card {
+    border: 1px solid #5f4a8a; border-radius: 6px; margin-top: .4rem;
+    background: #1f1c28; padding: .6rem .7rem;
+  }
+  .result-card .attrib { font-size: 11px; color: #b79ae8; margin-bottom: .3rem; }
+  .result-card ul.sources { margin: .4rem 0 0; padding-left: 1.2rem; }
+  .result-card a { color: #8ab8e8; }
+
+  /* Local diagnostics: hatched border + explicit label so it can never be
+     mistaken for server-authored state */
+  .local-diag {
+    border: 2px dashed #8a6d2e; background: #241f14; border-radius: 6px;
+    padding: .5rem .7rem; margin: .8rem .9rem; font-size: 12px; color: #d8c9a0;
+  }
+  .local-diag .tag {
+    display: inline-block; background: #8a6d2e; color: #14161a; font-weight: 700;
+    font-size: 10px; padding: .05rem .4rem; border-radius: 3px; margin-right: .4rem;
+  }
+  .reconnect-banner {
+    display: flex; gap: .75rem; align-items: baseline; flex-wrap: wrap;
+    background: #2a2416; border-bottom: 1px solid #8a6d2e; padding: .5rem .9rem;
+    color: #f0c26a;
+  }
+  .server-state-tag {
+    display: inline-block; background: #2f6f4f; color: #fff; font-weight: 700;
+    font-size: 10px; padding: .05rem .4rem; border-radius: 3px; margin-right: .4rem;
+  }
+
+  /* ===== Result Log: full-width row below the two-column grid =====
+     Combined chronological feed of ALL workers' finalized results,
+     interleaved by timestamp. Server-authoritative; rebuilt from
+     snapshot on reconnect. One shared feed (not per-worker) so
+     cross-worker timing is visible at a glance. */
+  .result-log { border-top: 1px solid #2c313a; padding: .9rem; }
+  .result-log .entries { overflow-x: auto; }
+  .rl-entry {
+    display: grid; grid-template-columns: max-content max-content max-content 1fr max-content;
+    gap: .8rem; align-items: baseline;
+    padding: .35rem .5rem; border-bottom: 1px solid #23272f; font-size: 12px;
+    min-width: 640px;
+  }
+  .rl-entry:last-child { border-bottom: 0; }
+  .rl-ts { color: #8a919c; font-variant-numeric: tabular-nums; }
+  .rl-wid { color: #b79ae8; font-weight: 700; white-space: nowrap; }
+  .rl-turn { color: #8a919c; white-space: nowrap; }
+  .rl-src { color: #8ab8e8; white-space: nowrap; }
+  details.rl-entry-wrap > summary { list-style: none; cursor: pointer; }
+  details.rl-entry-wrap > summary::-webkit-details-marker { display: none; }
+  details.rl-entry-wrap > summary .rl-ts::before { content: "▸ "; color: #565e6a; }
+  details.rl-entry-wrap[open] > summary .rl-ts::before { content: "▾ "; color: #565e6a; }
+  details.rl-entry-wrap .result-card { margin: .3rem .5rem .7rem 1.4rem; }
+</style>
+</head>
+<body>
+
+<h1>Pipecat Subagents Lab — browser RTVI client wireframe</h1>
+<p class="subtitle">Static mockup, Phase 4. Stacked sections below show distinct runtime states of the SAME single-page layout. Dashed grey boxes are wireframe scaffolding, not part of the app.</p>
+
+<!-- ============================================================ -->
+<!-- STATE (a): disconnected / idle.
+     Phase 4: no mic acquisition before explicit Connect gesture. -->
+<!-- ============================================================ -->
+<div class="wf-section">
+  <span class="wf-label">STATE A — Disconnected / idle</span>
+  <p class="wf-note">Req: page load acquires NO microphone media. Only a Connect button and an empty shell. Mic toggle disabled until connected.</p>
+  <div class="app">
+    <div class="topbar">
+      <span class="title">pipecat subagents lab</span>
+      <span class="conn-pill disconnected">disconnected</span>
+      <button class="primary">Connect</button>
+      <button disabled>Mic: off</button>
+    </div>
+    <div class="main">
+      <div class="panel">
+        <h2>Transcript</h2>
+        <p class="unspoken">No session. Press Connect to start (microphone is requested only after you click).</p>
+      </div>
+      <div class="panel">
+        <h2>Router / Workers</h2>
+        <p class="unspoken">No server state.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- STATE (b): connected, mid-turn.
+     Phase 4: routing state, worker structured result + sources,
+     incomplete tail grey/italic, delivery-state badges,
+     sequence/snapshot debug readout. -->
+<!-- ============================================================ -->
+<div class="wf-section">
+  <span class="wf-label">STATE B — Connected, mid-turn (worker result streaming)</span>
+  <p class="wf-note">Req: router decision visible for current turn; per-result worker identity; structured answer + sources (target=_blank rel=noopener noreferrer); unspoken tail grey/italic at utterance granularity; synthesis_ended styled distinctly from delivery_completed.</p>
+  <div class="app">
+    <div class="topbar">
+      <span class="title">pipecat subagents lab</span>
+      <span class="conn-pill connected">connected</span>
+      <button class="danger">Disconnect</button>
+      <button>Mic: on</button>
+    </div>
+    <!-- Local diagnostics strip: always labelled LOCAL, never mixed with server state -->
+    <div class="local-diag">
+      <span class="tag">LOCAL</span>client-side diagnostics — not server state · last seq applied: 148 · last snapshot: #3 (seq 121) · gaps detected: 0 · transport: SmallWebRTC
+    </div>
+    <div class="main">
+      <div class="panel">
+        <h2>Transcript (session order)</h2>
+
+        <div class="turn">
+          <div class="who">user</div>
+          <div class="utterance">what's the latest on the EU AI Act enforcement timeline?</div>
+        </div>
+
+        <div class="turn">
+          <div class="who">assistant · router → worker:websearch-eu-ai-act</div>
+          <!-- Earlier utterance: fully delivered -->
+          <div class="utterance">
+            <div class="meta"><span class="dstate delivery_completed">delivery_completed</span><span class="wf-note" style="margin:0">audio playback completed (client-reported; not proof it was audible)</span></div>
+            Let me hand that to the EU AI Act search worker.
+          </div>
+          <!-- Current utterance: synthesis finished but playback not confirmed — amber, NOT green -->
+          <div class="utterance">
+            <div class="meta"><span class="dstate synthesis_ended">synthesis_ended</span><span class="wf-note" style="margin:0">TTS finished synthesis — delivery unconfirmed</span></div>
+            The enforcement timeline has three key milestones this year.
+            <!-- Req: incomplete/unspoken tail — grey + italic, utterance-level -->
+            <span class="unspoken">General-purpose AI obligations took effect in August, and national authorities must be designated by…</span>
+          </div>
+          <!-- Structured result card: per-result worker identity + sources -->
+          <div class="result-card">
+            <div class="attrib">result from worker:websearch-eu-ai-act · topic: EU AI Act · policy: hosted-web-search</div>
+            <strong>EU AI Act enforcement milestones (2026)</strong>
+            <ul>
+              <li>Feb 2026: prohibited-practices provisions enforceable</li>
+              <li>Aug 2026: GPAI transparency obligations apply</li>
+            </ul>
+            <ul class="sources">
+              <li><a href="https://example.eu/ai-act-timeline" target="_blank" rel="noopener noreferrer">example.eu — AI Act implementation timeline</a></li>
+              <li><a href="https://example.org/gpai-obligations" target="_blank" rel="noopener noreferrer">example.org — GPAI obligations explainer</a></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Router — current turn</h2>
+        <div class="router-box">
+          <span class="route dim">direct</span>
+          <span class="route dim">unsupported</span>
+          <span class="route dim">clarify</span>
+          <span class="route active-existing_worker">existing_worker</span>
+          <span class="route dim">new_worker</span>
+          <div style="margin-top:.4rem; font-size:12px;">owner: <strong>worker:websearch-eu-ai-act</strong></div>
+        </div>
+
+        <h2>Workers (persistent) <span class="server-state-tag">SERVER</span></h2>
+        <!-- Req: identity, topic, model-policy label, status, latest result ONLY.
+             No prompts, no raw logs, no private context. -->
+        <div class="worker">
+          <span class="wid">worker:websearch-eu-ai-act</span> <span class="wstatus working">working</span>
+          <dl>
+            <dt>topic</dt><dd>EU AI Act enforcement</dd>
+            <dt>policy</dt><dd>hosted-web-search</dd>
+            <dt>latest</dt><dd>enforcement milestones (2 sources)</dd>
+          </dl>
+        </div>
+        <div class="worker">
+          <span class="wid">worker:websearch-webrtc-news</span> <span class="wstatus idle">idle</span>
+          <dl>
+            <dt>topic</dt><dd>WebRTC standards news</dd>
+            <dt>policy</dt><dd>hosted-web-search</dd>
+            <!-- "latest" stays as a quick-glance pointer; full history lives in the Result Log below -->
+            <dt>latest</dt><dd>codec negotiation draft status (2 sources, 14:24:40)</dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+
+    <!-- Full-width Result Log row BELOW the two-column grid (layout decision:
+         table-ish content wants width; two-column area above stays the "live
+         current turn" view, this row is the finalized-history view). -->
+    <div class="result-log">
+      <h2 style="font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:#8a919c; margin:0 0 .6rem;">
+        Result Log — all workers, chronological <span class="server-state-tag">SERVER</span>
+      </h2>
+      <p class="wf-note">Req: persistent, unbounded (process-lifetime) history of every worker's finalized canonical results, interleaved by timestamp in ONE shared feed — cross-worker timing (A finished before B started) readable at a glance. Each entry: timestamp · worker · turn · one-line summary · source count. Entries expand to the full structured answer + sources (same .result-card treatment as the transcript). Rebuilt from snapshot on reconnect.</p>
+      <div class="entries">
+        <div class="rl-entry">
+          <span class="rl-ts">14:12:03</span>
+          <span class="rl-wid">worker:websearch-webrtc-news</span>
+          <span class="rl-turn">turn 2</span>
+          <span>W3C WebRTC WG charter update — extension proposal summarized</span>
+          <span class="rl-src">3 sources</span>
+        </div>
+        <div class="rl-entry">
+          <span class="rl-ts">14:20:15</span>
+          <span class="rl-wid">worker:websearch-eu-ai-act</span>
+          <span class="rl-turn">turn 4</span>
+          <span>Prohibited-practices scope: which systems fall under Art. 5</span>
+          <span class="rl-src">1 source</span>
+        </div>
+        <div class="rl-entry">
+          <span class="rl-ts">14:24:40</span>
+          <span class="rl-wid">worker:websearch-webrtc-news</span>
+          <span class="rl-turn">turn 5</span>
+          <span>Codec negotiation draft — adoption status after interim call</span>
+          <span class="rl-src">2 sources</span>
+        </div>
+        <!-- Expanded entry: reveals full structured answer, reusing .result-card -->
+        <details class="rl-entry-wrap" open>
+          <summary class="rl-entry">
+            <span class="rl-ts">14:29:41</span>
+            <span class="rl-wid">worker:websearch-eu-ai-act</span>
+            <span class="rl-turn">turn 6</span>
+            <span>EU AI Act enforcement milestones (2026)</span>
+            <span class="rl-src">2 sources</span>
+          </summary>
+          <div class="result-card">
+            <div class="attrib">result from worker:websearch-eu-ai-act · topic: EU AI Act · policy: hosted-web-search · finalized 14:29:41</div>
+            <strong>EU AI Act enforcement milestones (2026)</strong>
+            <ul>
+              <li>Feb 2026: prohibited-practices provisions enforceable</li>
+              <li>Aug 2026: GPAI transparency obligations apply</li>
+            </ul>
+            <ul class="sources">
+              <li><a href="https://example.eu/ai-act-timeline" target="_blank" rel="noopener noreferrer">example.eu — AI Act implementation timeline</a></li>
+              <li><a href="https://example.org/gpai-obligations" target="_blank" rel="noopener noreferrer">example.org — GPAI obligations explainer</a></li>
+            </ul>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- STATE (c): barge-in interruption.
+     Phase 4 / testing notes: prior utterance marked interrupted,
+     shown-so-far text preserved, no auto-resume; styled distinctly
+     from delivery_completed. -->
+<!-- ============================================================ -->
+<div class="wf-section">
+  <span class="wf-label">STATE C — Barge-in: interrupted utterance vs completed utterance</span>
+  <p class="wf-note">Req: interruption cancels audio, marks utterance <code>interrupted</code> (red, distinct from completed green), preserves already-shown text, never auto-resumes. Undelivered remainder stays grey/italic.</p>
+  <div class="app">
+    <div class="main">
+      <div class="panel">
+        <h2>Transcript</h2>
+        <div class="turn">
+          <div class="who">assistant</div>
+          <div class="utterance">
+            <div class="meta"><span class="dstate delivery_completed">delivery_completed</span></div>
+            Here's a summary of yesterday's standards call.
+          </div>
+          <div class="utterance">
+            <div class="meta"><span class="dstate interrupted">interrupted</span><span class="wf-note" style="margin:0">user barged in — audio cancelled, shown text preserved, no auto-resume</span></div>
+            The working group also discussed a proposal to
+            <span class="unspoken">extend the charter through 2027, which would…</span>
+          </div>
+        </div>
+        <div class="turn">
+          <div class="who">user</div>
+          <div class="utterance">— actually, switch topics: what's the weather in Helsinki?</div>
+        </div>
+        <div class="turn">
+          <div class="who">assistant · router → direct</div>
+          <div class="utterance">
+            <div class="meta"><span class="dstate started">started</span></div>
+            I can't fetch live weather directly, but I can spin up a search worker for that.
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Router — current turn</h2>
+        <div class="router-box">
+          <span class="route active-direct">direct</span>
+          <span class="route dim">unsupported</span>
+          <span class="route dim">clarify</span>
+          <span class="route dim">existing_worker</span>
+          <span class="route dim">new_worker</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- STATE (d): reconnect.
+     Phase 4: fresh snapshot replaces projections; banner separates
+     LOCAL diagnostics from SERVER-authoritative state; utterances
+     in-flight at disconnect marked interrupted_by_reconnect. -->
+<!-- ============================================================ -->
+<div class="wf-section">
+  <span class="wf-label">STATE D — Reconnecting: local diagnostics vs server state</span>
+  <p class="wf-note">Req: on reconnect, request fresh snapshot and replace worker/result projections with server-authoritative state; keep ONLY explicitly-labelled local diagnostics; the two must be visually unmistakable (dashed amber = local, solid green tag = server).</p>
+  <div class="app">
+    <div class="topbar">
+      <span class="title">pipecat subagents lab</span>
+      <span class="conn-pill reconnecting">reconnecting…</span>
+      <button disabled>Disconnect</button>
+      <button disabled>Mic: paused</button>
+    </div>
+    <div class="reconnect-banner">
+      <strong>Reconnecting — awaiting fresh snapshot.</strong>
+      <span>Worker/result panels below are stale until the snapshot replaces them.</span>
+    </div>
+    <div class="local-diag">
+      <span class="tag">LOCAL</span>client-side diagnostics — not server state · ICE state: disconnected → checking · last seq applied: 212 · snapshot requested at 14:32:07 · reconnect attempt 2/5
+    </div>
+    <div class="main">
+      <div class="panel">
+        <h2>Transcript</h2>
+        <div class="utterance">
+          <div class="meta"><span class="dstate interrupted_by_reconnect">interrupted_by_reconnect</span><span class="wf-note" style="margin:0">connection dropped mid-delivery — distinct from user barge-in</span></div>
+          The three main proposals under discussion were
+          <span class="unspoken">codec negotiation changes, a new stats field, and…</span>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Workers <span class="server-state-tag">SERVER</span> <span style="color:#f0c26a; font-size:11px;">(stale — awaiting snapshot)</span></h2>
+        <div class="worker" style="opacity:.55">
+          <span class="wid">worker:websearch-webrtc-news</span> <span class="wstatus idle">idle</span>
+          <dl><dt>topic</dt><dd>WebRTC standards news</dd></dl>
+        </div>
+      </div>
+    </div>
+
+    <!-- Result Log gets the SAME stale treatment as the worker list during
+         reconnect: dimmed + amber "stale" flag, then rebuilt from snapshot. -->
+    <div class="result-log">
+      <h2 style="font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:#8a919c; margin:0 0 .6rem;">
+        Result Log — all workers, chronological <span class="server-state-tag">SERVER</span> <span style="color:#f0c26a; font-size:11px;">(stale — awaiting snapshot)</span>
+      </h2>
+      <p class="wf-note">Req: Result Log is server-authoritative and survives reconnect by being rebuilt from the snapshot. Until the snapshot arrives, existing entries are shown stale (dimmed) with the same amber flag as the worker list — consistent staleness treatment across all SERVER-tagged regions.</p>
+      <div class="entries" style="opacity:.55">
+        <div class="rl-entry">
+          <span class="rl-ts">14:12:03</span>
+          <span class="rl-wid">worker:websearch-webrtc-news</span>
+          <span class="rl-turn">turn 2</span>
+          <span>W3C WebRTC WG charter update — extension proposal summarized</span>
+          <span class="rl-src">3 sources</span>
+        </div>
+        <div class="rl-entry">
+          <span class="rl-ts">14:20:15</span>
+          <span class="rl-wid">worker:websearch-eu-ai-act</span>
+          <span class="rl-turn">turn 4</span>
+          <span>Prohibited-practices scope: which systems fall under Art. 5</span>
+          <span class="rl-src">1 source</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- STATE (e): persistent worker list with multiple coexisting workers.
+     Phase 4: identity/topic/model-policy/status/latest result only. -->
+<!-- ============================================================ -->
+<div class="wf-section">
+  <span class="wf-label">STATE E — Persistent worker list (2+ workers, different topics/statuses)</span>
+  <p class="wf-note">Req: multiple workers coexist; inspection shows identity, topic, model-policy label, status, plus a quick-glance "latest" pointer. The FULL timestamped result history is NOT nested here per-worker — it lives in the shared full-width Result Log (see STATE B), so "latest" is a convenience pointer into that log, not the history itself. Prompts/context/raw logs stay server-side — nothing here exposes them.</p>
+  <div class="app">
+    <div class="panel">
+      <h2>Workers (persistent) <span class="server-state-tag">SERVER</span></h2>
+      <div class="worker">
+        <span class="wid">worker:websearch-eu-ai-act</span> <span class="wstatus working">working</span>
+        <dl>
+          <dt>topic</dt><dd>EU AI Act enforcement</dd>
+          <dt>policy</dt><dd>hosted-web-search</dd>
+          <dt>latest</dt><dd>enforcement milestones (2 sources, 14:29:41)</dd>
+        </dl>
+      </div>
+      <div class="worker">
+        <span class="wid">worker:websearch-webrtc-news</span> <span class="wstatus idle">idle</span>
+        <dl>
+          <dt>topic</dt><dd>WebRTC standards news</dd>
+          <dt>policy</dt><dd>hosted-web-search</dd>
+          <dt>latest</dt><dd>W3C WG charter update (3 sources, 14:12:03)</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
