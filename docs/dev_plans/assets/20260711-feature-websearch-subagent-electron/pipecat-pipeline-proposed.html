@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proposed Pipecat pipeline topology</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #10131a;
+    --surface: #191f2b;
+    --line: #536078;
+    --text: #e7edf8;
+    --muted: #a9b4c8;
+    --worker: #30295b;
+    --bridge: #153f37;
+    --connection: #3c301b;
+    --warn: #f0c26a;
+    --green: #60d2b0;
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 system-ui, sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 32px; }
+  h1 { margin: 0; font-size: 25px; }
+  .subtitle { margin: 8px 0 28px; color: var(--muted); }
+  .topology { position: relative; display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  .zone { position: relative; min-height: 650px; padding: 24px; border: 2px solid var(--line); border-radius: 18px; background: var(--surface); }
+  .zone.connection { border-color: var(--warn); border-style: dashed; background: var(--connection); }
+  h2 { margin: 0; font-size: 20px; }
+  .zone > p { margin: 5px 0 22px; color: var(--muted); }
+  .stack { display: grid; gap: 18px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .node { min-height: 76px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #151a24; }
+  .node.worker { background: var(--worker); border-color: #8370e8; }
+  .node.bridge { background: var(--bridge); border: 2px solid var(--green); }
+  .node strong { display: block; font-size: 16px; }
+  .node span { display: block; margin-top: 4px; color: var(--muted); font-size: 13px; }
+  .flow { margin: 0; color: var(--muted); font-size: 12px; text-align: center; }
+  .flow::before { content: "↓ "; color: var(--green); font-weight: 700; }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 24px; color: var(--muted); font-size: 13px; }
+  .legend b { color: var(--text); }
+  .bridge-note { grid-column: 1 / -1; margin: 10px 0 0; padding: 14px 18px; border-left: 4px solid var(--green); background: #112d28; color: var(--muted); }
+  .bridge-note b { color: var(--green); }
+  .connector { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+  @media (max-width: 760px) {
+    main { padding: 20px; }
+    .topology { grid-template-columns: 1fr; }
+    .zone { min-height: 0; }
+    .connector { display: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Proposed Pipecat pipeline topology</h1>
+  <p class="subtitle">Persistent workers and state remain alive across browser reconnection. The active browser receives a fresh, connection-scoped pipeline attached through one explicit bridge.</p>
+
+  <section class="topology" aria-label="Process-lifetime host and connection-lifetime pipeline">
+    <svg class="connector" viewBox="0 0 1120 650" aria-hidden="true">
+      <defs>
+        <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#60d2b0"/></marker>
+      </defs>
+      <path d="M520 330 H600" fill="none" stroke="#60d2b0" stroke-width="3" marker-end="url(#arrow)"/>
+      <text x="530" y="316" fill="#60d2b0" font-family="system-ui" font-size="12" font-weight="700">VALIDATED FRAMES</text>
+    </svg>
+
+    <section class="zone" aria-labelledby="host-title">
+      <h2 id="host-title">Process-lifetime Pipecat host</h2>
+      <p>Created once; stops only when the Python service stops.</p>
+      <div class="stack">
+        <div class="row">
+          <div class="node"><strong>WorkerRunner</strong><span><code>auto_end=False</code></span></div>
+          <div class="node"><strong>Worker registry</strong><span>IDs, lifecycle, causal mailboxes</span></div>
+        </div>
+        <p class="flow">owns worker bus</p>
+        <div class="node bridge"><strong>Shared worker bus</strong><span>Only canonical-result and control frames may cross this boundary.</span></div>
+        <p class="flow">bridged worker edges</p>
+        <div class="row">
+          <div class="node worker"><strong>LLMContextWorker A</strong><span>topic context · serialized turns</span></div>
+          <div class="node worker"><strong>LLMContextWorker B</strong><span>topic context · serialized turns</span></div>
+        </div>
+        <p class="flow">commits canonical results</p>
+        <div class="node"><strong>Authoritative session state</strong><span>Result history · pending dialogue · sequence stream · connection epochs</span></div>
+      </div>
+    </section>
+
+    <section class="zone connection" aria-labelledby="connection-title">
+      <h2 id="connection-title">Connection-lifetime pipeline</h2>
+      <p>Rebuilt whenever the arbiter promotes a new browser connection.</p>
+      <div class="stack">
+        <div class="row">
+          <div class="node"><strong>Small WebRTC transport</strong><span>browser microphone, remote audio, RTVI</span></div>
+          <div class="node"><strong>Connection epoch arbiter</strong><span>one active client; fences old traffic</span></div>
+        </div>
+        <p class="flow">audio and controls</p>
+        <div class="row">
+          <div class="node"><strong>STT / turn ingress</strong><span>final transcripts and barge-in</span></div>
+          <div class="node"><strong>Router / dispatcher</strong><span>validated worker selection</span></div>
+        </div>
+        <p class="flow">normalized worker exchange</p>
+        <div class="node bridge"><strong>BusBridgeProcessor + canonical-result adapter</strong><span>Routes transcript work to workers; accepts normalized results only. Raw worker LLM text cannot bypass result normalization.</span></div>
+        <p class="flow">two deterministic projections</p>
+        <div class="row">
+          <div class="node"><strong>TTS projection</strong><span>synthesis and server-delivery state</span></div>
+          <div class="node"><strong>RTVI projection</strong><span>UI messages and snapshots</span></div>
+        </div>
+        <p class="flow">transport output</p>
+        <div class="node"><strong>Browser audio + structured UI</strong><span>Remote <code>MediaStream</code> attaches to the client-owned audio element; browser playout is not inferred from server delivery state.</span></div>
+      </div>
+    </section>
+
+    <p class="bridge-note"><b>The bridge:</b> a server-side Pipecat processor path, not a browser bridge. It is the only allowed route between persistent worker pipelines and the current browser connection pipeline.</p>
+  </section>
+
+  <p class="legend"><span><b>Solid panel:</b> survives reconnect</span><span><b>Dashed amber panel:</b> rebuilt per active connection</span><span><b>Green boundary:</b> validated inter-pipeline frame exchange</span></p>
+</main>
+</body>
+</html>

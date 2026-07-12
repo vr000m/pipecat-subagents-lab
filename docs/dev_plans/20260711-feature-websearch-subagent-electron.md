@@ -65,7 +65,7 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 
 ### Phase 1: Contracts and runtime foundation
 
-**Impl files:** `pyproject.toml`, `server/config.py`, `server/preflight.py`, `server/contracts.py`, `shared/protocol.md`, `shared/schemas/*.json`
+**Impl files:** `pyproject.toml`, `web/package.json`, `bun.lock`, `server/config.py`, `server/preflight.py`, `server/contracts.py`, `shared/protocol.md`, `shared/schemas/*.json`
 **Test files:** `tests/test_config.py`, `tests/test_preflight.py`, `tests/test_contracts.py`
 **Test command:** `uv run pytest tests/test_config.py tests/test_preflight.py tests/test_contracts.py`
 **Validation cmd:** `uv run ruff format --check . && uv run ruff check .`
@@ -73,6 +73,7 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 
 - Initialize the Python project and pin a verified Pipecat version with the verified `openai`, `webrtc`, and `local` extras; RTVI is built in rather than installed as a separate extra.
 - Pin and record the compatible Pipecat JavaScript client version alongside the Python Pipecat version pin, and verify RTVI/Small WebRTC wire compatibility between the two before Phase 4 depends on it.
+- Create the minimal Bun manifest and lockfile needed for that client-version pin and compatibility probe; do not add browser application code in this phase.
 - Verify `LLMContextWorker`'s actual context-retention and bus-edge (`active`, `bridged`) API, and `RTVIServerMessageFrame`'s actual payload semantics, directly against the pinned Pipecat version rather than relying on the Context Hub's 2026-07-05 index description.
 - Define strict Python models and matching JSON Schemas for all versioned Python-to-browser messages.
 - Reserve a nullable `origin_epoch` field (default `null`/unset pre-arbiter) on turn, result, utterance, and pending-dialogue contract models so Phase 3's connection-epoch arbiter can populate it without reopening this Phase 1 contract.
@@ -128,7 +129,7 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 
 ### Phase 4: Plain browser RTVI client
 
-**Impl files:** `web/package.json`, `web/index.html`, `web/src/app.js`, `web/src/state.js`, `web/src/render.js`, `web/src/styles.css`
+**Impl files:** `web/index.html`, `web/src/app.js`, `web/src/state.js`, `web/src/render.js`, `web/src/styles.css`
 **Test files:** `web/test/state.test.js`, `web/test/render.test.js`, `web/test/protocol.test.js`
 **Test command:** `cd web && bun test`
 **Validation cmd:** `cd web && bun run lint`
@@ -137,6 +138,7 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 **Wireframe reference:** `docs/dev_plans/assets/20260711-feature-websearch-subagent-electron/wireframe.html` — a static, non-interactive HTML/CSS mockup (no JS logic, self-contained) covering disconnected/idle, connected mid-turn, barge-in interruption, reconnect, and multi-worker states, plus the full-width cross-worker Result Log described below. This is a design-review artifact, not implementation code; Phase 4's actual `web/` client is built from the requirements below, informed by this mockup's layout/interaction reasoning (inline HTML comments annotate which requirement each region demonstrates).
 
 - Build Connect/Disconnect and microphone controls with the Pipecat JavaScript client and Small WebRTC transport.
+- Own received remote audio explicitly in plain JavaScript: create and retain an `HTMLAudioElement`, attach/remove the remote `MediaStream` across connect, replacement, and disconnect, start playback on a user-gesture-safe path, and render an actionable autoplay-failure state.
 - Test that page initialization and connection do not acquire/publish microphone media before the explicit user gesture, and that disconnect disables capture.
 - Render transcript, current routing state, persistent worker list, per-result worker identity, structured answer, and sources.
 - Apply RTVI messages in session-sequence order; ignore duplicates, detect gaps, and request a snapshot when state may be incomplete. Discard any incremental message whose sequence number is older than the last-applied snapshot's sequence, so a snapshot arriving while older increments are still in flight cannot be superseded by them.
@@ -174,7 +176,6 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 - The repository was initialized at `/Users/vr000m/Code/pipecat-ai/pipecat-subagents-lab`; no implementation manifest exists yet.
 - The Pipecat Context Hub snapshot refreshed 2026-07-05 indexes `LLMContextWorker` as a self-contained context-owning LLM worker and `RTVIServerMessageFrame` as the arbitrary server-message frame.
 - Pipecat documents `pipecat-ai[webrtc]` for the server-side Small WebRTC transport.
-- Pipecat's JavaScript Small WebRTC transport includes ICE reconnection handling, but the higher-level client session lifecycle still requires explicit reconnect/session handling after a completed disconnect.
 - RTVI defines `client-ready` after media channels connect; state snapshots must be sent after this readiness boundary rather than assumed to arrive during page initialization.
 - OpenAI's Responses API exposes hosted `web_search` through the request `tools` configuration; this is API capability and billing, not inherited ChatGPT/Codex product access.
 - The reference local STT adapter uses `SegmentedSTTService` and the `pipecat-local-stt-server` client over a Unix-domain socket.
@@ -190,6 +191,7 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 - The pinned local TTS adapter emitting an observable `synthesis_ended` frame is assumed, not verified in-repo. Confirm the adapter produces this signal before relying on it for delivery-state styling; if it doesn't, the coarse completion/incomplete styling needs a different seam.
 - The OpenAI Responses hosted `web_search` output/citation shape (field path, nullability, URL encoding) is assumed from documentation, not pinned against a real response. The Phase 1 compatibility gate verifies model/tool availability, not output schema — capture one real response (when credentials permit) to pin the shape before the normalizer is finalized; otherwise keep the normalizer's mocked-shape assumption explicitly flagged as unverified.
 - The exact hosted `web_search` tool-type string and request `tools` shape is assumed from a documentation snapshot; tool naming has drifted historically (e.g. `web_search` vs `web_search_preview`). Pin the exact string/shape during the Phase 1 compatibility gate rather than assuming it from the snapshot description.
+- Small WebRTC ICE-reconnection and post-disconnect session behaviour are assumed until verified against the pinned JavaScript client with a controlled disconnect/reconnect probe. Keep a fresh-session reconnect fallback if transport-level recovery is unavailable.
 - `LLMContextWorker`'s context-retention/bus-edge (`active`, `bridged`) behavior and `RTVIServerMessageFrame`'s payload semantics are asserted from the Context Hub's 2026-07-05 index description, not verified against the pinned Pipecat version. Phase 1 adds an explicit verification step against the pinned version itself.
 
 Corrections to verified paths, patterns, or dependencies above alter the immutable contract and require a fresh plan review.
@@ -368,6 +370,7 @@ sequenceDiagram
 - Session/readiness test asserting the first runtime snapshot is gated on the `client-ready` boundary and is not emitted during page initialization, complementing the existing reconnect-snapshot tests.
 - No-tools assertion extended to the pending-turn arbiter's semantic classifier (currently only asserted for the main router/main-response call), proving continuation/task-change detection runs without registered tools.
 - Reducer test seeding a snapshot at sequence N, then delivering a stale increment with sequence < N, asserting the stale increment is discarded rather than applied.
+- Gap-recovery reducer/protocol test injecting a sequence gap, asserting exactly one snapshot request while recovery is pending, no unsafe incremental state is treated as complete, and ordered application resumes only after the replacement snapshot arrives.
 - Pending-dialogue expiry tests use an injected/fake clock so expiry timing is asserted deterministically rather than depending on wall-clock elapsed time.
 - Result-log tests prove the per-worker result history persists across reconnect (rebuilt from snapshot), preserves timestamp/turn ordering, and never silently truncates or evicts entries within the process lifetime.
 
@@ -386,7 +389,7 @@ sequenceDiagram
 - A worker clarification deterministically owns the next applicable user turn until answered, explicitly cancelled, superseded by a task change, or expired.
 - Closing and reopening the browser reconnects to the known Python instance and rebuilds state from a fresh snapshot.
 - Reconnection preserves only clearly labelled local connection diagnostics, and a replacement connection epoch fences all stale-client traffic.
-- Browser state schema excludes raw logs and full prompts/context (worker inspection is limited to identity, topic, model-policy label, status, and latest result); Pipecat logs remain the authoritative diagnostic trail.
+- Browser state schema excludes raw logs and full prompts/context. Worker cards are limited to identity, topic, model-policy label, status, and a latest-result pointer; the separate Result Log carries the required timestamped finalized-result history. Pipecat logs remain the authoritative diagnostic trail.
 - The `direct`, `unsupported`, and main-owned `clarify` outcomes are produced by a single structured-output call that both validates the routing decision and emits user-facing prose; the pending-turn arbiter classifier is skipped via a deterministic no-pending-owner check rather than invoked as an LLM call on every turn.
 - Full Python and browser test suites, formatting, linting, secret scan, documentation review, code review, and security review pass before push.
 - Required local acceptance evidence demonstrates user-initiated microphone capture, Small WebRTC media, live local STT/TTS, and audible output; paid OpenAI smoke verification is reported separately when credentials are available.
