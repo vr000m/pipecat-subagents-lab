@@ -70,8 +70,8 @@
       <p>Created once; stops only when the Python service stops.</p>
       <div class="stack">
         <div class="row">
-          <div class="node"><strong>WorkerRunner</strong><span><code>auto_end=False</code></span></div>
-          <div class="node"><strong>Worker registry</strong><span>IDs, lifecycle, causal mailboxes</span></div>
+          <div class="node"><strong>SessionHost → WorkerRunner</strong><span><code>auto_end=False</code>; runner owns bus</span></div>
+          <div class="node"><strong>Worker registry</strong><span>Pipecat workers; IDs and causal policy</span></div>
         </div>
         <p class="flow">owns worker bus</p>
         <div class="node bridge"><strong>Shared worker bus</strong><span>Only canonical-result and control frames may cross this boundary.</span></div>
@@ -103,7 +103,7 @@
         <p class="flow">two deterministic projections</p>
         <div class="row">
           <div class="node"><strong>TTS projection</strong><span>synthesis and server-delivery state</span></div>
-          <div class="node"><strong>RTVI projection</strong><span>UI messages and snapshots</span></div>
+          <div class="node"><strong>RTVI state publisher</strong><span>versioned UI messages and snapshots</span></div>
         </div>
         <p class="flow">transport output</p>
         <div class="node"><strong>Browser audio + structured UI</strong><span>Remote <code>MediaStream</code> attaches to the client-owned audio element; browser playout is not inferred from server delivery state.</span></div>
