@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/work-item-event.json",
+  "title": "WorkItemEvent", "type": "object", "additionalProperties": false,
+  "required": ["work_item_id", "run_id", "worker_id", "turn_id", "event_id", "event_sequence", "state", "timestamp", "origin_epoch"],
+  "properties": {"work_item_id": {"type": "string"}, "run_id": {"type": "string"}, "worker_id": {"type": "string"}, "turn_id": {"type": "string"}, "event_id": {"type": "string"}, "event_sequence": {"type": "integer", "minimum": 0}, "state": {"enum": ["started", "progress", "cancellation_requested", "cancelled", "completed", "failed"]}, "timestamp": {"type": "string"}, "origin_epoch": {"type": ["integer", "null"]}}
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/worker-state.json",
+  "title": "WorkerState", "type": "object", "additionalProperties": false,
+  "required": ["worker_id", "topic", "model_policy", "status", "latest_result_id", "origin_epoch"],
+  "properties": {"worker_id": {"type": "string"}, "topic": {"type": "string"}, "model_policy": {"type": "string"}, "status": {"type": "string"}, "latest_result_id": {"type": ["string", "null"]}, "origin_epoch": {"type": ["integer", "null"]}}
+}

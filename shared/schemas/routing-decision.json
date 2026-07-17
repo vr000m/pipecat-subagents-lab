@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/routing-decision.json",
+  "title": "RoutingDecision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action", "capability_available", "catalogue_version", "catalogue_worker_ids", "origin_epoch"],
+  "properties": {
+    "action": {"enum": ["direct", "unsupported", "clarify", "existing_worker", "new_worker"]},
+    "worker_id": {"type": ["string", "null"]}, "worker_type": {"type": ["string", "null"]},
+    "topic": {"type": ["string", "null"]}, "capability": {"type": ["string", "null"]},
+    "capability_available": {"type": "boolean"}, "model_policy": {"type": ["string", "null"]},
+    "catalogue_version": {"type": "string"}, "catalogue_worker_ids": {"type": "array", "items": {"type": "string"}},
+    "origin_epoch": {"type": ["integer", "null"]}
+  }
+}

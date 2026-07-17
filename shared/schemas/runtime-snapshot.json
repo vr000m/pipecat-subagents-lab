@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/runtime-snapshot.json",
+  "title": "RuntimeSnapshot", "type": "object", "additionalProperties": false,
+  "required": ["contract_version", "session_id", "snapshot_sequence", "workers", "results", "speech_progress", "origin_epoch"],
+  "properties": {"contract_version": {"const": "v1.0"}, "session_id": {"type": "string"}, "snapshot_sequence": {"type": "integer", "minimum": 0}, "workers": {"type": "array"}, "results": {"type": "array"}, "speech_progress": {"type": "array"}, "origin_epoch": {"type": ["integer", "null"]}}
+}

@@ -1,0 +1,10 @@
+{
+  "name": "pipecat-subagents-lab-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pipecat-ai/client-js": "1.2.0",
+    "@pipecat-ai/small-webrtc-transport": "1.2.0"
+  }
+}
