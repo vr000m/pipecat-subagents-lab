@@ -96,15 +96,13 @@ function snapshotState(state, snapshot, sequence) {
       .filter(Boolean)
       .map((item) => [item.utterance_id, item]),
   );
-  const diagnostics = Array.isArray(state.localDiagnostics)
-    ? state.localDiagnostics
-    : {
-        ...state.localDiagnostics,
-        lastSequence: snapshotSequence,
-        lastAppliedSequence: snapshotSequence,
-        lastSnapshotSequence: Math.max(state.localDiagnostics.lastSnapshotSequence, snapshotSequence),
-        snapshotRequestPending: false,
-      };
+  const diagnostics = {
+    ...state.localDiagnostics,
+    lastSequence: snapshotSequence,
+    lastAppliedSequence: snapshotSequence,
+    lastSnapshotSequence: Math.max(state.localDiagnostics.lastSnapshotSequence, snapshotSequence),
+    snapshotRequestPending: false,
+  };
   return {
     ...state,
     sessionId: snapshot.session_id ?? state.sessionId,
@@ -170,6 +168,10 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
     if (snapshotSequence < Math.max(state.lastAppliedSequence, state.localDiagnostics.lastSnapshotSequence)) return state;
     return snapshotState(state, snapshot, sequence);
   }
+  // Increments are meaningful only after the first authoritative snapshot.
+  // A ready event can race the snapshot response; accepting that increment
+  // would make a later, lower-sequence snapshot look stale and strand state.
+  if (!state.serverState) return state;
   if (!sequence || sequence <= state.lastAppliedSequence) return state;
   if (state.localDiagnostics.snapshotRequestPending) return state;
   if (sequence < state.localDiagnostics.lastSnapshotSequence) return state;

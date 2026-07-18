@@ -34,6 +34,17 @@ const increment = (sequence, resultId) => ({
 });
 
 describe("server-authoritative runtime reducer", () => {
+  test("ignores increments until the first authoritative snapshot", () => {
+    let state = applyServerMessage(createInitialState(), increment(10, "before-snapshot"));
+
+    expect(state.results).toEqual([]);
+    expect(state.lastAppliedSequence).toBe(0);
+
+    state = applyServerMessage(state, snapshot(1));
+    expect(state.serverState).toBe(true);
+    expect(state.localDiagnostics.lastSnapshotSequence).toBe(1);
+  });
+
   test("applies ordered increments and ignores duplicate sequence numbers", () => {
     let state = applyServerMessage(createInitialState(), snapshot(10));
     state = applyServerMessage(state, increment(11, "result-1"));

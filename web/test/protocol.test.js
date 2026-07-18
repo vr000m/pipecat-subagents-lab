@@ -86,8 +86,15 @@ test("rejects an unsupported contract before it advances sequence state", async 
   await protocol.receive({ contract_version: "v2.0", session_id: "session-1", kind: "result", sequence: 99, data: {} });
 
   expect(protocol.getState().lastAppliedSequence).toBe(0);
-  await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 1, data: { result_id: "accepted" } });
-  expect(protocol.getState().lastAppliedSequence).toBe(1);
+  await protocol.receive({
+    contract_version: "v1.0",
+    session_id: "session-1",
+    kind: "runtime_snapshot",
+    sequence: 1,
+    data: { session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [] },
+  });
+  await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, data: { result_id: "accepted" } });
+  expect(protocol.getState().lastAppliedSequence).toBe(2);
 });
 
 test("gates the first snapshot request on client readiness and ignores stale increments", async () => {
