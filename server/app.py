@@ -21,6 +21,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequestHandler,
 )
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
@@ -127,7 +128,9 @@ async def _attach_connection(
     # entries. Lightweight test runners retain their documented add_workers
     # registration seam.
     if type(host.runner).__module__.startswith("pipecat."):
-        runtime.worker_task = asyncio.create_task(worker.run(worker.params))
+        runtime.worker_task = asyncio.create_task(
+            worker.run(WorkerParams(loop=asyncio.get_running_loop()))
+        )
     else:
         add_workers = getattr(host.runner, "add_workers", None)
         if add_workers is None:
@@ -216,6 +219,10 @@ def create_app(host: SessionHost | None = None) -> FastAPI:
 
     if (_WEB_ROOT / "dist").is_dir():
         app.mount("/dist", StaticFiles(directory=_WEB_ROOT / "dist"), name="dist")
+
+        @app.get("/styles.css", include_in_schema=False)
+        async def styles() -> FileResponse:
+            return FileResponse(_WEB_ROOT / "src" / "styles.css", media_type="text/css")
 
         @app.get("/", include_in_schema=False)
         async def index() -> FileResponse:

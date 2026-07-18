@@ -1535,6 +1535,7 @@ source = { editable = "." }
 dependencies = [
     { name = "pipecat-ai", extra = ["local", "runner", "webrtc"] },
     { name = "pydantic" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -1548,6 +1549,7 @@ dev = [
 requires-dist = [
     { name = "pipecat-ai", extras = ["openai", "webrtc", "local", "runner"], specifier = "==1.4.0" },
     { name = "pydantic", specifier = ">=2.10,<3" },
+    { name = "websockets", specifier = ">=16,<17" },
 ]
 
 [package.metadata.requires-dev]

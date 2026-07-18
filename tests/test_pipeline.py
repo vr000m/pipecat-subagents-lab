@@ -116,10 +116,11 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         assert worker.frames[0].text == result.spoken_text
         assert worker.frames[0].append_to_context is False
         assert connection.scheduler.active is not None
+        utterance_id = connection.scheduler.active.item.utterance_id
 
         await tts.on_event("synthesis_ended", "pipecat-generated-context")
-        progress = host.state.speech[connection.scheduler.active.item.utterance_id]
-        assert progress.state.value == "synthesis_ended"
+        assert connection.scheduler.active is None
+        assert host.state.speech[utterance_id].state.value == "delivery_unknown"
         await host.shutdown()
 
     asyncio.run(run())
@@ -261,6 +262,7 @@ def test_connection_observer_projects_canonical_runtime_events_without_live_serv
 
         messages = host.connection.observer.messages()
         assert [message["kind"] for message in messages] == ["worker", "result"]
+        assert {message["session_id"] for message in messages} == {host.state.session_id}
         assert messages[-1]["data"]["result_id"] == "result-1"
         assert messages[-1]["origin_epoch"] == 1
 

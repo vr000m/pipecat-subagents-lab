@@ -15,6 +15,8 @@ from typing import Any, Callable
 from pipecat.frames.frames import Frame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame
 from pipecat.services.tts_service import TTSService
 
+from .ws_clients import default_tts_client_factory
+
 
 @dataclass(frozen=True)
 class TTSEndpoint:
@@ -33,7 +35,7 @@ class LocalTTS(TTSService):
     ) -> None:
         super().__init__(sample_rate=sample_rate)
         self.endpoint, self.on_event = endpoint, on_event
-        self.client_factory = client_factory
+        self.client_factory = client_factory or default_tts_client_factory
         self._client: Any = None
         self.started = False
 

@@ -11,9 +11,10 @@ from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from .connection_arbiter import ConnectionArbiter
-from .contracts import CONTRACT_VERSION
+from .contracts import CONTRACT_VERSION, GroundedResult
 from .observers import RuntimeObserver
 from .registry import WorkerRegistry
+from .results import canonical_result
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
 
@@ -303,7 +304,28 @@ class SessionHost:
                     # Pipecat 1.4.0 creates its own TTSSpeakFrame context ID.
                     # The scheduler's one-active-lease invariant is the only
                     # correlation available without claiming playout completion.
-                    pipeline.scheduler.synthesis_ended(pipeline.scheduler.active.item.utterance_id)
+                    utterance_id = pipeline.scheduler.active.item.utterance_id
+                    pipeline.scheduler.synthesis_ended(utterance_id)
+                    # The pinned local service exposes synthesis completion, not
+                    # browser playout completion. Release conservatively as
+                    # unknown so later utterances cannot be starved.
+                    pipeline.scheduler.delivery_unknown(utterance_id)
+                elif (
+                    event == "delivery_completed"
+                    and self.connection is pipeline
+                    and pipeline.active
+                    and pipeline.scheduler.active is not None
+                ):
+                    pipeline.scheduler.delivery_completed(
+                        pipeline.scheduler.active.item.utterance_id
+                    )
+                elif (
+                    event == "delivery_unknown"
+                    and self.connection is pipeline
+                    and pipeline.active
+                    and pipeline.scheduler.active is not None
+                ):
+                    pipeline.scheduler.delivery_unknown(pipeline.scheduler.active.item.utterance_id)
                 return callback_result
 
             self.tts.on_event = on_tts_event
@@ -323,7 +345,41 @@ class SessionHost:
             self.coordinator.arbitrate, self.state.session_id, transcript
         )
         if outcome.kind != "routed" or outcome.decision is None:
-            return outcome
+            text = {
+                "control": "Control request noted.",
+                "continue_pending": "Continuing the pending request.",
+                "multi_intent": "I will handle those requests in order.",
+            }.get(outcome.kind)
+            if text is None:
+                return outcome
+            return await self._commit_and_speak(
+                canonical_result(
+                    worker_id="main",
+                    turn_id=f"turn-{self.state.sequence + 1}",
+                    text=text,
+                    origin_epoch=origin_epoch,
+                ),
+                origin,
+            )
+        action = getattr(outcome.decision, "action", None)
+        if action in {"direct", "unsupported", "clarify"}:
+            router = getattr(self.coordinator, "router", None)
+            text = getattr(router, "last_prose", None)
+            if not text:
+                text = {
+                    "direct": "I could not produce a direct answer yet.",
+                    "unsupported": "I cannot access that capability here.",
+                    "clarify": "Could you clarify what you want me to search for?",
+                }[action]
+            return await self._commit_and_speak(
+                canonical_result(
+                    worker_id="main",
+                    turn_id=f"turn-{self.state.sequence + 1}",
+                    text=text,
+                    origin_epoch=origin_epoch,
+                ),
+                origin,
+            )
         worker = self.coordinator.dispatch(outcome.decision)
         if worker is None:
             return outcome
@@ -335,6 +391,11 @@ class SessionHost:
             turn_id=f"turn-{self.state.sequence + 1}",
             origin_epoch=origin_epoch,
         )
+        return await self._commit_and_speak(result, origin)
+
+    async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
+        """Commit a result and speak only when its originating epoch is active."""
+        origin_epoch = result.origin_epoch
         self.state.append_result(result, origin_epoch=origin_epoch)
         if (
             self.tts is None

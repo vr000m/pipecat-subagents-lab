@@ -111,9 +111,11 @@ def test_default_app_host_materializes_configured_local_speech_adapters(
     host = create_app().state.session_host
 
     assert isinstance(host.stt, LocalSTT)
+    assert host.stt.client_factory is not None
     assert host.stt.endpoint.transport == "uds"
     assert host.stt.endpoint.address == "/tmp/local-stt.sock"
     assert isinstance(host.tts, LocalTTS)
+    assert host.tts.client_factory is not None
     assert host.tts.endpoint.transport == "ws"
     assert host.tts.endpoint.address == "127.0.0.1:9000"
 

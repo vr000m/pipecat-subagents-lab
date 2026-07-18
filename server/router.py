@@ -180,6 +180,7 @@ class Router:
     ) -> None:
         self._call, self.config, self.model = call, config, model
         self.last_prompt: str | None = None
+        self.last_prose: str | None = None
 
     def route(
         self, transcript: str, catalogue: WorkerCatalogue | tuple[WorkerCatalogueEntry, ...]
@@ -208,6 +209,7 @@ class Router:
                 if isinstance(payload, dict) and "decision" in payload
                 else {"decision": payload}
             )
+        self.last_prose = envelope.prose
         validate_decision(envelope.decision, catalogue)
         return envelope.decision
 

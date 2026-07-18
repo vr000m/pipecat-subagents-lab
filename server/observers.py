@@ -44,6 +44,7 @@ class RuntimeObserver:
         return tuple(
             {
                 "contract_version": "v1.0",
+                "session_id": self.state.session_id,
                 "sequence": event.sequence,
                 "kind": event.kind,
                 "data": event.payload,
@@ -64,6 +65,7 @@ class RuntimeObserver:
             return None
         payload = {
             "contract_version": "v1.0",
+            "session_id": self.state.session_id,
             "sequence": event.sequence,
             "kind": event.kind,
             "data": event.payload,

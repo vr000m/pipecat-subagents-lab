@@ -15,6 +15,8 @@ from typing import Any, Callable
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
 from pipecat.services.stt_service import SegmentedSTTService
 
+from .ws_clients import default_stt_client_factory
+
 
 @dataclass(frozen=True)
 class STTEndpoint:
@@ -35,7 +37,7 @@ class LocalSTT(SegmentedSTTService):
     ) -> None:
         super().__init__(sample_rate=sample_rate)
         self.endpoint, self.on_final = endpoint, on_final
-        self.client_factory = client_factory
+        self.client_factory = client_factory or default_stt_client_factory
         self._client: Any = None
         self.started = False
 
@@ -89,6 +91,7 @@ class LocalSTT(SegmentedSTTService):
             if event.get("type", "").endswith("transcription.completed"):
                 text = event.get("transcript") or ""
                 if text:
+                    await self.handle_final_transcript(text)
                     yield TranscriptionFrame(text, "", "")
                 return
             if event.get("type") == "error":
