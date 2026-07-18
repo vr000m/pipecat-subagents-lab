@@ -56,15 +56,10 @@ class RoutingDecision(StrictModel):
     @model_validator(mode="after")
     def validate_selection(self) -> RoutingDecision:
         if self.action in {"existing_worker", "new_worker"}:
-            if (
-                not self.worker_id
-                or not self.worker_type
-                or not self.topic
-                or not self.model_policy
-            ):
-                raise ValueError(
-                    "worker routes require worker_id, worker_type, topic, and model_policy"
-                )
+            if not self.worker_type or not self.topic or not self.model_policy:
+                raise ValueError("worker routes require worker_type, topic, and model_policy")
+            if self.action == "existing_worker" and not self.worker_id:
+                raise ValueError("existing-worker routes require worker_id")
             if self.action == "existing_worker" and self.catalogue_worker_ids:
                 if self.worker_id not in self.catalogue_worker_ids:
                     raise ValueError("worker_id is not present in the catalogue snapshot")

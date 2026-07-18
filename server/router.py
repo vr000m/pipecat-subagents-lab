@@ -62,6 +62,20 @@ def validate_decision(decision: RoutingDecision, catalogue: WorkerCatalogue) -> 
         if any(getattr(decision, f) is not None for f in ("worker_id", "worker_type", "topic")):
             raise RoutingValidationError("non-worker routes cannot select a worker")
         return decision
+    if decision.action == "new_worker":
+        if decision.worker_id is not None and decision.worker_id in catalogue.worker_ids:
+            raise RoutingValidationError("new-worker proposals cannot select an existing worker")
+        worker_types = {entry.worker_type for entry in catalogue.workers}
+        if worker_types and decision.worker_type not in worker_types:
+            raise RoutingValidationError("new worker type is not allowlisted")
+        if (
+            decision.model_policy not in catalogue.model_policies
+            or decision.capability not in catalogue.capability_labels
+            or not decision.capability_available
+        ):
+            raise RoutingValidationError("new worker policy or capability is not allowlisted")
+        return decision
+
     entry = next((w for w in catalogue.workers if w.worker_id == decision.worker_id), None)
     if entry is None or decision.worker_type != entry.worker_type or decision.topic != entry.topic:
         raise RoutingValidationError("worker selection does not match the catalogue snapshot")

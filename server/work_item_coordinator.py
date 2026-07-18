@@ -10,7 +10,7 @@ from typing import Any, Callable
 from .config import Config
 from .contracts import RoutingDecision
 from .registry import WorkerRegistry
-from .router import Router
+from .router import Router, WorkerCatalogue, validate_decision
 
 
 @dataclass(frozen=True)
@@ -114,9 +114,22 @@ class WorkItemCoordinator:
         return DispatchOutcome("routed", transcript, decision=decision)
 
     def dispatch(
-        self, decision: RoutingDecision, operation: Callable[[Any], Any] | None = None
+        self,
+        decision: RoutingDecision,
+        operation: Callable[[Any], Any] | None = None,
+        catalogue: WorkerCatalogue | None = None,
     ) -> Any:
-        worker = self.registry.get(decision.worker_id) if decision.worker_id else None
+        if self.registry is None:
+            raise RuntimeError("dispatch requires a worker registry")
+        validate_decision(decision, catalogue or self.registry.catalogue())
+        if decision.action == "new_worker":
+            worker = self.registry.get_or_create(
+                topic=decision.topic or "",
+                worker_type=decision.worker_type or "",
+                model_policy=decision.model_policy or "",
+            )
+        else:
+            worker = self.registry.get(decision.worker_id) if decision.worker_id else None
         if worker is None:
             return None
         if operation is None:
