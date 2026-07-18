@@ -108,7 +108,7 @@ def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:
     assert asyncio.run(scheduler.start_next()).utterance_id == second.utterance_id
 
 
-def test_reconnect_interrupts_active_item_without_touching_other_work_item_queues() -> None:
+def test_reconnect_terminally_cancels_active_and_queued_old_epoch_items() -> None:
     scheduler = SpeechScheduler(SessionState())
     first = enqueue(scheduler, "work-1", "one")
     second = enqueue(scheduler, "work-2", "two")
@@ -120,8 +120,13 @@ def test_reconnect_interrupts_active_item_without_touching_other_work_item_queue
     assert (
         scheduler.state.speech[first.utterance_id].state == DeliveryState.INTERRUPTED_BY_RECONNECT
     )
-    assert [item.utterance_id for item in scheduler._queues["work-2"]] == [second.utterance_id]
-    assert [item.utterance_id for item in scheduler._queues["work-3"]] == [third.utterance_id]
+    assert scheduler._queues == {}
+    assert (
+        scheduler.state.speech[second.utterance_id].state == DeliveryState.INTERRUPTED_BY_RECONNECT
+    )
+    assert (
+        scheduler.state.speech[third.utterance_id].state == DeliveryState.INTERRUPTED_BY_RECONNECT
+    )
 
 
 def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:

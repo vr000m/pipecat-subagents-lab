@@ -123,8 +123,56 @@ def test_stale_epoch_speech_callback_cannot_mutate_active_authoritative_state() 
         origin_epoch=2,
     )
 
-    assert stale.state == DeliveryState.DELIVERY_COMPLETED
+    assert stale.state == DeliveryState.STARTED
     assert state.speech["utt-1"].state == DeliveryState.STARTED
+
+
+def test_promoted_state_rejects_epochless_callbacks_but_keeps_pre_activation_setup() -> None:
+    state = SessionState(session_id="session-1")
+    state.set_worker(
+        WorkerState(worker_id="worker-weather", topic="weather", model_policy="deep", status="idle")
+    )
+    state.append_result(result("setup"))
+    state.active_epoch = 3
+
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-weather", topic="weather", model_policy="deep", status="working"
+        )
+    )
+    state.append_result(result("epochless"))
+    state.speech_progress(
+        result_id="epochless",
+        work_item_id="work-1",
+        run_id="run-1",
+        utterance_id="utt-1",
+        state=DeliveryState.STARTED,
+    )
+
+    assert state.workers["worker-weather"].status == "idle"
+    assert [item.result_id for item in state.results.results] == ["setup"]
+    assert "utt-1" not in state.speech
+
+
+def test_result_callback_epoch_must_match_result_origin_and_old_result_stays_history_only() -> None:
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 3
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-weather",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=3,
+        )
+    )
+    mismatched = result("mismatched").model_copy(update={"origin_epoch": 2})
+    state.append_result(mismatched, origin_epoch=3)
+    old = result("old").model_copy(update={"origin_epoch": 2})
+    state.append_result(old, origin_epoch=2)
+
+    assert [item.result_id for item in state.results.results] == ["old"]
+    assert state.workers["worker-weather"].latest_result_id is None
 
 
 def test_snapshot_round_trip_rebuilds_worker_result_history_and_delivery_projection() -> None:

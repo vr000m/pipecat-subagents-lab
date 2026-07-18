@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,17 +20,25 @@ class RTVIMessage(BaseModel):
 
 
 class RTVIMessagePublisher:
-    def __init__(self, session_id: str, active_epoch: int) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        active_epoch: int,
+        sequence_provider: Callable[[], int] | None = None,
+    ) -> None:
         self.session_id, self.active_epoch = session_id, active_epoch
         RuntimeSnapshot.reset_monotonicity(session_id)
         self._sequence = 0
+        self._sequence_provider = sequence_provider
         self._ready = False
         self._snapshot: RuntimeSnapshot | None = None
 
     def _message(self, kind: str, data: dict[str, Any], origin_epoch: int) -> RTVIMessage | None:
         if origin_epoch != self.active_epoch:
             return None
-        self._sequence += 1
+        self._sequence = (
+            self._sequence_provider() if self._sequence_provider is not None else self._sequence + 1
+        )
         return RTVIMessage(
             session_id=self.session_id,
             sequence=self._sequence,
@@ -52,10 +60,9 @@ class RTVIMessagePublisher:
 
     def set_snapshot(self, snapshot: RuntimeSnapshot) -> None:
         self._snapshot = snapshot
-        # The snapshot sequence is the last state event represented by the
-        # snapshot.  Keep the envelope counter in the same namespace so the
-        # snapshot and all following incremental messages remain contiguous.
-        self._sequence = max(self._sequence, snapshot.snapshot_sequence - 1)
+        # Snapshot sequence is authoritative session state, not a publisher
+        # sequence. Repeated snapshots do not invent state events.
+        self._sequence = max(self._sequence, snapshot.snapshot_sequence)
 
     def snapshot(self) -> RTVIMessage | None:
         if not self._ready:
@@ -72,8 +79,15 @@ class RTVIMessagePublisher:
                 "origin_epoch": None,
             }
         )
-        # A snapshot request is itself a sequenced event. Repeated requests
-        # must advance both fields together; otherwise the browser treats the
-        # envelope as a gap or rewinds its recovery watermark.
-        data["snapshot_sequence"] = self._sequence + 1
-        return self._message("runtime_snapshot", data, self.active_epoch)
+        sequence = (
+            self._sequence_provider() if self._sequence_provider is not None else self._sequence
+        )
+        data["snapshot_sequence"] = sequence
+        self._sequence = sequence
+        return RTVIMessage(
+            session_id=self.session_id,
+            sequence=sequence,
+            kind="runtime_snapshot",
+            data=data,
+            origin_epoch=self.active_epoch,
+        )

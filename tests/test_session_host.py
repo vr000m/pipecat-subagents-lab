@@ -77,7 +77,10 @@ def test_replacement_interrupts_only_old_connection_speech_and_keeps_result_hist
         host = SessionHost()
         host.state.set_worker(
             WorkerState(
-                worker_id="worker-weather", topic="weather", model_policy="deep", status="idle"
+                worker_id="worker-weather",
+                topic="weather",
+                model_policy="deep",
+                status="idle",
             )
         )
         first = await host.connect(
@@ -144,7 +147,11 @@ def test_replacement_fences_new_epoch_before_old_shutdown_and_rejects_old_callba
         first.worker = old_worker
         host.state.set_worker(
             WorkerState(
-                worker_id="worker-weather", topic="weather", model_policy="deep", status="idle"
+                worker_id="worker-weather",
+                topic="weather",
+                model_policy="deep",
+                status="idle",
+                origin_epoch=1,
             )
         )
 

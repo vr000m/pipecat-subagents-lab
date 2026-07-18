@@ -3,7 +3,9 @@
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server.config import Config
 from server.pipeline import SessionHost
+from server.registry import WorkerRegistry
 
 
 class FakeRunner:
@@ -42,3 +44,20 @@ def test_offer_rejects_missing_or_wrong_session_identity_before_sdp_handling() -
 
     assert response.status_code == 401
     assert response.json()["detail"] == "invalid Small WebRTC session identity"
+
+
+def test_session_discovery_rejects_cross_origin_requests() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    with TestClient(create_app(host)) as client:
+        response = client.get("/api/session", headers={"origin": "https://evil.example"})
+    assert response.status_code == 403
+
+
+def test_session_discovery_uses_configured_client_origin() -> None:
+    registry = WorkerRegistry(config=Config(known_client_url="https://client.example.test/app"))
+    host = SessionHost(registry=registry, runner_factory=FakeRunner)
+    with TestClient(create_app(host)) as client:
+        response = client.get(
+            "/api/session", headers={"origin": "https://client.example.test/app/"}
+        )
+    assert response.status_code == 200

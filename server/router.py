@@ -66,7 +66,15 @@ def validate_decision(decision: RoutingDecision, catalogue: WorkerCatalogue) -> 
         if decision.worker_id is not None and decision.worker_id in catalogue.worker_ids:
             raise RoutingValidationError("new-worker proposals cannot select an existing worker")
         if not catalogue.workers:
-            if not decision.capability or not decision.capability_available:
+            if (
+                (catalogue.model_policies and decision.model_policy not in catalogue.model_policies)
+                or not decision.capability
+                or (
+                    catalogue.capability_labels
+                    and decision.capability not in catalogue.capability_labels
+                )
+                or not decision.capability_available
+            ):
                 raise RoutingValidationError("first worker must request an available capability")
             return decision
         worker_types = {entry.worker_type for entry in catalogue.workers}

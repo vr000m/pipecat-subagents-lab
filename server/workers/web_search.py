@@ -134,7 +134,11 @@ class WebSearchWorker(ContextWorker):
         self.append_context({"turn_id": turn_id, "query": refined, "result_id": result.result_id})
         return result
 
-    async def run(self, query: str) -> Any:
+    async def run(self, query: Any) -> Any:
+        # WorkerRunner invokes BaseWorker.run(params); tests and the application
+        # invoke this convenience method with a query string.
+        if not isinstance(query, str):
+            return await super().run(query)
         if self.decline(self.refine_query(query)):
             return type("WorkerOutcome", (), {"outcome": "decline", "text": "", "citations": []})()
         return await self.search(query, turn_id="turn-worker")

@@ -23,7 +23,8 @@ _RANK = {
     DeliveryState.STARTED: 2,
     DeliveryState.SYNTHESIS_ENDED: 3,
     DeliveryState.PAUSED: 3,
-    DeliveryState.RESUMED: 4,
+    # A replay may transition from RESUMED back to STARTED.
+    DeliveryState.RESUMED: 2,
     DeliveryState.DELIVERY_UNKNOWN: 5,
     DeliveryState.DELIVERY_COMPLETED: 6,
     DeliveryState.INTERRUPTED: 7,
@@ -62,13 +63,21 @@ class SessionState:
     def events(self) -> tuple[StateEvent, ...]:
         return tuple(self._events)
 
-    def subscribe(self, listener: Callable[[StateEvent], Any]) -> None:
+    def subscribe(self, listener: Callable[[StateEvent], Any]) -> Callable[[], None]:
         """Register a live projection listener.
 
         Listeners are deliberately observational: they cannot replace the
         authoritative state mutation and are expected to fence by epoch.
         """
         self._listeners.append(listener)
+
+        def unsubscribe() -> None:
+            try:
+                self._listeners.remove(listener)
+            except ValueError:
+                pass
+
+        return unsubscribe
 
     def _emit(self, kind: str, payload: dict[str, Any]) -> StateEvent:
         self.sequence += 1
@@ -78,7 +87,11 @@ class SessionState:
             listener(event)
         return event
 
-    def set_worker(self, worker: WorkerState) -> StateEvent:
+    def set_worker(self, worker: WorkerState) -> StateEvent | None:
+        if self.active_epoch is not None and (
+            worker.origin_epoch is None or worker.origin_epoch != self.active_epoch
+        ):
+            return None
         self.workers[worker.worker_id] = worker
         return self._emit("worker", worker.model_dump(mode="json"))
 
@@ -87,14 +100,19 @@ class SessionState:
         result: GroundedResult,
         sequence: int | None = None,
         origin_epoch: int | None = None,
-    ) -> StateEvent:
-        if any(item.result_id == result.result_id for item in self.results.results):
-            return self._emit("result_duplicate", {"result_id": result.result_id})
+    ) -> StateEvent | None:
+        if self.active_epoch is not None and origin_epoch is None:
+            return None
         if (
             origin_epoch is not None
-            and self.active_epoch is not None
-            and origin_epoch != self.active_epoch
+            and result.origin_epoch is not None
+            and origin_epoch != result.origin_epoch
         ):
+            return None
+        if any(item.result_id == result.result_id for item in self.results.results):
+            return self._emit("result_duplicate", {"result_id": result.result_id})
+        effective_epoch = origin_epoch if origin_epoch is not None else result.origin_epoch
+        if self.active_epoch is not None and effective_epoch != self.active_epoch:
             # Late provider work is still an immutable result commit, but it cannot
             # update active worker pointers or speech state.
             self.results.append(result)
@@ -114,7 +132,7 @@ class SessionState:
                 model_policy="unknown",
                 status="idle",
                 latest_result_id=result.result_id,
-                origin_epoch=origin_epoch,
+                origin_epoch=effective_epoch,
             )
         return self._emit("result", result.model_dump(mode="json"))
 
@@ -135,10 +153,9 @@ class SessionState:
         allow_stale_reconnect: bool = False,
     ) -> SpeechProgress:
         if (
-            origin_epoch is not None
-            and self.active_epoch is not None
-            and origin_epoch != self.active_epoch
+            self.active_epoch is not None
             and not allow_stale_reconnect
+            and (origin_epoch is None or origin_epoch != self.active_epoch)
         ):
             return self.speech.get(
                 utterance_id,
@@ -170,14 +187,11 @@ class SessionState:
         return progress
 
     def apply_speech_progress(
-        self, progress: SpeechProgress, origin_epoch: int | None = None
+        self,
+        progress: SpeechProgress,
+        origin_epoch: int | None = None,
+        allow_stale_reconnect: bool = False,
     ) -> SpeechProgress:
-        if (
-            origin_epoch is not None
-            and self.active_epoch is not None
-            and origin_epoch != self.active_epoch
-        ):
-            return progress
         return self.speech_progress(
             result_id=progress.result_id,
             work_item_id=progress.work_item_id,
@@ -185,6 +199,7 @@ class SessionState:
             utterance_id=progress.utterance_id,
             state=progress.state,
             origin_epoch=origin_epoch if origin_epoch is not None else progress.origin_epoch,
+            allow_stale_reconnect=allow_stale_reconnect,
         )
 
     def speech_history(self, utterance_id: str) -> tuple[SpeechProgress, ...]:

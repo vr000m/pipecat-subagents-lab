@@ -68,15 +68,18 @@ class CanonicalResultAdapter(FrameProcessor):
 
     @staticmethod
     def accepts(frame: Any) -> bool:
-        return (
-            isinstance(frame, dict)
-            and frame.get("kind") == "canonical_result"
-            and isinstance(frame.get("result_id"), str)
-            and isinstance(frame.get("text"), str)
+        data = getattr(frame, "data", frame)
+        if isinstance(data, dict) and data.get("kind") == "canonical_result":
+            data = data.get("data", data)
+        return isinstance(data, dict) and all(
+            isinstance(data.get(field), str)
+            for field in ("result_id", "text", "worker_id", "turn_id")
         )
 
     async def process_frame(self, frame: Any, direction: Any) -> None:
         """Keep the adapter a real Pipecat processor; canonical dicts use the app gate."""
+        if direction != getattr(FrameDirection, "DOWNSTREAM", direction) or not self.accepts(frame):
+            return
         if FrameProcessor is not object:
             await super().process_frame(frame, direction)
 
@@ -115,7 +118,7 @@ def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
         transport=transport,
         stt=stt,
         tts=tts,
-        processors=(bridge, CanonicalResultAdapter()),
+        processors=(stt, bridge, CanonicalResultAdapter(), tts),
     )
 
 
@@ -126,6 +129,7 @@ class ConnectionPipeline:
     scheduler: SpeechScheduler
     transport: Any | None = None
     worker: Any | None = None
+    worker_task: asyncio.Task[Any] | None = None
     active: bool = True
 
     def deactivate(self) -> None:
@@ -142,6 +146,15 @@ class ConnectionPipeline:
                 if hasattr(result, "__await__"):
                     await result
             self.worker = None
+        if self.worker_task is not None:
+            self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self.worker_task = None
+        self.observer.unsubscribe()
 
 
 class SessionHost:
@@ -151,11 +164,16 @@ class SessionHost:
         self,
         registry: WorkerRegistry | None = None,
         runner_factory: Callable[[], Any] | None = None,
+        stt: Any | None = None,
+        tts: Any | None = None,
+        coordinator: Any | None = None,
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
         self.registry = registry or WorkerRegistry()
         self.runner_factory = runner_factory
+        self.stt, self.tts = stt, tts
+        self.coordinator = coordinator
         self.runner: Any = None
         self._runner_handles: dict[str, Any] = {}
         self._runner_registered: set[str] = set()
@@ -189,9 +207,7 @@ class SessionHost:
         """Register durable contexts with the runner when the API can accept them.
 
         Pipecat 1.4.0 does not expose the planned ``LLMContextWorker`` module;
-        registry contexts therefore remain the application context owners. A
-        runner-owned wait handle still gives each durable context a real bus/
-        lifecycle registration without pretending the missing worker API exists.
+        the lab's ContextWorker uses the pinned BaseWorker bus lifecycle instead.
         Test registries and runners without ``add_workers`` are left untouched.
         """
         add_workers = getattr(self.runner, "add_workers", None)
@@ -205,29 +221,8 @@ class SessionHost:
         for registered in self.registry.workers:
             if registered.worker_id in self._runner_registered:
                 continue
-            worker = registered.worker
-            if isinstance(worker, BaseWorker):
-                handle = worker
-            else:
-                handle = self._runner_handles.get(registered.worker_id)
-                if handle is None:
-                    owner = worker
-                    worker_id = registered.worker_id
-
-                    class DurableContextHandle(BaseWorker):
-                        def __init__(self) -> None:
-                            super().__init__(name=worker_id)
-                            self.owner = owner
-                            self._stop = asyncio.Event()
-
-                        async def run(self) -> None:
-                            await self._stop.wait()
-
-                    handle = DurableContextHandle()
-                    self._runner_handles[registered.worker_id] = handle
-            if registered.worker_id not in self._runner_handles:
-                self._runner_handles[registered.worker_id] = handle
-            if getattr(self.runner, "registry", None) is not None:
+            handle = registered.worker
+            if isinstance(handle, BaseWorker):
                 result = add_workers(handle)
                 if inspect.isawaitable(result):
                     await result
@@ -245,11 +240,41 @@ class SessionHost:
             RuntimeObserver(self.state, connection.epoch),
             SpeechScheduler(self.state),
         )
+        if self.stt is not None and self.coordinator is not None:
+            self.stt.on_final = self._handle_transcript
         self.connection = pipeline
         if old_connection is not None:
             await old_connection.shutdown()
         await self._register_persistent_workers()
         return pipeline
+
+    async def _handle_transcript(self, transcript: str) -> Any:
+        """Route a final local-STT turn through the application coordinator."""
+        if self.coordinator is None or self.connection is None:
+            return transcript
+        outcome = self.coordinator.arbitrate(self.state.session_id, transcript)
+        if outcome.kind != "routed" or outcome.decision is None:
+            return outcome
+        worker = self.coordinator.dispatch(outcome.decision)
+        if worker is None:
+            return outcome
+        search = getattr(worker, "search", None)
+        if search is None:
+            return outcome
+        result = await search(
+            transcript,
+            turn_id=f"turn-{self.state.sequence + 1}",
+            origin_epoch=self.connection.epoch,
+        )
+        self.state.append_result(result, origin_epoch=self.connection.epoch)
+        self.connection.scheduler.enqueue(
+            result_id=result.result_id,
+            work_item_id=f"work-{result.turn_id}",
+            run_id=f"run-{result.turn_id}",
+            text=result.spoken_text,
+            origin_epoch=self.connection.epoch,
+        )
+        return result
 
     def session_handshake(self) -> dict[str, Any]:
         """Return the next browser handshake without mutating session state."""

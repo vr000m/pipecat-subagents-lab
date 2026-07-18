@@ -13,13 +13,14 @@ from .session_state import SessionState, StateEvent
 class RuntimeObserver:
     def __init__(self, state: SessionState, epoch: int) -> None:
         self.state, self.epoch = state, epoch
+        self._unsubscribe: Callable[[], None] | None = None
 
-    def subscribe(self, emit: Callable[[Any], Any]) -> None:
+    def subscribe(self, emit: Callable[[Any], Any]) -> Callable[[], None]:
         """Forward future authoritative events as epoch-filtered framework frames."""
 
         def on_event(event: StateEvent) -> None:
             frame = self.frame(event)
-            if frame is None or event.kind not in {"result", "speech_progress"}:
+            if frame is None:
                 return
             result = emit(frame)
             # A connection emitter is normally a coroutine scheduled by the
@@ -27,7 +28,14 @@ class RuntimeObserver:
             if inspect.isawaitable(result):
                 asyncio.create_task(result)
 
-        self.state.subscribe(on_event)
+        self.unsubscribe()
+        self._unsubscribe = self.state.subscribe(on_event)
+        return self._unsubscribe
+
+    def unsubscribe(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
 
     def snapshot(self) -> RuntimeSnapshot:
         return self.state.snapshot(origin_epoch=self.epoch)

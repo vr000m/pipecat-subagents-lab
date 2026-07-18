@@ -86,6 +86,10 @@ class WorkerRegistry:
     def get_or_create(self, *, topic: str, worker_type: str, model_policy: str) -> RegisteredWorker:
         for item in self._workers.values():
             if item.metadata.topic == topic and item.metadata.worker_type == worker_type:
+                if item.metadata.model_policy != model_policy:
+                    raise ValueError(
+                        "existing worker has an incompatible model policy; refusing to reuse it"
+                    )
                 return item
         worker: ContextWorker | None = None
         if self.worker_factory is not None:
@@ -146,11 +150,12 @@ class WorkerRegistry:
                 topic_summary=item.metadata.topic_summary,
                 status=getattr(item.worker, "status", "idle"),
                 capabilities=dict(item.metadata.capabilities),
+                model_policies=frozenset({item.metadata.model_policy}),
                 model_policy=item.metadata.model_policy,
             )
             for item in self._workers.values()
         )
-        labels = {label for item in entries for label in item.capabilities}
+        labels = {label for item in entries for label in item.capabilities} or {"public_web"}
         return WorkerCatalogue(
             version=f"catalogue-{self._version}",
             workers=entries,

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from server.work_item_coordinator import WorkItemCoordinator
+from server.work_item_coordinator import PendingDialogue, WorkItemCoordinator
 
 
 class FakeSpeechScheduler:
@@ -15,6 +15,13 @@ class FakeSpeechScheduler:
 
 async def completed_worker(text: str) -> dict:
     return {"text": text, "citations": []}
+
+
+def test_compound_pending_reply_is_classified_as_multi_intent() -> None:
+    coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 0)
+    coordinator.add_pending(PendingDialogue("session", "worker", "worker-1", "turn", "result", 10))
+    outcome = coordinator.arbitrate("session", "yes, and also search for news")
+    assert outcome.kind == "multi_intent"
 
 
 def test_same_worker_turns_are_causal_but_different_workers_can_run_concurrently() -> None:

@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 try:  # Pipecat versions with distributed worker support can provide this class.
     from pipecat.processors.frameworks.llm_context import LLMContextWorker as _NativeWorker
 except ImportError:  # pragma: no cover - exercised by the pinned 1.4.0 fallback runtime
-    _NativeWorker = object
+    from pipecat.workers.base_worker import BaseWorker as _NativeWorker
 
 
 @dataclass(frozen=True)
@@ -28,13 +28,17 @@ class ContextWorker(_NativeWorker):
     def __init__(self, metadata: WorkerMetadata) -> None:
         if _NativeWorker is not object:
             try:
-                super().__init__()
+                super().__init__(name=metadata.worker_id)
             except TypeError:
                 pass
         self.metadata = metadata
         self.status = "idle"
         self.history: list[dict[str, Any]] = []
         self._tail: asyncio.Future[Any] | None = None
+
+    async def run(self, params: Any) -> None:
+        """Use Pipecat's real bus-worker lifecycle for durable context owners."""
+        await super().run(params)
 
     async def submit(self, operation: Callable[[], Awaitable[Any] | Any]) -> Any:
         previous = self._tail

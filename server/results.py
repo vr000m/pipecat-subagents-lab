@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 from uuid import uuid4
+from urllib.parse import urlparse
 
 from .contracts import Citation, GroundedResult
 
@@ -27,9 +28,19 @@ def normalize_citations(items: Iterable[Mapping[str, Any]] | None) -> list[Citat
     seen: set[str] = set()
     for item in items or ():
         url = item.get("url")
+        try:
+            parsed = urlparse(url) if isinstance(url, str) else None
+        except ValueError:
+            parsed = None
+        try:
+            hostname = parsed.hostname if parsed is not None else None
+        except ValueError:
+            hostname = None
         if (
-            not isinstance(url, str)
-            or not url.startswith(("http://", "https://"))
+            parsed is None
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or not hostname
             or any(ch.isspace() for ch in url)
         ):
             continue

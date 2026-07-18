@@ -1,6 +1,7 @@
 """The registry owns persistent context identities and immutable catalogues."""
 
 from server.registry import WorkerRegistry
+import pytest
 from server.workers.base import WorkerMetadata
 from server.workers.web_search import WebSearchWorker
 
@@ -47,6 +48,13 @@ def test_registry_keeps_two_workers_and_same_topic_identity_persistent() -> None
     assert news.worker_id != weather.worker_id
     assert registry.get(weather.worker_id).context is weather.context
     assert registry.policy.eviction_enabled is False
+
+
+def test_registry_does_not_reuse_topic_with_incompatible_model_policy() -> None:
+    registry = WorkerRegistry(worker_factory=FakeContextWorker)
+    registry.get_or_create(topic="weather", worker_type="web_search", model_policy="deep")
+    with pytest.raises(ValueError, match="incompatible model policy"):
+        registry.get_or_create(topic="weather", worker_type="web_search", model_policy="fast")
 
 
 def test_catalogue_is_immutable_and_dispatch_revalidates_against_its_snapshot() -> None:

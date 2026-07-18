@@ -50,3 +50,28 @@ def test_local_speech_services_preserve_sync_callbacks() -> None:
         assert await tts.synthesize("hello", "utt-1") == "synthesis_ended"
 
     asyncio.run(run())
+
+
+def test_run_tts_invokes_configured_synthesis_callback() -> None:
+    class Client:
+        async def append(self, _text: str) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+        async def events(self):
+            yield {"type": "audio.done"}
+
+    async def run() -> None:
+        events: list[str] = []
+        service = LocalTTS(
+            TTSEndpoint("tcp", "127.0.0.1:9001"),
+            lambda event, _utterance: events.append(event),
+            client_factory=lambda _endpoint: Client(),
+        )
+        await service.start()
+        [frame async for frame in service.run_tts("hello", "utt-1")]
+        assert events == ["synthesis_started", "synthesis_ended"]
+
+    asyncio.run(run())

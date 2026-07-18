@@ -121,8 +121,6 @@ class WorkItemCoordinator:
                 "control", transcript, work_items=(control[1],) if control[1] else ()
             )
         pending = self.pending(session_id)
-        if pending and transcript.lower().startswith(("yes", "continue", "that", "please search")):
-            return DispatchOutcome("continue_pending", transcript, work_items=(pending.owner_id,))
         if pending and re.search(r"\b(and|also)\b", transcript, re.I):
             parts = tuple(
                 part.strip()
@@ -132,6 +130,8 @@ class WorkItemCoordinator:
             if len(parts) > self.config.max_work_items_per_turn:
                 parts = parts[: self.config.max_work_items_per_turn]
             return DispatchOutcome("multi_intent", transcript, work_items=parts)
+        if pending and transcript.lower().startswith(("yes", "continue", "that", "please search")):
+            return DispatchOutcome("continue_pending", transcript, work_items=(pending.owner_id,))
         if self.registry is None or self.router is None:
             raise RuntimeError("routing arbitration requires a registry and router")
         catalogue = self.registry.catalogue()

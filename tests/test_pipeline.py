@@ -128,6 +128,36 @@ def test_connection_pipeline_uses_framework_bridge_and_canonical_result_gate() -
     assert asyncio.run(pipeline.emit_worker_frame({"kind": "raw_llm_text"})) is False
 
 
+def test_canonical_adapter_rejects_raw_frames_and_only_admits_downstream_results() -> None:
+    adapter = CanonicalResultAdapter()
+    assert adapter.accepts({"kind": "raw_llm_text", "text": "leak"}) is False
+    assert (
+        adapter.accepts(
+            {
+                "kind": "canonical_result",
+                "result_id": "r",
+                "worker_id": "w",
+                "turn_id": "t",
+                "text": "ok",
+            }
+        )
+        is True
+    )
+
+
+def test_connection_observer_unsubscribe_stops_future_listener_delivery() -> None:
+    from server.observers import RuntimeObserver
+    from server.session_state import SessionState
+
+    state = SessionState()
+    observer = RuntimeObserver(state, epoch=1)
+    received: list[object] = []
+    observer.subscribe(received.append)
+    observer.unsubscribe()
+    state.set_worker(WorkerState(worker_id="w", topic="t", model_policy="deep", status="idle"))
+    assert received == []
+
+
 class AsyncAddRunner:
     def __init__(self) -> None:
         self.added: list[object] = []

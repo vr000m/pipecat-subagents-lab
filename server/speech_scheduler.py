@@ -116,21 +116,35 @@ class SpeechScheduler:
         self._release(utterance_id)
 
     def interrupt(self, *, epoch: int | None = None, reconnect: bool = False) -> SpeechItem | None:
-        if self._active is None:
-            return None
-        item = self._active.item
         state = DeliveryState.INTERRUPTED_BY_RECONNECT if reconnect else DeliveryState.INTERRUPTED
-        self.state.speech_progress(
-            result_id=item.result_id,
-            work_item_id=item.work_item_id,
-            run_id=item.run_id,
-            utterance_id=item.utterance_id,
-            state=state,
-            origin_epoch=epoch if epoch is not None else item.origin_epoch,
-            allow_stale_reconnect=reconnect,
-        )
-        self._release(item.utterance_id)
-        return item
+        active_item = self._active.item if self._active is not None else None
+        if active_item is None and not reconnect:
+            return None
+        if active_item is not None:
+            self.state.speech_progress(
+                result_id=active_item.result_id,
+                work_item_id=active_item.work_item_id,
+                run_id=active_item.run_id,
+                utterance_id=active_item.utterance_id,
+                state=state,
+                origin_epoch=epoch if epoch is not None else active_item.origin_epoch,
+                allow_stale_reconnect=reconnect,
+            )
+            self._release(active_item.utterance_id)
+        if reconnect:
+            for queue in self._queues.values():
+                for item in queue:
+                    self.state.speech_progress(
+                        result_id=item.result_id,
+                        work_item_id=item.work_item_id,
+                        run_id=item.run_id,
+                        utterance_id=item.utterance_id,
+                        state=state,
+                        origin_epoch=epoch if epoch is not None else item.origin_epoch,
+                        allow_stale_reconnect=True,
+                    )
+            self._queues.clear()
+        return active_item
 
     def pause(self, work_item_id: str) -> None:
         if self._active and self._active.item.work_item_id == work_item_id:
