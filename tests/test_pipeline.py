@@ -2,8 +2,12 @@
 
 import asyncio
 
+import pytest
+from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
+
+import server.app as app_module
 from server.contracts import GroundedResult, WorkerState
-from server.pipeline import SessionHost
+from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
 
 
 class AsyncCancelRunner:
@@ -112,5 +116,93 @@ def test_observer_does_not_relabel_old_epoch_events_as_current() -> None:
         )
 
         assert host.connection.observer.messages() == ()
+
+    asyncio.run(run())
+
+
+def test_connection_pipeline_uses_framework_bridge_and_canonical_result_gate() -> None:
+    pipeline = build_pipeline(transport=object(), stt=object(), tts=object())
+
+    assert any(isinstance(item, FrameworkBusBridgeProcessor) for item in pipeline.processors)
+    assert any(isinstance(item, CanonicalResultAdapter) for item in pipeline.processors)
+    assert asyncio.run(pipeline.emit_worker_frame({"kind": "raw_llm_text"})) is False
+
+
+class AsyncAddRunner:
+    def __init__(self) -> None:
+        self.added: list[object] = []
+
+    def start(self) -> None:
+        pass
+
+    async def add_workers(self, *workers: object) -> None:
+        self.added.extend(workers)
+
+    def stop(self) -> None:
+        pass
+
+
+class FakeTransport:
+    def __init__(self) -> None:
+        self.frames: list[object] = []
+
+    def input(self) -> str:
+        return "input"
+
+    def output(self) -> str:
+        return "output"
+
+
+class FakeRTVI:
+    def event_handler(self, _name: str):
+        return lambda function: function
+
+
+class FakePipelineWorker:
+    def __init__(self, pipeline: object, **_: object) -> None:
+        self.pipeline = pipeline
+        self.rtvi = FakeRTVI()
+
+    async def queue_frame(self, _frame: object) -> None:
+        pass
+
+
+@pytest.mark.usefixtures("monkeypatch")
+def test_connection_attach_registers_worker_with_async_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        runner = AsyncAddRunner()
+        host = SessionHost(runner_factory=lambda: runner)
+        await host.start()
+        transport = FakeTransport()
+        pipeline_args: list[object] = []
+
+        monkeypatch.setattr(app_module, "SmallWebRTCTransport", lambda *_args: transport)
+        monkeypatch.setattr(app_module, "TransportParams", lambda **kwargs: kwargs)
+        monkeypatch.setattr(app_module, "PipelineParams", lambda **kwargs: kwargs)
+        monkeypatch.setattr(
+            app_module,
+            "Pipeline",
+            lambda processors: pipeline_args.append(processors) or processors,
+        )
+        monkeypatch.setattr(app_module, "PipelineWorker", FakePipelineWorker)
+
+        await app_module._attach_connection(
+            host,
+            object(),
+            app_module.SnapshotHandshake(
+                session_id=host.state.session_id,
+                resume_token=host.state.resume_token,
+                proposed_epoch=1,
+                snapshot_sequence=0,
+            ),
+        )
+
+        assert len(runner.added) == 1
+        assert runner.added[0] is host.connection.worker
+        assert pipeline_args
+        assert any(isinstance(item, FrameworkBusBridgeProcessor) for item in pipeline_args[0])
+        assert any(isinstance(item, CanonicalResultAdapter) for item in pipeline_args[0])
 
     asyncio.run(run())

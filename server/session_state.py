@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .contracts import GroundedResult, RuntimeSnapshot, SpeechProgress, DeliveryState, WorkerState
@@ -56,15 +56,26 @@ class SessionState:
         self._events: list[StateEvent] = []
         self.active_epoch: int | None = None
         self._speech_history: dict[str, list[SpeechProgress]] = {}
+        self._listeners: list[Callable[[StateEvent], Any]] = []
 
     @property
     def events(self) -> tuple[StateEvent, ...]:
         return tuple(self._events)
 
+    def subscribe(self, listener: Callable[[StateEvent], Any]) -> None:
+        """Register a live projection listener.
+
+        Listeners are deliberately observational: they cannot replace the
+        authoritative state mutation and are expected to fence by epoch.
+        """
+        self._listeners.append(listener)
+
     def _emit(self, kind: str, payload: dict[str, Any]) -> StateEvent:
         self.sequence += 1
         event = StateEvent(self.sequence, kind, payload)
         self._events.append(event)
+        for listener in tuple(self._listeners):
+            listener(event)
         return event
 
     def set_worker(self, worker: WorkerState) -> StateEvent:
@@ -121,11 +132,13 @@ class SessionState:
         utterance_id: str,
         state: DeliveryState,
         origin_epoch: int | None = None,
+        allow_stale_reconnect: bool = False,
     ) -> SpeechProgress:
         if (
             origin_epoch is not None
             and self.active_epoch is not None
             and origin_epoch != self.active_epoch
+            and not allow_stale_reconnect
         ):
             return self.speech.get(
                 utterance_id,

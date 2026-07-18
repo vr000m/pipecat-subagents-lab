@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -13,17 +14,57 @@ from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
 
 
-class BusBridgeProcessor:
-    """Small named seam for the Pipecat bus bridge used by the connection pipeline.
+try:
+    from pipecat.bus.bridge_processor import BusBridgeProcessor as BusBridgeProcessor
+    from pipecat.bus.bus import WorkerBus
+except ImportError:  # pragma: no cover - only for dependency-free contract tests
 
-    Pipecat 1.4 exposes the framework bridge in ``pipecat.bus.bridge_processor``;
-    keeping this connection-facing marker injectable also lets contract tests run
-    without opening a media transport.
-    """
+    class BusBridgeProcessor:
+        """Dependency-free marker used only when the pinned bridge API is absent."""
+
+        framework_fallback = True
+
+    WorkerBus = None  # type: ignore[assignment,misc]
 
 
-class CanonicalResultAdapter:
+if WorkerBus is not None:
+
+    class _ProbeBus(WorkerBus):
+        """No-op bus used only to construct dependency-free contract pipelines."""
+
+        async def publish(self, _message: Any) -> None:
+            return None
+else:  # pragma: no cover
+    _ProbeBus = None
+
+
+def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
+    """Construct the pinned framework bridge; fallback is intentionally explicit."""
+    if getattr(BusBridgeProcessor, "framework_fallback", False):
+        return BusBridgeProcessor()
+    return BusBridgeProcessor(bus=bus, worker_name=worker_name, **kwargs)
+
+
+def _contract_bridge() -> Any:
+    return framework_bridge(
+        bus=_ProbeBus() if _ProbeBus is not None else None,
+        worker_name="contract-pipeline",
+    )
+
+
+try:
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+except ImportError:  # pragma: no cover - dependency-free contract fallback
+    FrameProcessor = object  # type: ignore[assignment,misc]
+    FrameDirection = Any  # type: ignore[misc,assignment]
+
+
+class CanonicalResultAdapter(FrameProcessor):
     """Admit only normalized result frames to the transport side of the pipeline."""
+
+    def __init__(self) -> None:
+        if FrameProcessor is not object:
+            super().__init__()
 
     @staticmethod
     def accepts(frame: Any) -> bool:
@@ -34,6 +75,11 @@ class CanonicalResultAdapter:
             and isinstance(frame.get("text"), str)
         )
 
+    async def process_frame(self, frame: Any, direction: Any) -> None:
+        """Keep the adapter a real Pipecat processor; canonical dicts use the app gate."""
+        if FrameProcessor is not object:
+            await super().process_frame(frame, direction)
+
 
 @dataclass
 class LabPipeline:
@@ -41,7 +87,7 @@ class LabPipeline:
     stt: Any
     tts: Any
     processors: tuple[Any, ...] = field(
-        default_factory=lambda: (BusBridgeProcessor(), CanonicalResultAdapter())
+        default_factory=lambda: (_contract_bridge(), CanonicalResultAdapter())
     )
 
     def has_processor(self, name: str) -> bool:
@@ -59,7 +105,18 @@ class LabPipeline:
 
 def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
     """Compose the connection-local bridge, canonical adapter, and speech seams."""
-    return LabPipeline(transport=transport, stt=stt, tts=tts)
+    bus = _ProbeBus() if _ProbeBus is not None else None
+    bridge = (
+        framework_bridge(bus=bus, worker_name="contract-pipeline")
+        if bus is not None
+        else BusBridgeProcessor()
+    )
+    return LabPipeline(
+        transport=transport,
+        stt=stt,
+        tts=tts,
+        processors=(bridge, CanonicalResultAdapter()),
+    )
 
 
 @dataclass
@@ -100,6 +157,8 @@ class SessionHost:
         self.registry = registry or WorkerRegistry()
         self.runner_factory = runner_factory
         self.runner: Any = None
+        self._runner_handles: dict[str, Any] = {}
+        self._runner_registered: set[str] = set()
         self._runner_task: asyncio.Task[Any] | None = None
         self.connection: ConnectionPipeline | None = None
         self.started = False
@@ -113,6 +172,7 @@ class SessionHost:
             from pipecat.pipeline.runner import WorkerRunner
 
             self.runner = WorkerRunner(name="websearch-session", handle_sigint=False)
+        await self._register_persistent_workers()
         start = getattr(self.runner, "start", None)
         if start is not None:
             result = start()
@@ -125,12 +185,60 @@ class SessionHost:
         self.state.active_epoch = None
         self.started = True
 
+    async def _register_persistent_workers(self) -> None:
+        """Register durable contexts with the runner when the API can accept them.
+
+        Pipecat 1.4.0 does not expose the planned ``LLMContextWorker`` module;
+        registry contexts therefore remain the application context owners. A
+        runner-owned wait handle still gives each durable context a real bus/
+        lifecycle registration without pretending the missing worker API exists.
+        Test registries and runners without ``add_workers`` are left untouched.
+        """
+        add_workers = getattr(self.runner, "add_workers", None)
+        if add_workers is None:
+            return
+        try:
+            from pipecat.workers.base_worker import BaseWorker
+        except ImportError:
+            return
+
+        for registered in self.registry.workers:
+            if registered.worker_id in self._runner_registered:
+                continue
+            worker = registered.worker
+            if isinstance(worker, BaseWorker):
+                handle = worker
+            else:
+                handle = self._runner_handles.get(registered.worker_id)
+                if handle is None:
+                    owner = worker
+                    worker_id = registered.worker_id
+
+                    class DurableContextHandle(BaseWorker):
+                        def __init__(self) -> None:
+                            super().__init__(name=worker_id)
+                            self.owner = owner
+                            self._stop = asyncio.Event()
+
+                        async def run(self) -> None:
+                            await self._stop.wait()
+
+                    handle = DurableContextHandle()
+                    self._runner_handles[registered.worker_id] = handle
+            if registered.worker_id not in self._runner_handles:
+                self._runner_handles[registered.worker_id] = handle
+            if getattr(self.runner, "registry", None) is not None:
+                result = add_workers(handle)
+                if inspect.isawaitable(result):
+                    await result
+                self._runner_registered.add(registered.worker_id)
+
     async def connect(self, handshake: Any) -> ConnectionPipeline:
         if not self.started:
             await self.start()
         connection = self.arbiter.promote(handshake)
-        if self.connection is not None:
-            await self.connection.shutdown()
+        old_connection = self.connection
+        # Publish the new authority before awaiting any old transport cleanup.
         self.state.active_epoch = connection.epoch
         pipeline = ConnectionPipeline(
             connection.epoch,
@@ -138,6 +246,9 @@ class SessionHost:
             SpeechScheduler(self.state),
         )
         self.connection = pipeline
+        if old_connection is not None:
+            await old_connection.shutdown()
+        await self._register_persistent_workers()
         return pipeline
 
     def session_handshake(self) -> dict[str, Any]:

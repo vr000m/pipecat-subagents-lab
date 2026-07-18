@@ -127,6 +127,7 @@ class SpeechScheduler:
             utterance_id=item.utterance_id,
             state=state,
             origin_epoch=epoch if epoch is not None else item.origin_epoch,
+            allow_stale_reconnect=reconnect,
         )
         self._release(item.utterance_id)
         return item

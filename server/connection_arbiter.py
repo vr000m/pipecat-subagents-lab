@@ -53,6 +53,11 @@ class ConnectionArbiter:
         """Return whether an inbound callback belongs to the promoted connection."""
         return self.accepts(epoch)
 
+    def route_callback(self, epoch: int | None, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run a callback only while its originating connection is authoritative."""
+        self.require_active(epoch)
+        return callback(*args, **kwargs)
+
 
 @dataclass(frozen=True)
 class ActiveConnection:

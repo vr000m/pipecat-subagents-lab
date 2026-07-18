@@ -22,7 +22,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
-from .pipeline import SessionHost
+from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .rtvi_messages import RTVIMessagePublisher
 
 
@@ -60,8 +60,18 @@ async def _attach_connection(
         audio_out_sample_rate=24000,
     )
     transport = SmallWebRTCTransport(connection, params)
+    bus = getattr(host.runner, "bus", None)
+    if bus is None:
+        from .pipeline import _ProbeBus
+
+        bus = _ProbeBus() if _ProbeBus is not None else None
+    bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
+    processors = [transport.input()]
+    if bridge is not None:
+        processors.extend((bridge, CanonicalResultAdapter()))
+    processors.append(transport.output())
     worker = PipelineWorker(
-        Pipeline([transport.input(), transport.output()]),
+        Pipeline(processors),
         name=f"browser-{runtime.epoch}",
         params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=24000),
         enable_rtvi=True,
@@ -70,6 +80,12 @@ async def _attach_connection(
     publisher = RTVIMessagePublisher(host.state.session_id, runtime.epoch)
     runtime.transport = transport
     runtime.worker = worker
+
+    async def emit_frame(frame: Any) -> None:
+        if host.accepts(runtime.epoch):
+            await worker.queue_frame(frame)
+
+    runtime.observer.subscribe(emit_frame)
 
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(_rtvi: Any) -> None:
@@ -88,7 +104,11 @@ async def _attach_connection(
     add_workers = getattr(host.runner, "add_workers", None)
     if add_workers is None:
         raise RuntimeError("the configured runner cannot attach a Small WebRTC worker")
-    await add_workers(worker)
+    attached = add_workers(worker)
+    # The pinned wheel currently returns an awaitable; older/fake runners in
+    # this lab expose the documented synchronous registration shape.
+    if hasattr(attached, "__await__"):
+        await attached
 
 
 def create_app(host: SessionHost | None = None) -> FastAPI:
