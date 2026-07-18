@@ -129,7 +129,9 @@ class SpeechScheduler:
         if self._active and self._active.item.work_item_id == work_item_id:
             item = self._active.item
             self.state.speech_progress(**self._progress(item), state=DeliveryState.PAUSED)
-            self.interrupt()
+            # Pausing releases the lease without recording a terminal
+            # interruption; resume must be able to represent the next state.
+            self._release(item.utterance_id)
 
     def resume(self, item: SpeechItem) -> SpeechItem:
         replay = self.enqueue(

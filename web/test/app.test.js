@@ -38,3 +38,28 @@ test("connection readiness requests a snapshot and failed connect leaves Connect
   expect(connectButton.disabled).toBe(true);
   expect(snapshots).toEqual(["snapshot-request"]);
 });
+
+test("onServerMessage rejects unsupported contracts before applying state", () => {
+  const documentRef = fakeDocument();
+  const root = new Element();
+  let callbacks;
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: (_transport, nextCallbacks) => {
+      callbacks = nextCallbacks;
+      return { enableMic: () => {}, disconnect: async () => {} };
+    },
+  });
+
+  callbacks = undefined;
+  void app;
+  // Creating the client is intentionally deferred until connect.
+  return app.connect().then(() => {
+    callbacks.onServerMessage({ contract_version: "v2.0", kind: "result", sequence: 1, data: {} });
+    expect(app.getState().lastAppliedSequence).toBe(0);
+    callbacks.onServerMessage({ contract_version: "v1.0", kind: "result", sequence: 1, data: {} });
+    expect(app.getState().lastAppliedSequence).toBe(1);
+  });
+});

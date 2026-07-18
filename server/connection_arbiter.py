@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import SnapshotHandshake
+from .contracts import CONTRACT_VERSION, SnapshotHandshake
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,8 @@ class ConnectionArbiter:
 
     def promote(self, handshake: SnapshotHandshake | dict[str, Any]) -> Connection:
         value = SnapshotHandshake.model_validate(handshake)
+        if value.contract_version != CONTRACT_VERSION:
+            raise ValueError(f"unsupported contract version: {value.contract_version}")
         if value.session_id != self.session_id or value.resume_token != self.resume_token:
             raise ValueError("session identity or resume token is invalid")
         if value.proposed_epoch <= self._epoch:

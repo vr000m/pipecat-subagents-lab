@@ -2,7 +2,7 @@
 
 import pytest
 
-from server.router import Router, RoutingValidationError, WorkerCatalogueEntry
+from server.router import Router, RoutingValidationError, WorkerCatalogue, WorkerCatalogueEntry
 
 
 class FakeRouterModel:
@@ -87,3 +87,25 @@ def test_router_rejects_unavailable_private_capability_even_when_topic_is_curren
 
     with pytest.raises((RoutingValidationError, ValueError)):
         Router(model=model).route("What is on my private calendar today?", catalogue())
+
+
+def test_router_allows_first_valid_new_worker_with_empty_catalogue() -> None:
+    empty = WorkerCatalogue("catalogue-empty", (), (), ())
+    model = FakeRouterModel(
+        decision_payload(
+            action="new_worker",
+            worker_id=None,
+            worker_type="web_search",
+            topic="news",
+            capability="public_web",
+            capability_available=True,
+            model_policy="deep",
+            catalogue_version="catalogue-empty",
+            catalogue_worker_ids=(),
+        )
+    )
+
+    decision = Router(model=model).route("Search the news", empty)
+
+    assert decision.action == "new_worker"
+    assert decision.worker_type == "web_search"

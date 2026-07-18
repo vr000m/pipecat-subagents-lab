@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "bun build --target browser --outfile dist/app.js src/app.js",
     "lint": "bun build --target browser --outfile /tmp/pipecat-subagents-lab-web-lint.js src/app.js"
   },
   "dependencies": {

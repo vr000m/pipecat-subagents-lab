@@ -4,6 +4,7 @@ import { createClientProtocol, validateServerMessage } from "../src/protocol.js"
 
 const appSource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8");
 const indexSource = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+const packageSource = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 test("browser entrypoint starts with microphone capture disabled", () => {
   expect(appSource).toContain("enableMic: false");
@@ -26,8 +27,12 @@ test("entrypoint requests a snapshot after connect and preserves Connect after f
 });
 
 test("page has no credential-bearing or server-diagnostic browser contract", () => {
-  expect(indexSource).toContain('src="./src/app.js"');
+  expect(indexSource).toContain('src="./dist/app.js"');
   expect(indexSource).not.toMatch(/api[_-]?key|secret|prompt|raw[_-]?logs/i);
+});
+
+test("browser entrypoint has a Bun build that bundles bare package imports", () => {
+  expect(packageSource.scripts.build).toBe("bun build --target browser --outfile dist/app.js src/app.js");
 });
 
 test("validates versioned RTVI messages and rejects private server fields", () => {

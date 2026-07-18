@@ -107,3 +107,31 @@ def test_snapshot_contains_authoritative_history_and_delivery_state_after_reconn
     assert snapshot.data["snapshot_sequence"] == 8
     assert snapshot.data["results"][0]["result_id"] == "result-1"
     assert snapshot.data["speech_progress"][0]["state"] == "interrupted_by_reconnect"
+
+
+def test_high_snapshot_sequence_keeps_envelope_and_following_events_monotonic() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-high", active_epoch=1)
+    publisher.client_ready(epoch=1)
+    publisher.set_snapshot(
+        RuntimeSnapshot(
+            contract_version="v1.0",
+            session_id="session-high",
+            snapshot_sequence=40,
+        )
+    )
+
+    snapshot = publisher.snapshot()
+    event = publisher.speech(
+        SpeechProgress(
+            result_id="result-1",
+            work_item_id="work-1",
+            run_id="run-1",
+            utterance_id="utt-1",
+            state=DeliveryState.STARTED,
+            origin_epoch=1,
+        ),
+        origin_epoch=1,
+    )
+
+    assert snapshot is not None and snapshot.sequence == 40
+    assert event is not None and event.sequence == 41

@@ -52,6 +52,10 @@ class RTVIMessagePublisher:
 
     def set_snapshot(self, snapshot: RuntimeSnapshot) -> None:
         self._snapshot = snapshot
+        # The snapshot sequence is the last state event represented by the
+        # snapshot.  Keep the envelope counter in the same namespace so the
+        # snapshot and all following incremental messages remain contiguous.
+        self._sequence = max(self._sequence, snapshot.snapshot_sequence - 1)
 
     def snapshot(self) -> RTVIMessage | None:
         if not self._ready:

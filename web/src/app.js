@@ -1,5 +1,6 @@
 import { PipecatClient } from "@pipecat-ai/client-js";
 import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
+import { validateServerMessage } from "./protocol.js";
 import { applyServerMessage, createInitialState } from "./state.js";
 import { render } from "./render.js";
 
@@ -32,7 +33,14 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     onConnected: () => { update({ ...state, connection: "connected" }); requestSnapshot(); },
     onDisconnected: () => update({ ...state, connection: "disconnected" }),
     onError: (message) => report(message?.data?.message || "The RTVI connection reported an error."),
-    onServerMessage: (message) => update(applyServerMessage(state, message, requestSnapshot)),
+    onServerMessage: (message) => {
+      const candidate = message?.data?.kind ? message.data : message;
+      if (!validateServerMessage(candidate)) {
+        report("Ignored malformed or unsupported server message.");
+        return;
+      }
+      update(applyServerMessage(state, candidate, requestSnapshot));
+    },
     onTrackStarted: attachTrack,
     onTrackStopped: detachTrack,
     onUserTranscript: (data) => update({ ...state, transcript: [...state.transcript, { role: "user", ...data }] }),

@@ -42,6 +42,19 @@ def test_replay_gets_a_new_utterance_id() -> None:
     assert replay.text == "answer"
 
 
+def test_pause_preserves_paused_state_and_resume_records_resumed_transition() -> None:
+    scheduler = SpeechScheduler(SessionState())
+    first = enqueue(scheduler, "work-1", "answer")
+    asyncio.run(scheduler.start_next())
+
+    scheduler.pause("work-1")
+    assert scheduler.active is None
+    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.PAUSED
+
+    replay = scheduler.resume(first)
+    assert scheduler.state.speech[replay.utterance_id].state == DeliveryState.RESUMED
+
+
 def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
     async def run() -> None:
         scheduler = SpeechScheduler(SessionState())

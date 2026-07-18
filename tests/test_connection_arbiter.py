@@ -36,6 +36,13 @@ def test_handshake_requires_durable_identity_and_monotonic_epoch() -> None:
         arbiter.promote(handshake(2))
 
 
+def test_handshake_rejects_unsupported_contract_version_at_boundary() -> None:
+    arbiter = ConnectionArbiter(session_id="session-1", resume_token="resume-1")
+
+    with pytest.raises(ValueError, match="unsupported contract version"):
+        arbiter.promote({**handshake(1), "contract_version": "v2.0"})
+
+
 def test_stale_callbacks_are_rejected_at_the_state_boundary() -> None:
     arbiter = ConnectionArbiter(session_id="session-1", resume_token="resume-1")
     arbiter.promote(handshake(1))

@@ -65,6 +65,10 @@ def validate_decision(decision: RoutingDecision, catalogue: WorkerCatalogue) -> 
     if decision.action == "new_worker":
         if decision.worker_id is not None and decision.worker_id in catalogue.worker_ids:
             raise RoutingValidationError("new-worker proposals cannot select an existing worker")
+        if not catalogue.workers:
+            if not decision.capability or not decision.capability_available:
+                raise RoutingValidationError("first worker must request an available capability")
+            return decision
         worker_types = {entry.worker_type for entry in catalogue.workers}
         if worker_types and decision.worker_type not in worker_types:
             raise RoutingValidationError("new worker type is not allowlisted")
