@@ -1,13 +1,19 @@
 """HTTP entry-point tests for the local Small WebRTC server."""
 
+import asyncio
+
 from fastapi.testclient import TestClient
 
+import server.app as app_module
+from server.contracts import GroundedResult
 from server.app import create_app
 from server.config import Config
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
+from server.router import LazyRouterProvider, Router
 from server.services.stt import LocalSTT
 from server.services.tts import LocalTTS
+from server.work_item_coordinator import WorkItemCoordinator
 
 
 class FakeRunner:
@@ -16,6 +22,84 @@ class FakeRunner:
 
     async def stop(self) -> None:
         pass
+
+
+class FakeRouterModel:
+    tools: tuple[()] = ()
+
+    def structured_output(self, *, transcript: str, catalogue: tuple[object, ...]) -> dict:
+        assert transcript == "Search today's news"
+        assert catalogue == ()
+        return {
+            "action": "new_worker",
+            "worker_id": None,
+            "worker_type": "web_search",
+            "topic": "news",
+            "capability": "public_web",
+            "capability_available": True,
+            "model_policy": "deep",
+            "catalogue_version": "catalogue-0",
+            "catalogue_worker_ids": (),
+        }
+
+
+class FakeSearchWorker:
+    capabilities = {"public_web": True}
+
+    def __init__(self, worker_id: str) -> None:
+        self.worker_id = worker_id
+        self.calls: list[tuple[str, str, int | None]] = []
+
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+        self.calls.append((query, turn_id, origin_epoch))
+        return GroundedResult(
+            result_id="result-news",
+            worker_id=self.worker_id,
+            turn_id=turn_id,
+            text="News result",
+            spoken_text="News result",
+            ui_text="News result",
+            origin_epoch=origin_epoch,
+        )
+
+
+def test_default_host_has_lazy_router_and_real_coordinator(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "load_config", lambda: Config())
+
+    host = app_module._default_session_host()
+
+    assert isinstance(host.coordinator, WorkItemCoordinator)
+    assert host.coordinator.registry is host.registry
+    assert isinstance(host.coordinator.router, Router)
+    assert isinstance(host.coordinator.router._call, LazyRouterProvider)
+    assert repr(host.coordinator.router._call) == "LazyRouterProvider(initialized=False)"
+
+
+def test_default_host_dispatches_through_an_injected_router(monkeypatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(app_module, "load_config", lambda: Config())
+        host = app_module._default_session_host(router=Router(model=FakeRouterModel()))
+        worker = FakeSearchWorker("worker-1")
+        host.registry.worker_factory = lambda _worker_id: worker
+        host.runner_factory = FakeRunner
+        await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+
+        result = await host._handle_transcript("Search today's news")
+
+        assert result.result_id == "result-news"
+        assert worker.calls == [("Search today's news", "turn-1", 1)]
+        assert host.state.result_history("worker-1") == (result,)
+        assert host.state.speech == {}
+        await host.shutdown()
+
+    asyncio.run(run())
 
 
 def test_default_app_host_materializes_configured_local_speech_adapters(

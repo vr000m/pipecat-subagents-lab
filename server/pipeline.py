@@ -7,6 +7,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from .connection_arbiter import ConnectionArbiter
@@ -199,6 +200,7 @@ class SessionHost:
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
         self.coordinator = coordinator
+        self._tts_on_event = getattr(tts, "on_event", None)
         self.runner: Any = None
         self._runner_handles: dict[str, Any] = {}
         self._runner_registered: set[str] = set()
@@ -260,13 +262,51 @@ class SessionHost:
         old_connection = self.connection
         # Publish the new authority before awaiting any old transport cleanup.
         self.state.active_epoch = connection.epoch
+        pipeline: ConnectionPipeline
+
+        async def queue_speech(item: Any) -> None:
+            if (
+                self.tts is None
+                or self.connection is not pipeline
+                or not pipeline.active
+                or item.origin_epoch != pipeline.epoch
+                or not self.accepts(pipeline.epoch)
+            ):
+                raise RuntimeError("speech target is not the active TTS connection")
+            if pipeline.worker is None:
+                raise RuntimeError("active connection has no Pipecat worker for TTS")
+            await pipeline.worker.queue_frame(
+                TTSSpeakFrame(text=item.text, append_to_context=False)
+            )
+
         pipeline = ConnectionPipeline(
             connection.epoch,
             RuntimeObserver(self.state, connection.epoch),
-            SpeechScheduler(self.state),
+            SpeechScheduler(self.state, speak=queue_speech if self.tts is not None else None),
         )
         if self.stt is not None and self.coordinator is not None:
             self.stt.on_final = self._handle_transcript
+        if self.tts is not None and hasattr(self.tts, "on_event"):
+
+            async def on_tts_event(event: str, context_id: str) -> Any:
+                callback_result = None
+                if self._tts_on_event is not None:
+                    callback_result = self._tts_on_event(event, context_id)
+                    if inspect.isawaitable(callback_result):
+                        callback_result = await callback_result
+                if (
+                    event == "synthesis_ended"
+                    and self.connection is pipeline
+                    and pipeline.active
+                    and pipeline.scheduler.active is not None
+                ):
+                    # Pipecat 1.4.0 creates its own TTSSpeakFrame context ID.
+                    # The scheduler's one-active-lease invariant is the only
+                    # correlation available without claiming playout completion.
+                    pipeline.scheduler.synthesis_ended(pipeline.scheduler.active.item.utterance_id)
+                return callback_result
+
+            self.tts.on_event = on_tts_event
         self.connection = pipeline
         if old_connection is not None:
             await old_connection.shutdown()
@@ -277,7 +317,11 @@ class SessionHost:
         """Route a final local-STT turn through the application coordinator."""
         if self.coordinator is None or self.connection is None:
             return transcript
-        outcome = self.coordinator.arbitrate(self.state.session_id, transcript)
+        origin = self.connection
+        origin_epoch = origin.epoch
+        outcome = await asyncio.to_thread(
+            self.coordinator.arbitrate, self.state.session_id, transcript
+        )
         if outcome.kind != "routed" or outcome.decision is None:
             return outcome
         worker = self.coordinator.dispatch(outcome.decision)
@@ -289,16 +333,24 @@ class SessionHost:
         result = await search(
             transcript,
             turn_id=f"turn-{self.state.sequence + 1}",
-            origin_epoch=self.connection.epoch,
+            origin_epoch=origin_epoch,
         )
-        self.state.append_result(result, origin_epoch=self.connection.epoch)
-        self.connection.scheduler.enqueue(
+        self.state.append_result(result, origin_epoch=origin_epoch)
+        if (
+            self.tts is None
+            or self.connection is not origin
+            or not origin.active
+            or not self.accepts(origin_epoch)
+        ):
+            return result
+        origin.scheduler.enqueue(
             result_id=result.result_id,
             work_item_id=f"work-{result.turn_id}",
             run_id=f"run-{result.turn_id}",
             text=result.spoken_text,
-            origin_epoch=self.connection.epoch,
+            origin_epoch=origin_epoch,
         )
+        await origin.scheduler.start_next()
         return result
 
     def session_handshake(self) -> dict[str, Any]:

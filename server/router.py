@@ -1,9 +1,14 @@
 """Tool-free routing and snapshot-bound policy validation."""
 
 from __future__ import annotations
+
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+
 from pydantic import BaseModel, ConfigDict
+
+from .config import Config
 from .contracts import RoutingDecision
 
 
@@ -15,6 +20,70 @@ class RouterEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: RoutingDecision
     prose: str | None = None
+
+
+def _response_text(response: Any) -> str:
+    if isinstance(response, Mapping):
+        value = response.get("output_text")
+    else:
+        value = getattr(response, "output_text", None)
+    if isinstance(value, str) and value:
+        return value
+    raise RoutingValidationError("router provider returned no structured output")
+
+
+class LazyRouterProvider:
+    """Create the configured Responses provider only when routing is first used."""
+
+    def __init__(
+        self,
+        config: Config,
+        responses_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        self._config = config
+        self._responses_factory = responses_factory
+        self._responses: Any = None
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(initialized={self._responses is not None})"
+
+    def _get_responses(self) -> Any:
+        if self._responses is not None:
+            return self._responses
+        if self._responses_factory is not None:
+            self._responses = self._responses_factory()
+            return self._responses
+        if not self._config.openai_api_key:
+            raise RuntimeError(
+                "router provider is unavailable; configure an OpenAI credential "
+                "or inject a router provider"
+            )
+        from openai import OpenAI
+
+        self._responses = OpenAI(api_key=self._config.openai_api_key).responses
+        return self._responses
+
+    def __call__(self, prompt: str) -> dict[str, Any]:
+        response = self._get_responses().create(
+            model=self._config.resolve_router_model("fast"),
+            input=prompt,
+            store=False,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "router_envelope",
+                    "strict": True,
+                    "schema": RouterEnvelope.model_json_schema(),
+                }
+            },
+        )
+        try:
+            payload = json.loads(_response_text(response))
+        except json.JSONDecodeError as exc:
+            raise RoutingValidationError("router provider returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RoutingValidationError("router provider returned a non-object envelope")
+        return payload
 
 
 @dataclass(frozen=True)

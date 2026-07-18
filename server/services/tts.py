@@ -81,10 +81,14 @@ class LocalTTS(TTSService):
                 result = connect()
                 if inspect.isawaitable(result):
                     await result
+        # Keep a connection-bound callback stable for this synthesis. A reconnect
+        # may install a callback for the replacement scheduler while this
+        # generator is still draining.
+        on_event = self.on_event
         await self._client.append(text)
         await self._client.commit()
-        if self.on_event is not None:
-            result = self.on_event("synthesis_started", context_id)
+        if on_event is not None:
+            result = on_event("synthesis_started", context_id)
             if inspect.isawaitable(result):
                 await result
         yield TTSStartedFrame(context_id=context_id)
@@ -99,8 +103,8 @@ class LocalTTS(TTSService):
                     num_channels=1,
                 )
             elif kind.endswith("audio.done") or kind.endswith("cancelled"):
-                if self.on_event is not None:
-                    result = self.on_event("synthesis_ended", context_id)
+                if on_event is not None:
+                    result = on_event("synthesis_ended", context_id)
                     if inspect.isawaitable(result):
                         await result
                 yield TTSStoppedFrame(context_id=context_id)

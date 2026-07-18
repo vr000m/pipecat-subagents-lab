@@ -4,12 +4,179 @@ import asyncio
 
 import pytest
 from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.processors.frame_processor import FrameDirection
 
 import server.app as app_module
 from server.contracts import GroundedResult, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
+
+
+class RoutedCoordinator:
+    def __init__(self, worker: object) -> None:
+        self.worker = worker
+
+    def arbitrate(self, _session_id: str, transcript: str) -> object:
+        return type(
+            "Outcome",
+            (),
+            {"kind": "routed", "decision": object(), "transcript": transcript},
+        )()
+
+    def dispatch(self, _decision: object) -> object:
+        return self.worker
+
+
+class ResultWorker:
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+        return GroundedResult(
+            result_id=f"result-{turn_id}",
+            worker_id="worker-search",
+            turn_id=turn_id,
+            text=f"Answer for {query}",
+            spoken_text=f"Answer for {query}",
+            ui_text=f"Answer for {query}",
+            origin_epoch=origin_epoch,
+        )
+
+
+class BlockingResultWorker(ResultWorker):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.origin_epochs: list[int | None] = []
+
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+        self.origin_epochs.append(origin_epoch)
+        self.started.set()
+        await self.release.wait()
+        return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+
+class FakeTTS:
+    def __init__(self) -> None:
+        self.on_event = None
+
+
+class QueueingPipelineWorker:
+    def __init__(self) -> None:
+        self.frames: list[object] = []
+
+    async def queue_frame(self, frame: object) -> None:
+        self.frames.append(frame)
+
+    async def cancel(self, *, reason: str) -> None:
+        assert reason in {"connection replaced", "session shutdown"}
+
+
+class LifecycleRunner:
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+
+def connection_handshake(host: SessionHost, epoch: int) -> dict[str, object]:
+    return {
+        "session_id": host.state.session_id,
+        "resume_token": host.state.resume_token,
+        "proposed_epoch": epoch,
+        "snapshot_sequence": 0,
+    }
+
+
+def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        worker = QueueingPipelineWorker()
+        connection.worker = worker
+        start_next = connection.scheduler.start_next
+        start_calls = 0
+
+        async def tracked_start_next() -> object:
+            nonlocal start_calls
+            start_calls += 1
+            return await start_next()
+
+        connection.scheduler.start_next = tracked_start_next  # type: ignore[method-assign]
+
+        result = await host._handle_transcript("Riga weather")
+
+        assert start_calls == 1
+        assert len(worker.frames) == 1
+        assert isinstance(worker.frames[0], TTSSpeakFrame)
+        assert worker.frames[0].text == result.spoken_text
+        assert worker.frames[0].append_to_context is False
+        assert connection.scheduler.active is not None
+
+        await tts.on_event("synthesis_ended", "pipecat-generated-context")
+        progress = host.state.speech[connection.scheduler.active.item.utterance_id]
+        assert progress.state.value == "synthesis_ended"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_reconnect_while_search_is_blocked_keeps_late_result_history_only() -> None:
+    async def run() -> None:
+        search = BlockingResultWorker()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=RoutedCoordinator(search),
+        )
+        first = await host.connect(connection_handshake(host, 1))
+        first_worker = QueueingPipelineWorker()
+        first.worker = first_worker
+        pending = asyncio.create_task(host._handle_transcript("old request"))
+        await asyncio.wait_for(search.started.wait(), timeout=1)
+
+        second = await host.connect(connection_handshake(host, 2))
+        second_worker = QueueingPipelineWorker()
+        second.worker = second_worker
+        search.release.set()
+        result = await asyncio.wait_for(pending, timeout=1)
+
+        assert search.origin_epochs == [1]
+        assert result.origin_epoch == 1
+        assert host.state.result_history("worker-search") == (result,)
+        assert host.state.workers.get("worker-search") is None
+        assert first_worker.frames == []
+        assert second_worker.frames == []
+        assert first.scheduler._queues == {}
+        assert second.scheduler._queues == {}
+        assert host.state.speech == {}
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_successful_result_without_tts_is_history_only() -> None:
+    async def run() -> None:
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+
+        result = await host._handle_transcript("text only")
+
+        assert host.state.result_history("worker-search") == (result,)
+        assert connection.worker.frames == []
+        assert connection.scheduler._queues == {}
+        assert host.state.speech == {}
+        await host.shutdown()
+
+    asyncio.run(run())
 
 
 class AsyncCancelRunner:

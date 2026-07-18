@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -27,8 +27,10 @@ from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .rtvi_messages import RTVIMessagePublisher
 from .registry import WorkerRegistry
+from .router import LazyRouterProvider, Router
 from .services.stt import LocalSTT, STTEndpoint
 from .services.tts import LocalTTS, TTSEndpoint
+from .work_item_coordinator import WorkItemCoordinator
 
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -135,13 +137,26 @@ async def _attach_connection(
             await attached
 
 
-def _default_session_host() -> SessionHost:
-    """Build the default host from endpoint settings without wiring secrets to adapters."""
+def _default_session_host(
+    *,
+    router: Router | None = None,
+    router_responses_factory: Callable[[], Any] | None = None,
+) -> SessionHost:
+    """Build the default host while keeping credentialed providers lazy."""
     config = load_config()
     registry = WorkerRegistry(config=config)
+    configured_router = router or Router(
+        call=LazyRouterProvider(config, router_responses_factory),
+        config=config,
+    )
+    coordinator = WorkItemCoordinator(
+        registry=registry,
+        router=configured_router,
+        config=config,
+    )
     stt = LocalSTT(STTEndpoint(*config.stt_endpoint)) if config.stt_endpoint else None
     tts = LocalTTS(TTSEndpoint(*config.tts_endpoint)) if config.tts_endpoint else None
-    return SessionHost(registry=registry, stt=stt, tts=tts)
+    return SessionHost(registry=registry, stt=stt, tts=tts, coordinator=coordinator)
 
 
 def create_app(host: SessionHost | None = None) -> FastAPI:

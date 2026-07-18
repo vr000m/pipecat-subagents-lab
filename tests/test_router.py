@@ -1,8 +1,17 @@
 """Routing is tool-free and bound to one immutable catalogue snapshot."""
 
+import json
+
 import pytest
 
-from server.router import Router, RoutingValidationError, WorkerCatalogue, WorkerCatalogueEntry
+from server.config import Config
+from server.router import (
+    LazyRouterProvider,
+    Router,
+    RoutingValidationError,
+    WorkerCatalogue,
+    WorkerCatalogueEntry,
+)
 
 
 class FakeRouterModel:
@@ -44,6 +53,35 @@ def decision_payload(**overrides: object) -> dict:
     }
     payload.update(overrides)
     return payload
+
+
+def test_lazy_router_provider_defers_credentials_and_provider_creation_until_route() -> None:
+    calls: list[dict] = []
+
+    class FakeResponses:
+        def create(self, **kwargs: object) -> dict[str, str]:
+            calls.append(kwargs)
+            return {"output_text": json.dumps({"decision": decision_payload()})}
+
+    factory_calls = 0
+
+    def factory() -> FakeResponses:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FakeResponses()
+
+    provider = LazyRouterProvider(Config(openai_api_key="must-not-appear"), factory)
+    router = Router(call=provider)
+
+    assert factory_calls == 0
+    assert "must-not-appear" not in repr(provider)
+    decision = router.route("What is the weather in Riga?", catalogue())
+
+    assert decision.worker_id == "worker-weather"
+    assert factory_calls == 1
+    assert calls[0]["model"] == "gpt-4o-mini"
+    assert calls[0]["store"] is False
+    assert "tools" not in calls[0]
 
 
 def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validation() -> None:
