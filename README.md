@@ -4,6 +4,88 @@ Experimental Pipecat-native voice assistants with persistent specialist subagent
 
 The first experiment will route requests through a tool-free main model to persistent context-owning subagents, speak concise answers through a local TTS server, and render structured web-search results plus interruption state in a plain browser client. Electron packaging is deferred until the browser protocol and interaction model are proven.
 
+## Local runbook
+
+This repository is the browser-first verification slice. It keeps the Python
+session, worker contexts, result history, and connection epoch alive in one
+process; the browser is a plain RTVI client. Electron packaging is deliberately
+out of scope until these contracts have evidence behind them.
+
+### Environment and local services
+
+Load credentials in the shell from `~/.secrets/ai.env` (or provide an
+equivalent environment file) without copying secret values into this
+repository. The only credential used by the hosted-search worker is the
+variable named by `WEBSEARCH_OPENAI_API_KEY_ENV`, defaulting to
+`OPENAI_API_KEY`. The authenticated hosted-search smoke test is opt-in and
+must be kept separate from the credential-free test suite.
+
+Configure the already-running local services with transport-qualified
+endpoints; discovery must not assume UDS or TCP:
+
+```sh
+export WEBSEARCH_STT_ENDPOINT=uds:///path/to/stt.sock
+export WEBSEARCH_TTS_ENDPOINT=uds:///path/to/tts.sock
+```
+
+The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
+Run the values-redacted preflight before connecting a browser. It health-checks
+both services, records the discovered transport/address for the adapters, and
+reports OpenAI capability as `available`, `unavailable`, or `unconfirmed`
+without printing the credential.
+
+### Verification commands
+
+From the repository root:
+
+```sh
+uv sync
+uv run pytest
+uv run ruff format --check .
+uv run ruff check .
+cd web
+bun install
+bun test
+bun run lint
+```
+
+The required integrated test is `tests/integration/test_browser_session.py`.
+It uses fake model/provider boundaries and proves the routing matrix, same-topic
+context persistence, unrelated-worker isolation, citation normalization,
+canonical speech/UI identity, result-before-speech ordering, interruption on
+connection replacement, stale-epoch fencing, and snapshot reconstruction. It
+does not call paid APIs or require live STT/TTS services.
+
+### Browser and media acceptance
+
+Start the reviewed application host and the browser client using the local
+Pipecat/Small WebRTC server configuration for the checkout. Connect only after
+the page is open, then explicitly enable the microphone; page initialization
+and connection must not acquire microphone media. Confirm a final transcript,
+local TTS synthesis, and audible browser output. Disconnecting must disable
+capture. If autoplay is blocked, use the page's audio action and record that
+diagnostic as local browser state.
+
+On reconnect, the server-issued `session_id`, resume token, and proposed epoch
+fence the replacement transport. The replacement receives a fresh snapshot of
+workers, the complete per-worker Result Log, and delivery outcomes. Older
+transport callbacks are rejected. Result text may appear before speech; the UI
+marks server transport completion separately from incomplete or unconfirmed
+speech and never claims verified browser audibility.
+
+### Boundaries and diagnostics
+
+Pipecat logs are the authoritative diagnostic record. Browser state is a
+versioned product/debug projection and intentionally excludes raw logs, full
+prompts, and private worker context. Source links are normalized to absolute
+HTTP(S) URLs and open with `target="_blank" rel="noopener noreferrer"`.
+
+The paid OpenAI web-search smoke test and the local STT/TTS/Small WebRTC media
+acceptance are environment-dependent. Report them separately from the
+credential-safe unit and integration tests. Any semantic protocol change found
+during verification must return to the earlier contract/runtime/browser phases;
+Phase 5 documentation does not silently change those contracts.
+
 ## Planned layout
 
 ```text
