@@ -9,6 +9,14 @@ export function validateServerMessage(message) {
   if (!Number.isInteger(message.sequence) || message.sequence < 0) return false;
   const data = message.data;
   if (!data || typeof data !== "object") return false;
+  if (message.kind === "runtime_snapshot") {
+    if (typeof data.session_id !== "string" || data.session_id.length === 0) return false;
+    if (message.session_id !== undefined && message.session_id !== data.session_id) return false;
+    if (!Number.isInteger(data.snapshot_sequence) || data.snapshot_sequence < 0) return false;
+    if (!Array.isArray(data.workers) || !Array.isArray(data.results) || !Array.isArray(data.speech_progress)) {
+      return false;
+    }
+  }
   return !forbidden.some((field) => Object.prototype.hasOwnProperty.call(data, field));
 }
 

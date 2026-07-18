@@ -43,6 +43,41 @@ test("validates versioned RTVI messages and rejects private server fields", () =
   expect(validateServerMessage({ contract_version: "v2.0", kind: "result", sequence: 99, data: {} })).toBe(false);
 });
 
+test("requires complete runtime snapshots and preserves state on malformed snapshots", async () => {
+  const states = [];
+  const protocol = createClientProtocol({ requestSnapshot: () => {}, onState: (state) => states.push(state) });
+
+  await protocol.receive({ kind: "client-ready" });
+  const validSnapshot = {
+    contract_version: "v1.0",
+    kind: "runtime_snapshot",
+    sequence: 1,
+    session_id: "session-1",
+    data: { session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [] },
+  };
+  await protocol.receive(validSnapshot);
+  const beforeMalformed = protocol.getState();
+
+  expect(validateServerMessage({ ...validSnapshot, data: {} })).toBe(false);
+  expect(validateServerMessage({ ...validSnapshot, data: { ...validSnapshot.data, results: {} } })).toBe(false);
+  expect(validateServerMessage({ ...validSnapshot, session_id: "other" })).toBe(false);
+  await protocol.receive({ ...validSnapshot, sequence: 2, data: {} });
+
+  expect(protocol.getState()).toBe(beforeMalformed);
+  expect(protocol.getState().lastAppliedSequence).toBe(1);
+  expect(states).toHaveLength(1);
+});
+
+test("accepts a complete runtime snapshot with an envelope session id", () => {
+  expect(validateServerMessage({
+    contract_version: "v1.0",
+    kind: "runtime_snapshot",
+    sequence: 3,
+    session_id: "session-1",
+    data: { session_id: "session-1", snapshot_sequence: 3, workers: [], results: [], speech_progress: [] },
+  })).toBe(true);
+});
+
 test("rejects an unsupported contract before it advances sequence state", async () => {
   const protocol = createClientProtocol({ requestSnapshot: () => {} });
 

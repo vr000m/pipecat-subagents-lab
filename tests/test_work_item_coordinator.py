@@ -90,6 +90,31 @@ def test_timeout_boundary_completion_is_retained_after_wait_returns_stale_done_s
     asyncio.run(run())
 
 
+def test_immediate_worker_failure_is_retained_without_reordering_successes() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=3, wait_timeout_ms=100)
+
+        async def worker(worker_id: str, text: str) -> dict:
+            if text == "fail":
+                raise ValueError("provider detail should not be exposed")
+            return {"text": text, "citations": []}
+
+        outcome = await coordinator.submit(
+            "turn-failure",
+            [("worker-a", "first"), ("worker-b", "fail"), ("worker-c", "last")],
+            worker,
+        )
+
+        assert [result.text for result in outcome.results] == ["first", "last"]
+        assert len(outcome.failures) == 1
+        assert outcome.failures[0].work_item_id == "turn-failure-1"
+        assert outcome.failures[0].worker_id == "worker-b"
+        assert outcome.failures[0].error_type == "ValueError"
+        assert outcome.failures[0].error_message == "worker execution failed"
+
+    asyncio.run(run())
+
+
 def test_timed_out_result_is_drained_once_after_pending_worker_finishes() -> None:
     async def run() -> None:
         coordinator = WorkItemCoordinator(max_work_items_per_turn=2, wait_timeout_ms=1)

@@ -37,6 +37,15 @@ class SubmittedOutcome:
     work_items: tuple[Any, ...]
     results: tuple[Any, ...]
     pending_work_item_ids: tuple[str, ...] = ()
+    failures: tuple["WorkItemFailure", ...] = ()
+
+
+@dataclass(frozen=True)
+class WorkItemFailure:
+    work_item_id: str
+    worker_id: str
+    error_type: str
+    error_message: str
 
 
 @dataclass(frozen=True)
@@ -209,6 +218,16 @@ class WorkItemCoordinator:
             task.result() for task in tasks if task in done and task.exception() is None
         )
         results = tuple(materialize_result(value) for value in raw_results)
+        failures = tuple(
+            WorkItemFailure(
+                work_item_id=work[i].work_item_id,
+                worker_id=selected[i][0],
+                error_type=type(task.exception()).__name__,
+                error_message="worker execution failed",
+            )
+            for i, task in enumerate(tasks)
+            if task in done and task.exception() is not None
+        )
         pending_ids = tuple(
             work[i].work_item_id for i, task in enumerate(tasks) if task not in done
         )
@@ -219,4 +238,4 @@ class WorkItemCoordinator:
                         completed, work[i].work_item_id, selected[i][0]
                     )
                 )
-        return SubmittedOutcome(work, results, pending_ids)
+        return SubmittedOutcome(work, results, pending_ids, failures)
