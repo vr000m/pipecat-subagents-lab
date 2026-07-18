@@ -95,6 +95,17 @@ class WebSearchWorker(ContextWorker):
         normalized = " ".join(query.strip().split())
         return normalized.split("refined:", 1)[0].rstrip(" ;")[:2000]
 
+    def _contextual_input(self, query: str) -> str:
+        if not self.history:
+            return query
+        previous = self.history[-4:]
+        context = "\n".join(
+            f"Previous query: {entry.get('query', '')}\n"
+            f"Previous answer: {entry.get('text', '')[:1200]}"
+            for entry in previous
+        )
+        return f"Use this prior topic context when useful:\n{context}\nCurrent request: {query}"
+
     async def search(
         self, query: str, *, turn_id: str, origin_epoch: int | None = None
     ) -> GroundedResult:
@@ -105,7 +116,7 @@ class WebSearchWorker(ContextWorker):
         kwargs = {
             "model": self.model,
             "tools": [{"type": "web_search"}],
-            "input": refined,
+            "input": self._contextual_input(refined),
             "store": False,
         }
         self.requests.append(kwargs.copy())
@@ -131,7 +142,9 @@ class WebSearchWorker(ContextWorker):
             citations=_response_citations(response),
             origin_epoch=origin_epoch,
         )
-        self.append_context({"turn_id": turn_id, "query": refined, "result_id": result.result_id})
+        self.append_context(
+            {"turn_id": turn_id, "query": refined, "text": text, "result_id": result.result_id}
+        )
         return result
 
     async def run(self, query: Any) -> Any:

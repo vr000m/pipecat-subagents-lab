@@ -7,6 +7,7 @@ closed instead of claiming that toggling a flag produced live audio.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 import inspect
 from dataclasses import dataclass
@@ -60,11 +61,14 @@ class LocalSTT(SegmentedSTTService):
         self._client = None
         await super().cleanup()
 
-    async def handle_final_transcript(self, text: str) -> Any:
+    async def handle_final_transcript(
+        self, text: str, callback: Callable[[str], Any] | None = None
+    ) -> Any:
         if not self.started:
             raise RuntimeError("STT service is not started")
-        if self.on_final is not None:
-            result = self.on_final(text)
+        handler = callback if callback is not None else self.on_final
+        if handler is not None:
+            result = handler(text)
             if inspect.isawaitable(result):
                 return await result
             return result
@@ -78,6 +82,7 @@ class LocalSTT(SegmentedSTTService):
                 "local STT wire client is unavailable; inject the verified "
                 "pipecat-local-stt-server client factory before running audio"
             )
+        on_final = self.on_final
         if self._client is None:
             self._client = self.client_factory(self.endpoint)
             connect = getattr(self._client, "connect", None)
@@ -91,8 +96,9 @@ class LocalSTT(SegmentedSTTService):
             if event.get("type", "").endswith("transcription.completed"):
                 text = event.get("transcript") or ""
                 if text:
-                    await self.handle_final_transcript(text)
                     yield TranscriptionFrame(text, "", "")
+                    if on_final is not None:
+                        asyncio.create_task(self.handle_final_transcript(text, on_final))
                 return
             if event.get("type") == "error":
                 yield ErrorFrame(f"local STT error: {event.get('message', event)}")

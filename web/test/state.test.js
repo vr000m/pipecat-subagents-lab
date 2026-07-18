@@ -232,4 +232,21 @@ describe("server-authoritative runtime reducer", () => {
     expect(mismatched.results).toEqual([]);
     expect(accepted.results.map(({ result_id }) => result_id)).toEqual(["current-epoch"]);
   });
+
+  test("rejects a lower-epoch snapshot even when its sequence is newer", () => {
+    let state = applyServerMessage(createInitialState(), {
+      ...snapshot(1),
+      origin_epoch: 2,
+      data: { ...snapshot(1).data, origin_epoch: 2 },
+    });
+    const stale = applyServerMessage(state, {
+      ...snapshot(2, [result("stale-snapshot")]),
+      origin_epoch: 1,
+      data: { ...snapshot(2).data, origin_epoch: 1, results: [result("stale-snapshot")] },
+    });
+
+    expect(stale.connectionEpoch).toBe(2);
+    expect(stale.results).toEqual([]);
+    expect(stale.lastAppliedSequence).toBe(1);
+  });
 });

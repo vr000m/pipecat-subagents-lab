@@ -22,6 +22,20 @@ class RouterEnvelope(BaseModel):
     prose: str | None = None
 
 
+def _strict_json_schema(value: Any) -> Any:
+    """Normalize Pydantic's nullable defaults for strict structured outputs."""
+    if isinstance(value, list):
+        return [_strict_json_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: _strict_json_schema(item) for key, item in value.items()}
+    properties = result.get("properties")
+    if isinstance(properties, dict):
+        result["required"] = list(properties)
+    result.pop("default", None)
+    return result
+
+
 def _response_text(response: Any) -> str:
     if isinstance(response, Mapping):
         value = response.get("output_text")
@@ -73,7 +87,7 @@ class LazyRouterProvider:
                     "type": "json_schema",
                     "name": "router_envelope",
                     "strict": True,
-                    "schema": RouterEnvelope.model_json_schema(),
+                    "schema": _strict_json_schema(RouterEnvelope.model_json_schema()),
                 }
             },
         )

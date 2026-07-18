@@ -287,7 +287,13 @@ class SessionHost:
             SpeechScheduler(self.state, speak=queue_speech if self.tts is not None else None),
         )
         if self.stt is not None and self.coordinator is not None:
-            self.stt.on_final = self._handle_transcript
+
+            async def on_final(text: str) -> Any:
+                if self.connection is not pipeline or not pipeline.active:
+                    return None
+                return await self._handle_transcript(text, origin=pipeline)
+
+            self.stt.on_final = on_final
         if self.tts is not None and hasattr(self.tts, "on_event"):
 
             async def on_tts_event(event: str, context_id: str) -> Any:
@@ -343,11 +349,19 @@ class SessionHost:
         await self._register_persistent_workers()
         return pipeline
 
-    async def _handle_transcript(self, transcript: str) -> Any:
+    async def _handle_transcript(
+        self, transcript: str, *, origin: ConnectionPipeline | None = None
+    ) -> Any:
         """Route a final local-STT turn through the application coordinator."""
-        if self.coordinator is None or self.connection is None:
+        origin = origin or self.connection
+        if (
+            self.coordinator is None
+            or origin is None
+            or self.connection is not origin
+            or not origin.active
+            or not self.accepts(origin.epoch)
+        ):
             return transcript
-        origin = self.connection
         origin_epoch = origin.epoch
         outcome = await asyncio.to_thread(
             self.coordinator.arbitrate, self.state.session_id, transcript

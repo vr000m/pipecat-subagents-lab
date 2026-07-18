@@ -83,6 +83,21 @@ def test_lazy_router_provider_defers_credentials_and_provider_creation_until_rou
     assert calls[0]["store"] is False
     assert "tools" not in calls[0]
 
+    schema = calls[0]["text"]["format"]["schema"]
+
+    def assert_strict_objects(value: object) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get("properties"), dict):
+                assert value["required"] == list(value["properties"])
+                assert "default" not in value
+            for child in value.values():
+                assert_strict_objects(child)
+        elif isinstance(value, list):
+            for child in value:
+                assert_strict_objects(child)
+
+    assert_strict_objects(schema)
+
 
 def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validation() -> None:
     model = FakeRouterModel(decision_payload())

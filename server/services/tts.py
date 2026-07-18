@@ -39,6 +39,22 @@ class LocalTTS(TTSService):
         self._client: Any = None
         self.started = False
 
+    async def connect(self) -> int:
+        """Connect once and adopt the rate advertised by the local server."""
+        if self._client is not None:
+            return self.sample_rate
+        if self.client_factory is None:
+            raise RuntimeError("local TTS wire client is unavailable")
+        self._client = self.client_factory(self.endpoint)
+        connect = getattr(self._client, "connect", None)
+        hello = connect() if connect is not None else None
+        if inspect.isawaitable(hello):
+            hello = await hello
+        rate = (hello or {}).get("audio", {}).get("rate") if isinstance(hello, dict) else None
+        if isinstance(rate, int) and rate > 0:
+            self._sample_rate = rate
+        return self.sample_rate
+
     async def start(self, frame: Any = None) -> None:
         if frame is not None:
             await super().start(frame)
@@ -76,13 +92,7 @@ class LocalTTS(TTSService):
                 "local TTS wire client is unavailable; inject the verified "
                 "pipecat-local-tts-server client factory before running audio"
             )
-        if self._client is None:
-            self._client = self.client_factory(self.endpoint)
-            connect = getattr(self._client, "connect", None)
-            if connect is not None:
-                result = connect()
-                if inspect.isawaitable(result):
-                    await result
+        await self.connect()
         # Keep a connection-bound callback stable for this synthesis. A reconnect
         # may install a callback for the replacement scheduler while this
         # generator is still draining.
@@ -113,4 +123,8 @@ class LocalTTS(TTSService):
                 return
             elif kind in {"error", "response.failed"}:
                 message = str(event.get("message") or event.get("error") or "provider error")
+                if on_event is not None:
+                    result = on_event("delivery_unknown", context_id)
+                    if inspect.isawaitable(result):
+                        await result
                 raise RuntimeError(f"local TTS error: {message[:256]}")

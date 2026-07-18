@@ -120,6 +120,22 @@ def test_default_app_host_materializes_configured_local_speech_adapters(
     assert host.tts.endpoint.address == "127.0.0.1:9000"
 
 
+def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
+    import uvicorn
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        app_module, "load_config", lambda: Config(bind_host="0.0.0.0", bind_port=9000)
+    )
+    monkeypatch.setattr(
+        uvicorn, "run", lambda target, **kwargs: calls.append({"target": target, **kwargs})
+    )
+
+    app_module.main()
+
+    assert calls == [{"target": "server.app:app", "host": "0.0.0.0", "port": 9000}]
+
+
 def test_injected_session_host_is_preserved() -> None:
     host = SessionHost(runner_factory=FakeRunner)
 

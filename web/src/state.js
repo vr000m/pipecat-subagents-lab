@@ -166,6 +166,13 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
   if (snapshot) {
     const snapshotSequence = Number(snapshot.snapshot_sequence ?? sequence);
     if (snapshotSequence < Math.max(state.lastAppliedSequence, state.localDiagnostics.lastSnapshotSequence)) return state;
+    const snapshotEpoch = snapshot.origin_epoch;
+    if (
+      state.connectionEpoch !== null &&
+      snapshotEpoch !== undefined &&
+      snapshotEpoch !== null &&
+      snapshotEpoch < state.connectionEpoch
+    ) return state;
     return snapshotState(state, snapshot, sequence);
   }
   // Increments are meaningful only after the first authoritative snapshot.

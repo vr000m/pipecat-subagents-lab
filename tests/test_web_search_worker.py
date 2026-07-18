@@ -76,6 +76,20 @@ def test_worker_runs_sync_responses_client_off_event_loop() -> None:
     assert provider_thread != loop_thread
 
 
+def test_same_worker_search_uses_prior_canonical_context() -> None:
+    provider = FakeResponses({"output_text": "The answer."})
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    async def run() -> None:
+        await worker.search("weather in Riga", turn_id="turn-1")
+        await worker.search("What about tomorrow?", turn_id="turn-2")
+
+    asyncio.run(run())
+
+    assert "Previous query: weather in Riga" in provider.calls[1]["input"]
+    assert "Previous answer: The answer." in provider.calls[1]["input"]
+
+
 def test_failed_persistent_submission_does_not_poison_later_submissions() -> None:
     worker = ContextWorker(WorkerMetadata("worker-1", "test", "topic", "topic", "deep"))
     calls = 0

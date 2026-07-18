@@ -82,11 +82,12 @@ class LocalTTSClient:
         self.endpoint = endpoint
         self._ws: Any = None
 
-    async def connect(self) -> None:
+    async def connect(self) -> dict[str, Any]:
         self._ws = await _connect(self.endpoint)
         hello = await _receive_json(self._ws)
         if hello.get("type") != "server.hello":
             raise RuntimeError(f"expected TTS server.hello, got {hello.get('type')}")
+        return hello
 
     async def append(self, text: str) -> None:
         await self._ws.send(json.dumps({"type": "input_text.append", "text": text}))

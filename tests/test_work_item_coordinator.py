@@ -32,6 +32,17 @@ def test_control_and_consent_outcomes_preserve_the_requested_action() -> None:
     assert coordinator.arbitrate("session", "consent").kind == "continue_pending"
 
 
+def test_control_targets_match_scheduler_work_item_ids() -> None:
+    assert WorkItemCoordinator.control_intent("pause work-turn-1") == (
+        "pause",
+        "work-turn-1",
+    )
+    assert WorkItemCoordinator.control_intent("cancel work-item-2") == (
+        "cancel",
+        "work-item-2",
+    )
+
+
 def test_same_worker_turns_are_causal_but_different_workers_can_run_concurrently() -> None:
     observed: list[str] = []
 

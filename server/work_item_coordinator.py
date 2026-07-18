@@ -105,7 +105,7 @@ class WorkItemCoordinator:
     @staticmethod
     def control_intent(transcript: str) -> tuple[str, str | None] | None:
         match = re.match(
-            r"^\s*(pause|resume|cancel|stop|consent)\b(?:\s+(work[-_ ]item[-_ ]\w+))?",
+            r"^\s*(pause|resume|cancel|stop|consent)\b(?:\s+(work(?:[-_ ]item)?[-_ ][\w-]+))?",
             transcript,
             re.I,
         )

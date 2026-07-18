@@ -68,11 +68,14 @@ async def _attach_connection(
 ) -> None:
     """Attach a real Pipecat Small WebRTC pipeline to a promoted epoch."""
     runtime = await host.connect(handshake)
+    if host.tts is not None and hasattr(host.tts, "connect"):
+        await host.tts.connect()
+    output_sample_rate = getattr(host.tts, "sample_rate", 24000)
     params = TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         audio_in_sample_rate=16000,
-        audio_out_sample_rate=24000,
+        audio_out_sample_rate=output_sample_rate,
     )
     transport = SmallWebRTCTransport(connection, params)
     bus = getattr(host.runner, "bus", None)
@@ -92,7 +95,7 @@ async def _attach_connection(
     worker = PipelineWorker(
         Pipeline(processors),
         name=f"browser-{runtime.epoch}",
-        params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=24000),
+        params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=output_sample_rate),
         enable_rtvi=True,
         idle_timeout_secs=None,
     )
@@ -239,3 +242,15 @@ async def serve(host: SessionHost | None = None) -> SessionHost:
     runtime = host if host is not None else _default_session_host()
     await runtime.start()
     return runtime
+
+
+def main() -> None:
+    """Serve the browser app using the validated bind configuration."""
+    import uvicorn
+
+    config = load_config()
+    uvicorn.run("server.app:app", host=config.bind_host, port=config.bind_port)
+
+
+if __name__ == "__main__":
+    main()
