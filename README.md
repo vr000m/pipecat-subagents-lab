@@ -62,7 +62,7 @@ signaling endpoint from the same FastAPI process:
 
 ```sh
 cd web && bun run build && cd ..
-uv run uvicorn server.app:app --host 127.0.0.1 --port 7860
+uv run python -m server.app
 ```
 
 Open <http://127.0.0.1:7860/> and use Connect, then enable the microphone
