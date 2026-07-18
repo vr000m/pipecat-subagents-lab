@@ -30,7 +30,11 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   };
 
   const callbacks = {
-    onConnected: () => { update({ ...state, connection: "connected" }); requestSnapshot(); },
+    onConnected: () => update({ ...state, connection: "connected" }),
+    // PipecatClient.connect() sends the standard RTVI client-ready message
+    // before resolving onBotReady. Request the server-authoritative snapshot
+    // only after that media/RTVI readiness boundary.
+    onBotReady: () => requestSnapshot(),
     onDisconnected: () => update({ ...state, connection: "disconnected" }),
     onError: (message) => report(message?.data?.message || "The RTVI connection reported an error."),
     onServerMessage: (message) => {

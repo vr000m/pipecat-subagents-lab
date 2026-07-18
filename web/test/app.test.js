@@ -14,17 +14,21 @@ function fakeDocument() {
   return { body, createElement: () => new Element(), querySelector: () => new Element() };
 }
 
-test("connection readiness requests a snapshot and failed connect leaves Connect enabled", async () => {
+test("connection readiness sends RTVI ready before requesting a snapshot", async () => {
   const documentRef = fakeDocument();
   const root = new Element();
-  const snapshots = [];
+  const messages = [];
   let shouldFail = true;
-  const app = createApp({ root, documentRef, transportFactory: () => ({}), clientFactory: (_transport, callbacks) => ({
+  const app = createApp({ root, documentRef, transportFactory: () => ({ sendMessage: (message) => messages.push(message) }), clientFactory: (transport, callbacks) => ({
     connect: async () => {
       if (shouldFail) throw new Error("offline");
+      // PipecatClient.connect() performs this transport call internally
+      // before invoking the documented onBotReady callback.
+      transport.sendMessage({ type: "client-ready" });
       callbacks.onConnected();
+      callbacks.onBotReady();
     },
-    sendClientMessage: (message) => snapshots.push(message),
+    sendClientMessage: (message) => messages.push(message),
     disconnect: async () => {},
     enableMic: () => {},
   }) });
@@ -32,11 +36,12 @@ test("connection readiness requests a snapshot and failed connect leaves Connect
   const connectButton = root.children[0].children[1];
   await connectButton.onclick();
   expect(connectButton.disabled).toBe(false);
+  expect(messages).toEqual([]);
 
   shouldFail = false;
   await connectButton.onclick();
   expect(connectButton.disabled).toBe(true);
-  expect(snapshots).toEqual(["snapshot-request"]);
+  expect(messages).toEqual([{ type: "client-ready" }, "snapshot-request"]);
 });
 
 test("onServerMessage rejects unsupported contracts before applying state", () => {

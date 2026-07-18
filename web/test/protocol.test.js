@@ -21,8 +21,9 @@ test("browser entrypoint owns remote audio and handles track lifecycle", () => {
   expect(appSource).toContain("playback was blocked");
 });
 
-test("entrypoint requests a snapshot after connect and preserves Connect after failure", () => {
-  expect(appSource).toContain('onConnected: () => { update({ ...state, connection: "connected" }); requestSnapshot(); }');
+test("entrypoint requests a snapshot only after Pipecat reports bot readiness", () => {
+  expect(appSource).toContain('onConnected: () => update({ ...state, connection: "connected" })');
+  expect(appSource).toContain('onBotReady: () => requestSnapshot()');
   expect(appSource).toContain("if (!await connect()) return;");
 });
 
