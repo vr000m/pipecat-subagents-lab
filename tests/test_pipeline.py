@@ -11,6 +11,7 @@ from pipecat.processors.frame_processor import FrameDirection
 import server.app as app_module
 from server.contracts import GroundedResult, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
+from server.registry import UnsupportedWorkerType
 from server.workers.web_search import WorkerDeclined
 
 
@@ -186,6 +187,31 @@ def test_search_decline_becomes_a_safe_canonical_result() -> None:
         result = await host._handle_transcript("private calendar")
 
         assert result.text == "I could not find a reliable result for that request."
+        assert host.state.result_history("main") == (result,)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_unimplemented_worker_type_becomes_a_safe_canonical_result() -> None:
+    async def run() -> None:
+        class UnsupportedCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {"kind": "routed", "decision": object(), "transcript": transcript},
+                )()
+
+            def dispatch(self, _decision: object) -> object:
+                raise UnsupportedWorkerType("unsupported worker type: calendar")
+
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=UnsupportedCoordinator())
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("private calendar")
+
+        assert result.text == "I cannot access that capability here."
         assert host.state.result_history("main") == (result,)
         await host.shutdown()
 

@@ -1,6 +1,6 @@
 """The registry owns persistent context identities and immutable catalogues."""
 
-from server.registry import WorkerRegistry
+from server.registry import UnsupportedWorkerType, WorkerRegistry
 import pytest
 from server.workers.base import WorkerMetadata
 from server.workers.web_search import WebSearchWorker
@@ -34,6 +34,16 @@ def test_new_web_search_worker_uses_injected_provider_and_configured_model() -> 
     assert item.worker.responses is provider
     assert item.worker.model == registry.config.worker_model_policy["deep"]
     assert item.metadata.model_policy == "deep"
+
+
+def test_registry_rejects_unimplemented_worker_types() -> None:
+    registry = WorkerRegistry()
+
+    with pytest.raises(UnsupportedWorkerType, match="calendar"):
+        registry.get_or_create(topic="calendar", worker_type="calendar", model_policy="deep")
+
+    with pytest.raises(UnsupportedWorkerType, match="calendar"):
+        registry.register(worker_id="worker-calendar", worker_type="calendar", topic="calendar")
 
 
 def test_registry_keeps_two_workers_and_same_topic_identity_persistent() -> None:

@@ -13,7 +13,7 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from .connection_arbiter import ConnectionArbiter
 from .contracts import CONTRACT_VERSION, GroundedResult
 from .observers import RuntimeObserver
-from .registry import WorkerRegistry
+from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
@@ -406,7 +406,18 @@ class SessionHost:
                 ),
                 origin,
             )
-        worker = self.coordinator.dispatch(outcome.decision)
+        try:
+            worker = self.coordinator.dispatch(outcome.decision)
+        except UnsupportedWorkerType:
+            return await self._commit_and_speak(
+                canonical_result(
+                    worker_id="main",
+                    turn_id=f"turn-{self.state.sequence + 1}",
+                    text="I cannot access that capability here.",
+                    origin_epoch=origin_epoch,
+                ),
+                origin,
+            )
         if worker is None:
             return outcome
         search = getattr(worker, "search", None)
@@ -472,7 +483,21 @@ class SessionHost:
                     item_text,
                     self.coordinator.registry.catalogue(),
                 )
-                worker = await asyncio.to_thread(self.coordinator.dispatch, decision)
+                try:
+                    worker = await asyncio.to_thread(self.coordinator.dispatch, decision)
+                except UnsupportedWorkerType:
+                    results.append(
+                        await self._commit_and_speak(
+                            canonical_result(
+                                worker_id="main",
+                                turn_id=f"turn-{self.state.sequence + 1}",
+                                text="I cannot access that capability here.",
+                                origin_epoch=origin.epoch,
+                            ),
+                            origin,
+                        )
+                    )
+                    continue
             search = getattr(worker, "search", None)
             if search is None:
                 continue

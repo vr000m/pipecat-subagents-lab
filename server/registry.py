@@ -16,6 +16,10 @@ class _UnavailableResponses:
         raise RuntimeError("web-search provider is unavailable; inject a Responses client")
 
 
+class UnsupportedWorkerType(ValueError):
+    """The first-slice registry cannot execute the requested worker type."""
+
+
 @dataclass(frozen=True)
 class RegisteredWorker:
     metadata: WorkerMetadata
@@ -66,6 +70,8 @@ class WorkerRegistry:
         capabilities: dict[str, bool] | None = None,
         worker: ContextWorker | None = None,
     ) -> RegisteredWorker:
+        if worker_type != "web_search":
+            raise UnsupportedWorkerType(f"unsupported worker type: {worker_type}")
         if worker_id in self._workers:
             raise ValueError(f"worker ID already registered: {worker_id}")
         self.config.resolve_worker_model(model_policy)
@@ -84,6 +90,8 @@ class WorkerRegistry:
             raise ValueError(f"unknown worker: {worker_id}") from exc
 
     def get_or_create(self, *, topic: str, worker_type: str, model_policy: str) -> RegisteredWorker:
+        if worker_type != "web_search":
+            raise UnsupportedWorkerType(f"unsupported worker type: {worker_type}")
         for item in self._workers.values():
             if item.metadata.topic == topic and item.metadata.worker_type == worker_type:
                 if item.metadata.model_policy != model_policy:
