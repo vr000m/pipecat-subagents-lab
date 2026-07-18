@@ -1,0 +1,109 @@
+"""RTVI state messages expose ordered runtime projections, not raw diagnostics."""
+
+from server.contracts import DeliveryState, GroundedResult, RuntimeSnapshot, SpeechProgress
+from server.rtvi_messages import RTVIMessagePublisher
+
+
+def test_messages_have_monotonic_sequences_and_reject_stale_epoch_emission() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=4)
+    result = GroundedResult(
+        result_id="result-1",
+        worker_id="worker-weather",
+        turn_id="turn-1",
+        text="Rain is likely.",
+        spoken_text="Rain is likely.",
+        ui_text="Rain is likely.",
+    )
+    first = publisher.result(result, origin_epoch=4)
+    second = publisher.speech(
+        SpeechProgress(
+            result_id="result-1",
+            work_item_id="work-1",
+            run_id="run-1",
+            utterance_id="utt-1",
+            state=DeliveryState.STARTED,
+            origin_epoch=4,
+        ),
+        origin_epoch=4,
+    )
+
+    assert second.sequence == first.sequence + 1
+    assert publisher.result(result, origin_epoch=3) is None
+    payload = first.model_dump(mode="json")
+    assert "raw_logs" not in payload
+    assert "prompt" not in payload
+    assert "context" not in payload
+
+
+def test_snapshot_is_gated_until_client_ready() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=1)
+    assert publisher.snapshot() is None
+    publisher.client_ready(epoch=1)
+    snapshot = publisher.snapshot()
+    assert snapshot is not None
+    assert snapshot.kind == "runtime_snapshot"
+    assert snapshot.sequence >= 0
+
+
+def test_stale_epoch_cannot_advance_sequence_or_emit_after_readiness() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=2)
+    publisher.client_ready(epoch=2)
+    first = publisher.snapshot()
+
+    assert first is not None
+    assert (
+        publisher.speech(
+            SpeechProgress(
+                result_id="result-1",
+                work_item_id="work-1",
+                run_id="run-1",
+                utterance_id="utt-1",
+                state=DeliveryState.STARTED,
+                origin_epoch=1,
+            ),
+            origin_epoch=1,
+        )
+        is None
+    )
+    second = publisher.snapshot()
+
+    assert second is not None
+    assert second.sequence == first.sequence + 1
+
+
+def test_snapshot_contains_authoritative_history_and_delivery_state_after_reconnect() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=3)
+    publisher.client_ready(epoch=3)
+    publisher.set_snapshot(
+        RuntimeSnapshot(
+            contract_version="v1.0",
+            session_id="session-1",
+            snapshot_sequence=8,
+            results=[
+                GroundedResult(
+                    result_id="result-1",
+                    worker_id="worker-weather",
+                    turn_id="turn-1",
+                    text="Answer",
+                    spoken_text="Answer",
+                    ui_text="Answer",
+                )
+            ],
+            speech_progress=[
+                SpeechProgress(
+                    result_id="result-1",
+                    work_item_id="work-1",
+                    run_id="run-1",
+                    utterance_id="utt-1",
+                    state=DeliveryState.INTERRUPTED_BY_RECONNECT,
+                    origin_epoch=1,
+                )
+            ],
+        )
+    )
+
+    snapshot = publisher.snapshot()
+    assert snapshot is not None
+    assert snapshot.data["snapshot_sequence"] == 8
+    assert snapshot.data["results"][0]["result_id"] == "result-1"
+    assert snapshot.data["speech_progress"][0]["state"] == "interrupted_by_reconnect"

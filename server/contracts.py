@@ -140,15 +140,20 @@ class RuntimeSnapshot(StrictModel):
     results: list[GroundedResult] = Field(default_factory=list)
     speech_progress: list[SpeechProgress] = Field(default_factory=list)
     origin_epoch: int | None = None
-    _highest_sequence: ClassVar[int] = -1
+    _highest_by_session: ClassVar[dict[str, int]] = {}
+
+    @classmethod
+    def reset_monotonicity(cls, session_id: str) -> None:
+        cls._highest_by_session.pop(session_id, None)
 
     @model_validator(mode="after")
     def validate_version_and_monotonicity(self) -> RuntimeSnapshot:
         if self.contract_version != CONTRACT_VERSION:
             raise ValueError(f"unsupported contract version: {self.contract_version}")
-        if self.snapshot_sequence < type(self)._highest_sequence:
+        previous = type(self)._highest_by_session.get(self.session_id)
+        if previous is not None and self.snapshot_sequence < previous:
             raise ValueError("snapshot_sequence must be monotonic")
-        type(self)._highest_sequence = max(type(self)._highest_sequence, self.snapshot_sequence)
+        type(self)._highest_by_session[self.session_id] = max(previous or 0, self.snapshot_sequence)
         return self
 
 
