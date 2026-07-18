@@ -148,10 +148,12 @@ class SessionHost:
                 if hasattr(result, "__await__"):
                     await result
         if self._runner_task is not None:
+            self._runner_task.cancel()
             try:
                 await self._runner_task
             except asyncio.CancelledError:
                 pass
-            self._runner_task = None
+            finally:
+                self._runner_task = None
         self.started = False
         self.state.active_epoch = None

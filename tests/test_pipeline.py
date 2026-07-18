@@ -26,6 +26,36 @@ def test_shutdown_awaits_async_cancel_fallback() -> None:
     asyncio.run(run())
 
 
+class HangingRunRunner:
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.finished = asyncio.Event()
+
+    async def run(self, *, auto_end: bool) -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            self.finished.set()
+
+    async def cancel(self, reason: str) -> None:
+        self.cancelled = reason
+
+
+def test_shutdown_cancels_owned_runner_task() -> None:
+    async def run() -> None:
+        runner = HangingRunRunner()
+        host = SessionHost(runner_factory=lambda: runner)
+        await host.start()
+        await asyncio.sleep(0)
+
+        await asyncio.wait_for(host.shutdown(), timeout=1)
+
+        assert runner.cancelled == "session shutdown"
+        assert runner.finished.is_set()
+
+    asyncio.run(run())
+
+
 def handshake(host: SessionHost, epoch: int) -> dict[str, object]:
     return {
         "session_id": host.state.session_id,
