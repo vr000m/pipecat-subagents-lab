@@ -30,6 +30,7 @@ class DispatchOutcome:
     transcript: str
     decision: RoutingDecision | None = None
     work_items: tuple[str, ...] = ()
+    control_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,8 +118,19 @@ class WorkItemCoordinator:
     def arbitrate(self, session_id: str, transcript: str) -> DispatchOutcome:
         control = self.control_intent(transcript)
         if control:
+            pending = self.pending(session_id)
+            if control[0] == "consent" and pending:
+                return DispatchOutcome(
+                    "continue_pending",
+                    transcript,
+                    work_items=(pending.owner_id,),
+                    control_action="consent",
+                )
             return DispatchOutcome(
-                "control", transcript, work_items=(control[1],) if control[1] else ()
+                "control",
+                transcript,
+                work_items=(control[1],) if control[1] else (),
+                control_action=control[0],
             )
         pending = self.pending(session_id)
         if pending and re.search(r"\b(and|also)\b", transcript, re.I):

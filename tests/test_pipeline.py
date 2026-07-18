@@ -11,6 +11,7 @@ from pipecat.processors.frame_processor import FrameDirection
 import server.app as app_module
 from server.contracts import GroundedResult, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
+from server.workers.web_search import WorkerDeclined
 
 
 class RoutedCoordinator:
@@ -52,6 +53,11 @@ class BlockingResultWorker(ResultWorker):
         self.started.set()
         await self.release.wait()
         return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+
+class DecliningResultWorker(ResultWorker):
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+        raise WorkerDeclined(f"cannot satisfy {query}")
 
 
 class FakeTTS:
@@ -164,6 +170,63 @@ def test_reconnect_while_search_is_blocked_keeps_late_result_history_only() -> N
         assert first.scheduler._queues == {}
         assert second.scheduler._queues == {}
         assert host.state.speech == {}
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_search_decline_becomes_a_safe_canonical_result() -> None:
+    async def run() -> None:
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(DecliningResultWorker()),
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("private calendar")
+
+        assert result.text == "I could not find a reliable result for that request."
+        assert host.state.result_history("main") == (result,)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_control_interrupts_active_speech() -> None:
+    async def run() -> None:
+        class ControlCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": (),
+                        "control_action": "cancel",
+                    },
+                )()
+
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, tts=tts, coordinator=ControlCoordinator()
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        item = connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+
+        await host._handle_transcript("cancel")
+
+        assert host.state.speech[item.utterance_id].state.value == "interrupted"
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item.result_id != item.result_id
         await host.shutdown()
 
     asyncio.run(run())

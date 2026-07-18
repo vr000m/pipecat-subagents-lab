@@ -17,6 +17,7 @@ from .registry import WorkerRegistry
 from .results import canonical_result
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
+from .workers.web_search import WorkerDeclined
 
 
 try:
@@ -352,11 +353,29 @@ class SessionHost:
             self.coordinator.arbitrate, self.state.session_id, transcript
         )
         if outcome.kind != "routed" or outcome.decision is None:
-            text = {
-                "control": "Control request noted.",
-                "continue_pending": "Continuing the pending request.",
-                "multi_intent": "I will handle those requests in order.",
-            }.get(outcome.kind)
+            if outcome.kind == "control":
+                action = getattr(outcome, "control_action", None)
+                if action == "pause" and origin.scheduler.active is not None:
+                    target = (
+                        outcome.work_items[0]
+                        if outcome.work_items
+                        else origin.scheduler.active.item.work_item_id
+                    )
+                    origin.scheduler.pause(target)
+                elif action in {"cancel", "stop"}:
+                    origin.scheduler.interrupt(epoch=origin_epoch)
+                text = {
+                    "pause": "Pausing the active response.",
+                    "resume": "Resume requested; no audio was replayed automatically.",
+                    "cancel": "Cancelling the active response.",
+                    "stop": "Stopping the active response.",
+                }.get(action, "Control request noted.")
+            elif outcome.kind == "multi_intent":
+                return await self._handle_multi_intent(outcome, transcript, origin)
+            elif outcome.kind == "continue_pending":
+                return await self._handle_pending(outcome, transcript, origin)
+            else:
+                text = None
             if text is None:
                 return outcome
             return await self._commit_and_speak(
@@ -393,12 +412,92 @@ class SessionHost:
         search = getattr(worker, "search", None)
         if search is None:
             return outcome
-        result = await search(
-            transcript,
-            turn_id=f"turn-{self.state.sequence + 1}",
-            origin_epoch=origin_epoch,
-        )
+        try:
+            result = await search(
+                transcript, turn_id=f"turn-{self.state.sequence + 1}", origin_epoch=origin_epoch
+            )
+        except WorkerDeclined:
+            result = canonical_result(
+                worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                turn_id=f"turn-{self.state.sequence + 1}",
+                text="I could not find a reliable result for that request.",
+                origin_epoch=origin_epoch,
+            )
+        except Exception:
+            result = canonical_result(
+                worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                turn_id=f"turn-{self.state.sequence + 1}",
+                text="The web search is temporarily unavailable.",
+                origin_epoch=origin_epoch,
+            )
         return await self._commit_and_speak(result, origin)
+
+    async def _handle_pending(self, outcome: Any, transcript: str, origin: Any) -> Any:
+        owner_id = outcome.work_items[0] if outcome.work_items else None
+        registered = self.coordinator.registry.get(owner_id) if owner_id else None
+        worker = registered.worker if registered is not None else None
+        search = getattr(worker, "search", None)
+        if search is None:
+            return outcome
+        try:
+            result = await search(
+                transcript,
+                turn_id=f"turn-{self.state.sequence + 1}",
+                origin_epoch=origin.epoch,
+            )
+        except Exception:
+            result = canonical_result(
+                worker_id=owner_id or "main",
+                turn_id=f"turn-{self.state.sequence + 1}",
+                text="The pending web request could not be completed.",
+                origin_epoch=origin.epoch,
+            )
+        return await self._commit_and_speak(result, origin)
+
+    async def _handle_multi_intent(
+        self, outcome: Any, transcript: str, origin: Any
+    ) -> tuple[Any, ...]:
+        """Execute bounded compound work in the user's stated order."""
+        del transcript
+        results: list[Any] = []
+        pending = self.coordinator.pending(self.state.session_id)
+        for index, item_text in enumerate(outcome.work_items):
+            worker = None
+            if index == 0 and pending is not None:
+                registered = self.coordinator.registry.get(pending.owner_id)
+                worker = registered.worker if registered is not None else None
+            else:
+                decision = await asyncio.to_thread(
+                    self.coordinator.router.route,
+                    item_text,
+                    self.coordinator.registry.catalogue(),
+                )
+                worker = await asyncio.to_thread(self.coordinator.dispatch, decision)
+            search = getattr(worker, "search", None)
+            if search is None:
+                continue
+            try:
+                result = await search(
+                    item_text,
+                    turn_id=f"turn-{self.state.sequence + 1}",
+                    origin_epoch=origin.epoch,
+                )
+            except WorkerDeclined:
+                result = canonical_result(
+                    worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                    turn_id=f"turn-{self.state.sequence + 1}",
+                    text="I could not find a reliable result for that request.",
+                    origin_epoch=origin.epoch,
+                )
+            except Exception:
+                result = canonical_result(
+                    worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                    turn_id=f"turn-{self.state.sequence + 1}",
+                    text="The web search is temporarily unavailable.",
+                    origin_epoch=origin.epoch,
+                )
+            results.append(await self._commit_and_speak(result, origin))
+        return tuple(results)
 
     async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""
