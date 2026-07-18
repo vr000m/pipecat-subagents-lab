@@ -45,9 +45,13 @@ uv run ruff format --check .
 uv run ruff check .
 cd web
 bun install
+bun run build
 bun test
 bun run lint
 ```
+
+Run `bun run build` before opening or serving `web/index.html`: `dist/` is
+intentionally ignored, while lint writes its bundle only to `/tmp`.
 
 The required integrated test is `tests/integration/test_browser_session.py`.
 It uses fake model/provider boundaries and proves the routing matrix, same-topic

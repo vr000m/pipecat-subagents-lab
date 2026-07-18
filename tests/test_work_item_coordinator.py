@@ -88,3 +88,32 @@ def test_timeout_boundary_completion_is_retained_after_wait_returns_stale_done_s
         assert outcome.pending_work_item_ids == ()
 
     asyncio.run(run())
+
+
+def test_timed_out_result_is_drained_once_after_pending_worker_finishes() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2, wait_timeout_ms=1)
+        release = asyncio.Event()
+
+        async def worker(worker_id: str, text: str) -> dict:
+            assert worker_id == "worker-late"
+            await release.wait()
+            return {"text": text, "citations": []}
+
+        outcome = await coordinator.submit("turn-late", [("worker-late", "answer")], worker)
+        assert outcome.pending_work_item_ids == ("turn-late-0",)
+        assert coordinator.drain_late_results() == ()
+
+        release.set()
+        for _ in range(4):
+            await asyncio.sleep(0)
+
+        late = coordinator.drain_late_results()
+        assert len(late) == 1
+        assert late[0].work_item_id == "turn-late-0"
+        assert late[0].worker_id == "worker-late"
+        assert late[0].result.text == "answer"
+        assert late[0].error is None
+        assert coordinator.drain_late_results() == ()
+
+    asyncio.run(run())

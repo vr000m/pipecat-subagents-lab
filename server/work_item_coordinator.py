@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -38,6 +39,14 @@ class SubmittedOutcome:
     pending_work_item_ids: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class LateResult:
+    work_item_id: str
+    worker_id: str
+    result: Any = None
+    error: str | None = None
+
+
 class WorkItemCoordinator:
     def __init__(
         self,
@@ -65,6 +74,13 @@ class WorkItemCoordinator:
         self.speech_scheduler = speech_scheduler
         self._pending: dict[str, PendingDialogue] = {}
         self._tails: dict[str, Any] = {}
+        self._late_results: deque[LateResult] = deque()
+
+    def drain_late_results(self) -> tuple[LateResult, ...]:
+        """Return and remove results from timed-out work items in completion order."""
+        results = tuple(self._late_results)
+        self._late_results.clear()
+        return results
 
     def add_pending(self, candidate: PendingDialogue) -> None:
         self._pending[candidate.session_id] = candidate
@@ -142,6 +158,33 @@ class WorkItemCoordinator:
         import asyncio
 
         selected = items[: self.config.max_work_items_per_turn]
+        work = tuple(
+            type("WorkItem", (), {"work_item_id": f"{turn_id}-{i}"})()
+            for i, _ in enumerate(selected)
+        )
+
+        def materialize_result(value: Any) -> Any:
+            return type("Result", (), value)() if isinstance(value, dict) else value
+
+        def retain_late_result(task: asyncio.Task[Any], work_item_id: str, worker_id: str) -> None:
+            try:
+                result = materialize_result(task.result())
+            except BaseException as exc:
+                self._late_results.append(
+                    LateResult(
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+            else:
+                self._late_results.append(
+                    LateResult(
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        result=result,
+                    )
+                )
 
         async def one(worker_id: str, text: str) -> Any:
             previous = self._tails.get(worker_id)
@@ -165,15 +208,15 @@ class WorkItemCoordinator:
         raw_results = tuple(
             task.result() for task in tasks if task in done and task.exception() is None
         )
-        results = tuple(
-            type("Result", (), value)() if isinstance(value, dict) else value
-            for value in raw_results
-        )
-        work = tuple(
-            type("WorkItem", (), {"work_item_id": f"{turn_id}-{i}"})()
-            for i, _ in enumerate(selected)
-        )
+        results = tuple(materialize_result(value) for value in raw_results)
         pending_ids = tuple(
             work[i].work_item_id for i, task in enumerate(tasks) if task not in done
         )
+        for i, task in enumerate(tasks):
+            if task not in done:
+                task.add_done_callback(
+                    lambda completed, i=i: retain_late_result(
+                        completed, work[i].work_item_id, selected[i][0]
+                    )
+                )
         return SubmittedOutcome(work, results, pending_ids)

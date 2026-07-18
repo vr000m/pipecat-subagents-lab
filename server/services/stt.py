@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -27,5 +28,8 @@ class LocalSTT:
         if not self.started:
             raise RuntimeError("STT service is not started")
         if self.on_final is not None:
-            return self.on_final(text)
+            result = self.on_final(text)
+            if inspect.isawaitable(result):
+                return await result
+            return result
         return text

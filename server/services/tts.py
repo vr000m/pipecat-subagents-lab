@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -29,5 +30,8 @@ class LocalTTS:
         if not self.started:
             raise RuntimeError("TTS service is not started")
         if self.on_event is not None:
-            return self.on_event("synthesis_ended", utterance_id)
+            result = self.on_event("synthesis_ended", utterance_id)
+            if inspect.isawaitable(result):
+                return await result
+            return result
         return text
