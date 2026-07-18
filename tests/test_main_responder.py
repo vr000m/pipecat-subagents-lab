@@ -1,6 +1,7 @@
 """Direct, unsupported, and router-owned clarification use one tool-free call."""
 
 from server.main_responder import MainResponder, MainResponse
+from server.results import ResultLog
 
 
 class FakeStructuredModel:
@@ -59,3 +60,18 @@ def test_main_responder_validates_dict_main_response_before_reading_fields() -> 
     )
 
     assert result.text == "Validated answer."
+
+
+def test_repeated_identical_main_prose_gets_unique_result_ids_for_result_log() -> None:
+    model = FakeStructuredModel({"action": "direct", "prose": "The same answer."})
+    responder = MainResponder(model=model)
+
+    first = responder.respond("What is the answer?", {"action": "direct"})
+    second = responder.respond("What is the answer?", {"action": "direct"})
+    log = ResultLog()
+
+    assert first.text == second.text
+    assert first.result_id != second.result_id
+    log.append(first)
+    log.append(second)
+    assert [result.result_id for result in log.results] == [first.result_id, second.result_id]

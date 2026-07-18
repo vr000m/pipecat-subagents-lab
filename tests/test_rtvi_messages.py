@@ -45,6 +45,25 @@ def test_snapshot_is_gated_until_client_ready() -> None:
     assert snapshot.sequence >= 0
 
 
+def test_first_ready_snapshot_is_schema_complete_before_authoritative_state_is_set() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-empty", active_epoch=1)
+    publisher.client_ready(epoch=1)
+
+    snapshot = publisher.snapshot()
+
+    assert snapshot is not None
+    assert snapshot.data == {
+        "contract_version": "v1.0",
+        "session_id": "session-empty",
+        "snapshot_sequence": snapshot.sequence,
+        "workers": [],
+        "results": [],
+        "speech_progress": [],
+        "origin_epoch": None,
+    }
+    RuntimeSnapshot.model_validate(snapshot.data)
+
+
 def test_stale_epoch_cannot_advance_sequence_or_emit_after_readiness() -> None:
     publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=2)
     publisher.client_ready(epoch=2)

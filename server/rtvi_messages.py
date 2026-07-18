@@ -63,7 +63,14 @@ class RTVIMessagePublisher:
         data = (
             self._snapshot.model_dump(mode="json")
             if self._snapshot
-            else {"session_id": self.session_id}
+            else {
+                "contract_version": CONTRACT_VERSION,
+                "session_id": self.session_id,
+                "workers": [],
+                "results": [],
+                "speech_progress": [],
+                "origin_epoch": None,
+            }
         )
         # A snapshot request is itself a sequenced event. Repeated requests
         # must advance both fields together; otherwise the browser treats the

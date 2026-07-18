@@ -96,16 +96,22 @@ class SpeechScheduler:
         return item
 
     def synthesis_ended(self, utterance_id: str) -> None:
-        item = self._item(utterance_id)
+        item = self._active_item(utterance_id)
+        if item is None:
+            return
         self.state.speech_progress(**self._progress(item), state=DeliveryState.SYNTHESIS_ENDED)
 
     def delivery_completed(self, utterance_id: str) -> None:
-        item = self._item(utterance_id)
+        item = self._active_item(utterance_id)
+        if item is None:
+            return
         self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_COMPLETED)
         self._release(utterance_id)
 
     def delivery_unknown(self, utterance_id: str) -> None:
-        item = self._item(utterance_id)
+        item = self._active_item(utterance_id)
+        if item is None:
+            return
         self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_UNKNOWN)
         self._release(utterance_id)
 
@@ -144,9 +150,9 @@ class SpeechScheduler:
         self.state.speech_progress(**self._progress(replay), state=DeliveryState.RESUMED)
         return replay
 
-    def _item(self, utterance_id: str) -> SpeechItem:
+    def _active_item(self, utterance_id: str) -> SpeechItem | None:
         if self._active is None or self._active.item.utterance_id != utterance_id:
-            raise ValueError("utterance is not the active speech lease")
+            return None
         return self._active.item
 
     def _release(self, utterance_id: str) -> None:

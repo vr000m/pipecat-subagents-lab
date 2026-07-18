@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Any, Callable
+from uuid import uuid4
+
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from .contracts import RoutingDecision
@@ -48,4 +50,4 @@ class MainResponder:
             raise ValueError("main response action does not match routing action")
         prose = response.prose or response.text
         assert prose is not None
-        return ProjectedResult(f"main-{id(prose)}", prose, [])
+        return ProjectedResult(f"main-{uuid4().hex}", prose, [])

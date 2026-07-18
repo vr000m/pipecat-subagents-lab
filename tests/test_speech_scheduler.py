@@ -122,3 +122,29 @@ def test_reconnect_interrupts_active_item_without_touching_other_work_item_queue
     )
     assert [item.utterance_id for item in scheduler._queues["work-2"]] == [second.utterance_id]
     assert [item.utterance_id for item in scheduler._queues["work-3"]] == [third.utterance_id]
+
+
+def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:
+    scheduler = SpeechScheduler(SessionState())
+    old_item = enqueue(scheduler, "work-1", "old")
+    asyncio.run(scheduler.start_next())
+
+    scheduler.interrupt(epoch=2, reconnect=True)
+    new_item = scheduler.enqueue(
+        result_id="result-work-1",
+        work_item_id="work-1",
+        run_id="run-work-1-new",
+        text="new",
+        origin_epoch=2,
+    )
+    asyncio.run(scheduler.start_next())
+    events_before_callbacks = scheduler.state.events
+
+    scheduler.synthesis_ended(old_item.utterance_id)
+    scheduler.delivery_completed(old_item.utterance_id)
+    scheduler.delivery_unknown(old_item.utterance_id)
+
+    assert scheduler.active is not None
+    assert scheduler.active.item.utterance_id == new_item.utterance_id
+    assert scheduler.state.events == events_before_callbacks
+    assert scheduler.state.speech[new_item.utterance_id].state == DeliveryState.STARTED
