@@ -29,6 +29,9 @@ export WEBSEARCH_TTS_ENDPOINT=uds:///path/to/tts.sock
 ```
 
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
+The default host opens these websocket endpoints with the versioned local STT
+and TTS wire clients; adapter-level client factories remain injectable for
+alternate verified clients.
 The values-redacted preflight is implemented by `server.preflight.run_preflight`.
 Call it from the host integration that owns a service probe before connecting a
 browser. This repository does not expose a standalone preflight CLI.

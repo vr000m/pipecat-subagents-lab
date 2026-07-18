@@ -496,6 +496,9 @@ attaches a Pipecat `SmallWebRTCTransport`/`PipelineWorker` to the process-lifeti
 runner. Daily transport remains a deployment adapter to add only if this lab is
 deployed to a cloud runtime; it is not an alternate local transport path.
 
-The full feature remains incomplete: live local STT/TTS service adapters,
-worker-to-transport bus wiring, and credential-safe media acceptance still need
-to be implemented and verified before the plan can be marked complete.
+The configured local STT/TTS adapters now have a real websocket client path for
+UDS, TCP, WS, and WSS endpoints, while retaining an injectable factory seam for
+verified sibling-service clients. The live Small WebRTC worker and RTVI event
+path are wired and fenced. The full feature remains incomplete until the
+credential-safe local media acceptance procedure proves microphone capture,
+live local STT/TTS, and audible browser output.

@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="plan-view-source-sha256" content="f587c1a6f7abae4f5decffcbaf1dad040970cdef8e5a39d16b526c06de80b62d">
+<meta name="plan-view-source-sha256" content="f776dbac548228fde811b7e5f767fb270f091226eee32109f25ae09cc2fb6957">
 <meta name="plan-view-source-path" content="~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans/20260711-feature-websearch-subagent-electron.md">
-<meta name="plan-view-git-head" content="e9fb923c59d0ae2712519d0db9d567d5a250e8df">
-<meta name="plan-view-generated-at" content="2026-07-17T20:52:47Z">
+<meta name="plan-view-git-head" content="958483291e31e4e74a2c7526defada408f84428c">
+<meta name="plan-view-generated-at" content="2026-07-18T19:47:26Z">
 <title>Task: Pipecat Web-Search Subagent and Browser RTVI Lab — Plan View</title>
 <style>
 :root {
@@ -125,7 +125,7 @@ footer code { font-family: ui-monospace, monospace; background: var(--bg-card); 
   <div class="meta">
     <span><span class="chip blue">Planned</span></span>
     <span>Created <code>2026-07-11</code></span>
-    <span>Last touched <code>2026-07-17</code></span>
+    <span>Last touched <code>2026-07-18</code></span>
     
     <span>Branch <code>feature/websearch-subagent-electron</code></span>
   </div>
@@ -148,13 +148,15 @@ footer code { font-family: ui-monospace, monospace; background: var(--bg-card); 
   </section>
   <section id="commits">
     <h2>Commit history</h2>
-    <svg class="timeline-strip" viewBox="0 0 720 32" width="100%" height="32"><line x1="4" y1="16.0" x2="716" y2="16.0" /><rect x="714.0" y="4" width="4" height="24"><title>9b5dc47 · 2026-07-17 · docs: specify interruption and work item contracts</title></rect>
-<rect x="549.2" y="4" width="4" height="24"><title>8a58d9b · 2026-07-16 · docs: refine routing and multi-intent architecture</title></rect>
-<rect x="34.4" y="4" width="4" height="24"><title>ad86d51 · 2026-07-12 · docs: clarify browser pipeline design</title></rect>
-<rect x="22.2" y="4" width="4" height="24"><title>5422358 · 2026-07-12 · Commit Phase 4 wireframe and link it from the dev plan</title></rect>
-<rect x="16.3" y="4" width="4" height="24"><title>8989572 · 2026-07-12 · Add persistent per-worker result history to websearch subagent plan</title></rect>
+    <svg class="timeline-strip" viewBox="0 0 720 32" width="100%" height="32"><line x1="4" y1="16.0" x2="716" y2="16.0" /><rect x="714.0" y="4" width="4" height="24"><title>090c275 · 2026-07-18 · wire local Small WebRTC server transport</title></rect>
+<rect x="645.4" y="4" width="4" height="24"><title>9b5dc47 · 2026-07-17 · docs: specify interruption and work item contracts</title></rect>
+<rect x="496.4" y="4" width="4" height="24"><title>8a58d9b · 2026-07-16 · docs: refine routing and multi-intent architecture</title></rect>
+<rect x="31.3" y="4" width="4" height="24"><title>ad86d51 · 2026-07-12 · docs: clarify browser pipeline design</title></rect>
+<rect x="20.2" y="4" width="4" height="24"><title>5422358 · 2026-07-12 · Commit Phase 4 wireframe and link it from the dev plan</title></rect>
+<rect x="14.9" y="4" width="4" height="24"><title>8989572 · 2026-07-12 · Add persistent per-worker result history to websearch subagent plan</title></rect>
 <rect x="2.0" y="4" width="4" height="24"><title>95fa5c1 · 2026-07-11 · docs: plan browser-first web search subagent lab</title></rect></svg>
-    <ul class="commit-list"><li><span class="date">2026-07-17</span><span class="sha">9b5dc47</span><span class="subject">docs: specify interruption and work item contracts</span></li>
+    <ul class="commit-list"><li><span class="date">2026-07-18</span><span class="sha">090c275</span><span class="subject">wire local Small WebRTC server transport</span></li>
+<li><span class="date">2026-07-17</span><span class="sha">9b5dc47</span><span class="subject">docs: specify interruption and work item contracts</span></li>
 <li><span class="date">2026-07-16</span><span class="sha">8a58d9b</span><span class="subject">docs: refine routing and multi-intent architecture</span></li>
 <li><span class="date">2026-07-12</span><span class="sha">ad86d51</span><span class="subject">docs: clarify browser pipeline design</span></li>
 <li><span class="date">2026-07-12</span><span class="sha">5422358</span><span class="subject">Commit Phase 4 wireframe and link it from the dev plan</span></li>
@@ -289,13 +291,14 @@ footer code { font-family: ui-monospace, monospace; background: var(--bg-card); 
 <h2>Issues &amp; Solutions</h2>
 <ul><li><strong>Electron increased first-slice scope:</strong> defer it to a separate plan after the browser protocol and interruption UX are proven.</li><li><strong>Requested word-level spoken styling may exceed available evidence:</strong> start with conservative utterance-level completion/interruption styling and promote to finer progress only if Pipecat events provide verifiable alignment.</li></ul>
 <h2>Final Results</h2>
-<p>Not implemented yet.</p></div>
+<p>Transport selection is now explicit for the browser slice: local development uses Pipecat Small WebRTC, with <code>/api/session</code>, <code>/api/rtc</code>, and ICE PATCH signaling served by the FastAPI host. The browser obtains the durable session identity and proposed epoch before connecting, and the connection callback attaches a Pipecat <code>SmallWebRTCTransport</code>/<code>PipelineWorker</code> to the process-lifetime runner. Daily transport remains a deployment adapter to add only if this lab is deployed to a cloud runtime; it is not an alternate local transport path.</p>
+<p>The configured local STT/TTS adapters now have a real websocket client path for UDS, TCP, WS, and WSS endpoints, while retaining an injectable factory seam for verified sibling-service clients. The live Small WebRTC worker and RTVI event path are wired and fenced. The full feature remains incomplete until the credential-safe local media acceptance procedure proves microphone capture, live local STT/TTS, and audible browser output.</p></div>
   </section>
 </main>
 <footer>
-  Source: <code>~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans/20260711-feature-websearch-subagent-electron.md</code> · sha256 <code>f587c1a6f7ab</code> ·
-  rendered at <code>2026-07-17 20:52 UTC</code> ·
-  do not hand-edit — regenerate with <code>python3 /Users/vr000m/.claude/plugins/cache/skein/skein/0.5.2/skills/plan-view/generate.py ~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans</code>
+  Source: <code>~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans/20260711-feature-websearch-subagent-electron.md</code> · sha256 <code>f776dbac5482</code> ·
+  rendered at <code>2026-07-18 19:47 UTC</code> ·
+  do not hand-edit — regenerate with <code>python3 /Users/vr000m/.codex/plugins/cache/skein/skein/0.5.3/skills/plan-view/generate.py ~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans</code>
 </footer>
 </body>
 </html>
