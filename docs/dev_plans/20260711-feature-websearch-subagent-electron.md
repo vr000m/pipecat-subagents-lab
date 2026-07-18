@@ -471,7 +471,7 @@ sequenceDiagram
 - [x] Python and client product questions answered
 - [x] Browser-first architecture drafted
 - [x] Plan reviewed and findings addressed
-- [ ] User confirmed implementation may begin
+- [x] User confirmed implementation may begin
 - [ ] Implementation completed and verified
 
 ## Findings
@@ -502,3 +502,10 @@ verified sibling-service clients. The live Small WebRTC worker and RTVI event
 path are wired and fenced. The full feature remains incomplete until the
 credential-safe local media acceptance procedure proves microphone capture,
 live local STT/TTS, and audible browser output.
+
+Runtime hardening now also covers fail-closed same-origin discovery, expiring
+per-epoch signaling tokens with no-store responses, strict canonical-result
+normalization, nested runtime-snapshot validation, immutable catalogue-bound
+dispatch, unique concurrent turn IDs, connection-local STT/TTS clients, TTS
+EOF failure recovery, and generation-fenced browser callbacks. The browser
+check command now runs a real ESLint pass in addition to the build.

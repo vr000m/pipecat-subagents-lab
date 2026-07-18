@@ -69,9 +69,9 @@ test("onServerMessage rejects unsupported contracts before applying state", () =
       session_id: "session-1",
       kind: "runtime_snapshot",
       sequence: 1,
-      data: { session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [] },
+      data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
     });
-    callbacks.onServerMessage({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, data: { result_id: "result-1" } });
+    callbacks.onServerMessage({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, origin_epoch: 1, data: { result_id: "result-1" } });
     expect(app.getState().lastAppliedSequence).toBe(2);
   });
 });

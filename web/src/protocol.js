@@ -13,6 +13,68 @@ const runtimeKinds = new Set([
   "bot_transcript",
   "runtime_snapshot",
 ]);
+const deliveryStates = new Set([
+  "displayed",
+  "queued",
+  "started",
+  "synthesis_ended",
+  "delivery_completed",
+  "delivery_unknown",
+  "interrupted",
+  "interrupted_by_reconnect",
+  "paused",
+  "resumed",
+]);
+
+function validOrigin(value) {
+  return value === undefined || value === null || (Number.isInteger(value) && value >= 0);
+}
+
+function validCitation(value) {
+  if (!value || typeof value !== "object" || typeof value.url !== "string") return false;
+  if (Object.keys(value).some((key) => !["title", "url"].includes(key))) return false;
+  try {
+    const url = new URL(value.url);
+    return (url.protocol === "http:" || url.protocol === "https:") && typeof value.title === "string";
+  } catch {
+    return false;
+  }
+}
+
+function validWorker(value) {
+  if (!value || Object.keys(value).some((key) => !["worker_id", "topic", "model_policy", "status", "latest_result_id", "origin_epoch"].includes(key))) return false;
+  return value && typeof value === "object" &&
+    typeof value.worker_id === "string" && typeof value.topic === "string" &&
+    typeof value.model_policy === "string" && typeof value.status === "string" &&
+    (value.latest_result_id === null || typeof value.latest_result_id === "string") &&
+    Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
+}
+
+function validResult(value) {
+  const keys = ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "ui_text", "spoken_result_id", "ui_result_id", "spoken_citations", "ui_citations", "origin_epoch"];
+  if (!value || Object.keys(value).some((key) => !keys.includes(key))) return false;
+  const validOptionalId = (item) => item === null || typeof item === "string";
+  const validOptionalCitations = (items) => items === null || (Array.isArray(items) && items.every(validCitation));
+  return value && typeof value === "object" &&
+    typeof value.result_id === "string" && typeof value.worker_id === "string" &&
+    typeof value.turn_id === "string" && typeof value.timestamp === "string" &&
+    typeof value.text === "string" && typeof value.spoken_text === "string" &&
+    typeof value.ui_text === "string" && value.spoken_text === value.text &&
+    value.ui_text === value.text && Array.isArray(value.citations) &&
+    value.citations.every(validCitation) && validOptionalId(value.spoken_result_id) &&
+    validOptionalId(value.ui_result_id) && value.spoken_result_id === value.result_id &&
+    value.ui_result_id === value.result_id && validOptionalCitations(value.spoken_citations) &&
+    validOptionalCitations(value.ui_citations) && Object.hasOwn(value, "origin_epoch") &&
+    validOrigin(value.origin_epoch);
+}
+
+function validSpeech(value) {
+  if (!value || Object.keys(value).some((key) => !["result_id", "work_item_id", "run_id", "utterance_id", "state", "origin_epoch"].includes(key))) return false;
+  return value && typeof value === "object" &&
+    typeof value.result_id === "string" && typeof value.work_item_id === "string" &&
+    typeof value.run_id === "string" && typeof value.utterance_id === "string" &&
+    deliveryStates.has(value.state) && Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
+}
 
 export function validateServerMessage(message) {
   if (!message || typeof message !== "object" || typeof message.kind !== "string") return false;
@@ -34,8 +96,12 @@ export function validateServerMessage(message) {
   if (message.kind === "runtime_snapshot") {
     if (typeof data.session_id !== "string" || data.session_id.length === 0) return false;
     if (message.session_id !== undefined && message.session_id !== data.session_id) return false;
+    if (data.contract_version !== CONTRACT_VERSION || !validOrigin(data.origin_epoch)) return false;
     if (!Number.isInteger(data.snapshot_sequence) || data.snapshot_sequence < 0) return false;
     if (!Array.isArray(data.workers) || !Array.isArray(data.results) || !Array.isArray(data.speech_progress)) {
+      return false;
+    }
+    if (!data.workers.every(validWorker) || !data.results.every(validResult) || !data.speech_progress.every(validSpeech)) {
       return false;
     }
   }

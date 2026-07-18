@@ -22,7 +22,7 @@ test("browser entrypoint owns remote audio and handles track lifecycle", () => {
 });
 
 test("entrypoint requests a snapshot only after Pipecat reports bot readiness", () => {
-  expect(appSource).toContain('onConnected: () => update({ ...state, connection: "connected" })');
+  expect(appSource).toContain("onConnected: () => { if (current()) update");
   expect(appSource).toContain('onBotReady: () => requestSnapshot()');
   expect(appSource).toContain("if (!await connect()) return;");
 });
@@ -54,7 +54,7 @@ test("requires complete runtime snapshots and preserves state on malformed snaps
     kind: "runtime_snapshot",
     sequence: 1,
     session_id: "session-1",
-    data: { session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [] },
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
   };
   await protocol.receive(validSnapshot);
   const beforeMalformed = protocol.getState();
@@ -75,7 +75,7 @@ test("accepts a complete runtime snapshot with an envelope session id", () => {
     kind: "runtime_snapshot",
     sequence: 3,
     session_id: "session-1",
-    data: { session_id: "session-1", snapshot_sequence: 3, workers: [], results: [], speech_progress: [] },
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 3, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
   })).toBe(true);
 });
 
@@ -91,9 +91,9 @@ test("rejects an unsupported contract before it advances sequence state", async 
     session_id: "session-1",
     kind: "runtime_snapshot",
     sequence: 1,
-    data: { session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [] },
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
   });
-  await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, data: { result_id: "accepted" } });
+  await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, origin_epoch: 1, data: { result_id: "accepted" } });
   expect(protocol.getState().lastAppliedSequence).toBe(2);
 });
 
@@ -115,7 +115,7 @@ test("gates the first snapshot request on client readiness and ignores stale inc
     kind: "runtime_snapshot",
     sequence: 10,
     session_id: "session-1",
-    data: { session_id: "session-1", snapshot_sequence: 10, workers: [], results: [], speech_progress: [] },
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 10, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
   });
   await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 9, data: { result_id: "stale" } });
   expect(protocol.getState().lastAppliedSequence).toBe(10);

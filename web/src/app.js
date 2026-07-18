@@ -1,14 +1,49 @@
 import { PipecatClient } from "@pipecat-ai/client-js";
-import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
+import { DailyMediaManager, SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { validateServerMessage } from "./protocol.js";
 import { applyServerMessage, createInitialState } from "./state.js";
 import { render } from "./render.js";
+
+function createDeferredMicrophoneManager() {
+  let transport;
+  let microphoneRequested = false;
+  const manager = new DailyMediaManager(false, false, async (event) => {
+    if (!transport?.pc) return;
+    if (event.type === "audio") {
+      await transport.getAudioTransceiver().sender.replaceTrack(event.track);
+    } else if (event.type === "video") {
+      await transport.getVideoTransceiver().sender.replaceTrack(event.track);
+    }
+  });
+  const initialize = manager.initialize.bind(manager);
+  const connect = manager.connect.bind(manager);
+  const enableMic = manager.enableMic.bind(manager);
+  manager.connect = async () => {
+    if (microphoneRequested) await connect();
+  };
+  manager.initialize = async () => {
+    if (microphoneRequested) await initialize();
+  };
+  manager.enableMic = (enabled) => {
+    if (!enabled) return enableMic(false);
+    microphoneRequested = true;
+    return connect().then(() => enableMic(true));
+  };
+  return {
+    manager,
+    bind(nextTransport) {
+      transport = nextTransport;
+    },
+  };
+}
 
 export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", sessionUrl = "/api/session", fetchImpl = globalThis.fetch, clientFactory, transportFactory } = {}) {
   root ??= documentRef?.querySelector?.("#app");
   let state = createInitialState();
   let client;
   let connectPromise = null;
+  let generation = 0;
+  let activeGeneration = 0;
   let audio = documentRef.createElement("audio");
   audio.autoplay = true;
   audio.playsInline = true;
@@ -17,44 +52,52 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
 
   const content = documentRef.createElement("div");
   const update = (next) => { state = next; render(state, content); };
-  const requestSnapshot = () => client?.sendClientMessage("snapshot-request");
   const report = (message) => update({ ...state, localDiagnostics: { ...state.localDiagnostics, message } });
-  const attachTrack = (track, participant) => {
-    if (participant?.local || track?.kind !== "audio") return;
-    audio.srcObject = new MediaStream([track]);
-    audio.play().catch(() => report("Assistant audio is ready, but playback was blocked. Click the page or Play audio to allow it."));
-  };
-  const detachTrack = (track) => {
-    if (!audio.srcObject) return;
-    const tracks = audio.srcObject.getTracks();
-    if (!track || tracks.includes(track)) audio.srcObject = null;
-  };
 
-  const callbacks = {
-    onConnected: () => update({ ...state, connection: "connected" }),
-    // PipecatClient.connect() sends the standard RTVI client-ready message
-    // before resolving onBotReady. Request the server-authoritative snapshot
-    // only after that media/RTVI readiness boundary.
-    onBotReady: () => requestSnapshot(),
-    onDisconnected: () => update({ ...state, connection: "disconnected" }),
-    onError: (message) => report(message?.data?.message || "The RTVI connection reported an error."),
-    onServerMessage: (message) => {
-      const candidate = message?.data?.kind ? message.data : message;
-      if (!validateServerMessage(candidate)) {
-        report("Ignored malformed or unsupported server message.");
-        return;
-      }
-      update(applyServerMessage(state, candidate, requestSnapshot));
-    },
-    onTrackStarted: attachTrack,
-    onTrackStopped: detachTrack,
-    onUserTranscript: (data) => update({ ...state, transcript: [...state.transcript, { role: "user", ...data }] }),
-    onBotTranscript: (data) => update({ ...state, transcript: [...state.transcript, { role: "assistant", ...data }] }),
+  const callbacksFor = (callbackGeneration) => {
+    const current = () => callbackGeneration === activeGeneration;
+    const requestSnapshot = () => {
+      if (current()) client?.sendClientMessage("snapshot-request");
+    };
+    const attachTrack = (track, participant) => {
+      if (!current() || participant?.local || track?.kind !== "audio") return;
+      audio.srcObject = new MediaStream([track]);
+      audio.play().catch(() => report("Assistant audio is ready, but playback was blocked. Click the page or Play audio to allow it."));
+    };
+    const detachTrack = (track) => {
+      if (!current() || !audio.srcObject) return;
+      const tracks = audio.srcObject.getTracks();
+      if (!track || tracks.includes(track)) audio.srcObject = null;
+    };
+    return {
+      onConnected: () => { if (current()) update({ ...state, connection: "connected" }); },
+      // PipecatClient.connect() sends the standard RTVI client-ready message
+      // before resolving onBotReady. Request the server-authoritative snapshot
+      // only after that media/RTVI readiness boundary.
+      onBotReady: () => requestSnapshot(),
+      onDisconnected: () => { if (current()) update({ ...state, connection: "disconnected" }); },
+      onError: (message) => { if (current()) report(message?.data?.message || "The RTVI connection reported an error."); },
+      onServerMessage: (message) => {
+        if (!current()) return;
+        const candidate = message?.data?.kind ? message.data : message;
+        if (!validateServerMessage(candidate)) {
+          report("Ignored malformed or unsupported server message.");
+          return;
+        }
+        update(applyServerMessage(state, candidate, requestSnapshot));
+      },
+      onTrackStarted: attachTrack,
+      onTrackStopped: detachTrack,
+      onUserTranscript: (data) => { if (current()) update({ ...state, transcript: [...state.transcript, { role: "user", ...data }] }); },
+      onBotTranscript: (data) => { if (current()) update({ ...state, transcript: [...state.transcript, { role: "assistant", ...data }] }); },
+    };
   };
 
   const connect = async () => {
     if (connectPromise) return connectPromise;
     connectPromise = (async () => {
+    const callbackGeneration = ++generation;
+    activeGeneration = callbackGeneration;
     let connectionUrl = webrtcUrl;
     if (!transportFactory && fetchImpl) {
       try {
@@ -73,9 +116,16 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
         return false;
       }
     }
+    let deferredMic;
     const transport = transportFactory
       ? transportFactory({ webrtcUrl: connectionUrl })
-      : new SmallWebRTCTransport({ webrtcUrl: connectionUrl });
+      : (() => {
+        deferredMic = createDeferredMicrophoneManager();
+        const nextTransport = new SmallWebRTCTransport({ webrtcUrl: connectionUrl, mediaManager: deferredMic.manager });
+        deferredMic.bind(nextTransport);
+        return nextTransport;
+      })();
+    const callbacks = callbacksFor(callbackGeneration);
     client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: false });
     try {
       await client.connect();
@@ -92,6 +142,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     try { return await connectPromise; } finally { connectPromise = null; }
   };
   const disconnect = async () => {
+    activeGeneration = ++generation;
     client?.enableMic(false);
     await client?.disconnect();
     audio.srcObject = null;
