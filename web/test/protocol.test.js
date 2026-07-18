@@ -12,12 +12,17 @@ test("browser entrypoint starts with microphone capture disabled", () => {
 });
 
 test("browser entrypoint owns remote audio and handles track lifecycle", () => {
-  expect(appSource).toContain('document.createElement("audio")');
+  expect(appSource).toContain('createElement("audio")');
   expect(appSource).toContain("audio.srcObject = new MediaStream([track])");
   expect(appSource).toContain("audio.srcObject = null");
   expect(appSource).toContain("onTrackStarted: attachTrack");
   expect(appSource).toContain("onTrackStopped: detachTrack");
   expect(appSource).toContain("playback was blocked");
+});
+
+test("entrypoint requests a snapshot after connect and preserves Connect after failure", () => {
+  expect(appSource).toContain('onConnected: () => { update({ ...state, connection: "connected" }); requestSnapshot(); }');
+  expect(appSource).toContain("if (!await connect()) return;");
 });
 
 test("page has no credential-bearing or server-diagnostic browser contract", () => {

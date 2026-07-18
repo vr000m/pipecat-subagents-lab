@@ -19,23 +19,34 @@ class RuntimeObserver:
         return tuple(
             {
                 "contract_version": "v1.0",
-                "session_sequence": event.sequence,
-                "type": event.kind,
+                "sequence": event.sequence,
+                "kind": event.kind,
                 "data": event.payload,
-                "origin_epoch": self.epoch,
+                "origin_epoch": (
+                    event.payload["origin_epoch"]
+                    if event.payload.get("origin_epoch") is not None
+                    else self.epoch
+                ),
             }
             for event in self.state.events
             if event.sequence > after_sequence
+            and event.payload.get("origin_epoch") in (None, self.epoch)
         )
 
     def frame(self, event: StateEvent) -> Any:
         """Build the framework frame when available, while keeping tests dependency-free."""
+        if event.payload.get("origin_epoch") not in (None, self.epoch):
+            return None
         payload = {
             "contract_version": "v1.0",
-            "session_sequence": event.sequence,
-            "type": event.kind,
+            "sequence": event.sequence,
+            "kind": event.kind,
             "data": event.payload,
-            "origin_epoch": self.epoch,
+            "origin_epoch": (
+                event.payload["origin_epoch"]
+                if event.payload.get("origin_epoch") is not None
+                else self.epoch
+            ),
         }
         try:
             from pipecat.frames.frames import RTVIServerMessageFrame

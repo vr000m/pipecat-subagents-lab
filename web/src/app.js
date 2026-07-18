@@ -3,16 +3,17 @@ import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { applyServerMessage, createInitialState } from "./state.js";
 import { render } from "./render.js";
 
-export function createApp({ root = document.querySelector("#app"), webrtcUrl = "/api/rtc", clientFactory } = {}) {
+export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", clientFactory, transportFactory } = {}) {
+  root ??= documentRef?.querySelector?.("#app");
   let state = createInitialState();
   let client;
-  let audio = document.createElement("audio");
+  let audio = documentRef.createElement("audio");
   audio.autoplay = true;
   audio.playsInline = true;
   audio.setAttribute("aria-label", "Assistant audio");
-  document.body.append(audio);
+  documentRef.body.append(audio);
 
-  const content = document.createElement("div");
+  const content = documentRef.createElement("div");
   const update = (next) => { state = next; render(state, content); };
   const requestSnapshot = () => client?.sendClientMessage("snapshot-request");
   const report = (message) => update({ ...state, localDiagnostics: { ...state.localDiagnostics, message } });
@@ -28,7 +29,7 @@ export function createApp({ root = document.querySelector("#app"), webrtcUrl = "
   };
 
   const callbacks = {
-    onConnected: () => update({ ...state, connection: "connected" }),
+    onConnected: () => { update({ ...state, connection: "connected" }); requestSnapshot(); },
     onDisconnected: () => update({ ...state, connection: "disconnected" }),
     onError: (message) => report(message?.data?.message || "The RTVI connection reported an error."),
     onServerMessage: (message) => update(applyServerMessage(state, message, requestSnapshot)),
@@ -39,16 +40,20 @@ export function createApp({ root = document.querySelector("#app"), webrtcUrl = "
   };
 
   const connect = async () => {
-    const transport = new SmallWebRTCTransport({ webrtcUrl });
+    const transport = transportFactory
+      ? transportFactory({ webrtcUrl })
+      : new SmallWebRTCTransport({ webrtcUrl });
     client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: false });
     try {
       await client.connect();
       update({ ...state, connection: "connected" });
       // Connect is a user gesture, so a previously-created audio element may play here.
       audio.play().catch(() => report("Connected, but browser audio is blocked. Click Play audio to continue."));
+      return true;
     } catch (error) {
       report(`Connection failed: ${error?.message || error}`);
       update({ ...state, connection: "disconnected" });
+      return false;
     }
   };
   const disconnect = async () => {
@@ -65,15 +70,18 @@ export function createApp({ root = document.querySelector("#app"), webrtcUrl = "
   };
 
   root.replaceChildren();
-  const header = document.createElement("header");
+  const header = documentRef.createElement("header");
   header.className = "topbar";
-  header.append(el("h1", "Pipecat Subagents Lab"));
-  const connectButton = el("button", "Connect");
-  const disconnectButton = el("button", "Disconnect");
-  const micButton = el("button", "Mic: off");
-  const playButton = el("button", "Play audio");
+  header.append(el(documentRef, "h1", "Pipecat Subagents Lab"));
+  const connectButton = el(documentRef, "button", "Connect");
+  const disconnectButton = el(documentRef, "button", "Disconnect");
+  const micButton = el(documentRef, "button", "Mic: off");
+  const playButton = el(documentRef, "button", "Play audio");
   disconnectButton.disabled = true; micButton.disabled = true; playButton.hidden = true;
-  connectButton.onclick = async () => { await connect(); connectButton.disabled = true; disconnectButton.disabled = false; micButton.disabled = false; playButton.hidden = false; };
+  connectButton.onclick = async () => {
+    if (!await connect()) return;
+    connectButton.disabled = true; disconnectButton.disabled = false; micButton.disabled = false; playButton.hidden = false;
+  };
   disconnectButton.onclick = async () => { await disconnect(); connectButton.disabled = false; disconnectButton.disabled = true; micButton.disabled = true; };
   micButton.onclick = toggleMic;
   playButton.onclick = () => audio.play().catch(() => report("Playback is still blocked; check browser site permissions."));
@@ -83,8 +91,8 @@ export function createApp({ root = document.querySelector("#app"), webrtcUrl = "
   return { connect, disconnect, toggleMic, getState: () => state, getClient: () => client, audio };
 }
 
-function el(tag, text, className) {
-  const node = document.createElement(tag);
+function el(documentRef, tag, text, className) {
+  const node = documentRef.createElement(tag);
   node.textContent = text;
   if (className) node.className = className;
   return node;

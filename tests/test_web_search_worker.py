@@ -1,6 +1,7 @@
 """Web-worker policy owns query refinement and hosted-search invocation."""
 
 import asyncio
+import threading
 
 from server.workers.web_search import WebSearchWorker
 
@@ -12,6 +13,16 @@ class FakeResponses:
 
     async def create(self, **kwargs: object) -> dict:
         self.calls.append(kwargs)
+        return self.payload
+
+
+class SyncResponses:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.calls: list[tuple[dict, int]] = []
+
+    def create(self, **kwargs: object) -> dict:
+        self.calls.append((kwargs, threading.get_ident()))
         return self.payload
 
 
@@ -47,3 +58,16 @@ def test_worker_declines_or_clarifies_without_calling_search_when_web_cannot_sat
 
     assert provider.calls == []
     assert result.outcome in {"decline", "clarify"}
+
+
+def test_worker_runs_sync_responses_client_off_event_loop() -> None:
+    provider = SyncResponses({"output_text": "The answer."})
+
+    async def run() -> tuple[int, int]:
+        loop_thread = threading.get_ident()
+        worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+        await worker.search("What happened?", turn_id="turn-1")
+        return loop_thread, provider.calls[0][1]
+
+    loop_thread, provider_thread = asyncio.run(run())
+    assert provider_thread != loop_thread

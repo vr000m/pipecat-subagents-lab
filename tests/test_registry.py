@@ -1,12 +1,29 @@
 """The registry owns persistent context identities and immutable catalogues."""
 
 from server.registry import WorkerRegistry
+from server.workers.web_search import WebSearchWorker
 
 
 class FakeContextWorker:
     def __init__(self, worker_id: str) -> None:
         self.worker_id = worker_id
         self.turns: list[str] = []
+
+
+class FakeResponses:
+    pass
+
+
+def test_new_web_search_worker_uses_injected_provider_and_configured_model() -> None:
+    provider = FakeResponses()
+    registry = WorkerRegistry(responses=provider)
+
+    item = registry.get_or_create(topic="news", worker_type="web_search", model_policy="deep")
+
+    assert isinstance(item.worker, WebSearchWorker)
+    assert item.worker.responses is provider
+    assert item.worker.model == registry.config.worker_model_policy["deep"]
+    assert item.metadata.model_policy == "deep"
 
 
 def test_registry_keeps_two_workers_and_same_topic_identity_persistent() -> None:

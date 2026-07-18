@@ -144,7 +144,9 @@ class SessionHost:
         elif self.runner is not None:
             cancel = getattr(self.runner, "cancel", None)
             if cancel is not None:
-                cancel("session shutdown")
+                result = cancel("session shutdown")
+                if hasattr(result, "__await__"):
+                    await result
         if self._runner_task is not None:
             try:
                 await self._runner_task

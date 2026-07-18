@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import asyncio
 from typing import Any, Callable, Mapping
 
 from ..contracts import GroundedResult
@@ -69,6 +70,7 @@ class WebSearchWorker(ContextWorker):
         topic: str = "web-search",
         model: str,
         responses: Any,
+        model_policy: str | None = None,
         decline: Callable[[str], bool] | None = None,
         can_satisfy: Callable[[str], bool] | None = None,
     ) -> None:
@@ -77,10 +79,11 @@ class WebSearchWorker(ContextWorker):
             worker_type="web_search",
             topic=topic,
             topic_summary=topic,
-            model_policy=model,
+            model_policy=model_policy or model,
             capabilities={"public_web": True},
         )
         super().__init__(metadata)
+        self.model = model
         self.responses = responses
         self.decline = decline or (
             lambda query: can_satisfy(query) is False if can_satisfy else False
@@ -100,7 +103,7 @@ class WebSearchWorker(ContextWorker):
             raise WorkerDeclined("hosted web search cannot satisfy this request")
 
         kwargs = {
-            "model": self.metadata.model_policy,
+            "model": self.model,
             "tools": [{"type": "web_search"}],
             "input": refined,
             "store": False,
@@ -108,7 +111,11 @@ class WebSearchWorker(ContextWorker):
         self.requests.append(kwargs.copy())
 
         async def execute() -> Any:
-            response = self.responses.create(**kwargs)
+            create = self.responses.create
+            if inspect.iscoroutinefunction(create):
+                response = create(**kwargs)
+            else:
+                response = await asyncio.to_thread(create, **kwargs)
             if inspect.isawaitable(response):
                 response = await response
             return response

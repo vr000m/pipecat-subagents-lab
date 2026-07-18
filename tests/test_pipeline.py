@@ -6,6 +6,26 @@ from server.contracts import GroundedResult, WorkerState
 from server.pipeline import SessionHost
 
 
+class AsyncCancelRunner:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def cancel(self, reason: str) -> None:
+        await asyncio.sleep(0)
+        self.cancelled = reason
+
+
+def test_shutdown_awaits_async_cancel_fallback() -> None:
+    async def run() -> None:
+        runner = AsyncCancelRunner()
+        host = SessionHost(runner_factory=lambda: runner)
+        await host.start()
+        await host.shutdown()
+        assert runner.cancelled == "session shutdown"
+
+    asyncio.run(run())
+
+
 def handshake(host: SessionHost, epoch: int) -> dict[str, object]:
     return {
         "session_id": host.state.session_id,
@@ -37,8 +57,30 @@ def test_connection_observer_projects_canonical_runtime_events_without_live_serv
         )
 
         messages = host.connection.observer.messages()
-        assert [message["type"] for message in messages] == ["worker", "result"]
+        assert [message["kind"] for message in messages] == ["worker", "result"]
         assert messages[-1]["data"]["result_id"] == "result-1"
         assert messages[-1]["origin_epoch"] == 1
+
+    asyncio.run(run())
+
+
+def test_observer_does_not_relabel_old_epoch_events_as_current() -> None:
+    async def run() -> None:
+        host = SessionHost()
+        await host.connect(handshake(host, 2))
+        host.state.append_result(
+            GroundedResult(
+                result_id="old-result",
+                worker_id="worker-weather",
+                turn_id="turn-old",
+                text="Old answer",
+                spoken_text="Old answer",
+                ui_text="Old answer",
+                origin_epoch=1,
+            ),
+            origin_epoch=1,
+        )
+
+        assert host.connection.observer.messages() == ()
 
     asyncio.run(run())

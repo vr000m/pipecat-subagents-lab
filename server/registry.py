@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Callable
+
 from .config import Config
 from .router import WorkerCatalogue, WorkerCatalogueEntry
 from .workers.base import ContextWorker, WorkerMetadata
+from .workers.web_search import WebSearchWorker
+
+
+class _UnavailableResponses:
+    def create(self, **_: Any) -> Any:
+        raise RuntimeError("web-search provider is unavailable; inject a Responses client")
 
 
 @dataclass(frozen=True)
@@ -30,9 +38,15 @@ class RegistryPolicy:
 class WorkerRegistry:
     """Stable worker IDs with an explicit no-eviction policy."""
 
-    def __init__(self, config: Config | None = None, worker_factory: type | None = None) -> None:
+    def __init__(
+        self,
+        config: Config | None = None,
+        worker_factory: Callable[[str], ContextWorker] | None = None,
+        responses: Any = None,
+    ) -> None:
         self.config = config or Config()
         self.worker_factory = worker_factory
+        self.responses = responses
         self.policy = RegistryPolicy()
         self._workers: dict[str, RegisteredWorker] = {}
         self._version = 0
@@ -73,12 +87,31 @@ class WorkerRegistry:
         for item in self._workers.values():
             if item.metadata.topic == topic and item.metadata.worker_type == worker_type:
                 return item
+        worker: ContextWorker | None = None
+        if self.worker_factory is not None:
+            worker = self.worker_factory(f"worker-{len(self._workers) + 1}")
+        elif worker_type == "web_search":
+            if self.responses is None:
+                if self.config.openai_api_key:
+                    from openai import OpenAI
+
+                    self.responses = OpenAI(api_key=self.config.openai_api_key).responses
+                else:
+                    self.responses = _UnavailableResponses()
+            worker = WebSearchWorker(
+                model=self.config.resolve_worker_model(model_policy),
+                model_policy=model_policy,
+                responses=self.responses,
+                worker_id=f"worker-{len(self._workers) + 1}",
+                topic=topic,
+            )
         return self.register(
             worker_id=f"worker-{len(self._workers) + 1}",
             worker_type=worker_type,
             topic=topic,
             model_policy=model_policy,
             capabilities={"public_web": True},
+            worker=worker,
         )
 
     def validate_selection(self, snapshot: WorkerCatalogue, **kwargs: object) -> None:
@@ -108,7 +141,7 @@ class WorkerRegistry:
                 worker_type=item.metadata.worker_type,
                 topic=item.metadata.topic,
                 topic_summary=item.metadata.topic_summary,
-                status=item.worker.status,
+                status=getattr(item.worker, "status", "idle"),
                 capabilities=dict(item.metadata.capabilities),
                 model_policy=item.metadata.model_policy,
             )
