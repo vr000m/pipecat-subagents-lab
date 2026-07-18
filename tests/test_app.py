@@ -6,6 +6,8 @@ from server.app import create_app
 from server.config import Config
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
+from server.services.stt import LocalSTT
+from server.services.tts import LocalTTS
 
 
 class FakeRunner:
@@ -14,6 +16,28 @@ class FakeRunner:
 
     async def stop(self) -> None:
         pass
+
+
+def test_default_app_host_materializes_configured_local_speech_adapters(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("WEBSEARCH_STT_ENDPOINT", "uds:///tmp/local-stt.sock")
+    monkeypatch.setenv("WEBSEARCH_TTS_ENDPOINT", "ws://127.0.0.1:9000")
+
+    host = create_app().state.session_host
+
+    assert isinstance(host.stt, LocalSTT)
+    assert host.stt.endpoint.transport == "uds"
+    assert host.stt.endpoint.address == "/tmp/local-stt.sock"
+    assert isinstance(host.tts, LocalTTS)
+    assert host.tts.endpoint.transport == "ws"
+    assert host.tts.endpoint.address == "127.0.0.1:9000"
+
+
+def test_injected_session_host_is_preserved() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+
+    assert create_app(host).state.session_host is host
 
 
 def test_app_exposes_health_and_next_session_handshake() -> None:

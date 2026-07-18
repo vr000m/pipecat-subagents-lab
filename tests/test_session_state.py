@@ -175,6 +175,44 @@ def test_result_callback_epoch_must_match_result_origin_and_old_result_stays_his
     assert state.workers["worker-weather"].latest_result_id is None
 
 
+def test_reconnected_session_keeps_old_epoch_result_history_only() -> None:
+    state = SessionState(session_id="session-1")
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-weather",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+    state.active_epoch = 1
+    current = result("current").model_copy(update={"origin_epoch": 1})
+    state.append_result(current, origin_epoch=1)
+    state.speech_progress(
+        result_id="current",
+        work_item_id="work-current",
+        run_id="run-current",
+        utterance_id="utt-current",
+        state=DeliveryState.STARTED,
+        origin_epoch=1,
+    )
+
+    state.active_epoch = 2
+    old = result("old").model_copy(update={"origin_epoch": 1})
+    state.append_result(old, origin_epoch=1)
+    state.apply_speech_progress(
+        state.speech["utt-current"].model_copy(
+            update={"state": DeliveryState.DELIVERY_COMPLETED, "origin_epoch": 1}
+        ),
+        origin_epoch=1,
+    )
+
+    assert [item.result_id for item in state.results.results] == ["current", "old"]
+    assert state.workers["worker-weather"].latest_result_id == "current"
+    assert state.speech["utt-current"].state == DeliveryState.STARTED
+
+
 def test_snapshot_round_trip_rebuilds_worker_result_history_and_delivery_projection() -> None:
     state = SessionState(session_id="session-1")
     state.set_worker(

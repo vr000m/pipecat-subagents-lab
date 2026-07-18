@@ -22,10 +22,13 @@ from pipecat.transports.smallwebrtc.request_handler import (
 )
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
-from .config import Config
+from .config import Config, load_config
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .rtvi_messages import RTVIMessagePublisher
+from .registry import WorkerRegistry
+from .services.stt import LocalSTT, STTEndpoint
+from .services.tts import LocalTTS, TTSEndpoint
 
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -132,9 +135,18 @@ async def _attach_connection(
             await attached
 
 
+def _default_session_host() -> SessionHost:
+    """Build the default host from endpoint settings without wiring secrets to adapters."""
+    config = load_config()
+    registry = WorkerRegistry(config=config)
+    stt = LocalSTT(STTEndpoint(*config.stt_endpoint)) if config.stt_endpoint else None
+    tts = LocalTTS(TTSEndpoint(*config.tts_endpoint)) if config.tts_endpoint else None
+    return SessionHost(registry=registry, stt=stt, tts=tts)
+
+
 def create_app(host: SessionHost | None = None) -> FastAPI:
     """Create the local FastAPI app and its Small WebRTC signaling routes."""
-    session_host = host or SessionHost()
+    session_host = host if host is not None else _default_session_host()
     config = getattr(session_host.registry, "config", None) or Config()
     webrtc_handler = SmallWebRTCRequestHandler()
 
@@ -202,6 +214,6 @@ app = create_app()
 
 async def serve(host: SessionHost | None = None) -> SessionHost:
     """Start a host for embedding; production serving is provided by Uvicorn."""
-    runtime = host or SessionHost()
+    runtime = host if host is not None else _default_session_host()
     await runtime.start()
     return runtime

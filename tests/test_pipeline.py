@@ -4,6 +4,8 @@ import asyncio
 
 import pytest
 from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
+from pipecat.processors.frame_processor import FrameDirection
 
 import server.app as app_module
 from server.contracts import GroundedResult, WorkerState
@@ -143,6 +145,38 @@ def test_canonical_adapter_rejects_raw_frames_and_only_admits_downstream_results
         )
         is True
     )
+
+
+def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
+    async def run() -> None:
+        adapter = CanonicalResultAdapter()
+        forwarded: list[object] = []
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        adapter.push_frame = push  # type: ignore[method-assign]
+        frame = RTVIServerMessageFrame(
+            data={
+                "contract_version": "v1.0",
+                "session_id": "session-1",
+                "sequence": 4,
+                "kind": "runtime_snapshot",
+                "data": {"workers": [], "results": [], "speech_progress": []},
+                "origin_epoch": 2,
+            }
+        )
+
+        assert adapter.accepts(frame)
+        await adapter.process_frame(frame, FrameDirection.DOWNSTREAM)
+        assert forwarded == [frame]
+
+        raw = RTVIServerMessageFrame(data={"kind": "raw_llm_text", "text": "untrusted"})
+        assert not adapter.accepts(raw)
+        await adapter.process_frame(raw, FrameDirection.DOWNSTREAM)
+        assert forwarded == [frame]
+
+    asyncio.run(run())
 
 
 def test_connection_observer_unsubscribe_stops_future_listener_delivery() -> None:

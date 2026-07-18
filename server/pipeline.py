@@ -7,7 +7,10 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
+
 from .connection_arbiter import ConnectionArbiter
+from .contracts import CONTRACT_VERSION
 from .observers import RuntimeObserver
 from .registry import WorkerRegistry
 from .session_state import SessionState
@@ -62,6 +65,10 @@ except ImportError:  # pragma: no cover - dependency-free contract fallback
 class CanonicalResultAdapter(FrameProcessor):
     """Admit only normalized result frames to the transport side of the pipeline."""
 
+    _PUBLIC_RTVI_KINDS = frozenset(
+        {"runtime_snapshot", "result", "speech", "worker", "speech_progress"}
+    )
+
     def __init__(self) -> None:
         if FrameProcessor is not object:
             super().__init__()
@@ -71,9 +78,27 @@ class CanonicalResultAdapter(FrameProcessor):
         data = getattr(frame, "data", frame)
         if isinstance(data, dict) and data.get("kind") == "canonical_result":
             data = data.get("data", data)
-        return isinstance(data, dict) and all(
+        if isinstance(data, dict) and all(
             isinstance(data.get(field), str)
             for field in ("result_id", "text", "worker_id", "turn_id")
+        ):
+            return True
+        if not isinstance(frame, RTVIServerMessageFrame) or not isinstance(data, dict):
+            return False
+        sequence = data.get("sequence")
+        origin_epoch = data.get("origin_epoch")
+        return (
+            data.get("contract_version") == CONTRACT_VERSION
+            and isinstance(data.get("session_id"), str)
+            and isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence >= 0
+            and data.get("kind") in CanonicalResultAdapter._PUBLIC_RTVI_KINDS
+            and isinstance(data.get("data"), dict)
+            and (
+                origin_epoch is None
+                or (isinstance(origin_epoch, int) and not isinstance(origin_epoch, bool))
+            )
         )
 
     async def process_frame(self, frame: Any, direction: Any) -> None:
@@ -81,7 +106,7 @@ class CanonicalResultAdapter(FrameProcessor):
         if direction != getattr(FrameDirection, "DOWNSTREAM", direction) or not self.accepts(frame):
             return
         if FrameProcessor is not object:
-            await super().process_frame(frame, direction)
+            await self.push_frame(frame, direction)
 
 
 @dataclass
