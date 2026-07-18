@@ -62,3 +62,29 @@ def test_multi_intent_is_bounded_and_timeout_keeps_completed_results() -> None:
         assert outcome.pending_work_item_ids
 
     asyncio.run(run())
+
+
+def test_timeout_boundary_completion_is_retained_after_wait_returns_stale_done_set(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2, wait_timeout_ms=1)
+        real_wait = asyncio.wait
+
+        async def stale_wait(tasks, *, timeout):
+            await real_wait(tasks, timeout=timeout)
+            # Model the event-loop boundary where the task has completed but
+            # asyncio.wait returned before its completion was observed.
+            await asyncio.gather(*tasks)
+            return set(), set(tasks)
+
+        monkeypatch.setattr(asyncio, "wait", stale_wait)
+
+        async def worker(_worker_id: str, text: str) -> dict:
+            return await completed_worker(text)
+
+        outcome = await coordinator.submit("turn-boundary", [("worker", "done")], worker)
+        assert [result.text for result in outcome.results] == ["done"]
+        assert outcome.pending_work_item_ids == ()
+
+    asyncio.run(run())

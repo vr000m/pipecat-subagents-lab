@@ -10,8 +10,15 @@ from .contracts import Citation, GroundedResult
 
 
 class ProjectedResult:
-    def __init__(self, result_id: str, text: str, citations: list[Citation]) -> None:
-        self.result_id, self.text, self.citations = result_id, text, citations
+    def __init__(
+        self, result_id: str, text: str, citations: list[Citation], timestamp: str | None = None
+    ) -> None:
+        self.result_id, self.text, self.citations, self.timestamp = (
+            result_id,
+            text,
+            citations,
+            timestamp,
+        )
         self.spoken_text = self.ui_text = text
 
 
@@ -90,6 +97,6 @@ def project_result(
     ):
         raise ValueError("projections cannot add facts to the canonical result")
     return (
-        ProjectedResult(result.result_id, result.text, list(result.citations)),
-        ProjectedResult(result.result_id, result.text, list(result.citations)),
+        ProjectedResult(result.result_id, result.text, list(result.citations), result.timestamp),
+        ProjectedResult(result.result_id, result.text, list(result.citations), result.timestamp),
     )

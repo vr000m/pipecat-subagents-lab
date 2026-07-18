@@ -33,6 +33,7 @@ def test_spoken_and_ui_projections_share_one_canonical_id_and_cannot_add_facts()
     assert spoken.result_id == ui.result_id == result.result_id
     assert spoken.text == ui.text == result.text
     assert spoken.citations == ui.citations == result.citations
+    assert spoken.timestamp == ui.timestamp == result.timestamp
 
     with pytest.raises(ValueError):
         project_result(result, spoken_text="It will definitely snow.")

@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CONTRACT_VERSION = "v1.0"
+
+
+def utc_timestamp() -> str:
+    """Return a producer-generated ISO-8601 timestamp for wire contracts."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class StrictModel(BaseModel):
@@ -87,6 +93,7 @@ class GroundedResult(StrictModel):
     result_id: str
     worker_id: str
     turn_id: str
+    timestamp: str = Field(default_factory=utc_timestamp)
     text: str
     citations: list[Citation] = Field(default_factory=list)
     spoken_text: str

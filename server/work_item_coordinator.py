@@ -156,9 +156,12 @@ class WorkItemCoordinator:
                     self._tails.pop(worker_id, None)
 
         tasks = [asyncio.create_task(one(worker_id, text)) for worker_id, text in selected]
-        done, pending = await asyncio.wait(
-            tasks, timeout=self.config.multi_intent_wait_timeout_ms / 1000
-        )
+        await asyncio.wait(tasks, timeout=self.config.multi_intent_wait_timeout_ms / 1000)
+        # asyncio.wait can return its done set before a completion callback that
+        # crossed the timeout boundary has run. Give those callbacks one turn,
+        # then classify from the authoritative task state.
+        await asyncio.sleep(0)
+        done = {task for task in tasks if task.done()}
         raw_results = tuple(
             task.result() for task in tasks if task in done and task.exception() is None
         )
@@ -170,5 +173,7 @@ class WorkItemCoordinator:
             type("WorkItem", (), {"work_item_id": f"{turn_id}-{i}"})()
             for i, _ in enumerate(selected)
         )
-        pending_ids = tuple(work[i].work_item_id for i, task in enumerate(tasks) if task in pending)
+        pending_ids = tuple(
+            work[i].work_item_id for i, task in enumerate(tasks) if task not in done
+        )
         return SubmittedOutcome(work, results, pending_ids)

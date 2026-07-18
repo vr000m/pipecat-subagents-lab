@@ -1,5 +1,7 @@
 """Versioned Python contract invariants for the browser protocol."""
 
+from datetime import datetime
+
 import pytest
 
 from server.contracts import (
@@ -88,6 +90,8 @@ def test_canonical_result_drives_both_projections_and_preserves_origin_epoch() -
     assert result.spoken_text == result.ui_text == result.text
     assert result.spoken_result_id == result.ui_result_id == result.result_id
     assert result.spoken_citations == result.ui_citations == result.citations
+    assert datetime.fromisoformat(result.timestamp).tzinfo is not None
+    assert result.model_dump(mode="json")["timestamp"] == result.timestamp
     validate_contract(result)
 
 
