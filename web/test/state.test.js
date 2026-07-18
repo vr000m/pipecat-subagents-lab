@@ -16,6 +16,7 @@ const result = (resultId) => ({
 const snapshot = (sequence, results = []) => ({
   kind: "runtime_snapshot",
   sequence,
+  session_id: "session-1",
   data: {
     session_id: "session-1",
     snapshot_sequence: sequence,
@@ -28,6 +29,7 @@ const snapshot = (sequence, results = []) => ({
 const increment = (sequence, resultId) => ({
   kind: "result",
   sequence,
+  session_id: "session-1",
   data: result(resultId),
 });
 
@@ -141,26 +143,31 @@ describe("server-authoritative runtime reducer", () => {
     state = applyServerMessage(state, {
       kind: "routing",
       sequence: 2,
+      session_id: "session-1",
       data: { action: "existing_worker", worker_id: "worker-weather" },
     });
     state = applyServerMessage(state, {
       kind: "user_transcript",
       sequence: 3,
+      session_id: "session-1",
       data: { text: "What is the weather?", turn_id: "turn-1" },
     });
     state = applyServerMessage(state, {
       kind: "worker",
       sequence: 4,
+      session_id: "session-1",
       data: { worker: { worker_id: "worker-weather", topic: "weather", status: "working" } },
     });
     state = applyServerMessage(state, {
       kind: "result",
       sequence: 5,
+      session_id: "session-1",
       data: { result: result("result-1") },
     });
     state = applyServerMessage(state, {
       kind: "speech",
       sequence: 6,
+      session_id: "session-1",
       data: { progress: { utterance_id: "utterance-1", result_id: "result-1", state: "delivery_unknown" } },
     });
 
@@ -178,10 +185,40 @@ describe("server-authoritative runtime reducer", () => {
     state = applyServerMessage(state, {
       kind: "runtime_result",
       sequence: 3,
+      session_id: "session-1",
       data: { result: { ...result("result-1"), ui_text: "late duplicate wording" } },
     });
 
     expect(state.results).toHaveLength(1);
     expect(state.results[0].ui_text).toBe("Complete answer result-1");
+  });
+
+  test("rejects increments with missing or mismatched session fencing", () => {
+    let state = applyServerMessage(createInitialState(), snapshot(1));
+    const { session_id: _missingSession, ...missingMessage } = increment(2, "missing");
+    const missing = applyServerMessage(state, missingMessage);
+    const mismatched = applyServerMessage(state, {
+      ...increment(2, "mismatched"),
+      session_id: "session-other",
+    });
+
+    expect(missing.results).toEqual([]);
+    expect(mismatched.results).toEqual([]);
+    expect(missing.lastAppliedSequence).toBe(1);
+  });
+
+  test("rejects increments with missing or mismatched connection fencing", () => {
+    let state = applyServerMessage(createInitialState(), {
+      ...snapshot(1),
+      origin_epoch: 7,
+      data: { ...snapshot(1).data, origin_epoch: 7 },
+    });
+    const missing = applyServerMessage(state, increment(2, "missing-epoch"));
+    const mismatched = applyServerMessage(state, { ...increment(2, "stale-epoch"), origin_epoch: 6 });
+    const accepted = applyServerMessage(state, { ...increment(2, "current-epoch"), origin_epoch: 7 });
+
+    expect(missing.results).toEqual([]);
+    expect(mismatched.results).toEqual([]);
+    expect(accepted.results.map(({ result_id }) => result_id)).toEqual(["current-epoch"]);
   });
 });

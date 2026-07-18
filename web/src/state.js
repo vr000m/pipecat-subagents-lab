@@ -22,6 +22,7 @@ export function createInitialState() {
     localDiagnostics: { ...EMPTY_DIAGNOSTICS },
     lastAppliedSequence: 0,
     serverState: false,
+    connectionEpoch: null,
   };
 }
 
@@ -107,6 +108,7 @@ function snapshotState(state, snapshot, sequence) {
   return {
     ...state,
     sessionId: snapshot.session_id ?? state.sessionId,
+    connectionEpoch: snapshot.origin_epoch ?? state.connectionEpoch,
     workers: Array.isArray(snapshot.workers) ? snapshot.workers.map(projectedWorker).filter(Boolean) : [],
     results,
     speech,
@@ -161,6 +163,8 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
   const sequence = Number(message.sequence ?? 0);
   const kind = message.kind;
   const snapshot = kind === "runtime_snapshot" ? message.data ?? message.snapshot : null;
+  if (!snapshot && state.sessionId && message.session_id !== state.sessionId) return state;
+  if (!snapshot && state.connectionEpoch !== null && message.origin_epoch !== state.connectionEpoch) return state;
   if (snapshot) {
     const snapshotSequence = Number(snapshot.snapshot_sequence ?? sequence);
     if (snapshotSequence < Math.max(state.lastAppliedSequence, state.localDiagnostics.lastSnapshotSequence)) return state;

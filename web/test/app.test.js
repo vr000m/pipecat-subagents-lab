@@ -62,9 +62,9 @@ test("onServerMessage rejects unsupported contracts before applying state", () =
   void app;
   // Creating the client is intentionally deferred until connect.
   return app.connect().then(() => {
-    callbacks.onServerMessage({ contract_version: "v2.0", kind: "result", sequence: 1, data: {} });
+    callbacks.onServerMessage({ contract_version: "v2.0", session_id: "session-1", kind: "result", sequence: 1, data: {} });
     expect(app.getState().lastAppliedSequence).toBe(0);
-    callbacks.onServerMessage({ contract_version: "v1.0", kind: "result", sequence: 1, data: {} });
+    callbacks.onServerMessage({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 1, data: { result_id: "result-1" } });
     expect(app.getState().lastAppliedSequence).toBe(1);
   });
 });

@@ -8,6 +8,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   root ??= documentRef?.querySelector?.("#app");
   let state = createInitialState();
   let client;
+  let connectPromise = null;
   let audio = documentRef.createElement("audio");
   audio.autoplay = true;
   audio.playsInline = true;
@@ -52,6 +53,8 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   };
 
   const connect = async () => {
+    if (connectPromise) return connectPromise;
+    connectPromise = (async () => {
     let connectionUrl = webrtcUrl;
     if (!transportFactory && fetchImpl) {
       try {
@@ -85,6 +88,8 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       update({ ...state, connection: "disconnected" });
       return false;
     }
+    })();
+    try { return await connectPromise; } finally { connectPromise = null; }
   };
   const disconnect = async () => {
     client?.enableMic(false);

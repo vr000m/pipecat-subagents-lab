@@ -29,10 +29,9 @@ export WEBSEARCH_TTS_ENDPOINT=uds:///path/to/tts.sock
 ```
 
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
-Run the values-redacted preflight before connecting a browser. It health-checks
-both services, records the discovered transport/address for the adapters, and
-reports OpenAI capability as `available`, `unavailable`, or `unconfirmed`
-without printing the credential.
+The values-redacted preflight is implemented by `server.preflight.run_preflight`.
+Call it from the host integration that owns a service probe before connecting a
+browser. This repository does not expose a standalone preflight CLI.
 
 ### Verification commands
 
@@ -69,7 +68,8 @@ posts Small WebRTC offers to `/api/rtc`. Daily transport is not part of this
 local path; if the lab is deployed to a cloud runtime later, add Daily as a
 deployment adapter behind the same session and RTVI contracts.
 
-The required integrated test is `tests/integration/test_browser_session.py`.
+The integration test is `tests/integration/test_browser_session.py`; it is a
+credential-free contract test, not proof that live browser media is available.
 It uses fake model/provider boundaries and proves the routing matrix, same-topic
 context persistence, unrelated-worker isolation, citation normalization,
 canonical speech/UI identity, result-before-speech ordering, interruption on
@@ -78,13 +78,14 @@ does not call paid APIs or require live STT/TTS services.
 
 ### Browser and media acceptance
 
-Start the reviewed application host and the browser client using the local
+Start the application host and the browser client using the local
 Pipecat/Small WebRTC server configuration for the checkout. Connect only after
 the page is open, then explicitly enable the microphone; page initialization
-and connection must not acquire microphone media. Confirm a final transcript,
-local TTS synthesis, and audible browser output. Disconnecting must disable
-capture. If autoplay is blocked, use the page's audio action and record that
-diagnostic as local browser state.
+and connection must not acquire microphone media. When separately configured
+STT/TTS services are running, confirm a final transcript, local TTS synthesis,
+and audible browser output. Disconnecting must disable capture. If autoplay is
+blocked, use the page's audio action and record that diagnostic as local browser
+state.
 
 On reconnect, the server-issued `session_id`, resume token, and proposed epoch
 fence the replacement transport. The replacement receives a fresh snapshot of
