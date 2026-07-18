@@ -150,13 +150,15 @@ def test_app_exposes_health_and_next_session_handshake() -> None:
             "status": "ok",
             "transport": "smallwebrtc",
         }
-        handshake = client.get("/api/session").json()
+        response = client.get("/api/session", headers={"origin": "http://127.0.0.1:7860"})
+        handshake = response.json()
 
     assert handshake["contract_version"] == "v1.0"
     assert handshake["session_id"] == host.state.session_id
-    assert handshake["resume_token"] == host.state.resume_token
+    assert handshake["resume_token"] != host.state.resume_token
     assert handshake["proposed_epoch"] == 1
     assert handshake["snapshot_sequence"] == 0
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_offer_rejects_missing_or_wrong_session_identity_before_sdp_handling() -> None:
@@ -166,6 +168,7 @@ def test_offer_rejects_missing_or_wrong_session_identity_before_sdp_handling() -
         response = client.post(
             "/api/rtc?session_id=wrong&resume_token=wrong&proposed_epoch=1",
             json={"sdp": "v=0", "type": "offer"},
+            headers={"origin": "http://127.0.0.1:7860"},
         )
 
     assert response.status_code == 401
@@ -176,6 +179,13 @@ def test_session_discovery_rejects_cross_origin_requests() -> None:
     host = SessionHost(runner_factory=FakeRunner)
     with TestClient(create_app(host)) as client:
         response = client.get("/api/session", headers={"origin": "https://evil.example"})
+    assert response.status_code == 403
+
+
+def test_session_discovery_rejects_requests_without_an_origin() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    with TestClient(create_app(host)) as client:
+        response = client.get("/api/session")
     assert response.status_code == 403
 
 

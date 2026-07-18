@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from uuid import uuid4
+
+from pydantic import ValidationError
 
 from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
@@ -15,6 +19,7 @@ from .contracts import CONTRACT_VERSION, GroundedResult
 from .observers import RuntimeObserver
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
+from .router import RoutingValidationError
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
 from .workers.web_search import WorkerDeclined
@@ -77,15 +82,39 @@ class CanonicalResultAdapter(FrameProcessor):
             super().__init__()
 
     @staticmethod
-    def accepts(frame: Any) -> bool:
+    def _normalized_result(frame: Any) -> dict[str, Any] | None:
         data = getattr(frame, "data", frame)
         if isinstance(data, dict) and data.get("kind") == "canonical_result":
-            data = data.get("data", data)
-        if isinstance(data, dict) and all(
+            data = data.get("data", {key: value for key, value in data.items() if key != "kind"})
+        if not isinstance(data, dict) or not all(
             isinstance(data.get(field), str)
             for field in ("result_id", "text", "worker_id", "turn_id")
         ):
-            return True
+            return None
+        allowed = set(GroundedResult.model_fields)
+        if set(data) - allowed:
+            return None
+        try:
+            parsed = GroundedResult.model_validate(data)
+        except ValidationError:
+            return None
+        return canonical_result(
+            result_id=parsed.result_id,
+            worker_id=parsed.worker_id,
+            turn_id=parsed.turn_id,
+            text=parsed.text,
+            citations=[citation.model_dump() for citation in parsed.citations],
+            origin_epoch=parsed.origin_epoch,
+        ).model_dump(mode="json")
+
+    @staticmethod
+    def accepts(frame: Any) -> bool:
+        data = getattr(frame, "data", frame)
+        if isinstance(data, dict) and (
+            data.get("kind") == "canonical_result"
+            or all(field in data for field in ("result_id", "text", "worker_id", "turn_id"))
+        ):
+            return CanonicalResultAdapter._normalized_result(frame) is not None
         if not isinstance(frame, RTVIServerMessageFrame) or not isinstance(data, dict):
             return False
         sequence = data.get("sequence")
@@ -108,6 +137,17 @@ class CanonicalResultAdapter(FrameProcessor):
         """Keep the adapter a real Pipecat processor; canonical dicts use the app gate."""
         if direction != getattr(FrameDirection, "DOWNSTREAM", direction) or not self.accepts(frame):
             return
+        if isinstance(getattr(frame, "data", frame), dict) and (
+            getattr(frame, "data", frame).get("kind") == "canonical_result"
+            or all(
+                field in getattr(frame, "data", frame)
+                for field in ("result_id", "text", "worker_id", "turn_id")
+            )
+        ):
+            normalized = self._normalized_result(frame)
+            if normalized is None:
+                return
+            frame = normalized
         if FrameProcessor is not object:
             await self.push_frame(frame, direction)
 
@@ -125,12 +165,13 @@ class LabPipeline:
         return any(type(processor).__name__ == name for processor in self.processors)
 
     async def emit_worker_frame(self, frame: Any) -> bool:
-        if not CanonicalResultAdapter.accepts(frame):
+        normalized = CanonicalResultAdapter._normalized_result(frame)
+        if normalized is None:
             return False
         frames = getattr(self.transport, "frames", None)
         if frames is None:
             raise TypeError("transport must expose a frames collection for canonical output")
-        frames.append(frame)
+        frames.append(normalized)
         return True
 
 
@@ -155,6 +196,8 @@ class ConnectionPipeline:
     epoch: int
     observer: RuntimeObserver
     scheduler: SpeechScheduler
+    stt: Any | None = None
+    tts: Any | None = None
     transport: Any | None = None
     worker: Any | None = None
     worker_task: asyncio.Task[Any] | None = None
@@ -170,19 +213,32 @@ class ConnectionPipeline:
         if self.worker is not None:
             cancel = getattr(self.worker, "cancel", None)
             if cancel is not None:
-                result = cancel(reason=reason)
-                if hasattr(result, "__await__"):
-                    await result
+                try:
+                    result = cancel(reason=reason)
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:
+                    pass
             self.worker = None
         if self.worker_task is not None:
             self.worker_task.cancel()
             try:
                 await self.worker_task
-            except asyncio.CancelledError:
+            except BaseException:
                 pass
             finally:
                 self.worker_task = None
         self.observer.unsubscribe()
+        for service in (self.stt, self.tts):
+            cleanup = getattr(service, "cleanup", None)
+            if cleanup is None:
+                continue
+            try:
+                result = cleanup()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
 
 
 class SessionHost:
@@ -208,6 +264,8 @@ class SessionHost:
         self._runner_registered: set[str] = set()
         self._runner_task: asyncio.Task[Any] | None = None
         self.connection: ConnectionPipeline | None = None
+        self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
+        self._turn_sequence = 0
         self.started = False
 
     async def start(self) -> None:
@@ -265,10 +323,12 @@ class SessionHost:
         # Publish the new authority before awaiting any old transport cleanup.
         self.state.active_epoch = connection.epoch
         pipeline: ConnectionPipeline
+        connection_stt = self._connection_service(self.stt)
+        connection_tts = self._connection_service(self.tts)
 
         async def queue_speech(item: Any) -> None:
             if (
-                self.tts is None
+                connection_tts is None
                 or self.connection is not pipeline
                 or not pipeline.active
                 or item.origin_epoch != pipeline.epoch
@@ -284,17 +344,19 @@ class SessionHost:
         pipeline = ConnectionPipeline(
             connection.epoch,
             RuntimeObserver(self.state, connection.epoch),
-            SpeechScheduler(self.state, speak=queue_speech if self.tts is not None else None),
+            SpeechScheduler(self.state, speak=queue_speech if connection_tts is not None else None),
+            stt=connection_stt,
+            tts=connection_tts,
         )
-        if self.stt is not None and self.coordinator is not None:
+        if connection_stt is not None and self.coordinator is not None:
 
             async def on_final(text: str) -> Any:
                 if self.connection is not pipeline or not pipeline.active:
                     return None
                 return await self._handle_transcript(text, origin=pipeline)
 
-            self.stt.on_final = on_final
-        if self.tts is not None and hasattr(self.tts, "on_event"):
+            connection_stt.on_final = on_final
+        if connection_tts is not None and hasattr(connection_tts, "on_event"):
 
             async def on_tts_event(event: str, context_id: str) -> Any:
                 callback_result = None
@@ -342,12 +404,38 @@ class SessionHost:
                     await pipeline.scheduler.start_next()
                 return callback_result
 
-            self.tts.on_event = on_tts_event
+            connection_tts.on_event = on_tts_event
         self.connection = pipeline
         if old_connection is not None:
             await old_connection.shutdown()
         await self._register_persistent_workers()
         return pipeline
+
+    @staticmethod
+    def _connection_service(service: Any | None) -> Any | None:
+        if service is None:
+            return None
+        factory = getattr(service, "for_connection", None)
+        return factory() if factory is not None else service
+
+    def _next_turn_id(self) -> str:
+        self._turn_sequence += 1
+        return f"turn-{self._turn_sequence}"
+
+    def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
+        entry = self._handshake_tokens.get(token)
+        if entry is None:
+            return False
+        epoch, expires_at, redeemed = entry
+        if expires_at <= time.monotonic() or epoch != proposed_epoch:
+            self._handshake_tokens.pop(token, None)
+            return False
+        if redeem:
+            if redeemed:
+                return False
+            self._handshake_tokens[token] = (epoch, expires_at, True)
+            return True
+        return redeemed
 
     async def _handle_transcript(
         self, transcript: str, *, origin: ConnectionPipeline | None = None
@@ -363,6 +451,7 @@ class SessionHost:
         ):
             return transcript
         origin_epoch = origin.epoch
+        turn_id = self._next_turn_id()
         outcome = await asyncio.to_thread(
             self.coordinator.arbitrate, self.state.session_id, transcript
         )
@@ -385,9 +474,9 @@ class SessionHost:
                     "stop": "Stopping the active response.",
                 }.get(action, "Control request noted.")
             elif outcome.kind == "multi_intent":
-                return await self._handle_multi_intent(outcome, transcript, origin)
+                return await self._handle_multi_intent(outcome, transcript, origin, turn_id)
             elif outcome.kind == "continue_pending":
-                return await self._handle_pending(outcome, transcript, origin)
+                return await self._handle_pending(outcome, transcript, origin, turn_id)
             else:
                 text = None
             if text is None:
@@ -395,7 +484,7 @@ class SessionHost:
             return await self._commit_and_speak(
                 canonical_result(
                     worker_id="main",
-                    turn_id=f"turn-{self.state.sequence + 1}",
+                    turn_id=turn_id,
                     text=text,
                     origin_epoch=origin_epoch,
                 ),
@@ -414,19 +503,19 @@ class SessionHost:
             return await self._commit_and_speak(
                 canonical_result(
                     worker_id="main",
-                    turn_id=f"turn-{self.state.sequence + 1}",
+                    turn_id=turn_id,
                     text=text,
                     origin_epoch=origin_epoch,
                 ),
                 origin,
             )
         try:
-            worker = self.coordinator.dispatch(outcome.decision)
-        except UnsupportedWorkerType:
+            worker = self._dispatch(outcome.decision, getattr(outcome, "catalogue", None))
+        except (RoutingValidationError, UnsupportedWorkerType):
             return await self._commit_and_speak(
                 canonical_result(
                     worker_id="main",
-                    turn_id=f"turn-{self.state.sequence + 1}",
+                    turn_id=turn_id,
                     text="I cannot access that capability here.",
                     origin_epoch=origin_epoch,
                 ),
@@ -438,26 +527,26 @@ class SessionHost:
         if search is None:
             return outcome
         try:
-            result = await search(
-                transcript, turn_id=f"turn-{self.state.sequence + 1}", origin_epoch=origin_epoch
-            )
+            result = await search(transcript, turn_id=turn_id, origin_epoch=origin_epoch)
         except WorkerDeclined:
             result = canonical_result(
                 worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
-                turn_id=f"turn-{self.state.sequence + 1}",
+                turn_id=turn_id,
                 text="I could not find a reliable result for that request.",
                 origin_epoch=origin_epoch,
             )
         except Exception:
             result = canonical_result(
                 worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
-                turn_id=f"turn-{self.state.sequence + 1}",
+                turn_id=turn_id,
                 text="The web search is temporarily unavailable.",
                 origin_epoch=origin_epoch,
             )
         return await self._commit_and_speak(result, origin)
 
-    async def _handle_pending(self, outcome: Any, transcript: str, origin: Any) -> Any:
+    async def _handle_pending(
+        self, outcome: Any, transcript: str, origin: Any, turn_id: str
+    ) -> Any:
         owner_id = outcome.work_items[0] if outcome.work_items else None
         registered = self.coordinator.registry.get(owner_id) if owner_id else None
         worker = registered.worker if registered is not None else None
@@ -467,20 +556,20 @@ class SessionHost:
         try:
             result = await search(
                 transcript,
-                turn_id=f"turn-{self.state.sequence + 1}",
+                turn_id=turn_id,
                 origin_epoch=origin.epoch,
             )
         except Exception:
             result = canonical_result(
                 worker_id=owner_id or "main",
-                turn_id=f"turn-{self.state.sequence + 1}",
+                turn_id=turn_id,
                 text="The pending web request could not be completed.",
                 origin_epoch=origin.epoch,
             )
         return await self._commit_and_speak(result, origin)
 
     async def _handle_multi_intent(
-        self, outcome: Any, transcript: str, origin: Any
+        self, outcome: Any, transcript: str, origin: Any, turn_id: str
     ) -> tuple[Any, ...]:
         """Execute bounded compound work in the user's stated order."""
         del transcript
@@ -492,19 +581,20 @@ class SessionHost:
                 registered = self.coordinator.registry.get(pending.owner_id)
                 worker = registered.worker if registered is not None else None
             else:
+                catalogue = self.coordinator.registry.catalogue()
                 decision = await asyncio.to_thread(
                     self.coordinator.router.route,
                     item_text,
-                    self.coordinator.registry.catalogue(),
+                    catalogue,
                 )
                 try:
-                    worker = await asyncio.to_thread(self.coordinator.dispatch, decision)
-                except UnsupportedWorkerType:
+                    worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
+                except (RoutingValidationError, UnsupportedWorkerType):
                     results.append(
                         await self._commit_and_speak(
                             canonical_result(
                                 worker_id="main",
-                                turn_id=f"turn-{self.state.sequence + 1}",
+                                turn_id=f"{turn_id}-{index + 1}",
                                 text="I cannot access that capability here.",
                                 origin_epoch=origin.epoch,
                             ),
@@ -518,20 +608,20 @@ class SessionHost:
             try:
                 result = await search(
                     item_text,
-                    turn_id=f"turn-{self.state.sequence + 1}",
+                    turn_id=f"{turn_id}-{index + 1}",
                     origin_epoch=origin.epoch,
                 )
             except WorkerDeclined:
                 result = canonical_result(
                     worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
-                    turn_id=f"turn-{self.state.sequence + 1}",
+                    turn_id=f"{turn_id}-{index + 1}",
                     text="I could not find a reliable result for that request.",
                     origin_epoch=origin.epoch,
                 )
             except Exception:
                 result = canonical_result(
                     worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
-                    turn_id=f"turn-{self.state.sequence + 1}",
+                    turn_id=f"{turn_id}-{index + 1}",
                     text="The web search is temporarily unavailable.",
                     origin_epoch=origin.epoch,
                 )
@@ -543,7 +633,7 @@ class SessionHost:
         origin_epoch = result.origin_epoch
         self.state.append_result(result, origin_epoch=origin_epoch)
         if (
-            self.tts is None
+            origin.tts is None
             or self.connection is not origin
             or not origin.active
             or not self.accepts(origin_epoch)
@@ -561,13 +651,24 @@ class SessionHost:
 
     def session_handshake(self) -> dict[str, Any]:
         """Return the next browser handshake without mutating session state."""
+        token = uuid4().hex
+        self._handshake_tokens[token] = (
+            self.arbiter.epoch + 1,
+            time.monotonic() + 60,
+            False,
+        )
         return {
             "contract_version": "v1.0",
             "session_id": self.state.session_id,
-            "resume_token": self.state.resume_token,
+            "resume_token": token,
             "proposed_epoch": self.arbiter.epoch + 1,
             "snapshot_sequence": self.state.sequence,
         }
+
+    def _dispatch(self, decision: Any, catalogue: Any = None) -> Any:
+        if catalogue is None:
+            return self.coordinator.dispatch(decision)
+        return self.coordinator.dispatch(decision, catalogue=catalogue)
 
     def accepts(self, epoch: int) -> bool:
         return (

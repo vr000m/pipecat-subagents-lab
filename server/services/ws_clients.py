@@ -44,8 +44,11 @@ async def _events(ws: Any) -> AsyncIterator[dict[str, Any]]:
                 yield json.loads(raw)
             except json.JSONDecodeError:
                 continue
-    except websockets.exceptions.ConnectionClosed:
-        return
+    except websockets.exceptions.ConnectionClosed as exc:
+        yield {
+            "type": "error",
+            "message": f"local websocket closed before completion (code {exc.code})",
+        }
 
 
 class LocalSTTClient:

@@ -74,6 +74,14 @@ class LocalTTS(TTSService):
         self._client = None
         await super().cleanup()
 
+    def for_connection(self) -> LocalTTS:
+        """Create a client-bound adapter for one promoted browser epoch."""
+        return type(self)(
+            self.endpoint,
+            client_factory=self.client_factory,
+            sample_rate=self.sample_rate,
+        )
+
     async def synthesize(self, text: str, utterance_id: str) -> Any:
         if not self.started:
             raise RuntimeError("TTS service is not started")
@@ -104,6 +112,7 @@ class LocalTTS(TTSService):
             if inspect.isawaitable(result):
                 await result
         yield TTSStartedFrame(context_id=context_id)
+        completed = False
         async for event in self._client.events():
             kind = event.get("type", "")
             if kind.endswith("audio.delta"):
@@ -115,6 +124,7 @@ class LocalTTS(TTSService):
                     num_channels=1,
                 )
             elif kind.endswith("audio.done") or kind.endswith("cancelled"):
+                completed = True
                 if on_event is not None:
                     result = on_event("synthesis_ended", context_id)
                     if inspect.isawaitable(result):
@@ -128,3 +138,9 @@ class LocalTTS(TTSService):
                     if inspect.isawaitable(result):
                         await result
                 raise RuntimeError(f"local TTS error: {message[:256]}")
+        if not completed:
+            if on_event is not None:
+                result = on_event("delivery_unknown", context_id)
+                if inspect.isawaitable(result):
+                    await result
+            raise RuntimeError("local TTS stream ended before audio completion")

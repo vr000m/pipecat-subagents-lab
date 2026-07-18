@@ -61,6 +61,14 @@ class LocalSTT(SegmentedSTTService):
         self._client = None
         await super().cleanup()
 
+    def for_connection(self) -> LocalSTT:
+        """Create a client-bound adapter for one promoted browser epoch."""
+        return type(self)(
+            self.endpoint,
+            client_factory=self.client_factory,
+            sample_rate=self.sample_rate,
+        )
+
     async def handle_final_transcript(
         self, text: str, callback: Callable[[str], Any] | None = None
     ) -> Any:

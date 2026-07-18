@@ -359,7 +359,7 @@ def test_connection_observer_projects_canonical_runtime_events_without_live_serv
         )
 
         messages = host.connection.observer.messages()
-        assert [message["kind"] for message in messages] == ["worker", "result"]
+        assert [message["kind"] for message in messages] == ["result"]
         assert {message["session_id"] for message in messages} == {host.state.session_id}
         assert messages[-1]["data"]["result_id"] == "result-1"
         assert messages[-1]["origin_epoch"] == 1
@@ -408,6 +408,9 @@ def test_canonical_adapter_rejects_raw_frames_and_only_admits_downstream_results
                 "worker_id": "w",
                 "turn_id": "t",
                 "text": "ok",
+                "spoken_text": "ok",
+                "ui_text": "ok",
+                "citations": [],
             }
         )
         is True

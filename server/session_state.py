@@ -109,8 +109,13 @@ class SessionState:
             and origin_epoch != result.origin_epoch
         ):
             return None
+        if origin_epoch is not None and result.origin_epoch is None:
+            result = result.model_copy(update={"origin_epoch": origin_epoch})
         if any(item.result_id == result.result_id for item in self.results.results):
-            return self._emit("result_duplicate", {"result_id": result.result_id})
+            # Duplicate suppression is an internal idempotency decision. It is
+            # not a public event because consuming a sequence number for it
+            # would create a gap in the authoritative browser projection.
+            return None
         effective_epoch = origin_epoch if origin_epoch is not None else result.origin_epoch
         if self.active_epoch is not None and effective_epoch != self.active_epoch:
             # Late provider work is still an immutable result commit, but it cannot

@@ -29,6 +29,7 @@ class DispatchOutcome:
     kind: str
     transcript: str
     decision: RoutingDecision | None = None
+    catalogue: WorkerCatalogue | None = None
     work_items: tuple[str, ...] = ()
     control_action: str | None = None
 
@@ -148,7 +149,7 @@ class WorkItemCoordinator:
             raise RuntimeError("routing arbitration requires a registry and router")
         catalogue = self.registry.catalogue()
         decision = self.router.route(transcript, catalogue)
-        return DispatchOutcome("routed", transcript, decision=decision)
+        return DispatchOutcome("routed", transcript, decision=decision, catalogue=catalogue)
 
     def dispatch(
         self,

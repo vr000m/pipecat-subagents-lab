@@ -102,7 +102,7 @@ def test_duplicate_late_old_epoch_result_commit_is_idempotent() -> None:
     state.append_result(late, origin_epoch=1)
     duplicate = state.append_result(late, origin_epoch=1)
 
-    assert duplicate.kind == "result_duplicate"
+    assert duplicate is None
     assert [item.result_id for item in state.results.results] == ["late"]
 
 

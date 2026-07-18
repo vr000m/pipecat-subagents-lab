@@ -88,7 +88,6 @@ class WebSearchWorker(ContextWorker):
         self.decline = decline or (
             lambda query: can_satisfy(query) is False if can_satisfy else False
         )
-        self.requests: list[dict[str, Any]] = []
 
     @staticmethod
     def refine_query(query: str) -> str:
@@ -113,15 +112,16 @@ class WebSearchWorker(ContextWorker):
         if self.decline(refined):
             raise WorkerDeclined("hosted web search cannot satisfy this request")
 
-        kwargs = {
-            "model": self.model,
-            "tools": [{"type": "web_search"}],
-            "input": self._contextual_input(refined),
-            "store": False,
-        }
-        self.requests.append(kwargs.copy())
-
         async def execute() -> Any:
+            # Build the contextual request inside the mailbox. This keeps a
+            # same-worker turn from observing a history snapshot captured
+            # before an earlier queued turn has committed its result.
+            kwargs = {
+                "model": self.model,
+                "tools": [{"type": "web_search"}],
+                "input": self._contextual_input(refined),
+                "store": False,
+            }
             create = self.responses.create
             if inspect.iscoroutinefunction(create):
                 response = create(**kwargs)
@@ -129,23 +129,27 @@ class WebSearchWorker(ContextWorker):
                 response = await asyncio.to_thread(create, **kwargs)
             if inspect.isawaitable(response):
                 response = await response
-            return response
+            text = _response_text(response)
+            if not text:
+                raise WorkerDeclined("hosted web search returned no answer")
+            result = canonical_result(
+                worker_id=self.metadata.worker_id,
+                turn_id=turn_id,
+                text=text,
+                citations=_response_citations(response),
+                origin_epoch=origin_epoch,
+            )
+            self.append_context(
+                {
+                    "turn_id": turn_id,
+                    "query": refined,
+                    "text": text,
+                    "result_id": result.result_id,
+                }
+            )
+            return result
 
-        response = await self.submit(execute)
-        text = _response_text(response)
-        if not text:
-            raise WorkerDeclined("hosted web search returned no answer")
-        result = canonical_result(
-            worker_id=self.metadata.worker_id,
-            turn_id=turn_id,
-            text=text,
-            citations=_response_citations(response),
-            origin_epoch=origin_epoch,
-        )
-        self.append_context(
-            {"turn_id": turn_id, "query": refined, "text": text, "result_id": result.result_id}
-        )
-        return result
+        return await self.submit(execute)
 
     async def run(self, query: Any) -> Any:
         # WorkerRunner invokes BaseWorker.run(params); tests and the application

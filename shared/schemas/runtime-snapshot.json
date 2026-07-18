@@ -1,7 +1,75 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://pipecat-subagents-lab.local/schemas/v1/runtime-snapshot.json",
-  "title": "RuntimeSnapshot", "type": "object", "additionalProperties": false,
+  "title": "RuntimeSnapshot",
+  "type": "object",
+  "additionalProperties": false,
   "required": ["contract_version", "session_id", "snapshot_sequence", "workers", "results", "speech_progress", "origin_epoch"],
-  "properties": {"contract_version": {"const": "v1.0"}, "session_id": {"type": "string"}, "snapshot_sequence": {"type": "integer", "minimum": 0}, "workers": {"type": "array"}, "results": {"type": "array"}, "speech_progress": {"type": "array"}, "origin_epoch": {"type": ["integer", "null"]}}
+  "properties": {
+    "contract_version": {"const": "v1.0"},
+    "session_id": {"type": "string", "minLength": 1},
+    "snapshot_sequence": {"type": "integer", "minimum": 0},
+    "workers": {"type": "array", "items": {"$ref": "#/$defs/worker"}},
+    "results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
+    "speech_progress": {"type": "array", "items": {"$ref": "#/$defs/speech_progress"}},
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
+  },
+  "$defs": {
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0},
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "url"],
+      "properties": {
+        "title": {"type": "string"},
+        "url": {"type": "string", "pattern": "^https?://[^\\s]+$"}
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "topic", "model_policy", "status", "latest_result_id", "origin_epoch"],
+      "properties": {
+        "worker_id": {"type": "string", "minLength": 1},
+        "topic": {"type": "string"},
+        "model_policy": {"type": "string"},
+        "status": {"type": "string"},
+        "latest_result_id": {"type": ["string", "null"]},
+        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "ui_text", "spoken_result_id", "ui_result_id", "spoken_citations", "ui_citations", "origin_epoch"],
+      "properties": {
+        "result_id": {"type": "string", "minLength": 1},
+        "worker_id": {"type": "string", "minLength": 1},
+        "turn_id": {"type": "string", "minLength": 1},
+        "timestamp": {"type": "string", "minLength": 1},
+        "text": {"type": "string"},
+        "citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}},
+        "spoken_text": {"type": "string"},
+        "ui_text": {"type": "string"},
+        "spoken_result_id": {"type": ["string", "null"]},
+        "ui_result_id": {"type": ["string", "null"]},
+        "spoken_citations": {"type": ["array", "null"], "items": {"$ref": "#/$defs/citation"}},
+        "ui_citations": {"type": ["array", "null"], "items": {"$ref": "#/$defs/citation"}},
+        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
+      }
+    },
+    "speech_progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result_id", "work_item_id", "run_id", "utterance_id", "state", "origin_epoch"],
+      "properties": {
+        "result_id": {"type": "string", "minLength": 1},
+        "work_item_id": {"type": "string", "minLength": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "utterance_id": {"type": "string", "minLength": 1},
+        "state": {"enum": ["displayed", "queued", "started", "synthesis_ended", "delivery_completed", "delivery_unknown", "interrupted", "interrupted_by_reconnect", "paused", "resumed"]},
+        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
+      }
+    }
+  }
 }

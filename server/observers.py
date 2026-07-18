@@ -55,13 +55,12 @@ class RuntimeObserver:
                 ),
             }
             for event in self.state.events
-            if event.sequence > after_sequence
-            and event.payload.get("origin_epoch") in (None, self.epoch)
+            if event.sequence > after_sequence and event.payload.get("origin_epoch") == self.epoch
         )
 
     def frame(self, event: StateEvent) -> Any:
         """Build the framework frame when available, while keeping tests dependency-free."""
-        if event.payload.get("origin_epoch") not in (None, self.epoch):
+        if event.payload.get("origin_epoch") != self.epoch:
             return None
         payload = {
             "contract_version": "v1.0",

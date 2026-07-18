@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pipecat.pipeline.pipeline import Pipeline
@@ -38,7 +38,7 @@ _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 
 
 def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandshake:
-    """Parse and validate the browser session identity carried by the URL."""
+    """Parse a short-lived browser handshake token carried by the URL."""
     try:
         value = SnapshotHandshake(
             contract_version=request.query_params.get("contract_version", CONTRACT_VERSION),
@@ -49,15 +49,21 @@ def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandsh
         )
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
-    if value.session_id != host.state.session_id or value.resume_token != host.state.resume_token:
+    if value.session_id != host.state.session_id or not host.validate_handshake_token(
+        value.resume_token,
+        value.proposed_epoch,
+        redeem=request.method == "POST",
+    ):
         raise HTTPException(status_code=401, detail="invalid Small WebRTC session identity")
-    return value
+    # The URL token is deliberately not the process-lifetime resume bearer. The
+    # arbiter still receives its stable identity after the HTTP token is checked.
+    return value.model_copy(update={"resume_token": host.state.resume_token})
 
 
 def _require_local_origin(request: Request, config: Config) -> None:
     """Keep the credential-bearing local discovery surface same-origin."""
     origin = request.headers.get("origin")
-    if origin and origin.rstrip("/") != config.known_client_url.rstrip("/"):
+    if not origin or origin.rstrip("/") != config.known_client_url.rstrip("/"):
         raise HTTPException(status_code=403, detail="origin is not allowed for the local server")
 
 
@@ -68,9 +74,12 @@ async def _attach_connection(
 ) -> None:
     """Attach a real Pipecat Small WebRTC pipeline to a promoted epoch."""
     runtime = await host.connect(handshake)
-    if host.tts is not None and hasattr(host.tts, "connect"):
-        await host.tts.connect()
-    output_sample_rate = getattr(host.tts, "sample_rate", 24000)
+    if runtime.tts is not None and hasattr(runtime.tts, "connect"):
+        await runtime.tts.connect()
+    if not host.accepts(runtime.epoch):
+        await runtime.shutdown(reason="connection replaced during setup")
+        return
+    output_sample_rate = getattr(runtime.tts, "sample_rate", 24000)
     params = TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
@@ -85,12 +94,12 @@ async def _attach_connection(
         bus = _ProbeBus() if _ProbeBus is not None else None
     bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
     processors = [transport.input()]
-    if host.stt is not None:
-        processors.append(host.stt)
+    if runtime.stt is not None:
+        processors.append(runtime.stt)
     if bridge is not None:
         processors.extend((bridge, CanonicalResultAdapter()))
-    if host.tts is not None:
-        processors.append(host.tts)
+    if runtime.tts is not None:
+        processors.append(runtime.tts)
     processors.append(transport.output())
     worker = PipelineWorker(
         Pipeline(processors),
@@ -104,6 +113,9 @@ async def _attach_connection(
     )
     runtime.transport = transport
     runtime.worker = worker
+    if not host.accepts(runtime.epoch):
+        await runtime.shutdown(reason="connection replaced during setup")
+        return
 
     async def emit_frame(frame: Any) -> None:
         if host.accepts(runtime.epoch):
@@ -118,7 +130,13 @@ async def _attach_connection(
 
     @worker.rtvi.event_handler("on_client_message")
     async def on_client_message(_rtvi: Any, message: Any) -> None:
-        if message.type != "snapshot-request" or not host.accepts(runtime.epoch):
+        data = getattr(message, "data", None)
+        snapshot_requested = message.type == "snapshot-request" or (
+            message.type == "client-message"
+            and isinstance(data, dict)
+            and data.get("t") == "snapshot-request"
+        )
+        if not snapshot_requested or not host.accepts(runtime.epoch):
             return
         publisher.set_snapshot(runtime.observer.snapshot())
         snapshot = publisher.snapshot()
@@ -134,6 +152,18 @@ async def _attach_connection(
         runtime.worker_task = asyncio.create_task(
             worker.run(WorkerParams(loop=asyncio.get_running_loop()))
         )
+
+        def worker_finished(task: asyncio.Task[Any]) -> None:
+            if task.cancelled():
+                return
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                asyncio.create_task(runtime.shutdown(reason="Small WebRTC worker failed"))
+
+        runtime.worker_task.add_done_callback(worker_finished)
     else:
         add_workers = getattr(host.runner, "add_workers", None)
         if add_workers is None:
@@ -189,13 +219,17 @@ def create_app(host: SessionHost | None = None) -> FastAPI:
         return {"status": "ok", "transport": "smallwebrtc"}
 
     @app.get("/api/session")
-    async def session(request: Request) -> dict[str, Any]:
+    async def session(request: Request, response: Response) -> dict[str, Any]:
         _require_local_origin(request, config)
+        response.headers["Cache-Control"] = "no-store"
         return session_host.session_handshake()
 
     @app.post("/api/rtc")
-    async def offer(request: SmallWebRTCRequest, http_request: Request) -> dict[str, str]:
+    async def offer(
+        request: SmallWebRTCRequest, http_request: Request, response: Response
+    ) -> dict[str, str]:
         _require_local_origin(http_request, config)
+        response.headers["Cache-Control"] = "no-store"
         handshake = _handshake_from_query(session_host, http_request)
 
         async def connection_callback(connection: SmallWebRTCConnection) -> None:
@@ -211,9 +245,10 @@ def create_app(host: SessionHost | None = None) -> FastAPI:
 
     @app.patch("/api/rtc")
     async def ice_candidate(
-        request: SmallWebRTCPatchRequest, http_request: Request
+        request: SmallWebRTCPatchRequest, http_request: Request, response: Response
     ) -> dict[str, str]:
         _require_local_origin(http_request, config)
+        response.headers["Cache-Control"] = "no-store"
         handshake = _handshake_from_query(session_host, http_request)
         if not session_host.accepts(handshake.proposed_epoch):
             raise HTTPException(status_code=409, detail="stale Small WebRTC connection epoch")
