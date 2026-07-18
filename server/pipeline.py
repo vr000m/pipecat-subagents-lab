@@ -67,11 +67,24 @@ class ConnectionPipeline:
     epoch: int
     observer: RuntimeObserver
     scheduler: SpeechScheduler
+    transport: Any | None = None
+    worker: Any | None = None
     active: bool = True
 
     def deactivate(self) -> None:
         self.active = False
         self.scheduler.interrupt(epoch=self.epoch, reconnect=True)
+
+    async def shutdown(self, *, reason: str = "connection replaced") -> None:
+        """Fence this connection and stop its Pipecat worker, if attached."""
+        self.deactivate()
+        if self.worker is not None:
+            cancel = getattr(self.worker, "cancel", None)
+            if cancel is not None:
+                result = cancel(reason=reason)
+                if hasattr(result, "__await__"):
+                    await result
+            self.worker = None
 
 
 class SessionHost:
@@ -117,7 +130,7 @@ class SessionHost:
             await self.start()
         connection = self.arbiter.promote(handshake)
         if self.connection is not None:
-            self.connection.deactivate()
+            await self.connection.shutdown()
         self.state.active_epoch = connection.epoch
         pipeline = ConnectionPipeline(
             connection.epoch,
@@ -127,6 +140,16 @@ class SessionHost:
         self.connection = pipeline
         return pipeline
 
+    def session_handshake(self) -> dict[str, Any]:
+        """Return the next browser handshake without mutating session state."""
+        return {
+            "contract_version": "v1.0",
+            "session_id": self.state.session_id,
+            "resume_token": self.state.resume_token,
+            "proposed_epoch": self.arbiter.epoch + 1,
+            "snapshot_sequence": self.state.sequence,
+        }
+
     def accepts(self, epoch: int) -> bool:
         return (
             self.arbiter.accepts(epoch) and self.connection is not None and self.connection.active
@@ -134,7 +157,7 @@ class SessionHost:
 
     async def shutdown(self) -> None:
         if self.connection is not None:
-            self.connection.deactivate()
+            await self.connection.shutdown(reason="session shutdown")
             self.connection = None
         stop = getattr(self.runner, "stop", None)
         if stop is not None:

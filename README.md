@@ -53,6 +53,22 @@ bun run lint
 Run `bun run build` before opening or serving `web/index.html`: `dist/` is
 intentionally ignored, while lint writes its bundle only to `/tmp`.
 
+### Start the local browser server
+
+Build the browser bundle, then serve the bundled page and the Small WebRTC
+signaling endpoint from the same FastAPI process:
+
+```sh
+cd web && bun run build && cd ..
+uv run uvicorn server.app:app --host 127.0.0.1 --port 7860
+```
+
+Open <http://127.0.0.1:7860/> and use Connect, then enable the microphone
+explicitly. The browser obtains its session identity from `/api/session` and
+posts Small WebRTC offers to `/api/rtc`. Daily transport is not part of this
+local path; if the lab is deployed to a cloud runtime later, add Daily as a
+deployment adapter behind the same session and RTVI contracts.
+
 The required integrated test is `tests/integration/test_browser_session.py`.
 It uses fake model/provider boundaries and proves the routing matrix, same-topic
 context persistence, unrelated-worker isolation, citation normalization,

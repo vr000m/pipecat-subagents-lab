@@ -488,4 +488,14 @@ sequenceDiagram
 
 ## Final Results
 
-Not implemented yet.
+Transport selection is now explicit for the browser slice: local development
+uses Pipecat Small WebRTC, with `/api/session`, `/api/rtc`, and ICE PATCH
+signaling served by the FastAPI host. The browser obtains the durable session
+identity and proposed epoch before connecting, and the connection callback
+attaches a Pipecat `SmallWebRTCTransport`/`PipelineWorker` to the process-lifetime
+runner. Daily transport remains a deployment adapter to add only if this lab is
+deployed to a cloud runtime; it is not an alternate local transport path.
+
+The full feature remains incomplete: live local STT/TTS service adapters,
+worker-to-transport bus wiring, and credential-safe media acceptance still need
+to be implemented and verified before the plan can be marked complete.

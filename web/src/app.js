@@ -4,7 +4,7 @@ import { validateServerMessage } from "./protocol.js";
 import { applyServerMessage, createInitialState } from "./state.js";
 import { render } from "./render.js";
 
-export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", clientFactory, transportFactory } = {}) {
+export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", sessionUrl = "/api/session", fetchImpl = globalThis.fetch, clientFactory, transportFactory } = {}) {
   root ??= documentRef?.querySelector?.("#app");
   let state = createInitialState();
   let client;
@@ -52,9 +52,27 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   };
 
   const connect = async () => {
+    let connectionUrl = webrtcUrl;
+    if (!transportFactory && fetchImpl) {
+      try {
+        const response = await fetchImpl(sessionUrl);
+        if (!response.ok) throw new Error(`session discovery returned HTTP ${response.status}`);
+        const handshake = await response.json();
+        const base = documentRef?.baseURI || globalThis.location?.href || "http://localhost/";
+        const url = new URL(webrtcUrl, base);
+        for (const key of ["contract_version", "session_id", "resume_token", "proposed_epoch", "snapshot_sequence"]) {
+          if (handshake[key] !== undefined) url.searchParams.set(key, String(handshake[key]));
+        }
+        connectionUrl = url.toString();
+      } catch (error) {
+        report(`Session discovery failed: ${error?.message || error}`);
+        update({ ...state, connection: "disconnected" });
+        return false;
+      }
+    }
     const transport = transportFactory
-      ? transportFactory({ webrtcUrl })
-      : new SmallWebRTCTransport({ webrtcUrl });
+      ? transportFactory({ webrtcUrl: connectionUrl })
+      : new SmallWebRTCTransport({ webrtcUrl: connectionUrl });
     client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: false });
     try {
       await client.connect();
