@@ -65,4 +65,8 @@ class RTVIMessagePublisher:
             if self._snapshot
             else {"session_id": self.session_id}
         )
+        # A snapshot request is itself a sequenced event. Repeated requests
+        # must advance both fields together; otherwise the browser treats the
+        # envelope as a gap or rewinds its recovery watermark.
+        data["snapshot_sequence"] = self._sequence + 1
         return self._message("runtime_snapshot", data, self.active_epoch)

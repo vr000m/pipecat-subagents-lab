@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import urlparse
 
 
 class ConfigError(ValueError):
@@ -38,6 +39,13 @@ class Config:
             raise ConfigError("max_work_items_per_turn must be 2, 3, or 4")
         if self.multi_intent_wait_timeout_ms <= 0:
             raise ConfigError("multi_intent_wait_timeout_ms must be positive")
+        if not self.bind_host.strip():
+            raise ConfigError("bind_host must not be empty")
+        if not 1 <= self.bind_port <= 65_535:
+            raise ConfigError("bind_port must be between 1 and 65535")
+        parsed_client_url = urlparse(self.known_client_url)
+        if parsed_client_url.scheme not in {"http", "https"} or not parsed_client_url.netloc:
+            raise ConfigError("known_client_url must be an absolute http(s) URL")
         if not self.openai_api_key_env.isidentifier() or not self.openai_api_key_env.isupper():
             raise ConfigError("openai_api_key_env must be an uppercase environment variable name")
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
@@ -83,6 +91,16 @@ def load_config(
         kwargs["max_work_items_per_turn"] = int(raw)
     if raw := values.get("WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS"):
         kwargs["multi_intent_wait_timeout_ms"] = int(raw)
+    if "WEBSEARCH_BIND_HOST" in values:
+        kwargs["bind_host"] = values["WEBSEARCH_BIND_HOST"]
+    if "WEBSEARCH_BIND_PORT" in values:
+        raw = values["WEBSEARCH_BIND_PORT"]
+        try:
+            kwargs["bind_port"] = int(raw)
+        except ValueError as exc:
+            raise ConfigError("WEBSEARCH_BIND_PORT must be an integer") from exc
+    if "WEBSEARCH_KNOWN_CLIENT_URL" in values:
+        kwargs["known_client_url"] = values["WEBSEARCH_KNOWN_CLIENT_URL"]
     if raw := values.get("WEBSEARCH_OPENAI_API_KEY_ENV"):
         kwargs["openai_api_key_env"] = raw
     for service in ("stt", "tts"):

@@ -121,6 +121,7 @@ def test_high_snapshot_sequence_keeps_envelope_and_following_events_monotonic() 
     )
 
     snapshot = publisher.snapshot()
+    repeated_snapshot = publisher.snapshot()
     event = publisher.speech(
         SpeechProgress(
             result_id="result-1",
@@ -134,4 +135,23 @@ def test_high_snapshot_sequence_keeps_envelope_and_following_events_monotonic() 
     )
 
     assert snapshot is not None and snapshot.sequence == 40
-    assert event is not None and event.sequence == 41
+    assert snapshot.data["snapshot_sequence"] == snapshot.sequence
+    assert repeated_snapshot is not None and repeated_snapshot.sequence == 41
+    assert repeated_snapshot.data["snapshot_sequence"] == repeated_snapshot.sequence
+    assert event is not None and event.sequence == 42
+
+
+def test_repeated_zero_snapshot_requests_advance_one_shared_sequence_namespace() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-zero", active_epoch=1)
+    publisher.client_ready(epoch=1)
+    publisher.set_snapshot(
+        RuntimeSnapshot(contract_version="v1.0", session_id="session-zero", snapshot_sequence=0)
+    )
+
+    first = publisher.snapshot()
+    second = publisher.snapshot()
+
+    assert first is not None and first.sequence == 1
+    assert first.data["snapshot_sequence"] == first.sequence
+    assert second is not None and second.sequence == 2
+    assert second.data["snapshot_sequence"] == second.sequence

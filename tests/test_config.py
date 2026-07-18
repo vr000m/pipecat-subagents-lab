@@ -13,6 +13,9 @@ from server.config import Config, ConfigError, load_config
 def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
     config = Config()
 
+    assert config.bind_host == "127.0.0.1"
+    assert config.bind_port == 7860
+    assert config.known_client_url == "http://127.0.0.1:7860"
     assert config.max_work_items_per_turn == 2
     assert config.multi_intent_wait_timeout_ms == 10_000
     assert config.openai_api_key is None
@@ -59,3 +62,38 @@ def test_model_selection_uses_policy_labels_not_model_ids_from_untrusted_input()
     assert config.resolve_router_model("fast") == "verified-router-model"
     with pytest.raises(ConfigError):
         config.resolve_router_model("model-emitted-id")
+
+
+def test_bind_and_known_client_settings_load_from_environment() -> None:
+    config = load_config(
+        env={
+            "WEBSEARCH_BIND_HOST": "0.0.0.0",
+            "WEBSEARCH_BIND_PORT": "9000",
+            "WEBSEARCH_KNOWN_CLIENT_URL": "https://example.test:9443/client",
+        }
+    )
+
+    assert (config.bind_host, config.bind_port, config.known_client_url) == (
+        "0.0.0.0",
+        9000,
+        "https://example.test:9443/client",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("bind_host", ""), ("bind_port", 0), ("bind_port", 65_536), ("known_client_url", "client")),
+)
+def test_bind_settings_are_validated(field: str, value: object) -> None:
+    with pytest.raises(ConfigError):
+        Config(**{field: value})
+
+
+def test_bind_port_environment_value_has_config_error_boundary() -> None:
+    with pytest.raises(ConfigError, match="WEBSEARCH_BIND_PORT"):
+        load_config(env={"WEBSEARCH_BIND_PORT": "not-a-port"})
+
+
+def test_empty_bind_environment_values_are_not_silently_ignored() -> None:
+    with pytest.raises(ConfigError):
+        load_config(env={"WEBSEARCH_BIND_HOST": ""})

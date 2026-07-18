@@ -1,16 +1,25 @@
 """Tool-free main-model responses for router-owned outcomes."""
 
 from __future__ import annotations
+
 from typing import Any, Callable
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
+
 from .contracts import RoutingDecision
 from .results import ProjectedResult
 
 
 class MainResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    text: str
     action: str
+    prose: str | None = None
+    text: str | None = None
+
+    @model_validator(mode="after")
+    def require_text(self) -> MainResponse:
+        if not self.prose and not self.text:
+            raise ValueError("main response must contain prose or text")
+        return self
 
 
 class MainResponder:
@@ -31,7 +40,12 @@ class MainResponder:
             if self.model is not None
             else self._call(self.last_prompt)
         )
-        prose = raw if isinstance(raw, str) else raw.get("prose", raw.get("text", ""))
-        if isinstance(raw, dict) and raw.get("action", action) != action:
+        if isinstance(raw, str):
+            response = MainResponse(action=action, prose=raw)
+        else:
+            response = raw if isinstance(raw, MainResponse) else MainResponse.model_validate(raw)
+        if response.action != action:
             raise ValueError("main response action does not match routing action")
+        prose = response.prose or response.text
+        assert prose is not None
         return ProjectedResult(f"main-{id(prose)}", prose, [])

@@ -1,6 +1,6 @@
 """Direct, unsupported, and router-owned clarification use one tool-free call."""
 
-from server.main_responder import MainResponder
+from server.main_responder import MainResponder, MainResponse
 
 
 class FakeStructuredModel:
@@ -37,3 +37,25 @@ def test_main_responder_keeps_unsupported_and_clarify_distinct_from_worker_dispa
         result = MainResponder(model=model).respond(transcript="test", decision={"action": action})
         assert result.text == prose
         assert model.tools == []
+
+
+def test_main_responder_normalizes_pydantic_main_response_before_reading_fields() -> None:
+    model = FakeStructuredModel(MainResponse(action="direct", text="Structured answer."))
+
+    result = MainResponder(model=model).respond(
+        transcript="What is the answer?",
+        decision={"action": "direct"},
+    )
+
+    assert result.text == "Structured answer."
+
+
+def test_main_responder_validates_dict_main_response_before_reading_fields() -> None:
+    model = FakeStructuredModel({"action": "direct", "text": "Validated answer."})
+
+    result = MainResponder(model=model).respond(
+        transcript="What is the answer?",
+        decision={"action": "direct"},
+    )
+
+    assert result.text == "Validated answer."
