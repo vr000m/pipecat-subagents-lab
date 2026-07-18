@@ -36,7 +36,7 @@ class ConnectionArbiter:
             raise ValueError(f"unsupported contract version: {value.contract_version}")
         if value.session_id != self.session_id or value.resume_token != self.resume_token:
             raise ValueError("session identity or resume token is invalid")
-        if value.proposed_epoch <= self._epoch:
+        if self._active is not None and value.proposed_epoch <= self._epoch:
             raise ValueError("connection epoch is stale")
         self._epoch = value.proposed_epoch
         self._active = Connection(self._epoch, self.session_id, self.resume_token)
@@ -74,7 +74,7 @@ class ConnectionEpochArbiter(ConnectionArbiter):
         return (
             session_id == self.session_id
             and resume_token == self.resume_token
-            and proposed_epoch > self.epoch
+            and (self._active is None or proposed_epoch > self.epoch)
         )
 
     def activate(self, client_id: str, proposed_epoch: int) -> ActiveConnection:

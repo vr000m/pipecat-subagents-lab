@@ -25,6 +25,21 @@ def test_replacement_promotes_new_epoch_and_fences_old_transport() -> None:
     assert arbiter.fence(old.epoch) is False
 
 
+def test_initial_connection_accepts_schema_valid_epoch_zero() -> None:
+    arbiter = ConnectionArbiter(session_id="session-1", resume_token="resume-1")
+
+    connection = arbiter.promote(handshake(0))
+
+    assert connection.epoch == 0
+    assert arbiter.accepts(0)
+    with pytest.raises(ValueError, match="connection epoch is stale"):
+        arbiter.promote(handshake(0))
+
+    compatibility_arbiter = ConnectionEpochArbiter(session_id="session-1", resume_token="resume-1")
+    active = compatibility_arbiter.activate("client-a", 0)
+    assert compatibility_arbiter.accepts_input(active.client_id, active.epoch)
+
+
 def test_handshake_requires_durable_identity_and_monotonic_epoch() -> None:
     arbiter = ConnectionArbiter(session_id="session-1", resume_token="resume-1")
     with pytest.raises(ValueError):
