@@ -1,6 +1,7 @@
 """The registry owns persistent context identities and immutable catalogues."""
 
 from server.registry import WorkerRegistry
+from server.workers.base import WorkerMetadata
 from server.workers.web_search import WebSearchWorker
 
 
@@ -8,6 +9,14 @@ class FakeContextWorker:
     def __init__(self, worker_id: str) -> None:
         self.worker_id = worker_id
         self.turns: list[str] = []
+        self.metadata = WorkerMetadata(
+            worker_id=worker_id,
+            worker_type="web_search",
+            topic="custom",
+            topic_summary="custom",
+            model_policy="deep",
+            capabilities={"private_calendar": True},
+        )
 
 
 class FakeResponses:
@@ -54,6 +63,16 @@ def test_catalogue_is_immutable_and_dispatch_revalidates_against_its_snapshot() 
         snapshot,
         worker_id=worker.worker_id,
         worker_type="web_search",
-        capability="public_web",
+        capability="private_calendar",
         model_policy="deep",
     )
+
+
+def test_custom_factory_preserves_worker_specific_capabilities() -> None:
+    registry = WorkerRegistry(worker_factory=FakeContextWorker)
+
+    item = registry.get_or_create(topic="custom", worker_type="web_search", model_policy="deep")
+
+    entry = registry.catalogue().entries[0]
+    assert item.metadata.capabilities == {"private_calendar": True}
+    assert dict(entry.capabilities) == {"private_calendar": True}

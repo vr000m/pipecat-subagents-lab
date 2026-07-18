@@ -77,6 +77,8 @@ class SessionState:
         sequence: int | None = None,
         origin_epoch: int | None = None,
     ) -> StateEvent:
+        if any(item.result_id == result.result_id for item in self.results.results):
+            return self._emit("result_duplicate", {"result_id": result.result_id})
         if (
             origin_epoch is not None
             and self.active_epoch is not None
@@ -86,8 +88,6 @@ class SessionState:
             # update active worker pointers or speech state.
             self.results.append(result)
             return self._emit("result", result.model_dump(mode="json"))
-        if any(item.result_id == result.result_id for item in self.results.results):
-            return self._emit("result_duplicate", {"result_id": result.result_id})
         if sequence is not None and sequence > self.sequence:
             self.sequence = sequence - 1
         self.results.append(result)

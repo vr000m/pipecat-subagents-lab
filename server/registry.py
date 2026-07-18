@@ -105,12 +105,15 @@ class WorkerRegistry:
                 worker_id=f"worker-{len(self._workers) + 1}",
                 topic=topic,
             )
+        worker_capabilities = getattr(getattr(worker, "metadata", None), "capabilities", None)
+        if worker_capabilities is None:
+            worker_capabilities = getattr(worker, "capabilities", {})
         return self.register(
             worker_id=f"worker-{len(self._workers) + 1}",
             worker_type=worker_type,
             topic=topic,
             model_policy=model_policy,
-            capabilities={"public_web": True},
+            capabilities=dict(worker_capabilities),
             worker=worker,
         )
 

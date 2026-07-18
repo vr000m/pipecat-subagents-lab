@@ -84,10 +84,15 @@ class SpeechScheduler:
         self._queues[item.work_item_id].pop(0)
         self._active = UtteranceLease(item, uuid4().hex)
         self.state.speech_progress(**self._progress(item), state=DeliveryState.STARTED)
-        if self.speak is not None:
-            outcome = self.speak(item)
-            if isinstance(outcome, Awaitable):
-                await outcome
+        try:
+            if self.speak is not None:
+                outcome = self.speak(item)
+                if isinstance(outcome, Awaitable):
+                    await outcome
+        except BaseException:
+            self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_UNKNOWN)
+            self._release(item.utterance_id)
+            raise
         return item
 
     def synthesis_ended(self, utterance_id: str) -> None:

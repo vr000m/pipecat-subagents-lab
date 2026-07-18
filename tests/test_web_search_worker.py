@@ -3,6 +3,9 @@
 import asyncio
 import threading
 
+import pytest
+
+from server.workers.base import ContextWorker, WorkerMetadata
 from server.workers.web_search import WebSearchWorker
 
 
@@ -71,3 +74,20 @@ def test_worker_runs_sync_responses_client_off_event_loop() -> None:
 
     loop_thread, provider_thread = asyncio.run(run())
     assert provider_thread != loop_thread
+
+
+def test_failed_persistent_submission_does_not_poison_later_submissions() -> None:
+    worker = ContextWorker(WorkerMetadata("worker-1", "test", "topic", "topic", "deep"))
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient provider failure")
+        return "recovered"
+
+    with pytest.raises(RuntimeError, match="transient provider failure"):
+        asyncio.run(worker.submit(operation))
+
+    assert asyncio.run(worker.submit(operation)) == "recovered"

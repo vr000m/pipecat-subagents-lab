@@ -70,6 +70,31 @@ def test_synthesis_end_is_not_completion_and_unknown_delivery_is_terminal() -> N
     assert scheduler.active is None
 
 
+def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:
+    calls = 0
+
+    async def speak(_item):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("provider unavailable")
+
+    scheduler = SpeechScheduler(SessionState(), speak=speak)
+    first = enqueue(scheduler, "work-1", "first")
+    second = enqueue(scheduler, "work-2", "second")
+
+    try:
+        asyncio.run(scheduler.start_next())
+    except RuntimeError as exc:
+        assert str(exc) == "provider unavailable"
+    else:
+        raise AssertionError("speech provider failure was swallowed")
+
+    assert scheduler.active is None
+    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+    assert asyncio.run(scheduler.start_next()).utterance_id == second.utterance_id
+
+
 def test_reconnect_interrupts_active_item_without_touching_other_work_item_queues() -> None:
     scheduler = SpeechScheduler(SessionState())
     first = enqueue(scheduler, "work-1", "one")

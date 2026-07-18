@@ -1,9 +1,11 @@
 import { applyMessage, createInitialState } from "./state.js";
 
+export const CONTRACT_VERSION = "v1.0";
 const forbidden = ["raw_logs", "prompt", "context"];
 
 export function validateServerMessage(message) {
   if (!message || typeof message !== "object" || typeof message.kind !== "string") return false;
+  if (message.contract_version !== CONTRACT_VERSION) return false;
   if (!Number.isInteger(message.sequence) || message.sequence < 0) return false;
   const data = message.data;
   if (!data || typeof data !== "object") return false;

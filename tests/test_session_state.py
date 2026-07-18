@@ -95,6 +95,17 @@ def test_old_epoch_result_can_commit_but_cannot_schedule_speech() -> None:
     assert state.speech["utt-1"].state == DeliveryState.QUEUED
 
 
+def test_duplicate_late_old_epoch_result_commit_is_idempotent() -> None:
+    state = SessionState(session_id="session-1")
+    late = result("late")
+
+    state.append_result(late, origin_epoch=1)
+    duplicate = state.append_result(late, origin_epoch=1)
+
+    assert duplicate.kind == "result_duplicate"
+    assert [item.result_id for item in state.results.results] == ["late"]
+
+
 def test_stale_epoch_speech_callback_cannot_mutate_active_authoritative_state() -> None:
     state = SessionState(session_id="session-1")
     state.active_epoch = 3

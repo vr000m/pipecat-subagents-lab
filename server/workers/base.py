@@ -42,7 +42,13 @@ class ContextWorker(_NativeWorker):
 
         async def run() -> Any:
             if previous is not None:
-                await previous
+                try:
+                    await previous
+                except BaseException:
+                    # A failed operation must not poison the durable mailbox for
+                    # every later submission. The failed task still propagates
+                    # to its own caller; later tasks may start a fresh run.
+                    pass
             self.status = "running"
             try:
                 value = operation()
