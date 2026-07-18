@@ -326,6 +326,13 @@ class SessionHost:
                     and pipeline.scheduler.active is not None
                 ):
                     pipeline.scheduler.delivery_unknown(pipeline.scheduler.active.item.utterance_id)
+                if (
+                    event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
+                    and self.connection is pipeline
+                    and pipeline.active
+                    and pipeline.scheduler.active is None
+                ):
+                    await pipeline.scheduler.start_next()
                 return callback_result
 
             self.tts.on_event = on_tts_event

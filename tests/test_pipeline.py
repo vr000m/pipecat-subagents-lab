@@ -117,10 +117,19 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         assert worker.frames[0].append_to_context is False
         assert connection.scheduler.active is not None
         utterance_id = connection.scheduler.active.item.utterance_id
+        connection.scheduler.enqueue(
+            result_id="result-next",
+            work_item_id="work-next",
+            run_id="run-next",
+            text="Next answer",
+            origin_epoch=1,
+        )
 
         await tts.on_event("synthesis_ended", "pipecat-generated-context")
-        assert connection.scheduler.active is None
         assert host.state.speech[utterance_id].state.value == "delivery_unknown"
+        assert len(worker.frames) == 2
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item.result_id == "result-next"
         await host.shutdown()
 
     asyncio.run(run())
