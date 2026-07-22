@@ -35,6 +35,7 @@ from .registry import WorkerRegistry
 from .router import LazyRouterProvider, Router
 from .services.stt import LocalSTT, STTEndpoint
 from .services.tts import LocalTTS, TTSEndpoint
+from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from .work_item_coordinator import WorkItemCoordinator
 
 
@@ -134,6 +135,8 @@ async def _attach_connection(
             (
                 VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=16000)),
                 runtime.stt,
+                smart_turn_processor(),
+                FinalTurnTranscriptProcessor(runtime.on_transcript),
             )
         )
     if bridge is not None:

@@ -4,14 +4,23 @@ import asyncio
 
 import pytest
 from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.frames.frames import (
+    TTSSpeakFrame,
+    TranscriptionFrame,
+    UserStoppedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_processor import UserTurnProcessor
 
 import server.app as app_module
 from server.contracts import GroundedResult, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
 from server.registry import UnsupportedWorkerType
+from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.workers.web_search import WorkerDeclined
 
 
@@ -453,6 +462,58 @@ def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
     asyncio.run(run())
 
 
+def test_final_turn_transcript_waits_for_smart_turn_stop() -> None:
+    async def run() -> None:
+        routed: list[str] = []
+        routed_event = asyncio.Event()
+        forwarded: list[object] = []
+
+        async def on_final(text: str) -> None:
+            routed.append(text)
+            routed_event.set()
+
+        processor = FinalTurnTranscriptProcessor(on_final)
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        processor.push_frame = push  # type: ignore[method-assign]
+        fragments = [
+            TranscriptionFrame("Can you look for", "", ""),
+            TranscriptionFrame("the capital of", "", ""),
+            TranscriptionFrame("India?", "", ""),
+        ]
+
+        for fragment in fragments:
+            await processor.process_frame(fragment, FrameDirection.DOWNSTREAM)
+            await processor.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        await asyncio.sleep(0)
+        assert routed == []
+
+        semantic_stop = UserStoppedSpeakingFrame()
+        await processor.process_frame(semantic_stop, FrameDirection.DOWNSTREAM)
+        await asyncio.wait_for(routed_event.wait(), timeout=1)
+        assert routed == ["Can you look for the capital of India?"]
+
+        await processor.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+        assert routed == ["Can you look for the capital of India?"]
+        assert forwarded[-2] is semantic_stop
+
+    asyncio.run(run())
+
+
+def test_smart_turn_processor_uses_pipecat_semantic_stop_strategy() -> None:
+    processor = smart_turn_processor()
+    strategies = processor._user_turn_controller.user_turn_strategies
+
+    assert isinstance(processor, UserTurnProcessor)
+    assert len(strategies.stop) == 1
+    assert isinstance(strategies.stop[0], TurnAnalyzerUserTurnStopStrategy)
+    assert isinstance(strategies.stop[0]._turn_analyzer, LocalSmartTurnAnalyzerV3)
+
+
 def test_connection_observer_unsubscribe_stops_future_listener_delivery() -> None:
     from server.observers import RuntimeObserver
     from server.session_state import SessionState
@@ -525,12 +586,19 @@ def test_connection_attach_registers_worker_with_async_runner(
     async def run() -> None:
         runner = AsyncAddRunner()
         stt = object()
-        host = SessionHost(runner_factory=lambda: runner, stt=stt)
+        host = SessionHost(
+            runner_factory=lambda: runner,
+            stt=stt,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
         await host.start()
         transport = FakeTransport()
         pipeline_args: list[object] = []
         vad_analyzer = object()
         vad_processor = object()
+        turn_processor = object()
+        transcript_processor = object()
+        transcript_callbacks: list[object] = []
 
         monkeypatch.setattr(app_module, "SmallWebRTCTransport", lambda *_args: transport)
         monkeypatch.setattr(
@@ -542,6 +610,12 @@ def test_connection_attach_registers_worker_with_async_runner(
             app_module,
             "VADProcessor",
             lambda *, vad_analyzer: vad_processor if vad_analyzer is not None else None,
+        )
+        monkeypatch.setattr(app_module, "smart_turn_processor", lambda: turn_processor)
+        monkeypatch.setattr(
+            app_module,
+            "FinalTurnTranscriptProcessor",
+            lambda callback: transcript_callbacks.append(callback) or transcript_processor,
         )
         monkeypatch.setattr(app_module, "TransportParams", lambda **kwargs: kwargs)
         monkeypatch.setattr(app_module, "PipelineParams", lambda **kwargs: kwargs)
@@ -566,7 +640,17 @@ def test_connection_attach_registers_worker_with_async_runner(
         assert len(runner.added) == 1
         assert runner.added[0] is host.connection.worker
         assert pipeline_args
-        assert pipeline_args[0][:3] == ["input", vad_processor, stt]
+        assert pipeline_args[0][:5] == [
+            "input",
+            vad_processor,
+            stt,
+            turn_processor,
+            transcript_processor,
+        ]
+        assert len(transcript_callbacks) == 1
+        assert callable(transcript_callbacks[0])
+        result = await transcript_callbacks[0]("Riga weather")
+        assert result.text == "Answer for Riga weather"
         assert any(isinstance(item, FrameworkBusBridgeProcessor) for item in pipeline_args[0])
         assert any(isinstance(item, CanonicalResultAdapter) for item in pipeline_args[0])
 

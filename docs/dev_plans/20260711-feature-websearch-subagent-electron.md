@@ -486,6 +486,7 @@ sequenceDiagram
 - **Electron increased first-slice scope:** defer it to a separate plan after the browser protocol and interruption UX are proven.
 - **Requested word-level spoken styling may exceed available evidence:** start with conservative utterance-level completion/interruption styling and promote to finer progress only if Pipecat events provide verifiable alignment.
 - **A negotiated microphone track did not produce STT turns:** Pipecat 1.6's `SegmentedSTTService` requires VAD start/stop frames and defaults to WAV-wrapped segments. Insert a connection-local Silero `VADProcessor` before `LocalSTT` and override the adapter's segment format to raw 16 kHz mono PCM16, matching the local server wire contract.
+- **Short VAD pauses were routed as complete application turns:** retain VAD as the commit boundary required by the local segmented STT service, pass its audio and finalized fragments through Pipecat's `LocalSmartTurnAnalyzerV3`, and route the accumulated transcript only when `UserTurnProcessor` emits the semantic `UserStoppedSpeakingFrame`.
 
 ## Final Results
 

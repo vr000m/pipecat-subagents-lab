@@ -215,6 +215,7 @@ class ConnectionPipeline:
     transport: Any | None = None
     worker: Any | None = None
     worker_task: asyncio.Task[Any] | None = None
+    on_transcript: Callable[[str], Any] | None = None
     active: bool = True
 
     def deactivate(self) -> None:
@@ -370,7 +371,7 @@ class SessionHost:
                     return None
                 return await self._handle_transcript(text, origin=pipeline)
 
-            connection_stt.on_final = on_final
+            pipeline.on_transcript = on_final
         if connection_tts is not None and hasattr(connection_tts, "on_event"):
 
             async def on_tts_event(event: str, context_id: str) -> Any:

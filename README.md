@@ -115,9 +115,12 @@ state.
 For live STT, `Track audio received` proves only WebRTC negotiation. A complete
 utterance should also produce `VADProcessor: User started speaking`,
 `VADProcessor: User stopped speaking`, `committed <N> PCM bytes to local STT`,
-and `local STT transcription completed` in the server log. The local STT adapter
-uses Pipecat's VAD-delimited segments and sends the Nemotron service raw 16 kHz
-mono PCM16 rather than a WAV container.
+and `local STT transcription completed` in the server log. VAD may commit several
+short acoustic segments for one utterance; `UserTurnProcessor: User stopped
+speaking (strategy: TurnAnalyzerUserTurnStopStrategy...)` is the semantic turn
+boundary that routes their combined transcript once. The local STT adapter uses
+Pipecat's VAD-delimited segments and sends the Nemotron service raw 16 kHz mono
+PCM16 rather than a WAV container.
 
 On reconnect, the server-issued `session_id`, resume token, and proposed epoch
 fence the replacement transport. The replacement receives a fresh snapshot of
