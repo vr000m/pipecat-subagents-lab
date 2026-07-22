@@ -22,6 +22,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequestHandler,
 )
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config
@@ -117,12 +118,14 @@ async def _attach_connection(
     if runtime.tts is not None:
         processors.append(runtime.tts)
     processors.append(transport.output())
+    task_manager = TaskManager(loop=asyncio.get_running_loop())
     worker = PipelineWorker(
         Pipeline(processors),
         name=f"browser-{runtime.epoch}",
         params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=output_sample_rate),
         enable_rtvi=True,
         idle_timeout_secs=None,
+        task_manager=task_manager,
     )
     publisher = RTVIMessagePublisher(
         host.state.session_id, runtime.epoch, sequence_provider=lambda: host.state.sequence
@@ -172,7 +175,7 @@ async def _attach_connection(
     # registration seam.
     if type(host.runner).__module__.startswith("pipecat."):
         runtime.worker_task = asyncio.create_task(
-            worker.run(WorkerParams(loop=asyncio.get_running_loop()))
+            worker.run(WorkerParams(task_manager=task_manager))
         )
 
         def worker_finished(task: asyncio.Task[Any]) -> None:

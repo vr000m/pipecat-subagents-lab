@@ -83,9 +83,10 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
         return false;
       }
     }
+    const transportOptions = { webrtcRequestParams: { endpoint: connectionUrl } };
     const transport = transportFactory
-      ? transportFactory({ webrtcUrl: connectionUrl })
-      : new SmallWebRTCTransport({ webrtcUrl: connectionUrl });
+      ? transportFactory(transportOptions)
+      : new SmallWebRTCTransport(transportOptions);
     const callbacks = callbacksFor(callbackGeneration);
     client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: true });
     try {

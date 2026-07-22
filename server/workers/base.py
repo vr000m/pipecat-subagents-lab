@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable
 
 try:  # Pipecat versions with distributed worker support can provide this class.
     from pipecat.processors.frameworks.llm_context import LLMContextWorker as _NativeWorker
-except ImportError:  # pragma: no cover - exercised by the pinned 1.4.0 fallback runtime
+except ImportError:  # pragma: no cover - exercised by the pinned 1.6.0 fallback runtime
     from pipecat.workers.base_worker import BaseWorker as _NativeWorker
 
 

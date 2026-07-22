@@ -65,11 +65,11 @@ epoch, and the last snapshot sequence. The new epoch is fenced before the
 snapshot is sent; old callbacks may append an immutable canonical result tied
 to their originating turn but cannot mutate active state or autoplay.
 
-## Verified Pipecat 1.4.0 seam notes
+## Verified Pipecat 1.6.0 seam notes
 
-The pinned package exposes `LLMContextWorker(name, llm, active=False,
-bridged=...)`, `PipelineWorker(..., bridged=...)`, `BusBridgeProcessor(bus,
-worker_name, target_task, bridge)`, and `RTVIServerMessageFrame(data)`.
+The pinned package does not expose the planned `LLMContextWorker` module.
+`PipelineWorker(..., bridged=...)`, `BusBridgeProcessor(bus, worker_name,
+target_task, bridge)`, and `RTVIServerMessageFrame(data)` remain available.
 `RTVIServerMessageFrame` carries its arbitrary payload in `data`. The pinned
 `WorkerRunner` constructor has no `auto_end` parameter; its runtime default is
 `_auto_end=True`, so the durable-host implementation must set/verify the

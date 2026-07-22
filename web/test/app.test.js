@@ -18,8 +18,12 @@ test("connection readiness sends RTVI ready before requesting a snapshot", async
   const documentRef = fakeDocument();
   const root = new Element();
   const messages = [];
+  let transportOptions;
   let shouldFail = true;
-  const app = createApp({ root, documentRef, transportFactory: () => ({ sendMessage: (message) => messages.push(message) }), clientFactory: (transport, callbacks) => ({
+  const app = createApp({ root, documentRef, transportFactory: (options) => {
+    transportOptions = options;
+    return { sendMessage: (message) => messages.push(message) };
+  }, clientFactory: (transport, callbacks) => ({
     connect: async () => {
       if (shouldFail) throw new Error("offline");
       // PipecatClient.connect() performs this transport call internally
@@ -42,6 +46,7 @@ test("connection readiness sends RTVI ready before requesting a snapshot", async
   await connectButton.onclick();
   expect(connectButton.disabled).toBe(true);
   expect(messages).toEqual([{ type: "client-ready" }, "snapshot-request"]);
+  expect(transportOptions).toEqual({ webrtcRequestParams: { endpoint: "/api/rtc" } });
 });
 
 test("onServerMessage rejects unsupported contracts before applying state", () => {

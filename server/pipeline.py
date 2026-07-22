@@ -308,7 +308,7 @@ class SessionHost:
     async def _register_persistent_workers(self) -> None:
         """Register durable contexts with the runner when the API can accept them.
 
-        Pipecat 1.4.0 does not expose the planned ``LLMContextWorker`` module;
+        Pipecat 1.6.0 does not expose the planned ``LLMContextWorker`` module;
         the lab's ContextWorker uses the pinned BaseWorker bus lifecycle instead.
         Test registries and runners without ``add_workers`` are left untouched.
         """
@@ -385,7 +385,7 @@ class SessionHost:
                     and pipeline.active
                     and pipeline.scheduler.active is not None
                 ):
-                    # Pipecat 1.4.0 creates its own TTSSpeakFrame context ID.
+                    # Pipecat 1.6.0 creates its own TTSSpeakFrame context ID.
                     # The scheduler's one-active-lease invariant is the only
                     # correlation available without claiming playout completion.
                     utterance_id = pipeline.scheduler.active.item.utterance_id
