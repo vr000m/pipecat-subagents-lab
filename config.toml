@@ -9,6 +9,8 @@ stt_language = "en"
 [turn]
 # Fallback after Smart Turn reports INCOMPLETE and no further speech arrives.
 smart_turn_timeout_seconds = 5.0
+# Debounce a premature COMPLETE if speech resumes after a natural pause.
+smart_turn_complete_grace_seconds = 1.5
 
 [tts]
 tts_ws_host = "127.0.0.1"

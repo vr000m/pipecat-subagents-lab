@@ -12,7 +12,9 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     TranscriptionFrame,
+    UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
@@ -36,13 +38,20 @@ def smart_turn_processor(*, timeout_seconds: float = 5.0) -> UserTurnProcessor:
 
 
 class FinalTurnTranscriptProcessor(FrameProcessor):
-    """Route finalized STT fragments only after Smart Turn closes the turn."""
+    """Debounce Smart Turn stops and route one combined application turn."""
 
-    def __init__(self, on_final: Callable[[str], Any] | None) -> None:
+    def __init__(
+        self,
+        on_final: Callable[[str], Any] | None,
+        *,
+        complete_grace_seconds: float = 1.5,
+    ) -> None:
         super().__init__()
         self._on_final = on_final
+        self._complete_grace_seconds = complete_grace_seconds
         self._fragments: list[str] = []
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
+        self._completion_task: asyncio.Task[None] | None = None
 
     async def _dispatch(self, text: str) -> None:
         if self._on_final is None:
@@ -59,8 +68,35 @@ class FinalTurnTranscriptProcessor(FrameProcessor):
         self._dispatch_tasks.add(task)
         task.add_done_callback(self._dispatch_tasks.discard)
 
+    def _cancel_completion(self) -> None:
+        if self._completion_task is not None and not self._completion_task.done():
+            self._completion_task.cancel()
+        self._completion_task = None
+
+    async def _complete_after_grace(self) -> None:
+        try:
+            await asyncio.sleep(self._complete_grace_seconds)
+        except asyncio.CancelledError:
+            return
+        text = " ".join(self._fragments)
+        fragment_count = len(self._fragments)
+        self._fragments.clear()
+        self._completion_task = None
+        if not text:
+            return
+        logger.info(f"{self}: routing {fragment_count} STT fragment(s) as one completed user turn")
+        self._dispatch_in_background(text)
+        await self.push_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+    def _arm_completion(self) -> None:
+        self._cancel_completion()
+        logger.debug(
+            f"{self}: Smart Turn completion armed for {self._complete_grace_seconds:g}s grace"
+        )
+        self._completion_task = asyncio.create_task(self._complete_after_grace())
+
     async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
-        """Collect final STT fragments and route once per semantic user turn."""
+        """Collect STT fragments and debounce premature semantic stops."""
         await super().process_frame(frame, direction)
 
         if direction == FrameDirection.DOWNSTREAM:
@@ -68,12 +104,18 @@ class FinalTurnTranscriptProcessor(FrameProcessor):
                 text = frame.text.strip()
                 if text:
                     self._fragments.append(text)
+                # Raw local-STT segments are not application turns and must not
+                # leak into the browser transcript as separate messages.
+                return
+            if isinstance(frame, (UserStartedSpeakingFrame, VADUserStartedSpeakingFrame)):
+                if self._completion_task is not None:
+                    logger.debug(f"{self}: speech resumed during completion grace")
+                    self._cancel_completion()
             elif isinstance(frame, UserStoppedSpeakingFrame):
-                text = " ".join(self._fragments)
-                self._fragments.clear()
-                if text:
-                    self._dispatch_in_background(text)
+                self._arm_completion()
+                return
             elif isinstance(frame, (CancelFrame, EndFrame)):
+                self._cancel_completion()
                 self._fragments.clear()
 
         await self.push_frame(frame, direction)

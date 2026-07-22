@@ -137,7 +137,10 @@ async def _attach_connection(
                 VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=16000)),
                 runtime.stt,
                 smart_turn_processor(timeout_seconds=config.smart_turn_timeout_seconds),
-                FinalTurnTranscriptProcessor(runtime.on_transcript),
+                FinalTurnTranscriptProcessor(
+                    runtime.on_transcript,
+                    complete_grace_seconds=config.smart_turn_complete_grace_seconds,
+                ),
             )
         )
     if bridge is not None:

@@ -8,6 +8,7 @@ from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnal
 from pipecat.frames.frames import (
     TTSSpeakFrame,
     TranscriptionFrame,
+    UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -473,7 +474,7 @@ def test_final_turn_transcript_waits_for_smart_turn_stop() -> None:
             routed.append(text)
             routed_event.set()
 
-        processor = FinalTurnTranscriptProcessor(on_final)
+        processor = FinalTurnTranscriptProcessor(on_final, complete_grace_seconds=0.01)
 
         async def push(frame: object, _direction: object) -> None:
             forwarded.append(frame)
@@ -492,15 +493,24 @@ def test_final_turn_transcript_waits_for_smart_turn_stop() -> None:
         await asyncio.sleep(0)
         assert routed == []
 
-        semantic_stop = UserStoppedSpeakingFrame()
-        await processor.process_frame(semantic_stop, FrameDirection.DOWNSTREAM)
+        await processor.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await processor.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await processor.process_frame(
+            TranscriptionFrame("over the last two hundred years.", "", ""),
+            FrameDirection.DOWNSTREAM,
+        )
+        await asyncio.sleep(0.02)
+        assert routed == []
+
+        await processor.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         await asyncio.wait_for(routed_event.wait(), timeout=1)
-        assert routed == ["Can you look for the capital of India?"]
+        assert routed == ["Can you look for the capital of India? over the last two hundred years."]
 
         await processor.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         await asyncio.sleep(0)
-        assert routed == ["Can you look for the capital of India?"]
-        assert forwarded[-2] is semantic_stop
+        assert routed == ["Can you look for the capital of India? over the last two hundred years."]
+        assert not any(isinstance(frame, TranscriptionFrame) for frame in forwarded)
+        assert sum(isinstance(frame, UserStoppedSpeakingFrame) for frame in forwarded) == 1
 
     asyncio.run(run())
 
@@ -601,6 +611,7 @@ def test_connection_attach_registers_worker_with_async_runner(
         vad_processor = object()
         turn_processor = object()
         turn_timeouts: list[float] = []
+        completion_graces: list[float] = []
         transcript_processor = object()
         transcript_callbacks: list[object] = []
 
@@ -623,7 +634,11 @@ def test_connection_attach_registers_worker_with_async_runner(
         monkeypatch.setattr(
             app_module,
             "FinalTurnTranscriptProcessor",
-            lambda callback: transcript_callbacks.append(callback) or transcript_processor,
+            lambda callback, *, complete_grace_seconds: (
+                transcript_callbacks.append(callback)
+                or completion_graces.append(complete_grace_seconds)
+                or transcript_processor
+            ),
         )
         monkeypatch.setattr(app_module, "TransportParams", lambda **kwargs: kwargs)
         monkeypatch.setattr(app_module, "PipelineParams", lambda **kwargs: kwargs)
@@ -656,6 +671,7 @@ def test_connection_attach_registers_worker_with_async_runner(
             transcript_processor,
         ]
         assert turn_timeouts == [7.5]
+        assert completion_graces == [1.5]
         assert len(transcript_callbacks) == 1
         assert callable(transcript_callbacks[0])
         result = await transcript_callbacks[0]("Riga weather")

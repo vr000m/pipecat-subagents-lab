@@ -34,6 +34,7 @@ class Config:
     stt_language: str = "en"
     stt_endpoint: tuple[str, str] | None = None
     smart_turn_timeout_seconds: float = 5.0
+    smart_turn_complete_grace_seconds: float = 1.5
     tts_endpoint: tuple[str, str] | None = None
     tts_voice_id: str = "azelma"
     bind_host: str = "127.0.0.1"
@@ -62,6 +63,8 @@ class Config:
             raise ConfigError("stt_language must be auto or an ISO language code")
         if not 0 < self.smart_turn_timeout_seconds <= 60:
             raise ConfigError("smart_turn_timeout_seconds must be between 0 and 60")
+        if not 0 < self.smart_turn_complete_grace_seconds <= 10:
+            raise ConfigError("smart_turn_complete_grace_seconds must be between 0 and 10")
         if not self.tts_voice_id.strip():
             raise ConfigError("tts_voice_id must not be empty")
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
@@ -131,6 +134,13 @@ def load_config(
             kwargs["smart_turn_timeout_seconds"] = float(raw)
         except (TypeError, ValueError) as exc:
             raise ConfigError("WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS must be a number") from exc
+    if raw := values.get("WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS"):
+        try:
+            kwargs["smart_turn_complete_grace_seconds"] = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS must be a number"
+            ) from exc
     if raw := values.get("WEBSEARCH_TTS_VOICE_ID"):
         kwargs["tts_voice_id"] = str(raw)
     if "WEBSEARCH_BIND_HOST" in values:
@@ -188,6 +198,10 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         values["WEBSEARCH_STT_WS_SOCKET"] = stt["stt_ws_socket"]
     if "smart_turn_timeout_seconds" in turn:
         values["WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS"] = turn["smart_turn_timeout_seconds"]
+    if "smart_turn_complete_grace_seconds" in turn:
+        values["WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS"] = turn[
+            "smart_turn_complete_grace_seconds"
+        ]
     for key in ("tts_ws_uri", "tts_ws_socket", "tts_ws_host", "tts_ws_port"):
         if key in tts:
             values[f"WEBSEARCH_{key.upper()}"] = tts[key]
