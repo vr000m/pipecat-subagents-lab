@@ -1,26 +1,8 @@
 import { PipecatClient } from "@pipecat-ai/client-js";
-import { DailyMediaManager, SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
+import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { validateServerMessage } from "./protocol.js";
 import { applyServerMessage, createInitialState } from "./state.js";
 import { render } from "./render.js";
-
-function createMicrophoneManager() {
-  let transport;
-  const manager = new DailyMediaManager(false, false, async (event) => {
-    if (!transport?.pc) return;
-    if (event.type === "audio") {
-      await transport.getAudioTransceiver().sender.replaceTrack(event.track);
-    } else if (event.type === "video") {
-      await transport.getVideoTransceiver().sender.replaceTrack(event.track);
-    }
-  });
-  return {
-    manager,
-    bind(nextTransport) {
-      transport = nextTransport;
-    },
-  };
-}
 
 export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", sessionUrl = "/api/session", fetchImpl = globalThis.fetch, clientFactory, transportFactory } = {}) {
   root ??= documentRef?.querySelector?.("#app");
@@ -101,15 +83,9 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
         return false;
       }
     }
-    let microphoneManager;
     const transport = transportFactory
       ? transportFactory({ webrtcUrl: connectionUrl })
-      : (() => {
-        microphoneManager = createMicrophoneManager();
-        const nextTransport = new SmallWebRTCTransport({ webrtcUrl: connectionUrl, mediaManager: microphoneManager.manager });
-        microphoneManager.bind(nextTransport);
-        return nextTransport;
-      })();
+      : new SmallWebRTCTransport({ webrtcUrl: connectionUrl });
     const callbacks = callbacksFor(callbackGeneration);
     client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: true });
     try {

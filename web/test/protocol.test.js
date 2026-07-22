@@ -8,6 +8,7 @@ const packageSource = JSON.parse(readFileSync(new URL("../package.json", import.
 
 test("browser entrypoint requests microphone capture on explicit connect", () => {
   expect(appSource).toContain("enableMic: true");
+  expect(appSource).not.toContain("createMicrophoneManager");
   expect(appSource).toContain("if (typeof client.initDevices === \"function\") await client.initDevices();");
   expect(appSource).toContain("client?.enableMic(false)");
   expect(appSource).toContain("await client?.disconnect()");
