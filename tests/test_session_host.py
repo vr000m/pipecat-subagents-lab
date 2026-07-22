@@ -165,10 +165,14 @@ def test_replacement_fences_new_epoch_before_old_shutdown_and_rejects_old_callba
                 }
             )
         )
-        await asyncio.wait_for(old_worker.shutdown_started.wait(), timeout=1)
+        second = await asyncio.wait_for(replacement, timeout=1)
 
         assert host.arbiter.accepts(2)
         assert host.state.active_epoch == 2
+        assert second.epoch == 2
+        assert host.connection is second
+
+        await asyncio.wait_for(old_worker.shutdown_started.wait(), timeout=1)
 
         host.state.append_result(
             GroundedResult(
@@ -185,8 +189,6 @@ def test_replacement_fences_new_epoch_before_old_shutdown_and_rejects_old_callba
         assert host.state.workers["worker-weather"].latest_result_id is None
 
         old_worker.release_shutdown.set()
-        second = await asyncio.wait_for(replacement, timeout=1)
-        assert second.epoch == 2
-        assert host.connection is second
+        await host.shutdown()
 
     asyncio.run(run())

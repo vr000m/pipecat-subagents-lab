@@ -264,6 +264,7 @@ class SessionHost:
         self._runner_registered: set[str] = set()
         self._runner_task: asyncio.Task[Any] | None = None
         self.connection: ConnectionPipeline | None = None
+        self._background_shutdowns: set[asyncio.Task[None]] = set()
         self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
         self._turn_sequence = 0
         self.started = False
@@ -407,7 +408,10 @@ class SessionHost:
             connection_tts.on_event = on_tts_event
         self.connection = pipeline
         if old_connection is not None:
-            await old_connection.shutdown()
+            old_connection.deactivate()
+            task = asyncio.create_task(old_connection.shutdown(reason="connection replaced"))
+            self._background_shutdowns.add(task)
+            task.add_done_callback(self._background_shutdowns.discard)
         await self._register_persistent_workers()
         return pipeline
 
@@ -679,6 +683,8 @@ class SessionHost:
         if self.connection is not None:
             await self.connection.shutdown(reason="session shutdown")
             self.connection = None
+        if self._background_shutdowns:
+            await asyncio.gather(*self._background_shutdowns, return_exceptions=True)
         stop = getattr(self.runner, "stop", None)
         if stop is not None:
             result = stop()
