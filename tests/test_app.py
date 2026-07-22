@@ -203,6 +203,29 @@ def test_session_discovery_accepts_browser_same_origin_get_without_origin() -> N
     assert response.status_code == 200
 
 
+def test_session_discovery_accepts_localhost_alias_for_loopback_config() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    with TestClient(create_app(host)) as client:
+        response = client.get(
+            "/api/session",
+            headers={"origin": "http://localhost:7860"},
+        )
+    assert response.status_code == 200
+
+
+def test_session_discovery_accepts_localhost_same_origin_without_origin() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    with TestClient(create_app(host)) as client:
+        response = client.get(
+            "/api/session",
+            headers={
+                "host": "localhost:7860",
+                "sec-fetch-site": "same-origin",
+            },
+        )
+    assert response.status_code == 200
+
+
 def test_session_discovery_uses_configured_client_origin() -> None:
     registry = WorkerRegistry(config=Config(known_client_url="https://client.example.test/app"))
     host = SessionHost(registry=registry, runner_factory=FakeRunner)

@@ -37,6 +37,7 @@ from .work_item_coordinator import WorkItemCoordinator
 
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandshake:
@@ -65,10 +66,26 @@ def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandsh
 def _require_local_origin(request: Request, config: Config) -> None:
     """Keep local discovery same-origin without rejecting browser fetch defaults."""
     configured = urlparse(config.known_client_url)
-    expected_origin = f"{configured.scheme}://{configured.netloc}"
+    allowed_hosts = {configured.hostname}
+    if configured.hostname in _LOOPBACK_HOSTS:
+        allowed_hosts.update(_LOOPBACK_HOSTS)
+
+    def allowed_origin(value: str) -> bool:
+        try:
+            candidate = urlparse(value)
+            candidate_port = candidate.port or (443 if candidate.scheme == "https" else 80)
+            configured_port = configured.port or (443 if configured.scheme == "https" else 80)
+        except ValueError:
+            return False
+        return (
+            candidate.scheme == configured.scheme
+            and candidate.hostname in allowed_hosts
+            and candidate_port == configured_port
+        )
+
     origin = request.headers.get("origin")
     if origin:
-        if origin.rstrip("/") != expected_origin.rstrip("/"):
+        if not allowed_origin(origin):
             raise HTTPException(
                 status_code=403, detail="origin is not allowed for the local server"
             )
@@ -77,9 +94,8 @@ def _require_local_origin(request: Request, config: Config) -> None:
     # Chromium omits Origin on a same-origin GET such as fetch('/api/session').
     # Sec-Fetch-Site is browser-controlled, and Host prevents accepting a
     # same-origin marker sent to an unexpected local listener.
-    if (
-        request.headers.get("sec-fetch-site") != "same-origin"
-        or request.headers.get("host") != configured.netloc
+    if request.headers.get("sec-fetch-site") != "same-origin" or not allowed_origin(
+        f"{configured.scheme}://{request.headers.get('host', '')}"
     ):
         raise HTTPException(status_code=403, detail="origin is not allowed for the local server")
 
