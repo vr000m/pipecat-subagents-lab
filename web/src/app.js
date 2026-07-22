@@ -4,9 +4,8 @@ import { validateServerMessage } from "./protocol.js";
 import { applyServerMessage, createInitialState } from "./state.js";
 import { render } from "./render.js";
 
-function createDeferredMicrophoneManager() {
+function createMicrophoneManager() {
   let transport;
-  let microphoneRequested = false;
   const manager = new DailyMediaManager(false, false, async (event) => {
     if (!transport?.pc) return;
     if (event.type === "audio") {
@@ -15,20 +14,6 @@ function createDeferredMicrophoneManager() {
       await transport.getVideoTransceiver().sender.replaceTrack(event.track);
     }
   });
-  const initialize = manager.initialize.bind(manager);
-  const connect = manager.connect.bind(manager);
-  const enableMic = manager.enableMic.bind(manager);
-  manager.connect = async () => {
-    if (microphoneRequested) await connect();
-  };
-  manager.initialize = async () => {
-    if (microphoneRequested) await initialize();
-  };
-  manager.enableMic = (enabled) => {
-    if (!enabled) return enableMic(false);
-    microphoneRequested = true;
-    return connect().then(() => enableMic(true));
-  };
   return {
     manager,
     bind(nextTransport) {
@@ -116,20 +101,25 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
         return false;
       }
     }
-    let deferredMic;
+    let microphoneManager;
     const transport = transportFactory
       ? transportFactory({ webrtcUrl: connectionUrl })
       : (() => {
-        deferredMic = createDeferredMicrophoneManager();
-        const nextTransport = new SmallWebRTCTransport({ webrtcUrl: connectionUrl, mediaManager: deferredMic.manager });
-        deferredMic.bind(nextTransport);
+        microphoneManager = createMicrophoneManager();
+        const nextTransport = new SmallWebRTCTransport({ webrtcUrl: connectionUrl, mediaManager: microphoneManager.manager });
+        microphoneManager.bind(nextTransport);
         return nextTransport;
       })();
     const callbacks = callbacksFor(callbackGeneration);
-    client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: false });
+    client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: true });
     try {
+      // Initialize devices inside this catch boundary so microphone permission
+      // failures are surfaced in the local diagnostics instead of leaving the
+      // client connection promise pending.
+      if (typeof client.initDevices === "function") await client.initDevices();
       await client.connect();
       update({ ...state, connection: "connected" });
+      setMicButton(Boolean(client.isMicEnabled));
       // Connect is a user gesture, so a previously-created audio element may play here.
       audio.play().catch(() => report("Connected, but browser audio is blocked. Click Play audio to continue."));
       return true;
@@ -146,12 +136,14 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     client?.enableMic(false);
     await client?.disconnect();
     audio.srcObject = null;
+    setMicButton(false);
     update({ ...state, connection: "disconnected" });
   };
   const toggleMic = () => {
     if (!client) return;
     const enabled = !client.isMicEnabled;
     client.enableMic(enabled);
+    setMicButton(enabled);
     update({ ...state, localDiagnostics: { ...state.localDiagnostics, message: enabled ? "Microphone enabled." : "Microphone disabled." } });
   };
 
@@ -163,6 +155,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   const disconnectButton = el(documentRef, "button", "Disconnect");
   const micButton = el(documentRef, "button", "Mic: off");
   const playButton = el(documentRef, "button", "Play audio");
+  const setMicButton = (enabled) => { micButton.textContent = `Mic: ${enabled ? "on" : "off"}`; };
   disconnectButton.disabled = true; micButton.disabled = true; playButton.hidden = true;
   connectButton.onclick = async () => {
     if (!await connect()) return;

@@ -6,8 +6,9 @@ const appSource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8"
 const indexSource = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 const packageSource = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
-test("browser entrypoint starts with microphone capture disabled", () => {
-  expect(appSource).toContain("enableMic: false");
+test("browser entrypoint requests microphone capture on explicit connect", () => {
+  expect(appSource).toContain("enableMic: true");
+  expect(appSource).toContain("if (typeof client.initDevices === \"function\") await client.initDevices();");
   expect(appSource).toContain("client?.enableMic(false)");
   expect(appSource).toContain("await client?.disconnect()");
 });
