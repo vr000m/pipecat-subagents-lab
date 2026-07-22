@@ -33,6 +33,7 @@ class Config:
     stt_service: str = "websocket"
     stt_language: str = "en"
     stt_endpoint: tuple[str, str] | None = None
+    smart_turn_timeout_seconds: float = 5.0
     tts_endpoint: tuple[str, str] | None = None
     tts_voice_id: str = "azelma"
     bind_host: str = "127.0.0.1"
@@ -59,6 +60,8 @@ class Config:
             r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?", self.stt_language
         ):
             raise ConfigError("stt_language must be auto or an ISO language code")
+        if not 0 < self.smart_turn_timeout_seconds <= 60:
+            raise ConfigError("smart_turn_timeout_seconds must be between 0 and 60")
         if not self.tts_voice_id.strip():
             raise ConfigError("tts_voice_id must not be empty")
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
@@ -101,7 +104,7 @@ def load_config(
                     toml_values = tomllib.load(handle)
             except tomllib.TOMLDecodeError as exc:
                 raise ConfigError(f"invalid TOML config: {path}") from exc
-    _load_toml_service_values(values, toml_values)
+    _load_toml_values(values, toml_values)
     if env_file:
         if isinstance(env_file, (str, Path)):
             for line in Path(env_file).read_text().splitlines():
@@ -123,6 +126,11 @@ def load_config(
         kwargs["stt_service"] = str(raw)
     if raw := values.get("WEBSEARCH_STT_LANGUAGE"):
         kwargs["stt_language"] = str(raw)
+    if raw := values.get("WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS"):
+        try:
+            kwargs["smart_turn_timeout_seconds"] = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS must be a number") from exc
     if raw := values.get("WEBSEARCH_TTS_VOICE_ID"):
         kwargs["tts_voice_id"] = str(raw)
     if "WEBSEARCH_BIND_HOST" in values:
@@ -165,18 +173,21 @@ def load_config(
     return Config(**kwargs)
 
 
-def _load_toml_service_values(values: dict[str, object], document: Mapping[str, object]) -> None:
-    """Map the non-secret local-service TOML surface into config values."""
+def _load_toml_values(values: dict[str, object], document: Mapping[str, object]) -> None:
+    """Map the non-secret local runtime TOML surface into config values."""
     stt = document.get("stt", {})
     tts = document.get("tts", {})
-    if not isinstance(stt, Mapping) or not isinstance(tts, Mapping):
-        raise ConfigError("[stt] and [tts] config sections must be tables")
+    turn = document.get("turn", {})
+    if not all(isinstance(section, Mapping) for section in (stt, tts, turn)):
+        raise ConfigError("[stt], [tts], and [turn] config sections must be tables")
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
     if "stt_language" in stt:
         values["WEBSEARCH_STT_LANGUAGE"] = stt["stt_language"]
     if "stt_ws_socket" in stt:
         values["WEBSEARCH_STT_WS_SOCKET"] = stt["stt_ws_socket"]
+    if "smart_turn_timeout_seconds" in turn:
+        values["WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS"] = turn["smart_turn_timeout_seconds"]
     for key in ("tts_ws_uri", "tts_ws_socket", "tts_ws_host", "tts_ws_port"):
         if key in tts:
             values[f"WEBSEARCH_{key.upper()}"] = tts[key]

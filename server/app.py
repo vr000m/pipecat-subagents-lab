@@ -129,13 +129,14 @@ async def _attach_connection(
 
         bus = _ProbeBus() if _ProbeBus is not None else None
     bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
+    config = getattr(host.registry, "config", None) or Config()
     processors = [transport.input()]
     if runtime.stt is not None:
         processors.extend(
             (
                 VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=16000)),
                 runtime.stt,
-                smart_turn_processor(),
+                smart_turn_processor(timeout_seconds=config.smart_turn_timeout_seconds),
                 FinalTurnTranscriptProcessor(runtime.on_transcript),
             )
         )

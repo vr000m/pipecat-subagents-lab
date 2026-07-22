@@ -6,6 +6,10 @@ stt_service = "websocket"
 stt_ws_socket = "~/Library/Caches/pipecat-stt/nemotron.sock"
 stt_language = "en"
 
+[turn]
+# Fallback after Smart Turn reports INCOMPLETE and no further speech arrives.
+smart_turn_timeout_seconds = 5.0
+
 [tts]
 tts_ws_host = "127.0.0.1"
 tts_ws_port = 8965

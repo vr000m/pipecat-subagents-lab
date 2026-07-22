@@ -20,8 +20,9 @@ from pipecat.turns.user_turn_processor import UserTurnProcessor
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 
-def smart_turn_processor() -> UserTurnProcessor:
+def smart_turn_processor(*, timeout_seconds: float = 5.0) -> UserTurnProcessor:
     """Build the Pipecat 1.6 semantic end-of-turn processor explicitly."""
+    logger.debug(f"Smart Turn fallback timeout set to {timeout_seconds:g}s")
     return UserTurnProcessor(
         user_turn_strategies=UserTurnStrategies(
             stop=[
@@ -29,7 +30,8 @@ def smart_turn_processor() -> UserTurnProcessor:
                     turn_analyzer=LocalSmartTurnAnalyzerV3(),
                 )
             ]
-        )
+        ),
+        user_turn_stop_timeout=timeout_seconds,
     )
 
 

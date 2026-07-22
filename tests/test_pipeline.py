@@ -17,6 +17,7 @@ from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 
 import server.app as app_module
+from server.config import Config
 from server.contracts import GroundedResult, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
 from server.registry import UnsupportedWorkerType
@@ -505,13 +506,14 @@ def test_final_turn_transcript_waits_for_smart_turn_stop() -> None:
 
 
 def test_smart_turn_processor_uses_pipecat_semantic_stop_strategy() -> None:
-    processor = smart_turn_processor()
+    processor = smart_turn_processor(timeout_seconds=7.5)
     strategies = processor._user_turn_controller.user_turn_strategies
 
     assert isinstance(processor, UserTurnProcessor)
     assert len(strategies.stop) == 1
     assert isinstance(strategies.stop[0], TurnAnalyzerUserTurnStopStrategy)
     assert isinstance(strategies.stop[0]._turn_analyzer, LocalSmartTurnAnalyzerV3)
+    assert processor._user_turn_controller._user_turn_stop_timeout == 7.5
 
 
 def test_connection_observer_unsubscribe_stops_future_listener_delivery() -> None:
@@ -591,12 +593,14 @@ def test_connection_attach_registers_worker_with_async_runner(
             stt=stt,
             coordinator=RoutedCoordinator(ResultWorker()),
         )
+        host.registry.config = Config(smart_turn_timeout_seconds=7.5)
         await host.start()
         transport = FakeTransport()
         pipeline_args: list[object] = []
         vad_analyzer = object()
         vad_processor = object()
         turn_processor = object()
+        turn_timeouts: list[float] = []
         transcript_processor = object()
         transcript_callbacks: list[object] = []
 
@@ -611,7 +615,11 @@ def test_connection_attach_registers_worker_with_async_runner(
             "VADProcessor",
             lambda *, vad_analyzer: vad_processor if vad_analyzer is not None else None,
         )
-        monkeypatch.setattr(app_module, "smart_turn_processor", lambda: turn_processor)
+        monkeypatch.setattr(
+            app_module,
+            "smart_turn_processor",
+            lambda *, timeout_seconds: turn_timeouts.append(timeout_seconds) or turn_processor,
+        )
         monkeypatch.setattr(
             app_module,
             "FinalTurnTranscriptProcessor",
@@ -647,6 +655,7 @@ def test_connection_attach_registers_worker_with_async_runner(
             turn_processor,
             transcript_processor,
         ]
+        assert turn_timeouts == [7.5]
         assert len(transcript_callbacks) == 1
         assert callable(transcript_callbacks[0])
         result = await transcript_callbacks[0]("Riga weather")

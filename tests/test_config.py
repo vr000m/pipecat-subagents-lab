@@ -22,6 +22,7 @@ def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
     assert config.multi_intent_wait_timeout_ms == 10_000
     assert config.stt_service == "websocket"
     assert config.stt_language == "en"
+    assert config.smart_turn_timeout_seconds == 5.0
     assert config.tts_voice_id == "azelma"
     assert config.openai_api_key is None
     assert config.router_model_policy
@@ -37,6 +38,12 @@ def test_operator_limits_reject_zero_or_unbounded_values() -> None:
 
     with pytest.raises(ConfigError):
         Config(multi_intent_wait_timeout_ms=0)
+
+    with pytest.raises(ConfigError):
+        Config(smart_turn_timeout_seconds=0)
+
+    with pytest.raises(ConfigError):
+        Config(smart_turn_timeout_seconds=61)
 
 
 def test_env_precedence_is_explicit_and_secret_values_are_not_logged(
@@ -85,6 +92,29 @@ def test_bind_and_known_client_settings_load_from_environment() -> None:
     )
 
 
+def test_smart_turn_timeout_loads_from_environment() -> None:
+    config = load_config(env={"WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS": "7.5"})
+
+    assert config.smart_turn_timeout_seconds == 7.5
+
+
+def test_invalid_smart_turn_timeout_has_config_error_boundary() -> None:
+    with pytest.raises(ConfigError, match="WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS"):
+        load_config(env={"WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS": "not-a-number"})
+
+
+def test_smart_turn_environment_timeout_overrides_toml(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[turn]\nsmart_turn_timeout_seconds = 8.0\n")
+
+    config = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS": "6.5"},
+    )
+
+    assert config.smart_turn_timeout_seconds == 6.5
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (("bind_host", ""), ("bind_port", 0), ("bind_port", 65_536), ("known_client_url", "client")),
@@ -108,7 +138,8 @@ def test_toml_local_service_settings_load_and_expand_socket_paths(tmp_path) -> N
     config_file = tmp_path / "config.toml"
     config_file.write_text(
         '[stt]\nstt_service = "websocket"\nstt_ws_socket = "~/stt.sock"\n'
-        'stt_language = "en-US"\n[tts]\ntts_ws_socket = "~/tts.sock"\n'
+        'stt_language = "en-US"\n[turn]\nsmart_turn_timeout_seconds = 8.0\n'
+        '[tts]\ntts_ws_socket = "~/tts.sock"\n'
     )
 
     config = load_config(config_file=config_file, env={})
@@ -116,6 +147,7 @@ def test_toml_local_service_settings_load_and_expand_socket_paths(tmp_path) -> N
     assert config.stt_service == "websocket"
     assert config.stt_language == "en-US"
     assert config.stt_endpoint == ("uds", str(Path.home() / "stt.sock"))
+    assert config.smart_turn_timeout_seconds == 8.0
     assert config.tts_endpoint == ("uds", str(Path.home() / "tts.sock"))
 
 
@@ -131,6 +163,7 @@ def test_repository_config_contains_the_local_socket_defaults() -> None:
         "127.0.0.1:8965",
     )
     assert config.tts_voice_id == "azelma"
+    assert config.smart_turn_timeout_seconds == 5.0
 
 
 def test_environment_endpoint_overrides_toml_socket(tmp_path) -> None:

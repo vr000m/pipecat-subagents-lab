@@ -29,6 +29,9 @@ stt_service = "websocket"
 stt_ws_socket = "~/Library/Caches/pipecat-stt/nemotron.sock"
 stt_language = "en"
 
+[turn]
+smart_turn_timeout_seconds = 5.0
+
 [tts]
 tts_ws_host = "127.0.0.1"
 tts_ws_port = 8965
@@ -46,7 +49,10 @@ export WEBSEARCH_TTS_ENDPOINT=uds:///path/to/tts.sock
 The equivalent overrides are `WEBSEARCH_STT_WS_SOCKET`,
 `WEBSEARCH_TTS_WS_SOCKET`, and `WEBSEARCH_TTS_WS_URI`; for TTS, URI takes
 precedence over socket, followed by `WEBSEARCH_TTS_WS_HOST` plus
-`WEBSEARCH_TTS_WS_PORT`.
+`WEBSEARCH_TTS_WS_PORT`. `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
+semantic-turn fallback. After Smart Turn reports an incomplete turn, each new
+speech boundary resets this timer; five silent seconds finalize the accumulated
+transcript by default.
 
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
 The default host opens these websocket endpoints with the versioned local STT
