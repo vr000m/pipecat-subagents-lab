@@ -42,9 +42,43 @@ def test_worker_sanitizes_query_and_requests_store_false_before_normalizing_resu
 
     assert provider.calls[0]["store"] is False
     assert provider.calls[0]["tools"] == [{"type": "web_search"}]
+    assert provider.calls[0]["tool_choice"] == "required"
     assert "refined:" not in provider.calls[0]["input"]
     assert result.text == "The answer."
     assert result.citations[0].url == "https://example.com/a"
+
+
+def test_worker_collects_object_sources_from_web_search_call_actions() -> None:
+    class Value:
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    provider = FakeResponses(
+        Value(
+            output_text="The answer.",
+            output=[
+                Value(
+                    type="web_search_call",
+                    action=Value(
+                        sources=[
+                            Value(
+                                type="url",
+                                title="Historical source",
+                                url="https://example.com/history",
+                            )
+                        ]
+                    ),
+                )
+            ],
+        )
+    )
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    result = asyncio.run(worker.search("Historical capitals", turn_id="turn-1"))
+
+    assert [(item.title, item.url) for item in result.citations] == [
+        ("Historical source", "https://example.com/history")
+    ]
 
 
 def test_worker_declines_or_clarifies_without_calling_search_when_web_cannot_satisfy_request() -> (

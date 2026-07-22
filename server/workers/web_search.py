@@ -53,7 +53,14 @@ def _response_citations(response: Any) -> list[dict[str, str]]:
             url = _value(value, "url")
             if isinstance(url, str):
                 citations.append({"title": str(_value(value, "title", "") or ""), "url": url})
-            for child_name in ("output", "content", "annotations", "results"):
+            for child_name in (
+                "output",
+                "content",
+                "annotations",
+                "results",
+                "action",
+                "sources",
+            ):
                 child = _value(value, child_name)
                 if child is not None:
                     visit(child)
@@ -119,6 +126,7 @@ class WebSearchWorker(ContextWorker):
             kwargs = {
                 "model": self.model,
                 "tools": [{"type": "web_search"}],
+                "tool_choice": "required",
                 "input": self._contextual_input(refined),
                 "store": False,
             }
