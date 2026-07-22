@@ -118,6 +118,7 @@ def test_default_app_host_materializes_configured_local_speech_adapters(
     assert host.tts.client_factory is not None
     assert host.tts.endpoint.transport == "ws"
     assert host.tts.endpoint.address == "127.0.0.1:9000"
+    assert host.tts.voice_id == "azelma"
 
 
 def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
@@ -182,18 +183,29 @@ def test_session_discovery_rejects_cross_origin_requests() -> None:
     assert response.status_code == 403
 
 
-def test_session_discovery_rejects_requests_without_an_origin() -> None:
+def test_session_discovery_rejects_requests_without_browser_same_origin_headers() -> None:
     host = SessionHost(runner_factory=FakeRunner)
     with TestClient(create_app(host)) as client:
         response = client.get("/api/session")
     assert response.status_code == 403
 
 
+def test_session_discovery_accepts_browser_same_origin_get_without_origin() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    with TestClient(create_app(host)) as client:
+        response = client.get(
+            "/api/session",
+            headers={
+                "host": "127.0.0.1:7860",
+                "sec-fetch-site": "same-origin",
+            },
+        )
+    assert response.status_code == 200
+
+
 def test_session_discovery_uses_configured_client_origin() -> None:
     registry = WorkerRegistry(config=Config(known_client_url="https://client.example.test/app"))
     host = SessionHost(registry=registry, runner_factory=FakeRunner)
     with TestClient(create_app(host)) as client:
-        response = client.get(
-            "/api/session", headers={"origin": "https://client.example.test/app/"}
-        )
+        response = client.get("/api/session", headers={"origin": "https://client.example.test"})
     assert response.status_code == 200

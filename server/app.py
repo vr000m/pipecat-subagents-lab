@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -61,9 +62,24 @@ def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandsh
 
 
 def _require_local_origin(request: Request, config: Config) -> None:
-    """Keep the credential-bearing local discovery surface same-origin."""
+    """Keep local discovery same-origin without rejecting browser fetch defaults."""
+    configured = urlparse(config.known_client_url)
+    expected_origin = f"{configured.scheme}://{configured.netloc}"
     origin = request.headers.get("origin")
-    if not origin or origin.rstrip("/") != config.known_client_url.rstrip("/"):
+    if origin:
+        if origin.rstrip("/") != expected_origin.rstrip("/"):
+            raise HTTPException(
+                status_code=403, detail="origin is not allowed for the local server"
+            )
+        return
+
+    # Chromium omits Origin on a same-origin GET such as fetch('/api/session').
+    # Sec-Fetch-Site is browser-controlled, and Host prevents accepting a
+    # same-origin marker sent to an unexpected local listener.
+    if (
+        request.headers.get("sec-fetch-site") != "same-origin"
+        or request.headers.get("host") != configured.netloc
+    ):
         raise HTTPException(status_code=403, detail="origin is not allowed for the local server")
 
 
@@ -190,8 +206,16 @@ def _default_session_host(
         router=configured_router,
         config=config,
     )
-    stt = LocalSTT(STTEndpoint(*config.stt_endpoint)) if config.stt_endpoint else None
-    tts = LocalTTS(TTSEndpoint(*config.tts_endpoint)) if config.tts_endpoint else None
+    stt = (
+        LocalSTT(STTEndpoint(*config.stt_endpoint), language=config.stt_language)
+        if config.stt_endpoint
+        else None
+    )
+    tts = (
+        LocalTTS(TTSEndpoint(*config.tts_endpoint), voice_id=config.tts_voice_id)
+        if config.tts_endpoint
+        else None
+    )
     return SessionHost(registry=registry, stt=stt, tts=tts, coordinator=coordinator)
 
 

@@ -31,11 +31,14 @@ class LocalTTS(TTSService):
         on_event: Callable[[str, str], Any] | None = None,
         *,
         client_factory: Callable[[TTSEndpoint], Any] | None = None,
+        voice_id: str | None = "azelma",
         sample_rate: int = 24000,
     ) -> None:
         super().__init__(sample_rate=sample_rate)
-        self.endpoint, self.on_event = endpoint, on_event
-        self.client_factory = client_factory or default_tts_client_factory
+        self.endpoint, self.on_event, self.voice_id = endpoint, on_event, voice_id
+        self.client_factory = client_factory or (
+            lambda next_endpoint: default_tts_client_factory(next_endpoint, voice_id=voice_id)
+        )
         self._client: Any = None
         self.started = False
 
@@ -79,6 +82,7 @@ class LocalTTS(TTSService):
         return type(self)(
             self.endpoint,
             client_factory=self.client_factory,
+            voice_id=self.voice_id,
             sample_rate=self.sample_rate,
         )
 

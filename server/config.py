@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
@@ -28,8 +30,11 @@ class Config:
     worker_model_policy: Mapping[str, str] = field(default_factory=lambda: {"deep": "gpt-4o"})
     max_work_items_per_turn: int = 2
     multi_intent_wait_timeout_ms: int = 10_000
+    stt_service: str = "websocket"
+    stt_language: str = "en"
     stt_endpoint: tuple[str, str] | None = None
     tts_endpoint: tuple[str, str] | None = None
+    tts_voice_id: str = "azelma"
     bind_host: str = "127.0.0.1"
     bind_port: int = 7860
     known_client_url: str = "http://127.0.0.1:7860"
@@ -48,6 +53,14 @@ class Config:
             raise ConfigError("known_client_url must be an absolute http(s) URL")
         if not self.openai_api_key_env.isidentifier() or not self.openai_api_key_env.isupper():
             raise ConfigError("openai_api_key_env must be an uppercase environment variable name")
+        if self.stt_service != "websocket":
+            raise ConfigError("stt_service must be websocket")
+        if self.stt_language != "auto" and not re.fullmatch(
+            r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?", self.stt_language
+        ):
+            raise ConfigError("stt_language must be auto or an ISO language code")
+        if not self.tts_voice_id.strip():
+            raise ConfigError("tts_voice_id must not be empty")
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
         object.__setattr__(self, "worker_model_policy", _models(self.worker_model_policy))
 
@@ -70,10 +83,25 @@ class Config:
 
 
 def load_config(
-    *, env: Mapping[str, str] | None = None, env_file: Mapping[str, str] | str | Path | None = None
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Mapping[str, str] | str | Path | None = None,
+    config_file: str | Path | None = None,
 ) -> Config:
-    """Load config with process environment taking precedence over an env file."""
-    values: dict[str, str] = {}
+    """Load TOML defaults, then env-file values, then process environment."""
+    values: dict[str, object] = {}
+    toml_values: dict[str, object] = {}
+    if config_file is None and env is None:
+        config_file = Path(__file__).resolve().parents[1] / "config.toml"
+    if config_file:
+        path = Path(config_file).expanduser()
+        if path.exists():
+            try:
+                with path.open("rb") as handle:
+                    toml_values = tomllib.load(handle)
+            except tomllib.TOMLDecodeError as exc:
+                raise ConfigError(f"invalid TOML config: {path}") from exc
+    _load_toml_service_values(values, toml_values)
     if env_file:
         if isinstance(env_file, (str, Path)):
             for line in Path(env_file).read_text().splitlines():
@@ -91,6 +119,12 @@ def load_config(
         kwargs["max_work_items_per_turn"] = int(raw)
     if raw := values.get("WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS"):
         kwargs["multi_intent_wait_timeout_ms"] = int(raw)
+    if raw := values.get("WEBSEARCH_STT_SERVICE"):
+        kwargs["stt_service"] = str(raw)
+    if raw := values.get("WEBSEARCH_STT_LANGUAGE"):
+        kwargs["stt_language"] = str(raw)
+    if raw := values.get("WEBSEARCH_TTS_VOICE_ID"):
+        kwargs["tts_voice_id"] = str(raw)
     if "WEBSEARCH_BIND_HOST" in values:
         kwargs["bind_host"] = values["WEBSEARCH_BIND_HOST"]
     if "WEBSEARCH_BIND_PORT" in values:
@@ -103,10 +137,51 @@ def load_config(
         kwargs["known_client_url"] = values["WEBSEARCH_KNOWN_CLIENT_URL"]
     if raw := values.get("WEBSEARCH_OPENAI_API_KEY_ENV"):
         kwargs["openai_api_key_env"] = raw
-    for service in ("stt", "tts"):
-        if raw := values.get(f"WEBSEARCH_{service.upper()}_ENDPOINT"):
-            kwargs[f"{service}_endpoint"] = parse_endpoint(raw)
+    stt_endpoint = values.get("WEBSEARCH_STT_ENDPOINT")
+    if stt_endpoint:
+        kwargs["stt_endpoint"] = parse_endpoint(str(stt_endpoint))
+    elif values.get("WEBSEARCH_STT_WS_SOCKET"):
+        kwargs["stt_endpoint"] = ("uds", _expand_socket(str(values["WEBSEARCH_STT_WS_SOCKET"])))
+    tts_endpoint = values.get("WEBSEARCH_TTS_ENDPOINT")
+    if tts_endpoint:
+        kwargs["tts_endpoint"] = parse_endpoint(str(tts_endpoint))
+    else:
+        tts_uri = values.get("WEBSEARCH_TTS_WS_URI")
+        tts_socket = values.get("WEBSEARCH_TTS_WS_SOCKET")
+        tts_host = values.get("WEBSEARCH_TTS_WS_HOST")
+        tts_port = values.get("WEBSEARCH_TTS_WS_PORT")
+        if tts_uri:
+            kwargs["tts_endpoint"] = parse_endpoint(str(tts_uri))
+        elif tts_socket:
+            kwargs["tts_endpoint"] = ("uds", _expand_socket(str(tts_socket)))
+        elif tts_host and tts_port:
+            try:
+                port = int(str(tts_port))
+            except ValueError as exc:
+                raise ConfigError("WEBSEARCH_TTS_WS_PORT must be an integer") from exc
+            if not 1 <= port <= 65_535:
+                raise ConfigError("WEBSEARCH_TTS_WS_PORT must be between 1 and 65535")
+            kwargs["tts_endpoint"] = ("ws", f"{tts_host}:{port}")
     return Config(**kwargs)
+
+
+def _load_toml_service_values(values: dict[str, object], document: Mapping[str, object]) -> None:
+    """Map the non-secret local-service TOML surface into config values."""
+    stt = document.get("stt", {})
+    tts = document.get("tts", {})
+    if not isinstance(stt, Mapping) or not isinstance(tts, Mapping):
+        raise ConfigError("[stt] and [tts] config sections must be tables")
+    if "stt_service" in stt:
+        values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
+    if "stt_language" in stt:
+        values["WEBSEARCH_STT_LANGUAGE"] = stt["stt_language"]
+    if "stt_ws_socket" in stt:
+        values["WEBSEARCH_STT_WS_SOCKET"] = stt["stt_ws_socket"]
+    for key in ("tts_ws_uri", "tts_ws_socket", "tts_ws_host", "tts_ws_port"):
+        if key in tts:
+            values[f"WEBSEARCH_{key.upper()}"] = tts[key]
+    if "voice_id" in tts:
+        values["WEBSEARCH_TTS_VOICE_ID"] = tts["voice_id"]
 
 
 def parse_endpoint(value: str) -> tuple[str, str]:
@@ -116,4 +191,13 @@ def parse_endpoint(value: str) -> tuple[str, str]:
     transport, address = value.split("://", 1)
     if transport not in {"uds", "tcp", "ws", "wss"} or not address:
         raise ConfigError("unsupported or empty service endpoint")
+    if transport == "uds":
+        address = _expand_socket(address)
     return transport, address
+
+
+def _expand_socket(value: str) -> str:
+    address = os.path.expanduser(value).strip()
+    if not address:
+        raise ConfigError("service socket path must not be empty")
+    return address

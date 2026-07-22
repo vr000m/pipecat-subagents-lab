@@ -109,6 +109,38 @@ def test_local_tts_adopts_server_rate_before_emitting_audio() -> None:
     asyncio.run(run())
 
 
+def test_local_tts_preserves_configured_voice_for_connection_client() -> None:
+    captured: list[str | None] = []
+
+    class Client:
+        async def connect(self) -> dict:
+            captured.append(self.voice_id)
+            return {"type": "server.hello", "audio": {"rate": 24000}}
+
+        async def append(self, _text: str) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+        async def events(self):
+            yield {"type": "response.audio.done"}
+
+        voice_id = "azelma"
+
+    async def run() -> None:
+        service = LocalTTS(
+            TTSEndpoint("tcp", "127.0.0.1:9001"),
+            client_factory=lambda _endpoint: Client(),
+            voice_id="azelma",
+        )
+        await service.start()
+        [frame async for frame in service.run_tts("hello", "utt-1")]
+        assert service.voice_id == "azelma"
+
+    asyncio.run(run())
+
+
 def test_local_tts_reports_unknown_delivery_on_provider_error() -> None:
     class Client:
         async def append(self, _text: str) -> None:

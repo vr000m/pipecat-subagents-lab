@@ -35,6 +35,14 @@ async def _receive_json(ws: Any) -> dict[str, Any]:
     return json.loads(raw)
 
 
+async def _receive_until(ws: Any, expected_types: set[str]) -> dict[str, Any]:
+    """Drain compatibility alias events until the required acknowledgement arrives."""
+    while True:
+        event = await _receive_json(ws)
+        if event.get("type") in expected_types:
+            return event
+
+
 async def _events(ws: Any) -> AsyncIterator[dict[str, Any]]:
     try:
         async for raw in ws:
@@ -52,8 +60,9 @@ async def _events(ws: Any) -> AsyncIterator[dict[str, Any]]:
 
 
 class LocalSTTClient:
-    def __init__(self, endpoint: Any) -> None:
+    def __init__(self, endpoint: Any, *, language: str | None = None) -> None:
         self.endpoint = endpoint
+        self.language = language
         self._ws: Any = None
 
     async def connect(self) -> None:
@@ -64,6 +73,22 @@ class LocalSTTClient:
         created = await _receive_json(self._ws)
         if created.get("type") != "session.created":
             raise RuntimeError(f"expected STT session.created, got {created.get('type')}")
+        if self.language:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "transcription",
+                            "audio": {"input": {"language": self.language}},
+                        },
+                    }
+                )
+            )
+            await _receive_until(
+                self._ws,
+                {"session.updated", "transcription_session.updated"},
+            )
 
     async def send_audio(self, audio: bytes) -> None:
         await self._ws.send(audio)
@@ -81,8 +106,9 @@ class LocalSTTClient:
 
 
 class LocalTTSClient:
-    def __init__(self, endpoint: Any) -> None:
+    def __init__(self, endpoint: Any, *, voice_id: str | None = None) -> None:
         self.endpoint = endpoint
+        self.voice_id = voice_id
         self._ws: Any = None
 
     async def connect(self) -> dict[str, Any]:
@@ -90,6 +116,11 @@ class LocalTTSClient:
         hello = await _receive_json(self._ws)
         if hello.get("type") != "server.hello":
             raise RuntimeError(f"expected TTS server.hello, got {hello.get('type')}")
+        if self.voice_id:
+            await self._ws.send(json.dumps({"type": "session.update", "voice": self.voice_id}))
+            created = await _receive_json(self._ws)
+            if created.get("type") not in {"session.created", "session.updated"}:
+                raise RuntimeError(f"expected TTS session.created, got {created.get('type')}")
         return hello
 
     async def append(self, text: str) -> None:
@@ -107,9 +138,9 @@ class LocalTTSClient:
             self._ws = None
 
 
-def default_stt_client_factory(endpoint: Any) -> LocalSTTClient:
-    return LocalSTTClient(endpoint)
+def default_stt_client_factory(endpoint: Any, *, language: str | None = None) -> LocalSTTClient:
+    return LocalSTTClient(endpoint, language=language)
 
 
-def default_tts_client_factory(endpoint: Any) -> LocalTTSClient:
-    return LocalTTSClient(endpoint)
+def default_tts_client_factory(endpoint: Any, *, voice_id: str | None = None) -> LocalTTSClient:
+    return LocalTTSClient(endpoint, voice_id=voice_id)

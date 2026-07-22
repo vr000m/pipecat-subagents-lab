@@ -1,0 +1,12 @@
+# Non-secret local development defaults. Environment variables override these
+# values; do not add API keys or bearer tokens to this file.
+
+[stt]
+stt_service = "websocket"
+stt_ws_socket = "~/Library/Caches/pipecat-stt/nemotron.sock"
+stt_language = "en"
+
+[tts]
+tts_ws_host = "127.0.0.1"
+tts_ws_port = 8965
+voice_id = "azelma"

@@ -5,6 +5,8 @@ environment-specific defaults.  They are test-first: the Phase 1
 implementation is expected to provide ``Config`` and ``load_config``.
 """
 
+from pathlib import Path
+
 import pytest
 
 from server.config import Config, ConfigError, load_config
@@ -18,6 +20,9 @@ def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
     assert config.known_client_url == "http://127.0.0.1:7860"
     assert config.max_work_items_per_turn == 2
     assert config.multi_intent_wait_timeout_ms == 10_000
+    assert config.stt_service == "websocket"
+    assert config.stt_language == "en"
+    assert config.tts_voice_id == "azelma"
     assert config.openai_api_key is None
     assert config.router_model_policy
     assert config.worker_model_policy
@@ -97,3 +102,56 @@ def test_bind_port_environment_value_has_config_error_boundary() -> None:
 def test_empty_bind_environment_values_are_not_silently_ignored() -> None:
     with pytest.raises(ConfigError):
         load_config(env={"WEBSEARCH_BIND_HOST": ""})
+
+
+def test_toml_local_service_settings_load_and_expand_socket_paths(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[stt]\nstt_service = "websocket"\nstt_ws_socket = "~/stt.sock"\n'
+        'stt_language = "en-US"\n[tts]\ntts_ws_socket = "~/tts.sock"\n'
+    )
+
+    config = load_config(config_file=config_file, env={})
+
+    assert config.stt_service == "websocket"
+    assert config.stt_language == "en-US"
+    assert config.stt_endpoint == ("uds", str(Path.home() / "stt.sock"))
+    assert config.tts_endpoint == ("uds", str(Path.home() / "tts.sock"))
+
+
+def test_repository_config_contains_the_local_socket_defaults() -> None:
+    config = load_config(config_file=Path(__file__).parents[1] / "config.toml", env={})
+
+    assert config.stt_endpoint == (
+        "uds",
+        str(Path.home() / "Library/Caches/pipecat-stt/nemotron.sock"),
+    )
+    assert config.tts_endpoint == (
+        "ws",
+        "127.0.0.1:8965",
+    )
+    assert config.tts_voice_id == "azelma"
+
+
+def test_environment_endpoint_overrides_toml_socket(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[stt]\nstt_ws_socket = "~/from-toml.sock"\n')
+
+    config = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_STT_ENDPOINT": "uds:///tmp/from-env.sock"},
+    )
+
+    assert config.stt_endpoint == ("uds", "/tmp/from-env.sock")
+
+
+def test_tts_uri_precedes_socket_and_host_port(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[tts]\ntts_ws_uri = "wss://tts.example.test:9443"\n'
+        'tts_ws_socket = "~/tts.sock"\ntts_ws_host = "ignored.example.test"\ntts_ws_port = 9000\n'
+    )
+
+    config = load_config(config_file=config_file, env={})
+
+    assert config.tts_endpoint == ("wss", "tts.example.test:9443")

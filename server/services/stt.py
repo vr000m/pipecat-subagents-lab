@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
-from pipecat.services.stt_service import SegmentedSTTService
+from pipecat.services.stt_service import STTSettings, SegmentedSTTService
 
 from .ws_clients import default_stt_client_factory
 
@@ -34,11 +34,17 @@ class LocalSTT(SegmentedSTTService):
         on_final: Callable[[str], Any] | None = None,
         *,
         client_factory: Callable[[STTEndpoint], Any] | None = None,
+        language: str | None = "en",
         sample_rate: int = 16000,
     ) -> None:
-        super().__init__(sample_rate=sample_rate)
-        self.endpoint, self.on_final = endpoint, on_final
-        self.client_factory = client_factory or default_stt_client_factory
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=STTSettings(model=None, language=language),
+        )
+        self.endpoint, self.on_final, self.language = endpoint, on_final, language
+        self.client_factory = client_factory or (
+            lambda next_endpoint: default_stt_client_factory(next_endpoint, language=language)
+        )
         self._client: Any = None
         self.started = False
 
@@ -66,6 +72,7 @@ class LocalSTT(SegmentedSTTService):
         return type(self)(
             self.endpoint,
             client_factory=self.client_factory,
+            language=self.language,
             sample_rate=self.sample_rate,
         )
 

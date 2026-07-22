@@ -20,13 +20,33 @@ variable named by `WEBSEARCH_OPENAI_API_KEY_ENV`, defaulting to
 `OPENAI_API_KEY`. The authenticated hosted-search smoke test is opt-in and
 must be kept separate from the credential-free test suite.
 
-Configure the already-running local services with transport-qualified
-endpoints; discovery must not assume UDS or TCP:
+The checked-in `config.toml` contains the local macOS socket defaults for the
+Nemotron STT service and the sibling TTS service:
+
+```toml
+[stt]
+stt_service = "websocket"
+stt_ws_socket = "~/Library/Caches/pipecat-stt/nemotron.sock"
+stt_language = "en"
+
+[tts]
+tts_ws_host = "127.0.0.1"
+tts_ws_port = 8965
+voice_id = "azelma"
+```
+
+Environment variables override the checked-in defaults. Use transport-qualified
+endpoints when overriding them; discovery must not assume UDS or TCP:
 
 ```sh
 export WEBSEARCH_STT_ENDPOINT=uds:///path/to/stt.sock
 export WEBSEARCH_TTS_ENDPOINT=uds:///path/to/tts.sock
 ```
+
+The equivalent overrides are `WEBSEARCH_STT_WS_SOCKET`,
+`WEBSEARCH_TTS_WS_SOCKET`, and `WEBSEARCH_TTS_WS_URI`; for TTS, URI takes
+precedence over socket, followed by `WEBSEARCH_TTS_WS_HOST` plus
+`WEBSEARCH_TTS_WS_PORT`.
 
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
 The default host opens these websocket endpoints with the versioned local STT
@@ -65,9 +85,11 @@ cd web && bun run build && cd ..
 uv run python -m server.app
 ```
 
-Open <http://127.0.0.1:7860/> and use Connect, then enable the microphone
-explicitly. The browser obtains its session identity from `/api/session` and
-posts Small WebRTC offers to `/api/rtc`. Daily transport is not part of this
+Open <http://127.0.0.1:7860/> and use Connect. The browser requests microphone
+permission as part of that explicit user action; the Mic button then mutes or
+unmutes the active track. The browser obtains its session identity from
+`/api/session` and posts Small WebRTC offers to `/api/rtc`. Daily transport is
+not part of this
 local path; if the lab is deployed to a cloud runtime later, add Daily as a
 deployment adapter behind the same session and RTVI contracts.
 
@@ -83,8 +105,8 @@ does not call paid APIs or require live STT/TTS services.
 
 Start the application host and the browser client using the local
 Pipecat/Small WebRTC server configuration for the checkout. Connect only after
-the page is open, then explicitly enable the microphone; page initialization
-and connection must not acquire microphone media. When separately configured
+the page is open; the Connect action is the microphone permission boundary. When
+separately configured
 STT/TTS services are running, confirm a final transcript, local TTS synthesis,
 and audible browser output. Disconnecting must disable capture. If autoplay is
 blocked, use the page's audio action and record that diagnostic as local browser
