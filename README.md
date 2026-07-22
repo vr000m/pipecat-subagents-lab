@@ -31,6 +31,11 @@ stt_language = "en"
 
 [turn]
 smart_turn_timeout_seconds = 5.0
+smart_turn_complete_grace_seconds = 1.5
+
+[models]
+router_model = "gpt-5-mini"
+worker_model = "gpt-5"
 
 [tts]
 tts_ws_host = "127.0.0.1"
@@ -52,7 +57,11 @@ precedence over socket, followed by `WEBSEARCH_TTS_WS_HOST` plus
 `WEBSEARCH_TTS_WS_PORT`. `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
 semantic-turn fallback. After Smart Turn reports an incomplete turn, each new
 speech boundary resets this timer; five silent seconds finalize the accumulated
-transcript by default.
+transcript by default. `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` controls a
+separate application debounce after Smart Turn reports a complete turn. Speech
+that resumes within the default 1.5-second grace remains part of the same turn.
+`WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
+OpenAI model IDs without allowing model output to select an arbitrary model.
 
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
 The default host opens these websocket endpoints with the versioned local STT

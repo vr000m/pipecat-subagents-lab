@@ -488,6 +488,9 @@ sequenceDiagram
 - **A negotiated microphone track did not produce STT turns:** Pipecat 1.6's `SegmentedSTTService` requires VAD start/stop frames and defaults to WAV-wrapped segments. Insert a connection-local Silero `VADProcessor` before `LocalSTT` and override the adapter's segment format to raw 16 kHz mono PCM16, matching the local server wire contract.
 - **Short VAD pauses were routed as complete application turns:** retain VAD as the commit boundary required by the local segmented STT service, pass its audio and finalized fragments through Pipecat's `LocalSmartTurnAnalyzerV3`, and route the accumulated transcript only when `UserTurnProcessor` emits the semantic `UserStoppedSpeakingFrame`.
 - **Unstructured incomplete turns need a bounded fallback:** expose Pipecat's user-turn stop watchdog as `[turn].smart_turn_timeout_seconds` / `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS`, defaulting to five seconds. New speech resets the watchdog; silence after an `INCOMPLETE` decision eventually emits the semantic stop instead of retaining fragments indefinitely.
+- **Smart Turn `COMPLETE` could still fire before a natural pause ended:** add a separate application-owned completion grace, configured as `[turn].smart_turn_complete_grace_seconds` / `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` and defaulting to 1.5 seconds. New speech cancels the pending completion, raw STT fragments remain internal, and one combined transcript is routed after the grace expires.
+- **The empty catalogue produced a contradictory `unsupported` envelope:** make the router prompt's action policy explicit, reserve `unsupported` for genuinely unavailable capabilities, map public factual/current/historical requests to a `new_worker` web-search bootstrap, wrap semantic schema failures at the provider boundary, and return a safe canonical result if routing still fails. Verified defaults are `gpt-5-mini` for routing and `gpt-5` for hosted web search, with TOML/environment overrides.
+- **The browser showed raw fragments and no worker despite backend work:** project the semantic transcript, validated routing decision, and real worker running/idle state through authoritative session events and snapshots. Browser SDK transcript callbacks no longer mutate product state directly.
 
 ## Final Results
 
@@ -512,3 +515,14 @@ normalization, nested runtime-snapshot validation, immutable catalogue-bound
 dispatch, unique concurrent turn IDs, connection-local STT/TTS clients, TTS
 EOF failure recovery, and generation-fenced browser callbacks. The browser
 check command now runs a real ESLint pass in addition to the build.
+
+The local speech/routing repair now adds a 1.5-second completion debounce on top
+of Pipecat's five-second incomplete-turn fallback. A regression test feeds the
+historical-capitals request as multiple STT fragments separated by a premature
+semantic stop and proves one combined application turn, one router call, one web
+worker call, and authoritative transcript/routing/worker projections. A live
+credentialed router probe returned `new_worker` with `web_search`, `public_web`,
+and the `deep` policy for that same query. A required-tool `gpt-5` worker smoke
+returned a sourced answer with four normalized citations. Full
+microphone-to-audible-output acceptance remains an operator-run check with the
+local STT/TTS processes.
