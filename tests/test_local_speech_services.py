@@ -26,6 +26,14 @@ def test_local_stt_awaits_async_callback() -> None:
     asyncio.run(run())
 
 
+def test_local_tts_initializes_runtime_settings() -> None:
+    service = LocalTTS(TTSEndpoint("tcp", "127.0.0.1:9001"), voice_id="azelma")
+
+    assert service._settings.model is None
+    assert service._settings.voice == "azelma"
+    assert service._settings.language is None
+
+
 def test_local_tts_awaits_async_callback() -> None:
     async def run() -> None:
         observed: list[tuple[str, str]] = []

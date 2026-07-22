@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from pipecat.frames.frames import Frame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
 from .ws_clients import default_tts_client_factory
@@ -34,7 +35,10 @@ class LocalTTS(TTSService):
         voice_id: str | None = "azelma",
         sample_rate: int = 24000,
     ) -> None:
-        super().__init__(sample_rate=sample_rate)
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=TTSSettings(model=None, voice=voice_id, language=None),
+        )
         self.endpoint, self.on_event, self.voice_id = endpoint, on_event, voice_id
         self.client_factory = client_factory or (
             lambda next_endpoint: default_tts_client_factory(next_endpoint, voice_id=voice_id)
