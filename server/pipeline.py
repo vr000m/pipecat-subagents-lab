@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover - dependency-free contract fallback
 
 
 class CanonicalResultAdapter(FrameProcessor):
-    """Admit only normalized result frames to the transport side of the pipeline."""
+    """Gate result envelopes without interrupting Pipecat frame lifecycles."""
 
     _PUBLIC_RTVI_KINDS = frozenset(
         {"runtime_snapshot", "result", "speech", "worker", "speech_progress"}
@@ -134,8 +134,22 @@ class CanonicalResultAdapter(FrameProcessor):
         )
 
     async def process_frame(self, frame: Any, direction: Any) -> None:
-        """Keep the adapter a real Pipecat processor; canonical dicts use the app gate."""
-        if direction != getattr(FrameDirection, "DOWNSTREAM", direction) or not self.accepts(frame):
+        """Gate result envelopes while preserving Pipecat pipeline frames."""
+        if FrameProcessor is not object:
+            await super().process_frame(frame, direction)
+        if direction != getattr(FrameDirection, "DOWNSTREAM", direction):
+            return
+
+        # Lifecycle, control, audio, and TTS frames must continue through the
+        # adapter. Only RTVI result envelopes (and the legacy plain-dict form)
+        # are subject to the canonical-result gate.
+        data = getattr(frame, "data", frame)
+        is_result_envelope = isinstance(frame, RTVIServerMessageFrame) or isinstance(data, dict)
+        if not is_result_envelope:
+            if FrameProcessor is not object:
+                await self.push_frame(frame, direction)
+            return
+        if not self.accepts(frame):
             return
         if isinstance(getattr(frame, "data", frame), dict) and (
             getattr(frame, "data", frame).get("kind") == "canonical_result"

@@ -446,6 +446,10 @@ def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
         await adapter.process_frame(raw, FrameDirection.DOWNSTREAM)
         assert forwarded == [frame]
 
+        tts_frame = TTSSpeakFrame(text="hello")
+        await adapter.process_frame(tts_frame, FrameDirection.DOWNSTREAM)
+        assert forwarded[-1] is tts_frame
+
     asyncio.run(run())
 
 
@@ -491,6 +495,7 @@ class FakeRTVI:
     def __init__(self) -> None:
         self.handlers: dict[str, object] = {}
         self.bot_ready = False
+        self.bot_ready_calls = 0
 
     def event_handler(self, name: str):
         def register(function: object) -> object:
@@ -501,6 +506,7 @@ class FakeRTVI:
 
     async def set_bot_ready(self) -> None:
         self.bot_ready = True
+        self.bot_ready_calls += 1
 
 
 class FakePipelineWorker:
@@ -552,6 +558,10 @@ def test_connection_attach_registers_worker_with_async_runner(
 
         rtvi = runner.added[0].rtvi
         await rtvi.handlers["on_client_ready"](rtvi)
-        assert rtvi.bot_ready is True
+        await rtvi.handlers["on_client_ready"](rtvi)
+        # PipelineWorker owns the framework bot-ready handler. The app handler
+        # only publishes the application-level client-ready state.
+        assert rtvi.bot_ready is False
+        assert rtvi.bot_ready_calls == 0
 
     asyncio.run(run())
