@@ -143,6 +143,7 @@ async def _attach_connection(
     async def on_client_ready(_rtvi: Any) -> None:
         if host.accepts(runtime.epoch):
             publisher.client_ready(epoch=runtime.epoch)
+            await worker.rtvi.set_bot_ready()
 
     @worker.rtvi.event_handler("on_client_message")
     async def on_client_message(_rtvi: Any, message: Any) -> None:

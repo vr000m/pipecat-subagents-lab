@@ -39,6 +39,7 @@ class LocalSTT(SegmentedSTTService):
     ) -> None:
         super().__init__(
             sample_rate=sample_rate,
+            ttfs_p99_latency=1.0,
             settings=STTSettings(model=None, language=language),
         )
         self.endpoint, self.on_final, self.language = endpoint, on_final, language

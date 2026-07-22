@@ -488,8 +488,19 @@ class FakeTransport:
 
 
 class FakeRTVI:
-    def event_handler(self, _name: str):
-        return lambda function: function
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+        self.bot_ready = False
+
+    def event_handler(self, name: str):
+        def register(function: object) -> object:
+            self.handlers[name] = function
+            return function
+
+        return register
+
+    async def set_bot_ready(self) -> None:
+        self.bot_ready = True
 
 
 class FakePipelineWorker:
@@ -538,5 +549,9 @@ def test_connection_attach_registers_worker_with_async_runner(
         assert pipeline_args
         assert any(isinstance(item, FrameworkBusBridgeProcessor) for item in pipeline_args[0])
         assert any(isinstance(item, CanonicalResultAdapter) for item in pipeline_args[0])
+
+        rtvi = runner.added[0].rtvi
+        await rtvi.handlers["on_client_ready"](rtvi)
+        assert rtvi.bot_ready is True
 
     asyncio.run(run())
