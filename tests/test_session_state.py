@@ -1,6 +1,13 @@
 """Session state is authoritative and retains immutable result history."""
 
-from server.contracts import CONTRACT_VERSION, DeliveryState, GroundedResult, WorkerState
+from server.contracts import (
+    CONTRACT_VERSION,
+    DeliveryState,
+    GroundedResult,
+    RoutingState,
+    TranscriptEntry,
+    WorkerState,
+)
 from server.session_state import SessionState
 
 
@@ -27,6 +34,36 @@ def test_result_history_is_append_only_and_snapshot_retains_all_results() -> Non
     assert [item.result_id for item in snapshot.results] == ["result-1", "result-2"]
     assert snapshot.workers[0].latest_result_id == "result-2"
     assert snapshot.contract_version == CONTRACT_VERSION
+
+
+def test_routing_and_semantic_transcript_are_authoritative_snapshot_state() -> None:
+    state = SessionState(session_id="session-routing")
+    state.active_epoch = 2
+    state.append_transcript(
+        TranscriptEntry(
+            role="user",
+            text="What were the capitals of India through the last two hundred years?",
+            turn_id="turn-1",
+            origin_epoch=2,
+        )
+    )
+    state.set_routing(
+        RoutingState(
+            turn_id="turn-1",
+            action="new_worker",
+            worker_type="web_search",
+            topic="historical capitals of India",
+            model_policy="deep",
+            origin_epoch=2,
+        )
+    )
+
+    snapshot = state.snapshot(origin_epoch=2)
+    restored = SessionState.from_snapshot(snapshot)
+
+    assert [event.kind for event in state.events] == ["user_transcript", "routing"]
+    assert restored.transcript == state.transcript
+    assert restored.routing == state.routing
 
 
 def test_speech_progress_is_monotonic_and_synthesis_end_is_not_delivery_completion() -> None:

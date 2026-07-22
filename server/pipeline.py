@@ -16,7 +16,14 @@ from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 
 from .connection_arbiter import ConnectionArbiter
-from .contracts import CONTRACT_VERSION, GroundedResult
+from .contracts import (
+    CONTRACT_VERSION,
+    GroundedResult,
+    RoutingDecision,
+    RoutingState,
+    TranscriptEntry,
+    WorkerState,
+)
 from .observers import RuntimeObserver
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
@@ -75,7 +82,16 @@ class CanonicalResultAdapter(FrameProcessor):
     """Gate result envelopes without interrupting Pipecat frame lifecycles."""
 
     _PUBLIC_RTVI_KINDS = frozenset(
-        {"runtime_snapshot", "result", "speech", "worker", "speech_progress"}
+        {
+            "runtime_snapshot",
+            "result",
+            "speech",
+            "worker",
+            "speech_progress",
+            "routing",
+            "user_transcript",
+            "bot_transcript",
+        }
     )
 
     def __init__(self) -> None:
@@ -472,6 +488,14 @@ class SessionHost:
             return transcript
         origin_epoch = origin.epoch
         turn_id = self._next_turn_id()
+        self.state.append_transcript(
+            TranscriptEntry(
+                role="user",
+                text=transcript,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+            )
+        )
         try:
             outcome = await asyncio.to_thread(
                 self.coordinator.arbitrate, self.state.session_id, transcript
@@ -524,6 +548,22 @@ class SessionHost:
                 ),
                 origin,
             )
+        if isinstance(outcome.decision, RoutingDecision):
+            self.state.set_routing(
+                RoutingState(
+                    turn_id=turn_id,
+                    action=outcome.decision.action,
+                    worker_id=outcome.decision.worker_id,
+                    worker_type=outcome.decision.worker_type,
+                    topic=outcome.decision.topic,
+                    model_policy=outcome.decision.model_policy,
+                    origin_epoch=origin_epoch,
+                )
+            )
+            logger.info(
+                f"Routing {turn_id}: action={outcome.decision.action}, "
+                f"worker={outcome.decision.worker_id or outcome.decision.worker_type or 'main'}"
+            )
         action = getattr(outcome.decision, "action", None)
         if action in {"direct", "unsupported", "clarify"}:
             router = getattr(self.coordinator, "router", None)
@@ -557,6 +597,7 @@ class SessionHost:
             )
         if worker is None:
             return outcome
+        self._project_worker(worker, origin_epoch=origin_epoch, status="running")
         search = getattr(worker, "search", None)
         if search is None:
             return outcome
@@ -576,7 +617,14 @@ class SessionHost:
                 text="The web search is temporarily unavailable.",
                 origin_epoch=origin_epoch,
             )
-        return await self._commit_and_speak(result, origin)
+        committed = await self._commit_and_speak(result, origin)
+        self._project_worker(
+            worker,
+            origin_epoch=origin_epoch,
+            status="idle",
+            latest_result_id=result.result_id,
+        )
+        return committed
 
     async def _handle_pending(
         self, outcome: Any, transcript: str, origin: Any, turn_id: str
@@ -665,6 +713,14 @@ class SessionHost:
     async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""
         origin_epoch = result.origin_epoch
+        self.state.append_transcript(
+            TranscriptEntry(
+                role="assistant",
+                text=result.ui_text,
+                turn_id=result.turn_id,
+                origin_epoch=origin_epoch,
+            )
+        )
         self.state.append_result(result, origin_epoch=origin_epoch)
         if (
             origin.tts is None
@@ -703,6 +759,40 @@ class SessionHost:
         if catalogue is None:
             return self.coordinator.dispatch(decision)
         return self.coordinator.dispatch(decision, catalogue=catalogue)
+
+    def _project_worker(
+        self,
+        worker: Any,
+        *,
+        origin_epoch: int,
+        status: str,
+        latest_result_id: str | None = None,
+    ) -> None:
+        metadata = getattr(worker, "metadata", None)
+        if metadata is None:
+            return
+        worker_id = getattr(metadata, "worker_id", None)
+        topic = getattr(metadata, "topic", None)
+        model_policy = getattr(metadata, "model_policy", None)
+        if not all(isinstance(value, str) and value for value in (worker_id, topic, model_policy)):
+            return
+        previous = self.state.workers.get(worker_id)
+        self.state.set_worker(
+            WorkerState(
+                worker_id=worker_id,
+                topic=topic,
+                model_policy=model_policy,
+                status=status,
+                latest_result_id=(
+                    latest_result_id
+                    if latest_result_id is not None
+                    else previous.latest_result_id
+                    if previous is not None
+                    else None
+                ),
+                origin_epoch=origin_epoch,
+            )
+        )
 
     def accepts(self, epoch: int) -> bool:
         return (

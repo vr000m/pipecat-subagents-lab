@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/transcript-entry.json",
+  "title": "TranscriptEntry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["role", "text", "turn_id", "timestamp", "origin_epoch"],
+  "properties": {
+    "role": {"enum": ["user", "assistant"]},
+    "text": {"type": "string"},
+    "turn_id": {"type": "string", "minLength": 1},
+    "timestamp": {"type": "string", "minLength": 1},
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
+  }
+}

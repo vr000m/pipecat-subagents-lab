@@ -111,6 +111,7 @@ function snapshotState(state, snapshot, sequence) {
     results,
     speech,
     routing: snapshot.routing ?? null,
+    transcript: Array.isArray(snapshot.transcript) ? snapshot.transcript.map((item) => ({ ...item })) : [],
     serverState: true,
     lastAppliedSequence: snapshotSequence,
     localDiagnostics: diagnostics,

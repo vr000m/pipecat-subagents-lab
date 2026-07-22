@@ -7,7 +7,15 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
-from .contracts import GroundedResult, RuntimeSnapshot, SpeechProgress, DeliveryState, WorkerState
+from .contracts import (
+    DeliveryState,
+    GroundedResult,
+    RoutingState,
+    RuntimeSnapshot,
+    SpeechProgress,
+    TranscriptEntry,
+    WorkerState,
+)
 from .results import ResultLog
 
 
@@ -54,6 +62,8 @@ class SessionState:
         self.workers: dict[str, WorkerState] = {}
         self.results = ResultLog()
         self.speech: dict[str, SpeechProgress] = {}
+        self.routing: RoutingState | None = None
+        self.transcript: list[TranscriptEntry] = []
         self._events: list[StateEvent] = []
         self.active_epoch: int | None = None
         self._speech_history: dict[str, list[SpeechProgress]] = {}
@@ -95,6 +105,28 @@ class SessionState:
         self.workers[worker.worker_id] = worker
         return self._emit("worker", worker.model_dump(mode="json"))
 
+    def set_routing(self, routing: RoutingState) -> StateEvent | None:
+        if self.active_epoch is not None and (
+            routing.origin_epoch is None or routing.origin_epoch != self.active_epoch
+        ):
+            return None
+        self.routing = routing
+        return self._emit("routing", routing.model_dump(mode="json"))
+
+    def append_transcript(self, entry: TranscriptEntry) -> StateEvent | None:
+        if self.active_epoch is not None and (
+            entry.origin_epoch is None or entry.origin_epoch != self.active_epoch
+        ):
+            return None
+        if any(
+            item.role == entry.role and item.turn_id == entry.turn_id and item.text == entry.text
+            for item in self.transcript
+        ):
+            return None
+        self.transcript.append(entry)
+        kind = "user_transcript" if entry.role == "user" else "bot_transcript"
+        return self._emit(kind, entry.model_dump(mode="json"))
+
     def append_result(
         self,
         result: GroundedResult,
@@ -129,15 +161,6 @@ class SessionState:
         if worker:
             self.workers[result.worker_id] = worker.model_copy(
                 update={"latest_result_id": result.result_id}
-            )
-        elif result.worker_id:
-            self.workers[result.worker_id] = WorkerState(
-                worker_id=result.worker_id,
-                topic=result.worker_id,
-                model_policy="unknown",
-                status="idle",
-                latest_result_id=result.result_id,
-                origin_epoch=effective_epoch,
             )
         return self._emit("result", result.model_dump(mode="json"))
 
@@ -221,6 +244,8 @@ class SessionState:
         for progress in snapshot.speech_progress:
             state.speech[progress.utterance_id] = progress
             state._speech_history[progress.utterance_id] = [progress]
+        state.routing = snapshot.routing
+        state.transcript.extend(snapshot.transcript)
         return state
 
     def snapshot(self, origin_epoch: int | None = None) -> RuntimeSnapshot:
@@ -231,5 +256,7 @@ class SessionState:
             workers=list(self.workers.values()),
             results=list(self.results.results),
             speech_progress=list(self.speech.values()),
+            routing=self.routing,
+            transcript=list(self.transcript),
             origin_epoch=origin_epoch,
         )

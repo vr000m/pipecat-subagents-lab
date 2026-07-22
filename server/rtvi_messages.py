@@ -76,6 +76,8 @@ class RTVIMessagePublisher:
                 "workers": [],
                 "results": [],
                 "speech_progress": [],
+                "routing": None,
+                "transcript": [],
                 "origin_epoch": None,
             }
         )

@@ -29,6 +29,11 @@ test("entrypoint requests a snapshot only after Pipecat reports bot readiness", 
   expect(appSource).toContain("if (!await connect()) return;");
 });
 
+test("browser transcript is projected only from server-authored runtime messages", () => {
+  expect(appSource).not.toContain("onUserTranscript");
+  expect(appSource).not.toContain("onBotTranscript");
+});
+
 test("page has no credential-bearing or server-diagnostic browser contract", () => {
   expect(indexSource).toContain('src="./dist/app.js"');
   expect(indexSource).not.toMatch(/api[_-]?key|secret|prompt|raw[_-]?logs/i);
@@ -56,7 +61,7 @@ test("requires complete runtime snapshots and preserves state on malformed snaps
     kind: "runtime_snapshot",
     sequence: 1,
     session_id: "session-1",
-    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
   };
   await protocol.receive(validSnapshot);
   const beforeMalformed = protocol.getState();
@@ -77,8 +82,43 @@ test("accepts a complete runtime snapshot with an envelope session id", () => {
     kind: "runtime_snapshot",
     sequence: 3,
     session_id: "session-1",
-    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 3, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
-  })).toBe(true);
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 3, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
+})).toBe(true);
+});
+
+test("validates server-authored routing and semantic transcript messages", () => {
+  const routing = {
+    contract_version: "v1.0",
+    session_id: "session-1",
+    kind: "routing",
+    sequence: 2,
+    origin_epoch: 1,
+    data: {
+      turn_id: "turn-1",
+      action: "new_worker",
+      worker_id: null,
+      worker_type: "web_search",
+      topic: "historical capitals of India",
+      model_policy: "deep",
+      origin_epoch: 1,
+    },
+  };
+  const transcript = {
+    ...routing,
+    kind: "user_transcript",
+    sequence: 3,
+    data: {
+      role: "user",
+      text: "What were the capitals of India through the last two hundred years?",
+      turn_id: "turn-1",
+      timestamp: "2026-07-22T20:00:00Z",
+      origin_epoch: 1,
+    },
+  };
+
+  expect(validateServerMessage(routing)).toBe(true);
+  expect(validateServerMessage(transcript)).toBe(true);
+  expect(validateServerMessage({ ...transcript, data: { ...transcript.data, role: "assistant" } })).toBe(false);
 });
 
 test("rejects an unsupported contract before it advances sequence state", async () => {
@@ -93,7 +133,7 @@ test("rejects an unsupported contract before it advances sequence state", async 
     session_id: "session-1",
     kind: "runtime_snapshot",
     sequence: 1,
-    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
   });
   await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, origin_epoch: 1, data: { result_id: "accepted" } });
   expect(protocol.getState().lastAppliedSequence).toBe(2);
@@ -117,7 +157,7 @@ test("gates the first snapshot request on client readiness and ignores stale inc
     kind: "runtime_snapshot",
     sequence: 10,
     session_id: "session-1",
-    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 10, workers: [], results: [], speech_progress: [], origin_epoch: 1 },
+    data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 10, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
   });
   await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 9, data: { result_id: "stale" } });
   expect(protocol.getState().lastAppliedSequence).toBe(10);

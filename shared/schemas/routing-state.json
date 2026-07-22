@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/routing-state.json",
+  "title": "RoutingState",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["turn_id", "action", "worker_id", "worker_type", "topic", "model_policy", "origin_epoch"],
+  "properties": {
+    "turn_id": {"type": "string", "minLength": 1},
+    "action": {"enum": ["direct", "unsupported", "clarify", "existing_worker", "new_worker"]},
+    "worker_id": {"type": ["string", "null"]},
+    "worker_type": {"type": ["string", "null"]},
+    "topic": {"type": ["string", "null"]},
+    "model_policy": {"type": ["string", "null"]},
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
+  }
+}

@@ -23,6 +23,8 @@ const snapshot = (sequence, results = []) => ({
     workers: [{ worker_id: "worker-weather", topic: "weather", model_policy: "deep", status: "idle" }],
     results,
     speech_progress: [],
+    routing: null,
+    transcript: [],
   },
 });
 
@@ -188,6 +190,33 @@ describe("server-authoritative runtime reducer", () => {
     expect(state.results).toHaveLength(1);
     expect(state.speech["utterance-1"].result_id).toBe("result-1");
     expect(state.lastAppliedSequence).toBe(6);
+  });
+
+  test("reconnect snapshots restore routing and semantic transcript", () => {
+    const routing = {
+      turn_id: "turn-1",
+      action: "new_worker",
+      worker_id: null,
+      worker_type: "web_search",
+      topic: "historical capitals of India",
+      model_policy: "deep",
+      origin_epoch: 2,
+    };
+    const transcript = [{
+      role: "user",
+      text: "What were the capitals of India through the last two hundred years?",
+      turn_id: "turn-1",
+      timestamp: "2026-07-22T20:00:00Z",
+      origin_epoch: 2,
+    }];
+
+    const state = applyServerMessage(createInitialState(), {
+      ...snapshot(8),
+      data: { ...snapshot(8).data, routing, transcript, origin_epoch: 2 },
+    });
+
+    expect(state.routing).toEqual(routing);
+    expect(state.transcript).toEqual(transcript);
   });
 
   test("does not let a duplicate result event create a second historical entry", () => {

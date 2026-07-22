@@ -9,8 +9,10 @@ from server.contracts import (
     DeliveryState,
     GroundedResult,
     RoutingDecision,
+    RoutingState,
     RuntimeSnapshot,
     SpeechProgress,
+    TranscriptEntry,
     WorkerState,
     WorkItemState,
     validate_contract,
@@ -125,12 +127,23 @@ def test_snapshot_is_versioned_monotonic_and_excludes_raw_prompts_or_logs() -> N
         workers=[worker],
         results=[],
         speech_progress=[],
+        routing=RoutingState(
+            turn_id="turn-1",
+            action="existing_worker",
+            worker_id="worker-weather",
+            worker_type="web_search",
+            topic="weather",
+            model_policy="deep",
+        ),
+        transcript=[TranscriptEntry(role="user", text="Weather?", turn_id="turn-1")],
         origin_epoch=None,
     )
 
     validate_contract(snapshot)
     payload = snapshot.model_dump(mode="json")
     assert payload["snapshot_sequence"] == 12
+    assert payload["routing"]["worker_id"] == "worker-weather"
+    assert payload["transcript"][0]["text"] == "Weather?"
     assert "raw_logs" not in payload
     assert "prompt" not in payload
     assert "context" not in payload

@@ -80,6 +80,24 @@ class RoutingDecision(StrictModel):
         return self
 
 
+class RoutingState(StrictModel):
+    turn_id: str
+    action: Literal["direct", "unsupported", "clarify", "existing_worker", "new_worker"]
+    worker_id: str | None = None
+    worker_type: str | None = None
+    topic: str | None = None
+    model_policy: str | None = None
+    origin_epoch: int | None = None
+
+
+class TranscriptEntry(StrictModel):
+    role: Literal["user", "assistant"]
+    text: str
+    turn_id: str
+    timestamp: str = Field(default_factory=utc_timestamp)
+    origin_epoch: int | None = None
+
+
 class WorkerState(StrictModel):
     worker_id: str
     topic: str
@@ -141,6 +159,8 @@ class RuntimeSnapshot(StrictModel):
     workers: list[WorkerState] = Field(default_factory=list)
     results: list[GroundedResult] = Field(default_factory=list)
     speech_progress: list[SpeechProgress] = Field(default_factory=list)
+    routing: RoutingState | None = None
+    transcript: list[TranscriptEntry] = Field(default_factory=list)
     origin_epoch: int | None = None
     _highest_by_session: ClassVar[dict[str, int]] = {}
 

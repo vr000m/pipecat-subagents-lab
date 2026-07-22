@@ -76,6 +76,25 @@ function validSpeech(value) {
     deliveryStates.has(value.state) && Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
 }
 
+function validRouting(value) {
+  const keys = ["turn_id", "action", "worker_id", "worker_type", "topic", "model_policy", "origin_epoch"];
+  const actions = new Set(["direct", "unsupported", "clarify", "existing_worker", "new_worker"]);
+  const optionalString = (item) => item === null || typeof item === "string";
+  if (!value || typeof value !== "object" || Object.keys(value).some((key) => !keys.includes(key))) return false;
+  return typeof value.turn_id === "string" && actions.has(value.action) &&
+    optionalString(value.worker_id) && optionalString(value.worker_type) &&
+    optionalString(value.topic) && optionalString(value.model_policy) &&
+    Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
+}
+
+function validTranscript(value) {
+  const keys = ["role", "text", "turn_id", "timestamp", "origin_epoch"];
+  if (!value || typeof value !== "object" || Object.keys(value).some((key) => !keys.includes(key))) return false;
+  return ["user", "assistant"].includes(value.role) && typeof value.text === "string" &&
+    typeof value.turn_id === "string" && typeof value.timestamp === "string" &&
+    Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
+}
+
 export function validateServerMessage(message) {
   if (!message || typeof message !== "object" || typeof message.kind !== "string") return false;
   if (!runtimeKinds.has(message.kind)) return false;
@@ -92,18 +111,25 @@ export function validateServerMessage(message) {
   if (["speech", "speech_progress"].includes(message.kind) &&
       (typeof payload?.utterance_id !== "string" || typeof payload?.state !== "string")) return false;
   if (message.kind === "worker" && typeof payload?.worker_id !== "string") return false;
-  if (["user_transcript", "bot_transcript"].includes(message.kind) && typeof data.text !== "string") return false;
+  if (message.kind === "routing" && !validRouting(data.routing ?? data)) return false;
+  if (["user_transcript", "bot_transcript"].includes(message.kind)) {
+    if (!validTranscript(data)) return false;
+    if (message.kind === "user_transcript" && data.role !== "user") return false;
+    if (message.kind === "bot_transcript" && data.role !== "assistant") return false;
+  }
   if (message.kind === "runtime_snapshot") {
     if (typeof data.session_id !== "string" || data.session_id.length === 0) return false;
     if (message.session_id !== undefined && message.session_id !== data.session_id) return false;
     if (data.contract_version !== CONTRACT_VERSION || !validOrigin(data.origin_epoch)) return false;
     if (!Number.isInteger(data.snapshot_sequence) || data.snapshot_sequence < 0) return false;
-    if (!Array.isArray(data.workers) || !Array.isArray(data.results) || !Array.isArray(data.speech_progress)) {
+    if (!Array.isArray(data.workers) || !Array.isArray(data.results) ||
+        !Array.isArray(data.speech_progress) || !Array.isArray(data.transcript)) {
       return false;
     }
     if (!data.workers.every(validWorker) || !data.results.every(validResult) || !data.speech_progress.every(validSpeech)) {
       return false;
     }
+    if (!(data.routing === null || validRouting(data.routing)) || !data.transcript.every(validTranscript)) return false;
   }
   return !forbidden.some((field) => Object.prototype.hasOwnProperty.call(data, field));
 }

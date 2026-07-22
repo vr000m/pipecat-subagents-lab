@@ -59,6 +59,8 @@ def test_first_ready_snapshot_is_schema_complete_before_authoritative_state_is_s
         "workers": [],
         "results": [],
         "speech_progress": [],
+        "routing": None,
+        "transcript": [],
         "origin_epoch": None,
     }
     RuntimeSnapshot.model_validate(snapshot.data)

@@ -57,8 +57,11 @@ for a future, verified Phase-3 extension.
 One `GroundedResult` owns the text and normalized absolute HTTP(S) citations.
 The spoken and UI projections carry the same `result_id`, text facts, and
 citations. Worker cards expose only identity, topic, policy label, status, and
-latest-result pointer. A runtime snapshot contains worker state, canonical
-results, and speech progress but never prompts, private context, or raw logs.
+latest-result pointer. A runtime snapshot contains the latest validated routing
+decision, semantic transcript turns, worker state, canonical results, and speech
+progress but never prompts, private context, raw STT fragments, or raw logs.
+Transcript entries are created by the server only after the application turn
+boundary closes; browser SDK transcript callbacks are not authoritative state.
 
 Reconnect uses `session_id`, a resume token/known-process identity, proposed
 epoch, and the last snapshot sequence. The new epoch is fenced before the

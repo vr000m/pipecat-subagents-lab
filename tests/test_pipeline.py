@@ -19,7 +19,7 @@ from pipecat.turns.user_turn_processor import UserTurnProcessor
 
 import server.app as app_module
 from server.config import Config
-from server.contracts import GroundedResult, WorkerState
+from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
 from server.registry import UnsupportedWorkerType
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
@@ -52,6 +52,51 @@ class ResultWorker:
             ui_text=f"Answer for {query}",
             origin_epoch=origin_epoch,
         )
+
+
+class ProjectedResultWorker(ResultWorker):
+    metadata = type(
+        "Metadata",
+        (),
+        {
+            "worker_id": "worker-search",
+            "topic": "historical capitals of India",
+            "model_policy": "deep",
+        },
+    )()
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+        self.queries.append(query)
+        return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+
+class ProjectedCoordinator(RoutedCoordinator):
+    def __init__(self, worker: object) -> None:
+        super().__init__(worker)
+        self.transcripts: list[str] = []
+
+    def arbitrate(self, _session_id: str, transcript: str) -> object:
+        self.transcripts.append(transcript)
+        return type(
+            "Outcome",
+            (),
+            {
+                "kind": "routed",
+                "decision": RoutingDecision(
+                    action="new_worker",
+                    worker_type="web_search",
+                    topic="historical capitals of India",
+                    capability="public_web",
+                    capability_available=True,
+                    model_policy="deep",
+                    catalogue_version="catalogue-0",
+                ),
+                "transcript": transcript,
+            },
+        )()
 
 
 class BlockingResultWorker(ResultWorker):
@@ -148,6 +193,68 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         assert len(worker.frames) == 2
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.result_id == "result-next"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_completed_turn_projects_routing_transcript_and_real_worker_state() -> None:
+    async def run() -> None:
+        search = ProjectedResultWorker()
+        coordinator = ProjectedCoordinator(search)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
+        await host.connect(connection_handshake(host, 1))
+        processor = FinalTurnTranscriptProcessor(
+            host._handle_transcript,
+            complete_grace_seconds=0.01,
+        )
+
+        async def push(_frame: object, _direction: object) -> None:
+            return None
+
+        processor.push_frame = push  # type: ignore[method-assign]
+        await processor.process_frame(
+            TranscriptionFrame("What were the capitals of", "", ""),
+            FrameDirection.DOWNSTREAM,
+        )
+        await processor.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await processor.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        for fragment in ("India through", "the last two hundred years?"):
+            await processor.process_frame(
+                TranscriptionFrame(fragment, "", ""),
+                FrameDirection.DOWNSTREAM,
+            )
+        await processor.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        async def wait_for_result() -> GroundedResult:
+            while not host.state.results.results:
+                await asyncio.sleep(0.01)
+            return host.state.results.results[-1]
+
+        result = await asyncio.wait_for(wait_for_result(), timeout=1)
+
+        expected = "What were the capitals of India through the last two hundred years?"
+        assert coordinator.transcripts == [expected]
+        assert search.queries == [expected]
+        assert [entry.role for entry in host.state.transcript] == ["user", "assistant"]
+        assert host.state.transcript[0].turn_id == result.turn_id
+        assert host.state.routing is not None
+        assert host.state.routing.action == "new_worker"
+        worker = host.state.workers["worker-search"]
+        assert worker.topic == "historical capitals of India"
+        assert worker.status == "idle"
+        assert worker.latest_result_id == result.result_id
+        assert [event.kind for event in host.state.events] == [
+            "user_transcript",
+            "routing",
+            "worker",
+            "bot_transcript",
+            "result",
+            "worker",
+        ]
         await host.shutdown()
 
     asyncio.run(run())

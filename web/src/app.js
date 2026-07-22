@@ -55,8 +55,6 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       },
       onTrackStarted: attachTrack,
       onTrackStopped: detachTrack,
-      onUserTranscript: (data) => { if (current()) update({ ...state, transcript: [...state.transcript, { role: "user", ...data }] }); },
-      onBotTranscript: (data) => { if (current()) update({ ...state, transcript: [...state.transcript, { role: "assistant", ...data }] }); },
     };
   };
 
