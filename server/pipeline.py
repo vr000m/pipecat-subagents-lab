@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
+from loguru import logger
 from pydantic import ValidationError
 
 from pipecat.frames.frames import TTSSpeakFrame
@@ -471,9 +472,23 @@ class SessionHost:
             return transcript
         origin_epoch = origin.epoch
         turn_id = self._next_turn_id()
-        outcome = await asyncio.to_thread(
-            self.coordinator.arbitrate, self.state.session_id, transcript
-        )
+        try:
+            outcome = await asyncio.to_thread(
+                self.coordinator.arbitrate, self.state.session_id, transcript
+            )
+        except Exception:
+            logger.exception(
+                f"Routing failed for {turn_id}; returning a safe result without provider details"
+            )
+            return await self._commit_and_speak(
+                canonical_result(
+                    worker_id="main",
+                    turn_id=turn_id,
+                    text="Routing is temporarily unavailable. Please try that request again.",
+                    origin_epoch=origin_epoch,
+                ),
+                origin,
+            )
         if outcome.kind != "routed" or outcome.decision is None:
             if outcome.kind == "control":
                 action = getattr(outcome, "control_action", None)

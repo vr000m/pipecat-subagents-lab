@@ -12,6 +12,10 @@ smart_turn_timeout_seconds = 5.0
 # Debounce a premature COMPLETE if speech resumes after a natural pause.
 smart_turn_complete_grace_seconds = 1.5
 
+[models]
+router_model = "gpt-5-mini"
+worker_model = "gpt-5"
+
 [tts]
 tts_ws_host = "127.0.0.1"
 tts_ws_port = 8965

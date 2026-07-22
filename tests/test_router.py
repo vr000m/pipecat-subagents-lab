@@ -79,7 +79,7 @@ def test_lazy_router_provider_defers_credentials_and_provider_creation_until_rou
 
     assert decision.worker_id == "worker-weather"
     assert factory_calls == 1
-    assert calls[0]["model"] == "gpt-4o-mini"
+    assert calls[0]["model"] == "gpt-5-mini"
     assert calls[0]["store"] is False
     assert "tools" not in calls[0]
 
@@ -162,3 +162,26 @@ def test_router_allows_first_valid_new_worker_with_empty_catalogue() -> None:
 
     assert decision.action == "new_worker"
     assert decision.worker_type == "web_search"
+
+
+def test_empty_catalogue_prompt_bootstraps_public_web_and_reserves_unsupported() -> None:
+    prompt = WorkerCatalogue("catalogue-empty", (), ("public_web",), ("deep",)).prompt(
+        "What were the capitals of India through the last two hundred years?"
+    )
+
+    assert "public factual, current, or historical" in prompt
+    assert "action=new_worker" in prompt
+    assert "worker_type=web_search" in prompt
+    assert "Use unsupported only" in prompt
+
+
+def test_router_wraps_semantically_invalid_structured_output() -> None:
+    invalid = decision_payload(
+        action="unsupported",
+        worker_id=None,
+        worker_type="web_search",
+        topic="capitals of India",
+    )
+
+    with pytest.raises(RoutingValidationError, match="invalid routing decision"):
+        Router(model=FakeRouterModel(invalid)).route("Search the web", catalogue())

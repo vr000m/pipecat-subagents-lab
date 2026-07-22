@@ -26,8 +26,8 @@ def _models(value: Mapping[str, str]) -> dict[str, str]:
 class Config:
     openai_api_key: str | None = field(default=None, repr=False)
     openai_api_key_env: str = "OPENAI_API_KEY"
-    router_model_policy: Mapping[str, str] = field(default_factory=lambda: {"fast": "gpt-4o-mini"})
-    worker_model_policy: Mapping[str, str] = field(default_factory=lambda: {"deep": "gpt-4o"})
+    router_model_policy: Mapping[str, str] = field(default_factory=lambda: {"fast": "gpt-5-mini"})
+    worker_model_policy: Mapping[str, str] = field(default_factory=lambda: {"deep": "gpt-5"})
     max_work_items_per_turn: int = 2
     multi_intent_wait_timeout_ms: int = 10_000
     stt_service: str = "websocket"
@@ -155,6 +155,10 @@ def load_config(
         kwargs["known_client_url"] = values["WEBSEARCH_KNOWN_CLIENT_URL"]
     if raw := values.get("WEBSEARCH_OPENAI_API_KEY_ENV"):
         kwargs["openai_api_key_env"] = raw
+    if raw := values.get("WEBSEARCH_ROUTER_MODEL"):
+        kwargs["router_model_policy"] = {"fast": str(raw)}
+    if raw := values.get("WEBSEARCH_WORKER_MODEL"):
+        kwargs["worker_model_policy"] = {"deep": str(raw)}
     stt_endpoint = values.get("WEBSEARCH_STT_ENDPOINT")
     if stt_endpoint:
         kwargs["stt_endpoint"] = parse_endpoint(str(stt_endpoint))
@@ -188,8 +192,9 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
     stt = document.get("stt", {})
     tts = document.get("tts", {})
     turn = document.get("turn", {})
-    if not all(isinstance(section, Mapping) for section in (stt, tts, turn)):
-        raise ConfigError("[stt], [tts], and [turn] config sections must be tables")
+    models = document.get("models", {})
+    if not all(isinstance(section, Mapping) for section in (stt, tts, turn, models)):
+        raise ConfigError("[stt], [tts], [turn], and [models] config sections must be tables")
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
     if "stt_language" in stt:
@@ -202,6 +207,10 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         values["WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS"] = turn[
             "smart_turn_complete_grace_seconds"
         ]
+    if "router_model" in models:
+        values["WEBSEARCH_ROUTER_MODEL"] = models["router_model"]
+    if "worker_model" in models:
+        values["WEBSEARCH_WORKER_MODEL"] = models["worker_model"]
     for key in ("tts_ws_uri", "tts_ws_socket", "tts_ws_host", "tts_ws_port"):
         if key in tts:
             values[f"WEBSEARCH_{key.upper()}"] = tts[key]

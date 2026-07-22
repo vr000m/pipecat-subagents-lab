@@ -26,8 +26,8 @@ def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
     assert config.smart_turn_complete_grace_seconds == 1.5
     assert config.tts_voice_id == "azelma"
     assert config.openai_api_key is None
-    assert config.router_model_policy
-    assert config.worker_model_policy
+    assert config.router_model_policy == {"fast": "gpt-5-mini"}
+    assert config.worker_model_policy == {"deep": "gpt-5"}
 
 
 def test_operator_limits_reject_zero_or_unbounded_values() -> None:
@@ -78,6 +78,19 @@ def test_model_selection_uses_policy_labels_not_model_ids_from_untrusted_input()
     assert config.resolve_router_model("fast") == "verified-router-model"
     with pytest.raises(ConfigError):
         config.resolve_router_model("model-emitted-id")
+
+
+def test_operator_models_load_from_toml_and_environment_wins(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[models]\nrouter_model = "toml-router"\nworker_model = "toml-worker"\n')
+
+    config = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_ROUTER_MODEL": "env-router"},
+    )
+
+    assert config.resolve_router_model("fast") == "env-router"
+    assert config.resolve_worker_model("deep") == "toml-worker"
 
 
 def test_bind_and_known_client_settings_load_from_environment() -> None:
@@ -182,6 +195,8 @@ def test_repository_config_contains_the_local_socket_defaults() -> None:
     assert config.tts_voice_id == "azelma"
     assert config.smart_turn_timeout_seconds == 5.0
     assert config.smart_turn_complete_grace_seconds == 1.5
+    assert config.resolve_router_model("fast") == "gpt-5-mini"
+    assert config.resolve_worker_model("deep") == "gpt-5"
 
 
 def test_environment_endpoint_overrides_toml_socket(tmp_path) -> None:

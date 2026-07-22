@@ -229,6 +229,25 @@ def test_unimplemented_worker_type_becomes_a_safe_canonical_result() -> None:
     asyncio.run(run())
 
 
+def test_router_provider_failure_becomes_a_safe_canonical_result() -> None:
+    async def run() -> None:
+        class FailingCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                raise RuntimeError("provider detail must stay in server logs")
+
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=FailingCoordinator())
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("search for India's historical capitals")
+
+        assert result.text == "Routing is temporarily unavailable. Please try that request again."
+        assert "provider detail" not in result.text
+        assert host.state.result_history("main") == (result,)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_cancel_control_interrupts_active_speech() -> None:
     async def run() -> None:
         class ControlCoordinator:

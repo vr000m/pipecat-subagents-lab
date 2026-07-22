@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .config import Config
 from .contracts import RoutingDecision
@@ -129,9 +129,18 @@ class WorkerCatalogue:
 
     def prompt(self, transcript: str) -> str:
         return (
-            "Route this transcript using only this immutable catalogue. Do not use tools or "
-            f"invent IDs. catalogue_version={self.version}; workers={self.workers!r}; "
-            f"capabilities={self.capability_labels!r}; transcript={transcript}"
+            "Route the user transcript using only this immutable catalogue and these rules. "
+            "Do not use tools. Do not invent existing worker IDs. "
+            "A public factual, current, or historical request is available through the "
+            "public_web capability. Select an existing matching worker when present; otherwise "
+            "return action=new_worker, worker_id=null, worker_type=web_search, "
+            "capability=public_web, capability_available=true, and model_policy=deep. "
+            "Use unsupported only for a capability that is genuinely unavailable, such as "
+            "private account data. For direct, unsupported, or clarify, worker_id, worker_type, "
+            "topic, and model_policy must all be null. "
+            f"catalogue_version={self.version}; workers={self.workers!r}; "
+            f"capabilities={self.capability_labels!r}; "
+            f"model_policies={self.model_policies!r}; transcript={transcript}"
         )
 
 
@@ -218,11 +227,14 @@ class Router:
             envelope = raw
         else:
             payload = raw.model_dump() if isinstance(raw, RoutingDecision) else raw
-            envelope = RouterEnvelope.model_validate(
-                payload
-                if isinstance(payload, dict) and "decision" in payload
-                else {"decision": payload}
-            )
+            try:
+                envelope = RouterEnvelope.model_validate(
+                    payload
+                    if isinstance(payload, dict) and "decision" in payload
+                    else {"decision": payload}
+                )
+            except ValidationError as exc:
+                raise RoutingValidationError("router returned an invalid routing decision") from exc
         self.last_prose = envelope.prose
         validate_decision(envelope.decision, catalogue)
         return envelope.decision
