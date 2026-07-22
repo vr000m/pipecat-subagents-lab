@@ -26,6 +26,12 @@ def test_local_stt_awaits_async_callback() -> None:
     asyncio.run(run())
 
 
+def test_local_stt_sends_raw_pcm_segments() -> None:
+    service = LocalSTT(STTEndpoint("uds", "/tmp/stt.sock"))
+
+    assert service.wants_wav_segments() is False
+
+
 def test_local_tts_initializes_runtime_settings() -> None:
     service = LocalTTS(TTSEndpoint("tcp", "127.0.0.1:9001"), voice_id="azelma")
 

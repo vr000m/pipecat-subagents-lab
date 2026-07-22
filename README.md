@@ -112,6 +112,13 @@ and audible browser output. Disconnecting must disable capture. If autoplay is
 blocked, use the page's audio action and record that diagnostic as local browser
 state.
 
+For live STT, `Track audio received` proves only WebRTC negotiation. A complete
+utterance should also produce `VADProcessor: User started speaking`,
+`VADProcessor: User stopped speaking`, `committed <N> PCM bytes to local STT`,
+and `local STT transcription completed` in the server log. The local STT adapter
+uses Pipecat's VAD-delimited segments and sends the Nemotron service raw 16 kHz
+mono PCM16 rather than a WAV container.
+
 On reconnect, the server-issued `session_id`, resume token, and proposed epoch
 fence the replacement transport. The replacement receives a fresh snapshot of
 workers, the complete per-worker Result Log, and delivery outcomes. Older

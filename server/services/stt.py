@@ -13,6 +13,7 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from loguru import logger
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
 from pipecat.services.stt_service import STTSettings, SegmentedSTTService
 
@@ -77,6 +78,10 @@ class LocalSTT(SegmentedSTTService):
             sample_rate=self.sample_rate,
         )
 
+    def wants_wav_segments(self) -> bool:
+        """Send the local server its required raw PCM16 wire format."""
+        return False
+
     async def handle_final_transcript(
         self, text: str, callback: Callable[[str], Any] | None = None
     ) -> Any:
@@ -108,9 +113,11 @@ class LocalSTT(SegmentedSTTService):
                     await result
         await self._client.send_audio(audio)
         await self._client.commit()
+        logger.debug(f"{self}: committed {len(audio)} PCM bytes to local STT")
         async for event in self._client.events():
             if event.get("type", "").endswith("transcription.completed"):
                 text = event.get("transcript") or ""
+                logger.debug(f"{self}: local STT transcription completed")
                 if text:
                     yield TranscriptionFrame(text, "", "")
                     if on_final is not None:

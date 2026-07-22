@@ -11,8 +11,10 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -128,7 +130,12 @@ async def _attach_connection(
     bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
     processors = [transport.input()]
     if runtime.stt is not None:
-        processors.append(runtime.stt)
+        processors.extend(
+            (
+                VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=16000)),
+                runtime.stt,
+            )
+        )
     if bridge is not None:
         processors.extend((bridge, CanonicalResultAdapter()))
     if runtime.tts is not None:

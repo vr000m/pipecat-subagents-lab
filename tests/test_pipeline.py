@@ -524,12 +524,25 @@ def test_connection_attach_registers_worker_with_async_runner(
 ) -> None:
     async def run() -> None:
         runner = AsyncAddRunner()
-        host = SessionHost(runner_factory=lambda: runner)
+        stt = object()
+        host = SessionHost(runner_factory=lambda: runner, stt=stt)
         await host.start()
         transport = FakeTransport()
         pipeline_args: list[object] = []
+        vad_analyzer = object()
+        vad_processor = object()
 
         monkeypatch.setattr(app_module, "SmallWebRTCTransport", lambda *_args: transport)
+        monkeypatch.setattr(
+            app_module,
+            "SileroVADAnalyzer",
+            lambda *, sample_rate: vad_analyzer if sample_rate == 16000 else None,
+        )
+        monkeypatch.setattr(
+            app_module,
+            "VADProcessor",
+            lambda *, vad_analyzer: vad_processor if vad_analyzer is not None else None,
+        )
         monkeypatch.setattr(app_module, "TransportParams", lambda **kwargs: kwargs)
         monkeypatch.setattr(app_module, "PipelineParams", lambda **kwargs: kwargs)
         monkeypatch.setattr(
@@ -553,6 +566,7 @@ def test_connection_attach_registers_worker_with_async_runner(
         assert len(runner.added) == 1
         assert runner.added[0] is host.connection.worker
         assert pipeline_args
+        assert pipeline_args[0][:3] == ["input", vad_processor, stt]
         assert any(isinstance(item, FrameworkBusBridgeProcessor) for item in pipeline_args[0])
         assert any(isinstance(item, CanonicalResultAdapter) for item in pipeline_args[0])
 
