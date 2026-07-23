@@ -20,7 +20,7 @@ from pipecat.turns.user_turn_processor import UserTurnProcessor
 import server.app as app_module
 from server.config import Config
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
-from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline
+from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.workers.web_search import WorkerDeclined
@@ -586,6 +586,33 @@ def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
         tts_frame = TTSSpeakFrame(text="hello")
         await adapter.process_frame(tts_frame, FrameDirection.DOWNSTREAM)
         assert forwarded[-1] is tts_frame
+
+    asyncio.run(run())
+
+
+def test_framework_bridge_keeps_speech_on_connection_pipeline() -> None:
+    class RecordingBus:
+        def __init__(self) -> None:
+            self.messages: list[object] = []
+
+        async def send(self, message: object) -> None:
+            self.messages.append(message)
+
+    async def run() -> None:
+        bus = RecordingBus()
+        bridge = framework_bridge(bus=bus, worker_name="browser-1")
+        forwarded: list[object] = []
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        bridge.push_frame = push  # type: ignore[method-assign]
+        tts_frame = TTSSpeakFrame(text="hello", append_to_context=False)
+
+        await bridge.process_frame(tts_frame, FrameDirection.DOWNSTREAM)
+
+        assert forwarded == [tts_frame]
+        assert bus.messages == []
 
     asyncio.run(run())
 

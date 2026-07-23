@@ -58,9 +58,11 @@ else:  # pragma: no cover
 
 
 def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
-    """Construct the pinned framework bridge; fallback is intentionally explicit."""
+    """Construct the pinned framework bridge with connection-local output frames."""
     if getattr(BusBridgeProcessor, "framework_fallback", False):
         return BusBridgeProcessor()
+    excluded = kwargs.pop("exclude_frames", ())
+    kwargs["exclude_frames"] = tuple(dict.fromkeys((TTSSpeakFrame, *excluded)))
     return BusBridgeProcessor(bus=bus, worker_name=worker_name, **kwargs)
 
 
