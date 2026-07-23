@@ -11,13 +11,32 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .panel, .worker, .result-card { background: #20242b; border: 1px solid #303641; border-radius: 6px; padding: .7rem; }
 .panel h2, .result-log h2 { font-size: .95rem; margin: 0 0 .7rem; }
 .turn { border-top: 1px solid #303641; padding: .55rem 0; }
+.turn-header { display: flex; align-items: baseline; justify-content: space-between; gap: .75rem; }
 .turn strong, .result-meta { color: #b79ae8; font-size: .8rem; }
+.turn time { color: #7d8490; font-size: .75rem; font-variant-numeric: tabular-nums; }
 .turn p, .answer { margin: .2rem 0 0; white-space: pre-wrap; }
 .unspoken { color: #7d8490; font-style: italic; }
 .worker { margin-bottom: .55rem; }
 .worker-meta, .muted { color: #9aa1ab; font-size: .82rem; }
 .route { color: #f0c26a; }
 .result-card { border-color: #5f4a8a; margin-top: .6rem; }
+.result-card-heading { display: flex; align-items: center; gap: .5rem; }
+.result-toggle {
+  margin-left: auto;
+  border: 0;
+  padding: 0 .2rem;
+  background: transparent;
+  color: #b79ae8;
+  font-size: 1rem;
+  line-height: 1;
+}
+.result-card-content {
+  position: relative;
+}
+.result-card.is-collapsible:not(.is-expanded) .result-card-content {
+  max-height: var(--result-preview-height);
+  overflow: hidden;
+}
 .delivery { display: inline-block; margin-top: .4rem; color: #f0c26a; font-size: .78rem; }
 .delivery.delivery_completed { color: #7fd6a4; }
 .sources { margin: .5rem 0 0; padding-left: 1.2rem; }

@@ -154,7 +154,10 @@ fence the replacement transport. The replacement receives a fresh snapshot of
 workers, the complete per-worker Result Log, and delivery outcomes. Older
 transport callbacks are rejected. Result text may appear before speech; the UI
 marks server transport completion separately from incomplete or unconfirmed
-speech and never claims verified browser audibility.
+speech and never claims verified browser audibility. Transcript turns show their
+server-authored local-time timestamp. Long inline worker-result diagnostics are
+collapsed to a five-line preview with a disclosure caret; the complete answer
+and sources remain available on expansion and in the Result Log.
 
 ### Boundaries and diagnostics
 

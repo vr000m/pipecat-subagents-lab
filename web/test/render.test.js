@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
 
-import { renderRuntime } from "../src/render.js";
+import {
+  enhanceResultCards,
+  formatTimestamp,
+  renderRuntime,
+  resultContentExceedsLineLimit,
+} from "../src/render.js";
 
 const state = {
   connection: "connected",
@@ -44,6 +49,76 @@ test("renders a separate persistent result log with worker, turn, timestamp, and
   expect(html).toContain("turn-1");
   expect(html).toContain("1 source");
   expect(html).toContain("<details>");
+});
+
+test("renders server-authored timestamps beside user and assistant transcript messages", () => {
+  const userTimestamp = "2026-07-23T11:31:23Z";
+  const assistantTimestamp = "2026-07-23T11:31:47Z";
+  const html = renderRuntime({
+    ...state,
+    transcript: [
+      { role: "user", text: "What is the forecast?", turn_id: "turn-1", timestamp: userTimestamp },
+      { role: "assistant", text: "Mostly cloudy.", turn_id: "turn-1", timestamp: assistantTimestamp },
+    ],
+  });
+
+  expect(html).toContain(`<time datetime="${userTimestamp}" title="${userTimestamp}">${formatTimestamp(userTimestamp)}</time>`);
+  expect(html).toContain(`<time datetime="${assistantTimestamp}" title="${assistantTimestamp}">${formatTimestamp(assistantTimestamp)}</time>`);
+  expect(html).toContain('<div class="turn user">');
+  expect(html).toContain('<div class="turn assistant">');
+});
+
+test("renders live worker result cards with a hidden disclosure control for layout measurement", () => {
+  const longResult = {
+    ...state.results[0],
+    ui_text: Array.from({ length: 6 }, (_, index) => `Answer line ${index + 1}`).join("\n"),
+  };
+  const html = renderRuntime({ ...state, results: [longResult] });
+
+  expect(html).toContain('class="result-card result-card-measured"');
+  expect(html).toContain('class="result-toggle"');
+  expect(html).toContain('aria-label="Expand full worker result" hidden');
+});
+
+test("measures actual rendered height and expands only cards longer than five lines", () => {
+  const classes = new Set();
+  let click;
+  const attributes = new Map();
+  const content = {
+    scrollHeight: 131,
+    style: { setProperty: (name, value) => attributes.set(name, value) },
+  };
+  const toggle = {
+    hidden: true,
+    textContent: "▸",
+    setAttribute: (name, value) => attributes.set(name, value),
+    addEventListener: (_event, callback) => { click = callback; },
+  };
+  const card = {
+    classList: {
+      contains: (name) => classes.has(name),
+      toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name),
+    },
+    querySelector: (selector) => selector === ".result-card-content" ? content : toggle,
+  };
+  const root = {
+    ownerDocument: { defaultView: { getComputedStyle: () => ({ lineHeight: "21.75px" }) } },
+    querySelectorAll: () => [card],
+  };
+
+  expect(resultContentExceedsLineLimit(content.scrollHeight, 21.75)).toBe(true);
+  enhanceResultCards(root);
+  expect(classes.has("is-collapsible")).toBe(true);
+  expect(toggle.hidden).toBe(false);
+  expect(attributes.get("--result-preview-height")).toBe("108.75px");
+  click();
+  expect(classes.has("is-expanded")).toBe(true);
+  expect(attributes.get("aria-expanded")).toBe("true");
+  expect(toggle.textContent).toBe("▾");
+});
+
+test("keeps the disclosure control hidden for cards no longer than five lines", () => {
+  expect(resultContentExceedsLineLimit(109.75, 21.75)).toBe(false);
 });
 
 test("does not style server-transport-completed text as incomplete or claim browser audibility", () => {
