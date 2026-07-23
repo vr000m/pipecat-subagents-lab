@@ -1,11 +1,6 @@
 import { expect, test } from "bun:test";
 
-import {
-  enhanceResultCards,
-  formatTimestamp,
-  renderRuntime,
-  resultContentExceedsLineLimit,
-} from "../src/render.js";
+import { formatTimestamp, renderRuntime } from "../src/render.js";
 
 const state = {
   connection: "connected",
@@ -68,57 +63,66 @@ test("renders server-authored timestamps beside user and assistant transcript me
   expect(html).toContain('<div class="turn assistant">');
 });
 
-test("renders live worker result cards with a hidden disclosure control for layout measurement", () => {
-  const longResult = {
+test("shows the spoken projection and nests the full structured result under a caret", () => {
+  const html = renderRuntime({
+    ...state,
+    transcript: [{
+      role: "assistant",
+      text: state.results[0].ui_text,
+      turn_id: "turn-1",
+      timestamp: "2026-07-18T10:00:01Z",
+    }],
+  });
+
+  expect(html).toContain('<span class="projection-label">TTS</span>');
+  expect(html).toContain('<p class="spoken-text unspoken">Concise spoken projection.</p>');
+  expect(html).toContain('<details class="turn-details">');
+  expect(html).toContain("<summary>Subagent output · worker-weather · turn-1</summary>");
+  expect(html).toContain('<div class="turn-details-content"><p class="answer">');
+  expect(html).toContain("Complete answer text, available before speech finishes.");
+  expect(html).toContain("synthesis_ended — speech delivery incomplete or unconfirmed");
+  expect(html).not.toContain("result-card-measured");
+});
+
+test("leaves unmatched transcript messages unchanged without claiming a TTS projection", () => {
+  const html = renderRuntime({
+    ...state,
+    transcript: [{
+      role: "assistant",
+      text: "A transient response without a committed result.",
+      turn_id: "turn-pending",
+      timestamp: "2026-07-18T10:00:01Z",
+    }],
+  });
+
+  expect(html).toContain("A transient response without a committed result.");
+  expect(html).not.toContain("projection-label");
+  expect(html).not.toContain("turn-details");
+});
+
+test("does not invent subagent details for a main response with no separate projection", () => {
+  const mainResult = {
     ...state.results[0],
-    ui_text: Array.from({ length: 6 }, (_, index) => `Answer line ${index + 1}`).join("\n"),
+    result_id: "result-main",
+    worker_id: "main",
+    ui_text: "Please clarify your request.",
+    spoken_text: "Please clarify your request.",
+    citations: [],
   };
-  const html = renderRuntime({ ...state, results: [longResult] });
+  const html = renderRuntime({
+    ...state,
+    results: [mainResult],
+    transcript: [{
+      role: "assistant",
+      text: mainResult.ui_text,
+      turn_id: "turn-1",
+      timestamp: "2026-07-18T10:00:01Z",
+    }],
+  });
 
-  expect(html).toContain('class="result-card result-card-measured"');
-  expect(html).toContain('class="result-toggle"');
-  expect(html).toContain('aria-label="Expand full worker result" hidden');
-});
-
-test("measures actual rendered height and expands only cards longer than five lines", () => {
-  const classes = new Set();
-  let click;
-  const attributes = new Map();
-  const content = {
-    scrollHeight: 131,
-    style: { setProperty: (name, value) => attributes.set(name, value) },
-  };
-  const toggle = {
-    hidden: true,
-    textContent: "▸",
-    setAttribute: (name, value) => attributes.set(name, value),
-    addEventListener: (_event, callback) => { click = callback; },
-  };
-  const card = {
-    classList: {
-      contains: (name) => classes.has(name),
-      toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name),
-    },
-    querySelector: (selector) => selector === ".result-card-content" ? content : toggle,
-  };
-  const root = {
-    ownerDocument: { defaultView: { getComputedStyle: () => ({ lineHeight: "21.75px" }) } },
-    querySelectorAll: () => [card],
-  };
-
-  expect(resultContentExceedsLineLimit(content.scrollHeight, 21.75)).toBe(true);
-  enhanceResultCards(root);
-  expect(classes.has("is-collapsible")).toBe(true);
-  expect(toggle.hidden).toBe(false);
-  expect(attributes.get("--result-preview-height")).toBe("108.75px");
-  click();
-  expect(classes.has("is-expanded")).toBe(true);
-  expect(attributes.get("aria-expanded")).toBe("true");
-  expect(toggle.textContent).toBe("▾");
-});
-
-test("keeps the disclosure control hidden for cards no longer than five lines", () => {
-  expect(resultContentExceedsLineLimit(109.75, 21.75)).toBe(false);
+  expect(html).toContain('<span class="projection-label">TTS</span>');
+  expect(html).toContain("Please clarify your request.");
+  expect(html).not.toContain("Subagent output");
 });
 
 test("does not style server-transport-completed text as incomplete or claim browser audibility", () => {
@@ -139,7 +143,7 @@ test("renders every external source link with safe new-tab attributes", () => {
   expect(html).toContain('target="_blank"');
   expect(html).toContain('rel="noopener noreferrer"');
   const links = [...html.matchAll(/<a href="([^"]+)"[^>]*>/g)];
-  expect(links).toHaveLength(2);
+  expect(links).toHaveLength(1);
   for (const match of links) {
     const [, href] = match;
     const start = html.lastIndexOf("<a ", match.index);
@@ -215,7 +219,6 @@ test("uses conservative incomplete styling for every non-transport-complete deli
 
     expect(html).toContain(`>${deliveryState} — speech delivery incomplete or unconfirmed</p>`);
     expect(html).toContain('class="answer unspoken"');
-    expect(html).toContain('font-style: italic');
     expect(html).not.toContain("verified browser audibility");
   }
 });

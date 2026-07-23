@@ -155,9 +155,10 @@ workers, the complete per-worker Result Log, and delivery outcomes. Older
 transport callbacks are rejected. Result text may appear before speech; the UI
 marks server transport completion separately from incomplete or unconfirmed
 speech and never claims verified browser audibility. Transcript turns show their
-server-authored local-time timestamp. Long inline worker-result diagnostics are
-collapsed to a five-line preview with a disclosure caret; the complete answer
-and sources remain available on expansion and in the Result Log.
+server-authored local-time timestamp. Assistant turns show the exact concise TTS
+projection as the primary message. A `Subagent output` disclosure caret contains
+the complete structured answer, worker/turn metadata, delivery state, and
+sources; the complete history remains available in the Result Log.
 
 ### Boundaries and diagnostics
 

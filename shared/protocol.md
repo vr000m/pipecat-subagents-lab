@@ -56,7 +56,10 @@ for a future, verified Phase-3 extension.
 
 One `GroundedResult` owns the text and normalized absolute HTTP(S) citations.
 The spoken and UI projections carry the same `result_id`, text facts, and
-citations. Worker cards expose only identity, topic, policy label, status, and
+citations. The browser may present `spoken_text` as the primary assistant turn
+and place the complete `ui_text`, delivery state, worker/turn metadata, and
+citations under a structured-output disclosure; this is not hidden model
+reasoning. Worker cards expose only identity, topic, policy label, status, and
 latest-result pointer. A runtime snapshot contains the latest validated routing
 decision, semantic transcript turns, worker state, canonical results, and speech
 progress but never prompts, private context, raw STT fragments, or raw logs.
