@@ -2,17 +2,55 @@
 
 from __future__ import annotations
 
-import inspect
 import asyncio
+import inspect
 from typing import Any, Callable, Mapping
+
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from ..contracts import GroundedResult
 from ..results import canonical_result
+from ..structured_outputs import structured_text_format
 from .base import ContextWorker, WorkerMetadata
 
 
 class WorkerDeclined(Exception):
     """The worker determined that hosted search cannot satisfy the request."""
+
+
+class WebSearchAnswer(BaseModel):
+    """One sourced answer with separate reading and speech projections."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_text: str
+    spoken_text: str
+
+    @field_validator("display_text", "spoken_text")
+    @classmethod
+    def require_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("answer projections must not be empty")
+        return normalized
+
+    @field_validator("spoken_text")
+    @classmethod
+    def bound_spoken_text(cls, value: str) -> str:
+        if len(value) > 600:
+            raise ValueError("spoken projection must not exceed 600 characters")
+        return value
+
+
+_WEB_SEARCH_INSTRUCTIONS = (
+    "Use hosted web search to answer the current request. Return a complete, normal readable "
+    "answer in display_text and a concise standalone version for text-to-speech in spoken_text. "
+    "spoken_text must be plain speech, use at most 80 words and 600 characters, and contain no "
+    "Markdown, URLs, citation markers, source lists, tables, headings, or stage directions. "
+    "Preserve names, dates, quantities, qualifications, and uncertainty needed to answer the "
+    "request accurately. Every claim in spoken_text must also be supported by display_text and "
+    "the same web-search sources; never introduce a fact only in the spoken projection."
+)
 
 
 def _value(value: Any, name: str, default: Any = None) -> Any:
@@ -32,6 +70,16 @@ def _response_text(response: Any) -> str:
             if isinstance(value, str):
                 chunks.append(value)
     return "\n".join(chunks).strip()
+
+
+def _response_answer(response: Any) -> WebSearchAnswer:
+    raw = _response_text(response)
+    if not raw:
+        raise WorkerDeclined("hosted web search returned no answer")
+    try:
+        return WebSearchAnswer.model_validate_json(raw)
+    except ValidationError as exc:
+        raise WorkerDeclined("hosted web search returned an invalid answer envelope") from exc
 
 
 def _response_citations(response: Any) -> list[dict[str, str]]:
@@ -127,7 +175,10 @@ class WebSearchWorker(ContextWorker):
                 "model": self.model,
                 "tools": [{"type": "web_search"}],
                 "tool_choice": "required",
+                "include": ["web_search_call.action.sources"],
+                "instructions": _WEB_SEARCH_INSTRUCTIONS,
                 "input": self._contextual_input(refined),
+                "text": structured_text_format(WebSearchAnswer, "web_search_answer"),
                 "store": False,
             }
             create = self.responses.create
@@ -137,13 +188,12 @@ class WebSearchWorker(ContextWorker):
                 response = await asyncio.to_thread(create, **kwargs)
             if inspect.isawaitable(response):
                 response = await response
-            text = _response_text(response)
-            if not text:
-                raise WorkerDeclined("hosted web search returned no answer")
+            answer = _response_answer(response)
             result = canonical_result(
                 worker_id=self.metadata.worker_id,
                 turn_id=turn_id,
-                text=text,
+                text=answer.display_text,
+                spoken_text=answer.spoken_text,
                 citations=_response_citations(response),
                 origin_epoch=origin_epoch,
             )
@@ -151,7 +201,7 @@ class WebSearchWorker(ContextWorker):
                 {
                     "turn_id": turn_id,
                     "query": refined,
-                    "text": text,
+                    "text": answer.display_text,
                     "result_id": result.result_id,
                 }
             )

@@ -82,14 +82,15 @@ def test_canonical_result_drives_both_projections_and_preserves_origin_epoch() -
         result_id="result-1",
         worker_id="worker-weather",
         turn_id="turn-1",
-        text="Rain is likely.",
+        text="Rain is likely this afternoon, with clearing expected tonight.",
         citations=[{"title": "Forecast", "url": "https://weather.example/forecast"}],
-        spoken_text="Rain is likely.",
-        ui_text="Rain is likely.",
+        spoken_text="Expect rain this afternoon and clearing tonight.",
+        ui_text="Rain is likely this afternoon, with clearing expected tonight.",
         origin_epoch=None,
     )
 
-    assert result.spoken_text == result.ui_text == result.text
+    assert result.spoken_text != result.text
+    assert result.ui_text == result.text
     assert result.spoken_result_id == result.ui_result_id == result.result_id
     assert result.spoken_citations == result.ui_citations == result.citations
     assert datetime.fromisoformat(result.timestamp).tzinfo is not None

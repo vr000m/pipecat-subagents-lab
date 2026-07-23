@@ -86,6 +86,52 @@ test("accepts a complete runtime snapshot with an envelope session id", () => {
 })).toBe(true);
 });
 
+test("accepts a full display result with a separate concise spoken projection", () => {
+  const citations = [{ title: "Source", url: "https://example.com/source" }];
+  const result = {
+    result_id: "result-1",
+    worker_id: "worker-1",
+    turn_id: "turn-1",
+    timestamp: "2026-07-23T10:00:00Z",
+    text: "The complete sourced answer for the browser.",
+    citations,
+    spoken_text: "Here is the short spoken answer.",
+    ui_text: "The complete sourced answer for the browser.",
+    spoken_result_id: "result-1",
+    ui_result_id: "result-1",
+    spoken_citations: citations,
+    ui_citations: citations,
+    origin_epoch: 1,
+  };
+  const message = {
+    contract_version: "v1.0",
+    kind: "runtime_snapshot",
+    sequence: 4,
+    session_id: "session-1",
+    data: {
+      contract_version: "v1.0",
+      session_id: "session-1",
+      snapshot_sequence: 4,
+      workers: [],
+      results: [result],
+      speech_progress: [],
+      routing: null,
+      transcript: [],
+      origin_epoch: 1,
+    },
+  };
+
+  expect(validateServerMessage(message)).toBe(true);
+  expect(validateServerMessage({
+    ...message,
+    data: { ...message.data, results: [{ ...result, spoken_text: "" }] },
+  })).toBe(false);
+  expect(validateServerMessage({
+    ...message,
+    data: { ...message.data, results: [{ ...result, ui_text: "Different UI facts." }] },
+  })).toBe(false);
+});
+
 test("validates server-authored routing and semantic transcript messages", () => {
   const routing = {
     contract_version: "v1.0",

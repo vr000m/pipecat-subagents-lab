@@ -48,7 +48,7 @@ class ResultWorker:
             worker_id="worker-search",
             turn_id=turn_id,
             text=f"Answer for {query}",
-            spoken_text=f"Answer for {query}",
+            spoken_text=f"Spoken answer for {query}",
             ui_text=f"Answer for {query}",
             origin_epoch=origin_epoch,
         )
@@ -177,6 +177,7 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         assert len(worker.frames) == 1
         assert isinstance(worker.frames[0], TTSSpeakFrame)
         assert worker.frames[0].text == result.spoken_text
+        assert worker.frames[0].text != result.text
         assert worker.frames[0].append_to_context is False
         assert connection.scheduler.active is not None
         utterance_id = connection.scheduler.active.item.utterance_id
@@ -537,21 +538,18 @@ def test_connection_pipeline_uses_framework_bridge_and_canonical_result_gate() -
 def test_canonical_adapter_rejects_raw_frames_and_only_admits_downstream_results() -> None:
     adapter = CanonicalResultAdapter()
     assert adapter.accepts({"kind": "raw_llm_text", "text": "leak"}) is False
-    assert (
-        adapter.accepts(
-            {
-                "kind": "canonical_result",
-                "result_id": "r",
-                "worker_id": "w",
-                "turn_id": "t",
-                "text": "ok",
-                "spoken_text": "ok",
-                "ui_text": "ok",
-                "citations": [],
-            }
-        )
-        is True
-    )
+    frame = {
+        "kind": "canonical_result",
+        "result_id": "r",
+        "worker_id": "w",
+        "turn_id": "t",
+        "text": "A complete answer.",
+        "spoken_text": "A short answer.",
+        "ui_text": "A complete answer.",
+        "citations": [],
+    }
+    assert adapter.accepts(frame) is True
+    assert adapter._normalized_result(frame)["spoken_text"] == "A short answer."
 
 
 def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:

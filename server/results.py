@@ -56,6 +56,7 @@ def canonical_result(
     worker_id: str,
     turn_id: str,
     text: str,
+    spoken_text: str | None = None,
     citations: Iterable[Mapping[str, Any]] | None = None,
     result_id: str | None = None,
     origin_epoch: int | None = None,
@@ -66,7 +67,7 @@ def canonical_result(
         turn_id=turn_id,
         text=text,
         citations=normalize_citations(citations),
-        spoken_text=text,
+        spoken_text=text if spoken_text is None else spoken_text,
         ui_text=text,
         origin_epoch=origin_epoch,
     )
@@ -102,12 +103,14 @@ def project_result(
 ) -> tuple[ProjectedResult, ProjectedResult]:
     if (
         spoken_text is not None
-        and spoken_text != result.text
+        and spoken_text != result.spoken_text
         or ui_text is not None
-        and ui_text != result.text
+        and ui_text != result.ui_text
     ):
         raise ValueError("projections cannot add facts to the canonical result")
     return (
-        ProjectedResult(result.result_id, result.text, list(result.citations), result.timestamp),
-        ProjectedResult(result.result_id, result.text, list(result.citations), result.timestamp),
+        ProjectedResult(
+            result.result_id, result.spoken_text, list(result.citations), result.timestamp
+        ),
+        ProjectedResult(result.result_id, result.ui_text, list(result.citations), result.timestamp),
     )

@@ -4,8 +4,8 @@
   "title": "GroundedResult", "type": "object", "additionalProperties": false,
   "required": ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "ui_text", "spoken_result_id", "ui_result_id", "spoken_citations", "ui_citations", "origin_epoch"],
   "properties": {
-    "result_id": {"type": "string"}, "worker_id": {"type": "string"}, "turn_id": {"type": "string"}, "timestamp": {"type": "string", "format": "date-time"}, "text": {"type": "string"},
-    "citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}}, "spoken_text": {"type": "string"}, "ui_text": {"type": "string"},
+    "result_id": {"type": "string"}, "worker_id": {"type": "string"}, "turn_id": {"type": "string"}, "timestamp": {"type": "string", "format": "date-time"}, "text": {"type": "string", "minLength": 1},
+    "citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}}, "spoken_text": {"type": "string", "minLength": 1}, "ui_text": {"type": "string", "minLength": 1},
     "spoken_result_id": {"type": ["string", "null"]}, "ui_result_id": {"type": ["string", "null"]},
     "spoken_citations": {"type": ["array", "null"], "items": {"$ref": "#/$defs/citation"}}, "ui_citations": {"type": ["array", "null"], "items": {"$ref": "#/$defs/citation"}}, "origin_epoch": {"type": ["integer", "null"]}
   },

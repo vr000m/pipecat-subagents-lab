@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .config import Config
 from .contracts import RoutingDecision
+from .structured_outputs import structured_text_format
 
 
 class RoutingValidationError(ValueError):
@@ -20,20 +21,6 @@ class RouterEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: RoutingDecision
     prose: str | None = None
-
-
-def _strict_json_schema(value: Any) -> Any:
-    """Normalize Pydantic's nullable defaults for strict structured outputs."""
-    if isinstance(value, list):
-        return [_strict_json_schema(item) for item in value]
-    if not isinstance(value, dict):
-        return value
-    result = {key: _strict_json_schema(item) for key, item in value.items()}
-    properties = result.get("properties")
-    if isinstance(properties, dict):
-        result["required"] = list(properties)
-    result.pop("default", None)
-    return result
 
 
 def _response_text(response: Any) -> str:
@@ -82,14 +69,7 @@ class LazyRouterProvider:
             model=self._config.resolve_router_model("fast"),
             input=prompt,
             store=False,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "router_envelope",
-                    "strict": True,
-                    "schema": _strict_json_schema(RouterEnvelope.model_json_schema()),
-                }
-            },
+            text=structured_text_format(RouterEnvelope, "router_envelope"),
         )
         try:
             payload = json.loads(_response_text(response))

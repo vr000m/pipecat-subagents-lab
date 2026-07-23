@@ -58,8 +58,9 @@ function validResult(value) {
   return value && typeof value === "object" &&
     typeof value.result_id === "string" && typeof value.worker_id === "string" &&
     typeof value.turn_id === "string" && typeof value.timestamp === "string" &&
-    typeof value.text === "string" && typeof value.spoken_text === "string" &&
-    typeof value.ui_text === "string" && value.spoken_text === value.text &&
+    typeof value.text === "string" && value.text.trim().length > 0 &&
+    typeof value.spoken_text === "string" && value.spoken_text.trim().length > 0 &&
+    typeof value.ui_text === "string" &&
     value.ui_text === value.text && Array.isArray(value.citations) &&
     value.citations.every(validCitation) && validOptionalId(value.spoken_result_id) &&
     validOptionalId(value.ui_result_id) && value.spoken_result_id === value.result_id &&

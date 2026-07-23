@@ -122,6 +122,7 @@ class CanonicalResultAdapter(FrameProcessor):
             worker_id=parsed.worker_id,
             turn_id=parsed.turn_id,
             text=parsed.text,
+            spoken_text=parsed.spoken_text,
             citations=[citation.model_dump() for citation in parsed.citations],
             origin_epoch=parsed.origin_epoch,
         ).model_dump(mode="json")

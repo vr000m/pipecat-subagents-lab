@@ -112,10 +112,10 @@ class GroundedResult(StrictModel):
     worker_id: str
     turn_id: str
     timestamp: str = Field(default_factory=utc_timestamp)
-    text: str
+    text: str = Field(min_length=1)
     citations: list[Citation] = Field(default_factory=list)
-    spoken_text: str
-    ui_text: str
+    spoken_text: str = Field(min_length=1)
+    ui_text: str = Field(min_length=1)
     spoken_result_id: str | None = None
     ui_result_id: str | None = None
     spoken_citations: list[Citation] | None = None
@@ -124,8 +124,10 @@ class GroundedResult(StrictModel):
 
     @model_validator(mode="after")
     def derive_and_validate_projections(self) -> GroundedResult:
-        if self.spoken_text != self.text or self.ui_text != self.text:
-            raise ValueError("speech and UI projections must derive from the canonical result text")
+        if self.ui_text != self.text:
+            raise ValueError("the UI projection must preserve the canonical result text")
+        if not self.text.strip() or not self.spoken_text.strip():
+            raise ValueError("result projections must not be blank")
         if self.spoken_result_id not in (None, self.result_id) or self.ui_result_id not in (
             None,
             self.result_id,

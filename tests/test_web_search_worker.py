@@ -1,30 +1,38 @@
 """Web-worker policy owns query refinement and hosted-search invocation."""
 
 import asyncio
+import json
 import threading
+from typing import Any
 
 import pytest
 
 from server.workers.base import ContextWorker, WorkerMetadata
-from server.workers.web_search import WebSearchWorker
+from server.workers.web_search import WebSearchWorker, WorkerDeclined
+
+
+def answer_payload(
+    display_text: str = "The answer.", spoken_text: str = "The answer."
+) -> dict[str, str]:
+    return {"output_text": json.dumps({"display_text": display_text, "spoken_text": spoken_text})}
 
 
 class FakeResponses:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: Any) -> None:
         self.payload = payload
         self.calls: list[dict] = []
 
-    async def create(self, **kwargs: object) -> dict:
+    async def create(self, **kwargs: object) -> Any:
         self.calls.append(kwargs)
         return self.payload
 
 
 class SyncResponses:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: Any) -> None:
         self.payload = payload
         self.calls: list[tuple[dict, int]] = []
 
-    def create(self, **kwargs: object) -> dict:
+    def create(self, **kwargs: object) -> Any:
         self.calls.append((kwargs, threading.get_ident()))
         return self.payload
 
@@ -32,7 +40,7 @@ class SyncResponses:
 def test_worker_sanitizes_query_and_requests_store_false_before_normalizing_result() -> None:
     provider = FakeResponses(
         {
-            "output_text": "The answer.",
+            **answer_payload("The complete answer.", "The short answer."),
             "citations": [{"title": "Source", "url": "https://example.com/a"}],
         }
     )
@@ -43,8 +51,17 @@ def test_worker_sanitizes_query_and_requests_store_false_before_normalizing_resu
     assert provider.calls[0]["store"] is False
     assert provider.calls[0]["tools"] == [{"type": "web_search"}]
     assert provider.calls[0]["tool_choice"] == "required"
+    assert provider.calls[0]["include"] == ["web_search_call.action.sources"]
+    assert "at most 80 words" in provider.calls[0]["instructions"]
+    assert provider.calls[0]["text"]["format"]["name"] == "web_search_answer"
+    assert provider.calls[0]["text"]["format"]["strict"] is True
+    assert set(provider.calls[0]["text"]["format"]["schema"]["required"]) == {
+        "display_text",
+        "spoken_text",
+    }
     assert "refined:" not in provider.calls[0]["input"]
-    assert result.text == "The answer."
+    assert result.text == result.ui_text == "The complete answer."
+    assert result.spoken_text == "The short answer."
     assert result.citations[0].url == "https://example.com/a"
 
 
@@ -55,7 +72,7 @@ def test_worker_collects_object_sources_from_web_search_call_actions() -> None:
 
     provider = FakeResponses(
         Value(
-            output_text="The answer.",
+            output_text=answer_payload()["output_text"],
             output=[
                 Value(
                     type="web_search_call",
@@ -98,7 +115,7 @@ def test_worker_declines_or_clarifies_without_calling_search_when_web_cannot_sat
 
 
 def test_worker_runs_sync_responses_client_off_event_loop() -> None:
-    provider = SyncResponses({"output_text": "The answer."})
+    provider = SyncResponses(answer_payload())
 
     async def run() -> tuple[int, int]:
         loop_thread = threading.get_ident()
@@ -111,7 +128,7 @@ def test_worker_runs_sync_responses_client_off_event_loop() -> None:
 
 
 def test_same_worker_search_uses_prior_canonical_context() -> None:
-    provider = FakeResponses({"output_text": "The answer."})
+    provider = FakeResponses(answer_payload())
     worker = WebSearchWorker(responses=provider, model="verified-worker-model")
 
     async def run() -> None:
@@ -122,6 +139,24 @@ def test_same_worker_search_uses_prior_canonical_context() -> None:
 
     assert "Previous query: weather in Riga" in provider.calls[1]["input"]
     assert "Previous answer: The answer." in provider.calls[1]["input"]
+
+
+def test_worker_rejects_invalid_or_oversized_spoken_projection() -> None:
+    invalid = FakeResponses({"output_text": "not JSON"})
+    oversized = FakeResponses(answer_payload(spoken_text="x" * 601))
+
+    with pytest.raises(WorkerDeclined, match="invalid answer envelope"):
+        asyncio.run(
+            WebSearchWorker(responses=invalid, model="verified-worker-model").search(
+                "What happened?", turn_id="turn-1"
+            )
+        )
+    with pytest.raises(WorkerDeclined, match="invalid answer envelope"):
+        asyncio.run(
+            WebSearchWorker(responses=oversized, model="verified-worker-model").search(
+                "What happened?", turn_id="turn-1"
+            )
+        )
 
 
 def test_failed_persistent_submission_does_not_poison_later_submissions() -> None:

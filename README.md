@@ -4,6 +4,12 @@ Experimental Pipecat-native voice assistants with persistent specialist subagent
 
 The first experiment will route requests through a tool-free main model to persistent context-owning subagents, speak concise answers through a local TTS server, and render structured web-search results plus interruption state in a plain browser client. Electron packaging is deferred until the browser protocol and interaction model are proven.
 
+Each hosted-search response is one strict structured envelope with a complete
+`display_text` answer and a separate speech-friendly `spoken_text` summary.
+Both projections retain the same canonical result ID and normalized citations.
+The browser renders the complete answer while the connection-local speech
+scheduler sends only the concise projection to TTS.
+
 ## Local runbook
 
 This repository is the browser-first verification slice. It keeps the Python
@@ -136,6 +142,12 @@ speaking (strategy: TurnAnalyzerUserTurnStopStrategy...)` is the semantic turn
 boundary that routes their combined transcript once. The local STT adapter uses
 Pipecat's VAD-delimited segments and sends the Nemotron service raw 16 kHz mono
 PCM16 rather than a WAV container.
+
+For live TTS, a completed worker result should produce
+`Generating TTS [<spoken projection>]` followed by local synthesis events and
+outbound audio. The Pipecat worker bus bridge explicitly keeps
+`TTSSpeakFrame` on the browser connection pipeline; sending that frame to the
+worker bus would remove it before `LocalTTS`.
 
 On reconnect, the server-issued `session_id`, resume token, and proposed epoch
 fence the replacement transport. The replacement receives a fresh snapshot of
