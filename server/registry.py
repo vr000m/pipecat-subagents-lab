@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from .config import Config
-from .router import WorkerCatalogue, WorkerCatalogueEntry
+from .router import WorkerCatalogue, WorkerCatalogueEntry, build_openai_responses_client
 from .workers.base import ContextWorker, WorkerMetadata
 from .workers.web_search import WebSearchWorker
 
@@ -105,9 +106,7 @@ class WorkerRegistry:
         elif worker_type == "web_search":
             if self.responses is None:
                 if self.config.openai_api_key:
-                    from openai import OpenAI
-
-                    self.responses = OpenAI(api_key=self.config.openai_api_key).responses
+                    self.responses = build_openai_responses_client(self.config.openai_api_key)
                 else:
                     self.responses = _UnavailableResponses()
             worker = WebSearchWorker(

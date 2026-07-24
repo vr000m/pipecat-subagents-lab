@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -21,6 +22,13 @@ class RouterEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: RoutingDecision
     prose: str | None = None
+
+
+def build_openai_responses_client(api_key: str) -> Any:
+    """Construct the shared OpenAI Responses client used by the router and workers."""
+    from openai import OpenAI
+
+    return OpenAI(api_key=api_key).responses
 
 
 def _response_text(response: Any) -> str:
@@ -59,9 +67,7 @@ class LazyRouterProvider:
                 "router provider is unavailable; configure an OpenAI credential "
                 "or inject a router provider"
             )
-        from openai import OpenAI
-
-        self._responses = OpenAI(api_key=self._config.openai_api_key).responses
+        self._responses = build_openai_responses_client(self._config.openai_api_key)
         return self._responses
 
     def __call__(self, prompt: str) -> dict[str, Any]:
