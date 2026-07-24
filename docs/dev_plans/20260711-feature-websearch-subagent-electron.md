@@ -1,6 +1,6 @@
 # Task: Pipecat Web-Search Subagent and Browser RTVI Lab
 
-**Status**: Not Started
+**Status**: In Progress
 **Component**: Pipecat subagents
 **Assigned to**: Codex
 **Priority**: Medium
@@ -494,6 +494,7 @@ sequenceDiagram
 - **Smart Turn `COMPLETE` could still fire before a natural pause ended:** add a separate application-owned completion grace, configured as `[turn].smart_turn_complete_grace_seconds` / `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` and defaulting to 1.5 seconds. New speech cancels the pending completion, raw STT fragments remain internal, and one combined transcript is routed after the grace expires.
 - **The empty catalogue produced a contradictory `unsupported` envelope:** make the router prompt's action policy explicit, reserve `unsupported` for genuinely unavailable capabilities, map public factual/current/historical requests to a `new_worker` web-search bootstrap, wrap semantic schema failures at the provider boundary, and return a safe canonical result if routing still fails. Verified defaults are `gpt-5-mini` for routing and `gpt-5` for hosted web search, with TOML/environment overrides.
 - **The browser showed raw fragments and no worker despite backend work:** project the semantic transcript, validated routing decision, and real worker running/idle state through authoritative session events and snapshots. Browser SDK transcript callbacks no longer mutate product state directly.
+- **Speech-provider latency needed an evidence-based deployment choice:** add explicit `[stt].provider = "local" | "deepgram"` and `[tts].provider = "local" | "cartesia"` policy, keep hosted credentials environment-only, preserve one connection-local service instance per browser epoch, and add an opt-in identical-fixture benchmark. On the 2026-07-24 development-machine sample, local TTS reached first audio in 25.0 ms median versus Cartesia's 92.2 ms, while local STT finalized 71.5 ms after speech end versus Deepgram's 240.5 ms. Local remains the latency default; hosted providers are deployment alternatives.
 
 ## Final Results
 
@@ -529,3 +530,13 @@ and the `deep` policy for that same query. A required-tool `gpt-5` worker smoke
 returned a sourced answer with four normalized citations. Full
 microphone-to-audible-output acceptance remains an operator-run check with the
 local STT/TTS processes.
+
+Speech provider selection is now independent for STT and TTS. The checked-in
+configuration remains local, while Deepgram `nova-3-general` and Cartesia
+`sonic-3.5` can be selected without putting credentials or the Cartesia voice
+UUID in TOML. Provider construction fails closed when required environment
+values are absent. Hosted services are cloned per browser connection, and a
+provider-neutral TTS lifecycle adapter releases Cartesia speech leases without
+double-processing the callback used by local TTS. The repeatable benchmark and
+2026-07-24 measurements live under `scripts/benchmark_speech.py` and
+`docs/benchmarks/20260724-speech-latency.md`.

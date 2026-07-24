@@ -21,9 +21,10 @@ out of scope until these contracts have evidence behind them.
 
 Load credentials in the shell from `~/.secrets/ai.env` (or provide an
 equivalent environment file) without copying secret values into this
-repository. The only credential used by the hosted-search worker is the
-variable named by `WEBSEARCH_OPENAI_API_KEY_ENV`, defaulting to
-`OPENAI_API_KEY`. The authenticated hosted-search smoke test is opt-in and
+repository. Hosted search uses the variable named by
+`WEBSEARCH_OPENAI_API_KEY_ENV`, defaulting to `OPENAI_API_KEY`. Optional hosted
+speech uses `DEEPGRAM_API_KEY`, `CARTESIA_API_KEY`, and
+`CARTESIA_VOICE_ID`. Authenticated smoke tests and benchmarks are opt-in and
 must be kept separate from the credential-free test suite.
 
 The checked-in `config.toml` contains the local macOS socket defaults for the
@@ -31,9 +32,11 @@ Nemotron STT service and the sibling TTS service:
 
 ```toml
 [stt]
+provider = "local"
 stt_service = "websocket"
 stt_ws_socket = "~/Library/Caches/pipecat-stt/nemotron.sock"
 stt_language = "en"
+model = "nova-3-general"
 
 [turn]
 smart_turn_timeout_seconds = 5.0
@@ -44,10 +47,19 @@ router_model = "gpt-5-mini"
 worker_model = "gpt-5"
 
 [tts]
+provider = "local"
 tts_ws_host = "127.0.0.1"
 tts_ws_port = 8965
 voice_id = "azelma"
+model = "sonic-3.5"
 ```
+
+Set `stt.provider = "deepgram"` and/or `tts.provider = "cartesia"` to use
+hosted speech. Provider model IDs remain in TOML; credentials and the Cartesia
+voice UUID remain environment-only. The equivalent provider/model overrides
+are `WEBSEARCH_STT_PROVIDER`, `WEBSEARCH_STT_MODEL`,
+`WEBSEARCH_TTS_PROVIDER`, and `WEBSEARCH_TTS_MODEL`. A selected hosted provider
+fails closed at startup when its required environment values are absent.
 
 Environment variables override the checked-in defaults. Use transport-qualified
 endpoints when overriding them; discovery must not assume UDS or TCP:
@@ -95,6 +107,23 @@ bun run lint
 
 Run `bun run build` before opening or serving `web/index.html`: `dist/` is
 intentionally ignored, while lint writes its bundle only to `/tmp`.
+
+To compare the configured local services with Deepgram and Cartesia using the
+same text and PCM fixture:
+
+```sh
+set -a
+source ~/.secrets/ai.env
+set +a
+uv run python scripts/benchmark_speech.py --runs 5
+```
+
+The script reports warm time-to-first-audio, synthesis completion,
+speech-end-to-final-transcript latency, and connection setup separately. It
+prints aggregate timings and transcript equality only; it does not print
+credentials or provider payloads. See
+`docs/benchmarks/20260724-speech-latency.md` for the current machine snapshot
+and interpretation.
 
 ### Start the local browser server
 
