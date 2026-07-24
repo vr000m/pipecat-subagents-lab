@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from .config import Config
 from .contracts import RoutingDecision
@@ -32,6 +33,7 @@ class DispatchOutcome:
     catalogue: WorkerCatalogue | None = None
     work_items: tuple[str, ...] = ()
     control_action: str | None = None
+    prose: str | None = None
 
 
 @dataclass(frozen=True)
@@ -149,7 +151,10 @@ class WorkItemCoordinator:
             raise RuntimeError("routing arbitration requires a registry and router")
         catalogue = self.registry.catalogue()
         decision = self.router.route(transcript, catalogue)
-        return DispatchOutcome("routed", transcript, decision=decision, catalogue=catalogue)
+        prose = self.router.last_prose
+        return DispatchOutcome(
+            "routed", transcript, decision=decision, catalogue=catalogue, prose=prose
+        )
 
     def dispatch(
         self,

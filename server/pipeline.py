@@ -578,8 +578,7 @@ class SessionHost:
             )
         action = getattr(outcome.decision, "action", None)
         if action in {"direct", "unsupported", "clarify"}:
-            router = getattr(self.coordinator, "router", None)
-            text = getattr(router, "last_prose", None)
+            text = getattr(outcome, "prose", None)
             if not text:
                 text = {
                     "direct": "I could not produce a direct answer yet.",
