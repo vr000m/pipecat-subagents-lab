@@ -7,8 +7,9 @@ browser state is a deliberately limited product/debug projection.
 ## Version and envelope rules
 
 The current contract version is `v1.0`. Every state-bearing message includes
-stable identifiers and an origin epoch (nullable before Phase 3's connection
-arbiter, but required after acceptance). JSON objects reject unknown fields.
+stable identifiers and an origin epoch. Internal records may use a nullable
+epoch before a browser connection is accepted; active-connection events require
+the accepted epoch. JSON objects reject unknown fields.
 Unknown future message types may be ignored only when their version is known;
 an unknown contract version is rejected. `snapshot_sequence` and incremental
 `event_sequence` values are monotonic. A reconnect replaces runtime projections
@@ -77,8 +78,8 @@ The pinned package does not expose the planned `LLMContextWorker` module.
 `PipelineWorker(..., bridged=...)`, `BusBridgeProcessor(bus, worker_name,
 target_task, bridge)`, and `RTVIServerMessageFrame(data)` remain available.
 `RTVIServerMessageFrame` carries its arbitrary payload in `data`. The pinned
-`WorkerRunner` constructor has no `auto_end` parameter; its runtime default is
-`_auto_end=True`, so the durable-host implementation must set/verify the
-long-lived runner policy at the Phase-3 seam or use an equivalent lifecycle
-adapter. No phase-1 contract treats durable-host or per-connection filtering
-as accepted before that probe.
+`WorkerRunner` constructor has no `auto_end` parameter. The durable session host
+owns the process-lifetime runner, while every accepted browser connection owns
+and awaits its real `PipelineWorker` lifecycle task. Replacement cancels the
+prior connection worker, and epoch-aware publishers, observers, and session
+state reject stale callbacks before they can mutate or emit active state.

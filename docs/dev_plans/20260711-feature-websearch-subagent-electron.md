@@ -1,12 +1,12 @@
 # Task: Pipecat Web-Search Subagent and Browser RTVI Lab
 
-**Status**: In Progress
+**Status**: Complete
 **Component**: Pipecat subagents
 **Assigned to**: Codex
 **Priority**: Medium
 **Branch**: feature/websearch-subagent-electron
 **Created**: 2026-07-11
-**Completed**:
+**Completed**: 2026-07-24
 **Review Gates**: full
 
 ## Objective
@@ -44,7 +44,7 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 - On reconnect, request a fresh runtime snapshot and replace the browser's worker/result projection with server-authoritative state while retaining only clearly marked local connection diagnostics.
 - Open search-result links in a new browser tab with safe link attributes.
 - Treat provider citations as untrusted input and render only normalized absolute `http` or `https` URLs.
-- Use the already-running local STT and TTS servers, following their verified client contracts rather than copying application-specific orchestration.
+- Default to the already-running local STT and TTS servers, following their verified client contracts rather than copying application-specific orchestration; allow independently selected Deepgram STT and Cartesia TTS alternatives for hosted deployments.
 - Load required credentials from environment variables sourced from `~/.secrets/ai.env`; never copy values into source, tests, plans, logs, or commits.
 - Treat live STT/TTS endpoint forms and OpenAI credential availability as preflight-verified environment assumptions, not defaults inferred from reference adapters or file existence.
 - Keep router, worker, and model-selection policy configurable. Pin concrete inexpensive/current OpenAI model defaults only after verifying OpenAI and Pipecat compatibility during implementation.
@@ -221,10 +221,13 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 ### New Files to Create
 
 - `pyproject.toml` — Python dependencies, scripts, Ruff, and pytest configuration.
+- `config.toml` — checked-in local defaults and provider/model policy.
 - `server/` — configuration, versioned contracts, router, worker registry, web-search worker, canonical result projection, Pipecat pipeline, speech services, observers, and session state.
+- `scripts/benchmark_speech.py` — opt-in identical-fixture latency benchmark for local and hosted speech providers.
 - `tests/` — unit and integration coverage for contracts, routing, persistence, projections, RTVI ordering, interruption, and reconnect.
 - `shared/protocol.md` and `shared/schemas/*.json` — versioned cross-runtime contracts.
 - `web/` — Bun-managed plain HTML, JavaScript, and CSS RTVI client plus tests.
+- `docs/benchmarks/20260724-speech-latency.md` — development-machine benchmark snapshot and interpretation.
 
 ### Architecture Decisions
 
@@ -285,7 +288,7 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 
 | Producer | Contract | Consumer | Verification |
 |---|---|---|---|
-| Local STT adapter | Final user transcript with turn ID | Main router | Contract test plus local-server integration smoke test |
+| Selected STT adapter (local or Deepgram) | Final user transcript with turn ID | Main router | Contract tests, local-server integration smoke test, and opt-in hosted benchmark |
 | Worker registry | Immutable per-turn worker catalogue | Main router and dispatch validator | Same-snapshot selection, stale-ID, and mutation tests |
 | Main router | Validated routing decision and policy label | Worker registry/dispatcher | Schema tests, allowlist rejection, and routing matrix |
 | Main router | Validated direct/unsupported/clarify intent | Tool-free main-response executor | Outcome matrix and no-tools assertion |
@@ -300,9 +303,9 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 | Worker runtime handle | `work_item_id`, `run_id`, capabilities, ordered events, cancellation acknowledgement | WorkItemCoordinator | Backend capability and event-order tests |
 | Context-owning worker (`LLMContextWorker`) | Validated canonical-result/control frames through its bridged edges | Connection `PipelineWorker`'s `BusBridgeProcessor` | Runner/bus ownership and bridge delivery test; verify against pinned Pipecat version |
 | Result normalizer | Versioned grounded result | Speech projector and UI projector | Projection equivalence/invariant test |
-| Speech projector/local TTS | `work_item_id`/`run_id`/utterance ID, audio frames, synthesis lifecycle | SpeechScheduler and Small WebRTC output | Frame-tag propagation and synthesis/transport distinction tests |
+| Speech projector/selected TTS adapter (local or Cartesia) | `work_item_id`/`run_id`/utterance ID, audio frames, synthesis lifecycle | SpeechScheduler and Small WebRTC output | Frame-tag propagation, provider lifecycle, and synthesis/transport distinction tests |
 | Interruption controller | Pipecat interruption frame plus work-item/utterance policy | Session delivery state and worker-task policy | Task-local pause/cancel/discard matrix and race tests |
-| SpeechScheduler | One active utterance lease plus per-work-item speech queues | Local TTS and transport output | Frame ownership, interruption, replay, and cross-work-item isolation tests |
+| SpeechScheduler | One active utterance lease plus per-work-item speech queues | Selected TTS adapter and transport output | Frame ownership, interruption, replay, and cross-work-item isolation tests |
 | Downstream transport observer | Utterance/work-item-correlated transport completion/interruption or unknown | Session delivery state | Precise completion/unknown labeling and race tests |
 | RTVI state publisher | Versioned state projections and full snapshot | Browser state reducer | Contract, duplicate, gap, stale-session, and reconnect tests |
 | Session state | Ordered per-worker canonical-result history (timestamped, unbounded, process-lifetime) | Browser Result Log panel | Reconnect-rebuild, ordering, and no-silent-eviction tests |
@@ -315,7 +318,7 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 graph LR
     Browser["Browser RTVI client"] -->|"connect"| Arbiter["Connection epoch arbiter"]
     Arbiter -->|"active microphone + controls"| WebRTC["Pipecat Small WebRTC session"]
-    WebRTC --> STT["Local STT service"]
+    WebRTC --> STT["Selected STT provider (local or Deepgram)"]
     STT --> Dialogue["Pending-turn arbiter"]
     Dialogue --> Router["Tool-free main router"]
     Registry["Validated worker registry"] -->|"per-turn catalogue"| Router
@@ -330,7 +333,7 @@ graph LR
     Direct --> Result["Canonical result + projections"]
     OpenAI --> Result
     Result --> Scheduler["SpeechScheduler"]
-    Scheduler --> TTS["Local TTS service"]
+    Scheduler --> TTS["Selected TTS provider (local or Cartesia)"]
     TTS --> WebRTC
     Result --> State["Authoritative session state"]
     WebRTC -->|"server transport completion/interruption"| State
@@ -342,13 +345,13 @@ sequenceDiagram
     participant B as Browser
     participant A as Connection epoch arbiter
     participant P as Pipecat session
-    participant S as Local STT
+    participant S as Selected STT provider
     participant D as Pending-dialogue dispatcher
     participant R as Main router
     participant W as Worker registry/search worker
     participant M as Tool-free main responder
     participant O as OpenAI web_search
-    participant T as Local TTS
+    participant T as Selected TTS provider
 
     B->>A: Connect and request activation
     A->>P: Promote epoch; fence prior transport
@@ -475,7 +478,7 @@ sequenceDiagram
 - [x] Browser-first architecture drafted
 - [x] Plan reviewed and findings addressed
 - [x] User confirmed implementation may begin
-- [ ] Implementation completed and verified
+- [x] Implementation completed and verified
 
 ## Findings
 
@@ -509,9 +512,9 @@ deployed to a cloud runtime; it is not an alternate local transport path.
 The configured local STT/TTS adapters now have a real websocket client path for
 UDS, TCP, WS, and WSS endpoints, while retaining an injectable factory seam for
 verified sibling-service clients. The live Small WebRTC worker and RTVI event
-path are wired and fenced. The full feature remains incomplete until the
-credential-safe local media acceptance procedure proves microphone capture,
-live local STT/TTS, and audible browser output.
+path are wired and fenced. The credential-safe local media acceptance procedure
+proved browser microphone capture, live local STT/TTS, and audible browser
+output.
 
 Runtime hardening now also covers fail-closed same-origin discovery, expiring
 per-epoch signaling tokens with no-store responses, strict canonical-result
@@ -527,9 +530,9 @@ semantic stop and proves one combined application turn, one router call, one web
 worker call, and authoritative transcript/routing/worker projections. A live
 credentialed router probe returned `new_worker` with `web_search`, `public_web`,
 and the `deep` policy for that same query. A required-tool `gpt-5` worker smoke
-returned a sourced answer with four normalized citations. Full
-microphone-to-audible-output acceptance remains an operator-run check with the
-local STT/TTS processes.
+returned a sourced answer with four normalized citations. The operator-run
+microphone-to-audible-output check completed successfully with the local
+STT/TTS processes.
 
 Speech provider selection is now independent for STT and TTS. The checked-in
 configuration remains local, while Deepgram `nova-3-general` and Cartesia

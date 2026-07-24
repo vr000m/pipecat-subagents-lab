@@ -2,7 +2,11 @@
 
 Experimental Pipecat-native voice assistants with persistent specialist subagents and a lightweight browser RTVI client.
 
-The first experiment will route requests through a tool-free main model to persistent context-owning subagents, speak concise answers through a local TTS server, and render structured web-search results plus interruption state in a plain browser client. Electron packaging is deferred until the browser protocol and interaction model are proven.
+The first experiment routes requests through a tool-free main model to
+persistent context-owning subagents, speaks concise answers through a configured
+TTS provider (local by default), and renders structured web-search results plus
+interruption state in a plain browser client. Electron packaging is deferred
+until the browser protocol and interaction model are proven.
 
 Each hosted-search response is one strict structured envelope with a complete
 `display_text` answer and a separate speech-friendly `spoken_text` summary.
