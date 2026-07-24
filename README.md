@@ -45,6 +45,7 @@ model = "nova-3-general"
 [turn]
 smart_turn_timeout_seconds = 5.0
 smart_turn_complete_grace_seconds = 1.5
+pending_dialogue_timeout_seconds = 30.0
 
 [models]
 router_model = "gpt-5-mini"
@@ -82,6 +83,9 @@ speech boundary resets this timer; five silent seconds finalize the accumulated
 transcript by default. `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` controls a
 separate application debounce after Smart Turn reports a complete turn. Speech
 that resumes within the default 1.5-second grace remains part of the same turn.
+`WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS` controls how long a worker's
+clarifying question remains available for continuation; the default is 30
+seconds. Its TOML equivalent is `[turn].pending_dialogue_timeout_seconds`.
 `WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
 OpenAI model IDs without allowing model output to select an arbitrary model.
 

@@ -30,11 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Wire worker clarification into pending-dialogue continuation: a web-search
   worker's clarifying question (`WorkerClarify`) is now caught at every
-  pipeline dispatch site and recorded as a pending-dialogue candidate, so the
-  existing `continue_pending`/steer/multi-intent arbitration — previously
-  unreachable in production — actually resumes the paused work item on the
-  next turn. Adds the `pending_dialogue_timeout_seconds` config
-  (`WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS`, default 30s).
+  pipeline dispatch site and recorded with its original request. Natural
+  answers resume the same worker, compound replies retain the pending owner,
+  and unrelated questions route normally. Adds the TOML/environment
+  `pending_dialogue_timeout_seconds` setting, defaulting to 30 seconds.
+- Keep timed-out worker searches alive for late UI delivery without autoplay,
+  propagate mailbox cancellation, and stop active TTS before speaking a
+  cancellation confirmation.
+- Return router decisions and prose atomically so concurrent turns cannot
+  observe another turn's response text.
 
 [Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0

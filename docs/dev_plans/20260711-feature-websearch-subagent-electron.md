@@ -549,9 +549,20 @@ requirement: `WorkItemCoordinator.add_pending()`/`PendingDialogue` were only
 ever populated by tests, so the already-implemented `continue_pending`
 arbitration branch was unreachable in production — a worker's clarifying
 question had no live path back into the pending-dialogue queue. `WebSearchWorker`
-now raises a `WorkerClarify` exception (checked after `decline()`, so
-capability-unavailable still wins over query-ambiguity), all three pipeline
-dispatch sites (`_handle_transcript`, `_handle_pending`, `_handle_multi_intent`)
-catch it and call the new `WorkItemCoordinator.add_worker_clarification()`, and
-the operator-configurable `pending_dialogue_timeout_seconds` (default 30s,
-`WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS`) sets the candidate's expiry.
+now raises a `WorkerClarify` exception for bounded production ambiguity checks
+(checked after `decline()`, so capability-unavailable still wins), and all
+three pipeline dispatch sites record the original request, question, worker,
+and expiry. Natural answers resume the same worker with the clarification
+context, steering remains same-topic, explicit unrelated questions route
+normally, and compound replies carry the pending owner through decomposition.
+The operator-configurable `[turn].pending_dialogue_timeout_seconds` /
+`WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS` defaults to 30 seconds and rejects
+non-finite values.
+
+The same hardening pass made router decision/prose delivery atomic across
+concurrent turns, retained timed-out searches for late UI delivery without
+autoplay, preserved caller cancellation while waiting on same-worker mailbox
+predecessors, and made cancel/stop enqueue Pipecat's interruption frame before
+speaking confirmation. Regression tests cover each lifecycle invariant,
+including ambiguous weather request -> spoken clarification -> `Riga` -> the
+same worker receiving the original request plus the answer.
