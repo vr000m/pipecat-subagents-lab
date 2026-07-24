@@ -2,9 +2,12 @@
 # values; do not add API keys or bearer tokens to this file.
 
 [stt]
+provider = "local" # local | deepgram
 stt_service = "websocket"
 stt_ws_socket = "~/Library/Caches/pipecat-stt/nemotron.sock"
 stt_language = "en"
+# Used when provider = "deepgram"; DEEPGRAM_API_KEY stays in the environment.
+model = "nova-3-general"
 
 [turn]
 # Fallback after Smart Turn reports INCOMPLETE and no further speech arrives.
@@ -17,6 +20,10 @@ router_model = "gpt-5-mini"
 worker_model = "gpt-5"
 
 [tts]
+provider = "local" # local | cartesia
 tts_ws_host = "127.0.0.1"
 tts_ws_port = 8965
 voice_id = "azelma"
+# Used when provider = "cartesia"; CARTESIA_API_KEY and CARTESIA_VOICE_ID
+# stay in the environment.
+model = "sonic-3.5"

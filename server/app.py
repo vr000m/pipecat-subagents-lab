@@ -15,6 +15,7 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -33,14 +34,46 @@ from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .rtvi_messages import RTVIMessagePublisher
 from .registry import WorkerRegistry
 from .router import LazyRouterProvider, Router
-from .services.stt import LocalSTT, STTEndpoint
-from .services.tts import LocalTTS, TTSEndpoint
+from .services.factory import create_stt, create_tts
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from .work_item_coordinator import WorkItemCoordinator
 
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class _SpeechCompletionProcessor(FrameProcessor):
+    """Release the active speech lease when any TTS provider finishes."""
+
+    def __init__(self, host: SessionHost, runtime: Any) -> None:
+        super().__init__()
+        self._host = host
+        self._runtime = runtime
+
+    async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+        from pipecat.frames.frames import TTSStoppedFrame
+
+        await super().process_frame(frame, direction)
+        if (
+            direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, TTSStoppedFrame)
+            and self._host.connection is self._runtime
+            and self._runtime.active
+            and self._runtime.scheduler.active is not None
+        ):
+            utterance_id = self._runtime.scheduler.active.item.utterance_id
+            self._runtime.scheduler.synthesis_ended(utterance_id)
+            self._runtime.scheduler.delivery_unknown(utterance_id)
+            await self._runtime.scheduler.start_next()
+        await self.push_frame(frame, direction)
+
+
+def _tts_processors(host: SessionHost, runtime: Any) -> tuple[Any, ...]:
+    """Choose exactly one completion signal for the configured TTS service."""
+    if hasattr(runtime.tts, "on_event"):
+        return (runtime.tts,)
+    return (runtime.tts, _SpeechCompletionProcessor(host, runtime))
 
 
 def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandshake:
@@ -146,7 +179,7 @@ async def _attach_connection(
     if bridge is not None:
         processors.extend((bridge, CanonicalResultAdapter()))
     if runtime.tts is not None:
-        processors.append(runtime.tts)
+        processors.extend(_tts_processors(host, runtime))
     processors.append(transport.output())
     task_manager = TaskManager(loop=asyncio.get_running_loop())
     worker = PipelineWorker(
@@ -245,16 +278,8 @@ def _default_session_host(
         router=configured_router,
         config=config,
     )
-    stt = (
-        LocalSTT(STTEndpoint(*config.stt_endpoint), language=config.stt_language)
-        if config.stt_endpoint
-        else None
-    )
-    tts = (
-        LocalTTS(TTSEndpoint(*config.tts_endpoint), voice_id=config.tts_voice_id)
-        if config.tts_endpoint
-        else None
-    )
+    stt = create_stt(config)
+    tts = create_tts(config)
     return SessionHost(registry=registry, stt=stt, tts=tts, coordinator=coordinator)
 
 

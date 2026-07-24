@@ -21,10 +21,14 @@ def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
     assert config.max_work_items_per_turn == 2
     assert config.multi_intent_wait_timeout_ms == 10_000
     assert config.stt_service == "websocket"
+    assert config.stt_provider == "local"
+    assert config.stt_model == "nova-3-general"
     assert config.stt_language == "en"
     assert config.smart_turn_timeout_seconds == 5.0
     assert config.smart_turn_complete_grace_seconds == 1.5
     assert config.tts_voice_id == "azelma"
+    assert config.tts_provider == "local"
+    assert config.tts_model == "sonic-3.5"
     assert config.openai_api_key is None
     assert config.router_model_policy == {"fast": "gpt-5-mini"}
     assert config.worker_model_policy == {"deep": "gpt-5"}
@@ -48,6 +52,12 @@ def test_operator_limits_reject_zero_or_unbounded_values() -> None:
 
     with pytest.raises(ConfigError):
         Config(smart_turn_complete_grace_seconds=0)
+
+    with pytest.raises(ConfigError, match="stt_provider"):
+        Config(stt_provider="unknown")
+
+    with pytest.raises(ConfigError, match="tts_provider"):
+        Config(tts_provider="unknown")
 
 
 def test_env_precedence_is_explicit_and_secret_values_are_not_logged(
@@ -181,6 +191,31 @@ def test_toml_local_service_settings_load_and_expand_socket_paths(tmp_path) -> N
     assert config.tts_endpoint == ("uds", str(Path.home() / "tts.sock"))
 
 
+def test_hosted_provider_models_load_from_toml_and_environment_wins(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[stt]\nprovider = "deepgram"\nmodel = "nova-3-medical"\n'
+        '[tts]\nprovider = "cartesia"\nmodel = "sonic-3"\n'
+    )
+
+    config = load_config(
+        config_file=config_file,
+        env={
+            "DEEPGRAM_API_KEY": "deepgram-secret",
+            "CARTESIA_API_KEY": "cartesia-secret",
+            "CARTESIA_VOICE_ID": "voice-uuid",
+            "WEBSEARCH_TTS_MODEL": "sonic-3.5",
+        },
+    )
+
+    assert (config.stt_provider, config.stt_model) == ("deepgram", "nova-3-medical")
+    assert (config.tts_provider, config.tts_model) == ("cartesia", "sonic-3.5")
+    assert config.cartesia_voice_id == "voice-uuid"
+    assert "deepgram-secret" not in repr(config)
+    assert "cartesia-secret" not in repr(config)
+    assert "voice-uuid" not in repr(config)
+
+
 def test_repository_config_contains_the_local_socket_defaults() -> None:
     config = load_config(config_file=Path(__file__).parents[1] / "config.toml", env={})
 
@@ -193,6 +228,8 @@ def test_repository_config_contains_the_local_socket_defaults() -> None:
         "127.0.0.1:8965",
     )
     assert config.tts_voice_id == "azelma"
+    assert config.stt_provider == "local"
+    assert config.tts_provider == "local"
     assert config.smart_turn_timeout_seconds == 5.0
     assert config.smart_turn_complete_grace_seconds == 1.5
     assert config.resolve_router_model("fast") == "gpt-5-mini"

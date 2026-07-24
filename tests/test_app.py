@@ -1,6 +1,7 @@
 """HTTP entry-point tests for the local Small WebRTC server."""
 
 import asyncio
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -119,6 +120,17 @@ def test_default_app_host_materializes_configured_local_speech_adapters(
     assert host.tts.endpoint.transport == "ws"
     assert host.tts.endpoint.address == "127.0.0.1:9000"
     assert host.tts.voice_id == "azelma"
+
+
+def test_tts_completion_uses_only_one_provider_signal() -> None:
+    local = SimpleNamespace(on_event=None)
+    hosted = SimpleNamespace()
+    host = SessionHost(runner_factory=FakeRunner)
+
+    assert app_module._tts_processors(host, SimpleNamespace(tts=local)) == (local,)
+    hosted_processors = app_module._tts_processors(host, SimpleNamespace(tts=hosted))
+    assert hosted_processors[0] is hosted
+    assert type(hosted_processors[1]).__name__ == "_SpeechCompletionProcessor"
 
 
 def test_main_uses_validated_bind_configuration(monkeypatch) -> None:

@@ -26,16 +26,23 @@ def _models(value: Mapping[str, str]) -> dict[str, str]:
 class Config:
     openai_api_key: str | None = field(default=None, repr=False)
     openai_api_key_env: str = "OPENAI_API_KEY"
+    deepgram_api_key: str | None = field(default=None, repr=False)
+    cartesia_api_key: str | None = field(default=None, repr=False)
+    cartesia_voice_id: str | None = field(default=None, repr=False)
     router_model_policy: Mapping[str, str] = field(default_factory=lambda: {"fast": "gpt-5-mini"})
     worker_model_policy: Mapping[str, str] = field(default_factory=lambda: {"deep": "gpt-5"})
     max_work_items_per_turn: int = 2
     multi_intent_wait_timeout_ms: int = 10_000
     stt_service: str = "websocket"
+    stt_provider: str = "local"
+    stt_model: str = "nova-3-general"
     stt_language: str = "en"
     stt_endpoint: tuple[str, str] | None = None
     smart_turn_timeout_seconds: float = 5.0
     smart_turn_complete_grace_seconds: float = 1.5
     tts_endpoint: tuple[str, str] | None = None
+    tts_provider: str = "local"
+    tts_model: str = "sonic-3.5"
     tts_voice_id: str = "azelma"
     bind_host: str = "127.0.0.1"
     bind_port: int = 7860
@@ -57,6 +64,10 @@ class Config:
             raise ConfigError("openai_api_key_env must be an uppercase environment variable name")
         if self.stt_service != "websocket":
             raise ConfigError("stt_service must be websocket")
+        if self.stt_provider not in {"local", "deepgram"}:
+            raise ConfigError("stt_provider must be local or deepgram")
+        if not self.stt_model.strip():
+            raise ConfigError("stt_model must not be empty")
         if self.stt_language != "auto" and not re.fullmatch(
             r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?", self.stt_language
         ):
@@ -65,6 +76,10 @@ class Config:
             raise ConfigError("smart_turn_timeout_seconds must be between 0 and 60")
         if not 0 < self.smart_turn_complete_grace_seconds <= 10:
             raise ConfigError("smart_turn_complete_grace_seconds must be between 0 and 10")
+        if self.tts_provider not in {"local", "cartesia"}:
+            raise ConfigError("tts_provider must be local or cartesia")
+        if not self.tts_model.strip():
+            raise ConfigError("tts_model must not be empty")
         if not self.tts_voice_id.strip():
             raise ConfigError("tts_voice_id must not be empty")
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
@@ -121,12 +136,22 @@ def load_config(
     key_name = values.get("WEBSEARCH_OPENAI_API_KEY_ENV", "OPENAI_API_KEY")
     if key := values.get("WEBSEARCH_OPENAI_API_KEY") or values.get(key_name):
         kwargs["openai_api_key"] = key
+    if key := values.get("WEBSEARCH_DEEPGRAM_API_KEY") or values.get("DEEPGRAM_API_KEY"):
+        kwargs["deepgram_api_key"] = key
+    if key := values.get("WEBSEARCH_CARTESIA_API_KEY") or values.get("CARTESIA_API_KEY"):
+        kwargs["cartesia_api_key"] = key
+    if voice := values.get("WEBSEARCH_CARTESIA_VOICE_ID") or values.get("CARTESIA_VOICE_ID"):
+        kwargs["cartesia_voice_id"] = voice
     if raw := values.get("WEBSEARCH_MAX_WORK_ITEMS_PER_TURN"):
         kwargs["max_work_items_per_turn"] = int(raw)
     if raw := values.get("WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS"):
         kwargs["multi_intent_wait_timeout_ms"] = int(raw)
     if raw := values.get("WEBSEARCH_STT_SERVICE"):
         kwargs["stt_service"] = str(raw)
+    if raw := values.get("WEBSEARCH_STT_PROVIDER"):
+        kwargs["stt_provider"] = str(raw)
+    if raw := values.get("WEBSEARCH_STT_MODEL"):
+        kwargs["stt_model"] = str(raw)
     if raw := values.get("WEBSEARCH_STT_LANGUAGE"):
         kwargs["stt_language"] = str(raw)
     if raw := values.get("WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS"):
@@ -143,6 +168,10 @@ def load_config(
             ) from exc
     if raw := values.get("WEBSEARCH_TTS_VOICE_ID"):
         kwargs["tts_voice_id"] = str(raw)
+    if raw := values.get("WEBSEARCH_TTS_PROVIDER"):
+        kwargs["tts_provider"] = str(raw)
+    if raw := values.get("WEBSEARCH_TTS_MODEL"):
+        kwargs["tts_model"] = str(raw)
     if "WEBSEARCH_BIND_HOST" in values:
         kwargs["bind_host"] = values["WEBSEARCH_BIND_HOST"]
     if "WEBSEARCH_BIND_PORT" in values:
@@ -197,6 +226,10 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         raise ConfigError("[stt], [tts], [turn], and [models] config sections must be tables")
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
+    if "provider" in stt:
+        values["WEBSEARCH_STT_PROVIDER"] = stt["provider"]
+    if "model" in stt:
+        values["WEBSEARCH_STT_MODEL"] = stt["model"]
     if "stt_language" in stt:
         values["WEBSEARCH_STT_LANGUAGE"] = stt["stt_language"]
     if "stt_ws_socket" in stt:
@@ -214,6 +247,10 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
     for key in ("tts_ws_uri", "tts_ws_socket", "tts_ws_host", "tts_ws_port"):
         if key in tts:
             values[f"WEBSEARCH_{key.upper()}"] = tts[key]
+    if "provider" in tts:
+        values["WEBSEARCH_TTS_PROVIDER"] = tts["provider"]
+    if "model" in tts:
+        values["WEBSEARCH_TTS_MODEL"] = tts["model"]
     if "voice_id" in tts:
         values["WEBSEARCH_TTS_VOICE_ID"] = tts["voice_id"]
 
