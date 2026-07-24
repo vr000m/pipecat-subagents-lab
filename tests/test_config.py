@@ -20,6 +20,7 @@ def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
     assert config.known_client_url == "http://127.0.0.1:7860"
     assert config.max_work_items_per_turn == 2
     assert config.multi_intent_wait_timeout_ms == 10_000
+    assert config.pending_dialogue_timeout_seconds == 30.0
     assert config.stt_service == "websocket"
     assert config.stt_provider == "local"
     assert config.stt_model == "nova-3-general"
@@ -43,6 +44,9 @@ def test_operator_limits_reject_zero_or_unbounded_values() -> None:
 
     with pytest.raises(ConfigError):
         Config(multi_intent_wait_timeout_ms=0)
+
+    with pytest.raises(ConfigError):
+        Config(pending_dialogue_timeout_seconds=0)
 
     with pytest.raises(ConfigError):
         Config(smart_turn_timeout_seconds=0)
@@ -129,6 +133,17 @@ def test_smart_turn_complete_grace_loads_from_environment() -> None:
     config = load_config(env={"WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS": "2.25"})
 
     assert config.smart_turn_complete_grace_seconds == 2.25
+
+
+def test_pending_dialogue_timeout_loads_from_environment() -> None:
+    config = load_config(env={"WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS": "45"})
+
+    assert config.pending_dialogue_timeout_seconds == 45.0
+
+
+def test_invalid_pending_dialogue_timeout_has_config_error_boundary() -> None:
+    with pytest.raises(ConfigError, match="WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"):
+        load_config(env={"WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS": "not-a-number"})
 
 
 def test_invalid_smart_turn_timeout_has_config_error_boundary() -> None:
