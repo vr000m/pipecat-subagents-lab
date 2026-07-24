@@ -214,3 +214,7 @@ web/             Bun-managed plain HTML, JavaScript, and CSS RTVI client
 shared/          Shared message schemas and protocol documentation
 docs/dev_plans/  Reviewed implementation plans
 ```
+
+## License
+
+Licensed under the [BSD 2-Clause License](LICENSE), matching Pipecat's license.

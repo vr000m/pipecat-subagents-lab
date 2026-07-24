@@ -2,6 +2,8 @@
 name = "pipecat-subagents-lab"
 version = "0.1.0"
 description = "Browser-first Pipecat web-search subagent laboratory"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "pipecat-ai[cartesia,deepgram,openai,webrtc,local,runner]==1.6.0",
