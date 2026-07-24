@@ -647,10 +647,16 @@ class SessionHost:
         search = getattr(worker, "search", None)
         if search is None:
             return outcome
+        timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
         try:
-            result = await search(
-                transcript,
+            result = await asyncio.wait_for(
+                search(transcript, turn_id=turn_id, origin_epoch=origin.epoch), timeout
+            )
+        except TimeoutError:
+            result = canonical_result(
+                worker_id=owner_id or "main",
                 turn_id=turn_id,
+                text="That is taking longer than expected; I will continue in the background.",
                 origin_epoch=origin.epoch,
             )
         except Exception:
@@ -699,10 +705,21 @@ class SessionHost:
             search = getattr(worker, "search", None)
             if search is None:
                 continue
+            timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
             try:
-                result = await search(
-                    item_text,
+                result = await asyncio.wait_for(
+                    search(
+                        item_text,
+                        turn_id=f"{turn_id}-{index + 1}",
+                        origin_epoch=origin.epoch,
+                    ),
+                    timeout,
+                )
+            except TimeoutError:
+                result = canonical_result(
+                    worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
                     turn_id=f"{turn_id}-{index + 1}",
+                    text="That item is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
             except WorkerDeclined:
