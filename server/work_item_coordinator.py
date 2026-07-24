@@ -219,7 +219,10 @@ class WorkItemCoordinator:
         async def one(worker_id: str, text: str) -> Any:
             previous = self._tails.get(worker_id)
             if previous is not None:
-                await previous
+                try:
+                    await previous
+                except BaseException:
+                    pass
             task = asyncio.create_task(worker(worker_id, text))
             self._tails[worker_id] = task
             try:
