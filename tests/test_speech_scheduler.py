@@ -69,6 +69,21 @@ def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
     asyncio.run(run())
 
 
+def test_interrupt_signals_provider_stop_before_releasing_active_lease() -> None:
+    stopped: list[str] = []
+    scheduler = SpeechScheduler(
+        SessionState(),
+        stop=lambda item: stopped.append(item.utterance_id),
+    )
+    item = enqueue(scheduler, "work-1", "one")
+    asyncio.run(scheduler.start_next())
+
+    scheduler.interrupt()
+
+    assert stopped == [item.utterance_id]
+    assert scheduler.active is None
+
+
 def test_synthesis_end_is_not_completion_and_unknown_delivery_is_terminal() -> None:
     scheduler = SpeechScheduler(SessionState())
     item = enqueue(scheduler, "work-1", "answer")

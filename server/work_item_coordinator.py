@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import re
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .config import Config
@@ -23,6 +25,8 @@ class PendingDialogue:
     turn_id: str
     result_id: str
     expires_at: float
+    original_query: str = ""
+    question: str = ""
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,7 @@ class DispatchOutcome:
     work_items: tuple[str, ...] = ()
     control_action: str | None = None
     prose: str | None = None
+    pending_dialogue: PendingDialogue | None = None
 
 
 @dataclass(frozen=True)
@@ -92,7 +97,8 @@ class WorkItemCoordinator:
         )
         max_work_items = max_work_items if max_work_items is not None else max_work_items_per_turn
         if max_work_items is not None:
-            self.config = Config(
+            self.config = replace(
+                self.config,
                 max_work_items_per_turn=max_work_items,
                 multi_intent_wait_timeout_ms=wait_timeout_ms or 10_000,
             )
@@ -100,6 +106,7 @@ class WorkItemCoordinator:
         self._pending: dict[str, PendingDialogue] = {}
         self._tails: dict[str, Any] = {}
         self._late_results: deque[LateResult] = deque()
+        self._late_tasks: set[asyncio.Task[Any]] = set()
 
     def drain_late_results(self) -> tuple[LateResult, ...]:
         """Return and remove results from timed-out work items in completion order."""
@@ -107,11 +114,60 @@ class WorkItemCoordinator:
         self._late_results.clear()
         return results
 
+    def retain_late_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        work_item_id: str,
+        worker_id: str,
+        on_complete: Callable[[LateResult], Any] | None = None,
+    ) -> None:
+        """Retain a timed-out task and publish its eventual terminal result."""
+        self._late_tasks.add(task)
+
+        def completed(completed_task: asyncio.Task[Any]) -> None:
+            self._late_tasks.discard(completed_task)
+            try:
+                value = completed_task.result()
+            except asyncio.CancelledError:
+                late = LateResult(
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    error="CancelledError: worker task was cancelled",
+                )
+            except Exception as exc:
+                late = LateResult(
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                late = LateResult(
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    result=Result(**value) if isinstance(value, dict) else value,
+                )
+            self._late_results.append(late)
+            if on_complete is None:
+                return
+            callback_result = on_complete(late)
+            if inspect.isawaitable(callback_result):
+                asyncio.create_task(callback_result)
+
+        task.add_done_callback(completed)
+
     def add_pending(self, candidate: PendingDialogue) -> None:
         self._pending[candidate.session_id] = candidate
 
     def add_worker_clarification(
-        self, *, session_id: str, worker_id: str, turn_id: str, result_id: str
+        self,
+        *,
+        session_id: str,
+        worker_id: str,
+        turn_id: str,
+        result_id: str,
+        original_query: str,
+        question: str,
     ) -> None:
         """Record a worker's clarifying question as the next turn's pending candidate."""
         self.add_pending(
@@ -122,6 +178,8 @@ class WorkItemCoordinator:
                 turn_id=turn_id,
                 result_id=result_id,
                 expires_at=self.clock() + self.config.pending_dialogue_timeout_seconds,
+                original_query=original_query,
+                question=question,
             )
         )
 
@@ -145,6 +203,21 @@ class WorkItemCoordinator:
         target = match.group(2).replace(" ", "_") if match.group(2) else None
         return action, target
 
+    @staticmethod
+    def pending_intent(transcript: str) -> str:
+        """Classify a reply while a worker clarification is pending."""
+        normalized = " ".join(transcript.strip().split())
+        lowered = normalized.casefold()
+        if re.search(r"\b(and|also)\b", lowered):
+            return "multi_intent"
+        if lowered.startswith(("new question", "unrelated", "forget that")):
+            return "new_topic"
+        if lowered.startswith(("what about", "how about", "instead", "change that")):
+            return "steer_same_topic"
+        if lowered.startswith(("who ", "what ", "when ", "where ", "why ", "how ")):
+            return "new_topic"
+        return "continue_pending"
+
     def arbitrate(self, session_id: str, transcript: str) -> DispatchOutcome:
         control = self.control_intent(transcript)
         if control:
@@ -156,6 +229,7 @@ class WorkItemCoordinator:
                     transcript,
                     work_items=(pending.owner_id,),
                     control_action="consent",
+                    pending_dialogue=pending,
                 )
             return DispatchOutcome(
                 "control",
@@ -164,7 +238,8 @@ class WorkItemCoordinator:
                 control_action=control[0],
             )
         pending = self.pending(session_id)
-        if pending and re.search(r"\b(and|also)\b", transcript, re.IGNORECASE):
+        pending_intent = self.pending_intent(transcript) if pending else None
+        if pending and pending_intent == "multi_intent":
             parts = tuple(
                 part.strip()
                 for part in re.split(r"\band\b|\balso\b", transcript, flags=re.IGNORECASE)
@@ -173,17 +248,30 @@ class WorkItemCoordinator:
             if len(parts) > self.config.max_work_items_per_turn:
                 parts = parts[: self.config.max_work_items_per_turn]
             self._pending.pop(session_id, None)
-            return DispatchOutcome("multi_intent", transcript, work_items=parts)
-        if pending and transcript.lower().startswith(("yes", "continue", "that", "please search")):
+            return DispatchOutcome(
+                "multi_intent",
+                transcript,
+                work_items=parts,
+                pending_dialogue=pending,
+            )
+        if pending and pending_intent in {"continue_pending", "steer_same_topic"}:
             self._pending.pop(session_id, None)
-            return DispatchOutcome("continue_pending", transcript, work_items=(pending.owner_id,))
+            return DispatchOutcome(
+                "continue_pending",
+                transcript,
+                work_items=(pending.owner_id,),
+                pending_dialogue=pending,
+            )
         if self.registry is None or self.router is None:
             raise RuntimeError("routing arbitration requires a registry and router")
         catalogue = self.registry.catalogue()
-        decision = self.router.route(transcript, catalogue)
-        prose = self.router.last_prose
+        envelope = self.router.route_envelope(transcript, catalogue)
         return DispatchOutcome(
-            "routed", transcript, decision=decision, catalogue=catalogue, prose=prose
+            "routed",
+            transcript,
+            decision=envelope.decision,
+            catalogue=catalogue,
+            prose=envelope.prose,
         )
 
     def dispatch(
@@ -212,40 +300,22 @@ class WorkItemCoordinator:
     async def submit(
         self, turn_id: str, items: list[tuple[str, str]], worker: Callable[[str, str], Any]
     ) -> SubmittedOutcome:
-        import asyncio
-
         selected = items[: self.config.max_work_items_per_turn]
         work = tuple(WorkItem(work_item_id=f"{turn_id}-{i}") for i, _ in enumerate(selected))
 
         def materialize_result(value: Any) -> Any:
             return Result(**value) if isinstance(value, dict) else value
 
-        def retain_late_result(task: asyncio.Task[Any], work_item_id: str, worker_id: str) -> None:
-            try:
-                result = materialize_result(task.result())
-            except BaseException as exc:
-                self._late_results.append(
-                    LateResult(
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-            else:
-                self._late_results.append(
-                    LateResult(
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        result=result,
-                    )
-                )
-
         async def one(worker_id: str, text: str) -> Any:
             previous = self._tails.get(worker_id)
             if previous is not None:
                 try:
-                    await previous
-                except BaseException:
+                    await asyncio.shield(previous)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                except Exception:
                     pass
             task = asyncio.create_task(worker(worker_id, text))
             self._tails[worker_id] = task
@@ -256,7 +326,13 @@ class WorkItemCoordinator:
                     self._tails.pop(worker_id, None)
 
         tasks = [asyncio.create_task(one(worker_id, text)) for worker_id, text in selected]
-        await asyncio.wait(tasks, timeout=self.config.multi_intent_wait_timeout_ms / 1000)
+        try:
+            await asyncio.wait(tasks, timeout=self.config.multi_intent_wait_timeout_ms / 1000)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         # asyncio.wait can return its done set before a completion callback that
         # crossed the timeout boundary has run. Give those callbacks one turn,
         # then classify from the authoritative task state.
@@ -281,9 +357,9 @@ class WorkItemCoordinator:
         )
         for i, task in enumerate(tasks):
             if task not in done:
-                task.add_done_callback(
-                    lambda completed, i=i: retain_late_result(
-                        completed, work[i].work_item_id, selected[i][0]
-                    )
+                self.retain_late_task(
+                    task,
+                    work_item_id=work[i].work_item_id,
+                    worker_id=selected[i][0],
                 )
         return SubmittedOutcome(work, results, pending_ids, failures)

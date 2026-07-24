@@ -1,6 +1,8 @@
 """Routing is tool-free and bound to one immutable catalogue snapshot."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -109,6 +111,33 @@ def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validatio
     assert decision.action == "existing_worker"
     assert model.calls[0]["catalogue"] == catalogue()
     assert decision.worker_id == model.calls[0]["catalogue"][0].worker_id
+
+
+def test_router_returns_decision_and_prose_atomically_across_concurrent_calls() -> None:
+    barrier = threading.Barrier(2)
+    catalogue_snapshot = WorkerCatalogue("catalogue-empty", (), (), ())
+
+    def call(prompt: str) -> dict[str, object]:
+        transcript = prompt.rsplit("transcript=", 1)[1]
+        barrier.wait()
+        return {
+            "decision": {
+                "action": "direct",
+                "catalogue_version": "catalogue-empty",
+            },
+            "prose": f"prose-{transcript}",
+        }
+
+    router = Router(call=call)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(router.route_envelope, "A", catalogue_snapshot)
+        second = executor.submit(router.route_envelope, "B", catalogue_snapshot)
+        envelopes = (first.result(), second.result())
+
+    assert {(item.prose, item.decision.action) for item in envelopes} == {
+        ("prose-A", "direct"),
+        ("prose-B", "direct"),
+    }
 
 
 @pytest.mark.parametrize("action", ["direct", "unsupported", "clarify"])

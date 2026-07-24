@@ -6,6 +6,7 @@ import pytest
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
 from pipecat.frames.frames import (
+    InterruptionFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
@@ -23,6 +24,7 @@ from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
+from server.work_item_coordinator import WorkItemCoordinator
 from server.workers.web_search import WorkerClarify, WorkerDeclined
 
 
@@ -42,7 +44,14 @@ class RoutedCoordinator:
         return self.worker
 
     def add_worker_clarification(
-        self, *, session_id: str, worker_id: str, turn_id: str, result_id: str
+        self,
+        *,
+        session_id: str,
+        worker_id: str,
+        turn_id: str,
+        result_id: str,
+        original_query: str,
+        question: str,
     ) -> None:
         self.clarifications.append(
             {
@@ -50,6 +59,8 @@ class RoutedCoordinator:
                 "worker_id": worker_id,
                 "turn_id": turn_id,
                 "result_id": result_id,
+                "original_query": original_query,
+                "question": question,
             }
         )
 
@@ -133,6 +144,35 @@ class DecliningResultWorker(ResultWorker):
 class ClarifyingResultWorker(ResultWorker):
     async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
         raise WorkerClarify("Which city's weather do you mean?")
+
+
+class ContinuationResultWorker(ResultWorker):
+    metadata = type(
+        "Metadata",
+        (),
+        {
+            "worker_id": "worker-search",
+            "topic": "weather",
+            "model_policy": "deep",
+        },
+    )()
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+        self.queries.append(query)
+        return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+
+class PendingRegistry:
+    def __init__(self, worker: object, config: Config | None = None) -> None:
+        self.worker = worker
+        self.config = config or Config()
+
+    def get(self, worker_id: str) -> object:
+        assert worker_id == "worker-search"
+        return type("Registered", (), {"worker": self.worker})()
 
 
 class FakeTTS:
@@ -348,6 +388,107 @@ def test_worker_clarify_records_a_pending_dialogue_and_speaks_the_question() -> 
         assert clarification["worker_id"] == "main"
         assert clarification["result_id"] == result.result_id
         assert clarification["session_id"] == host.state.session_id
+        assert clarification["original_query"] == "What's the weather like?"
+        assert clarification["question"] == "Which city's weather do you mean?"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_natural_clarification_answer_resumes_original_query_on_same_worker() -> None:
+    async def run() -> None:
+        worker = ContinuationResultWorker()
+        registry = PendingRegistry(worker)
+        coordinator = WorkItemCoordinator(registry=registry)
+        host = SessionHost(
+            registry=registry,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
+        coordinator.add_worker_clarification(
+            session_id=host.state.session_id,
+            worker_id="worker-search",
+            turn_id="turn-original",
+            result_id="result-question",
+            original_query="What's the weather like?",
+            question="Which location should I use?",
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("Riga")
+
+        assert result.text.startswith("Answer for Original request: What's the weather like?")
+        assert worker.queries == [
+            "Original request: What's the weather like?\n"
+            "Clarification asked: Which location should I use?\n"
+            "User answer: Riga"
+        ]
+        assert coordinator.pending(host.state.session_id) is None
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_timed_out_pending_search_finishes_in_background_without_autoplay() -> None:
+    async def run() -> None:
+        class SlowWorker(ContinuationResultWorker):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.cancelled = False
+
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                self.queries.append(query)
+                self.started.set()
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+                return await ResultWorker.search(
+                    self,
+                    query,
+                    turn_id=turn_id,
+                    origin_epoch=origin_epoch,
+                )
+
+        worker = SlowWorker()
+        config = Config(multi_intent_wait_timeout_ms=1)
+        registry = PendingRegistry(worker, config)
+        coordinator = WorkItemCoordinator(registry=registry, config=config)
+        host = SessionHost(
+            registry=registry,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+            tts=FakeTTS(),
+        )
+        coordinator.add_worker_clarification(
+            session_id=host.state.session_id,
+            worker_id="worker-search",
+            turn_id="turn-original",
+            result_id="result-question",
+            original_query="What's the weather like?",
+            question="Which location should I use?",
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+
+        timeout_result = await host._handle_transcript("Riga")
+        await worker.started.wait()
+        assert "continue in the background" in timeout_result.text
+        assert worker.cancelled is False
+
+        worker.release.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        history = host.state.result_history("worker-search")
+        assert len(history) == 2
+        assert history[-1].text.startswith("Answer for Original request:")
+        assert sum(isinstance(frame, TTSSpeakFrame) for frame in connection.worker.frames) == 1
         await host.shutdown()
 
     asyncio.run(run())
@@ -432,6 +573,8 @@ def test_cancel_control_interrupts_active_speech() -> None:
         assert host.state.speech[item.utterance_id].state.value == "interrupted"
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.result_id != item.result_id
+        assert isinstance(connection.worker.frames[-2], InterruptionFrame)
+        assert isinstance(connection.worker.frames[-1], TTSSpeakFrame)
         await host.shutdown()
 
     asyncio.run(run())

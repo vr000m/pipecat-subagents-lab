@@ -7,6 +7,7 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -54,8 +55,11 @@ class Config:
             raise ConfigError("max_work_items_per_turn must be 2, 3, or 4")
         if self.multi_intent_wait_timeout_ms <= 0:
             raise ConfigError("multi_intent_wait_timeout_ms must be positive")
-        if self.pending_dialogue_timeout_seconds <= 0:
-            raise ConfigError("pending_dialogue_timeout_seconds must be positive")
+        if (
+            not isfinite(self.pending_dialogue_timeout_seconds)
+            or self.pending_dialogue_timeout_seconds <= 0
+        ):
+            raise ConfigError("pending_dialogue_timeout_seconds must be finite and positive")
         if not self.bind_host.strip():
             raise ConfigError("bind_host must not be empty")
         if not 1 <= self.bind_port <= 65_535:
@@ -149,10 +153,11 @@ def load_config(
         kwargs["max_work_items_per_turn"] = int(raw)
     if raw := values.get("WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS"):
         kwargs["multi_intent_wait_timeout_ms"] = int(raw)
-    if raw := values.get("WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"):
+    if "WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS" in values:
+        raw = values["WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"]
         try:
             kwargs["pending_dialogue_timeout_seconds"] = float(raw)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ConfigError(
                 "WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS must be a number"
             ) from exc
@@ -249,6 +254,10 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
     if "smart_turn_complete_grace_seconds" in turn:
         values["WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS"] = turn[
             "smart_turn_complete_grace_seconds"
+        ]
+    if "pending_dialogue_timeout_seconds" in turn:
+        values["WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"] = turn[
+            "pending_dialogue_timeout_seconds"
         ]
     if "router_model" in models:
         values["WEBSEARCH_ROUTER_MODEL"] = models["router_model"]

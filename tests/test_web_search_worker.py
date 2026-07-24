@@ -128,6 +128,39 @@ def test_worker_raises_clarify_without_calling_search_when_query_is_ambiguous() 
     assert provider.calls == []
 
 
+def test_production_worker_clarifies_location_bound_search_without_provider_call() -> None:
+    provider = FakeResponses({})
+    worker = WebSearchWorker(
+        responses=provider,
+        model="verified-worker-model",
+    )
+
+    with pytest.raises(WorkerClarify, match="location"):
+        asyncio.run(worker.search("What's the weather like?", turn_id="turn-1"))
+
+    assert provider.calls == []
+
+
+def test_production_worker_accepts_answered_clarification_context() -> None:
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(
+        responses=provider,
+        model="verified-worker-model",
+    )
+
+    result = asyncio.run(
+        worker.search(
+            "Original request: What's the weather like?\n"
+            "Clarification asked: Which location should I use?\n"
+            "User answer: Riga",
+            turn_id="turn-2",
+        )
+    )
+
+    assert result.text == "The answer."
+    assert len(provider.calls) == 1
+
+
 def test_worker_prefers_decline_over_clarify_when_capability_is_unavailable() -> None:
     provider = FakeResponses({})
     worker = WebSearchWorker(

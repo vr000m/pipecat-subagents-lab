@@ -49,6 +49,12 @@ def test_operator_limits_reject_zero_or_unbounded_values() -> None:
         Config(pending_dialogue_timeout_seconds=0)
 
     with pytest.raises(ConfigError):
+        Config(pending_dialogue_timeout_seconds=float("nan"))
+
+    with pytest.raises(ConfigError):
+        Config(pending_dialogue_timeout_seconds=float("inf"))
+
+    with pytest.raises(ConfigError):
         Config(smart_turn_timeout_seconds=0)
 
     with pytest.raises(ConfigError):
@@ -166,6 +172,28 @@ def test_smart_turn_environment_timeout_overrides_toml(tmp_path) -> None:
     )
 
     assert config.smart_turn_timeout_seconds == 6.5
+
+
+def test_pending_dialogue_timeout_loads_from_toml_and_environment_wins(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[turn]\npending_dialogue_timeout_seconds = 40.0\n")
+
+    from_toml = load_config(config_file=config_file, env={})
+    from_environment = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS": "45"},
+    )
+
+    assert from_toml.pending_dialogue_timeout_seconds == 40.0
+    assert from_environment.pending_dialogue_timeout_seconds == 45.0
+
+
+def test_invalid_pending_dialogue_timeout_from_toml_is_not_ignored(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[turn]\npending_dialogue_timeout_seconds = 0\n")
+
+    with pytest.raises(ConfigError, match="pending_dialogue_timeout_seconds"):
+        load_config(config_file=config_file, env={})
 
 
 @pytest.mark.parametrize(

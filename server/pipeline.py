@@ -30,6 +30,7 @@ from .results import canonical_result
 from .router import RoutingValidationError
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
+from .work_item_coordinator import LateResult
 from .workers.web_search import WorkerClarify, WorkerDeclined
 
 try:
@@ -537,6 +538,7 @@ class SessionHost:
                     origin.scheduler.pause(target)
                 elif action in {"cancel", "stop"}:
                     origin.scheduler.interrupt(epoch=origin_epoch)
+                    await origin.scheduler.wait_for_stops()
                 text = {
                     "pause": "Pausing the active response.",
                     "resume": "Resume requested; no audio was replayed automatically.",
@@ -620,6 +622,7 @@ class SessionHost:
                 worker_id=worker_id,
                 turn_id=turn_id,
                 question=exc.question,
+                original_query=transcript,
                 origin_epoch=origin_epoch,
             )
         except WorkerDeclined:
@@ -648,7 +651,10 @@ class SessionHost:
     async def _handle_pending(
         self, outcome: Any, transcript: str, origin: Any, turn_id: str
     ) -> Any:
-        owner_id = outcome.work_items[0] if outcome.work_items else None
+        pending = getattr(outcome, "pending_dialogue", None)
+        owner_id = pending.owner_id if pending is not None else None
+        if owner_id is None:
+            owner_id = outcome.work_items[0] if outcome.work_items else None
         registered = self.coordinator.registry.get(owner_id) if owner_id else None
         worker = registered.worker if registered is not None else None
         search = getattr(worker, "search", None)
@@ -656,10 +662,22 @@ class SessionHost:
             return outcome
         timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
         try:
-            result = await asyncio.wait_for(
-                search(transcript, turn_id=turn_id, origin_epoch=origin.epoch), timeout
+            result = await self._search_with_timeout(
+                search,
+                self._pending_query(pending, transcript),
+                turn_id=turn_id,
+                origin_epoch=origin.epoch,
+                timeout=timeout,
+                worker_id=owner_id or "main",
             )
-        except TimeoutError:
+            if result is None:
+                result = canonical_result(
+                    worker_id=owner_id or "main",
+                    turn_id=turn_id,
+                    text="That is taking longer than expected; I will continue in the background.",
+                    origin_epoch=origin.epoch,
+                )
+        except TimeoutError:  # pragma: no cover - compatibility with injected search seams
             result = canonical_result(
                 worker_id=owner_id or "main",
                 turn_id=turn_id,
@@ -671,6 +689,7 @@ class SessionHost:
                 worker_id=owner_id or "main",
                 turn_id=turn_id,
                 question=exc.question,
+                original_query=(pending.original_query if pending is not None else transcript),
                 origin_epoch=origin.epoch,
             )
         except Exception:
@@ -688,7 +707,7 @@ class SessionHost:
         """Execute bounded compound work in the user's stated order."""
         del transcript
         results: list[Any] = []
-        pending = self.coordinator.pending(self.state.session_id)
+        pending = getattr(outcome, "pending_dialogue", None)
         for index, item_text in enumerate(outcome.work_items):
             worker = None
             if index == 0 and pending is not None:
@@ -722,15 +741,31 @@ class SessionHost:
             worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
             timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
             try:
-                result = await asyncio.wait_for(
-                    search(
-                        item_text,
-                        turn_id=f"{turn_id}-{index + 1}",
-                        origin_epoch=origin.epoch,
-                    ),
-                    timeout,
+                query = (
+                    self._pending_query(pending, item_text)
+                    if index == 0 and pending is not None
+                    else item_text
                 )
-            except TimeoutError:
+                item_turn_id = f"{turn_id}-{index + 1}"
+                result = await self._search_with_timeout(
+                    search,
+                    query,
+                    turn_id=item_turn_id,
+                    origin_epoch=origin.epoch,
+                    timeout=timeout,
+                    worker_id=worker_id,
+                )
+                if result is None:
+                    result = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=item_turn_id,
+                        text=(
+                            "That item is taking longer than expected; "
+                            "I will continue in the background."
+                        ),
+                        origin_epoch=origin.epoch,
+                    )
+            except TimeoutError:  # pragma: no cover - compatibility with injected search seams
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=f"{turn_id}-{index + 1}",
@@ -742,6 +777,7 @@ class SessionHost:
                     worker_id=worker_id,
                     turn_id=f"{turn_id}-{index + 1}",
                     question=exc.question,
+                    original_query=query,
                     origin_epoch=origin.epoch,
                 )
             except WorkerDeclined:
@@ -762,7 +798,13 @@ class SessionHost:
         return tuple(results)
 
     def _worker_clarification_result(
-        self, *, worker_id: str, turn_id: str, question: str, origin_epoch: int | None
+        self,
+        *,
+        worker_id: str,
+        turn_id: str,
+        question: str,
+        original_query: str,
+        origin_epoch: int | None,
     ) -> GroundedResult:
         """Record a worker's clarifying question as the next turn's pending candidate."""
         result_id = f"result-{uuid4().hex}"
@@ -771,6 +813,8 @@ class SessionHost:
             worker_id=worker_id,
             turn_id=turn_id,
             result_id=result_id,
+            original_query=original_query,
+            question=question,
         )
         return canonical_result(
             worker_id=worker_id,
@@ -780,18 +824,65 @@ class SessionHost:
             origin_epoch=origin_epoch,
         )
 
-    async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
-        """Commit a result and speak only when its originating epoch is active."""
-        origin_epoch = result.origin_epoch
+    @staticmethod
+    def _pending_query(pending: Any, transcript: str) -> str:
+        if pending is None or not pending.original_query:
+            return transcript
+        return (
+            f"Original request: {pending.original_query}\n"
+            f"Clarification asked: {pending.question}\n"
+            f"User answer: {transcript}"
+        )
+
+    async def _search_with_timeout(
+        self,
+        search: Callable[..., Any],
+        query: str,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        timeout: float,
+        worker_id: str,
+    ) -> GroundedResult | None:
+        task = asyncio.create_task(search(query, turn_id=turn_id, origin_epoch=origin_epoch))
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if task in done:
+            return await task
+        self.coordinator.retain_late_task(
+            task,
+            work_item_id=f"work-{turn_id}",
+            worker_id=worker_id,
+            on_complete=lambda late: self._commit_late_result(late, origin_epoch),
+        )
+        return None
+
+    async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
+        """Project a late result without autoplaying it."""
+        if late.error is not None:
+            logger.warning(f"Late worker result failed for {late.work_item_id}: {late.error}")
+            return
+        result = late.result
+        if not isinstance(result, GroundedResult):
+            return
+        if result.origin_epoch != origin_epoch:
+            return
+        self._commit_result_state(result)
+
+    def _commit_result_state(self, result: GroundedResult) -> None:
         self.state.append_transcript(
             TranscriptEntry(
                 role="assistant",
                 text=result.ui_text,
                 turn_id=result.turn_id,
-                origin_epoch=origin_epoch,
+                origin_epoch=result.origin_epoch,
             )
         )
-        self.state.append_result(result, origin_epoch=origin_epoch)
+        self.state.append_result(result, origin_epoch=result.origin_epoch)
+
+    async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
+        """Commit a result and speak only when its originating epoch is active."""
+        origin_epoch = result.origin_epoch
+        self._commit_result_state(result)
         if (
             origin.tts is None
             or self.connection is not origin

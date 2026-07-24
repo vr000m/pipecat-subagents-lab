@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -25,6 +26,21 @@ class WorkerClarify(Exception):
     def __init__(self, question: str) -> None:
         super().__init__(question)
         self.question = question
+
+
+def default_web_clarification(query: str) -> str | None:
+    """Ask for details only for narrow, safely detectable incomplete searches."""
+    normalized = " ".join(query.strip().split())
+    lowered = normalized.casefold()
+    if "clarification asked:" in lowered and "user answer:" in lowered:
+        return None
+    if re.search(r"\b(weather|forecast|temperature)\b", lowered) and not re.search(
+        r"\b(?:in|for|at|near)\s+\S+", lowered
+    ):
+        return "Which location should I use?"
+    if re.search(r"\b(?:search|find|look for)\s*$", lowered):
+        return "What should I search for?"
+    return None
 
 
 class WebSearchAnswer(BaseModel):
@@ -153,7 +169,7 @@ class WebSearchWorker(ContextWorker):
         self.decline = decline or (
             lambda query: can_satisfy(query) is False if can_satisfy else False
         )
-        self.needs_clarification = needs_clarification or (lambda query: None)
+        self.needs_clarification = needs_clarification or default_web_clarification
 
     @staticmethod
     def refine_query(query: str) -> str:

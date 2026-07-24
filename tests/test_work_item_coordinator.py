@@ -2,6 +2,9 @@
 
 import asyncio
 
+import pytest
+
+from server.config import Config
 from server.work_item_coordinator import PendingDialogue, WorkItemCoordinator
 
 
@@ -25,6 +28,8 @@ def test_add_worker_clarification_records_a_pending_candidate_owned_by_the_worke
         worker_id="worker-1",
         turn_id="turn-1",
         result_id="result-1",
+        original_query="What's the weather like?",
+        question="Which location should I use?",
     )
 
     pending = coordinator.pending("session")
@@ -34,6 +39,71 @@ def test_add_worker_clarification_records_a_pending_candidate_owned_by_the_worke
     assert pending.turn_id == "turn-1"
     assert pending.result_id == "result-1"
     assert pending.expires_at == 100.0 + coordinator.config.pending_dialogue_timeout_seconds
+    assert pending.original_query == "What's the weather like?"
+    assert pending.question == "Which location should I use?"
+
+
+def test_natural_clarification_answer_continues_with_the_pending_worker() -> None:
+    coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 0)
+    pending = PendingDialogue(
+        "session",
+        "worker",
+        "worker-1",
+        "turn",
+        "result",
+        10,
+        "What's the weather like?",
+        "Which location should I use?",
+    )
+    coordinator.add_pending(pending)
+
+    outcome = coordinator.arbitrate("session", "Riga")
+
+    assert outcome.kind == "continue_pending"
+    assert outcome.pending_dialogue == pending
+    assert outcome.work_items == ("worker-1",)
+    assert coordinator.pending("session") is None
+
+
+def test_pending_new_topic_routes_normally_without_consuming_candidate() -> None:
+    class Registry:
+        config = Config()
+
+        @staticmethod
+        def catalogue() -> tuple[()]:
+            return ()
+
+    class Router:
+        @staticmethod
+        def route_envelope(_transcript: str, _catalogue: object) -> object:
+            decision = object()
+            return type("Envelope", (), {"decision": decision, "prose": None})()
+
+    coordinator = WorkItemCoordinator(
+        registry=Registry(),
+        router=Router(),
+        clock=lambda: 0,
+    )
+    pending = PendingDialogue("session", "worker", "worker-1", "turn", "result", 10)
+    coordinator.add_pending(pending)
+
+    outcome = coordinator.arbitrate("session", "What is the capital of India?")
+
+    assert outcome.kind == "routed"
+    assert coordinator.pending("session") == pending
+
+
+def test_pending_multi_intent_carries_candidate_to_dispatch() -> None:
+    coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 0)
+    pending = PendingDialogue("session", "worker", "worker-1", "turn", "result", 10)
+    coordinator.add_pending(pending)
+
+    outcome = coordinator.arbitrate("session", "Riga and also search the news")
+
+    assert outcome.kind == "multi_intent"
+    assert outcome.pending_dialogue == pending
+    assert outcome.work_items == ("Riga", "search the news")
+    assert coordinator.pending("session") is None
 
 
 def test_compound_pending_reply_is_classified_as_multi_intent() -> None:
@@ -48,7 +118,19 @@ def test_control_and_consent_outcomes_preserve_the_requested_action() -> None:
     coordinator.add_pending(PendingDialogue("session", "worker", "worker-1", "turn", "result", 10))
 
     assert coordinator.arbitrate("session", "cancel").control_action == "cancel"
-    assert coordinator.arbitrate("session", "consent").kind == "continue_pending"
+    consent = coordinator.arbitrate("session", "consent")
+    assert consent.kind == "continue_pending"
+    assert consent.pending_dialogue is not None
+
+
+def test_constructor_overrides_preserve_pending_dialogue_timeout() -> None:
+    coordinator = WorkItemCoordinator(
+        config=Config(pending_dialogue_timeout_seconds=45),
+        max_work_items_per_turn=3,
+    )
+
+    assert coordinator.config.pending_dialogue_timeout_seconds == 45
+    assert coordinator.config.max_work_items_per_turn == 3
 
 
 def test_control_targets_match_scheduler_work_item_ids() -> None:
@@ -105,6 +187,38 @@ def test_multi_intent_is_bounded_and_timeout_keeps_completed_results() -> None:
         assert len(outcome.work_items) == 2
         assert outcome.results[0].text == "fast"
         assert outcome.pending_work_item_ids
+
+    asyncio.run(run())
+
+
+def test_cancelling_submission_does_not_launch_waiting_same_worker_item() -> None:
+    async def run() -> None:
+        release = asyncio.Event()
+        first_started = asyncio.Event()
+        calls: list[str] = []
+
+        async def worker(_worker_id: str, text: str) -> dict:
+            calls.append(text)
+            if text == "first":
+                first_started.set()
+                await release.wait()
+            return {"text": text, "citations": []}
+
+        coordinator = WorkItemCoordinator(
+            config=Config(multi_intent_wait_timeout_ms=1),
+        )
+        await coordinator.submit("turn-1", [("worker-1", "first")], worker)
+        await first_started.wait()
+        second = asyncio.create_task(coordinator.submit("turn-2", [("worker-1", "second")], worker))
+        await asyncio.sleep(0)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert calls == ["first"]
 
     asyncio.run(run())
 

@@ -42,6 +42,7 @@ class SpeechScheduler:
         self.stop = stop
         self._queues: dict[str, list[SpeechItem]] = {}
         self._active: UtteranceLease | None = None
+        self._stop_tasks: set[asyncio.Future[Any]] = set()
 
     def _signal_stop(self, item: SpeechItem) -> None:
         if self.stop is None:
@@ -52,9 +53,17 @@ class SpeechScheduler:
             return
         if isinstance(outcome, Awaitable):
             try:
-                asyncio.ensure_future(outcome)
+                task = asyncio.ensure_future(outcome)
             except RuntimeError:
-                pass
+                return
+            self._stop_tasks.add(task)
+            task.add_done_callback(self._stop_tasks.discard)
+
+    async def wait_for_stops(self) -> None:
+        """Wait until every stop signal scheduled so far has reached the pipeline."""
+        pending = tuple(self._stop_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     @property
     def active(self) -> UtteranceLease | None:
@@ -140,6 +149,7 @@ class SpeechScheduler:
         if active_item is None and not reconnect:
             return None
         if active_item is not None:
+            self._signal_stop(active_item)
             self.state.speech_progress(
                 result_id=active_item.result_id,
                 work_item_id=active_item.work_item_id,

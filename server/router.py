@@ -189,11 +189,10 @@ class Router:
     ) -> None:
         self._call, self.config, self.model = call, config, model
         self.last_prompt: str | None = None
-        self.last_prose: str | None = None
 
-    def route(
+    def route_envelope(
         self, transcript: str, catalogue: WorkerCatalogue | tuple[WorkerCatalogueEntry, ...]
-    ) -> RoutingDecision:
+    ) -> RouterEnvelope:
         if isinstance(catalogue, tuple):
             catalogue = WorkerCatalogue(
                 "catalogue-1",
@@ -221,9 +220,13 @@ class Router:
                 )
             except ValidationError as exc:
                 raise RoutingValidationError("router returned an invalid routing decision") from exc
-        self.last_prose = envelope.prose
         validate_decision(envelope.decision, catalogue)
-        return envelope.decision
+        return envelope
+
+    def route(
+        self, transcript: str, catalogue: WorkerCatalogue | tuple[WorkerCatalogueEntry, ...]
+    ) -> RoutingDecision:
+        return self.route_envelope(transcript, catalogue).decision
 
 
 def catalogue_from_registry(registry: Any) -> WorkerCatalogue:
