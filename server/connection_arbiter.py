@@ -66,7 +66,12 @@ class ActiveConnection:
 
 
 class ConnectionEpochArbiter(ConnectionArbiter):
-    """Compatibility facade used by the transport and its focused tests."""
+    """Client-tracking facade that delegates all fencing decisions to ConnectionArbiter.
+
+    This exists only to add a client-ID/replacement-history projection on top of
+    the parent's promote()/accepts() state machine; it must never reimplement the
+    epoch stale-check or active/epoch mutation itself, or the two can silently drift.
+    """
 
     def __init__(self, session_id: str, resume_token: str) -> None:
         super().__init__(session_id, resume_token)
@@ -76,25 +81,25 @@ class ConnectionEpochArbiter(ConnectionArbiter):
     def validate_handshake(
         self, *, session_id: str, resume_token: str, proposed_epoch: int
     ) -> bool:
-        return (
-            session_id == self.session_id
-            and resume_token == self.resume_token
-            and (self._active is None or proposed_epoch > self.epoch)
-        )
+        if session_id != self.session_id or resume_token != self.resume_token:
+            return False
+        return self._active is None or proposed_epoch > self.epoch
 
     def activate(self, client_id: str, proposed_epoch: int) -> ActiveConnection:
-        if not self.validate_handshake(
-            session_id=self.session_id,
-            resume_token=self.resume_token,
-            proposed_epoch=proposed_epoch,
-        ):
-            raise ValueError("invalid or stale connection epoch")
-        if self._active is not None:
-            self._previous.append(ActiveConnection(self.active_client_id or "", self._active.epoch))
-        self._epoch = proposed_epoch
-        self._active = Connection(proposed_epoch, self.session_id, self.resume_token)
+        previous_client, previous_epoch = self.active_client_id, self._active
+        connection = self.promote(
+            {
+                "contract_version": CONTRACT_VERSION,
+                "session_id": self.session_id,
+                "resume_token": self.resume_token,
+                "proposed_epoch": proposed_epoch,
+                "snapshot_sequence": 0,
+            }
+        )
+        if previous_epoch is not None:
+            self._previous.append(ActiveConnection(previous_client or "", previous_epoch.epoch))
         self.active_client_id = client_id
-        return ActiveConnection(client_id, proposed_epoch)
+        return ActiveConnection(client_id, connection.epoch)
 
     def accepts_input(self, client_id: str, epoch: int) -> bool:
         return self.active_client_id == client_id and self.accepts(epoch)
