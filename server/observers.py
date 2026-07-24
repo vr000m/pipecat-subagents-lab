@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from .contracts import RuntimeSnapshot
 from .session_state import SessionState, StateEvent
@@ -40,29 +41,8 @@ class RuntimeObserver:
     def snapshot(self) -> RuntimeSnapshot:
         return self.state.snapshot(origin_epoch=self.epoch)
 
-    def messages(self, after_sequence: int = 0) -> tuple[dict[str, Any], ...]:
-        return tuple(
-            {
-                "contract_version": "v1.0",
-                "session_id": self.state.session_id,
-                "sequence": event.sequence,
-                "kind": event.kind,
-                "data": event.payload,
-                "origin_epoch": (
-                    event.payload["origin_epoch"]
-                    if event.payload.get("origin_epoch") is not None
-                    else self.epoch
-                ),
-            }
-            for event in self.state.events
-            if event.sequence > after_sequence and event.payload.get("origin_epoch") == self.epoch
-        )
-
-    def frame(self, event: StateEvent) -> Any:
-        """Build the framework frame when available, while keeping tests dependency-free."""
-        if event.payload.get("origin_epoch") != self.epoch:
-            return None
-        payload = {
+    def _payload(self, event: StateEvent) -> dict[str, Any]:
+        return {
             "contract_version": "v1.0",
             "session_id": self.state.session_id,
             "sequence": event.sequence,
@@ -74,6 +54,19 @@ class RuntimeObserver:
                 else self.epoch
             ),
         }
+
+    def messages(self, after_sequence: int = 0) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            self._payload(event)
+            for event in self.state.events
+            if event.sequence > after_sequence and event.payload.get("origin_epoch") == self.epoch
+        )
+
+    def frame(self, event: StateEvent) -> Any:
+        """Build the framework frame when available, while keeping tests dependency-free."""
+        if event.payload.get("origin_epoch") != self.epoch:
+            return None
+        payload = self._payload(event)
         try:
             from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
         except ImportError:
