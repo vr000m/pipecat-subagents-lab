@@ -110,7 +110,7 @@ class WorkItemCoordinator:
         match = re.match(
             r"^\s*(pause|resume|cancel|stop|consent)\b(?:\s+(work(?:[-_ ]item)?[-_ ][\w-]+))?",
             transcript,
-            re.I,
+            re.IGNORECASE,
         )
         if not match:
             return None
@@ -123,6 +123,7 @@ class WorkItemCoordinator:
         if control:
             pending = self.pending(session_id)
             if control[0] == "consent" and pending:
+                self._pending.pop(session_id, None)
                 return DispatchOutcome(
                     "continue_pending",
                     transcript,
@@ -136,16 +137,18 @@ class WorkItemCoordinator:
                 control_action=control[0],
             )
         pending = self.pending(session_id)
-        if pending and re.search(r"\b(and|also)\b", transcript, re.I):
+        if pending and re.search(r"\b(and|also)\b", transcript, re.IGNORECASE):
             parts = tuple(
                 part.strip()
-                for part in re.split(r"\band\b|\balso\b", transcript, flags=re.I)
+                for part in re.split(r"\band\b|\balso\b", transcript, flags=re.IGNORECASE)
                 if part.strip()
             )
             if len(parts) > self.config.max_work_items_per_turn:
                 parts = parts[: self.config.max_work_items_per_turn]
+            self._pending.pop(session_id, None)
             return DispatchOutcome("multi_intent", transcript, work_items=parts)
         if pending and transcript.lower().startswith(("yes", "continue", "that", "please search")):
+            self._pending.pop(session_id, None)
             return DispatchOutcome("continue_pending", transcript, work_items=(pending.owner_id,))
         if self.registry is None or self.router is None:
             raise RuntimeError("routing arbitration requires a registry and router")
