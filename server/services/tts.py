@@ -7,10 +7,10 @@ emitting a callback-only fake audio lifecycle.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
 import inspect
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from pipecat.frames.frames import Frame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame
 from pipecat.services.settings import TTSSettings
@@ -85,6 +85,7 @@ class LocalTTS(TTSService):
         """Create a client-bound adapter for one promoted browser epoch."""
         return type(self)(
             self.endpoint,
+            self.on_event,
             client_factory=self.client_factory,
             voice_id=self.voice_id,
             sample_rate=self.sample_rate,

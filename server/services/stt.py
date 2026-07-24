@@ -8,14 +8,14 @@ closed instead of claiming that toggling a flag produced live audio.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
 import inspect
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from loguru import logger
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
-from pipecat.services.stt_service import STTSettings, SegmentedSTTService
+from pipecat.services.stt_service import SegmentedSTTService, STTSettings
 
 from .ws_clients import default_stt_client_factory
 
@@ -73,6 +73,7 @@ class LocalSTT(SegmentedSTTService):
         """Create a client-bound adapter for one promoted browser epoch."""
         return type(self)(
             self.endpoint,
+            self.on_final,
             client_factory=self.client_factory,
             language=self.language,
             sample_rate=self.sample_rate,
