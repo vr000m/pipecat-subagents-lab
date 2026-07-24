@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-07-24
+## [0.1.0] - 2026-07-25
 
 ### Added
 
@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete-turn grace period.
 - Repeatable local-versus-hosted speech latency benchmark.
 - Credential-safe Python and browser contract, integration, and regression tests.
+
+### Fixed
+
+- Wire worker clarification into pending-dialogue continuation: a web-search
+  worker's clarifying question (`WorkerClarify`) is now caught at every
+  pipeline dispatch site and recorded as a pending-dialogue candidate, so the
+  existing `continue_pending`/steer/multi-intent arbitration — previously
+  unreachable in production — actually resumes the paused work item on the
+  next turn. Adds the `pending_dialogue_timeout_seconds` config
+  (`WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS`, default 30s).
 
 [Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0

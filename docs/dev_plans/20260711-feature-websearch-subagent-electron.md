@@ -543,3 +543,15 @@ provider-neutral TTS lifecycle adapter releases Cartesia speech leases without
 double-processing the callback used by local TTS. The repeatable benchmark and
 2026-07-24 measurements live under `scripts/benchmark_speech.py` and
 `docs/benchmarks/20260724-speech-latency.md`.
+
+Post-completion hardening on 2026-07-25 closed a gap in the pending-dialogue
+requirement: `WorkItemCoordinator.add_pending()`/`PendingDialogue` were only
+ever populated by tests, so the already-implemented `continue_pending`
+arbitration branch was unreachable in production — a worker's clarifying
+question had no live path back into the pending-dialogue queue. `WebSearchWorker`
+now raises a `WorkerClarify` exception (checked after `decline()`, so
+capability-unavailable still wins over query-ambiguity), all three pipeline
+dispatch sites (`_handle_transcript`, `_handle_pending`, `_handle_multi_intent`)
+catch it and call the new `WorkItemCoordinator.add_worker_clarification()`, and
+the operator-configurable `pending_dialogue_timeout_seconds` (default 30s,
+`WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS`) sets the candidate's expiry.
