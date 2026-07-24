@@ -110,6 +110,21 @@ class WorkItemCoordinator:
     def add_pending(self, candidate: PendingDialogue) -> None:
         self._pending[candidate.session_id] = candidate
 
+    def add_worker_clarification(
+        self, *, session_id: str, worker_id: str, turn_id: str, result_id: str
+    ) -> None:
+        """Record a worker's clarifying question as the next turn's pending candidate."""
+        self.add_pending(
+            PendingDialogue(
+                session_id=session_id,
+                owner_kind="worker",
+                owner_id=worker_id,
+                turn_id=turn_id,
+                result_id=result_id,
+                expires_at=self.clock() + self.config.pending_dialogue_timeout_seconds,
+            )
+        )
+
     def pending(self, session_id: str) -> PendingDialogue | None:
         candidate = self._pending.get(session_id)
         if candidate and candidate.expires_at <= self.clock():

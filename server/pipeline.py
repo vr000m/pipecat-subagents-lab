@@ -30,7 +30,7 @@ from .results import canonical_result
 from .router import RoutingValidationError
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
-from .workers.web_search import WorkerDeclined
+from .workers.web_search import WorkerClarify, WorkerDeclined
 
 try:
     from pipecat.bus.bridge_processor import BusBridgeProcessor as BusBridgeProcessor
@@ -612,18 +612,26 @@ class SessionHost:
         search = getattr(worker, "search", None)
         if search is None:
             return outcome
+        worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
         try:
             result = await search(transcript, turn_id=turn_id, origin_epoch=origin_epoch)
+        except WorkerClarify as exc:
+            result = self._worker_clarification_result(
+                worker_id=worker_id,
+                turn_id=turn_id,
+                question=exc.question,
+                origin_epoch=origin_epoch,
+            )
         except WorkerDeclined:
             result = canonical_result(
-                worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                worker_id=worker_id,
                 turn_id=turn_id,
                 text="I could not find a reliable result for that request.",
                 origin_epoch=origin_epoch,
             )
         except Exception:
             result = canonical_result(
-                worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                worker_id=worker_id,
                 turn_id=turn_id,
                 text="The web search is temporarily unavailable.",
                 origin_epoch=origin_epoch,
@@ -656,6 +664,13 @@ class SessionHost:
                 worker_id=owner_id or "main",
                 turn_id=turn_id,
                 text="That is taking longer than expected; I will continue in the background.",
+                origin_epoch=origin.epoch,
+            )
+        except WorkerClarify as exc:
+            result = self._worker_clarification_result(
+                worker_id=owner_id or "main",
+                turn_id=turn_id,
+                question=exc.question,
                 origin_epoch=origin.epoch,
             )
         except Exception:
@@ -704,6 +719,7 @@ class SessionHost:
             search = getattr(worker, "search", None)
             if search is None:
                 continue
+            worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
             timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
             try:
                 result = await asyncio.wait_for(
@@ -716,27 +732,53 @@ class SessionHost:
                 )
             except TimeoutError:
                 result = canonical_result(
-                    worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                    worker_id=worker_id,
                     turn_id=f"{turn_id}-{index + 1}",
                     text="That item is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
+            except WorkerClarify as exc:
+                result = self._worker_clarification_result(
+                    worker_id=worker_id,
+                    turn_id=f"{turn_id}-{index + 1}",
+                    question=exc.question,
+                    origin_epoch=origin.epoch,
+                )
             except WorkerDeclined:
                 result = canonical_result(
-                    worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                    worker_id=worker_id,
                     turn_id=f"{turn_id}-{index + 1}",
                     text="I could not find a reliable result for that request.",
                     origin_epoch=origin.epoch,
                 )
             except Exception:
                 result = canonical_result(
-                    worker_id=getattr(getattr(worker, "metadata", None), "worker_id", "main"),
+                    worker_id=worker_id,
                     turn_id=f"{turn_id}-{index + 1}",
                     text="The web search is temporarily unavailable.",
                     origin_epoch=origin.epoch,
                 )
             results.append(await self._commit_and_speak(result, origin))
         return tuple(results)
+
+    def _worker_clarification_result(
+        self, *, worker_id: str, turn_id: str, question: str, origin_epoch: int | None
+    ) -> GroundedResult:
+        """Record a worker's clarifying question as the next turn's pending candidate."""
+        result_id = f"result-{uuid4().hex}"
+        self.coordinator.add_worker_clarification(
+            session_id=self.state.session_id,
+            worker_id=worker_id,
+            turn_id=turn_id,
+            result_id=result_id,
+        )
+        return canonical_result(
+            worker_id=worker_id,
+            turn_id=turn_id,
+            text=question,
+            result_id=result_id,
+            origin_epoch=origin_epoch,
+        )
 
     async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""

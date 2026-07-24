@@ -17,6 +17,25 @@ async def completed_worker(text: str) -> dict:
     return {"text": text, "citations": []}
 
 
+def test_add_worker_clarification_records_a_pending_candidate_owned_by_the_worker() -> None:
+    coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 100.0)
+
+    coordinator.add_worker_clarification(
+        session_id="session",
+        worker_id="worker-1",
+        turn_id="turn-1",
+        result_id="result-1",
+    )
+
+    pending = coordinator.pending("session")
+    assert pending is not None
+    assert pending.owner_kind == "worker"
+    assert pending.owner_id == "worker-1"
+    assert pending.turn_id == "turn-1"
+    assert pending.result_id == "result-1"
+    assert pending.expires_at == 100.0 + coordinator.config.pending_dialogue_timeout_seconds
+
+
 def test_compound_pending_reply_is_classified_as_multi_intent() -> None:
     coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 0)
     coordinator.add_pending(PendingDialogue("session", "worker", "worker-1", "turn", "result", 10))

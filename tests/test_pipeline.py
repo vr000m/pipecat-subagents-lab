@@ -23,12 +23,13 @@ from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
-from server.workers.web_search import WorkerDeclined
+from server.workers.web_search import WorkerClarify, WorkerDeclined
 
 
 class RoutedCoordinator:
     def __init__(self, worker: object) -> None:
         self.worker = worker
+        self.clarifications: list[dict[str, str]] = []
 
     def arbitrate(self, _session_id: str, transcript: str) -> object:
         return type(
@@ -39,6 +40,18 @@ class RoutedCoordinator:
 
     def dispatch(self, _decision: object) -> object:
         return self.worker
+
+    def add_worker_clarification(
+        self, *, session_id: str, worker_id: str, turn_id: str, result_id: str
+    ) -> None:
+        self.clarifications.append(
+            {
+                "session_id": session_id,
+                "worker_id": worker_id,
+                "turn_id": turn_id,
+                "result_id": result_id,
+            }
+        )
 
 
 class ResultWorker:
@@ -115,6 +128,11 @@ class BlockingResultWorker(ResultWorker):
 class DecliningResultWorker(ResultWorker):
     async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
         raise WorkerDeclined(f"cannot satisfy {query}")
+
+
+class ClarifyingResultWorker(ResultWorker):
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+        raise WorkerClarify("Which city's weather do you mean?")
 
 
 class FakeTTS:
@@ -307,6 +325,29 @@ def test_search_decline_becomes_a_safe_canonical_result() -> None:
 
         assert result.text == "I could not find a reliable result for that request."
         assert host.state.result_history("main") == (result,)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_worker_clarify_records_a_pending_dialogue_and_speaks_the_question() -> None:
+    async def run() -> None:
+        coordinator = RoutedCoordinator(ClarifyingResultWorker())
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("What's the weather like?")
+
+        assert result.text == "Which city's weather do you mean?"
+        assert host.state.result_history("main") == (result,)
+        assert len(coordinator.clarifications) == 1
+        clarification = coordinator.clarifications[0]
+        assert clarification["worker_id"] == "main"
+        assert clarification["result_id"] == result.result_id
+        assert clarification["session_id"] == host.state.session_id
         await host.shutdown()
 
     asyncio.run(run())
