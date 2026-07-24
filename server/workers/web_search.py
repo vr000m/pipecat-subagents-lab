@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
@@ -16,6 +17,14 @@ from .base import ContextWorker, WorkerMetadata
 
 class WorkerDeclined(Exception):
     """The worker determined that hosted search cannot satisfy the request."""
+
+
+class WorkerClarify(Exception):
+    """The worker needs a clarifying answer before it can search."""
+
+    def __init__(self, question: str) -> None:
+        super().__init__(question)
+        self.question = question
 
 
 class WebSearchAnswer(BaseModel):
@@ -128,6 +137,7 @@ class WebSearchWorker(ContextWorker):
         model_policy: str | None = None,
         decline: Callable[[str], bool] | None = None,
         can_satisfy: Callable[[str], bool] | None = None,
+        needs_clarification: Callable[[str], str | None] | None = None,
     ) -> None:
         metadata = WorkerMetadata(
             worker_id=worker_id,
@@ -143,6 +153,7 @@ class WebSearchWorker(ContextWorker):
         self.decline = decline or (
             lambda query: can_satisfy(query) is False if can_satisfy else False
         )
+        self.needs_clarification = needs_clarification or (lambda query: None)
 
     @staticmethod
     def refine_query(query: str) -> str:
@@ -166,6 +177,9 @@ class WebSearchWorker(ContextWorker):
         refined = self.refine_query(query)
         if self.decline(refined):
             raise WorkerDeclined("hosted web search cannot satisfy this request")
+        question = self.needs_clarification(refined)
+        if question:
+            raise WorkerClarify(question)
 
         async def execute() -> Any:
             # Build the contextual request inside the mailbox. This keeps a

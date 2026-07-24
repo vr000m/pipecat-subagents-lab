@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from server.workers.base import ContextWorker, WorkerMetadata
-from server.workers.web_search import WebSearchWorker, WorkerDeclined
+from server.workers.web_search import WebSearchWorker, WorkerClarify, WorkerDeclined
 
 
 def answer_payload(
@@ -112,6 +112,35 @@ def test_worker_declines_or_clarifies_without_calling_search_when_web_cannot_sat
 
     assert provider.calls == []
     assert result.outcome in {"decline", "clarify"}
+
+
+def test_worker_raises_clarify_without_calling_search_when_query_is_ambiguous() -> None:
+    provider = FakeResponses({})
+    worker = WebSearchWorker(
+        responses=provider,
+        model="verified-worker-model",
+        needs_clarification=lambda _query: "Which city's weather do you mean?",
+    )
+
+    with pytest.raises(WorkerClarify, match="Which city's weather"):
+        asyncio.run(worker.search("What's the weather like?", turn_id="turn-1"))
+
+    assert provider.calls == []
+
+
+def test_worker_prefers_decline_over_clarify_when_capability_is_unavailable() -> None:
+    provider = FakeResponses({})
+    worker = WebSearchWorker(
+        responses=provider,
+        model="verified-worker-model",
+        decline=lambda _query: True,
+        needs_clarification=lambda _query: "Which city?",
+    )
+
+    with pytest.raises(WorkerDeclined):
+        asyncio.run(worker.search("Show my private calendar", turn_id="turn-1"))
+
+    assert provider.calls == []
 
 
 def test_worker_runs_sync_responses_client_off_event_loop() -> None:
