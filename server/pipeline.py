@@ -5,15 +5,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 from loguru import logger
-from pydantic import ValidationError
-
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
+from pydantic import ValidationError
 
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
@@ -31,7 +31,6 @@ from .router import RoutingValidationError
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
 from .workers.web_search import WorkerDeclined
-
 
 try:
     from pipecat.bus.bridge_processor import BusBridgeProcessor as BusBridgeProcessor
@@ -377,10 +376,20 @@ class SessionHost:
                 TTSSpeakFrame(text=item.text, append_to_context=False)
             )
 
+        async def stop_speech(item: Any) -> None:
+            del item
+            if connection_tts is None or self.connection is not pipeline or pipeline.worker is None:
+                return
+            await pipeline.worker.queue_frame(InterruptionFrame())
+
         pipeline = ConnectionPipeline(
             connection.epoch,
             RuntimeObserver(self.state, connection.epoch),
-            SpeechScheduler(self.state, speak=queue_speech if connection_tts is not None else None),
+            SpeechScheduler(
+                self.state,
+                speak=queue_speech if connection_tts is not None else None,
+                stop=stop_speech if connection_tts is not None else None,
+            ),
             stt=connection_stt,
             tts=connection_tts,
         )
