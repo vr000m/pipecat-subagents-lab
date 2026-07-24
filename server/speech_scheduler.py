@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 from uuid import uuid4
 
 from .contracts import DeliveryState
@@ -30,12 +32,29 @@ class SpeechScheduler:
     """Queues speech per work item and fences state through SessionState."""
 
     def __init__(
-        self, state: SessionState | None = None, speak: Callable[[SpeechItem], Any] | None = None
+        self,
+        state: SessionState | None = None,
+        speak: Callable[[SpeechItem], Any] | None = None,
+        stop: Callable[[SpeechItem], Any] | None = None,
     ) -> None:
         self.state = state or SessionState()
         self.speak = speak
+        self.stop = stop
         self._queues: dict[str, list[SpeechItem]] = {}
         self._active: UtteranceLease | None = None
+
+    def _signal_stop(self, item: SpeechItem) -> None:
+        if self.stop is None:
+            return
+        try:
+            outcome = self.stop(item)
+        except BaseException:
+            return
+        if isinstance(outcome, Awaitable):
+            try:
+                asyncio.ensure_future(outcome)
+            except RuntimeError:
+                pass
 
     @property
     def active(self) -> UtteranceLease | None:
@@ -149,6 +168,7 @@ class SpeechScheduler:
     def pause(self, work_item_id: str) -> None:
         if self._active and self._active.item.work_item_id == work_item_id:
             item = self._active.item
+            self._signal_stop(item)
             self.state.speech_progress(**self._progress(item), state=DeliveryState.PAUSED)
             # Pausing releases the lease without recording a terminal
             # interruption; resume must be able to represent the next state.
