@@ -184,7 +184,7 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
   if (state.localDiagnostics.snapshotRequestPending) return state;
   if (sequence < state.localDiagnostics.lastSnapshotSequence) return state;
   const expected = state.lastAppliedSequence + 1;
-  if (state.lastAppliedSequence && sequence !== expected) {
+  if (sequence !== expected) {
     if (!state.localDiagnostics.snapshotRequestPending) requestSnapshot();
     return {
       ...state,
