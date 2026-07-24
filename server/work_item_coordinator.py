@@ -41,7 +41,7 @@ class SubmittedOutcome:
     work_items: tuple[Any, ...]
     results: tuple[Any, ...]
     pending_work_item_ids: tuple[str, ...] = ()
-    failures: tuple["WorkItemFailure", ...] = ()
+    failures: tuple[WorkItemFailure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,18 @@ class LateResult:
     worker_id: str
     result: Any = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    work_item_id: str
+
+
+@dataclass(frozen=True)
+class Result:
+    outcome: str = ""
+    text: str = ""
+    citations: tuple[Any, ...] = ()
 
 
 class WorkItemCoordinator:
@@ -188,13 +200,10 @@ class WorkItemCoordinator:
         import asyncio
 
         selected = items[: self.config.max_work_items_per_turn]
-        work = tuple(
-            type("WorkItem", (), {"work_item_id": f"{turn_id}-{i}"})()
-            for i, _ in enumerate(selected)
-        )
+        work = tuple(WorkItem(work_item_id=f"{turn_id}-{i}") for i, _ in enumerate(selected))
 
         def materialize_result(value: Any) -> Any:
-            return type("Result", (), value)() if isinstance(value, dict) else value
+            return Result(**value) if isinstance(value, dict) else value
 
         def retain_late_result(task: asyncio.Task[Any], work_item_id: str, worker_id: str) -> None:
             try:
