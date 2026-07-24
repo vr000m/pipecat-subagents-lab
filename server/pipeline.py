@@ -237,13 +237,13 @@ class ConnectionPipeline:
     on_transcript: Callable[[str], Any] | None = None
     active: bool = True
 
-    def deactivate(self) -> None:
+    def deactivate(self, *, reconnect: bool = True) -> None:
         self.active = False
-        self.scheduler.interrupt(epoch=self.epoch, reconnect=True)
+        self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect)
 
     async def shutdown(self, *, reason: str = "connection replaced") -> None:
         """Fence this connection and stop its Pipecat worker, if attached."""
-        self.deactivate()
+        self.deactivate(reconnect=reason == "connection replaced")
         if self.worker is not None:
             cancel = getattr(self.worker, "cancel", None)
             if cancel is not None:
