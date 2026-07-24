@@ -758,14 +758,15 @@ class SessionHost:
             or not self.accepts(origin_epoch)
         ):
             return result
+        work_item_id = f"work-{result.turn_id}"
         origin.scheduler.enqueue(
             result_id=result.result_id,
-            work_item_id=f"work-{result.turn_id}",
+            work_item_id=work_item_id,
             run_id=f"run-{result.turn_id}",
             text=result.spoken_text,
             origin_epoch=origin_epoch,
         )
-        await origin.scheduler.start_next()
+        await origin.scheduler.start_next(work_item_id)
         return result
 
     def session_handshake(self) -> dict[str, Any]:

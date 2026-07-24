@@ -3,17 +3,17 @@
 import asyncio
 
 import pytest
-from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
 from pipecat.frames.frames import (
-    TTSSpeakFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
-from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 
@@ -164,10 +164,10 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         start_next = connection.scheduler.start_next
         start_calls = 0
 
-        async def tracked_start_next() -> object:
+        async def tracked_start_next(work_item_id: str | None = None) -> object:
             nonlocal start_calls
             start_calls += 1
-            return await start_next()
+            return await start_next(work_item_id)
 
         connection.scheduler.start_next = tracked_start_next  # type: ignore[method-assign]
 
