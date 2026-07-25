@@ -31,14 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wire worker clarification into pending-dialogue continuation: a web-search
   worker's clarifying question (`WorkerClarify`) is now caught at every
   pipeline dispatch site and recorded with its original request. Natural
-  answers resume the same worker, compound replies retain the pending owner,
-  and unrelated questions route normally. Adds the TOML/environment
+  answers resume the same worker through typed continuation context, compound
+  replies retain the pending owner, and explicit unrelated requests route
+  normally. Weather time and temperature modifiers no longer masquerade as
+  locations. Adds the TOML/environment
   `pending_dialogue_timeout_seconds` setting, defaulting to 30 seconds.
-- Keep timed-out worker searches alive for late UI delivery without autoplay,
-  propagate mailbox cancellation, and stop active TTS before speaking a
-  cancellation confirmation.
-- Return router decisions and prose atomically so concurrent turns cannot
-  observe another turn's response text.
+- Keep a bounded set of timed-out worker searches alive for late UI delivery
+  without autoplay, give each late result one delivery owner, cancel retained
+  work during session shutdown, propagate caller cancellation, and redact
+  provider exception details from operational logs.
+- Stop active TTS before speaking pause or cancellation confirmation.
+- Keep router prompts, decisions, and prose request-local so concurrent turns
+  cannot observe another turn's prompt or response text.
 
 [Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0

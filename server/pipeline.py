@@ -31,7 +31,7 @@ from .router import RoutingValidationError
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
 from .work_item_coordinator import LateResult
-from .workers.web_search import WorkerClarify, WorkerDeclined
+from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 try:
     from pipecat.bus.bridge_processor import BusBridgeProcessor as BusBridgeProcessor
@@ -536,6 +536,7 @@ class SessionHost:
                         else origin.scheduler.active.item.work_item_id
                     )
                     origin.scheduler.pause(target)
+                    await origin.scheduler.wait_for_stops()
                 elif action in {"cancel", "stop"}:
                     origin.scheduler.interrupt(epoch=origin_epoch)
                     await origin.scheduler.wait_for_stops()
@@ -664,11 +665,12 @@ class SessionHost:
         try:
             result = await self._search_with_timeout(
                 search,
-                self._pending_query(pending, transcript),
+                transcript,
                 turn_id=turn_id,
                 origin_epoch=origin.epoch,
                 timeout=timeout,
                 worker_id=owner_id or "main",
+                clarification_context=self._clarification_context(pending, transcript),
             )
             if result is None:
                 result = canonical_result(
@@ -741,10 +743,11 @@ class SessionHost:
             worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
             timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
             try:
-                query = (
-                    self._pending_query(pending, item_text)
+                query = item_text
+                clarification_context = (
+                    self._clarification_context(pending, item_text)
                     if index == 0 and pending is not None
-                    else item_text
+                    else None
                 )
                 item_turn_id = f"{turn_id}-{index + 1}"
                 result = await self._search_with_timeout(
@@ -754,6 +757,7 @@ class SessionHost:
                     origin_epoch=origin.epoch,
                     timeout=timeout,
                     worker_id=worker_id,
+                    clarification_context=clarification_context,
                 )
                 if result is None:
                     result = canonical_result(
@@ -825,13 +829,13 @@ class SessionHost:
         )
 
     @staticmethod
-    def _pending_query(pending: Any, transcript: str) -> str:
+    def _clarification_context(pending: Any, transcript: str) -> ClarificationContext | None:
         if pending is None or not pending.original_query:
-            return transcript
-        return (
-            f"Original request: {pending.original_query}\n"
-            f"Clarification asked: {pending.question}\n"
-            f"User answer: {transcript}"
+            return None
+        return ClarificationContext(
+            original_query=pending.original_query,
+            question=pending.question,
+            answer=transcript,
         )
 
     async def _search_with_timeout(
@@ -843,9 +847,21 @@ class SessionHost:
         origin_epoch: int,
         timeout: float,
         worker_id: str,
+        clarification_context: ClarificationContext | None = None,
     ) -> GroundedResult | None:
-        task = asyncio.create_task(search(query, turn_id=turn_id, origin_epoch=origin_epoch))
-        done, _ = await asyncio.wait({task}, timeout=timeout)
+        kwargs: dict[str, Any] = {
+            "turn_id": turn_id,
+            "origin_epoch": origin_epoch,
+        }
+        if clarification_context is not None:
+            kwargs["clarification_context"] = clarification_context
+        task = asyncio.create_task(search(query, **kwargs))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         if task in done:
             return await task
         self.coordinator.retain_late_task(
@@ -859,7 +875,10 @@ class SessionHost:
     async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
         """Project a late result without autoplaying it."""
         if late.error is not None:
-            logger.warning(f"Late worker result failed for {late.work_item_id}: {late.error}")
+            logger.warning(
+                f"Late worker result failed for work_item={late.work_item_id} "
+                f"worker={late.worker_id}"
+            )
             return
         result = late.result
         if not isinstance(result, GroundedResult):
@@ -962,6 +981,11 @@ class SessionHost:
         )
 
     async def shutdown(self) -> None:
+        coordinator_shutdown = getattr(self.coordinator, "shutdown", None)
+        if coordinator_shutdown is not None:
+            result = coordinator_shutdown()
+            if inspect.isawaitable(result):
+                await result
         if self.connection is not None:
             await self.connection.shutdown(reason="session shutdown")
             self.connection = None

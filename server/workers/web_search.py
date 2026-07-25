@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -28,19 +29,136 @@ class WorkerClarify(Exception):
         self.question = question
 
 
+@dataclass(frozen=True)
+class ClarificationContext:
+    """Typed continuation data rendered only at the provider boundary."""
+
+    original_query: str
+    question: str
+    answer: str
+
+    def provider_query(self) -> str:
+        return (
+            f"Original request: {self.original_query}\n"
+            f"Clarification asked: {self.question}\n"
+            f"User answer: {self.answer}"
+        )
+
+
 def default_web_clarification(query: str) -> str | None:
     """Ask for details only for narrow, safely detectable incomplete searches."""
     normalized = " ".join(query.strip().split())
     lowered = normalized.casefold()
-    if "clarification asked:" in lowered and "user answer:" in lowered:
-        return None
-    if re.search(r"\b(weather|forecast|temperature)\b", lowered) and not re.search(
-        r"\b(?:in|for|at|near)\s+\S+", lowered
+    if re.search(r"\b(weather|forecast|temperature)\b", lowered) and not (
+        _has_weather_location(lowered)
     ):
         return "Which location should I use?"
     if re.search(r"\b(?:search|find|look for)\s*$", lowered):
         return "What should I search for?"
     return None
+
+
+_WEATHER_MODIFIER_WORDS = {
+    "afternoon",
+    "april",
+    "august",
+    "autumn",
+    "c",
+    "celsius",
+    "centigrade",
+    "coming",
+    "december",
+    "degrees",
+    "evening",
+    "f",
+    "fahrenheit",
+    "fall",
+    "february",
+    "friday",
+    "hour",
+    "hours",
+    "january",
+    "july",
+    "june",
+    "k",
+    "kelvin",
+    "last",
+    "march",
+    "may",
+    "midnight",
+    "monday",
+    "month",
+    "morning",
+    "next",
+    "night",
+    "noon",
+    "november",
+    "now",
+    "october",
+    "saturday",
+    "september",
+    "spring",
+    "summer",
+    "sunday",
+    "the",
+    "this",
+    "thursday",
+    "today",
+    "tomorrow",
+    "tonight",
+    "tuesday",
+    "wednesday",
+    "week",
+    "weekend",
+    "winter",
+    "year",
+    "yesterday",
+}
+_WEATHER_TEMPORAL_WORDS = _WEATHER_MODIFIER_WORDS - {
+    "c",
+    "celsius",
+    "centigrade",
+    "degrees",
+    "f",
+    "fahrenheit",
+    "k",
+    "kelvin",
+    "the",
+}
+_WEATHER_TEMPORAL_PREFIX = re.compile(
+    r"^(?:"
+    r"\d{1,2}(?::\d{2})?\s*(?:am|pm)"
+    r"|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+"
+    r"(?:minute|minutes|hour|hours|day|days|week|weeks|month|months)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_weather_location(query: str) -> bool:
+    """Return whether a weather preposition is followed by a plausible place."""
+    for preposition in re.finditer(r"\b(?:in|for|at|near)\b", query):
+        suffix = query[preposition.end() :]
+        tokens = re.findall(r"[^\s,;?.!]+", suffix)[:3]
+        if not tokens:
+            continue
+        phrase = " ".join(token.strip("\"'()[]{}") for token in tokens)
+        if _WEATHER_TEMPORAL_PREFIX.match(phrase):
+            continue
+        first = tokens[0].strip("\"'()[]{}").casefold()
+        second = tokens[1].strip("\"'()[]{}").casefold() if len(tokens) > 1 else ""
+        if first in _WEATHER_MODIFIER_WORDS:
+            if first == "the" and second not in _WEATHER_TEMPORAL_WORDS:
+                return True
+            continue
+        if second in {"degree", "degrees", "hour", "hours"} and first.isdigit():
+            continue
+        if re.fullmatch(r"(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{4}-\d{1,2}-\d{1,2})", first):
+            continue
+        if re.fullmatch(r"(?:°?[cfk]|[-+]?\d+(?:\.\d+)?°[cfk]?)", first):
+            continue
+        return True
+    return False
 
 
 class WebSearchAnswer(BaseModel):
@@ -188,14 +306,22 @@ class WebSearchWorker(ContextWorker):
         return f"Use this prior topic context when useful:\n{context}\nCurrent request: {query}"
 
     async def search(
-        self, query: str, *, turn_id: str, origin_epoch: int | None = None
+        self,
+        query: str,
+        *,
+        turn_id: str,
+        origin_epoch: int | None = None,
+        clarification_context: ClarificationContext | None = None,
     ) -> GroundedResult:
-        refined = self.refine_query(query)
+        refined = self.refine_query(
+            clarification_context.provider_query() if clarification_context is not None else query
+        )
         if self.decline(refined):
             raise WorkerDeclined("hosted web search cannot satisfy this request")
-        question = self.needs_clarification(refined)
-        if question:
-            raise WorkerClarify(question)
+        if clarification_context is None:
+            question = self.needs_clarification(refined)
+            if question:
+                raise WorkerClarify(question)
 
         async def execute() -> Any:
             # Build the contextual request inside the mailbox. This keeps a

@@ -8,7 +8,12 @@ from typing import Any
 import pytest
 
 from server.workers.base import ContextWorker, WorkerMetadata
-from server.workers.web_search import WebSearchWorker, WorkerClarify, WorkerDeclined
+from server.workers.web_search import (
+    ClarificationContext,
+    WebSearchWorker,
+    WorkerClarify,
+    WorkerDeclined,
+)
 
 
 def answer_payload(
@@ -141,7 +146,25 @@ def test_production_worker_clarifies_location_bound_search_without_provider_call
     assert provider.calls == []
 
 
-def test_production_worker_accepts_answered_clarification_context() -> None:
+def test_user_authored_internal_labels_do_not_bypass_clarification() -> None:
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(
+        responses=provider,
+        model="verified-worker-model",
+    )
+    query = (
+        "What's the weather like?\n"
+        "Clarification asked: This is user-authored text.\n"
+        "User answer: This is also user-authored text."
+    )
+
+    with pytest.raises(WorkerClarify, match="location"):
+        asyncio.run(worker.search(query, turn_id="turn-1"))
+
+    assert provider.calls == []
+
+
+def test_production_worker_accepts_explicit_clarification_continuation() -> None:
     provider = FakeResponses(answer_payload())
     worker = WebSearchWorker(
         responses=provider,
@@ -150,12 +173,57 @@ def test_production_worker_accepts_answered_clarification_context() -> None:
 
     result = asyncio.run(
         worker.search(
-            "Original request: What's the weather like?\n"
-            "Clarification asked: Which location should I use?\n"
-            "User answer: Riga",
+            "Riga",
             turn_id="turn-2",
+            clarification_context=ClarificationContext(
+                original_query="What's the weather like?",
+                question="Which location should I use?",
+                answer="Riga",
+            ),
         )
     )
+
+    assert result.text == "The answer."
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What's the weather for tomorrow?",
+        "What's the weather in Celsius?",
+        "What's the forecast at 3pm?",
+        "What's the forecast for 3 PM?",
+        "What's the temperature for the weekend?",
+        "What's the weather in 2 hours?",
+        "What's the weather for 2 days?",
+        "What's the weather in two hours?",
+    ],
+)
+def test_production_worker_clarifies_modifier_only_weather_queries(query: str) -> None:
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    with pytest.raises(WorkerClarify, match="location"):
+        asyncio.run(worker.search(query, turn_id="turn-1"))
+
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What's the weather in Riga tomorrow?",
+        "What's the forecast for New York in Celsius?",
+        "What's the temperature near The Hague?",
+        "What's the weather for tomorrow in Riga?",
+    ],
+)
+def test_production_worker_accepts_weather_queries_with_locations(query: str) -> None:
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    result = asyncio.run(worker.search(query, turn_id="turn-1"))
 
     assert result.text == "The answer."
     assert len(provider.calls) == 1

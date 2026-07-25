@@ -113,6 +113,95 @@ def test_compound_pending_reply_is_classified_as_multi_intent() -> None:
     assert outcome.kind == "multi_intent"
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Riga and Latvia",
+        "Tuesday and Wednesday",
+        "Also include Celsius",
+        "Yes, and use Reuters",
+    ],
+)
+def test_conjunction_clarification_answers_continue_pending(answer: str) -> None:
+    coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 0)
+    coordinator.add_pending(PendingDialogue("session", "worker", "worker-1", "turn", "result", 10))
+
+    outcome = coordinator.arbitrate("session", answer)
+
+    assert outcome.kind == "continue_pending"
+    assert outcome.work_items == ("worker-1",)
+
+
+def test_multi_intent_split_preserves_conjunctions_in_the_clarification_answer() -> None:
+    coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 0)
+    coordinator.add_pending(PendingDialogue("session", "worker", "worker-1", "turn", "result", 10))
+
+    outcome = coordinator.arbitrate(
+        "session",
+        "Riga and Latvia, and also search the latest stock news",
+    )
+
+    assert outcome.kind == "multi_intent"
+    assert outcome.work_items == ("Riga and Latvia", "search the latest stock news")
+
+
+def test_pending_imperative_new_topic_routes_normally_without_consuming_candidate() -> None:
+    class Registry:
+        config = Config()
+
+        @staticmethod
+        def catalogue() -> tuple[()]:
+            return ()
+
+    class Router:
+        @staticmethod
+        def route_envelope(_transcript: str, _catalogue: object) -> object:
+            decision = object()
+            return type("Envelope", (), {"decision": decision, "prose": None})()
+
+    coordinator = WorkItemCoordinator(registry=Registry(), router=Router(), clock=lambda: 0)
+    pending = PendingDialogue("session", "worker", "worker-1", "turn", "result", 10)
+    coordinator.add_pending(pending)
+
+    outcome = coordinator.arbitrate("session", "Search the latest stock news")
+
+    assert outcome.kind == "routed"
+    assert coordinator.pending("session") == pending
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Can you search the latest stock news instead?",
+        "Could you tell me today's headlines?",
+        "Would you please look up the exchange rate?",
+    ],
+)
+def test_pending_polite_new_topic_routes_normally_without_consuming_candidate(
+    transcript: str,
+) -> None:
+    class Registry:
+        config = Config()
+
+        @staticmethod
+        def catalogue() -> tuple[()]:
+            return ()
+
+    class Router:
+        @staticmethod
+        def route_envelope(_transcript: str, _catalogue: object) -> object:
+            return type("Envelope", (), {"decision": object(), "prose": None})()
+
+    coordinator = WorkItemCoordinator(registry=Registry(), router=Router(), clock=lambda: 0)
+    pending = PendingDialogue("session", "worker", "worker-1", "turn", "result", 10)
+    coordinator.add_pending(pending)
+
+    outcome = coordinator.arbitrate("session", transcript)
+
+    assert outcome.kind == "routed"
+    assert coordinator.pending("session") == pending
+
+
 def test_control_and_consent_outcomes_preserve_the_requested_action() -> None:
     coordinator = WorkItemCoordinator(max_work_items_per_turn=2, clock=lambda: 0)
     coordinator.add_pending(PendingDialogue("session", "worker", "worker-1", "turn", "result", 10))
@@ -299,5 +388,243 @@ def test_timed_out_result_is_drained_once_after_pending_worker_finishes() -> Non
         assert late[0].result.text == "answer"
         assert late[0].error is None
         assert coordinator.drain_late_results() == ()
+
+    asyncio.run(run())
+
+
+def test_callback_delivered_late_result_does_not_accumulate_in_polling_queue() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        release = asyncio.Event()
+        delivered = asyncio.Event()
+        observed = []
+
+        async def provider() -> dict:
+            await release.wait()
+            return {"text": "answer", "citations": []}
+
+        def on_complete(late: object) -> None:
+            observed.append(late)
+            delivered.set()
+
+        task = asyncio.create_task(provider())
+        assert coordinator.retain_late_task(
+            task,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=on_complete,
+        )
+        release.set()
+        await delivered.wait()
+
+        assert len(observed) == 1
+        assert coordinator.drain_late_results() == ()
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_background_provider_tasks_are_capped_per_coordinator() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(
+            max_work_items_per_turn=2,
+            max_background_tasks=2,
+        )
+        release = asyncio.Event()
+        cancelled: list[str] = []
+
+        async def provider(label: str) -> dict:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(label)
+                raise
+            return {"text": label, "citations": []}
+
+        tasks = [asyncio.create_task(provider(label)) for label in ("first", "second", "third")]
+        await asyncio.sleep(0)
+        for index, task in enumerate(tasks):
+            coordinator.retain_late_task(
+                task,
+                work_item_id=f"work-{index}",
+                worker_id=f"worker-{index}",
+            )
+        await asyncio.sleep(0)
+
+        assert cancelled == ["third"]
+        assert len(coordinator._late_tasks) == 2
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_rejected_cancellation_resistant_task_remains_owned_until_completion() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_background_tasks=1)
+        release = asyncio.Event()
+        ignored_cancellation = asyncio.Event()
+
+        async def provider(*, resist: bool = False) -> dict:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                if not resist:
+                    raise
+                ignored_cancellation.set()
+                await release.wait()
+            return {"text": "done", "citations": []}
+
+        retained = asyncio.create_task(provider())
+        rejected = asyncio.create_task(provider(resist=True))
+        await asyncio.sleep(0)
+        assert coordinator.retain_late_task(
+            retained,
+            work_item_id="work-retained",
+            worker_id="worker-retained",
+        )
+        assert not coordinator.retain_late_task(
+            rejected,
+            work_item_id="work-rejected",
+            worker_id="worker-rejected",
+        )
+        await ignored_cancellation.wait()
+
+        assert rejected in coordinator._cancelling_tasks
+        release.set()
+        await rejected
+        await asyncio.sleep(0)
+        assert rejected not in coordinator._cancelling_tasks
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_late_result_polling_queue_is_bounded_per_coordinator() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(
+            max_work_items_per_turn=2,
+            max_background_tasks=2,
+        )
+
+        async def provider(label: str) -> dict:
+            return {"text": label, "citations": []}
+
+        for index in range(3):
+            task = asyncio.create_task(provider(str(index)))
+            coordinator.retain_late_task(
+                task,
+                work_item_id=f"work-{index}",
+                worker_id=f"worker-{index}",
+            )
+            await task
+            await asyncio.sleep(0)
+
+        assert [late.work_item_id for late in coordinator.drain_late_results()] == [
+            "work-1",
+            "work-2",
+        ]
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_shutdown_cancels_retained_providers_and_callbacks_and_fences_mutation() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        provider_started = asyncio.Event()
+        provider_cancelled = asyncio.Event()
+        callback_started = asyncio.Event()
+        callback_cancelled = asyncio.Event()
+        provider_release = asyncio.Event()
+        callbacks = []
+
+        async def blocking_provider() -> dict:
+            provider_started.set()
+            try:
+                await provider_release.wait()
+            except asyncio.CancelledError:
+                provider_cancelled.set()
+                raise
+            return {"text": "late", "citations": []}
+
+        async def completed_provider() -> dict:
+            return {"text": "callback", "citations": []}
+
+        async def blocking_callback(late: object) -> None:
+            callbacks.append(late)
+            callback_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                callback_cancelled.set()
+                raise
+
+        provider_task = asyncio.create_task(blocking_provider())
+        coordinator.retain_late_task(
+            provider_task,
+            work_item_id="work-provider",
+            worker_id="worker-provider",
+            on_complete=lambda late: callbacks.append(late),
+        )
+        coordinator.retain_late_task(
+            asyncio.create_task(completed_provider()),
+            work_item_id="work-callback",
+            worker_id="worker-callback",
+            on_complete=blocking_callback,
+        )
+        await provider_started.wait()
+        await callback_started.wait()
+
+        await coordinator.shutdown()
+
+        assert provider_cancelled.is_set()
+        assert callback_cancelled.is_set()
+        assert len(callbacks) == 1
+        assert coordinator.drain_late_results() == ()
+
+        post_shutdown_task = asyncio.create_task(asyncio.sleep(60))
+        assert not coordinator.retain_late_task(
+            post_shutdown_task,
+            work_item_id="work-after-shutdown",
+            worker_id="worker-after-shutdown",
+        )
+        await asyncio.sleep(0)
+        assert post_shutdown_task.cancelled()
+        with pytest.raises(RuntimeError, match="coordinator is shut down"):
+            coordinator.add_pending(
+                PendingDialogue("session", "worker", "worker", "turn", "result", 10)
+            )
+
+    asyncio.run(run())
+
+
+def test_shutdown_cancels_active_submit_and_provider_tasks() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        provider_started = asyncio.Event()
+        provider_cancelled = asyncio.Event()
+
+        async def provider(_worker_id: str, _text: str) -> dict:
+            provider_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                provider_cancelled.set()
+                raise
+
+        submission = asyncio.create_task(
+            coordinator.submit("turn-1", [("worker-1", "query")], provider)
+        )
+        await provider_started.wait()
+
+        await coordinator.shutdown()
+
+        assert provider_cancelled.is_set()
+        assert submission.done()
+        with pytest.raises(asyncio.CancelledError):
+            await submission
+        assert coordinator._submission_tasks == set()
+        assert coordinator._submit_tasks == set()
+        assert coordinator._provider_tasks == set()
 
     asyncio.run(run())

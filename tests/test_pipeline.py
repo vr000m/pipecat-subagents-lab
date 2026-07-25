@@ -19,13 +19,14 @@ from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 
 import server.app as app_module
+import server.pipeline as pipeline_module
 from server.config import Config
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
-from server.work_item_coordinator import WorkItemCoordinator
-from server.workers.web_search import WorkerClarify, WorkerDeclined
+from server.work_item_coordinator import LateResult, WorkItemCoordinator
+from server.workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 
 class RoutedCoordinator:
@@ -92,9 +93,19 @@ class ProjectedResultWorker(ResultWorker):
     def __init__(self) -> None:
         self.queries: list[str] = []
 
-    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
-        self.queries.append(query)
-        return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+    async def search(
+        self,
+        query: str,
+        *,
+        turn_id: str,
+        origin_epoch: int | None,
+        clarification_context: ClarificationContext | None = None,
+    ) -> GroundedResult:
+        provider_query = (
+            clarification_context.provider_query() if clarification_context is not None else query
+        )
+        self.queries.append(provider_query)
+        return await super().search(provider_query, turn_id=turn_id, origin_epoch=origin_epoch)
 
 
 class ProjectedCoordinator(RoutedCoordinator):
@@ -160,9 +171,19 @@ class ContinuationResultWorker(ResultWorker):
     def __init__(self) -> None:
         self.queries: list[str] = []
 
-    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
-        self.queries.append(query)
-        return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+    async def search(
+        self,
+        query: str,
+        *,
+        turn_id: str,
+        origin_epoch: int | None,
+        clarification_context: ClarificationContext | None = None,
+    ) -> GroundedResult:
+        provider_query = (
+            clarification_context.provider_query() if clarification_context is not None else query
+        )
+        self.queries.append(provider_query)
+        return await super().search(provider_query, turn_id=turn_id, origin_epoch=origin_epoch)
 
 
 class PendingRegistry:
@@ -439,9 +460,19 @@ def test_timed_out_pending_search_finishes_in_background_without_autoplay() -> N
                 self.cancelled = False
 
             async def search(
-                self, query: str, *, turn_id: str, origin_epoch: int | None
+                self,
+                query: str,
+                *,
+                turn_id: str,
+                origin_epoch: int | None,
+                clarification_context: ClarificationContext | None = None,
             ) -> GroundedResult:
-                self.queries.append(query)
+                provider_query = (
+                    clarification_context.provider_query()
+                    if clarification_context is not None
+                    else query
+                )
+                self.queries.append(provider_query)
                 self.started.set()
                 try:
                     await self.release.wait()
@@ -450,7 +481,7 @@ def test_timed_out_pending_search_finishes_in_background_without_autoplay() -> N
                     raise
                 return await ResultWorker.search(
                     self,
-                    query,
+                    provider_query,
                     turn_id=turn_id,
                     origin_epoch=origin_epoch,
                 )
@@ -576,6 +607,131 @@ def test_cancel_control_interrupts_active_speech() -> None:
         assert isinstance(connection.worker.frames[-2], InterruptionFrame)
         assert isinstance(connection.worker.frames[-1], TTSSpeakFrame)
         await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pause_control_stops_active_speech_before_confirmation() -> None:
+    async def run() -> None:
+        class ControlCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": (),
+                        "control_action": "pause",
+                    },
+                )()
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=ControlCoordinator(),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+
+        await host._handle_transcript("pause")
+
+        assert isinstance(connection.worker.frames[-2], InterruptionFrame)
+        assert isinstance(connection.worker.frames[-1], TTSSpeakFrame)
+        assert connection.worker.frames[-1].text == "Pausing the active response."
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_search_cancellation_cancels_child_without_retaining_it() -> None:
+    async def run() -> None:
+        class RetainingCoordinator:
+            def __init__(self) -> None:
+                self.retained: list[asyncio.Task[object]] = []
+
+            def retain_late_task(self, task: asyncio.Task[object], **_: object) -> None:
+                self.retained.append(task)
+
+        coordinator = RetainingCoordinator()
+        host = SessionHost(coordinator=coordinator)
+        started = asyncio.Event()
+        child_cancelled = asyncio.Event()
+
+        async def search(_query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                child_cancelled.set()
+                raise
+
+        parent = asyncio.create_task(
+            host._search_with_timeout(
+                search,
+                "query",
+                turn_id="turn-cancelled",
+                origin_epoch=1,
+                timeout=30,
+                worker_id="worker-search",
+            )
+        )
+        await started.wait()
+        parent.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await parent
+
+        assert child_cancelled.is_set()
+        assert coordinator.retained == []
+
+    asyncio.run(run())
+
+
+def test_late_worker_error_log_omits_untrusted_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        messages: list[str] = []
+        monkeypatch.setattr(pipeline_module.logger, "warning", messages.append)
+        host = SessionHost()
+
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-1",
+                worker_id="worker-search",
+                error="ProviderError: secret-token\nforged log line",
+            ),
+            1,
+        )
+
+        assert messages == ["Late worker result failed for work_item=work-1 worker=worker-search"]
+
+    asyncio.run(run())
+
+
+def test_session_shutdown_closes_coordinator() -> None:
+    async def run() -> None:
+        class Coordinator:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def shutdown(self) -> None:
+                self.closed = True
+
+        coordinator = Coordinator()
+        host = SessionHost(coordinator=coordinator)
+
+        await host.shutdown()
+
+        assert coordinator.closed is True
 
     asyncio.run(run())
 
