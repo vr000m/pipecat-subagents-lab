@@ -6,7 +6,7 @@ license = "BSD-2-Clause"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "pipecat-ai[cartesia,deepgram,openai,webrtc,local,runner]==1.6.0",
+    "pipecat-ai[cartesia,deepgram,openai,webrtc,runner]==1.6.0",
     "pydantic>=2.10,<3",
     "websockets>=16,<17",
 ]
