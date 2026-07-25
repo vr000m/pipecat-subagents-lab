@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
 from .config import Config
 from .router import (
@@ -12,7 +12,7 @@ from .router import (
     WorkerCatalogueEntry,
     build_openai_async_responses_client,
 )
-from .workers.base import ContextWorker, WorkerMetadata
+from .workers.base import WorkerMetadata
 from .workers.web_search import WebSearchWorker
 
 
@@ -25,17 +25,23 @@ class UnsupportedWorkerType(ValueError):
     """The first-slice registry cannot execute the requested worker type."""
 
 
+class WebSearchCapableWorker(Protocol):
+    """Minimum execution contract for workers published as web search."""
+
+    def search(self, query: str, **kwargs: Any) -> Awaitable[Any]: ...
+
+
 @dataclass(frozen=True)
 class RegisteredWorker:
     metadata: WorkerMetadata
-    worker: ContextWorker
+    worker: WebSearchCapableWorker
 
     @property
     def worker_id(self) -> str:
         return self.metadata.worker_id
 
     @property
-    def context(self) -> ContextWorker:
+    def context(self) -> WebSearchCapableWorker:
         return self.worker
 
 
@@ -50,7 +56,7 @@ class WorkerRegistry:
     def __init__(
         self,
         config: Config | None = None,
-        worker_factory: Callable[[str], ContextWorker] | None = None,
+        worker_factory: Callable[[str], WebSearchCapableWorker] | None = None,
         responses: Any = None,
     ) -> None:
         self.config = config or Config()
@@ -73,7 +79,7 @@ class WorkerRegistry:
         topic_summary: str = "",
         model_policy: str = "deep",
         capabilities: dict[str, bool] | None = None,
-        worker: ContextWorker | None = None,
+        worker: WebSearchCapableWorker | None = None,
     ) -> RegisteredWorker:
         if worker_type != "web_search":
             raise UnsupportedWorkerType(f"unsupported worker type: {worker_type}")
@@ -83,10 +89,52 @@ class WorkerRegistry:
         metadata = WorkerMetadata(
             worker_id, worker_type, topic, topic_summary, model_policy, capabilities or {}
         )
-        registered = RegisteredWorker(metadata, worker or ContextWorker(metadata))
+        if worker is None:
+            worker = self._create_web_search_worker(metadata)
+        worker = self._require_web_search_capability(worker)
+        if capabilities is None:
+            worker_capabilities = getattr(getattr(worker, "metadata", None), "capabilities", None)
+            if worker_capabilities is None:
+                worker_capabilities = getattr(worker, "capabilities", {})
+            metadata = WorkerMetadata(
+                worker_id,
+                worker_type,
+                topic,
+                topic_summary,
+                model_policy,
+                dict(worker_capabilities),
+            )
+        registered = RegisteredWorker(metadata, worker)
         self._workers[worker_id] = registered
         self._version += 1
         return registered
+
+    @staticmethod
+    def _require_web_search_capability(worker: object) -> WebSearchCapableWorker:
+        if not callable(getattr(worker, "search", None)):
+            raise TypeError("web_search worker must define a callable search method")
+        return cast(WebSearchCapableWorker, worker)
+
+    def _create_web_search_worker(self, metadata: WorkerMetadata) -> WebSearchCapableWorker:
+        if self.worker_factory is not None:
+            return self._require_web_search_capability(self.worker_factory(metadata.worker_id))
+        if self.responses is None:
+            if self.config.openai_api_key:
+                self.responses = build_openai_async_responses_client(
+                    self.config.openai_api_key,
+                    timeout=self.config.provider_timeout_seconds,
+                )
+            else:
+                self.responses = _UnavailableResponses()
+        return WebSearchWorker(
+            model=self.config.resolve_worker_model(metadata.model_policy),
+            model_policy=metadata.model_policy,
+            responses=self.responses,
+            worker_id=metadata.worker_id,
+            topic=metadata.topic,
+            provider_timeout_seconds=self.config.provider_timeout_seconds,
+            max_citations=self.config.max_citations,
+        )
 
     def get(self, worker_id: str) -> RegisteredWorker:
         try:
@@ -104,37 +152,11 @@ class WorkerRegistry:
                         "existing worker has an incompatible model policy; refusing to reuse it"
                     )
                 return item
-        worker: ContextWorker | None = None
-        if self.worker_factory is not None:
-            worker = self.worker_factory(f"worker-{len(self._workers) + 1}")
-        elif worker_type == "web_search":
-            if self.responses is None:
-                if self.config.openai_api_key:
-                    self.responses = build_openai_async_responses_client(
-                        self.config.openai_api_key,
-                        timeout=self.config.provider_timeout_seconds,
-                    )
-                else:
-                    self.responses = _UnavailableResponses()
-            worker = WebSearchWorker(
-                model=self.config.resolve_worker_model(model_policy),
-                model_policy=model_policy,
-                responses=self.responses,
-                worker_id=f"worker-{len(self._workers) + 1}",
-                topic=topic,
-                provider_timeout_seconds=self.config.provider_timeout_seconds,
-                max_citations=self.config.max_citations,
-            )
-        worker_capabilities = getattr(getattr(worker, "metadata", None), "capabilities", None)
-        if worker_capabilities is None:
-            worker_capabilities = getattr(worker, "capabilities", {})
         return self.register(
             worker_id=f"worker-{len(self._workers) + 1}",
             worker_type=worker_type,
             topic=topic,
             model_policy=model_policy,
-            capabilities=dict(worker_capabilities),
-            worker=worker,
         )
 
     def validate_selection(self, snapshot: WorkerCatalogue, **kwargs: object) -> None:

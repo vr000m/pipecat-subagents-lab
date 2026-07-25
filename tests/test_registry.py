@@ -1,8 +1,9 @@
 """The registry owns persistent context identities and immutable catalogues."""
 
-from server.registry import UnsupportedWorkerType, WorkerRegistry
 import pytest
-from server.workers.base import WorkerMetadata
+
+from server.registry import UnsupportedWorkerType, WorkerRegistry
+from server.workers.base import ContextWorker, WorkerMetadata
 from server.workers.web_search import WebSearchWorker
 
 
@@ -18,6 +19,9 @@ class FakeContextWorker:
             model_policy="deep",
             capabilities={"private_calendar": True},
         )
+
+    async def search(self, query: str, **kwargs: object) -> object:
+        return {"query": query, **kwargs}
 
 
 class FakeResponses:
@@ -44,6 +48,61 @@ def test_registry_rejects_unimplemented_worker_types() -> None:
 
     with pytest.raises(UnsupportedWorkerType, match="calendar"):
         registry.register(worker_id="worker-calendar", worker_type="calendar", topic="calendar")
+
+
+def test_register_builds_a_search_capable_worker_by_default() -> None:
+    registry = WorkerRegistry(responses=FakeResponses())
+
+    item = registry.register(
+        worker_id="worker-weather",
+        worker_type="web_search",
+        topic="weather",
+    )
+
+    assert isinstance(item.worker, WebSearchWorker)
+    assert callable(item.worker.search)
+
+
+def test_register_rejects_context_worker_without_search_before_publication() -> None:
+    registry = WorkerRegistry()
+    worker = ContextWorker(
+        WorkerMetadata(
+            worker_id="worker-weather",
+            worker_type="web_search",
+            topic="weather",
+            topic_summary="weather",
+            model_policy="deep",
+        )
+    )
+
+    with pytest.raises(TypeError, match="callable search method"):
+        registry.register(
+            worker_id="worker-weather",
+            worker_type="web_search",
+            topic="weather",
+            worker=worker,
+        )
+
+    assert registry.workers == ()
+
+
+def test_get_or_create_rejects_factory_worker_without_search_before_publication() -> None:
+    registry = WorkerRegistry(
+        worker_factory=lambda worker_id: ContextWorker(
+            WorkerMetadata(
+                worker_id=worker_id,
+                worker_type="web_search",
+                topic="weather",
+                topic_summary="weather",
+                model_policy="deep",
+            )
+        )
+    )
+
+    with pytest.raises(TypeError, match="callable search method"):
+        registry.get_or_create(topic="weather", worker_type="web_search", model_policy="deep")
+
+    assert registry.workers == ()
 
 
 def test_registry_keeps_two_workers_and_same_topic_identity_persistent() -> None:
