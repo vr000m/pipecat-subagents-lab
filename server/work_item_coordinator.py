@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -124,6 +125,7 @@ class WorkItemCoordinator:
             )
         self.speech_scheduler = speech_scheduler
         self._pending: dict[str, PendingDialogue] = {}
+        self._pending_lock = threading.RLock()
         self._tails: dict[str, Any] = {}
         self._max_background_tasks = (
             max(4, self.config.max_work_items_per_turn * 2)
@@ -336,7 +338,8 @@ class WorkItemCoordinator:
 
     def add_pending(self, candidate: PendingDialogue) -> None:
         self._ensure_open()
-        self._pending[candidate.session_id] = candidate
+        with self._pending_lock:
+            self._pending[candidate.session_id] = candidate
 
     def add_worker_clarification(
         self,
@@ -363,11 +366,12 @@ class WorkItemCoordinator:
         )
 
     def pending(self, session_id: str) -> PendingDialogue | None:
-        candidate = self._pending.get(session_id)
-        if candidate and candidate.expires_at <= self.clock():
-            self._pending.pop(session_id, None)
-            return None
-        return candidate
+        with self._pending_lock:
+            candidate = self._pending.get(session_id)
+            if candidate and candidate.expires_at <= self.clock():
+                self._pending.pop(session_id, None)
+                return None
+            return candidate
 
     @staticmethod
     def control_intent(transcript: str) -> tuple[str, str | None] | None:
@@ -416,45 +420,49 @@ class WorkItemCoordinator:
         self._ensure_open()
         control = self.control_intent(transcript)
         if control:
-            pending = self.pending(session_id)
-            if control[0] == "consent" and pending:
-                self._pending.pop(session_id, None)
-                return DispatchOutcome(
-                    "continue_pending",
-                    transcript,
-                    work_items=(pending.owner_id,),
-                    control_action="consent",
-                    pending_dialogue=pending,
-                )
+            with self._pending_lock:
+                pending = self.pending(session_id)
+                if control[0] == "consent" and pending:
+                    self._pending.pop(session_id, None)
+                    return DispatchOutcome(
+                        "continue_pending",
+                        transcript,
+                        work_items=(pending.owner_id,),
+                        control_action="consent",
+                        pending_dialogue=pending,
+                    )
             return DispatchOutcome(
                 "control",
                 transcript,
                 work_items=(control[1],) if control[1] else (),
                 control_action=control[0],
             )
-        pending = self.pending(session_id)
-        pending_intent = self.pending_intent(transcript) if pending else None
-        if pending and pending_intent == "multi_intent":
-            parts = tuple(
-                part.strip() for part in _MULTI_INTENT_SEPARATOR.split(transcript) if part.strip()
-            )
-            if len(parts) > self.config.max_work_items_per_turn:
-                parts = parts[: self.config.max_work_items_per_turn]
-            self._pending.pop(session_id, None)
-            return DispatchOutcome(
-                "multi_intent",
-                transcript,
-                work_items=parts,
-                pending_dialogue=pending,
-            )
-        if pending and pending_intent in {"continue_pending", "steer_same_topic"}:
-            self._pending.pop(session_id, None)
-            return DispatchOutcome(
-                "continue_pending",
-                transcript,
-                work_items=(pending.owner_id,),
-                pending_dialogue=pending,
-            )
+        with self._pending_lock:
+            pending = self.pending(session_id)
+            pending_intent = self.pending_intent(transcript) if pending else None
+            if pending and pending_intent == "multi_intent":
+                parts = tuple(
+                    part.strip()
+                    for part in _MULTI_INTENT_SEPARATOR.split(transcript)
+                    if part.strip()
+                )
+                if len(parts) > self.config.max_work_items_per_turn:
+                    parts = parts[: self.config.max_work_items_per_turn]
+                self._pending.pop(session_id, None)
+                return DispatchOutcome(
+                    "multi_intent",
+                    transcript,
+                    work_items=parts,
+                    pending_dialogue=pending,
+                )
+            if pending and pending_intent in {"continue_pending", "steer_same_topic"}:
+                self._pending.pop(session_id, None)
+                return DispatchOutcome(
+                    "continue_pending",
+                    transcript,
+                    work_items=(pending.owner_id,),
+                    pending_dialogue=pending,
+                )
         if self.registry is None or self.router is None:
             raise RuntimeError("routing arbitration requires a registry and router")
         catalogue = self.registry.catalogue()

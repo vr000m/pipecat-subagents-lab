@@ -278,7 +278,12 @@ class SessionHost:
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
+        coordinator_registry = getattr(coordinator, "registry", None)
+        if registry is None and coordinator_registry is not None:
+            registry = coordinator_registry
         self.registry = registry or WorkerRegistry()
+        if coordinator_registry is not None and coordinator_registry is not self.registry:
+            raise ValueError("SessionHost and coordinator must share one WorkerRegistry")
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
         self.coordinator = coordinator
@@ -291,6 +296,7 @@ class SessionHost:
         self._background_shutdowns: set[asyncio.Task[None]] = set()
         self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
         self._turn_sequence = 0
+        self._inflight_turn_tasks: dict[str, asyncio.Task[Any]] = {}
         self._inflight_work_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._known_work_items: set[str] = set()
         self._cancelled_work_items: set[str] = set()
@@ -381,9 +387,17 @@ class SessionHost:
                 raise RuntimeError("speech target is not the active TTS connection")
             if pipeline.worker is None:
                 raise RuntimeError("active connection has no Pipecat worker for TTS")
-            await pipeline.worker.queue_frame(
-                TTSSpeakFrame(text=item.text, append_to_context=False)
+            frame_factory = getattr(connection_tts, "correlated_speak_frame", None)
+            frame = (
+                frame_factory(
+                    item.text,
+                    correlation_id=item.utterance_id,
+                    append_to_context=False,
+                )
+                if frame_factory is not None
+                else TTSSpeakFrame(text=item.text, append_to_context=False)
             )
+            await pipeline.worker.queue_frame(frame)
 
         async def stop_speech(item: Any) -> None:
             del item
@@ -488,6 +502,12 @@ class SessionHost:
     async def _handle_transcript(
         self, transcript: str, *, origin: ConnectionPipeline | None = None
     ) -> Any:
+        task = asyncio.create_task(self._handle_transcript_impl(transcript, origin=origin))
+        return await task
+
+    async def _handle_transcript_impl(
+        self, transcript: str, *, origin: ConnectionPipeline | None = None
+    ) -> Any:
         """Route a final local-STT turn through the application coordinator."""
         turn_started = time.perf_counter()
         origin = origin or self.connection
@@ -501,6 +521,10 @@ class SessionHost:
             return transcript
         origin_epoch = origin.epoch
         turn_id = self._next_turn_id()
+        work_item_id = f"work-{turn_id}"
+        turn_task = asyncio.current_task()
+        if turn_task is not None:
+            self._track_turn_task(work_item_id, turn_task)
         self.state.append_transcript(
             TranscriptEntry(
                 role="user",
@@ -546,17 +570,21 @@ class SessionHost:
                         await origin.scheduler.start_next(replay.work_item_id)
                 elif action in {"cancel", "stop"}:
                     target = outcome.work_items[0] if outcome.work_items else None
-                    cancelled_work = self._cancel_work(target)
+                    cancelled_work = self._cancel_work(
+                        target,
+                        exclude_work_item_id=work_item_id,
+                    )
                     cancelled_speech = origin.scheduler.cancel(target)
                     await origin.scheduler.wait_for_stops()
-                    if target is not None and not cancelled_work and not cancelled_speech:
-                        action = "unknown_target"
+                    if not cancelled_work and not cancelled_speech:
+                        action = "unknown_target" if target is not None else "no_active"
                 text = {
                     "pause": "Pausing the active response.",
                     "resume": "Resuming the paused response.",
                     "cancel": "Cancelling the active response.",
                     "stop": "Stopping the active response.",
                     "unknown_target": "I could not find that active work item.",
+                    "no_active": "There is no active response to cancel.",
                 }.get(action, "Control request noted.")
             elif outcome.kind == "multi_intent":
                 return await self._handle_multi_intent(outcome, transcript, origin, turn_id)
@@ -643,7 +671,7 @@ class SessionHost:
                     15.0,
                 ),
                 worker_id=worker_id,
-                work_item_id=f"work-{turn_id}",
+                work_item_id=work_item_id,
             )
             search_ms = (time.perf_counter() - search_started) * 1000
             if execution.status == "completed" and execution.result is not None:
@@ -1141,19 +1169,42 @@ class SessionHost:
 
         task.add_done_callback(completed)
 
-    def _cancel_work(self, work_item_id: str | None) -> tuple[str, ...]:
+    def _track_turn_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
+        self._known_work_items.add(work_item_id)
+        self._inflight_turn_tasks[work_item_id] = task
+
+        def completed(completed_task: asyncio.Task[Any]) -> None:
+            if self._inflight_turn_tasks.get(work_item_id) is not completed_task:
+                return
+            self._inflight_turn_tasks.pop(work_item_id, None)
+            if work_item_id not in self._inflight_work_tasks:
+                self._known_work_items.discard(work_item_id)
+                self._cancelled_work_items.discard(work_item_id)
+
+        task.add_done_callback(completed)
+
+    def _cancel_work(
+        self,
+        work_item_id: str | None,
+        *,
+        exclude_work_item_id: str | None = None,
+    ) -> tuple[str, ...]:
         selected = tuple(
             item_id
-            for item_id in self._inflight_work_tasks
-            if work_item_id is None or item_id == work_item_id
+            for item_id in dict.fromkeys((*self._inflight_turn_tasks, *self._inflight_work_tasks))
+            if (work_item_id is None or item_id == work_item_id) and item_id != exclude_work_item_id
         )
         coordinator_cancel = getattr(self.coordinator, "cancel", None)
         if coordinator_cancel is not None:
             selected = tuple(dict.fromkeys((*selected, *coordinator_cancel(work_item_id))))
         if work_item_id is None:
             selected = tuple(dict.fromkeys((*selected, *self._known_work_items)))
+        selected = tuple(item for item in selected if item != exclude_work_item_id)
         self._cancelled_work_items.update(selected)
         for item_id in selected:
+            turn_task = self._inflight_turn_tasks.get(item_id)
+            if turn_task is not None:
+                turn_task.cancel()
             for task in self._inflight_work_tasks.get(item_id, ()):
                 task.cancel()
         return selected
@@ -1202,6 +1253,11 @@ class SessionHost:
 
     async def shutdown(self) -> None:
         self._closing = True
+        turn_tasks = tuple(self._inflight_turn_tasks.values())
+        for task in turn_tasks:
+            task.cancel()
+        if turn_tasks:
+            await asyncio.gather(*turn_tasks, return_exceptions=True)
         shutdowns = set(self._background_shutdowns)
         if self.connection is not None:
             connection = self.connection

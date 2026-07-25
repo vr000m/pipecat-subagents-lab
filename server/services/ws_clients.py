@@ -8,6 +8,7 @@ they do not contain model, credential, or browser policy.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -16,42 +17,76 @@ import websockets
 from websockets.asyncio.client import connect as ws_connect
 from websockets.asyncio.client import unix_connect as ws_unix_connect
 
+_CONNECT_TIMEOUT_SECONDS = 10.0
+_HANDSHAKE_TIMEOUT_SECONDS = 10.0
+_OPERATION_TIMEOUT_SECONDS = 75.0
+_MAX_HANDSHAKE_EVENTS = 128
+_MAX_EVENT_COUNT = 4096
+_MAX_MESSAGE_BYTES = 1024 * 1024
+_MAX_OPERATION_BYTES = 64 * 1024 * 1024
+
 
 async def _connect(endpoint: Any) -> Any:
     transport = endpoint.transport
     address = endpoint.address
     if transport == "uds":
-        return await ws_unix_connect(address, "ws://localhost/")
+        return await asyncio.wait_for(
+            ws_unix_connect(address, "ws://localhost/"),
+            timeout=_CONNECT_TIMEOUT_SECONDS,
+        )
     if transport not in {"tcp", "ws", "wss"}:
         raise ValueError(f"unsupported local service transport: {transport}")
     scheme = "wss" if transport == "wss" else "ws"
-    return await ws_connect(f"{scheme}://{address}/")
+    return await asyncio.wait_for(
+        ws_connect(f"{scheme}://{address}/"),
+        timeout=_CONNECT_TIMEOUT_SECONDS,
+    )
 
 
 async def _receive_json(ws: Any) -> dict[str, Any]:
-    raw = await ws.recv()
+    raw = await asyncio.wait_for(ws.recv(), timeout=_HANDSHAKE_TIMEOUT_SECONDS)
     if isinstance(raw, (bytes, bytearray)):
         raise RuntimeError("unexpected binary frame during local service handshake")
+    if len(raw.encode("utf-8")) > _MAX_MESSAGE_BYTES:
+        raise RuntimeError("local service handshake message limit exceeded")
     return json.loads(raw)
 
 
 async def _receive_until(ws: Any, expected_types: set[str]) -> dict[str, Any]:
     """Drain compatibility alias events until the required acknowledgement arrives."""
-    while True:
+    for _ in range(_MAX_HANDSHAKE_EVENTS):
         event = await _receive_json(ws)
         if event.get("type") in expected_types:
             return event
+    raise RuntimeError("local service handshake event limit exceeded")
 
 
 async def _events(ws: Any) -> AsyncIterator[dict[str, Any]]:
+    event_count = 0
+    byte_count = 0
     try:
-        async for raw in ws:
-            if isinstance(raw, (bytes, bytearray)):
-                continue
-            try:
-                yield json.loads(raw)
-            except json.JSONDecodeError:
-                continue
+        async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+            async for raw in ws:
+                event_count += 1
+                raw_size = (
+                    len(raw) if isinstance(raw, (bytes, bytearray)) else len(raw.encode("utf-8"))
+                )
+                byte_count += raw_size
+                if event_count > _MAX_EVENT_COUNT or byte_count > _MAX_OPERATION_BYTES:
+                    await ws.close()
+                    raise RuntimeError("local service event stream limit exceeded")
+                if isinstance(raw, (bytes, bytearray)):
+                    continue
+                if raw_size > _MAX_MESSAGE_BYTES:
+                    await ws.close()
+                    raise RuntimeError("local service message limit exceeded")
+                try:
+                    yield json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+    except TimeoutError:
+        await ws.close()
+        raise RuntimeError("local service event stream timed out") from None
     except websockets.exceptions.ConnectionClosed as exc:
         yield {
             "type": "error",
@@ -91,10 +126,13 @@ class LocalSTTClient:
             )
 
     async def send_audio(self, audio: bytes) -> None:
-        await self._ws.send(audio)
+        await asyncio.wait_for(self._ws.send(audio), timeout=_OPERATION_TIMEOUT_SECONDS)
 
     async def commit(self) -> None:
-        await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        await asyncio.wait_for(
+            self._ws.send(json.dumps({"type": "input_audio_buffer.commit"})),
+            timeout=_OPERATION_TIMEOUT_SECONDS,
+        )
 
     def events(self) -> AsyncIterator[dict[str, Any]]:
         return _events(self._ws)
@@ -124,10 +162,16 @@ class LocalTTSClient:
         return hello
 
     async def append(self, text: str) -> None:
-        await self._ws.send(json.dumps({"type": "input_text.append", "text": text}))
+        await asyncio.wait_for(
+            self._ws.send(json.dumps({"type": "input_text.append", "text": text})),
+            timeout=_OPERATION_TIMEOUT_SECONDS,
+        )
 
     async def commit(self) -> None:
-        await self._ws.send(json.dumps({"type": "input_text.commit"}))
+        await asyncio.wait_for(
+            self._ws.send(json.dumps({"type": "input_text.commit"})),
+            timeout=_OPERATION_TIMEOUT_SECONDS,
+        )
 
     def events(self) -> AsyncIterator[dict[str, Any]]:
         return _events(self._ws)

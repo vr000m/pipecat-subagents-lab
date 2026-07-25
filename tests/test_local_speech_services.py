@@ -182,6 +182,42 @@ def test_local_tts_reports_unknown_delivery_on_provider_error() -> None:
     asyncio.run(run())
 
 
+def test_local_tts_bounds_decoded_audio_per_utterance() -> None:
+    class Client:
+        closed = False
+
+        async def append(self, _text: str) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+        async def events(self):
+            yield {"type": "response.audio.delta", "audio": "AAA="}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def run() -> None:
+        events: list[str] = []
+        client = Client()
+        service = LocalTTS(
+            TTSEndpoint("tcp", "127.0.0.1:9001"),
+            lambda event, _context: events.append(event),
+            client_factory=lambda _endpoint: client,
+            max_audio_bytes_per_utterance=1,
+        )
+        await service.start()
+
+        with pytest.raises(RuntimeError, match="audio limit"):
+            [frame async for frame in service.run_tts("hello", "utt-1")]
+
+        assert client.closed is True
+        assert events == ["synthesis_started", "delivery_unknown"]
+
+    asyncio.run(run())
+
+
 def test_local_stt_dispatches_routing_without_blocking_audio_frame_delivery() -> None:
     class Client:
         async def send_audio(self, _audio: bytes) -> None:

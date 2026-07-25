@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -44,7 +43,6 @@ class SpeechScheduler:
         self._queues: dict[str, list[SpeechItem]] = {}
         self._active: UtteranceLease | None = None
         self._paused: dict[str, SpeechItem] = {}
-        self._awaiting_provider_context: deque[str] = deque()
         self._provider_contexts: dict[str, str] = {}
         self._stop_tasks: set[asyncio.Future[Any]] = set()
 
@@ -123,8 +121,6 @@ class SpeechScheduler:
         self._queues[item.work_item_id].pop(0)
         lease = UtteranceLease(item, uuid4().hex)
         self._active = lease
-        if self.speak is not None:
-            self._awaiting_provider_context.append(lease.token)
         self.state.speech_progress(**self._progress(item), state=DeliveryState.STARTED)
         try:
             if self.speak is not None:
@@ -132,21 +128,20 @@ class SpeechScheduler:
                 if isinstance(outcome, Awaitable):
                     await outcome
         except BaseException:
-            if self.speak is not None:
-                try:
-                    self._awaiting_provider_context.remove(lease.token)
-                except ValueError:
-                    pass
             self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_UNKNOWN)
             self._release(item.utterance_id)
             raise
         return item
 
     def provider_started(self, context_id: str) -> None:
-        """Bind a Pipecat-generated TTS context to the lease that queued it."""
-        if context_id in self._provider_contexts or not self._awaiting_provider_context:
+        """Bind a correlated Pipecat TTS context to its active scheduler lease."""
+        if (
+            context_id in self._provider_contexts
+            or self._active is None
+            or context_id != self._active.item.utterance_id
+        ):
             return
-        self._provider_contexts[context_id] = self._awaiting_provider_context.popleft()
+        self._provider_contexts[context_id] = self._active.token
 
     def provider_synthesis_ended(self, context_id: str) -> bool:
         item = self._provider_item(context_id)
@@ -290,10 +285,6 @@ class SpeechScheduler:
     def _release(self, utterance_id: str) -> None:
         if self._active and self._active.item.utterance_id == utterance_id:
             token = self._active.token
-            # Keep an unbound token as a tombstone. Pipecat allocates the
-            # provider context after TTSSpeakFrame is queued, so a delayed
-            # synthesis_started for this interrupted lease must consume this
-            # token instead of binding to the replacement utterance.
             self._provider_contexts = {
                 context_id: lease_token
                 for context_id, lease_token in self._provider_contexts.items()

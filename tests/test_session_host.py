@@ -72,6 +72,21 @@ def test_start_replacement_and_shutdown_preserve_process_lifetime_worker_registr
     asyncio.run(run())
 
 
+def test_session_host_adopts_or_rejects_the_coordinator_registry() -> None:
+    registry = WorkerRegistry()
+    coordinator = type("Coordinator", (), {"registry": registry})()
+
+    adopted = SessionHost(coordinator=coordinator)
+    assert adopted.registry is registry
+
+    try:
+        SessionHost(registry=WorkerRegistry(), coordinator=coordinator)
+    except ValueError as exc:
+        assert "share one WorkerRegistry" in str(exc)
+    else:
+        raise AssertionError("divergent registries were accepted")
+
+
 def test_replacement_interrupts_only_old_connection_speech_and_keeps_result_history() -> None:
     async def run() -> None:
         host = SessionHost()

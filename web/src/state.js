@@ -163,6 +163,17 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
   if (!snapshot && state.sessionId && message.session_id !== state.sessionId) return state;
   if (!snapshot && state.connectionEpoch !== null && message.origin_epoch !== state.connectionEpoch) return state;
   if (snapshot) {
+    if (state.sessionId && snapshot.session_id && snapshot.session_id !== state.sessionId) {
+      state = {
+        ...createInitialState(),
+        connection: state.connection,
+        localDiagnostics: {
+          ...EMPTY_DIAGNOSTICS,
+          gaps: state.localDiagnostics.gaps,
+          message: state.localDiagnostics.message,
+        },
+      };
+    }
     const snapshotSequence = Number(snapshot.snapshot_sequence ?? sequence);
     if (snapshotSequence < Math.max(state.lastAppliedSequence, state.localDiagnostics.lastSnapshotSequence)) return state;
     const snapshotEpoch = snapshot.origin_epoch;

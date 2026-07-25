@@ -170,3 +170,23 @@ def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:
     assert scheduler.active.item.utterance_id == new_item.utterance_id
     assert scheduler.state.events == events_before_callbacks
     assert scheduler.state.speech[new_item.utterance_id].state == DeliveryState.STARTED
+
+
+def test_dropped_prestart_context_cannot_claim_replacement_utterance() -> None:
+    scheduler = SpeechScheduler(SessionState(), speak=lambda _item: None)
+    old_item = enqueue(scheduler, "work-1", "old")
+    asyncio.run(scheduler.start_next())
+    scheduler.interrupt()
+
+    new_item = enqueue(scheduler, "work-2", "new")
+    asyncio.run(scheduler.start_next())
+
+    scheduler.provider_started(old_item.utterance_id)
+    assert scheduler.provider_synthesis_ended(old_item.utterance_id) is False
+    assert scheduler.active is not None
+    assert scheduler.active.item == new_item
+
+    scheduler.provider_started(new_item.utterance_id)
+    assert scheduler.provider_synthesis_ended(new_item.utterance_id) is True
+    assert scheduler.provider_delivery_unknown(new_item.utterance_id) is True
+    assert scheduler.active is None

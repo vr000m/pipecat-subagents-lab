@@ -1,6 +1,7 @@
 """Connection pipelines expose authoritative state through a fakeable observer."""
 
 import asyncio
+import threading
 
 import pytest
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -24,6 +25,7 @@ from server.config import Config
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
+from server.services.tts import CorrelatedTTSSpeakFrame
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.work_item_coordinator import LateResult, WorkItemCoordinator
 from server.workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
@@ -200,6 +202,16 @@ class FakeTTS:
     def __init__(self) -> None:
         self.on_event = None
 
+    @staticmethod
+    def correlated_speak_frame(
+        text: str, *, correlation_id: str, append_to_context: bool
+    ) -> CorrelatedTTSSpeakFrame:
+        return CorrelatedTTSSpeakFrame(
+            text=text,
+            correlation_id=correlation_id,
+            append_to_context=append_to_context,
+        )
+
 
 class QueueingPipelineWorker:
     def __init__(self) -> None:
@@ -268,8 +280,9 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
             origin_epoch=1,
         )
 
-        await tts.on_event("synthesis_started", "pipecat-generated-context")
-        await tts.on_event("synthesis_ended", "pipecat-generated-context")
+        assert worker.frames[0].correlation_id == utterance_id
+        await tts.on_event("synthesis_started", utterance_id)
+        await tts.on_event("synthesis_ended", utterance_id)
         assert host.state.speech[utterance_id].state.value == "delivery_unknown"
         assert len(worker.frames) == 2
         assert connection.scheduler.active is not None
@@ -861,15 +874,62 @@ def test_cancel_fences_cancellation_resistant_worker_result_and_speech() -> None
         await worker.started.wait()
 
         await host._handle_transcript("cancel work-turn-1")
-        result = await pending
+        with pytest.raises(asyncio.CancelledError):
+            await pending
 
         assert worker.cancelled.is_set()
-        assert result.text == "Answer for slow search"
         assert host.state.result_history("worker-search") == ()
         assert all(
-            not isinstance(frame, TTSSpeakFrame) or frame.text != result.spoken_text
+            not isinstance(frame, TTSSpeakFrame) or frame.text != "Spoken answer for slow search"
             for frame in connection.worker.frames
         )
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_fences_a_turn_while_router_arbitration_is_still_running() -> None:
+    async def run() -> None:
+        class BlockingRouterCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(ResultWorker())
+                self.routing_started = threading.Event()
+                self.release_routing = threading.Event()
+
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                if transcript == "cancel":
+                    return type(
+                        "Outcome",
+                        (),
+                        {
+                            "kind": "control",
+                            "decision": None,
+                            "work_items": (),
+                            "control_action": "cancel",
+                        },
+                    )()
+                self.routing_started.set()
+                self.release_routing.wait(timeout=2)
+                return super().arbitrate(_session_id, transcript)
+
+        coordinator = BlockingRouterCoordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=coordinator,
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        pending = asyncio.create_task(host._handle_transcript("slow route"))
+        await asyncio.to_thread(coordinator.routing_started.wait, 1)
+
+        cancellation = await host._handle_transcript("cancel")
+        coordinator.release_routing.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        assert cancellation.text == "Cancelling the active response."
+        assert host.state.result_history("worker-search") == ()
         await host.shutdown()
 
     asyncio.run(run())

@@ -1,6 +1,8 @@
 """Bounded work items preserve accepted order and isolate worker contexts."""
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -62,6 +64,42 @@ def test_natural_clarification_answer_continues_with_the_pending_worker() -> Non
     assert outcome.kind == "continue_pending"
     assert outcome.pending_dialogue == pending
     assert outcome.work_items == ("worker-1",)
+    assert coordinator.pending("session") is None
+
+
+def test_concurrent_turns_cannot_both_consume_one_pending_clarification() -> None:
+    class Registry:
+        config = Config()
+
+        @staticmethod
+        def catalogue() -> tuple[()]:
+            return ()
+
+    class Router:
+        @staticmethod
+        def route_envelope(_transcript: str, _catalogue: object) -> object:
+            return type("Envelope", (), {"decision": object(), "prose": None})()
+
+    coordinator = WorkItemCoordinator(registry=Registry(), router=Router(), clock=lambda: 0)
+    coordinator.add_pending(PendingDialogue("session", "worker", "worker-1", "turn", "result", 10))
+    classifier_started = threading.Event()
+    release_classifier = threading.Event()
+    classify = coordinator.pending_intent
+
+    def slow_classify(transcript: str) -> str:
+        classifier_started.set()
+        release_classifier.wait(timeout=1)
+        return classify(transcript)
+
+    coordinator.pending_intent = slow_classify  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(coordinator.arbitrate, "session", "Riga")
+        assert classifier_started.wait(timeout=1)
+        second = executor.submit(coordinator.arbitrate, "session", "Latvia")
+        release_classifier.set()
+        outcomes = (first.result(timeout=1), second.result(timeout=1))
+
+    assert sorted(outcome.kind for outcome in outcomes) == ["continue_pending", "routed"]
     assert coordinator.pending("session") is None
 
 

@@ -4,6 +4,8 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from server.services import ws_clients
 
 
@@ -11,6 +13,7 @@ class FakeWebSocket:
     def __init__(self, *events: dict) -> None:
         self.events = [json.dumps(event) for event in events]
         self.sent: list[dict] = []
+        self.closed = False
 
     async def recv(self) -> str:
         return self.events.pop(0)
@@ -19,7 +22,14 @@ class FakeWebSocket:
         self.sent.append(json.loads(raw))
 
     async def close(self) -> None:
-        pass
+        self.closed = True
+
+    def __aiter__(self):
+        async def events():
+            while self.events:
+                yield self.events.pop(0)
+
+        return events()
 
 
 def test_stt_client_applies_language_after_compatibility_handshake(monkeypatch) -> None:
@@ -74,5 +84,18 @@ def test_tts_client_applies_voice_during_session_creation(monkeypatch) -> None:
         assert hello["audio"]["rate"] == 24_000
         assert socket.sent == [{"type": "session.update", "voice": "azelma"}]
         await client.close()
+
+    asyncio.run(run())
+
+
+def test_event_stream_closes_when_its_event_budget_is_exceeded(monkeypatch) -> None:
+    async def run() -> None:
+        socket = FakeWebSocket({"type": "one"}, {"type": "two"})
+        monkeypatch.setattr(ws_clients, "_MAX_EVENT_COUNT", 1)
+
+        with pytest.raises(RuntimeError, match="event stream limit"):
+            [event async for event in ws_clients._events(socket)]
+
+        assert socket.closed is True
 
     asyncio.run(run())

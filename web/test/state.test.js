@@ -276,6 +276,26 @@ describe("server-authoritative runtime reducer", () => {
     expect(state.transcript).toEqual(transcript);
   });
 
+  test("a restarted server session resets ordering fences before applying its snapshot", () => {
+    let state = applyServerMessage(createInitialState(), snapshot(20, [result("old-process")]));
+    state = applyServerMessage(state, {
+      ...snapshot(0, [result("new-process")]),
+      sequence: 0,
+      session_id: "session-2",
+      origin_epoch: 1,
+      data: {
+        ...snapshot(0).data,
+        session_id: "session-2",
+        snapshot_sequence: 0,
+        results: [result("new-process")],
+      },
+    });
+
+    expect(state.sessionId).toBe("session-2");
+    expect(state.lastAppliedSequence).toBe(0);
+    expect(state.results.map(({ result_id }) => result_id)).toEqual(["new-process"]);
+  });
+
   test("does not let a duplicate canonical result event create a second historical entry", () => {
     let state = applyServerMessage(createInitialState(), snapshot(1));
     state = applyServerMessage(state, increment(2, "result-1"));
