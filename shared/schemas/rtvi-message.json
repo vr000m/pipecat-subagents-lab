@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/rtvi-message.json",
+  "title": "RTVIMessage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "session_id", "sequence", "kind", "data", "origin_epoch"],
+  "properties": {
+    "contract_version": {"const": "v1.0"},
+    "session_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 0},
+    "kind": {
+      "enum": [
+        "runtime_snapshot",
+        "result",
+        "speech_progress",
+        "worker",
+        "routing",
+        "user_transcript",
+        "bot_transcript"
+      ]
+    },
+    "data": {"type": "object"},
+    "origin_epoch": {"type": "integer", "minimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "runtime_snapshot"}}},
+      "then": {"properties": {"data": {"$ref": "runtime-snapshot.json"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "result"}}},
+      "then": {"properties": {"data": {"$ref": "grounded-result.json"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "speech_progress"}}},
+      "then": {"properties": {"data": {"$ref": "speech-progress.json"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "worker"}}},
+      "then": {"properties": {"data": {"$ref": "worker-state.json"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "routing"}}},
+      "then": {"properties": {"data": {"$ref": "routing-state.json"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "user_transcript"}}},
+      "then": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {"$ref": "transcript-entry.json"},
+              {"properties": {"role": {"const": "user"}}}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "bot_transcript"}}},
+      "then": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {"$ref": "transcript-entry.json"},
+              {"properties": {"role": {"const": "assistant"}}}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

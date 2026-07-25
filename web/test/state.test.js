@@ -11,20 +11,35 @@ const result = (resultId) => ({
   ui_text: `Complete answer ${resultId}`,
   spoken_text: `Spoken answer ${resultId}`,
   citations: [{ title: "Weather service", url: "https://weather.example.test" }],
+  spoken_result_id: resultId,
+  ui_result_id: resultId,
+  spoken_citations: [{ title: "Weather service", url: "https://weather.example.test" }],
+  ui_citations: [{ title: "Weather service", url: "https://weather.example.test" }],
+  origin_epoch: 1,
 });
 
 const snapshot = (sequence, results = []) => ({
   kind: "runtime_snapshot",
   sequence,
   session_id: "session-1",
+  origin_epoch: 1,
   data: {
+    contract_version: "v1.0",
     session_id: "session-1",
     snapshot_sequence: sequence,
-    workers: [{ worker_id: "worker-weather", topic: "weather", model_policy: "deep", status: "idle" }],
+    workers: [{
+      worker_id: "worker-weather",
+      topic: "weather",
+      model_policy: "deep",
+      status: "idle",
+      latest_result_id: null,
+      origin_epoch: 1,
+    }],
     results,
     speech_progress: [],
     routing: null,
     transcript: [],
+    origin_epoch: 1,
   },
 });
 
@@ -32,6 +47,7 @@ const increment = (sequence, resultId) => ({
   kind: "result",
   sequence,
   session_id: "session-1",
+  origin_epoch: 1,
   data: result(resultId),
 });
 
@@ -99,7 +115,14 @@ describe("server-authoritative runtime reducer", () => {
       ...snapshot(9, [result("authoritative-after-reconnect")]),
       data: {
         ...snapshot(9).data,
-        workers: [{ worker_id: "worker-news", topic: "news", model_policy: "fast", status: "working" }],
+        workers: [{
+          worker_id: "worker-news",
+          topic: "news",
+          model_policy: "fast",
+          status: "working",
+          latest_result_id: null,
+          origin_epoch: 1,
+        }],
         results: [result("authoritative-after-reconnect")],
       },
     });
@@ -157,35 +180,69 @@ describe("server-authoritative runtime reducer", () => {
       kind: "routing",
       sequence: 2,
       session_id: "session-1",
-      data: { action: "existing_worker", worker_id: "worker-weather" },
+      origin_epoch: 1,
+      data: {
+        turn_id: "turn-1",
+        action: "existing_worker",
+        worker_id: "worker-weather",
+        worker_type: "web_search",
+        topic: "weather",
+        model_policy: "deep",
+        origin_epoch: 1,
+      },
     });
     state = applyServerMessage(state, {
       kind: "user_transcript",
       sequence: 3,
       session_id: "session-1",
-      data: { text: "What is the weather?", turn_id: "turn-1" },
+      origin_epoch: 1,
+      data: {
+        role: "user",
+        text: "What is the weather?",
+        turn_id: "turn-1",
+        timestamp: "2026-07-18T10:00:00Z",
+        origin_epoch: 1,
+      },
     });
     state = applyServerMessage(state, {
       kind: "worker",
       sequence: 4,
       session_id: "session-1",
-      data: { worker: { worker_id: "worker-weather", topic: "weather", status: "working" } },
+      origin_epoch: 1,
+      data: {
+        worker_id: "worker-weather",
+        topic: "weather",
+        model_policy: "deep",
+        status: "working",
+        latest_result_id: null,
+        origin_epoch: 1,
+      },
     });
     state = applyServerMessage(state, {
       kind: "result",
       sequence: 5,
       session_id: "session-1",
-      data: { result: result("result-1") },
+      origin_epoch: 1,
+      data: result("result-1"),
     });
     state = applyServerMessage(state, {
-      kind: "speech",
+      kind: "speech_progress",
       sequence: 6,
       session_id: "session-1",
-      data: { progress: { utterance_id: "utterance-1", result_id: "result-1", state: "delivery_unknown" } },
+      origin_epoch: 1,
+      data: {
+        utterance_id: "utterance-1",
+        result_id: "result-1",
+        work_item_id: "work-1",
+        run_id: "run-1",
+        state: "delivery_unknown",
+        origin_epoch: 1,
+      },
     });
 
-    expect(state.routing).toEqual({ action: "existing_worker", worker_id: "worker-weather" });
-    expect(state.transcript).toEqual([{ role: "user", text: "What is the weather?", turn_id: "turn-1" }]);
+    expect(state.routing.action).toBe("existing_worker");
+    expect(state.routing.worker_id).toBe("worker-weather");
+    expect(state.transcript[0].text).toBe("What is the weather?");
     expect(state.workers[0].status).toBe("working");
     expect(state.results).toHaveLength(1);
     expect(state.speech["utterance-1"].result_id).toBe("result-1");
@@ -219,14 +276,15 @@ describe("server-authoritative runtime reducer", () => {
     expect(state.transcript).toEqual(transcript);
   });
 
-  test("does not let a duplicate result event create a second historical entry", () => {
+  test("does not let a duplicate canonical result event create a second historical entry", () => {
     let state = applyServerMessage(createInitialState(), snapshot(1));
     state = applyServerMessage(state, increment(2, "result-1"));
     state = applyServerMessage(state, {
-      kind: "runtime_result",
+      kind: "result",
       sequence: 3,
       session_id: "session-1",
-      data: { result: { ...result("result-1"), ui_text: "late duplicate wording" } },
+      origin_epoch: 1,
+      data: { ...result("result-1"), ui_text: "late duplicate wording" },
     });
 
     expect(state.results).toHaveLength(1);

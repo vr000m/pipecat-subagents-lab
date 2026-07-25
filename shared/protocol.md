@@ -20,6 +20,27 @@ The schemas in `shared/schemas/` are the wire artifacts. Python models in
 `server/contracts.py` are the validation authority for server-produced data;
 the browser must treat provider text, titles, and URLs as untrusted.
 
+The only server-to-browser RTVI state message kinds in `v1.0` are
+`runtime_snapshot`, `result`, `speech_progress`, `worker`, `routing`,
+`user_transcript`, and `bot_transcript`. Their envelope is defined by
+`shared/schemas/rtvi-message.json`. Each message carries its payload directly
+in `data`; aliases and wrapper objects are not part of the contract. In
+particular, `runtime_result` and `speech` are not message kinds.
+
+| Kind | `data` contract |
+| --- | --- |
+| `runtime_snapshot` | `runtime-snapshot.json` |
+| `result` | `grounded-result.json` |
+| `speech_progress` | `speech-progress.json` |
+| `worker` | `worker-state.json` |
+| `routing` | `routing-state.json` |
+| `user_transcript` | `transcript-entry.json` with `role: "user"` |
+| `bot_transcript` | `transcript-entry.json` with `role: "assistant"` |
+
+The envelope and payload carry the same non-negative `origin_epoch`. Snapshot
+envelope and payload session identifiers match, as do `sequence` and
+`snapshot_sequence`.
+
 ## Identity, ordering, and nullable fields
 
 `session_id` identifies durable process state. `turn_id` identifies a user

@@ -127,29 +127,27 @@ function addResult(state, result) {
 
 function applyIncrement(state, payload) {
   switch (payload.kind) {
-    case "runtime_result":
     case "result":
-      return addResult(state, payload.data?.result ?? payload.data ?? payload.result ?? payload);
-    case "speech":
+      return addResult(state, payload.data);
     case "speech_progress": {
-      const progress = payload.data?.progress ?? payload.data ?? payload.progress ?? payload;
+      const progress = payload.data;
       const projected = projectedSpeech(progress);
       if (!projected) return state;
       return { ...state, speech: { ...state.speech, [projected.utterance_id]: projected } };
     }
     case "worker": {
-      const worker = payload.data?.worker ?? payload.data ?? payload.worker ?? payload;
+      const worker = payload.data;
       const projected = projectedWorker(worker);
       if (!projected) return state;
       return { ...state, workers: [...state.workers.filter((item) => item.worker_id !== projected.worker_id), projected] };
     }
     case "routing":
-      return { ...state, routing: payload.data?.routing ?? payload.data ?? payload.routing ?? payload };
+      return { ...state, routing: payload.data };
     case "user_transcript":
     case "bot_transcript":
       return {
         ...state,
-        transcript: [...state.transcript, { ...(payload.data ?? payload), role: payload.kind === "user_transcript" ? "user" : "assistant" }],
+        transcript: [...state.transcript, { ...payload.data, role: payload.kind === "user_transcript" ? "user" : "assistant" }],
       };
     default:
       return state;
@@ -161,7 +159,7 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
   if (!message || typeof message !== "object") return state;
   const sequence = Number(message.sequence ?? 0);
   const kind = message.kind;
-  const snapshot = kind === "runtime_snapshot" ? message.data ?? message.snapshot : null;
+  const snapshot = kind === "runtime_snapshot" ? message.data : null;
   if (!snapshot && state.sessionId && message.session_id !== state.sessionId) return state;
   if (!snapshot && state.connectionEpoch !== null && message.origin_epoch !== state.connectionEpoch) return state;
   if (snapshot) {

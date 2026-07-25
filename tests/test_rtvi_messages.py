@@ -1,7 +1,21 @@
 """RTVI state messages expose ordered runtime projections, not raw diagnostics."""
 
-from server.contracts import DeliveryState, GroundedResult, RuntimeSnapshot, SpeechProgress
-from server.rtvi_messages import RTVIMessagePublisher
+import json
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from server.contracts import (
+    DeliveryState,
+    GroundedResult,
+    RoutingState,
+    RuntimeSnapshot,
+    SpeechProgress,
+    TranscriptEntry,
+    WorkerState,
+)
+from server.rtvi_messages import RTVI_MESSAGE_KINDS, RTVIMessage, RTVIMessagePublisher
 
 
 def test_messages_have_monotonic_sequences_and_reject_stale_epoch_emission() -> None:
@@ -15,7 +29,7 @@ def test_messages_have_monotonic_sequences_and_reject_stale_epoch_emission() -> 
         ui_text="Rain is likely.",
     )
     first = publisher.result(result, origin_epoch=4)
-    second = publisher.speech(
+    second = publisher.speech_progress(
         SpeechProgress(
             result_id="result-1",
             work_item_id="work-1",
@@ -61,7 +75,7 @@ def test_first_ready_snapshot_is_schema_complete_before_authoritative_state_is_s
         "speech_progress": [],
         "routing": None,
         "transcript": [],
-        "origin_epoch": None,
+        "origin_epoch": 1,
     }
     RuntimeSnapshot.model_validate(snapshot.data)
 
@@ -73,7 +87,7 @@ def test_stale_epoch_cannot_advance_sequence_or_emit_after_readiness() -> None:
 
     assert first is not None
     assert (
-        publisher.speech(
+        publisher.speech_progress(
             SpeechProgress(
                 result_id="result-1",
                 work_item_id="work-1",
@@ -143,7 +157,7 @@ def test_high_snapshot_sequence_is_shared_with_envelope_and_following_events() -
 
     snapshot = publisher.snapshot()
     repeated_snapshot = publisher.snapshot()
-    event = publisher.speech(
+    event = publisher.speech_progress(
         SpeechProgress(
             result_id="result-1",
             work_item_id="work-1",
@@ -176,3 +190,127 @@ def test_repeated_zero_snapshot_requests_do_not_advance_authoritative_watermark(
     assert first.data["snapshot_sequence"] == 0
     assert second is not None and second.sequence == 0
     assert second.data["snapshot_sequence"] == 0
+
+
+def test_python_message_kinds_match_the_shared_wire_schema() -> None:
+    schema = json.loads(
+        (Path(__file__).parents[1] / "shared" / "schemas" / "rtvi-message.json").read_text()
+    )
+
+    assert tuple(schema["properties"]["kind"]["enum"]) == RTVI_MESSAGE_KINDS
+    assert "runtime_result" not in RTVI_MESSAGE_KINDS
+    assert "speech" not in RTVI_MESSAGE_KINDS
+
+
+def test_every_versioned_message_kind_validates_its_direct_payload() -> None:
+    epoch = 3
+    session_id = "session-parity"
+    RuntimeSnapshot.reset_monotonicity(session_id)
+    result = GroundedResult(
+        result_id="result-1",
+        worker_id="worker-1",
+        turn_id="turn-1",
+        text="Answer",
+        spoken_text="Answer",
+        ui_text="Answer",
+        origin_epoch=epoch,
+    )
+    payloads = {
+        "runtime_snapshot": RuntimeSnapshot(
+            contract_version="v1.0",
+            session_id=session_id,
+            snapshot_sequence=7,
+            origin_epoch=epoch,
+        ),
+        "result": result,
+        "speech_progress": SpeechProgress(
+            result_id="result-1",
+            work_item_id="work-1",
+            run_id="run-1",
+            utterance_id="utterance-1",
+            state=DeliveryState.STARTED,
+            origin_epoch=epoch,
+        ),
+        "worker": WorkerState(
+            worker_id="worker-1",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=epoch,
+        ),
+        "routing": RoutingState(
+            turn_id="turn-1",
+            action="new_worker",
+            worker_type="web_search",
+            topic="weather",
+            model_policy="deep",
+            origin_epoch=epoch,
+        ),
+        "user_transcript": TranscriptEntry(
+            role="user", text="Question", turn_id="turn-1", origin_epoch=epoch
+        ),
+        "bot_transcript": TranscriptEntry(
+            role="assistant", text="Answer", turn_id="turn-1", origin_epoch=epoch
+        ),
+    }
+
+    for kind in RTVI_MESSAGE_KINDS:
+        message = RTVIMessage(
+            session_id=session_id,
+            sequence=7 if kind == "runtime_snapshot" else 8,
+            kind=kind,
+            data=payloads[kind].model_dump(mode="json"),
+            origin_epoch=epoch,
+        )
+        assert message.kind == kind
+
+
+@pytest.mark.parametrize("kind", ["runtime_result", "speech"])
+def test_undocumented_message_aliases_are_rejected(kind: str) -> None:
+    with pytest.raises(ValidationError):
+        RTVIMessage(
+            session_id="session-1",
+            sequence=1,
+            kind=kind,
+            data={},
+            origin_epoch=1,
+        )
+
+
+def test_envelope_rejects_payload_kind_epoch_and_snapshot_fence_mismatches() -> None:
+    worker = WorkerState(
+        worker_id="worker-1",
+        topic="weather",
+        model_policy="deep",
+        status="idle",
+        origin_epoch=2,
+    )
+    with pytest.raises(ValidationError, match="result_id"):
+        RTVIMessage(
+            session_id="session-1",
+            sequence=1,
+            kind="result",
+            data=worker.model_dump(mode="json"),
+            origin_epoch=2,
+        )
+    with pytest.raises(ValidationError, match="origin_epoch"):
+        RTVIMessage(
+            session_id="session-1",
+            sequence=1,
+            kind="worker",
+            data=worker.model_dump(mode="json"),
+            origin_epoch=3,
+        )
+    with pytest.raises(ValidationError, match="snapshot_sequence"):
+        RTVIMessage(
+            session_id="session-1",
+            sequence=2,
+            kind="runtime_snapshot",
+            data=RuntimeSnapshot(
+                contract_version="v1.0",
+                session_id="session-1",
+                snapshot_sequence=1,
+                origin_epoch=2,
+            ).model_dump(mode="json"),
+            origin_epoch=2,
+        )

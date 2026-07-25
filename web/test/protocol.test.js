@@ -1,10 +1,35 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { createClientProtocol, validateServerMessage } from "../src/protocol.js";
+import {
+  createClientProtocol,
+  RTVI_MESSAGE_KINDS,
+  validateServerMessage,
+} from "../src/protocol.js";
 
 const appSource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8");
 const indexSource = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 const packageSource = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const messageSchema = JSON.parse(
+  readFileSync(new URL("../../shared/schemas/rtvi-message.json", import.meta.url), "utf8"),
+);
+const result = (resultId, originEpoch = 1) => {
+  const citations = [{ title: "Source", url: "https://example.com/source" }];
+  return {
+    result_id: resultId,
+    worker_id: "worker-1",
+    turn_id: "turn-1",
+    timestamp: "2026-07-23T10:00:00Z",
+    text: "The complete sourced answer for the browser.",
+    citations,
+    spoken_text: "Here is the short spoken answer.",
+    ui_text: "The complete sourced answer for the browser.",
+    spoken_result_id: resultId,
+    ui_result_id: resultId,
+    spoken_citations: citations,
+    ui_citations: citations,
+    origin_epoch: originEpoch,
+  };
+};
 
 test("browser entrypoint requests microphone capture on explicit connect", () => {
   expect(appSource).toContain("enableMic: true");
@@ -43,8 +68,25 @@ test("browser entrypoint has a Bun build that bundles bare package imports", () 
   expect(packageSource.scripts.build).toBe("bun build --target browser --outfile dist/app.js src/app.js");
 });
 
-test("validates versioned RTVI messages and rejects private server fields", () => {
-  expect(validateServerMessage({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 1, data: { result: { result_id: "r1" } } })).toBe(true);
+test("browser message kinds match the shared v1 envelope schema", () => {
+  expect(RTVI_MESSAGE_KINDS).toEqual(messageSchema.properties.kind.enum);
+  expect(RTVI_MESSAGE_KINDS).not.toContain("runtime_result");
+  expect(RTVI_MESSAGE_KINDS).not.toContain("speech");
+});
+
+test("validates versioned RTVI messages and rejects aliases, wrappers, and private fields", () => {
+  const message = {
+    contract_version: "v1.0",
+    session_id: "session-1",
+    kind: "result",
+    sequence: 1,
+    origin_epoch: 1,
+    data: result("r1"),
+  };
+  expect(validateServerMessage(message)).toBe(true);
+  expect(validateServerMessage({ ...message, kind: "runtime_result" })).toBe(false);
+  expect(validateServerMessage({ ...message, kind: "speech" })).toBe(false);
+  expect(validateServerMessage({ ...message, data: { result: result("r1") } })).toBe(false);
   expect(validateServerMessage({ contract_version: "v1.0", kind: "result", sequence: 1, data: { prompt: "private" } })).toBe(false);
   expect(validateServerMessage({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: -1, data: {} })).toBe(false);
   expect(validateServerMessage({ contract_version: "v2.0", session_id: "session-1", kind: "result", sequence: 99, data: {} })).toBe(false);
@@ -61,6 +103,7 @@ test("requires complete runtime snapshots and preserves state on malformed snaps
     kind: "runtime_snapshot",
     sequence: 1,
     session_id: "session-1",
+    origin_epoch: 1,
     data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
   };
   await protocol.receive(validSnapshot);
@@ -82,38 +125,25 @@ test("accepts a complete runtime snapshot with an envelope session id", () => {
     kind: "runtime_snapshot",
     sequence: 3,
     session_id: "session-1",
+    origin_epoch: 1,
     data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 3, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
 })).toBe(true);
 });
 
 test("accepts a full display result with a separate concise spoken projection", () => {
-  const citations = [{ title: "Source", url: "https://example.com/source" }];
-  const result = {
-    result_id: "result-1",
-    worker_id: "worker-1",
-    turn_id: "turn-1",
-    timestamp: "2026-07-23T10:00:00Z",
-    text: "The complete sourced answer for the browser.",
-    citations,
-    spoken_text: "Here is the short spoken answer.",
-    ui_text: "The complete sourced answer for the browser.",
-    spoken_result_id: "result-1",
-    ui_result_id: "result-1",
-    spoken_citations: citations,
-    ui_citations: citations,
-    origin_epoch: 1,
-  };
+  const payload = result("result-1");
   const message = {
     contract_version: "v1.0",
     kind: "runtime_snapshot",
     sequence: 4,
     session_id: "session-1",
+    origin_epoch: 1,
     data: {
       contract_version: "v1.0",
       session_id: "session-1",
       snapshot_sequence: 4,
       workers: [],
-      results: [result],
+      results: [payload],
       speech_progress: [],
       routing: null,
       transcript: [],
@@ -124,11 +154,11 @@ test("accepts a full display result with a separate concise spoken projection", 
   expect(validateServerMessage(message)).toBe(true);
   expect(validateServerMessage({
     ...message,
-    data: { ...message.data, results: [{ ...result, spoken_text: "" }] },
+    data: { ...message.data, results: [{ ...payload, spoken_text: "" }] },
   })).toBe(false);
   expect(validateServerMessage({
     ...message,
-    data: { ...message.data, results: [{ ...result, ui_text: "Different UI facts." }] },
+    data: { ...message.data, results: [{ ...payload, ui_text: "Different UI facts." }] },
   })).toBe(false);
 });
 
@@ -167,6 +197,58 @@ test("validates server-authored routing and semantic transcript messages", () =>
   expect(validateServerMessage({ ...transcript, data: { ...transcript.data, role: "assistant" } })).toBe(false);
 });
 
+test("validates every canonical increment payload and matching epoch fence", () => {
+  const base = {
+    contract_version: "v1.0",
+    session_id: "session-1",
+    sequence: 2,
+    origin_epoch: 1,
+  };
+  const messages = [
+    { ...base, kind: "result", data: result("result-1") },
+    {
+      ...base,
+      kind: "speech_progress",
+      data: {
+        result_id: "result-1",
+        work_item_id: "work-1",
+        run_id: "run-1",
+        utterance_id: "utterance-1",
+        state: "started",
+        origin_epoch: 1,
+      },
+    },
+    {
+      ...base,
+      kind: "worker",
+      data: {
+        worker_id: "worker-1",
+        topic: "weather",
+        model_policy: "deep",
+        status: "idle",
+        latest_result_id: null,
+        origin_epoch: 1,
+      },
+    },
+    {
+      ...base,
+      kind: "bot_transcript",
+      data: {
+        role: "assistant",
+        text: "Answer",
+        turn_id: "turn-1",
+        timestamp: "2026-07-23T10:00:00Z",
+        origin_epoch: 1,
+      },
+    },
+  ];
+
+  expect(messages.every(validateServerMessage)).toBe(true);
+  expect(validateServerMessage({ ...messages[0], origin_epoch: 2 })).toBe(false);
+  expect(validateServerMessage({ ...messages[1], data: { ...messages[1].data, extra: true } })).toBe(false);
+  expect(validateServerMessage({ ...messages[2], data: { ...messages[2].data, status: null } })).toBe(false);
+});
+
 test("rejects an unsupported contract before it advances sequence state", async () => {
   const protocol = createClientProtocol({ requestSnapshot: () => {} });
 
@@ -179,9 +261,10 @@ test("rejects an unsupported contract before it advances sequence state", async 
     session_id: "session-1",
     kind: "runtime_snapshot",
     sequence: 1,
+    origin_epoch: 1,
     data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 1, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
   });
-  await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, origin_epoch: 1, data: { result_id: "accepted" } });
+  await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 2, origin_epoch: 1, data: result("accepted") });
   expect(protocol.getState().lastAppliedSequence).toBe(2);
 });
 
@@ -203,6 +286,7 @@ test("gates the first snapshot request on client readiness and ignores stale inc
     kind: "runtime_snapshot",
     sequence: 10,
     session_id: "session-1",
+    origin_epoch: 1,
     data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 10, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
   });
   await protocol.receive({ contract_version: "v1.0", session_id: "session-1", kind: "result", sequence: 9, data: { result_id: "stale" } });
