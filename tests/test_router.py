@@ -113,13 +113,23 @@ def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validatio
     assert decision.worker_id == model.calls[0]["catalogue"][0].worker_id
 
 
-def test_router_returns_decision_and_prose_atomically_across_concurrent_calls() -> None:
+def test_router_passes_request_local_prompts_across_concurrent_calls() -> None:
     barrier = threading.Barrier(2)
     catalogue_snapshot = WorkerCatalogue("catalogue-empty", (), (), ())
+    provider_prompts: list[str] = []
+
+    class InterleavedRouter(Router):
+        coordinate_calls = False
+
+        def __getattribute__(self, name: str) -> object:
+            value = super().__getattribute__(name)
+            if name == "_call" and self.coordinate_calls:
+                barrier.wait()
+            return value
 
     def call(prompt: str) -> dict[str, object]:
+        provider_prompts.append(prompt)
         transcript = prompt.rsplit("transcript=", 1)[1]
-        barrier.wait()
         return {
             "decision": {
                 "action": "direct",
@@ -128,7 +138,8 @@ def test_router_returns_decision_and_prose_atomically_across_concurrent_calls() 
             "prose": f"prose-{transcript}",
         }
 
-    router = Router(call=call)
+    router = InterleavedRouter(call=call)
+    router.coordinate_calls = True
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(router.route_envelope, "A", catalogue_snapshot)
         second = executor.submit(router.route_envelope, "B", catalogue_snapshot)
@@ -138,6 +149,7 @@ def test_router_returns_decision_and_prose_atomically_across_concurrent_calls() 
         ("prose-A", "direct"),
         ("prose-B", "direct"),
     }
+    assert {prompt.rsplit("transcript=", 1)[1] for prompt in provider_prompts} == {"A", "B"}
 
 
 @pytest.mark.parametrize("action", ["direct", "unsupported", "clarify"])

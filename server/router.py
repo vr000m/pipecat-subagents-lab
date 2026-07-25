@@ -202,11 +202,12 @@ class Router:
                     sorted({p for e in catalogue for p in (e.model_policies or {e.model_policy})})
                 ),
             )
-        self.last_prompt = catalogue.prompt(transcript)
+        prompt = catalogue.prompt(transcript)
+        self.last_prompt = prompt
         raw = (
             self.model.structured_output(transcript=transcript, catalogue=catalogue.workers)
             if self.model is not None
-            else self._call(self.last_prompt)
+            else self._call(prompt)
         )
         if isinstance(raw, RouterEnvelope):
             envelope = raw
