@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="plan-view-rich-source-sha256" content="93addf72863ad6aaed17c7f5c47f8c8d94b8d48880ee847d1fbe4b8dade1d5b1">
+<meta name="plan-view-rich-source-sha256" content="0809efbef4ef1ed5ce478ece1300d2e0f1b362cb6b8d408d32010d43a14dabf5">
 <meta name="plan-view-rich-strategy" content="sections">
 <meta name="plan-view-rich-section-count" content="14">
 <title>Task: Pipecat Web-Search Subagent and Browser RTVI Lab — rich view</title>
@@ -173,7 +173,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 <header class="plan-hero">
   <div class="meta">plan-view · rich · 20260711-feature-websearch-subagent-electron</div>
   <h1>Task: Pipecat Web-Search Subagent and Browser RTVI Lab</h1>
-  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>93addf72863a</code> · 14 sections (assembled from fragments)</div>
+  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>0809efbef4ef</code> · 14 sections (assembled from fragments)</div>
 </header>
 
 <div class="tabs" data-tabs-id="plan-20260711-feature-websearch-subagent-electron">
@@ -333,278 +333,329 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="implementation-checklist">
-<!-- plan-view-rich-section-sha256: 62b28139d0369602e6de972064db23f95504a4696cbe2fed521d316eee998915 -->
-<section class="section">
-  <h2>Implementation Checklist</h2>
-  <pre>### Phase 1: Contracts and runtime foundation
-
-**Impl files:** `pyproject.toml`, `web/package.json`, `bun.lock`, `server/config.py`, `server/preflight.py`, `server/contracts.py`, `shared/protocol.md`, `shared/schemas/*.json`
-**Test files:** `tests/test_config.py`, `tests/test_preflight.py`, `tests/test_contracts.py`
-**Test command:** `uv run pytest tests/test_config.py tests/test_preflight.py tests/test_contracts.py`
-**Validation cmd:** `uv run ruff format --check . &amp;&amp; uv run ruff check .`
-**Goal:** Version and validate routing, worker-state, grounded-result, speech-progress, and snapshot contracts before either runtime consumes them.
-
-- Initialize the Python project and pin a verified Pipecat version with the verified `openai`, `webrtc`, and `local` extras; RTVI is built in rather than installed as a separate extra.
-- Pin and record the compatible Pipecat JavaScript client version alongside the Python Pipecat version pin, and verify RTVI/Small WebRTC wire compatibility between the two before Phase 4 depends on it.
-- Create the minimal Bun manifest and lockfile needed for that client-version pin and compatibility probe; do not add browser application code in this phase.
-- Verify `LLMContextWorker`'s actual context-retention and bus-edge (`active`, `bridged`) API, and `RTVIServerMessageFrame`'s actual payload semantics, directly against the pinned Pipecat version rather than relying on the Context Hub's 2026-07-05 index description.
-- Verify the pinned `WorkerRunner(auto_end=False)`, worker registration/removal, `PipelineWorker` lifecycle, `BusBridgeProcessor` construction/attach/detach, programmatic activation, and per-connection bus topic/epoch filtering APIs. Record a fallback topology if any seam is unavailable; do not make durable-host or bridge behavior an acceptance invariant before this probe passes.
-- Probe actual pinned worker/provider capabilities for steering and cancellation. Real adapters default to `unconfirmed` until they emit a backend acknowledgement; local task cancellation alone cannot produce confirmed `cancelled`.
-- Define strict Python models and matching JSON Schemas for all versioned Python-to-browser messages.
-- Define the reconnect handshake contract (`session_id`, resume token/known-process identity, proposed epoch, and snapshot sequence) before Phase 3 transport wiring; a fresh Small WebRTC transport must attach to durable state through this contract.
-- Define an internal evented work-item contract with stable `work_item_id` (one bounded item in a parent turn), distinct `run_id` (one execution/retry), stable `worker_id`/topic identity (context owner), parent turn/aggregate IDs, event IDs/sequences, and capability flags for streaming/progress, steering, cancellation, and session continuation. Normalize `started`, `progress`, `completed`, `failed`, `cancellation_requested`, `cancelled`, `paused`, `resumed`, and late-completion events before they reach session state or UI.
-- Define the interruption event schema and producer seam with stage enum (`result_pending`, `voice_llm_accepted`, `speech_active`), policy, template-used flag, resume outcome (`resumed`, `declined`, `stale`), and linked `work_item_id`/`run_id`/`utterance_id`; these are session/utterance fields, not implicit prose-only telemetry.
-- Reserve a nullable `origin_epoch` field (default `null`/unset pre-arbiter) on turn, work-item, run, event, result, utterance, pending-dialogue, and control contract models so Phase 3's connection-epoch arbiter can populate it without reopening this Phase 1 contract; after acceptance, epoch-less callbacks are invalid.
-- Define configurable router/worker model policy without embedding credentials or treating model names emitted by an LLM as trusted.
-- Define and validate `max_work_items_per_turn` as an operator configuration (default `2`) so bounded multi-intent decomposition can be raised to `3` or `4` without changing the cross-runtime protocol.
-- Define and validate `multi_intent_wait_timeout_ms` as an operator configuration for synthesis readiness (default `10_000` ms). On timeout, synthesize completed results and explicitly mark unfinished work as still running; do not block or discard completed results.
-- Define and validate configuration precedence for the OpenAI credential variable name, STT/TTS endpoint transport and address, server bind/known client URL, and router/worker model-policy mappings.
-- Add a values-redacted preflight that verifies required variable names, detects each local service endpoint form, checks protocol/health compatibility, persists the discovered endpoint transport/address into the config surface for Phase 3 adapters to read (rather than re-discovering), and reports actionable failures without printing secrets. This preflight probe stays standalone — it must not import Phase 3 adapter code, so Phase 1 completes and commits independently of Phase 3.
-- Make successful redacted configuration/service preflight a Phase 1 exit gate. Verify configured model IDs and Responses/hosted-search compatibility when credentials permit; otherwise record authenticated capability as explicitly unavailable and keep the paid smoke path opt-in rather than silently solidifying defaults.
-- Freeze separate conservative work-item/result and utterance-delivery state sets in the versioned contract: work-item/result (`started`, `progress`, `cancellation_requested`, `cancelled`, `completed`, `failed`) and delivery (`displayed`, `queued`, `started`, `synthesis_ended`, `delivery_completed`, `delivery_unknown`, `interrupted`, `interrupted_by_reconnect`, `paused`, `resumed`). Define cross-entity terminal precedence and mark finer word-level progress as a forward-compatible, Phase-3-gated extension rather than speculatively schema'd now.
-- Document identifiers, ordering fields, timestamps, nullable fields, and forward-compatibility behavior in `shared/protocol.md`.
-
-### Phase 2: Persistent routing and web-search workers
-
-**Impl files:** `server/router.py`, `server/main_responder.py`, `server/registry.py`, `server/work_item_coordinator.py`, `server/workers/base.py`, `server/workers/web_search.py`, `server/results.py`
-**Test files:** `tests/test_router.py`, `tests/test_main_responder.py`, `tests/test_registry.py`, `tests/test_work_item_coordinator.py`, `tests/test_web_search_worker.py`, `tests/test_results.py`
-**Test command:** `uv run pytest tests/test_router.py tests/test_main_responder.py tests/test_registry.py tests/test_work_item_coordinator.py tests/test_web_search_worker.py tests/test_results.py`
-**Validation cmd:** `uv run ruff format --check . &amp;&amp; uv run ruff check .`
-**Goal:** Validated routing decisions select one or a bounded set of persistent context owners, and canonical grounded results remain the sole source for speech and UI output.
-
-- Build an immutable per-turn worker catalogue from registry state, pass it into the tool-free router prompt, and validate the result against the same snapshot before dispatch.
-- Validate action, worker ID, worker type, topic label, domain capability, and configured model policy before dispatch.
-- Implement one tool-free structured-output envelope: the model returns the routing decision and optional prose together; Python validates the entire envelope against the catalogue before any side effect, then emits the validated prose for `direct`, `unsupported`, and router-owned `clarify` outcomes. Worker-delegated `existing_worker`/`new_worker` outcomes remain a distinct dispatch since they hand off to a different context-owning component entirely.
-- Implement a process-lifetime worker registry whose workers are Pipecat `LLMContextWorker` instances (or a thin subclass), with stable IDs, topic metadata, status, an explicit no-eviction first-slice policy, and one causal mailbox per worker built on top of `LLMContextWorker`'s own `active`/`bridged` scheduling rather than a fully parallel activation model.
-- Serialize each worker's operations in accepted-turn order through its mailbox. A later same-worker turn waits for earlier work and therefore reads the context after earlier immutable commits; different workers remain independently concurrent.
-- Implement a context-owning web-search worker using OpenAI hosted `web_search`; let it clarify or decline requests that search cannot satisfy.
-- Configure OpenAI Responses calls with `store=False` unless a later reviewed decision explicitly requires provider retention. Document which transcript/query/context fields leave the process, verify the pinned Pipecat adapter preserves the setting across worker calls, and note that `store=False` is treated as a backend-semantics assumption (its exact provider-side retention guarantee is not independently verifiable from this repo) rather than a settled fact.
-- When a worker asks a clarification, record a pending-dialogue candidate by session with owner kind/worker ID, originating turn/result ID, and expiry, using an injectable/fake clock so expiry timing is deterministic in tests rather than wall-clock dependent.
-- Arbitrate every final transcript before dispatch. Run deterministic control-intent checks first; classify explicit pause/resume/cancel/consent controls with a target `work_item_id` when present. Then, when pending candidates exist, a narrow tool-free classifier labels intents as `continue_pending`, `steer_same_topic`, `new_topic`, or `multi_intent`. With no pending candidates and no control intent, skip that classifier and route directly to the main router. Preserve the user's untouched wording for normal routing, and cap `multi_intent` decomposition at the validated `max_work_items_per_turn` setting.
-- Normalize provider output into a canonical grounded-result record with citations before deriving spoken/UI projections. Treat the real OpenAI Responses hosted-search citation output shape (field path, nullability, URL encoding) as an assumption until a captured real response confirms it — the Phase 1 compatibility gate verifies model/tool availability, not output schema, so this normalizer must not be written against mocked shapes alone.
-- Request one strict hosted-search response envelope containing a complete `display_text` answer and a concise, speech-safe `spoken_text` projection. The worker instructions bound the spoken form to plain speech without URLs, citation markers, Markdown, or source lists; Python validates the envelope and attaches one normalized citation set and canonical result ID to both projections.
-- Normalize citation titles and URLs at the server trust boundary. Accept only absolute `http`/`https` URLs; reject or omit unsupported schemes, relative/malformed/missing URLs, and deterministic duplicates before any browser message is emitted.
-- Cover ambiguous follow-ups, unsupported private-data requests, new/existing topic selection, hallucinated IDs, search failure, worker-level decline (search cannot satisfy the request, distinct from routing-level `unsupported`), a `store=False` assertion on outbound Responses requests, and citation/result validation.
-- Keep provider-shape verification as a Phase 1 gate: capture one authenticated hosted-search response or pin an official fixture; if neither is available, mark the normalizer/provider-shape acceptance blocked and run only clearly labelled mocked contract tests.
-
-### Phase 3: Pipecat pipeline, local speech, and observable interruption state
-
-**Impl files:** `server/app.py`, `server/pipeline.py`, `server/speech_scheduler.py`, `server/services/stt.py`, `server/services/tts.py`, `server/observers.py`, `server/session_state.py`, `server/connection_arbiter.py`
-**Test files:** `tests/test_pipeline.py`, `tests/test_session_host.py`, `tests/test_speech_scheduler.py`, `tests/test_session_state.py`, `tests/test_rtvi_messages.py`, `tests/test_interruptions.py`, `tests/test_connection_arbiter.py`
-**Test command:** `uv run pytest tests/test_pipeline.py tests/test_session_host.py tests/test_speech_scheduler.py tests/test_session_state.py tests/test_rtvi_messages.py tests/test_interruptions.py tests/test_connection_arbiter.py`
-**Validation cmd:** `uv run ruff format --check . &amp;&amp; uv run ruff check .`
-**Goal:** The runtime remains authoritative for worker/result state and emits monotonic speech-progress evidence that lets the UI show what was displayed, started, completed, or interrupted.
-
-- Start one process-lifetime `WorkerRunner(auto_end=False)` that owns the local worker bus and persistent `LLMContextWorker` registry. For each promoted browser connection, add one connection-lifetime Pipecat `PipelineWorker` whose main pipeline contains the framework `BusBridgeProcessor`; remove/deactivate that connection worker on replacement without rebuilding persistent workers or their contexts. `LLMContextWorker` `bridged` edges wrap the worker-side exchange, but do not by themselves attach it to the transport pipeline.
-- Implement and test the `SessionHost` lifecycle as startup → runner registration → worker/bridge topic attach → active connection → replacement detach/fence → clean shutdown. If the Phase 1 probe rejects a seam, use the documented fallback topology and downgrade the affected acceptance criterion rather than silently emulating it.
-- Keep the main router tool-free: validate its structured worker-selection output in application policy code, then programmatically activate the selected Pipecat worker. The bridge admits only validated canonical-result/control frames through a canonical-result adapter before TTS or UI projection; raw worker LLM text cannot bypass normalization.
-- Add a thin, connection-scoped RTVI state publisher/observer beside the bridge. It projects canonical results, worker status, speech progress, and snapshots as versioned RTVI messages; it neither owns browser state nor performs LLM work.
-- Assign monotonic session sequence numbers plus stable turn/result/`work_item_id`/`run_id`/utterance IDs to state-bearing messages and control responses.
-- Persist an ordered, unbounded (process-lifetime) history of each worker's canonical results — not only a latest-result pointer — so the browser can render a full timestamped result log and rebuild it from a snapshot after reconnect.
-- Emit full result/UI data independently of slower speech playback.
-- Track synthesis and server-side transport delivery separately. TTS stop means `synthesis_ended`, not `delivery_completed`; Phase 1/3 must identify and probe the exact downstream transport-output event and utterance-correlation seam. If no reliable seam exists, emit `delivery_unknown` and retain synthesis-only styling rather than claiming server transport completion; neither state proves browser decode, playout, or audibility.
-- Do not claim word-accurate spoken progress unless implementation evidence proves an available timing/alignment seam; the initial UI may conservatively mark the whole utterance as spoken only on completion and otherwise mark it incomplete.
-- On barge-in or explicit `stop`, route through `SpeechScheduler`, which emits Pipecat's interruption path for only the currently leased utterance. Preserve completed results and the other work items' computation/state; do not globally cancel unrelated workers. The active work item records a task-local interruption outcome and retains any resumable speech projection according to the configured interruption policy. Residual audio already buffered in the browser is unverified in this slice.
-- Start with a task-local `pause_current_work_item` policy as the default: stop current audio, let unrelated work continue, and allow an explicit later `resume`/replay request for that work item. Keep `resume_after_soft_interrupt`, `cancel_current_work_item`, and `discard_remaining_speech` as instrumented policy variants; telemetry must establish evidence before changing the default.
-- Keep `resume_after_soft_interrupt` as a separate measured variant with stage-aware behavior. If a worker result is ready but has not yet been accepted by the main voice-loop LLM, retain it as canonical pending state and let the normal voice loop consume it after the current turn; do not emit a bridge template. If the voice-loop LLM has already generated speech and Pipecat interrupts that active utterance, the voice loop may give a short bridge acknowledgement (for example, “I’ll triage that, then return to what I was saying”) and requeue the paused work item's remaining speech while the new work continues only when a verified segment/offset boundary exists. Without that seam, use whole-utterance replay or decline replay explicitly; never guess a remainder boundary. This is never used after an explicit pause/cancel request, and retained speech is held outside the discarded Pipecat frame queue with its original work-item/utterance ID.
-- The soft-interruption bridge acknowledgement is a fixed, configurable template only for the post-LLM-speech case; it is not another LLM call. Record the stage (`result_pending`, `voice_llm_accepted`, or `speech_active`), whether a template was used, and whether the retained remainder resumed, was declined, or became stale.
-- Treat the interruption policy as deliberately provisional lab configuration. Record the selected strategy, work-item IDs, interruption cause, resume/decline outcome, and resulting speech/result state so observed usage can change the default without changing the versioned RTVI contracts or Pipecat transport seam.
-- Implement snapshot request/response after client readiness or reconnection.
-- Resolve delivery races with a monotonic state machine: `completed`, `interrupted`, `interrupted_by_reconnect`, `cancelled`, and `delivery_unknown` are terminal outcomes with explicit precedence; duplicate, late, and stale events cannot change a terminal utterance. `cancellation_requested`, `paused`, and `resumed` are non-terminal until a backend-confirmed terminal event or policy expiry.
-- Issue a connection epoch on activation. Atomically promote a replacement client and disconnect or ignore every older epoch across audio/control input, snapshot requests, outbound state, and sequence streams.
-- On replacement, cancel old-epoch speech delivery and record `interrupted_by_reconnect`. Require a session identity/resume handshake when a fresh transport attaches to the durable Python process; reject stale epoch callbacks at the bus and session-state boundaries. Allow already-running router/provider work to commit a canonical result without speech; route every asynchronous callback through epoch-aware session state so only the active epoch receives incremental state.
-- Bound late old-epoch commits to append-only immutable result/context records tied to the origin turn. They cannot change active routing/status, pending-dialogue ownership, latest-result pointers, or speech scheduling unless the origin turn is still current; same-worker completions retain accepted-turn order and newer active turns supersede late interactive side effects.
-
-### Phase 4: Plain browser RTVI client
-
-**Impl files:** `web/index.html`, `web/src/app.js`, `web/src/state.js`, `web/src/render.js`, `web/src/styles.css`
-**Test files:** `web/test/state.test.js`, `web/test/render.test.js`, `web/test/protocol.test.js`
-**Test command:** `cd web &amp;&amp; bun test`
-**Validation cmd:** `cd web &amp;&amp; bun run lint`
-**Goal:** The browser renders the server-authoritative lab state and makes text-versus-speech divergence visible without becoming a second diagnostic authority.
-
-**Wireframe reference:** `docs/dev_plans/assets/20260711-feature-websearch-subagent-electron/wireframe.html` — a static, non-interactive HTML/CSS mockup (no JS logic, self-contained) covering disconnected/idle, connected mid-turn, barge-in interruption, reconnect, and multi-worker states, plus the full-width cross-worker Result Log described below. This is a design-review artifact, not implementation code; Phase 4's actual `web/` client is built from the requirements below, informed by this mockup's layout/interaction reasoning (inline HTML comments annotate which requirement each region demonstrates).
-
-- Build Connect/Disconnect and microphone controls with the Pipecat JavaScript client and Small WebRTC transport.
-- Own received remote audio explicitly in plain JavaScript: create and retain an `HTMLAudioElement`, attach/remove the remote `MediaStream` across connect, replacement, and disconnect, start playback on a user-gesture-safe path, and render an actionable autoplay-failure state.
-- Test that page initialization and connection do not acquire/publish microphone media before the explicit user gesture, and that disconnect disables capture.
-- Render transcript with compact server-authored timestamps, current routing state, persistent worker list, per-result worker identity, structured answer, and sources. For assistant results, present the exact `spoken_text` projection as the primary turn and place complete non-TTS structured output (`ui_text`, worker/turn metadata, delivery state, and citations) under a `Subagent output` disclosure. Do not label this structured result as hidden model reasoning.
-- Apply RTVI messages in session-sequence order; ignore duplicates, detect gaps, and request a snapshot when state may be incomplete. Discard any incremental message whose sequence number is older than the last-applied snapshot's sequence, so a snapshot arriving while older increments are still in flight cannot be superseded by them.
-- Render completed spoken text normally and incomplete/unspoken text grey and italic using the conservative utterance-level status from Phase 3.
-- Keep worker inspection limited to identity, topic, model policy label, status, and the worker's history of finalized canonical results (timestamped, unbounded for the process lifetime); full private prompts/context and raw logs remain server-side.
-- Render a persistent, timestamped result log as a full-width row below the live two-column transcript/inspector layout, distinct from the live per-turn view. Each entry shows worker identity, turn, timestamp, and a one-line summary with source count; entries expand to the full structured answer and sources. This is a session-spanning historical view, not a duplicate of the live result already shown inline in the transcript for the current turn.
-- Keep structured worker output from dominating the transcript: the closed disclosure shows only the concise spoken projection; expansion exposes the complete result without truncating canonical state.
-- Open source URLs in new tabs using `target="_blank"` and `rel="noopener noreferrer"`.
-- Assert every rendered source-link path includes `target="_blank"` plus both `noopener` and `noreferrer` tokens.
-- Reconnect to the known server endpoint and replace runtime projections from the returned snapshot.
-- Preserve only explicitly labelled local connection diagnostics across snapshot replacement; stale server projections are replaced and local diagnostics cannot be rendered as server-authored state.
-
-### Phase 5: Integrated verification and documentation
-
-**Impl files:** `README.md`
-**Test files:** `tests/integration/test_browser_session.py`
-**Test command:** `uv run pytest &amp;&amp; (cd web &amp;&amp; bun test)`
-**Validation cmd:** `uv run ruff format --check . &amp;&amp; uv run ruff check . &amp;&amp; (cd web &amp;&amp; bun run lint) &amp;&amp; git diff --check`
-**Goal:** Demonstrate routing, persistence, grounding, reconnect, and interruption invariants end to end before designing Electron packaging.
-
-- Add a local runbook covering server, browser client, existing STT/TTS services, environment loading, and known endpoint configuration.
-- Keep Phase 5 protocol work prose-only. Any semantic contract change discovered during integration returns to Phases 1, 3, and 4 and lands JSON Schemas, Python models/emission, browser reducers, protocol prose, and affected tests together before final verification.
-- Verify direct, unsupported, clarify, new-worker, and existing-worker routing paths.
-- Verify one worker retains same-topic context and unrelated topics remain isolated.
-- Verify UI results can precede speech, interruption stops audio without deleting the result, and the UI visibly reports incomplete speech.
-- Verify closing/reopening the page reconnects to the same Python process and rebuilds the worker/result projection from a snapshot.
-- Verify replacement-client fencing: the new epoch becomes authoritative and an old still-live client cannot send accepted audio/controls or mutate/receive the new sequence stream.
-- Run a required credential-safe local media acceptance procedure that proves Small WebRTC connection, user-initiated microphone capture, live local STT/TTS interaction, and audible browser output. Keep the paid authenticated OpenAI web-search smoke test separate and opt-in.
-- Run formatting, linting, full tests, a staged secret scan, documentation review, code review, and security review before any push.
-- Use the evidence from this lab to create a separate Electron plan covering packaging, preload/IPC boundaries, external navigation, and process ownership.</pre>
+<!-- plan-view-rich-section-sha256: 3b50e41e4ce11a0d9d37a7d5d96b27aed9c58c851452d05447b7b67d6ac66cf9 -->
+<section class="section" aria-labelledby="implementation-checklist-title">
+  <h2 id="implementation-checklist-title">Implementation Checklist</h2>
+  <section class="timeline-wrapper" aria-label="Five-phase implementation timeline">
+    <div class="timeline">
+      <div class="event phase">
+        <span class="when">Phase 1</span>
+        <div class="what">
+          <h3>Contracts and runtime foundation</h3>
+          <p><strong>Impl files:</strong> <code>pyproject.toml</code>, <code>web/package.json</code>, <code>bun.lock</code>, <code>server/config.py</code>, <code>server/preflight.py</code>, <code>server/contracts.py</code>, <code>shared/protocol.md</code>, <code>shared/schemas/*.json</code></p>
+          <p><strong>Test files:</strong> <code>tests/test_config.py</code>, <code>tests/test_preflight.py</code>, <code>tests/test_contracts.py</code></p>
+          <p><strong>Test command:</strong> <code>uv run pytest tests/test_config.py tests/test_preflight.py tests/test_contracts.py</code></p>
+          <p><strong>Validation cmd:</strong> <code>uv run ruff format --check . &amp;&amp; uv run ruff check .</code></p>
+          <p><strong>Goal:</strong> Version and validate routing, worker-state, grounded-result, speech-progress, and snapshot contracts before either runtime consumes them.</p>
+          <ul class="checklist">
+            <li>Initialize the Python project and pin a verified Pipecat version with the verified <code>openai</code>, <code>webrtc</code>, and <code>local</code> extras; RTVI is built in rather than installed as a separate extra.</li>
+            <li>Pin and record the compatible Pipecat JavaScript client version alongside the Python Pipecat version pin, and verify RTVI/Small WebRTC wire compatibility between the two before Phase 4 depends on it.</li>
+            <li>Create the minimal Bun manifest and lockfile needed for that client-version pin and compatibility probe; do not add browser application code in this phase.</li>
+            <li>Verify <code>LLMContextWorker</code>'s actual context-retention and bus-edge (<code>active</code>, <code>bridged</code>) API, and <code>RTVIServerMessageFrame</code>'s actual payload semantics, directly against the pinned Pipecat version rather than relying on the Context Hub's 2026-07-05 index description.</li>
+            <li>Verify the pinned <code>WorkerRunner(auto_end=False)</code>, worker registration/removal, <code>PipelineWorker</code> lifecycle, <code>BusBridgeProcessor</code> construction/attach/detach, programmatic activation, and per-connection bus topic/epoch filtering APIs. Record a fallback topology if any seam is unavailable; do not make durable-host or bridge behavior an acceptance invariant before this probe passes.</li>
+            <li>Probe actual pinned worker/provider capabilities for steering and cancellation. <strong>Deferred beyond v0.1:</strong> the shipped slice performs local best-effort task cancellation and suppresses a later local commit, but it does not expose backend capability declarations or acknowledgements and therefore does not claim confirmed <code>cancelled</code>.</li>
+            <li>Define strict Python models and matching JSON Schemas for all versioned Python-to-browser messages.</li>
+            <li>Define the reconnect handshake contract (<code>session_id</code>, resume token/known-process identity, proposed epoch, and snapshot sequence) before Phase 3 transport wiring; a fresh Small WebRTC transport must attach to durable state through this contract.</li>
+            <li>Reserve an internal evented work-item schema with stable <code>work_item_id</code> (one bounded item in a parent turn), distinct <code>run_id</code> (one execution/retry), stable <code>worker_id</code>/topic identity (context owner), parent turn IDs, and event IDs/sequences. <strong>Deferred beyond v0.1:</strong> production execution does not yet emit this schema, declare streaming/steering/cancellation/session-continuation capabilities, or normalize capability-aware work-item outcome events into session state or the UI.</li>
+            <li>Define the interruption event schema and producer seam with stage enum (<code>result_pending</code>, <code>voice_llm_accepted</code>, <code>speech_active</code>), policy, template-used flag, resume outcome (<code>resumed</code>, <code>declined</code>, <code>stale</code>), and linked <code>work_item_id</code>/<code>run_id</code>/<code>utterance_id</code>; these are session/utterance fields, not implicit prose-only telemetry.</li>
+            <li>Reserve a nullable <code>origin_epoch</code> field (default <code>null</code>/unset pre-arbiter) on turn, work-item, run, event, result, utterance, pending-dialogue, and control contract models so Phase 3's connection-epoch arbiter can populate it without reopening this Phase 1 contract; after acceptance, epoch-less callbacks are invalid.</li>
+            <li>Define configurable router/worker model policy without embedding credentials or treating model names emitted by an LLM as trusted.</li>
+            <li>Define and validate <code>max_work_items_per_turn</code> as an operator configuration (default <code>2</code>) so bounded multi-intent decomposition can be raised to <code>3</code> or <code>4</code> without changing the cross-runtime protocol.</li>
+            <li>Define and validate <code>multi_intent_wait_timeout_ms</code> as an operator configuration for bounded per-item waiting (default <code>10_000</code> ms). In v0.1, completed items are committed and spoken individually in user order, while unfinished items receive an ordered “continuing in the background” placeholder; aggregate main-model synthesis is deferred.</li>
+            <li>Define and validate configuration precedence for the OpenAI credential variable name, STT/TTS endpoint transport and address, server bind/known client URL, and router/worker model-policy mappings.</li>
+            <li>Add a values-redacted preflight that verifies required variable names, detects each local service endpoint form, checks protocol/health compatibility, persists the discovered endpoint transport/address into the config surface for Phase 3 adapters to read (rather than re-discovering), and reports actionable failures without printing secrets. This preflight probe stays standalone — it must not import Phase 3 adapter code, so Phase 1 completes and commits independently of Phase 3.</li>
+            <li>Make successful redacted configuration/service preflight a Phase 1 exit gate. Verify configured model IDs and Responses/hosted-search compatibility when credentials permit; otherwise record authenticated capability as explicitly unavailable and keep the paid smoke path opt-in rather than silently solidifying defaults.</li>
+            <li>Freeze separate conservative work-item/result and utterance-delivery state sets in the versioned contract: work-item/result (<code>started</code>, <code>progress</code>, <code>cancellation_requested</code>, <code>cancelled</code>, <code>completed</code>, <code>failed</code>) and delivery (<code>displayed</code>, <code>queued</code>, <code>started</code>, <code>synthesis_ended</code>, <code>delivery_completed</code>, <code>delivery_unknown</code>, <code>interrupted</code>, <code>interrupted_by_reconnect</code>, <code>paused</code>, <code>resumed</code>). Define cross-entity terminal precedence and mark finer word-level progress as a forward-compatible, Phase-3-gated extension rather than speculatively schema'd now.</li>
+            <li>Document identifiers, ordering fields, timestamps, nullable fields, and forward-compatibility behavior in <code>shared/protocol.md</code>.</li>
+        </ul>
+      </div>
+      <div class="event phase">
+        <span class="when">Phase 2</span>
+        <div class="what">
+          <h3>Persistent routing and web-search workers</h3>
+          <p><strong>Impl files:</strong> <code>server/router.py</code>, <code>server/main_responder.py</code>, <code>server/registry.py</code>, <code>server/work_item_coordinator.py</code>, <code>server/workers/base.py</code>, <code>server/workers/web_search.py</code>, <code>server/results.py</code></p>
+          <p><strong>Test files:</strong> <code>tests/test_router.py</code>, <code>tests/test_main_responder.py</code>, <code>tests/test_registry.py</code>, <code>tests/test_work_item_coordinator.py</code>, <code>tests/test_web_search_worker.py</code>, <code>tests/test_results.py</code></p>
+          <p><strong>Test command:</strong> <code>uv run pytest tests/test_router.py tests/test_main_responder.py tests/test_registry.py tests/test_work_item_coordinator.py tests/test_web_search_worker.py tests/test_results.py</code></p>
+          <p><strong>Validation cmd:</strong> <code>uv run ruff format --check . &amp;&amp; uv run ruff check .</code></p>
+          <p><strong>Goal:</strong> Validated routing decisions select one or a bounded set of persistent context owners, and canonical grounded results remain the sole source for speech and UI output.</p>
+          <ul class="checklist">
+            <li>Build an immutable per-turn worker catalogue from registry state, pass it into the tool-free router prompt, and validate the result against the same snapshot before dispatch.</li>
+            <li>Validate action, worker ID, worker type, topic label, domain capability, and configured model policy before dispatch.</li>
+            <li>Implement one tool-free structured-output envelope: the model returns the routing decision and optional prose together; Python validates the entire envelope against the catalogue before any side effect, then emits the validated prose for <code>direct</code>, <code>unsupported</code>, and router-owned <code>clarify</code> outcomes. Worker-delegated <code>existing_worker</code>/<code>new_worker</code> outcomes remain a distinct dispatch since they hand off to a different context-owning component entirely.</li>
+            <li>Implement a process-lifetime worker registry whose workers are Pipecat <code>LLMContextWorker</code> instances (or a thin subclass), with stable IDs, topic metadata, status, an explicit no-eviction first-slice policy, and one causal mailbox per worker built on top of <code>LLMContextWorker</code>'s own <code>active</code>/<code>bridged</code> scheduling rather than a fully parallel activation model.</li>
+            <li>Serialize each worker's operations in accepted-turn order through its mailbox. A later same-worker turn waits for earlier work and therefore reads the context after earlier immutable commits; different workers remain independently concurrent.</li>
+            <li>Implement a context-owning web-search worker using OpenAI hosted <code>web_search</code>; let it clarify or decline requests that search cannot satisfy.</li>
+            <li>Configure OpenAI Responses calls with <code>store=False</code> unless a later reviewed decision explicitly requires provider retention. Document which transcript/query/context fields leave the process, verify the pinned Pipecat adapter preserves the setting across worker calls, and note that <code>store=False</code> is treated as a backend-semantics assumption (its exact provider-side retention guarantee is not independently verifiable from this repo) rather than a settled fact.</li>
+            <li>When a worker asks a clarification, record a pending-dialogue candidate by session with owner kind/worker ID, originating turn/result ID, and expiry, using an injectable/fake clock so expiry timing is deterministic in tests rather than wall-clock dependent.</li>
+            <li>Arbitrate every final transcript before dispatch. Run deterministic control-intent checks first; classify explicit pause/resume/cancel controls with a target <code>work_item_id</code> when present. The v0.1 parser reserves the <code>consent</code> token, but no late-result consent-offer state machine produces a reconnectable offer for it to accept. Then, when pending candidates exist, a narrow tool-free classifier labels intents as <code>continue_pending</code>, <code>steer_same_topic</code>, <code>new_topic</code>, or <code>multi_intent</code>. With no pending candidates and no control intent, skip that classifier and route directly to the main router. Preserve the user's untouched wording for normal routing, and cap <code>multi_intent</code> decomposition at the validated <code>max_work_items_per_turn</code> setting.</li>
+            <li>Normalize provider output into a canonical grounded-result record with citations before deriving spoken/UI projections. Treat the real OpenAI Responses hosted-search citation output shape (field path, nullability, URL encoding) as an assumption until a captured real response confirms it — the Phase 1 compatibility gate verifies model/tool availability, not output schema, so this normalizer must not be written against mocked shapes alone.</li>
+            <li>Request one strict hosted-search response envelope containing a complete <code>display_text</code> answer and a concise, speech-safe <code>spoken_text</code> projection. The worker instructions bound the spoken form to plain speech without URLs, citation markers, Markdown, or source lists; Python validates the envelope and attaches one normalized citation set and canonical result ID to both projections.</li>
+            <li>Normalize citation titles and URLs at the server trust boundary. Accept only absolute <code>http</code>/<code>https</code> URLs; reject or omit unsupported schemes, relative/malformed/missing URLs, and deterministic duplicates before any browser message is emitted.</li>
+            <li>Cover ambiguous follow-ups, unsupported private-data requests, new/existing topic selection, hallucinated IDs, search failure, worker-level decline (search cannot satisfy the request, distinct from routing-level <code>unsupported</code>), a <code>store=False</code> assertion on outbound Responses requests, and citation/result validation.</li>
+            <li>Keep provider-shape verification as a Phase 1 gate: capture one authenticated hosted-search response or pin an official fixture; if neither is available, mark the normalizer/provider-shape acceptance blocked and run only clearly labelled mocked contract tests.</li>
+        </ul>
+      </div>
+      <div class="event phase">
+        <span class="when">Phase 3</span>
+        <div class="what">
+          <h3>Pipecat pipeline, local speech, and observable interruption state</h3>
+          <p><strong>Impl files:</strong> <code>server/app.py</code>, <code>server/pipeline.py</code>, <code>server/speech_scheduler.py</code>, <code>server/services/stt.py</code>, <code>server/services/tts.py</code>, <code>server/observers.py</code>, <code>server/session_state.py</code>, <code>server/connection_arbiter.py</code></p>
+          <p><strong>Test files:</strong> <code>tests/test_pipeline.py</code>, <code>tests/test_session_host.py</code>, <code>tests/test_speech_scheduler.py</code>, <code>tests/test_session_state.py</code>, <code>tests/test_rtvi_messages.py</code>, <code>tests/test_interruptions.py</code>, <code>tests/test_connection_arbiter.py</code></p>
+          <p><strong>Test command:</strong> <code>uv run pytest tests/test_pipeline.py tests/test_session_host.py tests/test_speech_scheduler.py tests/test_session_state.py tests/test_rtvi_messages.py tests/test_interruptions.py tests/test_connection_arbiter.py</code></p>
+          <p><strong>Validation cmd:</strong> <code>uv run ruff format --check . &amp;&amp; uv run ruff check .</code></p>
+          <p><strong>Goal:</strong> The runtime remains authoritative for worker/result state and emits monotonic speech-progress evidence that lets the UI show what was displayed, started, completed, or interrupted.</p>
+          <ul class="checklist">
+            <li>Start one process-lifetime <code>WorkerRunner(auto_end=False)</code> that owns the local worker bus and persistent <code>LLMContextWorker</code> registry. For each promoted browser connection, add one connection-lifetime Pipecat <code>PipelineWorker</code> whose main pipeline contains the framework <code>BusBridgeProcessor</code>; remove/deactivate that connection worker on replacement without rebuilding persistent workers or their contexts. <code>LLMContextWorker</code> <code>bridged</code> edges wrap the worker-side exchange, but do not by themselves attach it to the transport pipeline.</li>
+            <li>Implement and test the <code>SessionHost</code> lifecycle as startup → runner registration → worker/bridge topic attach → active connection → replacement detach/fence → clean shutdown. If the Phase 1 probe rejects a seam, use the documented fallback topology and downgrade the affected acceptance criterion rather than silently emulating it.</li>
+            <li>Keep the main router tool-free: validate its structured worker-selection output in application policy code, then programmatically activate the selected Pipecat worker. The bridge admits only validated canonical-result/control frames through a canonical-result adapter before TTS or UI projection; raw worker LLM text cannot bypass normalization.</li>
+            <li>Add a thin, connection-scoped RTVI state publisher/observer beside the bridge. It projects canonical results, worker status, speech progress, and snapshots as versioned RTVI messages; it neither owns browser state nor performs LLM work.</li>
+            <li>Assign monotonic session sequence numbers plus stable turn/result/<code>work_item_id</code>/<code>run_id</code>/utterance IDs to state-bearing messages and control responses.</li>
+            <li>Persist an ordered, unbounded (process-lifetime) history of each worker's canonical results — not only a latest-result pointer — so the browser can render a full timestamped result log and rebuild it from a snapshot after reconnect.</li>
+            <li>Emit full result/UI data independently of slower speech playback.</li>
+            <li>Track synthesis and server-side transport delivery separately. TTS stop means <code>synthesis_ended</code>, not <code>delivery_completed</code>; Phase 1/3 must identify and probe the exact downstream transport-output event and utterance-correlation seam. If no reliable seam exists, emit <code>delivery_unknown</code> and retain synthesis-only styling rather than claiming server transport completion; neither state proves browser decode, playout, or audibility.</li>
+            <li>Do not claim word-accurate spoken progress unless implementation evidence proves an available timing/alignment seam; the initial UI may conservatively mark the whole utterance as spoken only on completion and otherwise mark it incomplete.</li>
+            <li>On barge-in or explicit <code>stop</code>, route through <code>SpeechScheduler</code>, which emits Pipecat's interruption path for only the currently leased utterance. Preserve completed results and the other work items' computation/state; do not globally cancel unrelated workers. The active work item records a task-local interruption outcome and retains any resumable speech projection according to the configured interruption policy. Residual audio already buffered in the browser is unverified in this slice.</li>
+            <li>Start with task-local speech interruption and local best-effort work cancellation. <strong>Deferred beyond v0.1:</strong> capability-aware <code>pause_current_work_item</code>, <code>resume_after_soft_interrupt</code>, <code>cancel_current_work_item</code>, and <code>discard_remaining_speech</code> policy outcomes, including backend acknowledgements and normalized telemetry, require a follow-up implementation.</li>
+            <li>Keep <code>resume_after_soft_interrupt</code> as a separate measured variant with stage-aware behavior. If a worker result is ready but has not yet been accepted by the main voice-loop LLM, retain it as canonical pending state and let the normal voice loop consume it after the current turn; do not emit a bridge template. If the voice-loop LLM has already generated speech and Pipecat interrupts that active utterance, the voice loop may give a short bridge acknowledgement (for example, “I’ll triage that, then return to what I was saying”) and requeue the paused work item's remaining speech while the new work continues only when a verified segment/offset boundary exists. Without that seam, use whole-utterance replay or decline replay explicitly; never guess a remainder boundary. This is never used after an explicit pause/cancel request, and retained speech is held outside the discarded Pipecat frame queue with its original work-item/utterance ID.</li>
+            <li>The soft-interruption bridge acknowledgement is a fixed, configurable template only for the post-LLM-speech case; it is not another LLM call. Record the stage (<code>result_pending</code>, <code>voice_llm_accepted</code>, or <code>speech_active</code>), whether a template was used, and whether the retained remainder resumed, was declined, or became stale.</li>
+            <li>Treat the interruption policy as deliberately provisional lab configuration. Record the selected strategy, work-item IDs, interruption cause, resume/decline outcome, and resulting speech/result state so observed usage can change the default without changing the versioned RTVI contracts or Pipecat transport seam.</li>
+            <li>Implement snapshot request/response after client readiness or reconnection.</li>
+            <li>Resolve utterance-delivery races with the implemented monotonic speech state machine. The versioned work-item schema reserves <code>cancellation_requested</code> and <code>cancelled</code>, but v0.1 does not emit capability-aware work-item lifecycle events or infer backend-confirmed cancellation from local task cancellation.</li>
+            <li>Issue a connection epoch on activation. Atomically promote a replacement client and disconnect or ignore every older epoch across audio/control input, snapshot requests, outbound state, and sequence streams.</li>
+            <li>On replacement, cancel old-epoch speech delivery and record <code>interrupted_by_reconnect</code>. Require a session identity/resume handshake when a fresh transport attaches to the durable Python process; reject stale epoch callbacks at the bus and session-state boundaries. Allow already-running router/provider work to commit a canonical result without speech; route every asynchronous callback through epoch-aware session state so only the active epoch receives incremental state.</li>
+            <li>Bound late old-epoch commits to append-only immutable result/context records tied to the origin turn. They cannot change active routing/status, pending-dialogue ownership, latest-result pointers, or speech scheduling unless the origin turn is still current; same-worker completions retain accepted-turn order and newer active turns supersede late interactive side effects.</li>
+        </ul>
+      </div>
+      <div class="event phase">
+        <span class="when">Phase 4</span>
+        <div class="what">
+          <h3>Plain browser RTVI client</h3>
+          <p><strong>Impl files:</strong> <code>web/index.html</code>, <code>web/src/app.js</code>, <code>web/src/state.js</code>, <code>web/src/render.js</code>, <code>web/src/styles.css</code></p>
+          <p><strong>Test files:</strong> <code>web/test/state.test.js</code>, <code>web/test/render.test.js</code>, <code>web/test/protocol.test.js</code></p>
+          <p><strong>Test command:</strong> <code>cd web &amp;&amp; bun test</code></p>
+          <p><strong>Validation cmd:</strong> <code>cd web &amp;&amp; bun run lint</code></p>
+          <p><strong>Goal:</strong> The browser renders the server-authoritative lab state and makes text-versus-speech divergence visible without becoming a second diagnostic authority.</p>
+          <p><strong>Wireframe reference:</strong> <code>docs/dev_plans/assets/20260711-feature-websearch-subagent-electron/wireframe.html</code> — a static, non-interactive HTML/CSS mockup (no JS logic, self-contained) covering disconnected/idle, connected mid-turn, barge-in interruption, reconnect, and multi-worker states, plus the full-width cross-worker Result Log described below. This is a design-review artifact, not implementation code; Phase 4's actual <code>web/</code> client is built from the requirements below, informed by this mockup's layout/interaction reasoning (inline HTML comments annotate which requirement each region demonstrates).</p>
+          <ul class="checklist">
+            <li>Build Connect/Disconnect and microphone controls with the Pipecat JavaScript client and Small WebRTC transport.</li>
+            <li>Own received remote audio explicitly in plain JavaScript: create and retain an <code>HTMLAudioElement</code>, attach/remove the remote <code>MediaStream</code> across connect, replacement, and disconnect, start playback on a user-gesture-safe path, and render an actionable autoplay-failure state.</li>
+            <li>Test that page initialization and connection do not acquire/publish microphone media before the explicit user gesture, and that disconnect disables capture.</li>
+            <li>Render transcript with compact server-authored timestamps, current routing state, persistent worker list, per-result worker identity, structured answer, and sources. For assistant results, present the exact <code>spoken_text</code> projection as the primary turn and place complete non-TTS structured output (<code>ui_text</code>, worker/turn metadata, delivery state, and citations) under a <code>Subagent output</code> disclosure. Do not label this structured result as hidden model reasoning.</li>
+            <li>Apply RTVI messages in session-sequence order; ignore duplicates, detect gaps, and request a snapshot when state may be incomplete. Discard any incremental message whose sequence number is older than the last-applied snapshot's sequence, so a snapshot arriving while older increments are still in flight cannot be superseded by them.</li>
+            <li>Render completed spoken text normally and incomplete/unspoken text grey and italic using the conservative utterance-level status from Phase 3.</li>
+            <li>Keep worker inspection limited to identity, topic, model policy label, status, and the worker's history of finalized canonical results (timestamped, unbounded for the process lifetime); full private prompts/context and raw logs remain server-side.</li>
+            <li>Render a persistent, timestamped result log as a full-width row below the live two-column transcript/inspector layout, distinct from the live per-turn view. Each entry shows worker identity, turn, timestamp, and a one-line summary with source count; entries expand to the full structured answer and sources. This is a session-spanning historical view, not a duplicate of the live result already shown inline in the transcript for the current turn.</li>
+            <li>Keep structured worker output from dominating the transcript: the closed disclosure shows only the concise spoken projection; expansion exposes the complete result without truncating canonical state.</li>
+            <li>Open source URLs in new tabs using <code>target=&quot;_blank&quot;</code> and <code>rel=&quot;noopener noreferrer&quot;</code>.</li>
+            <li>Assert every rendered source-link path includes <code>target=&quot;_blank&quot;</code> plus both <code>noopener</code> and <code>noreferrer</code> tokens.</li>
+            <li>Reconnect to the known server endpoint and replace runtime projections from the returned snapshot.</li>
+            <li>Preserve only explicitly labelled local connection diagnostics across snapshot replacement; stale server projections are replaced and local diagnostics cannot be rendered as server-authored state.</li>
+        </ul>
+      </div>
+      <div class="event phase">
+        <span class="when">Phase 5</span>
+        <div class="what">
+          <h3>Integrated verification and documentation</h3>
+          <p><strong>Impl files:</strong> <code>README.md</code></p>
+          <p><strong>Test files:</strong> <code>tests/integration/test_browser_session.py</code></p>
+          <p><strong>Test command:</strong> <code>uv run pytest &amp;&amp; (cd web &amp;&amp; bun test)</code></p>
+          <p><strong>Validation cmd:</strong> <code>uv run ruff format --check . &amp;&amp; uv run ruff check . &amp;&amp; (cd web &amp;&amp; bun run lint) &amp;&amp; git diff --check</code></p>
+          <p><strong>Goal:</strong> Demonstrate routing, persistence, grounding, reconnect, and interruption invariants end to end before designing Electron packaging.</p>
+          <ul class="checklist">
+            <li>Add a local runbook covering server, browser client, existing STT/TTS services, environment loading, and known endpoint configuration.</li>
+            <li>Keep Phase 5 protocol work prose-only. Any semantic contract change discovered during integration returns to Phases 1, 3, and 4 and lands JSON Schemas, Python models/emission, browser reducers, protocol prose, and affected tests together before final verification.</li>
+            <li>Verify direct, unsupported, clarify, new-worker, and existing-worker routing paths.</li>
+            <li>Verify one worker retains same-topic context and unrelated topics remain isolated.</li>
+            <li>Verify UI results can precede speech, interruption stops audio without deleting the result, and the UI visibly reports incomplete speech.</li>
+            <li>Verify closing/reopening the page reconnects to the same Python process and rebuilds the worker/result projection from a snapshot.</li>
+            <li>Verify replacement-client fencing: the new epoch becomes authoritative and an old still-live client cannot send accepted audio/controls or mutate/receive the new sequence stream.</li>
+            <li>Run a required credential-safe local media acceptance procedure that proves Small WebRTC connection, user-initiated microphone capture, live local STT/TTS interaction, and audible browser output. Keep the paid authenticated OpenAI web-search smoke test separate and opt-in.</li>
+            <li>Run formatting, linting, full tests, a staged secret scan, documentation review, code review, and security review before any push.</li>
+            <li>Use the evidence from this lab to create a separate Electron plan covering packaging, preload/IPC boundaries, external navigation, and process ownership.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
 </section>
 
 </div>
 <div class="tab-panel" data-slot="technical-specifications">
-<!-- plan-view-rich-section-sha256: 289c923fc5580661151ba138b96247ef6a17cbf75cb5f2b439fdc56e68239071 -->
+<!-- plan-view-rich-section-sha256: 746c34711861e6486b528463f8c923fdaaf9189c97c7b818bdcd1248e8de08e1 -->
 <section class="section" id="technical-specifications">
   <h2>Technical Specifications</h2>
 
   <section class="card" id="verified-starting-facts">
     <h3>Verified Starting Facts</h3>
     <ul>
-      <li>The repository was initialized at <code>/Users/vr000m/Code/pipecat-ai/pipecat-subagents-lab</code>; no implementation manifest exists yet.</li>
-      <li>The Pipecat Context Hub snapshot refreshed 2026-07-05 indexes <code>LLMContextWorker</code> as a self-contained context-owning LLM worker and <code>RTVIServerMessageFrame</code> as the arbitrary server-message frame.</li>
-      <li>Pipecat documents <code>pipecat-ai[webrtc]</code> for the server-side Small WebRTC transport.</li>
-      <li>RTVI defines <code>client-ready</code> after media channels connect; state snapshots must be sent after this readiness boundary rather than assumed to arrive during page initialization.</li>
-      <li>OpenAI's Responses API exposes hosted <code>web_search</code> through the request <code>tools</code> configuration; this is API capability and billing, not inherited ChatGPT/Codex product access.</li>
-      <li>The reference local STT adapter uses <code>SegmentedSTTService</code> and the <code>pipecat-local-stt-server</code> client over a Unix-domain socket.</li>
-      <li>The reference local TTS adapter subclasses Pipecat <code>TTSService</code> and uses the <code>pipecat-local-tts-server</code> client over a Unix-domain socket.</li>
-      <li>Current Pipecat packaging exposes <code>openai</code>, <code>webrtc</code>, and <code>local</code> extras; RTVI is part of the core package rather than a separate extra.</li>
-      <li><code>~/.secrets/ai.env</code> exists; its contents and values have not been read into this plan.</li>
+      <li>The repository is initialized at <code>/Users/vr000m/Code/pipecat-ai/pipecat-subagents-lab</code>; no implementation manifest exists yet.</li>
+      <li>The 2026-07-05 Pipecat Context Hub snapshot describes <code>LLMContextWorker</code> as a self-contained, context-owning LLM worker and <code>RTVIServerMessageFrame</code> as the arbitrary server-message frame.</li>
+      <li>Pipecat documents <code>pipecat-ai[webrtc]</code> for server-side Small WebRTC. Current packaging exposes <code>openai</code>, <code>webrtc</code>, and <code>local</code> extras; RTVI is in the core package.</li>
+      <li>RTVI emits <code>client-ready</code> after media channels connect, so state snapshots must follow that readiness boundary.</li>
+      <li>OpenAI Responses exposes hosted <code>web_search</code> in request tools. This is an API capability with separate billing, not inherited ChatGPT or Codex access.</li>
+      <li>The reference local STT and TTS adapters use their respective local servers over Unix-domain sockets; STT uses <code>SegmentedSTTService</code>, while TTS subclasses Pipecat <code>TTSService</code>.</li>
+      <li><code>~/.secrets/ai.env</code> exists, but this plan has not read its contents or values.</li>
     </ul>
   </section>
 
-  <section class="card" id="environment-assumptions-requiring-preflight">
+  <section class="card" id="environment-preflight">
     <h3>Environment Assumptions Requiring Preflight</h3>
+    <div class="banner">
+      <strong>Preflight rule:</strong> endpoint reachability, provider compatibility, transcript semantics, output shape, and reconnect behavior are separate checks.
+    </div>
     <ul>
-      <li>The live STT and TTS services may use different endpoint transports and addresses than the reference UDS adapters. Implementation must discover and health-check each configured endpoint before choosing defaults.</li>
-      <li><code>~/.secrets/ai.env</code> existence does not establish that an OpenAI API credential variable is present, authorized, or funded. Preflight checks variable presence without printing its value; the authenticated hosted-search smoke test remains opt-in.</li>
-      <li>The live STT service's final-transcript/segmentation behavior compatible with <code>SegmentedSTTService</code> is assumed, not preflighted — endpoint reachability and health are distinct from transcript semantics. The required local media acceptance procedure (Phase 5) must include a smoke assertion that a final transcript is actually produced, separate from the endpoint-form/health preflight.</li>
-      <li>The pinned local TTS adapter emitting an observable <code>synthesis_ended</code> frame is assumed, not verified in-repo. Confirm the adapter produces this signal before relying on it for delivery-state styling; if it doesn't, the coarse completion/incomplete styling needs a different seam.</li>
-      <li>The OpenAI Responses hosted <code>web_search</code> output/citation shape (field path, nullability, URL encoding) is assumed from documentation, not pinned against a real response. The Phase 1 compatibility gate verifies model/tool availability, not output schema — capture one real response (when credentials permit) to pin the shape before the normalizer is finalized; otherwise keep the normalizer's mocked-shape assumption explicitly flagged as unverified.</li>
-      <li>The exact hosted <code>web_search</code> tool-type string and request <code>tools</code> shape is assumed from a documentation snapshot; tool naming has drifted historically (e.g. <code>web_search</code> vs <code>web_search_preview</code>). Pin the exact string/shape during the Phase 1 compatibility gate rather than assuming it from the snapshot description.</li>
-      <li>Small WebRTC ICE-reconnection and post-disconnect session behaviour are assumed until verified against the pinned JavaScript client with a controlled disconnect/reconnect probe. Keep a fresh-session reconnect fallback if transport-level recovery is unavailable.</li>
-      <li><code>LLMContextWorker</code>'s context-retention/bus-edge (<code>active</code>, <code>bridged</code>) behavior and <code>RTVIServerMessageFrame</code>'s payload semantics are asserted from the Context Hub's 2026-07-05 index description, not verified against the pinned Pipecat version. Phase 1 adds an explicit verification step against the pinned version itself.</li>
+      <li>Discover and health-check configured STT and TTS endpoints before selecting defaults; live transports may differ from the reference UDS adapters.</li>
+      <li>Check OpenAI credential-variable presence without printing its value. Keep authenticated hosted-search smoke testing opt-in.</li>
+      <li>Phase 5 must prove that local STT emits a final transcript; endpoint health alone does not establish segmentation compatibility.</li>
+      <li>Verify that the pinned TTS adapter emits observable <code>synthesis_ended</code> evidence before basing delivery styling on it.</li>
+      <li>Capture a real hosted-search response, when credentials permit, before finalizing citation normalization. Until then, label the mocked output-shape assumption unverified.</li>
+      <li>Pin the exact hosted-search tool type and request shape in Phase 1 because naming has historically drifted between forms such as <code>web_search</code> and <code>web_search_preview</code>.</li>
+      <li>Probe Small WebRTC disconnect/reconnect behavior against the pinned JavaScript client and retain a fresh-session fallback.</li>
+      <li>Verify <code>LLMContextWorker</code> active/bridged behavior and <code>RTVIServerMessageFrame</code> payload semantics against the pinned Pipecat version.</li>
     </ul>
-    <p>Corrections to verified paths, patterns, or dependencies above alter the immutable contract and require a fresh plan review.</p>
+    <p>Corrections to these verified paths, patterns, or dependencies alter the immutable contract and require a fresh plan review.</p>
   </section>
 
-  <section class="card" id="files-to-modify">
-    <h3>Files to Modify</h3>
-    <ul>
-      <li><code>README.md</code> — replace the placeholder description with the verified browser-first runbook and experiment boundaries.</li>
-      <li><code>docs/dev_plans/20260711-feature-websearch-subagent-electron.md</code> — retain this original path for continuity while explicitly documenting the browser-first scope and deferred Electron follow-up.</li>
-    </ul>
-  </section>
-
-  <section class="card" id="new-files-to-create">
-    <h3>New Files to Create</h3>
-    <ul>
-      <li><code>pyproject.toml</code> — Python dependencies, scripts, Ruff, and pytest configuration.</li>
-      <li><code>config.toml</code> — checked-in local defaults and provider/model policy.</li>
-      <li><code>server/</code> — configuration, versioned contracts, router, worker registry, web-search worker, canonical result projection, Pipecat pipeline, speech services, observers, and session state.</li>
-      <li><code>scripts/benchmark_speech.py</code> — opt-in identical-fixture latency benchmark for local and hosted speech providers.</li>
-      <li><code>tests/</code> — unit and integration coverage for contracts, routing, persistence, projections, RTVI ordering, interruption, and reconnect.</li>
-      <li><code>shared/protocol.md</code> and <code>shared/schemas/*.json</code> — versioned cross-runtime contracts.</li>
-      <li><code>web/</code> — Bun-managed plain HTML, JavaScript, and CSS RTVI client plus tests.</li>
-      <li><code>docs/benchmarks/20260724-speech-latency.md</code> — development-machine benchmark snapshot and interpretation.</li>
-    </ul>
-  </section>
+  <div class="card-grid">
+    <section class="card" id="files-to-modify">
+      <h3>Files to Modify</h3>
+      <ul>
+        <li><code>README.md</code> — replace the placeholder with the verified browser-first runbook and experiment boundaries.</li>
+        <li><code>docs/dev_plans/20260711-feature-websearch-subagent-electron.md</code> — preserve path continuity while documenting browser-first scope and the deferred Electron follow-up.</li>
+      </ul>
+    </section>
+    <section class="card" id="new-files">
+      <h3>New Files to Create</h3>
+      <ul>
+        <li><code>pyproject.toml</code> and <code>config.toml</code> — dependencies, tooling, local defaults, and provider/model policy.</li>
+        <li><code>server/</code> — contracts, routing, registry, workers, projections, pipeline, speech, observers, and session state.</li>
+        <li><code>scripts/benchmark_speech.py</code> and <code>docs/benchmarks/20260724-speech-latency.md</code> — opt-in identical-fixture benchmark and recorded interpretation.</li>
+        <li><code>tests/</code> — contract, routing, persistence, projection, RTVI ordering, interruption, and reconnect coverage.</li>
+        <li><code>shared/protocol.md</code> and <code>shared/schemas/*.json</code> — versioned cross-runtime contracts.</li>
+        <li><code>web/</code> — Bun-managed plain HTML, JavaScript, CSS, and tests.</li>
+      </ul>
+    </section>
+  </div>
 
   <section class="card" id="architecture-decisions">
     <h3>Architecture Decisions</h3>
-    <pre>- **Browser before Electron:** prove the voice, routing, state, and interruption contracts in a normal browser; package them in a separately reviewed Electron plan later.
-- **Tool-free main router:** the main model receives no external tools. It returns a validated routing decision and remains the user-turn coordinator.
-- **Capability before topic:** routing first distinguishes direct/unsupported/clarify/specialist capability, then selects an existing topic worker or proposes a new one.
-- **Snapshot-bound routing:** the registry supplies an immutable worker catalogue for each routing turn; the router can select only entries from that snapshot, and dispatch validates against the identical snapshot to prevent stale or hallucinated IDs.
-- **Collapsed main response generation:** one tool-free model call returns a structured routing/prose envelope; Python validates the entire envelope before any side effect, then emits validated prose for `direct`, `unsupported`, and main-owned `clarify` actions. Worker-delegated outcomes (`existing_worker`/`new_worker`) remain a separate dispatch since they hand off to a different context-owning component. All results then enter the same canonical result/delivery path.
-- **Worker-owned search judgment:** once delegated, the web worker refines/sanitizes queries, decides whether web search is sufficient, asks domain clarification, and returns a grounded result.
-- **Thin durable host:** a small application `SessionHost` keeps one `WorkerRunner(auto_end=False)` alive. The runner, not custom application scheduling, owns the local worker bus and persistent `LLMContextWorker` registry; application policy retains only worker selection, epochs, pending dialogue, and canonical result history.
-- **Runner/registry source of truth:** `SessionHost` owns the authoritative mapping from stable `worker_id` to the Pipecat runner handle and metadata registry. Add/activate/deactivate/status updates are one transaction at the host boundary; per-turn catalogues are immutable snapshots of that source, never an independent worker registry.
-- **Process-lifetime vs connection-lifetime boundary:** persistent workers, their contexts, canonical results, pending-dialogue state, and the session sequence counter outlive any single connection. Each promoted browser connection receives one connection-lifetime `PipelineWorker` containing Small WebRTC, STT/TTS, `BusBridgeProcessor`, canonical-result adapter, and RTVI state publisher; replacement removes/deactivates that worker and builds a fresh one without rebuilding the durable runner or worker contexts.
-- **Worker identity and frame path:** registry workers are Pipecat `LLMContextWorker` instances (or a thin subclass), so Pipecat owns their bus participation and active-worker scheduling. The connection `PipelineWorker`'s `BusBridgeProcessor` is the required transport-side endpoint; worker `bridged` edges alone do not attach frames to a browser pipeline. Application policy programmatically activates the router-selected worker after structured-output validation, preserving a tool-free router.
-- **Per-turn LLM call count is documented, not implicit:** the hot `direct` path issues at most two sequential LLM calls (the pending-intent classifier runs only when pending candidates exist; the collapsed router+response call). A delegated-worker path adds the worker's own hosted-search call. This is stated explicitly so the latency profile is visible to implementers and the lab's interruption/UX findings.
-- **Pending dialogue is a routing candidate, not an exclusive owner:** a worker clarification remains available as context for the next turn, but the main router always sees the new final transcript together with pending candidates and active-topic summaries. Explicit cancellation or expiry removes the candidate.
-- **Pending-turn arbitration:** deterministic cancellation/expiry checks run first, followed by a narrow tool-free classifier that labels each detected intent as `continue_pending`, `steer_same_topic`, `new_topic`, or `multi_intent`. The first two return to the asking worker; `new_topic` routes normally; `multi_intent` decomposes the utterance into bounded ordered work items, preserving user order and allowing independent workers to proceed concurrently where safe.
-- The first slice uses a validated `max_work_items_per_turn` configuration (default `2`; setting it to `3` or `4` requires no schema change). It records decomposition decisions and does not attempt unrestricted autonomous project planning or merge arbitrary specialist outputs; independent work-item concurrency and provider/resource budgets remain separate operational limits. The main router produces a user-visible synthesis turn after selected work items complete or one needs clarification.
-- Phase 2's `WorkItemCoordinator` targets a narrow `SpeechScheduler` protocol stub for unit tests; Phase 3 supplies the concrete Pipecat scheduler/transport implementation and its frame-ownership tests, so Phase 2 does not depend on an unbuilt media seam.
-- For a multi-intent turn, each completed canonical worker result is emitted to the browser immediately for inspection. After the selected work items complete (or one needs clarification), the fast main model receives their ordered summaries and produces one synthesis result for the spoken projection; the synthesis does not gain web-search tools or replace the underlying worker result records.
-- Synthesis waits only until all selected work items finish, one needs clarification, or `multi_intent_wait_timeout_ms` expires. A timeout produces a partial synthesis with explicit pending-work status; late worker results remain valid and are emitted independently. If a late result arrives while the session is idle, the assistant may issue a short consent prompt (for example, “A long-running task just returned. Would you like to hear the result?”) rather than speaking the full answer; if the user is speaking or another turn is active, show the offer in the UI and defer speech. Record per-item and aggregate wait durations, timeout counts, partial-synthesis counts, consent-prompt outcomes, and late-result latency so the default can be tuned from lab evidence.
-- On affirmative consent, synthesize and speak a concise late-result summary; keep the complete structured result and citations in the browser Result Log for inspection or a later explicit request.
-- A declined or unanswered late-result offer expires after one prompt, remains visible in the UI/Result Log, and is not automatically repeated. A later explicit user request may retrieve or replay it.
-- A consent response is a control intent, not a conversation lock. A compound reply such as “yes, and also search for…” acknowledges the pending late result and sends the additional utterance through bounded multi-intent routing in the same acceptance order.
-- Late-result offers are server-authoritative session records with stable offer/result IDs, origin turn/epoch, one-shot status (`pending`, `prompted`, `deferred`, `accepted`, `declined`, `expired`), and expiry. The browser renders the offer and submits consent; reconnect snapshots restore the authoritative offer state. Offers are separate per late result in the first slice; a later experiment may add an LLM batch-synthesis offer without changing the underlying result records.
-- Only one late-result consent offer may be spoken at a time. Additional pending offers remain queued in server order and visible in the UI; the next offer becomes eligible after the active offer is accepted, declined, or expires.
-- A new active user turn pauses spoken late-result offers. The turn routes normally; queued offers remain server-authoritative and visible, and offer prompting resumes only after the session returns to idle.
-- A current user turn has priority over a pending worker result that has not entered speech. Commit the pending result and expose it in the UI, but schedule its voice projection only after the current turn reaches a terminal state and the configured interruption policy permits delivery.
-- Semantic control separates delivery from computation: “stop/pause, let me think” pauses or defers speech while the work item continues; explicit “cancel/forget it” language or a cancel control requests work-item cancellation. The UI shows these as distinct outcomes.
-- Cancellation is capability-aware: when a backend cannot confirm preemption, record `cancellation_requested`, tell the user cancellation is unconfirmed, keep the work item visible, suppress autoplay, and accept a later completion as a late result subject to the normal offer policy. Local request/task cancellation must never be presented as confirmed backend cancellation.
-- For offer scheduling, `idle` means no active user turn, no active TTS/synthesis utterance, and no higher-priority control prompt; a queued offer is eligible only after the current transport utterance reaches a terminal state.
-- If a user interrupts a consent prompt, mark the offer `deferred` and never replay it immediately; it may be eligible for a later idle prompt before normal expiry.
-- If some work items complete while another requests clarification, the synthesis acknowledges the completed result(s) first, then asks the clarification question for the unresolved item. A combined user reply is treated as a fresh bounded routing turn: it may answer the pending question while also steering, starting a new topic, or adding another configured number of work items.
-- **Registry-controlled persistence:** Python owns stable worker IDs and contexts. Router output is advisory and cannot instantiate arbitrary classes or models.
-- **Per-worker causal mailbox:** each worker executes one accepted turn at a time in acceptance order. This makes context visibility and commit order deterministic across reconnects while preserving concurrency between different workers.
-- **Policy-labelled model selection:** routing may select only a configured policy label such as `fast`, `balanced`, or `deep`; Python maps labels to verified model IDs and budgets.
-- **Server-owned capabilities:** a worker's optional skills are selected from a Python registry of approved capability bundles (prompt fragments, schemas, and explicitly declared tools). The model can request only a configured label; dynamic skill discovery/loading is deferred until a later security-reviewed experiment.
-- **Evented work-item seam:** keep voice/media orchestration independent from worker execution details. Each work item exposes a normalized run handle and capability declaration; backend-specific cancellation or steering is reported honestly instead of being inferred from local task cancellation.
-- **Work-item coordinator:** `WorkItemCoordinator` owns parent-turn decomposition, ordered work items, bounded wait/timeout, synthesis lifecycle, clarification, late-result offers, and control-intent transitions. It emits normalized work-item events to session state and delegates speech to `SpeechScheduler`.
-- **Speech scheduler:** `SpeechScheduler` owns one active utterance lease and per-work-item speech queues. Every TTS/transport frame is tagged with `work_item_id`, `run_id`, and `utterance_id`; only the scheduler can pause, resume, cancel, discard, or requeue speech after a Pipecat interruption.
-- **Canonical result, two projections:** provider output becomes one strict validated envelope containing the full display answer and concise spoken form. Python binds both to one grounded result ID and citation set; factual equivalence remains an explicit provider instruction and evaluation target rather than a claim that string validation can prove semantics.
-- **Multi-intent projection:** worker results are independently visible as they arrive, while one ordered main-model synthesis supplies the conversational spoken response. A synthesis interruption never deletes the underlying worker results. Late results use a short, interrupt-safe consent prompt instead of unsolicited full-result TTS.
-- **Partial completion with clarification:** completed work is never hidden behind an unresolved item. The spoken/UI synthesis labels what is complete and what needs clarification; the next transcript is reclassified rather than assumed to be only an answer to the pending worker.
-- **Result and delivery are separate:** complete UI text may appear before TTS finishes. Result state survives interruption; speech-delivery state records whether its audio completed.
-- **Separate lifecycle state machines:** work-item/result outcomes (`completed`, `cancelled`, `failed`) are linked to, but not conflated with, utterance-delivery outcomes (`delivery_completed`, `delivery_unknown`, `interrupted`, `interrupted_by_reconnect`). A replay always receives a new utterance ID.
-- **Transport completion is not audibility:** TTS completion only closes synthesis. The initial UI may style server-side `delivery_completed` versus incomplete delivery, but labels it precisely and never claims browser receipt or audible completion. Per-utterance browser playout acknowledgement is deferred until a verifiable client seam exists.
-- **Coarse first-slice speech evidence:** only claim the granularity supported by observed Pipecat frames. Word-level black/grey splitting is conditional on verified alignment; otherwise mark complete versus incomplete utterances conservatively.
-- **Server-authoritative snapshot:** Pipecat logs are diagnostic authority and Python runtime state is projection authority. Reconnected browsers rebuild from a versioned snapshot.
-- **Single-client fencing:** a connection arbiter owns monotonically increasing epochs, atomically promotes replacements, and rejects all traffic from stale transports.
-- **Task-local interruption over a shared audio path:** Pipecat's `InterruptionFrame` and TTS reset operate on the currently active pipeline/audio utterance. Application session state scopes the semantic effect by work-item and utterance ID: task 1's spoken delivery may pause while tasks 2 and 3 continue computing and producing UI results. A canonical result pending before voice-loop LLM acceptance is retained and re-offered through normal loop state rather than trusted to survive the discarded frame queue. A global worker cancel is reserved for connection shutdown/replacement, not ordinary barge-in.
-- **Interruption policy is an experiment seam:** `pause_current_work_item`, `resume_after_soft_interrupt`, `cancel_current_work_item`, and `discard_remaining_speech` remain selectable policy variants. Findings may change the default; no variant is treated as an inherent Pipecat behavior. A bridge acknowledgement and resumed remainder are application-level frames/state, not claims about Pipecat's discarded-frame queue.
-- **Epoch-owned in-flight work:** turns, bounded work items, router/search tasks, results, and utterances carry their origin epoch. Replacement cancels old speech, permits canonical result completion without autoplay, and exposes committed state only to the active epoch.
-- **Causal late-commit policy:** an old-origin completion may append its immutable turn/result/context record, but cannot regain dialogue ownership, replace active/latest pointers, alter current worker/routing status, or schedule speech after a newer epoch accepts work. Same-worker results retain accepted-turn order.
-- **Provider minimization:** OpenAI Responses use `store=False` by default and the runbook names data leaving the process plus any account-level retention limitation.
-- **No `UIWorker` initially:** a connection-scoped RTVI state publisher/observer projects versioned server state, while the plain-JavaScript browser renders it. This keeps UI delivery explicit without a second agent, browser-state owner, or UI framework.
-- **Unbounded per-worker result history, not latest-only:** each worker's finalized canonical results are retained and exposed for the full process lifetime (no eviction), mirroring the plan's existing no-eviction stance on worker lifecycle. This supersedes the earlier "latest result only" worker-inspection limit. The browser renders this as a persistent, timestamped Result Log distinct from the live transcript view, and reconnect rebuilds it from the snapshot like other worker-projected state.</pre>
+
+    <details open>
+      <summary><strong>Scope, routing, and worker ownership</strong></summary>
+      <ul>
+        <li><strong>Browser before Electron:</strong> prove voice, routing, state, and interruption contracts in a browser; package Electron in a separately reviewed plan.</li>
+        <li><strong>Tool-free main router:</strong> one validated structured routing/prose envelope coordinates each user turn. It emits prose for direct, unsupported, and main-owned clarification outcomes; delegated outcomes dispatch separately.</li>
+        <li><strong>Capability before topic:</strong> classify direct, unsupported, clarify, or specialist capability before selecting an existing worker or proposing a new one.</li>
+        <li><strong>Snapshot-bound routing:</strong> selection and dispatch validate against the identical immutable worker-catalogue snapshot.</li>
+        <li><strong>Worker-owned search judgment:</strong> the delegated web worker sanitizes/refines queries, decides sufficiency, asks domain clarification, and returns a grounded result.</li>
+        <li><strong>Registry-controlled persistence:</strong> Python owns stable worker IDs, contexts, approved capability bundles, and policy-label-to-model mapping. Model output cannot instantiate arbitrary classes, models, tools, or skills.</li>
+        <li><strong>Per-worker causal mailbox:</strong> each worker handles accepted turns serially in acceptance order, while distinct workers may run concurrently.</li>
+        <li>The direct hot path has at most two sequential LLM calls: an optional pending-intent classifier and the collapsed router/response call. Delegation adds the worker’s hosted-search call.</li>
+      </ul>
+    </details>
+
+    <details>
+      <summary><strong>Durable host, Pipecat runner, and connection boundary</strong></summary>
+      <ul>
+        <li>A thin <code>SessionHost</code> keeps one <code>WorkerRunner(auto_end=False)</code> alive. The runner owns the worker bus and persistent <code>LLMContextWorker</code> registry; application policy owns selection, epochs, pending dialogue, and canonical history.</li>
+        <li><code>SessionHost</code> is the authoritative mapping from stable worker ID to runner handle and metadata. Add, activate, deactivate, and status updates form one host-boundary transaction.</li>
+        <li>Persistent workers, contexts, results, pending dialogue, and the session sequence counter outlive connections. Every promoted browser connection receives a fresh connection-lifetime <code>PipelineWorker</code>.</li>
+        <li>Registry workers are <code>LLMContextWorker</code> instances or thin subclasses. The connection pipeline’s <code>BusBridgeProcessor</code> is the transport-side endpoint; bridged worker edges alone do not attach browser frames.</li>
+        <li>A single-client arbiter atomically promotes monotonically increasing connection epochs and fences stale transports.</li>
+      </ul>
+    </details>
+
+    <details>
+      <summary><strong>Pending dialogue and bounded multi-intent work</strong></summary>
+      <ul>
+        <li>Pending clarification is a routing candidate, not an exclusive owner. Deterministic cancellation and expiry precede classification as <code>continue_pending</code>, <code>steer_same_topic</code>, <code>new_topic</code>, or <code>multi_intent</code>.</li>
+        <li><code>multi_intent</code> decomposes input into bounded, ordered work items. The validated default maximum is <code>2</code>; values <code>3</code> or <code>4</code> require no schema change.</li>
+        <li><code>WorkItemCoordinator</code> owns decomposition, bounded wait/timeout, pending clarification, retained late tasks, and process-local cancellation. Phase 2 targets a narrow <code>SpeechScheduler</code> test protocol; Phase 3 supplies the Pipecat implementation.</li>
+        <li>v0.1 commits and speaks one canonical result per item in user order. A timeout inserts an ordered “continuing in the background” placeholder; late results update UI/snapshot state without autoplay.</li>
+        <li>Aggregate main-model synthesis, reconnectable consent offers, offer scheduling, and capability-aware cancellation events are deferred.</li>
+      </ul>
+    </details>
+
+    <details>
+      <summary><strong>Cancellation, speech, results, and delivery</strong></summary>
+      <ul>
+        <li>“Stop/pause” controls speech; explicit “cancel/forget it” requests best-effort local computation cancellation.</li>
+        <li>v0.1 cancellation targets known local work-item IDs, calls <code>Task.cancel()</code>, and suppresses locally cancelled commits. It does not claim provider acknowledgement or backend capability.</li>
+        <li><code>SpeechScheduler</code> exclusively owns the active utterance lease and per-item queues. Frames carry <code>work_item_id</code>, <code>run_id</code>, and <code>utterance_id</code>.</li>
+        <li>Provider output normalizes into one strict canonical envelope with full display text, concise speech, one grounded result ID, and one citation set. Factual equivalence is an evaluation target, not something string validation proves.</li>
+        <li>Result and delivery are separate lifecycles. UI text may precede TTS completion; interruption does not erase canonical result state; replay receives a new utterance ID.</li>
+        <li>Transport/TTS completion is not proof of browser receipt or audibility. v0.1 labels only the evidence available and uses conservative complete/incomplete styling unless alignment is verified.</li>
+        <li>Pipecat interruption affects the active shared audio path. Application IDs scope semantic effects so one item’s speech can pause while other items keep computing and producing UI results.</li>
+      </ul>
+    </details>
+
+    <details>
+      <summary><strong>Epochs, snapshots, retention, and privacy</strong></summary>
+      <ul>
+        <li>Python runtime state is projection authority; Pipecat logs are diagnostic authority. Reconnecting clients rebuild from a versioned server snapshot.</li>
+        <li>Turns, work items, tasks, results, and utterances retain their origin epoch. Replacement cancels old speech but may permit canonical completion without autoplay.</li>
+        <li>An old-origin completion may append immutable history but cannot reclaim dialogue ownership, replace active/latest pointers, alter current routing state, or schedule speech.</li>
+        <li>Per-worker finalized result history is timestamped, unbounded for process lifetime, shown in a persistent Result Log, and restored on reconnect.</li>
+        <li>OpenAI Responses uses <code>store=False</code> by default; the runbook identifies data leaving the process and account-level retention limitations.</li>
+        <li>No initial <code>UIWorker</code>: a connection-scoped RTVI publisher/observer projects versioned server state to a plain-JavaScript browser.</li>
+      </ul>
+    </details>
   </section>
 
   <section class="card" id="integration-seams">
     <h3>Integration Seams</h3>
-    <div class="table-wrap">
-      <table aria-label="Integration Seams">
-        <thead><tr><th>Producer</th><th>Contract</th><th>Consumer</th><th>Verification</th></tr></thead>
-        <tbody>
-          <tr><td>Selected STT adapter (local or Deepgram)</td><td>Final user transcript with turn ID</td><td>Main router</td><td>Contract tests, local-server integration smoke test, and opt-in hosted benchmark</td></tr>
-          <tr><td>Worker registry</td><td>Immutable per-turn worker catalogue</td><td>Main router and dispatch validator</td><td>Same-snapshot selection, stale-ID, and mutation tests</td></tr>
-          <tr><td>Main router</td><td>Validated routing decision and policy label</td><td>Worker registry/dispatcher</td><td>Schema tests, allowlist rejection, and routing matrix</td></tr>
-          <tr><td>Main router</td><td>Validated direct/unsupported/clarify intent</td><td>Tool-free main-response executor</td><td>Outcome matrix and no-tools assertion</td></tr>
-          <tr><td>SessionHost</td><td>Runner handle + metadata transaction for worker add/activate/deactivate/status</td><td>Registry catalogue, bridge topics, connection arbiter</td><td>Startup/replacement/shutdown lifecycle and half-applied snapshot race tests</td></tr>
-          <tr><td>Worker registry</td><td>Stable worker identity, topic, context owner, status</td><td>Dispatcher and UI snapshot</td><td>Persistence/isolation tests</td></tr>
-          <tr><td>Per-worker causal mailbox</td><td>Ordered accepted turns and post-prior-turn context</td><td>Context-owning worker</td><td>Same-worker serialization/order and cross-worker concurrency tests</td></tr>
-          <tr><td>Pending dialogue state</td><td>Session-scoped clarification owner and expiry</td><td>Transcript dispatcher</td><td>Continuation, cancellation, task-change, and expiry tests</td></tr>
-          <tr><td>Pending-turn arbiter</td><td><code>continue_pending</code>/<code>steer_same_topic</code>/<code>new_topic</code>/<code>multi_intent</code> plus candidate IDs</td><td>Prior worker, bounded dispatcher, or main router</td><td>Deterministic expiry, classification, decomposition, and ordering tests</td></tr>
-          <tr><td>Control-intent classifier</td><td><code>pause</code>/<code>resume</code>/<code>cancel</code>/<code>consent</code> plus target <code>work_item_id</code></td><td>WorkItemCoordinator and SpeechScheduler</td><td>Active-control tests with and without pending dialogue</td></tr>
-          <tr><td>WorkItemCoordinator</td><td>Parent turn, ordered work items, timeout, synthesis, clarification, late offers</td><td>Session state and SpeechScheduler</td><td>Atomic timeout/late-result/consent/clarification transitions</td></tr>
-          <tr><td>Web worker</td><td>OpenAI hosted-search response</td><td>Canonical result normalizer</td><td>Mocked provider shapes, missing citations, and failure tests</td></tr>
-          <tr><td>Worker runtime handle</td><td><code>work_item_id</code>, <code>run_id</code>, capabilities, ordered events, cancellation acknowledgement</td><td>WorkItemCoordinator</td><td>Backend capability and event-order tests</td></tr>
-          <tr><td>Context-owning worker (<code>LLMContextWorker</code>)</td><td>Validated canonical-result/control frames through its bridged edges</td><td>Connection <code>PipelineWorker</code>'s <code>BusBridgeProcessor</code></td><td>Runner/bus ownership and bridge delivery test; verify against pinned Pipecat version</td></tr>
-          <tr><td>Result normalizer</td><td>Versioned grounded result</td><td>Speech projector and UI projector</td><td>Projection equivalence/invariant test</td></tr>
-          <tr><td>Speech projector/selected TTS adapter (local or Cartesia)</td><td><code>work_item_id</code>/<code>run_id</code>/utterance ID, audio frames, synthesis lifecycle</td><td>SpeechScheduler and Small WebRTC output</td><td>Frame-tag propagation, provider lifecycle, and synthesis/transport distinction tests</td></tr>
-          <tr><td>Interruption controller</td><td>Pipecat interruption frame plus work-item/utterance policy</td><td>Session delivery state and worker-task policy</td><td>Task-local pause/cancel/discard matrix and race tests</td></tr>
-          <tr><td>SpeechScheduler</td><td>One active utterance lease plus per-work-item speech queues</td><td>Selected TTS adapter and transport output</td><td>Frame ownership, interruption, replay, and cross-work-item isolation tests</td></tr>
-          <tr><td>Downstream transport observer</td><td>Utterance/work-item-correlated transport completion/interruption or unknown</td><td>Session delivery state</td><td>Precise completion/unknown labeling and race tests</td></tr>
-          <tr><td>RTVI state publisher</td><td>Versioned state projections and full snapshot</td><td>Browser state reducer</td><td>Contract, duplicate, gap, stale-session, and reconnect tests</td></tr>
-          <tr><td>Session state</td><td>Ordered per-worker canonical-result history (timestamped, unbounded, process-lifetime)</td><td>Browser Result Log panel</td><td>Reconnect-rebuild, ordering, and no-silent-eviction tests</td></tr>
-          <tr><td>Browser controls</td><td>RTVI connect/disconnect, microphone state, snapshot request</td><td>Pipecat session</td><td>Readiness and lifecycle integration test</td></tr>
-          <tr><td>Connection arbiter</td><td>Active/origin connection epochs and fencing decision</td><td>Pipecat sessions, async callbacks, and state emitter</td><td>Replacement, stale-client, and in-flight race tests</td></tr>
-        </tbody>
-      </table>
-    </div>
+    <p class="muted">Search across producer, contract, consumer, and verification evidence.</p>
+    <section class="searchable-table" data-table-id="technical-spec-integration-seams">
+      <div class="search-bar">
+        <input type="search" class="st-search" placeholder="Search integration seams…" aria-label="Search integration seams">
+      </div>
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr><th>Producer</th><th>Contract</th><th>Consumer</th><th>Verification</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Selected STT adapter</td><td>Final transcript + turn ID</td><td>Main router</td><td>Contract tests, local integration smoke, hosted benchmark</td></tr>
+            <tr><td>Worker registry</td><td>Immutable per-turn catalogue</td><td>Router + dispatch validator</td><td>Same-snapshot, stale-ID, mutation tests</td></tr>
+            <tr><td>Main router</td><td>Routing decision + policy label</td><td>Registry / dispatcher</td><td>Schema, allowlist, routing-matrix tests</td></tr>
+            <tr><td>Main router</td><td>Direct / unsupported / clarify intent</td><td>Tool-free response executor</td><td>Outcome matrix + no-tools assertion</td></tr>
+            <tr><td>SessionHost</td><td>Atomic runner-handle + metadata transaction</td><td>Catalogue, bridge topics, arbiter</td><td>Lifecycle + half-applied snapshot race tests</td></tr>
+            <tr><td>Worker registry</td><td>Stable identity, topic, context owner, status</td><td>Dispatcher + UI snapshot</td><td>Persistence and isolation tests</td></tr>
+            <tr><td>Per-worker causal mailbox</td><td>Ordered accepted turns + prior-turn context</td><td>Context-owning worker</td><td>Same-worker order + cross-worker concurrency</td></tr>
+            <tr><td>Pending dialogue state</td><td>Clarification owner + expiry</td><td>Transcript dispatcher</td><td>Continuation, cancellation, task-change, expiry</td></tr>
+            <tr><td>Pending-turn arbiter</td><td>Four outcome labels + candidate IDs</td><td>Prior worker, bounded dispatcher, or router</td><td>Expiry, classification, decomposition, ordering</td></tr>
+            <tr><td>Control-intent classifier</td><td>Local pause/resume/cancel + target ID</td><td>Coordinator + scheduler</td><td>Control tests with/without pending dialogue</td></tr>
+            <tr><td>WorkItemCoordinator</td><td>Ordered results, placeholders, clarification, late results, cancellation</td><td>Session state + scheduler</td><td>Timeout, late-result, clarification, cancellation</td></tr>
+            <tr><td>Web worker</td><td>Hosted-search response</td><td>Canonical normalizer</td><td>Provider-shape, missing-citation, failure tests</td></tr>
+            <tr><td>Worker runtime handle</td><td>Deferred capabilities, events, cancellation acknowledgement</td><td>WorkItemCoordinator</td><td>Follow-up capability and event-order tests</td></tr>
+            <tr><td>LLMContextWorker</td><td>Validated result/control frames over bridged edges</td><td>Pipeline BusBridgeProcessor</td><td>Runner/bus ownership + pinned-version bridge test</td></tr>
+            <tr><td>Result normalizer</td><td>Versioned grounded result</td><td>Speech + UI projectors</td><td>Projection equivalence invariant</td></tr>
+            <tr><td>Speech projector / TTS</td><td>Correlated IDs, audio, synthesis lifecycle</td><td>Scheduler + WebRTC output</td><td>Tag propagation, lifecycle, completion distinctions</td></tr>
+            <tr><td>Interruption controller</td><td>Interruption frame + item/utterance policy</td><td>Delivery state + task policy</td><td>Pause/cancel/discard matrix + races</td></tr>
+            <tr><td>SpeechScheduler</td><td>Active lease + per-item queues</td><td>TTS + transport</td><td>Ownership, interruption, replay, isolation</td></tr>
+            <tr><td>Transport observer</td><td>Correlated completion/interruption/unknown</td><td>Delivery state</td><td>Precise labeling + races</td></tr>
+            <tr><td>RTVI state publisher</td><td>Versioned projections + snapshot</td><td>Browser reducer</td><td>Duplicate, gap, stale-session, reconnect tests</td></tr>
+            <tr><td>Session state</td><td>Timestamped unbounded worker-result history</td><td>Browser Result Log</td><td>Reconnect rebuild, ordering, no eviction</td></tr>
+            <tr><td>Browser controls</td><td>Connect, disconnect, microphone, snapshot request</td><td>Pipecat session</td><td>Readiness + lifecycle integration</td></tr>
+            <tr><td>Connection arbiter</td><td>Connection epochs + fencing</td><td>Sessions, callbacks, emitter</td><td>Replacement, stale-client, in-flight races</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <script>
+      (function () {
+        var root = document.querySelector('.searchable-table[data-table-id="technical-spec-integration-seams"]');
+        if (!root) return;
+        var search = root.querySelector('.st-search');
+        var rows = root.querySelectorAll('tbody tr');
+        if (search) search.addEventListener('input', function (event) {
+          var query = event.target.value.toLowerCase();
+          rows.forEach(function (row) {
+            row.classList.toggle('hidden', query && row.textContent.toLowerCase().indexOf(query) === -1);
+          });
+        });
+      }());
+      </script>
+    </section>
   </section>
 </section>
 
@@ -781,9 +832,9 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="testing-notes">
-<!-- plan-view-rich-section-sha256: 2886fb12ac0e0c991fd0d0a4e19564e6b12185ecfbd7167dafdb3c1de6c197bf -->
-<section class="section" id="testing-notes">
-  <h2>Testing Notes</h2>
+<!-- plan-view-rich-section-sha256: 7e04de22bda14ceded49947375be806e22eb2e9e025455532bd1f7f23aff1db7 -->
+<section class="section" aria-labelledby="testing-notes-heading">
+  <h2 id="testing-notes-heading">Testing Notes</h2>
   <ul>
     <li>Unit tests use fake router/provider/local-service boundaries; they must not call paid APIs or require running STT/TTS servers.</li>
     <li>Contract tests validate JSON Schema and Python model agreement, version rejection, monotonic sequence handling, and unknown-field policy.</li>
@@ -793,14 +844,14 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
     <li>Invariant tests prove every spoken and UI projection shares the canonical result ID and citation set, the UI preserves the complete canonical text, and only the bounded speech field reaches TTS. Provider evaluation separately checks that the concise speech projection adds no facts absent from the display answer and sources.</li>
     <li>Interruption tests distinguish result availability from audio completion and prove that barge-in preserves UI/result state while closing the utterance as interrupted.</li>
     <li>Delivery-race tests cover interruption before start, interruption after start, late completion after interruption, duplicate terminal events, and stale events from an earlier utterance; exactly one terminal outcome wins per utterance.</li>
-    <li>Task-local interruption tests cover three work items with task 1 speaking: barge-in/<code>stop</code> changes only task 1's utterance, tasks 2 and 3 continue, and the configured pause/cancel/discard policy is reflected in state and telemetry. Explicit <code>resume</code> targets only the paused work-item ID.</li>
+    <li>v0.1 task-local interruption tests cover barge-in/<code>stop</code> changing only the active utterance while unrelated work continues. Capability-aware pause/cancel/discard outcomes, telemetry, and targeted resume are deferred.</li>
     <li>Speech-scheduler tests prove one active utterance lease, per-work-item queue isolation, frame ownership tags, no duplicate/lost replay at the verified segment boundary, and deterministic cross-work-item ordering.</li>
     <li>Soft-interruption tests cover task 1 speech interrupted by task 2: the bridge acknowledgement is concise, task 2 remains active, task 1's retained remainder resumes only when policy-eligible, explicit pause prevents resumption, and a stale/invalid remainder is not spoken.</li>
     <li>Stage-aware interruption tests cover a worker result arriving before voice-loop LLM acceptance (canonical state is consumed later without a bridge template) versus after speech has started (bridge template is eligible), plus interruption during each stage.</li>
-    <li>State-machine and browser reducer/render tests cover <code>displayed</code>, <code>queued</code>, <code>started</code>, <code>synthesis_ended</code>, <code>delivery_completed</code>, <code>delivery_unknown</code>, <code>interrupted</code>, <code>interrupted_by_reconnect</code>, <code>paused</code>, <code>resumed</code>, <code>cancellation_requested</code>, <code>cancelled</code>, and <code>completed</code>; assert legal monotonic transitions, terminal precedence, exact labels/styles, and that <code>synthesis_ended</code> never produces completed styling.</li>
-    <li>Cross-entity lifecycle tests keep work-item/result terminal states separate from utterance-delivery terminal states, prove <code>interrupted</code> → replay creates a new utterance ID, and verify stage/template/resume outcomes round-trip through the versioned event and RTVI schemas.</li>
+    <li>v0.1 state-machine and browser reducer/render tests cover the emitted utterance-delivery states and assert legal monotonic transitions, terminal precedence, exact labels/styles, and that <code>synthesis_ended</code> never produces completed styling. Work-item <code>cancellation_requested</code>/<code>cancelled</code> production events remain schema-only and deferred.</li>
+    <li>Cross-entity lifecycle schema tests keep reserved work-item/result terminal states separate from utterance-delivery terminal states. Production work-item-event and capability-outcome round trips are deferred.</li>
     <li>Replacement-race tests cover replacement during routing, hosted search, synthesis, and transport delivery. Old-epoch speech becomes <code>interrupted_by_reconnect</code>; canonical results may commit without autoplay; stale callbacks cannot emit to or mutate the active epoch except through epoch-checked authoritative state.</li>
-    <li>Stale work-item/run/event tests prove old-epoch callbacks cannot mutate WorkItemCoordinator, SessionHost metadata, SpeechScheduler queues, or RTVI state after replacement.</li>
+    <li>Stale task/callback tests prove old-epoch work cannot mutate WorkItemCoordinator, SessionHost metadata, SpeechScheduler queues, or RTVI state after replacement. Stale normalized work-item-event tests are deferred with production event emission.</li>
     <li>Repeated-replacement tests exercise A -&gt; B -&gt; C while A-origin work completes: one immutable canonical commit, no A/B delivery, exactly-once C visibility by incremental event or snapshot, no autoplay, and a terminal old utterance. A second race has a new-epoch turn precede an old result/clarification and proves the late completion cannot seize dialogue ownership, latest pointers, or active status.</li>
     <li>Same-worker causal tests accept turns A then B across replacement, hold A in flight, and prove B does not execute until A commits; B observes A's committed context, history remains A-before-B, each result commits/appears exactly once, and A cannot regain interactive ownership or autoplay. A separate test proves different workers remain concurrent.</li>
     <li>Reconnect tests prove a new page/client instance can reconstruct workers, results, and delivery outcomes from the same Python process.</li>
@@ -816,123 +867,48 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
     <li>Reducer test seeding a snapshot at sequence N, then delivering a stale increment with sequence &lt; N, asserting the stale increment is discarded rather than applied.</li>
     <li>Gap-recovery reducer/protocol test injecting a sequence gap, asserting exactly one snapshot request while recovery is pending, no unsafe incremental state is treated as complete, and ordered application resumes only after the replacement snapshot arrives.</li>
     <li>Pending-dialogue tests cover follow-up versus steering versus new-topic classification, configured decomposition/order at limits <code>2</code>, <code>3</code>, and <code>4</code>, invalid-limit rejection, and expiry using an injected/fake clock rather than wall-clock elapsed time.</li>
-    <li>Multi-intent tests cover ordered partial completion, clarification alongside completed results, timeout synthesis, and late-result emission after timeout.</li>
-    <li>Control-intent tests cover pause/resume/cancel/consent with and without pending dialogue, explicit target work-item IDs, unsupported backend cancellation, and late completion without autoplay.</li>
-    <li>Late-result offer reducer tests cover one-shot statuses, queue ordering, compound consent plus new task, reconnect restoration, stale/duplicate consent, and expiry.</li>
-    <li>Multi-intent telemetry tests cover duration/timeout fields, late-result consent-prompt outcomes, and idle-versus-active notification behavior without exposing prompts, raw provider payloads, or credentials.</li>
+    <li>v0.1 multi-intent tests cover bounded decomposition, user-order per-item commit/speech, pending placeholders, clarification alongside completed results, and UI-only late-result emission after timeout. Aggregate synthesis tests are deferred.</li>
+    <li>v0.1 control tests cover local pause/resume/cancel parsing, explicit target work-item IDs, task cancellation, commit suppression, and late completion without autoplay. Backend capability/acknowledgement and normalized work-item-event tests are deferred.</li>
+    <li>Reconnectable late-result offer reducer tests (one-shot statuses, queue ordering, compound consent plus new task, reconnect restoration, stale/duplicate consent, and expiry) are deferred and are not v0.1 acceptance.</li>
+    <li>Aggregate wait/synthesis and late-result consent telemetry are deferred; v0.1 telemetry does not claim those outcomes.</li>
     <li>Result-log tests prove the per-worker result history persists across reconnect (rebuilt from snapshot), preserves timestamp/turn ordering, and never silently truncates or evicts entries within the process lifetime.</li>
   </ul>
 </section>
 
 </div>
 <div class="tab-panel" data-slot="acceptance-criteria">
-<!-- plan-view-rich-section-sha256: 7f2135ade832cc618950eb1fd1d1dde6e58e4b374023be5832066e6be4867f9c -->
-<section class="section" id="acceptance-criteria">
-  <h2>Acceptance Criteria</h2>
+<!-- plan-view-rich-section-sha256: 01d76f4e81588c9b52bbed84fea6937248d3211aab540d18dab42aa07eb0941e -->
+<section class="section" aria-labelledby="acceptance-criteria-heading">
+  <h2 id="acceptance-criteria-heading">Acceptance Criteria</h2>
   <div class="card">
-    <ul style="list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:10px;">
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>The main model has no external tools registered and all router output passes deterministic Python validation.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Every routing turn selects against an immutable registry catalogue, and stale or hallucinated IDs fail validation against that same snapshot.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Every routing turn validates domain-capability labels and availability against that same catalogue; unavailable private-data capabilities cannot route to a merely topical web worker.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>The router can choose direct, unsupported, clarify, existing-worker, and new-worker paths without turning unavailable private-data requests into web searches.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>At least two topic workers can coexist, same-topic follow-ups return to the chosen worker, and unrelated worker contexts remain unchanged.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Web-search workers use OpenAI hosted <code>web_search</code> and return validated citations through one canonical grounded-result record. Provider request/tool/citation shape is accepted only after a captured authenticated response or pinned official fixture; otherwise the adapter remains explicitly provider-shape-unverified and the paid acceptance is blocked, not silently satisfied by mocked shapes.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Hosted Responses calls request <code>store=False</code> by default and never send a router-created refined query; the plan makes no stronger zero-retention claim without an official provider retention source. Citation URLs reaching the browser are normalized absolute HTTP(S) URLs.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Spoken and UI projections share a canonical result ID and cannot diverge in grounded facts or sources.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>One browser client can connect through Small WebRTC, explicitly control microphone state, receive TTS audio, and render transcript, routing, workers, results, and links.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>UI results may render before delivery completion; when the transport seam is verified, server transport-completed versus interrupted/incomplete delivery is visibly distinguishable, otherwise <code>delivery_unknown</code>/synthesis-only styling is accepted. Neither path claims verified browser playout.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Barge-in interrupts only the currently spoken work item, records a task-local policy outcome, preserves the prior result and unrelated work, and routes the new turn; configured pause, soft-interrupt/resume, cancel, and discard variants are observable and testable. Residual browser-buffered playout is explicitly unverified.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>The speech scheduler proves one active utterance lease and isolates task 1 interruption from task 2/3 queues; any replay boundary is verified or falls back to whole-utterance replay/decline.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>A worker clarification becomes a pending routing candidate; follow-ups, steering, new topics, and bounded multi-intent utterances are classified deterministically before dispatch, with no unrelated topic being captured accidentally. The decomposition limit is configurable through <code>max_work_items_per_turn</code>.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Closing and reopening the browser reconnects to the known Python instance and rebuilds state from a fresh snapshot.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>A fresh transport must present the durable session identity/resume token; the server fences the new epoch before sending the snapshot and rejects stale bus/session callbacks.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Reconnection preserves only clearly labelled local connection diagnostics, and a replacement connection epoch fences all stale-client traffic.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Browser state schema excludes raw logs and full prompts/context. Worker cards are limited to identity, topic, model-policy label, status, and an optional latest-result pointer; the separate Result Log carries the required timestamped finalized-result history. Pipecat logs remain the authoritative diagnostic trail.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>The <code>direct</code>, <code>unsupported</code>, and main-owned <code>clarify</code> outcomes are produced by a single structured-output call; Python validates the returned envelope before emitting prose or causing side effects. The pending-intent classifier runs only when pending candidates exist, and bounded multi-intent decomposition preserves user order.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Backend cancellation outcomes distinguish <code>cancellation_requested</code>, confirmed <code>cancelled</code>, and unconfirmed/late completion; local request cancellation never implies backend preemption.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Full Python and browser test suites, formatting, linting, secret scan, documentation review, code review, and security review pass before push.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Required local acceptance evidence demonstrates user-initiated microphone capture, Small WebRTC media, live local STT/TTS, and audible output; paid OpenAI smoke verification is reported separately when credentials are available.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Normal-versus-grey styling is backed by server transport completion rather than TTS synthesis completion and is labelled as delivery state, not verified audible speech.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>If no reliable transport-completion seam is verified, the UI uses <code>delivery_unknown</code>/synthesis-only styling rather than claiming <code>delivery_completed</code>.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>Each worker's finalized results accumulate in a persistent, timestamped log surviving reconnect (not just a "latest result" pointer), rendered separately from the live transcript view.</span>
-      </li>
-      <li style="display:flex; gap:10px; align-items:flex-start;">
-        <span class="chip grey" style="flex:0 0 auto; margin-top:1px;">AC</span>
-        <span>No Electron code is implemented under this plan; a follow-up plan is created only after the browser lab establishes stable contracts.</span>
-      </li>
+    <ul class="acceptance-criteria">
+      <li>The main model has no external tools registered and all router output passes deterministic Python validation.</li>
+      <li>Every routing turn selects against an immutable registry catalogue, and stale or hallucinated IDs fail validation against that same snapshot.</li>
+      <li>Every routing turn validates domain-capability labels and availability against that same catalogue; unavailable private-data capabilities cannot route to a merely topical web worker.</li>
+      <li>The router can choose direct, unsupported, clarify, existing-worker, and new-worker paths without turning unavailable private-data requests into web searches.</li>
+      <li>At least two topic workers can coexist, same-topic follow-ups return to the chosen worker, and unrelated worker contexts remain unchanged.</li>
+      <li>Web-search workers use OpenAI hosted <code>web_search</code> and return validated citations through one canonical grounded-result record. Provider request/tool/citation shape is accepted only after a captured authenticated response or pinned official fixture; otherwise the adapter remains explicitly provider-shape-unverified and the paid acceptance is blocked, not silently satisfied by mocked shapes.</li>
+      <li>Hosted Responses calls request <code>store=False</code> by default and never send a router-created refined query; the plan makes no stronger zero-retention claim without an official provider retention source. Citation URLs reaching the browser are normalized absolute HTTP(S) URLs.</li>
+      <li>Spoken and UI projections share a canonical result ID and cannot diverge in grounded facts or sources.</li>
+      <li>One browser client can connect through Small WebRTC, explicitly control microphone state, receive TTS audio, and render transcript, routing, workers, results, and links.</li>
+      <li>UI results may render before delivery completion; when the transport seam is verified, server transport-completed versus interrupted/incomplete delivery is visibly distinguishable, otherwise <code>delivery_unknown</code>/synthesis-only styling is accepted. Neither path claims verified browser playout.</li>
+      <li>Barge-in interrupts only the currently spoken utterance, preserves the prior result and unrelated work, and routes the new turn. v0.1 exposes speech-delivery evidence and local best-effort cancellation only; capability-aware pause, soft-interrupt/resume, cancel, and discard work-item outcomes are deferred. Residual browser-buffered playout is explicitly unverified.</li>
+      <li>The speech scheduler proves one active utterance lease and isolates task 1 interruption from task 2/3 queues; any replay boundary is verified or falls back to whole-utterance replay/decline.</li>
+      <li>A worker clarification becomes a pending routing candidate; follow-ups, steering, new topics, and bounded multi-intent utterances are classified deterministically before dispatch, with no unrelated topic being captured accidentally. The decomposition limit is configurable through <code>max_work_items_per_turn</code>.</li>
+      <li>Closing and reopening the browser reconnects to the known Python instance and rebuilds state from a fresh snapshot.</li>
+      <li>A fresh transport must present the durable session identity/resume token; the server fences the new epoch before sending the snapshot and rejects stale bus/session callbacks.</li>
+      <li>Reconnection preserves only clearly labelled local connection diagnostics, and a replacement connection epoch fences all stale-client traffic.</li>
+      <li>Browser state schema excludes raw logs and full prompts/context. Worker cards are limited to identity, topic, model-policy label, status, and an optional latest-result pointer; the separate Result Log carries the required timestamped finalized-result history. Pipecat logs remain the authoritative diagnostic trail.</li>
+      <li>The <code>direct</code>, <code>unsupported</code>, and main-owned <code>clarify</code> outcomes are produced by a single structured-output call; Python validates the returned envelope before emitting prose or causing side effects. The pending-intent classifier runs only when pending candidates exist, and v0.1 bounded multi-intent execution commits and speaks per-item results in user order without aggregate synthesis.</li>
+      <li>v0.1 cancellation is local best-effort task cancellation plus local commit suppression. Capability declarations, backend acknowledgements, and emitted <code>cancellation_requested</code>/confirmed <code>cancelled</code> work-item outcomes are explicitly deferred and are not required for completed v0.1 acceptance.</li>
+      <li>v0.1 late background results are committed to authoritative UI/snapshot state without autoplay. Reconnectable consent offers and spoken late-result prompts are explicitly deferred and are not required for completed v0.1 acceptance.</li>
+      <li>Full Python and browser test suites, formatting, linting, secret scan, documentation review, code review, and security review pass before push.</li>
+      <li>Required local acceptance evidence demonstrates user-initiated microphone capture, Small WebRTC media, live local STT/TTS, and audible output; paid OpenAI smoke verification is reported separately when credentials are available.</li>
+      <li>Normal-versus-grey styling is backed by server transport completion rather than TTS synthesis completion and is labelled as delivery state, not verified audible speech.</li>
+      <li>If no reliable transport-completion seam is verified, the UI uses <code>delivery_unknown</code>/synthesis-only styling rather than claiming <code>delivery_completed</code>.</li>
+      <li>Each worker's finalized results accumulate in a persistent, timestamped log surviving reconnect (not just a “latest result” pointer), rendered separately from the live transcript view.</li>
+      <li>No Electron code is implemented under this plan; a follow-up plan is created only after the browser lab establishes stable contracts.</li>
     </ul>
-    <p style="margin:14px 0 0; font-size:12px; color:var(--fg-dim);">Reviewed 2026-07-17 &middot; commit 421c39cb</p>
   </div>
 </section>
 
@@ -954,14 +930,17 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="findings">
-<!-- plan-view-rich-section-sha256: 358bc5fed30e4a88708356345a6d5ac2a1101812ae15664d6a5e6cbf38b7dced -->
+<!-- plan-view-rich-section-sha256: 7b395611f04eeb1e1b1d6ce51043bc52c4d3f40404249e2a98cb97f34729d0b7 -->
 <section class="card" id="findings">
   <h3>Findings</h3>
   <ul>
     <li>A plain browser is the correct first client because it exercises the Pipecat JavaScript client, Small WebRTC, RTVI controls/messages, microphone, audio, reconnect, and links without Electron-specific lifecycle or security work.</li>
     <li>Worker visibility is useful for the interruption experiment, but raw prompts, full contexts, and logs should remain server-side; the UI needs worker identity/status, results, and delivery state.</li>
     <li>Full result text and speech delivery are distinct timelines. The protocol must correlate them using stable IDs and must not infer word-level progress without a verified timing seam.</li>
-    <li>Task-local interruption strategies (pause/resume, cancel, discard) are an explicit lab experiment. The first slice instruments their outcomes rather than assuming that the single-pipeline Pipecat interruption primitive is a complete multi-worker policy.</li>
+    <li>Task-local interruption strategies (pause/resume, cancel, discard) remain an explicit follow-up lab experiment. v0.1 records speech-delivery interruption and performs local best-effort task cancellation without treating the single-pipeline Pipecat interruption primitive as a complete multi-worker policy.</li>
+    <li>Post-implementation reconciliation defines the completed v0.1 multi-intent behavior as ordered per-item commit and speech; aggregate main-model synthesis remains a follow-up.</li>
+    <li>Late background results in v0.1 are authoritative UI/snapshot updates without autoplay. Server-owned, reconnectable consent offers remain a follow-up.</li>
+    <li>Cancellation in v0.1 is local best-effort task cancellation and commit suppression. Capability-aware work-item events and backend-confirmed outcomes remain a follow-up.</li>
   </ul>
 </section>
 
@@ -1019,7 +998,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="final-results">
-<!-- plan-view-rich-section-sha256: 676dbca5cb439dfb652f879d2f74b94d7c333d8c2151537879be18364fec434d -->
+<!-- plan-view-rich-section-sha256: c7046785c7c65464e40477bf2280424f2c72d38eeebc5fdf3a0f197d411575b8 -->
 <section class="section" id="final-results">
   <h2>Final Results</h2>
   <p>Transport selection is now explicit for the browser slice: local development uses Pipecat Small WebRTC, with <code>/api/session</code>, <code>/api/rtc</code>, and ICE PATCH signaling served by the FastAPI host. The browser obtains the durable session identity and proposed epoch before connecting, and the connection callback attaches a Pipecat <code>SmallWebRTCTransport</code>/<code>PipelineWorker</code> to the process-lifetime runner. Daily transport remains a deployment adapter to add only if this lab is deployed to a cloud runtime; it is not an alternate local transport path.</p>
@@ -1034,7 +1013,9 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
   <p>Post-completion hardening on 2026-07-25 closed a gap in the pending-dialogue requirement: <code>WorkItemCoordinator.add_pending()</code>/<code>PendingDialogue</code> were only ever populated by tests, so the already-implemented <code>continue_pending</code> arbitration branch was unreachable in production — a worker's clarifying question had no live path back into the pending-dialogue queue. <code>WebSearchWorker</code> now raises a <code>WorkerClarify</code> exception for bounded production ambiguity checks (checked after <code>decline()</code>, so capability-unavailable still wins), and all three pipeline dispatch sites record the original request, question, worker, and expiry. Natural answers resume the same worker with the clarification context through a typed continuation object rendered only at the worker provider boundary. Steering remains same-topic, explicit and polite unrelated requests route normally without consuming the pending candidate, and compound replies carry the pending owner through decomposition. Weather time, temperature-unit, and multi-token temporal modifiers no longer masquerade as locations. The operator-configurable <code>[turn].pending_dialogue_timeout_seconds</code> / <code>WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS</code> defaults to 30 seconds and rejects non-finite values.</p>
 
-  <p>The same hardening pass keeps router prompts, decisions, and prose request-local across concurrent turns. Timed-out searches are retained in a bounded coordinator-owned set for late UI delivery without autoplay; callback-delivered results do not also accumulate in the polling queue. Session shutdown fences, cancels, and awaits retained searches, callback tasks, active submissions, and provider children, including cancellation-resistant work until it reaches a terminal state. Caller cancellation also cancels and awaits its child search. Pause, cancel, and stop wait for Pipecat's interruption path before speaking a confirmation, and late provider failures are logged with fixed correlation fields rather than untrusted exception text. Regression tests cover each lifecycle invariant, including ambiguous weather request → spoken clarification → <code>Riga</code> → the same worker receiving the original request plus the answer.</p>
+  <p>The same hardening pass keeps router prompts, decisions, and prose request-local across concurrent turns. Timed-out searches are retained in a bounded coordinator-owned set for late UI delivery without autoplay; callback-delivered results do not also accumulate in the polling queue. A follow-up latency and lifecycle pass reserves coordinator capacity before provider work starts and uses typed completed/retained/rejected transfer outcomes, so rejected work is never reported as continuing in the background. Direct searches now share the bounded foreground behavior already used by pending and multi-intent work. Session shutdown fences connection callbacks first, cancels all coordinator work, waits only for an operator-configurable grace period, and safely consumes eventual completion from cancellation-resistant tasks. Production web workers use a cancellable asynchronous Responses client with a longer provider deadline. Caller cancellation also cancels and awaits its child search. Pause, cancel, and stop wait for Pipecat's interruption path before speaking a confirmation. This is local best-effort control: v0.1 does not declare backend cancellation capabilities, receive provider cancellation acknowledgements, or emit capability-aware work-item outcome events. Late provider failures are logged with fixed correlation fields rather than untrusted exception text. Regression tests cover each lifecycle invariant, including ambiguous weather request → spoken clarification → <code>Riga</code> → the same worker receiving the original request plus the answer. Router, search, and total-turn timings are logged independently; the paid smoke enforces routing and total latency budgets. Hosted-search instructions prefer a small authoritative source set, normalized citations are capped, and typed clarification fields are bounded independently so a long original request cannot truncate the user's answer.</p>
+
+  <p>The completed v0.1 multi-intent path commits and speaks each item in the user's original order; it does not run one aggregate main-model synthesis. Work retained past the foreground timeout may commit later to authoritative result/UI state, including reconnect snapshots, but never autoplays and has no server-owned reconnectable consent offer. Aggregate synthesis, consent-offer lifecycle, and capability-aware cancellation events are deferred follow-up scope rather than completed acceptance.</p>
 </section>
 
 </div>
@@ -1042,7 +1023,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 
 <footer class="plan-foot">
-  Rich view · assembled from 14 section fragments · source sha <code>93addf72863a</code>.
+  Rich view · assembled from 14 section fragments · source sha <code>0809efbef4ef</code>.
   Source of truth: <code>20260711-feature-websearch-subagent-electron.md</code>.
 </footer>
 </body>
