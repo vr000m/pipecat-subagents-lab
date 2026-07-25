@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fence connection callbacks before coordinator shutdown and log routing,
   search, and total turn latency.
 
-## [0.1.0] - 2026-07-25
+## [0.1.0] - Unreleased
 
 ### Added
 
@@ -69,5 +69,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep router prompts, decisions, and prose request-local so concurrent turns
   cannot observe another turn's prompt or response text.
 
-[Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0
+[Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/commits/main
+[0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/pull/1

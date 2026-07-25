@@ -118,9 +118,16 @@ The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
 The default host opens these websocket endpoints with the versioned local STT
 and TTS wire clients; adapter-level client factories remain injectable for
 alternate verified clients.
-The values-redacted preflight is implemented by `server.preflight.run_preflight`.
-Call it from the host integration that owns a service probe before connecting a
-browser. This repository does not expose a standalone preflight CLI.
+Run the values-redacted provider preflight before connecting a browser:
+
+```sh
+uv run python -m server.preflight
+```
+
+The same concrete probe backs `/api/readyz`; it verifies the local websocket
+hello/session handshake or the presence of the selected hosted provider's
+required credentials. `/api/healthz` remains process liveness and does not
+claim dependency readiness.
 
 ### Verification commands
 
@@ -131,6 +138,7 @@ uv sync
 uv run pytest
 uv run ruff format --check .
 uv run ruff check .
+gitleaks git --no-banner --redact
 cd web
 bun install
 bun run build
@@ -148,7 +156,7 @@ uv run python scripts/smoke_server.py
 ```
 
 It starts the real FastAPI/Uvicorn process on an ephemeral loopback port,
-captures its logs, verifies health, browser assets, same-origin session
+captures its logs, verifies liveness, browser assets, same-origin session
 discovery, cross-origin rejection, the versioned session handshake, and clean
 shutdown. It does not claim WebRTC media, STT, TTS, or hosted-model acceptance.
 
