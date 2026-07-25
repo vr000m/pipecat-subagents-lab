@@ -553,16 +553,26 @@ now raises a `WorkerClarify` exception for bounded production ambiguity checks
 (checked after `decline()`, so capability-unavailable still wins), and all
 three pipeline dispatch sites record the original request, question, worker,
 and expiry. Natural answers resume the same worker with the clarification
-context, steering remains same-topic, explicit unrelated questions route
-normally, and compound replies carry the pending owner through decomposition.
+context through a typed continuation object rendered only at the worker
+provider boundary. Steering remains same-topic, explicit and polite unrelated
+requests route normally without consuming the pending candidate, and compound
+replies carry the pending owner through decomposition. Weather time,
+temperature-unit, and multi-token temporal modifiers no longer masquerade as
+locations.
 The operator-configurable `[turn].pending_dialogue_timeout_seconds` /
 `WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS` defaults to 30 seconds and rejects
 non-finite values.
 
-The same hardening pass made router decision/prose delivery atomic across
-concurrent turns, retained timed-out searches for late UI delivery without
-autoplay, preserved caller cancellation while waiting on same-worker mailbox
-predecessors, and made cancel/stop enqueue Pipecat's interruption frame before
-speaking confirmation. Regression tests cover each lifecycle invariant,
-including ambiguous weather request -> spoken clarification -> `Riga` -> the
-same worker receiving the original request plus the answer.
+The same hardening pass keeps router prompts, decisions, and prose request-local
+across concurrent turns. Timed-out searches are retained in a bounded
+coordinator-owned set for late UI delivery without autoplay; callback-delivered
+results do not also accumulate in the polling queue. Session shutdown fences,
+cancels, and awaits retained searches, callback tasks, active submissions, and
+provider children, including cancellation-resistant work until it reaches a
+terminal state. Caller cancellation also cancels and awaits its child search.
+Pause, cancel, and stop wait for Pipecat's interruption path before speaking a
+confirmation, and late provider failures are logged with fixed correlation
+fields rather than untrusted exception text. Regression tests cover each
+lifecycle invariant, including ambiguous weather request -> spoken
+clarification -> `Riga` -> the same worker receiving the original request plus
+the answer.
