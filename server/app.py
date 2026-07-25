@@ -143,122 +143,136 @@ async def _attach_connection(
 ) -> None:
     """Attach a real Pipecat Small WebRTC pipeline to a promoted epoch."""
     runtime = await host.connect(handshake)
-    if runtime.tts is not None and hasattr(runtime.tts, "connect"):
-        await runtime.tts.connect()
-    if not host.accepts(runtime.epoch):
-        await runtime.shutdown(reason="connection replaced during setup")
-        return
-    output_sample_rate = getattr(runtime.tts, "sample_rate", 24000)
-    params = TransportParams(
-        audio_in_enabled=True,
-        audio_out_enabled=True,
-        audio_in_sample_rate=16000,
-        audio_out_sample_rate=output_sample_rate,
-    )
-    transport = SmallWebRTCTransport(connection, params)
-    bus = getattr(host.runner, "bus", None)
-    if bus is None:
-        from .pipeline import _ProbeBus
+    try:
+        if runtime.tts is not None and hasattr(runtime.tts, "connect"):
+            await runtime.tts.connect()
+        if not host.accepts(runtime.epoch):
+            await runtime.shutdown(reason="connection replaced during setup")
+            return
+        output_sample_rate = getattr(runtime.tts, "sample_rate", 24000)
+        params = TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=output_sample_rate,
+        )
+        transport = SmallWebRTCTransport(connection, params)
+        bus = getattr(host.runner, "bus", None)
+        if bus is None:
+            from .pipeline import _ProbeBus
 
-        bus = _ProbeBus() if _ProbeBus is not None else None
-    bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
-    config = getattr(host.registry, "config", None) or Config()
-    processors = [transport.input()]
-    if runtime.stt is not None:
-        processors.extend(
-            (
-                VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=16000)),
-                runtime.stt,
-                smart_turn_processor(timeout_seconds=config.smart_turn_timeout_seconds),
-                FinalTurnTranscriptProcessor(
-                    runtime.on_transcript,
-                    complete_grace_seconds=config.smart_turn_complete_grace_seconds,
-                ),
+            bus = _ProbeBus() if _ProbeBus is not None else None
+        bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
+        config = getattr(host.registry, "config", None) or Config()
+        processors = [transport.input()]
+        if runtime.stt is not None:
+            processors.extend(
+                (
+                    VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=16000)),
+                    runtime.stt,
+                    smart_turn_processor(timeout_seconds=config.smart_turn_timeout_seconds),
+                    FinalTurnTranscriptProcessor(
+                        runtime.on_transcript,
+                        complete_grace_seconds=config.smart_turn_complete_grace_seconds,
+                    ),
+                )
             )
+        if bridge is not None:
+            processors.extend((bridge, CanonicalResultAdapter()))
+        if runtime.tts is not None:
+            processors.extend(_tts_processors(host, runtime))
+        processors.append(transport.output())
+        task_manager = TaskManager(loop=asyncio.get_running_loop())
+        worker = PipelineWorker(
+            Pipeline(processors),
+            name=f"browser-{runtime.epoch}",
+            params=PipelineParams(
+                audio_in_sample_rate=16000, audio_out_sample_rate=output_sample_rate
+            ),
+            enable_rtvi=True,
+            idle_timeout_secs=None,
+            task_manager=task_manager,
         )
-    if bridge is not None:
-        processors.extend((bridge, CanonicalResultAdapter()))
-    if runtime.tts is not None:
-        processors.extend(_tts_processors(host, runtime))
-    processors.append(transport.output())
-    task_manager = TaskManager(loop=asyncio.get_running_loop())
-    worker = PipelineWorker(
-        Pipeline(processors),
-        name=f"browser-{runtime.epoch}",
-        params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=output_sample_rate),
-        enable_rtvi=True,
-        idle_timeout_secs=None,
-        task_manager=task_manager,
-    )
-    publisher = RTVIMessagePublisher(
-        host.state.session_id, runtime.epoch, sequence_provider=lambda: host.state.sequence
-    )
-    runtime.transport = transport
-    runtime.worker = worker
-    if not host.accepts(runtime.epoch):
-        await runtime.shutdown(reason="connection replaced during setup")
-        return
-
-    async def emit_frame(frame: Any) -> None:
-        if host.accepts(runtime.epoch):
-            await worker.queue_frame(frame)
-
-    runtime.observer.subscribe(emit_frame)
-
-    client_ready_sent = False
-
-    @worker.rtvi.event_handler("on_client_ready")
-    async def on_client_ready(_rtvi: Any) -> None:
-        nonlocal client_ready_sent
-        if client_ready_sent:
+    except BaseException:
+        host.abort_connection(runtime)
+        await runtime.shutdown(reason="connection setup failed")
+        raise
+    try:
+        publisher = RTVIMessagePublisher(
+            host.state.session_id, runtime.epoch, sequence_provider=lambda: host.state.sequence
+        )
+        runtime.transport = transport
+        runtime.worker = worker
+        if not host.accepts(runtime.epoch):
+            await runtime.shutdown(reason="connection replaced during setup")
             return
-        if host.accepts(runtime.epoch):
-            client_ready_sent = True
-            publisher.client_ready(epoch=runtime.epoch)
 
-    @worker.rtvi.event_handler("on_client_message")
-    async def on_client_message(_rtvi: Any, message: Any) -> None:
-        data = getattr(message, "data", None)
-        snapshot_requested = message.type == "snapshot-request" or (
-            message.type == "client-message"
-            and isinstance(data, dict)
-            and data.get("t") == "snapshot-request"
-        )
-        if not snapshot_requested or not host.accepts(runtime.epoch):
-            return
-        publisher.set_snapshot(runtime.observer.snapshot())
-        snapshot = publisher.snapshot()
-        if snapshot is not None:
-            await worker.queue_frame(RTVIServerMessageFrame(data=snapshot.model_dump(mode="json")))
+        async def emit_frame(frame: Any) -> None:
+            if host.accepts(runtime.epoch):
+                await worker.queue_frame(frame)
 
-    # WorkerRunner has no remove-workers API in the pinned wheel. Run each
-    # connection worker through its real PipelineWorker lifecycle task so
-    # replacement can cancel and await it without leaking runner registry
-    # entries. Lightweight test runners retain their documented add_workers
-    # registration seam.
-    if type(host.runner).__module__.startswith("pipecat."):
-        runtime.worker_task = asyncio.create_task(
-            worker.run(WorkerParams(task_manager=task_manager))
-        )
+        runtime.observer.subscribe(emit_frame)
 
-        def worker_finished(task: asyncio.Task[Any]) -> None:
-            if task.cancelled():
+        client_ready_sent = False
+
+        @worker.rtvi.event_handler("on_client_ready")
+        async def on_client_ready(_rtvi: Any) -> None:
+            nonlocal client_ready_sent
+            if client_ready_sent:
                 return
-            try:
-                error = task.exception()
-            except asyncio.CancelledError:
-                return
-            if error is not None:
-                asyncio.create_task(runtime.shutdown(reason="Small WebRTC worker failed"))
+            if host.accepts(runtime.epoch):
+                client_ready_sent = True
+                publisher.client_ready(epoch=runtime.epoch)
 
-        runtime.worker_task.add_done_callback(worker_finished)
-    else:
-        add_workers = getattr(host.runner, "add_workers", None)
-        if add_workers is None:
-            raise RuntimeError("the configured runner cannot attach a Small WebRTC worker")
-        attached = add_workers(worker)
-        if hasattr(attached, "__await__"):
-            await attached
+        @worker.rtvi.event_handler("on_client_message")
+        async def on_client_message(_rtvi: Any, message: Any) -> None:
+            data = getattr(message, "data", None)
+            snapshot_requested = message.type == "snapshot-request" or (
+                message.type == "client-message"
+                and isinstance(data, dict)
+                and data.get("t") == "snapshot-request"
+            )
+            if not snapshot_requested or not host.accepts(runtime.epoch):
+                return
+            publisher.set_snapshot(runtime.observer.snapshot())
+            snapshot = publisher.snapshot()
+            if snapshot is not None:
+                await worker.queue_frame(
+                    RTVIServerMessageFrame(data=snapshot.model_dump(mode="json"))
+                )
+
+        # WorkerRunner has no remove-workers API in the pinned wheel. Run each
+        # connection worker through its real PipelineWorker lifecycle task so
+        # replacement can cancel and await it without leaking runner registry
+        # entries. Lightweight test runners retain their documented add_workers
+        # registration seam.
+        if type(host.runner).__module__.startswith("pipecat."):
+            runtime.worker_task = asyncio.create_task(
+                worker.run(WorkerParams(task_manager=task_manager))
+            )
+
+            def worker_finished(task: asyncio.Task[Any]) -> None:
+                if task.cancelled():
+                    return
+                try:
+                    error = task.exception()
+                except asyncio.CancelledError:
+                    return
+                if error is not None:
+                    asyncio.create_task(runtime.shutdown(reason="Small WebRTC worker failed"))
+
+            runtime.worker_task.add_done_callback(worker_finished)
+        else:
+            add_workers = getattr(host.runner, "add_workers", None)
+            if add_workers is None:
+                raise RuntimeError("the configured runner cannot attach a Small WebRTC worker")
+            attached = add_workers(worker)
+            if hasattr(attached, "__await__"):
+                await attached
+    except BaseException:
+        host.abort_connection(runtime)
+        await runtime.shutdown(reason="connection setup failed")
+        raise
 
 
 def _default_session_host(

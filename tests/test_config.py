@@ -136,14 +136,14 @@ def test_operator_models_load_from_toml_and_environment_wins(tmp_path) -> None:
 def test_bind_and_known_client_settings_load_from_environment() -> None:
     config = load_config(
         env={
-            "WEBSEARCH_BIND_HOST": "0.0.0.0",
+            "WEBSEARCH_BIND_HOST": "127.0.0.2",
             "WEBSEARCH_BIND_PORT": "9000",
             "WEBSEARCH_KNOWN_CLIENT_URL": "https://example.test:9443/client",
         }
     )
 
     assert (config.bind_host, config.bind_port, config.known_client_url) == (
-        "0.0.0.0",
+        "127.0.0.2",
         9000,
         "https://example.test:9443/client",
     )
@@ -241,11 +241,23 @@ def test_invalid_pending_dialogue_timeout_from_toml_is_not_ignored(tmp_path) -> 
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    (("bind_host", ""), ("bind_port", 0), ("bind_port", 65_536), ("known_client_url", "client")),
+    (
+        ("bind_host", ""),
+        ("bind_host", "0.0.0.0"),
+        ("bind_host", "192.168.1.20"),
+        ("bind_port", 0),
+        ("bind_port", 65_536),
+        ("known_client_url", "client"),
+    ),
 )
 def test_bind_settings_are_validated(field: str, value: object) -> None:
     with pytest.raises(ConfigError):
         Config(**{field: value})
+
+
+@pytest.mark.parametrize("host", ("localhost", "127.0.0.1", "127.0.0.2", "::1"))
+def test_loopback_bind_hosts_are_allowed(host: str) -> None:
+    assert Config(bind_host=host).bind_host == host
 
 
 def test_bind_port_environment_value_has_config_error_boundary() -> None:

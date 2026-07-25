@@ -3,6 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 import server.app as app_module
@@ -23,6 +24,17 @@ class FakeRunner:
 
     async def stop(self) -> None:
         pass
+
+
+class FailingTTS:
+    def __init__(self) -> None:
+        self.cleaned = False
+
+    async def connect(self) -> None:
+        raise RuntimeError("TTS unavailable")
+
+    async def cleanup(self) -> None:
+        self.cleaned = True
 
 
 class FakeRouterModel:
@@ -133,12 +145,37 @@ def test_tts_completion_uses_only_one_provider_signal() -> None:
     assert type(hosted_processors[1]).__name__ == "_SpeechCompletionProcessor"
 
 
+def test_connection_setup_failure_cleans_and_fences_promoted_runtime() -> None:
+    async def run() -> None:
+        tts = FailingTTS()
+        host = SessionHost(runner_factory=FakeRunner, tts=tts)
+
+        with pytest.raises(RuntimeError, match="TTS unavailable"):
+            await app_module._attach_connection(
+                host,
+                object(),
+                {
+                    "session_id": host.state.session_id,
+                    "resume_token": host.state.resume_token,
+                    "proposed_epoch": 1,
+                    "snapshot_sequence": 0,
+                },
+            )
+
+        assert host.connection is None
+        assert host.state.active_epoch is None
+        assert tts.cleaned is True
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
     import uvicorn
 
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
-        app_module, "load_config", lambda: Config(bind_host="0.0.0.0", bind_port=9000)
+        app_module, "load_config", lambda: Config(bind_host="127.0.0.2", bind_port=9000)
     )
     monkeypatch.setattr(
         uvicorn, "run", lambda target, **kwargs: calls.append({"target": target, **kwargs})
@@ -146,7 +183,7 @@ def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
 
     app_module.main()
 
-    assert calls == [{"target": "server.app:app", "host": "0.0.0.0", "port": 9000}]
+    assert calls == [{"target": "server.app:app", "host": "127.0.0.2", "port": 9000}]
 
 
 def test_injected_session_host_is_preserved() -> None:

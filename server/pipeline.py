@@ -287,6 +287,8 @@ class SearchExecution:
 class SessionHost:
     """Process-lifetime host; persistent workers outlive connection pipelines."""
 
+    _MAX_HANDSHAKE_TOKENS = 32
+
     def __init__(
         self,
         registry: WorkerRegistry | None = None,
@@ -485,6 +487,7 @@ class SessionHost:
         return f"turn-{self._turn_sequence}"
 
     def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
+        self._prune_handshake_tokens()
         entry = self._handshake_tokens.get(token)
         if entry is None:
             return False
@@ -498,6 +501,13 @@ class SessionHost:
             self._handshake_tokens[token] = (epoch, expires_at, True)
             return True
         return redeemed
+
+    def abort_connection(self, pipeline: ConnectionPipeline) -> None:
+        """Fence a promoted connection whose transport setup did not complete."""
+        if self.connection is pipeline:
+            pipeline.deactivate()
+            self.connection = None
+            self.state.active_epoch = None
 
     async def _handle_transcript(
         self, transcript: str, *, origin: ConnectionPipeline | None = None
@@ -1017,12 +1027,16 @@ class SessionHost:
 
     def session_handshake(self) -> dict[str, Any]:
         """Return the next browser handshake without mutating session state."""
+        self._prune_handshake_tokens()
         token = uuid4().hex
         self._handshake_tokens[token] = (
             self.arbiter.epoch + 1,
             time.monotonic() + 60,
             False,
         )
+        while len(self._handshake_tokens) > self._MAX_HANDSHAKE_TOKENS:
+            oldest = min(self._handshake_tokens, key=lambda item: self._handshake_tokens[item][1])
+            self._handshake_tokens.pop(oldest, None)
         return {
             "contract_version": "v1.0",
             "session_id": self.state.session_id,
@@ -1030,6 +1044,16 @@ class SessionHost:
             "proposed_epoch": self.arbiter.epoch + 1,
             "snapshot_sequence": self.state.sequence,
         }
+
+    def _prune_handshake_tokens(self) -> None:
+        now = time.monotonic()
+        expired = [
+            token
+            for token, (_epoch, expires_at, _redeemed) in self._handshake_tokens.items()
+            if expires_at <= now
+        ]
+        for token in expired:
+            self._handshake_tokens.pop(token, None)
 
     def _dispatch(self, decision: Any, catalogue: Any = None) -> Any:
         if catalogue is None:

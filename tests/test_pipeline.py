@@ -926,6 +926,17 @@ def handshake(host: SessionHost, epoch: int) -> dict[str, object]:
     }
 
 
+def test_session_handshake_tokens_are_pruned_and_bounded() -> None:
+    host = SessionHost(runner_factory=LifecycleRunner)
+    host._handshake_tokens["expired"] = (1, 0.0, False)
+
+    handshakes = [host.session_handshake() for _ in range(host._MAX_HANDSHAKE_TOKENS + 10)]
+
+    assert "expired" not in host._handshake_tokens
+    assert len(host._handshake_tokens) == host._MAX_HANDSHAKE_TOKENS
+    assert handshakes[-1]["resume_token"] in host._handshake_tokens
+
+
 def test_connection_observer_projects_canonical_runtime_events_without_live_services() -> None:
     async def run() -> None:
         host = SessionHost()

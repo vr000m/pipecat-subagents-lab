@@ -7,6 +7,7 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,6 +15,16 @@ from urllib.parse import urlparse
 
 class ConfigError(ValueError):
     """Raised when an operator setting is invalid or not allowlisted."""
+
+
+def _is_loopback_host(value: str) -> bool:
+    host = value.strip().strip("[]")
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _models(value: Mapping[str, str]) -> dict[str, str]:
@@ -84,6 +95,10 @@ class Config:
             raise ConfigError("pending_dialogue_timeout_seconds must be finite and positive")
         if not self.bind_host.strip():
             raise ConfigError("bind_host must not be empty")
+        if not _is_loopback_host(self.bind_host):
+            raise ConfigError(
+                "bind_host must be loopback; remote deployment requires an authenticated transport"
+            )
         if not 1 <= self.bind_port <= 65_535:
             raise ConfigError("bind_port must be between 1 and 65535")
         parsed_client_url = urlparse(self.known_client_url)
