@@ -98,6 +98,12 @@ bound hosted routing and worker requests, while
 `WEBSEARCH_SHUTDOWN_GRACE_SECONDS` prevents cancellation-resistant work from
 blocking server shutdown. `WEBSEARCH_MAX_CITATIONS` caps the normalized source
 list. Their TOML equivalents use the same lowercase names under `[turn]`.
+`WEBSEARCH_MAX_WORK_ITEMS_PER_TURN` limits one routed turn to 2, 3, or 4 work
+items and defaults to 2. `WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS` controls how
+long a multi-intent turn waits for all routed work before returning its
+available results; it must be a positive integer and defaults to 10000
+milliseconds. These two settings are environment-only and have no TOML
+equivalents.
 `WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
 OpenAI model IDs without allowing model output to select an arbitrary model.
 
