@@ -1,6 +1,8 @@
 """Versioned Python contract invariants for the browser protocol."""
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +18,13 @@ from server.contracts import (
     WorkerState,
     WorkItemState,
     validate_contract,
+)
+
+GROUNDED_RESULT_SCHEMA = json.loads(
+    (Path(__file__).parents[1] / "shared" / "schemas" / "grounded-result.json").read_text()
+)
+CANONICAL_PROJECTION_PAIRS = tuple(
+    tuple(pair) for pair in GROUNDED_RESULT_SCHEMA["x-equal-properties"]
 )
 
 
@@ -98,6 +107,45 @@ def test_canonical_result_drives_both_projections_and_preserves_origin_epoch() -
     validate_contract(result)
 
 
+def test_shared_result_schema_declares_the_python_projection_invariants() -> None:
+    assert set(GROUNDED_RESULT_SCHEMA["required"]) == set(GROUNDED_RESULT_SCHEMA["properties"])
+    assert CANONICAL_PROJECTION_PAIRS == (
+        ("spoken_result_id", "result_id"),
+        ("ui_result_id", "result_id"),
+        ("ui_text", "text"),
+        ("spoken_citations", "citations"),
+        ("ui_citations", "citations"),
+    )
+    for projection in ("spoken_result_id", "ui_result_id"):
+        assert GROUNDED_RESULT_SCHEMA["properties"][projection]["type"] == "string"
+    for projection in ("spoken_citations", "ui_citations"):
+        assert GROUNDED_RESULT_SCHEMA["properties"][projection]["type"] == "array"
+
+
+@pytest.mark.parametrize(("projection", "canonical"), CANONICAL_PROJECTION_PAIRS)
+def test_python_contract_rejects_shared_projection_invariant_violations(
+    projection: str, canonical: str
+) -> None:
+    payload = GroundedResult(
+        result_id="result-1",
+        worker_id="worker-weather",
+        turn_id="turn-1",
+        text="Canonical answer.",
+        citations=[{"title": "Source", "url": "https://example.com/source"}],
+        spoken_text="Spoken answer.",
+        ui_text="Canonical answer.",
+    ).model_dump(mode="json")
+    payload[projection] = (
+        [{"title": "Other", "url": "https://example.com/other"}]
+        if projection.endswith("_citations")
+        else f"different-{projection}"
+    )
+    assert payload[projection] != payload[canonical]
+
+    with pytest.raises(ValueError, match="canonical|projection"):
+        GroundedResult.model_validate(payload)
+
+
 def test_speech_progress_is_distinct_from_result_completion_and_has_origin_epoch() -> None:
     progress = SpeechProgress(
         result_id="result-1",
@@ -151,3 +199,5 @@ def test_snapshot_is_versioned_monotonic_and_excludes_raw_prompts_or_logs() -> N
 
     with pytest.raises(ValueError):
         RuntimeSnapshot(**{**payload, "snapshot_sequence": 11})
+    with pytest.raises(ValueError):
+        RuntimeSnapshot(**{**payload, "unexpected_private_field": True})

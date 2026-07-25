@@ -12,6 +12,9 @@ const packageSource = JSON.parse(readFileSync(new URL("../package.json", import.
 const messageSchema = JSON.parse(
   readFileSync(new URL("../../shared/schemas/rtvi-message.json", import.meta.url), "utf8"),
 );
+const groundedResultSchema = JSON.parse(
+  readFileSync(new URL("../../shared/schemas/grounded-result.json", import.meta.url), "utf8"),
+);
 const result = (resultId, originEpoch = 1) => {
   const citations = [{ title: "Source", url: "https://example.com/source" }];
   return {
@@ -111,6 +114,25 @@ test("requires complete runtime snapshots and preserves state on malformed snaps
 
   expect(validateServerMessage({ ...validSnapshot, data: {} })).toBe(false);
   expect(validateServerMessage({ ...validSnapshot, data: { ...validSnapshot.data, results: {} } })).toBe(false);
+  expect(validateServerMessage({
+    ...validSnapshot,
+    data: { ...validSnapshot.data, unexpected_private_field: true },
+  })).toBe(false);
+  expect(validateServerMessage({
+    ...validSnapshot,
+    data: {
+      ...validSnapshot.data,
+      workers: [{
+        worker_id: "worker-1",
+        topic: "weather",
+        model_policy: "deep",
+        status: "idle",
+        latest_result_id: null,
+        origin_epoch: 1,
+        unexpected_private_field: true,
+      }],
+    },
+  })).toBe(false);
   expect(validateServerMessage({ ...validSnapshot, session_id: "other" })).toBe(false);
   await protocol.receive({ ...validSnapshot, sequence: 2, data: {} });
 
@@ -161,6 +183,43 @@ test("accepts a full display result with a separate concise spoken projection", 
     data: { ...message.data, results: [{ ...payload, ui_text: "Different UI facts." }] },
   })).toBe(false);
 });
+
+for (const [projection, canonical] of groundedResultSchema["x-equal-properties"]) {
+  test(`rejects a grounded result whose ${projection} diverges from ${canonical}`, () => {
+    const payload = result("result-1");
+    if (projection.endsWith("_citations")) {
+      payload[projection] = [{ title: "Other", url: "https://example.com/other" }];
+    } else {
+      payload[projection] = `different-${projection}`;
+    }
+    const directMessage = {
+      contract_version: "v1.0",
+      session_id: "session-1",
+      kind: "result",
+      sequence: 4,
+      origin_epoch: 1,
+      data: payload,
+    };
+    const snapshotMessage = {
+      ...directMessage,
+      kind: "runtime_snapshot",
+      data: {
+        contract_version: "v1.0",
+        session_id: "session-1",
+        snapshot_sequence: 4,
+        workers: [],
+        results: [payload],
+        speech_progress: [],
+        routing: null,
+        transcript: [],
+        origin_epoch: 1,
+      },
+    };
+
+    expect(validateServerMessage(directMessage)).toBe(false);
+    expect(validateServerMessage(snapshotMessage)).toBe(false);
+  });
+}
 
 test("validates server-authored routing and semantic transcript messages", () => {
   const routing = {

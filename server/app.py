@@ -9,7 +9,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
@@ -31,6 +31,7 @@ from pipecat.workers.base_worker import WorkerParams
 from .config import Config, load_config
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
+from .preflight import ConfiguredServiceProbe, Probe, run_preflight
 from .rtvi_messages import RTVIMessagePublisher
 from .registry import WorkerRegistry
 from .router import LazyRouterProvider, Router
@@ -303,7 +304,11 @@ def _default_session_host(
     return SessionHost(registry=registry, stt=stt, tts=tts, coordinator=coordinator)
 
 
-def create_app(host: SessionHost | None = None) -> FastAPI:
+def create_app(
+    host: SessionHost | None = None,
+    *,
+    preflight_probe: Probe | None = None,
+) -> FastAPI:
     """Create the local FastAPI app and its Small WebRTC signaling routes."""
     session_host = host if host is not None else _default_session_host()
     config = getattr(session_host.registry, "config", None) or Config()
@@ -325,6 +330,26 @@ def create_app(host: SessionHost | None = None) -> FastAPI:
     @app.get("/api/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok", "transport": "smallwebrtc"}
+
+    @app.get("/api/readyz")
+    async def readyz() -> JSONResponse:
+        probe = preflight_probe or ConfiguredServiceProbe(config)
+        report = await asyncio.to_thread(
+            run_preflight,
+            config,
+            probe=probe,
+            authenticated_capability_check=lambda value: (
+                "available" if value.openai_api_key else "unavailable"
+            ),
+        )
+        return JSONResponse(
+            status_code=200 if report.ok else 503,
+            content={
+                "status": "ready" if report.ok else "not_ready",
+                "failures": report.failures,
+                "authenticated_capability": report.authenticated_capability,
+            },
+        )
 
     @app.get("/api/session")
     async def session(request: Request, response: Response) -> dict[str, Any]:

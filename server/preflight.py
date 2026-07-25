@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
+
+from websockets.sync.client import connect as ws_connect
+from websockets.sync.client import unix_connect as ws_unix_connect
 
 from .config import Config
 
@@ -11,6 +15,62 @@ from .config import Config
 class Probe(Protocol):
     def discover(self, service: str) -> tuple[str, str]: ...
     def healthcheck(self, service: str, transport: str, address: str) -> bool: ...
+
+
+class ConfiguredServiceProbe:
+    """Probe configured speech providers without exposing credential values."""
+
+    def __init__(self, config: Config, *, timeout_seconds: float = 2.0) -> None:
+        self.config = config
+        self.timeout_seconds = timeout_seconds
+
+    def discover(self, service: str) -> tuple[str, str]:
+        provider = getattr(self.config, f"{service}_provider")
+        if provider != "local":
+            return "hosted", provider
+        endpoint = getattr(self.config, f"{service}_endpoint")
+        if endpoint is None:
+            raise ValueError(f"{service} endpoint is not configured")
+        return endpoint
+
+    def healthcheck(self, service: str, transport: str, address: str) -> bool:
+        if transport == "hosted":
+            if service == "stt":
+                return address == "deepgram" and bool(self.config.deepgram_api_key)
+            return (
+                address == "cartesia"
+                and bool(self.config.cartesia_api_key)
+                and bool(self.config.cartesia_voice_id)
+            )
+        if transport == "uds":
+            connection = ws_unix_connect(
+                address,
+                uri="ws://localhost/",
+                open_timeout=self.timeout_seconds,
+                close_timeout=self.timeout_seconds,
+            )
+        else:
+            scheme = "wss" if transport == "wss" else "ws"
+            connection = ws_connect(
+                f"{scheme}://{address}/",
+                open_timeout=self.timeout_seconds,
+                close_timeout=self.timeout_seconds,
+            )
+        with connection as websocket:
+            hello = self._receive_json(websocket)
+            if hello.get("type") != "server.hello":
+                return False
+            if service == "stt":
+                created = self._receive_json(websocket)
+                return created.get("type") == "session.created"
+            return True
+
+    def _receive_json(self, websocket: object) -> dict[str, object]:
+        raw = websocket.recv(timeout=self.timeout_seconds)  # type: ignore[attr-defined]
+        if not isinstance(raw, str):
+            return {}
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
 
 
 def record_phase_three_import(_: str) -> None:
@@ -63,6 +123,8 @@ def run_preflight(
         capability = "unconfirmed"
     discovered_config = config
     for service, endpoint in endpoints.items():
+        if endpoint["transport"] == "hosted":
+            continue
         discovered_config = discovered_config.with_discovered_endpoint(
             service, endpoint["transport"], endpoint["address"]
         )
@@ -76,3 +138,24 @@ def run_preflight(
         redacted_text=f"stt={endpoints.get('stt', 'unavailable')}; tts={endpoints.get('tts', 'unavailable')}; "
         f"openai={capability}",
     )
+
+
+def main() -> int:
+    from .config import load_config
+
+    config = load_config()
+    report = run_preflight(
+        config,
+        probe=ConfiguredServiceProbe(config),
+        authenticated_capability_check=lambda value: (
+            "available" if value.openai_api_key else "unavailable"
+        ),
+    )
+    print(report.redacted_text)
+    for service, failure in sorted(report.failures.items()):
+        print(f"{service}: {failure}")
+    return 0 if report.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

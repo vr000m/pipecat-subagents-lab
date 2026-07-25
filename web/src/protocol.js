@@ -1,4 +1,6 @@
 import { applyMessage, createInitialState } from "./state.js";
+import groundedResultSchema from "../../shared/schemas/grounded-result.json";
+import runtimeSnapshotSchema from "../../shared/schemas/runtime-snapshot.json";
 
 export const CONTRACT_VERSION = "v1.0";
 const forbidden = ["raw_logs", "prompt", "context"];
@@ -12,6 +14,11 @@ export const RTVI_MESSAGE_KINDS = Object.freeze([
   "bot_transcript",
 ]);
 const runtimeKinds = new Set(RTVI_MESSAGE_KINDS);
+const groundedResultKeys = Object.freeze(Object.keys(groundedResultSchema.properties));
+const groundedResultEqualProperties = Object.freeze(
+  groundedResultSchema["x-equal-properties"],
+);
+const runtimeSnapshotKeys = Object.freeze(Object.keys(runtimeSnapshotSchema.properties));
 const deliveryStates = new Set([
   "displayed",
   "queued",
@@ -27,6 +34,37 @@ const deliveryStates = new Set([
 
 function validOrigin(value) {
   return value === undefined || value === null || (Number.isInteger(value) && value >= 0);
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actualKeys = Object.keys(value);
+  return actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.hasOwn(value, key));
+}
+
+function equalContractValue(left, right) {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => equalContractValue(item, right[index]));
+  }
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") {
+    return false;
+  }
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => Object.hasOwn(right, key) &&
+      equalContractValue(left[key], right[key]));
+}
+
+function preservesCanonicalProjections(value) {
+  return Array.isArray(groundedResultEqualProperties) &&
+    groundedResultEqualProperties.every(
+      ([projection, canonical]) => equalContractValue(value[projection], value[canonical]),
+    );
 }
 
 function validCitation(value) {
@@ -50,22 +88,18 @@ function validWorker(value) {
 }
 
 function validResult(value) {
-  const keys = ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "ui_text", "spoken_result_id", "ui_result_id", "spoken_citations", "ui_citations", "origin_epoch"];
-  if (!value || Object.keys(value).some((key) => !keys.includes(key))) return false;
-  const validOptionalId = (item) => item === null || typeof item === "string";
-  const validOptionalCitations = (items) => items === null || (Array.isArray(items) && items.every(validCitation));
+  if (!hasExactKeys(value, groundedResultKeys)) return false;
   return value && typeof value === "object" &&
     typeof value.result_id === "string" && typeof value.worker_id === "string" &&
     typeof value.turn_id === "string" && typeof value.timestamp === "string" &&
     typeof value.text === "string" && value.text.trim().length > 0 &&
     typeof value.spoken_text === "string" && value.spoken_text.trim().length > 0 &&
-    typeof value.ui_text === "string" &&
-    value.ui_text === value.text && Array.isArray(value.citations) &&
-    value.citations.every(validCitation) && validOptionalId(value.spoken_result_id) &&
-    validOptionalId(value.ui_result_id) && value.spoken_result_id === value.result_id &&
-    value.ui_result_id === value.result_id && validOptionalCitations(value.spoken_citations) &&
-    validOptionalCitations(value.ui_citations) && Object.hasOwn(value, "origin_epoch") &&
-    validOrigin(value.origin_epoch);
+    typeof value.ui_text === "string" && Array.isArray(value.citations) &&
+    value.citations.every(validCitation) && typeof value.spoken_result_id === "string" &&
+    typeof value.ui_result_id === "string" && Array.isArray(value.spoken_citations) &&
+    value.spoken_citations.every(validCitation) && Array.isArray(value.ui_citations) &&
+    value.ui_citations.every(validCitation) && validOrigin(value.origin_epoch) &&
+    preservesCanonicalProjections(value);
 }
 
 function validSpeech(value) {
@@ -117,6 +151,7 @@ export function validateServerMessage(message) {
     if (message.kind === "bot_transcript" && data.role !== "assistant") return false;
   }
   if (message.kind === "runtime_snapshot") {
+    if (!hasExactKeys(data, runtimeSnapshotKeys)) return false;
     if (typeof data.session_id !== "string" || data.session_id.length === 0) return false;
     if (message.session_id !== data.session_id) return false;
     if (data.contract_version !== CONTRACT_VERSION || !validOrigin(data.origin_epoch)) return false;

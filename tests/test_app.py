@@ -219,6 +219,26 @@ def test_app_exposes_health_and_next_session_handshake() -> None:
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_readiness_reports_dependency_failures_without_changing_liveness() -> None:
+    class UnreadyProbe:
+        @staticmethod
+        def discover(service: str) -> tuple[str, str]:
+            return ("uds", f"/tmp/{service}.sock")
+
+        @staticmethod
+        def healthcheck(_service: str, _transport: str, _address: str) -> bool:
+            return False
+
+    host = SessionHost(runner_factory=FakeRunner)
+    with TestClient(create_app(host, preflight_probe=UnreadyProbe())) as client:
+        assert client.get("/api/healthz").status_code == 200
+        response = client.get("/api/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
+    assert set(response.json()["failures"]) == {"stt", "tts"}
+
+
 def test_offer_rejects_missing_or_wrong_session_identity_before_sdp_handling() -> None:
     host = SessionHost(runner_factory=FakeRunner)
 

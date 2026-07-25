@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 from server.config import Config
-from server.preflight import PreflightReport, run_preflight
+from server.preflight import ConfiguredServiceProbe, PreflightReport, run_preflight
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,25 @@ def test_preflight_checks_required_variable_names_without_requiring_paid_access(
     assert report.ok is True
     assert report.authenticated_capability == "unavailable"
     assert report.paid_smoke_required is False
+
+
+def test_configured_probe_validates_hosted_provider_credentials_without_network() -> None:
+    config = Config(
+        stt_provider="deepgram",
+        deepgram_api_key="deepgram-test",
+        tts_provider="cartesia",
+        cartesia_api_key="cartesia-test",
+        cartesia_voice_id="voice-test",
+    )
+    report = run_preflight(config, probe=ConfiguredServiceProbe(config))
+
+    assert report.ok is True
+    assert report.endpoints == {
+        "stt": {"transport": "hosted", "address": "deepgram"},
+        "tts": {"transport": "hosted", "address": "cartesia"},
+    }
+    assert report.config.stt_endpoint is None
+    assert report.config.tts_endpoint is None
 
 
 def test_preflight_propagates_actionable_probe_failures_without_phase_three_imports(
