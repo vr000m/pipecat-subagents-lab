@@ -458,6 +458,35 @@ def test_background_provider_tasks_are_capped_per_coordinator() -> None:
     asyncio.run(run())
 
 
+def test_start_task_reserves_capacity_before_provider_coroutine_runs() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_background_tasks=1)
+        release = asyncio.Event()
+        second_started = False
+
+        async def first() -> None:
+            await release.wait()
+
+        async def second() -> None:
+            nonlocal second_started
+            second_started = True
+
+        first_task = coordinator.start_task(first())
+        second_task = coordinator.start_task(second())
+
+        assert first_task is not None
+        assert second_task is None
+        await asyncio.sleep(0)
+        assert second_started is False
+
+        release.set()
+        await first_task
+        await asyncio.sleep(0)
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
 def test_rejected_cancellation_resistant_task_remains_owned_until_completion() -> None:
     async def run() -> None:
         coordinator = WorkItemCoordinator(max_background_tasks=1)
@@ -494,6 +523,57 @@ def test_rejected_cancellation_resistant_task_remains_owned_until_completion() -
         await rejected
         await asyncio.sleep(0)
         assert rejected not in coordinator._cancelling_tasks
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_shutdown_grace_is_bounded_for_cancellation_resistant_task() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(
+            config=Config(shutdown_grace_seconds=0.01),
+            max_background_tasks=1,
+        )
+        started = asyncio.Event()
+        ignored_cancellation = asyncio.Event()
+        release = asyncio.Event()
+
+        async def provider() -> None:
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                ignored_cancellation.set()
+                await release.wait()
+
+        task = coordinator.start_task(provider())
+        assert task is not None
+        await started.wait()
+
+        before = asyncio.get_running_loop().time()
+        await coordinator.shutdown()
+        elapsed = asyncio.get_running_loop().time() - before
+
+        assert ignored_cancellation.is_set()
+        assert elapsed < 0.2
+        assert not task.done()
+        release.set()
+        await task
+
+    asyncio.run(run())
+
+
+def test_submit_releases_caller_ownership_when_call_returns() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator()
+
+        async def provider(_worker_id: str, text: str) -> dict:
+            return {"text": text, "citations": []}
+
+        await coordinator.submit("turn-1", [("worker-1", "answer")], provider)
+
+        assert asyncio.current_task() not in coordinator._submission_tasks
+        assert coordinator._submission_tasks == set()
         await coordinator.shutdown()
 
     asyncio.run(run())

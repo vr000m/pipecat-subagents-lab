@@ -695,6 +695,91 @@ def test_search_cancellation_cancels_child_without_retaining_it() -> None:
     asyncio.run(run())
 
 
+def test_direct_search_timeout_transfers_to_background_and_commits_late_result() -> None:
+    async def run() -> None:
+        worker = BlockingResultWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {
+                "worker_id": "worker-search",
+                "topic": "slow search",
+                "model_policy": "deep",
+            },
+        )()
+
+        class RetainingRoutedCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(worker)
+                self.owner = WorkItemCoordinator(
+                    config=Config(foreground_search_timeout_seconds=0.001)
+                )
+                self.config = self.owner.config
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                return self.owner.start_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **kwargs: object) -> bool:
+                return self.owner.retain_late_task(task, **kwargs)
+
+            async def shutdown(self) -> None:
+                await self.owner.shutdown()
+
+        coordinator = RetainingRoutedCoordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        foreground = await host._handle_transcript("slow query")
+
+        assert "continue in the background" in foreground.text
+        worker.release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if len(host.state.result_history("worker-search")) == 2:
+                break
+
+        history = host.state.result_history("worker-search")
+        assert len(history) == 2
+        assert history[-1].text == "Answer for slow query"
+        assert host.state.workers["worker-search"].latest_result_id == history[-1].result_id
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_rejected_direct_search_does_not_claim_background_continuation() -> None:
+    async def run() -> None:
+        worker = BlockingResultWorker()
+
+        class RejectingCoordinator(RoutedCoordinator):
+            config = Config(foreground_search_timeout_seconds=0.001)
+
+            def start_task(self, operation: object) -> asyncio.Task[object]:
+                return asyncio.create_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **_: object) -> bool:
+                task.cancel()
+                return False
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RejectingCoordinator(worker),
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("slow query")
+
+        assert result.text == "The search service is busy; please try again shortly."
+        assert "background" not in result.text
+        await asyncio.sleep(0)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_late_worker_error_log_omits_untrusted_exception_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -732,6 +817,32 @@ def test_session_shutdown_closes_coordinator() -> None:
         await host.shutdown()
 
         assert coordinator.closed is True
+
+    asyncio.run(run())
+
+
+def test_session_shutdown_fences_connection_before_coordinator() -> None:
+    async def run() -> None:
+        events: list[str] = []
+
+        class Connection:
+            def deactivate(self, *, reconnect: bool) -> None:
+                assert reconnect is False
+
+            async def shutdown(self, *, reason: str) -> None:
+                assert reason == "session shutdown"
+                events.append("connection")
+
+        class Coordinator:
+            async def shutdown(self) -> None:
+                events.append("coordinator")
+
+        host = SessionHost(coordinator=Coordinator())
+        host.connection = Connection()  # type: ignore[assignment]
+
+        await host.shutdown()
+
+        assert events == ["connection", "coordinator"]
 
     asyncio.run(run())
 

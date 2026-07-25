@@ -34,6 +34,11 @@ class Config:
     worker_model_policy: Mapping[str, str] = field(default_factory=lambda: {"deep": "gpt-5"})
     max_work_items_per_turn: int = 2
     multi_intent_wait_timeout_ms: int = 10_000
+    foreground_search_timeout_seconds: float = 15.0
+    router_timeout_seconds: float = 12.0
+    provider_timeout_seconds: float = 75.0
+    shutdown_grace_seconds: float = 2.0
+    max_citations: int = 12
     pending_dialogue_timeout_seconds: float = 30.0
     stt_service: str = "websocket"
     stt_provider: str = "local"
@@ -55,6 +60,23 @@ class Config:
             raise ConfigError("max_work_items_per_turn must be 2, 3, or 4")
         if self.multi_intent_wait_timeout_ms <= 0:
             raise ConfigError("multi_intent_wait_timeout_ms must be positive")
+        for name in (
+            "foreground_search_timeout_seconds",
+            "router_timeout_seconds",
+            "provider_timeout_seconds",
+            "shutdown_grace_seconds",
+        ):
+            value = getattr(self, name)
+            if not isfinite(value) or value <= 0:
+                raise ConfigError(f"{name} must be finite and positive")
+        if self.provider_timeout_seconds <= self.foreground_search_timeout_seconds:
+            raise ConfigError(
+                "provider_timeout_seconds must exceed foreground_search_timeout_seconds"
+            )
+        if self.router_timeout_seconds > self.provider_timeout_seconds:
+            raise ConfigError("router_timeout_seconds must not exceed provider_timeout_seconds")
+        if not 1 <= self.max_citations <= 50:
+            raise ConfigError("max_citations must be between 1 and 50")
         if (
             not isfinite(self.pending_dialogue_timeout_seconds)
             or self.pending_dialogue_timeout_seconds <= 0
@@ -153,6 +175,22 @@ def load_config(
         kwargs["max_work_items_per_turn"] = int(raw)
     if raw := values.get("WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS"):
         kwargs["multi_intent_wait_timeout_ms"] = int(raw)
+    for env_name, field_name in (
+        ("WEBSEARCH_FOREGROUND_SEARCH_TIMEOUT_SECONDS", "foreground_search_timeout_seconds"),
+        ("WEBSEARCH_ROUTER_TIMEOUT_SECONDS", "router_timeout_seconds"),
+        ("WEBSEARCH_PROVIDER_TIMEOUT_SECONDS", "provider_timeout_seconds"),
+        ("WEBSEARCH_SHUTDOWN_GRACE_SECONDS", "shutdown_grace_seconds"),
+    ):
+        if env_name in values:
+            try:
+                kwargs[field_name] = float(values[env_name])
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{env_name} must be a number") from exc
+    if raw := values.get("WEBSEARCH_MAX_CITATIONS"):
+        try:
+            kwargs["max_citations"] = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("WEBSEARCH_MAX_CITATIONS must be an integer") from exc
     if "WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS" in values:
         raw = values["WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"]
         try:
@@ -259,6 +297,15 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         values["WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"] = turn[
             "pending_dialogue_timeout_seconds"
         ]
+    for key in (
+        "foreground_search_timeout_seconds",
+        "router_timeout_seconds",
+        "provider_timeout_seconds",
+        "shutdown_grace_seconds",
+        "max_citations",
+    ):
+        if key in turn:
+            values[f"WEBSEARCH_{key.upper()}"] = turn[key]
     if "router_model" in models:
         values["WEBSEARCH_ROUTER_MODEL"] = models["router_model"]
     if "worker_model" in models:

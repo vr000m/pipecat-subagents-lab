@@ -276,6 +276,14 @@ class ConnectionPipeline:
                 pass
 
 
+@dataclass(frozen=True)
+class SearchExecution:
+    """Result of a foreground search and any ownership transfer."""
+
+    status: str
+    result: GroundedResult | None = None
+
+
 class SessionHost:
     """Process-lifetime host; persistent workers outlive connection pipelines."""
 
@@ -302,11 +310,14 @@ class SessionHost:
         self._background_shutdowns: set[asyncio.Task[None]] = set()
         self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
         self._turn_sequence = 0
+        self.last_turn_metrics: dict[str, float | str] = {}
+        self._closing = False
         self.started = False
 
     async def start(self) -> None:
         if self.started:
             return
+        self._closing = False
         if self.runner_factory is not None:
             self.runner = self.runner_factory()
         else:
@@ -352,6 +363,8 @@ class SessionHost:
                 self._runner_registered.add(registered.worker_id)
 
     async def connect(self, handshake: Any) -> ConnectionPipeline:
+        if self._closing:
+            raise RuntimeError("session host is shutting down")
         if not self.started:
             await self.start()
         connection = self.arbiter.promote(handshake)
@@ -490,6 +503,7 @@ class SessionHost:
         self, transcript: str, *, origin: ConnectionPipeline | None = None
     ) -> Any:
         """Route a final local-STT turn through the application coordinator."""
+        turn_started = time.perf_counter()
         origin = origin or self.connection
         if (
             self.coordinator is None
@@ -510,9 +524,11 @@ class SessionHost:
             )
         )
         try:
+            routing_started = time.perf_counter()
             outcome = await asyncio.to_thread(
                 self.coordinator.arbitrate, self.state.session_id, transcript
             )
+            routing_ms = (time.perf_counter() - routing_started) * 1000
         except Exception:
             logger.exception(
                 f"Routing failed for {turn_id}; returning a safe result without provider details"
@@ -617,8 +633,39 @@ class SessionHost:
             return outcome
         worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
         try:
-            result = await search(transcript, turn_id=turn_id, origin_epoch=origin_epoch)
+            search_started = time.perf_counter()
+            execution = await self._search_with_timeout(
+                search,
+                transcript,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                timeout=getattr(
+                    getattr(self.coordinator, "config", None)
+                    or getattr(self.registry, "config", None),
+                    "foreground_search_timeout_seconds",
+                    15.0,
+                ),
+                worker_id=worker_id,
+            )
+            search_ms = (time.perf_counter() - search_started) * 1000
+            if execution.status == "completed" and execution.result is not None:
+                result = execution.result
+            elif execution.status == "retained":
+                result = canonical_result(
+                    worker_id=worker_id,
+                    turn_id=turn_id,
+                    text="That is taking longer than expected; I will continue in the background.",
+                    origin_epoch=origin_epoch,
+                )
+            else:
+                result = canonical_result(
+                    worker_id=worker_id,
+                    turn_id=turn_id,
+                    text="The search service is busy; please try again shortly.",
+                    origin_epoch=origin_epoch,
+                )
         except WorkerClarify as exc:
+            search_ms = (time.perf_counter() - search_started) * 1000
             result = self._worker_clarification_result(
                 worker_id=worker_id,
                 turn_id=turn_id,
@@ -627,6 +674,7 @@ class SessionHost:
                 origin_epoch=origin_epoch,
             )
         except WorkerDeclined:
+            search_ms = (time.perf_counter() - search_started) * 1000
             result = canonical_result(
                 worker_id=worker_id,
                 turn_id=turn_id,
@@ -634,6 +682,7 @@ class SessionHost:
                 origin_epoch=origin_epoch,
             )
         except Exception:
+            search_ms = (time.perf_counter() - search_started) * 1000
             result = canonical_result(
                 worker_id=worker_id,
                 turn_id=turn_id,
@@ -641,6 +690,17 @@ class SessionHost:
                 origin_epoch=origin_epoch,
             )
         committed = await self._commit_and_speak(result, origin)
+        total_ms = (time.perf_counter() - turn_started) * 1000
+        self.last_turn_metrics = {
+            "turn_id": turn_id,
+            "routing_ms": round(routing_ms, 1),
+            "search_ms": round(search_ms, 1),
+            "total_ms": round(total_ms, 1),
+        }
+        logger.info(
+            f"Turn latency {turn_id}: routing_ms={routing_ms:.1f} "
+            f"search_ms={search_ms:.1f} total_ms={total_ms:.1f}"
+        )
         self._project_worker(
             worker,
             origin_epoch=origin_epoch,
@@ -663,7 +723,7 @@ class SessionHost:
             return outcome
         timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
         try:
-            result = await self._search_with_timeout(
+            execution = await self._search_with_timeout(
                 search,
                 transcript,
                 turn_id=turn_id,
@@ -672,11 +732,20 @@ class SessionHost:
                 worker_id=owner_id or "main",
                 clarification_context=self._clarification_context(pending, transcript),
             )
-            if result is None:
+            if execution.status == "completed" and execution.result is not None:
+                result = execution.result
+            elif execution.status == "retained":
                 result = canonical_result(
                     worker_id=owner_id or "main",
                     turn_id=turn_id,
                     text="That is taking longer than expected; I will continue in the background.",
+                    origin_epoch=origin.epoch,
+                )
+            else:
+                result = canonical_result(
+                    worker_id=owner_id or "main",
+                    turn_id=turn_id,
+                    text="The search service is busy; please try again shortly.",
                     origin_epoch=origin.epoch,
                 )
         except TimeoutError:  # pragma: no cover - compatibility with injected search seams
@@ -750,7 +819,7 @@ class SessionHost:
                     else None
                 )
                 item_turn_id = f"{turn_id}-{index + 1}"
-                result = await self._search_with_timeout(
+                execution = await self._search_with_timeout(
                     search,
                     query,
                     turn_id=item_turn_id,
@@ -759,7 +828,9 @@ class SessionHost:
                     worker_id=worker_id,
                     clarification_context=clarification_context,
                 )
-                if result is None:
+                if execution.status == "completed" and execution.result is not None:
+                    result = execution.result
+                elif execution.status == "retained":
                     result = canonical_result(
                         worker_id=worker_id,
                         turn_id=item_turn_id,
@@ -767,6 +838,13 @@ class SessionHost:
                             "That item is taking longer than expected; "
                             "I will continue in the background."
                         ),
+                        origin_epoch=origin.epoch,
+                    )
+                else:
+                    result = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=item_turn_id,
+                        text="The search service is busy; please try again shortly.",
                         origin_epoch=origin.epoch,
                     )
             except TimeoutError:  # pragma: no cover - compatibility with injected search seams
@@ -848,14 +926,21 @@ class SessionHost:
         timeout: float,
         worker_id: str,
         clarification_context: ClarificationContext | None = None,
-    ) -> GroundedResult | None:
+    ) -> SearchExecution:
         kwargs: dict[str, Any] = {
             "turn_id": turn_id,
             "origin_epoch": origin_epoch,
         }
         if clarification_context is not None:
             kwargs["clarification_context"] = clarification_context
-        task = asyncio.create_task(search(query, **kwargs))
+        starter = getattr(self.coordinator, "start_task", None)
+        task = (
+            starter(search(query, **kwargs))
+            if starter is not None
+            else asyncio.create_task(search(query, **kwargs))
+        )
+        if task is None:
+            return SearchExecution("rejected")
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
@@ -863,14 +948,14 @@ class SessionHost:
             await asyncio.gather(task, return_exceptions=True)
             raise
         if task in done:
-            return await task
-        self.coordinator.retain_late_task(
+            return SearchExecution("completed", await task)
+        accepted = self.coordinator.retain_late_task(
             task,
             work_item_id=f"work-{turn_id}",
             worker_id=worker_id,
             on_complete=lambda late: self._commit_late_result(late, origin_epoch),
         )
-        return None
+        return SearchExecution("retained" if accepted else "rejected")
 
     async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
         """Project a late result without autoplaying it."""
@@ -886,6 +971,16 @@ class SessionHost:
         if result.origin_epoch != origin_epoch:
             return
         self._commit_result_state(result)
+        worker = self.state.workers.get(result.worker_id)
+        if worker is not None and worker.origin_epoch == origin_epoch:
+            self.state.set_worker(
+                worker.model_copy(
+                    update={
+                        "status": "idle",
+                        "latest_result_id": result.result_id,
+                    }
+                )
+            )
 
     def _commit_result_state(self, result: GroundedResult) -> None:
         self.state.append_transcript(
@@ -977,20 +1072,42 @@ class SessionHost:
 
     def accepts(self, epoch: int) -> bool:
         return (
-            self.arbiter.accepts(epoch) and self.connection is not None and self.connection.active
+            not self._closing
+            and self.arbiter.accepts(epoch)
+            and self.connection is not None
+            and self.connection.active
         )
 
     async def shutdown(self) -> None:
+        self._closing = True
+        shutdowns = set(self._background_shutdowns)
+        if self.connection is not None:
+            connection = self.connection
+            connection.deactivate(reconnect=False)
+            self.connection = None
+            shutdowns.add(asyncio.create_task(connection.shutdown(reason="session shutdown")))
+        if shutdowns:
+            done, pending = await asyncio.wait(
+                shutdowns,
+                timeout=getattr(
+                    getattr(self.coordinator, "config", None),
+                    "shutdown_grace_seconds",
+                    2.0,
+                ),
+            )
+            for task in pending:
+                task.cancel()
+                task.add_done_callback(
+                    lambda completed: None if completed.cancelled() else completed.exception()
+                )
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
         coordinator_shutdown = getattr(self.coordinator, "shutdown", None)
         if coordinator_shutdown is not None:
             result = coordinator_shutdown()
             if inspect.isawaitable(result):
                 await result
-        if self.connection is not None:
-            await self.connection.shutdown(reason="session shutdown")
-            self.connection = None
-        if self._background_shutdowns:
-            await asyncio.gather(*self._background_shutdowns, return_exceptions=True)
         stop = getattr(self.runner, "stop", None)
         if stop is not None:
             result = stop()

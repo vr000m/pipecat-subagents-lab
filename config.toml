@@ -16,6 +16,16 @@ smart_turn_timeout_seconds = 5.0
 smart_turn_complete_grace_seconds = 1.5
 # Expire an unanswered worker clarification after this many seconds.
 pending_dialogue_timeout_seconds = 30.0
+# Return a spoken acknowledgement while a slow search continues in the background.
+foreground_search_timeout_seconds = 15.0
+# Fail routing promptly instead of holding the entire voice turn open.
+router_timeout_seconds = 12.0
+# Bound the hosted model/search request itself; this must exceed the foreground timeout.
+provider_timeout_seconds = 75.0
+# Do not let cancellation-resistant tasks block process shutdown indefinitely.
+shutdown_grace_seconds = 2.0
+# Keep result payloads and the browser source list concise.
+max_citations = 12
 
 [models]
 router_model = "gpt-5-mini"

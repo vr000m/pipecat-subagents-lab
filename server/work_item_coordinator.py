@@ -136,6 +136,7 @@ class WorkItemCoordinator:
         self._late_tasks: set[asyncio.Task[Any]] = set()
         self._callback_tasks: set[asyncio.Task[Any]] = set()
         self._cancelling_tasks: set[asyncio.Task[Any]] = set()
+        self._owned_tasks: set[asyncio.Task[Any]] = set()
         self._submission_tasks: set[asyncio.Task[Any]] = set()
         self._submit_tasks: set[asyncio.Task[Any]] = set()
         self._provider_tasks: set[asyncio.Task[Any]] = set()
@@ -147,19 +148,54 @@ class WorkItemCoordinator:
             raise RuntimeError("work item coordinator is shut down")
 
     def _has_background_capacity(self) -> bool:
-        return len(self._late_tasks | self._callback_tasks) < self._max_background_tasks
+        return len(self._owned_tasks) < self._max_background_tasks
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    def _adopt_task(self, task: asyncio.Task[Any], *, force: bool = False) -> bool:
+        """Own a task until terminal completion.
+
+        Internal callers reserve ownership before scheduling provider work.
+        ``force`` exists only for already-started compatibility seams: such a
+        task must remain owned while cancellation takes effect.
+        """
+        if task in self._owned_tasks:
+            return True
+        if not force and not self._has_background_capacity():
+            return False
+        self._owned_tasks.add(task)
+
+        def completed(completed_task: asyncio.Task[Any]) -> None:
+            self._owned_tasks.discard(completed_task)
+
+        task.add_done_callback(completed)
+        return True
+
+    def start_task(self, operation: Any) -> asyncio.Task[Any] | None:
+        """Start an awaitable only after reserving bounded coordinator capacity."""
+        if self._shutdown or not self._has_background_capacity():
+            close = getattr(operation, "close", None)
+            if close is not None:
+                close()
+            return None
+        task = asyncio.create_task(operation)
+        self._adopt_task(task, force=True)
+        return task
 
     def _track_cancelling_task(self, task: asyncio.Task[Any]) -> None:
+        self._adopt_task(task, force=True)
         self._cancelling_tasks.add(task)
 
         def completed(completed_task: asyncio.Task[Any]) -> None:
             self._cancelling_tasks.discard(completed_task)
-            if completed_task.cancelled():
-                return
-            try:
-                completed_task.exception()
-            except asyncio.CancelledError:
-                pass
+            self._consume_task_exception(completed_task)
 
         task.add_done_callback(completed)
         task.cancel()
@@ -177,7 +213,7 @@ class WorkItemCoordinator:
             pass
 
     def _track_callback_task(self, task: asyncio.Task[Any]) -> None:
-        if not self._has_background_capacity():
+        if not self._adopt_task(task):
             self._track_cancelling_task(task)
             return
         self._callback_tasks.add(task)
@@ -219,9 +255,9 @@ class WorkItemCoordinator:
     ) -> bool:
         """Retain a timed-out task, returning false when shutdown rejects ownership."""
         if self._shutdown:
-            task.cancel()
+            self._track_cancelling_task(task)
             return False
-        if not self._has_background_capacity():
+        if not self._adopt_task(task):
             self._track_cancelling_task(task)
             return False
         self._late_tasks.add(task)
@@ -260,7 +296,9 @@ class WorkItemCoordinator:
                 return
             callback_result = on_complete(late)
             if inspect.isawaitable(callback_result):
-                self._track_callback_task(asyncio.create_task(callback_result))
+                callback_task = self.start_task(callback_result)
+                if callback_task is not None:
+                    self._track_callback_task(callback_task)
 
         task.add_done_callback(completed)
         return True
@@ -271,22 +309,23 @@ class WorkItemCoordinator:
         self._pending.clear()
         self._late_results.clear()
         current_task = asyncio.current_task()
-        owned_tasks = (
-            self._late_tasks
-            | self._callback_tasks
-            | self._cancelling_tasks
-            | self._submission_tasks
-            | self._submit_tasks
-            | self._provider_tasks
-        )
+        owned_tasks = self._owned_tasks | self._submission_tasks | self._provider_tasks
         tasks = tuple(owned_tasks - ({current_task} if current_task is not None else set()))
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=self.config.shutdown_grace_seconds,
+            )
+            for task in done:
+                self._consume_task_exception(task)
+            for task in pending:
+                task.add_done_callback(self._consume_task_exception)
         self._late_tasks.clear()
         self._callback_tasks.clear()
         self._cancelling_tasks.clear()
+        self._owned_tasks.clear()
         self._submission_tasks.clear()
         self._submit_tasks.clear()
         self._provider_tasks.clear()
@@ -445,72 +484,100 @@ class WorkItemCoordinator:
         submission_task = asyncio.current_task()
         if submission_task is not None:
             self._submission_tasks.add(submission_task)
-            submission_task.add_done_callback(self._submission_tasks.discard)
-        selected = items[: self.config.max_work_items_per_turn]
-        work = tuple(WorkItem(work_item_id=f"{turn_id}-{i}") for i, _ in enumerate(selected))
-
-        def materialize_result(value: Any) -> Any:
-            return Result(**value) if isinstance(value, dict) else value
-
-        async def one(worker_id: str, text: str) -> Any:
-            previous = self._tails.get(worker_id)
-            if previous is not None:
-                try:
-                    await asyncio.shield(previous)
-                except asyncio.CancelledError:
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
-                except Exception:
-                    pass
-            task = asyncio.create_task(worker(worker_id, text))
-            self._provider_tasks.add(task)
-            self._tails[worker_id] = task
-            try:
-                return await task
-            finally:
-                self._provider_tasks.discard(task)
-                if self._tails.get(worker_id) is task:
-                    self._tails.pop(worker_id, None)
-
-        tasks = [asyncio.create_task(one(worker_id, text)) for worker_id, text in selected]
-        self._submit_tasks.update(tasks)
-        for task in tasks:
-            task.add_done_callback(self._submit_tasks.discard)
         try:
-            await asyncio.wait(tasks, timeout=self.config.multi_intent_wait_timeout_ms / 1000)
-        except asyncio.CancelledError:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-        # asyncio.wait can return its done set before a completion callback that
-        # crossed the timeout boundary has run. Give those callbacks one turn,
-        # then classify from the authoritative task state.
-        await asyncio.sleep(0)
-        done = {task for task in tasks if task.done()}
-        raw_results = tuple(
-            task.result() for task in tasks if task in done and task.exception() is None
-        )
-        results = tuple(materialize_result(value) for value in raw_results)
-        failures = tuple(
-            WorkItemFailure(
-                work_item_id=work[i].work_item_id,
-                worker_id=selected[i][0],
-                error_type=type(task.exception()).__name__,
-                error_message="worker execution failed",
+            selected = items[: self.config.max_work_items_per_turn]
+            work = tuple(WorkItem(work_item_id=f"{turn_id}-{i}") for i, _ in enumerate(selected))
+
+            def materialize_result(value: Any) -> Any:
+                return Result(**value) if isinstance(value, dict) else value
+
+            async def one(worker_id: str, text: str) -> Any:
+                previous = self._tails.get(worker_id)
+                if previous is not None:
+                    try:
+                        await asyncio.shield(previous)
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
+                    except Exception:
+                        pass
+                task = asyncio.create_task(worker(worker_id, text))
+                self._provider_tasks.add(task)
+                self._tails[worker_id] = task
+                try:
+                    return await task
+                finally:
+                    self._provider_tasks.discard(task)
+                    if self._tails.get(worker_id) is task:
+                        self._tails.pop(worker_id, None)
+
+            indexed_tasks: list[tuple[int, asyncio.Task[Any]]] = []
+            capacity_failures: list[WorkItemFailure] = []
+            for index, (worker_id, text) in enumerate(selected):
+                task = self.start_task(one(worker_id, text))
+                if task is None:
+                    capacity_failures.append(
+                        WorkItemFailure(
+                            work_item_id=work[index].work_item_id,
+                            worker_id=worker_id,
+                            error_type="CapacityError",
+                            error_message="worker execution capacity is exhausted",
+                        )
+                    )
+                    continue
+                indexed_tasks.append((index, task))
+                self._submit_tasks.add(task)
+                task.add_done_callback(self._submit_tasks.discard)
+            tasks = [task for _, task in indexed_tasks]
+            try:
+                if tasks:
+                    await asyncio.wait(
+                        tasks,
+                        timeout=self.config.multi_intent_wait_timeout_ms / 1000,
+                    )
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            await asyncio.sleep(0)
+            done = {task for task in tasks if task.done()}
+            raw_results = tuple(
+                task.result() for task in tasks if task in done and task.exception() is None
             )
-            for i, task in enumerate(tasks)
-            if task in done and task.exception() is not None
-        )
-        pending_ids = tuple(
-            work[i].work_item_id for i, task in enumerate(tasks) if task not in done
-        )
-        for i, task in enumerate(tasks):
-            if task not in done:
-                self.retain_late_task(
-                    task,
-                    work_item_id=work[i].work_item_id,
-                    worker_id=selected[i][0],
+            results = tuple(materialize_result(value) for value in raw_results)
+            failures = tuple(capacity_failures) + tuple(
+                WorkItemFailure(
+                    work_item_id=work[index].work_item_id,
+                    worker_id=selected[index][0],
+                    error_type=type(task.exception()).__name__,
+                    error_message="worker execution failed",
                 )
-        return SubmittedOutcome(work, results, pending_ids, failures)
+                for index, task in indexed_tasks
+                if task in done and task.exception() is not None
+            )
+            pending_ids: list[str] = []
+            for index, task in indexed_tasks:
+                if task in done:
+                    continue
+                accepted = self.retain_late_task(
+                    task,
+                    work_item_id=work[index].work_item_id,
+                    worker_id=selected[index][0],
+                )
+                if accepted:
+                    pending_ids.append(work[index].work_item_id)
+                else:
+                    failures += (
+                        WorkItemFailure(
+                            work_item_id=work[index].work_item_id,
+                            worker_id=selected[index][0],
+                            error_type="CapacityError",
+                            error_message="worker execution could not continue in background",
+                        ),
+                    )
+            return SubmittedOutcome(work, results, tuple(pending_ids), failures)
+        finally:
+            if submission_task is not None:
+                self._submission_tasks.discard(submission_task)

@@ -20,6 +20,11 @@ def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
     assert config.known_client_url == "http://127.0.0.1:7860"
     assert config.max_work_items_per_turn == 2
     assert config.multi_intent_wait_timeout_ms == 10_000
+    assert config.foreground_search_timeout_seconds == 15.0
+    assert config.router_timeout_seconds == 12.0
+    assert config.provider_timeout_seconds == 75.0
+    assert config.shutdown_grace_seconds == 2.0
+    assert config.max_citations == 12
     assert config.pending_dialogue_timeout_seconds == 30.0
     assert config.stt_service == "websocket"
     assert config.stt_provider == "local"
@@ -44,6 +49,21 @@ def test_operator_limits_reject_zero_or_unbounded_values() -> None:
 
     with pytest.raises(ConfigError):
         Config(multi_intent_wait_timeout_ms=0)
+
+    with pytest.raises(ConfigError):
+        Config(foreground_search_timeout_seconds=0)
+
+    with pytest.raises(ConfigError):
+        Config(provider_timeout_seconds=15, foreground_search_timeout_seconds=15)
+
+    with pytest.raises(ConfigError):
+        Config(router_timeout_seconds=76)
+
+    with pytest.raises(ConfigError):
+        Config(shutdown_grace_seconds=float("inf"))
+
+    with pytest.raises(ConfigError):
+        Config(max_citations=0)
 
     with pytest.raises(ConfigError):
         Config(pending_dialogue_timeout_seconds=0)
@@ -145,6 +165,29 @@ def test_pending_dialogue_timeout_loads_from_environment() -> None:
     config = load_config(env={"WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS": "45"})
 
     assert config.pending_dialogue_timeout_seconds == 45.0
+
+
+def test_search_lifecycle_limits_load_from_toml_and_environment_wins(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "[turn]\n"
+        "foreground_search_timeout_seconds = 20\n"
+        "router_timeout_seconds = 9\n"
+        "provider_timeout_seconds = 80\n"
+        "shutdown_grace_seconds = 3\n"
+        "max_citations = 9\n"
+    )
+
+    config = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_FOREGROUND_SEARCH_TIMEOUT_SECONDS": "25"},
+    )
+
+    assert config.foreground_search_timeout_seconds == 25
+    assert config.router_timeout_seconds == 9
+    assert config.provider_timeout_seconds == 80
+    assert config.shutdown_grace_seconds == 3
+    assert config.max_citations == 9
 
 
 def test_invalid_pending_dialogue_timeout_has_config_error_boundary() -> None:
