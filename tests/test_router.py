@@ -205,6 +205,54 @@ def test_router_allows_first_valid_new_worker_with_empty_catalogue() -> None:
     assert decision.worker_type == "web_search"
 
 
+def test_router_completes_unambiguous_nullable_new_worker_fields() -> None:
+    empty = WorkerCatalogue("catalogue-empty", (), ("public_web",), ("deep",))
+    transcript = "What are the latest Pipecat announcements?"
+    model = FakeRouterModel(
+        {
+            "decision": {
+                "action": "new_worker",
+                "worker_id": None,
+                "worker_type": None,
+                "topic": None,
+                "capability": "public_web",
+                "capability_available": True,
+                "model_policy": None,
+                "catalogue_version": "catalogue-empty",
+                "catalogue_worker_ids": (),
+                "origin_epoch": None,
+            }
+        }
+    )
+
+    decision = Router(model=model).route(transcript, empty)
+
+    assert decision.worker_type == "web_search"
+    assert decision.topic == transcript
+    assert decision.model_policy == "deep"
+    assert decision.capability == "public_web"
+
+
+def test_router_does_not_overwrite_invalid_explicit_new_worker_values() -> None:
+    empty = WorkerCatalogue("catalogue-empty", (), ("public_web",), ("deep",))
+    model = FakeRouterModel(
+        decision_payload(
+            action="new_worker",
+            worker_id=None,
+            worker_type="private_calendar",
+            topic="calendar",
+            capability="public_web",
+            capability_available=True,
+            model_policy="deep",
+            catalogue_version="catalogue-empty",
+            catalogue_worker_ids=(),
+        )
+    )
+
+    with pytest.raises(RoutingValidationError):
+        Router(model=model).route("Read my calendar", empty)
+
+
 def test_empty_catalogue_prompt_bootstraps_public_web_and_reserves_unsupported() -> None:
     prompt = WorkerCatalogue("catalogue-empty", (), ("public_web",), ("deep",)).prompt(
         "What were the capitals of India through the last two hundred years?"

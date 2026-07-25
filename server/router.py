@@ -145,7 +145,11 @@ def validate_decision(decision: RoutingDecision, catalogue: WorkerCatalogue) -> 
             raise RoutingValidationError("new-worker proposals cannot select an existing worker")
         if not catalogue.workers:
             if (
-                (catalogue.model_policies and decision.model_policy not in catalogue.model_policies)
+                decision.worker_type != "web_search"
+                or (
+                    catalogue.model_policies
+                    and decision.model_policy not in catalogue.model_policies
+                )
                 or not decision.capability
                 or (
                     catalogue.capability_labels
@@ -213,6 +217,7 @@ class Router:
             envelope = raw
         else:
             payload = raw.model_dump() if isinstance(raw, RoutingDecision) else raw
+            payload = _complete_unambiguous_new_worker_fields(payload, transcript, catalogue)
             try:
                 envelope = RouterEnvelope.model_validate(
                     payload
@@ -228,6 +233,49 @@ class Router:
         self, transcript: str, catalogue: WorkerCatalogue | tuple[WorkerCatalogueEntry, ...]
     ) -> RoutingDecision:
         return self.route_envelope(transcript, catalogue).decision
+
+
+def _complete_unambiguous_new_worker_fields(
+    payload: Any,
+    transcript: str,
+    catalogue: WorkerCatalogue,
+) -> Any:
+    """Fill only deterministic fields omitted by a structured new-worker route.
+
+    OpenAI strict schemas can require nullable routing fields to be present, but
+    cannot express that worker fields become non-null for one action. Preserve
+    fail-closed validation for arbitrary values while completing the single
+    worker type and policy this registry can actually execute.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    container = payload.get("decision", payload)
+    if not isinstance(container, dict) or container.get("action") != "new_worker":
+        return payload
+
+    decision = dict(container)
+    worker_types = {entry.worker_type for entry in catalogue.workers} or {"web_search"}
+    if decision.get("worker_type") is None and len(worker_types) == 1:
+        decision["worker_type"] = next(iter(worker_types))
+    if decision.get("model_policy") is None and len(catalogue.model_policies) == 1:
+        decision["model_policy"] = catalogue.model_policies[0]
+    if (
+        decision.get("capability") is None
+        and decision.get("worker_type") == "web_search"
+        and "public_web" in catalogue.capability_labels
+    ):
+        decision["capability"] = "public_web"
+    if decision.get("topic") is None:
+        topic = " ".join(transcript.split()).strip()
+        if topic:
+            decision["topic"] = topic[:200]
+
+    completed = dict(payload)
+    if "decision" in payload:
+        completed["decision"] = decision
+    else:
+        completed = decision
+    return completed
 
 
 def catalogue_from_registry(registry: Any) -> WorkerCatalogue:
