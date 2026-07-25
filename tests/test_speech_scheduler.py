@@ -49,9 +49,11 @@ def test_pause_preserves_paused_state_and_resume_records_resumed_transition() ->
 
     scheduler.pause("work-1")
     assert scheduler.active is None
+    assert scheduler.paused("work-1") == first
     assert scheduler.state.speech[first.utterance_id].state == DeliveryState.PAUSED
 
-    replay = scheduler.resume(first)
+    replay = scheduler.resume("work-1")
+    assert replay is not None
     assert scheduler.state.speech[replay.utterance_id].state == DeliveryState.RESUMED
 
 

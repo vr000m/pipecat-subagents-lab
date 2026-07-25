@@ -233,6 +233,48 @@ def test_control_targets_match_scheduler_work_item_ids() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "stop signs near me",
+        "cancel culture history",
+        "resume writing tips",
+    ],
+)
+def test_control_parser_does_not_consume_ordinary_queries(transcript: str) -> None:
+    assert WorkItemCoordinator.control_intent(transcript) is None
+
+
+def test_cancel_targets_only_the_selected_submitted_work_item() -> None:
+    async def run() -> None:
+        started = [asyncio.Event(), asyncio.Event()]
+        cancelled: list[str] = []
+
+        async def worker(_worker_id: str, text: str) -> dict:
+            started[int(text)].set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.append(text)
+                raise
+
+        coordinator = WorkItemCoordinator(wait_timeout_ms=1)
+        outcome = await coordinator.submit(
+            "work-turn",
+            [("worker-a", "0"), ("worker-b", "1")],
+            worker,
+        )
+        await asyncio.gather(*(event.wait() for event in started))
+
+        assert coordinator.cancel("work-turn-0") == ("work-turn-0",)
+        await asyncio.sleep(0)
+        assert cancelled == ["0"]
+        assert outcome.pending_work_item_ids == ("work-turn-0", "work-turn-1")
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
 def test_same_worker_turns_are_causal_but_different_workers_can_run_concurrently() -> None:
     observed: list[str] = []
 

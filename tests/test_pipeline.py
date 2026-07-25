@@ -268,6 +268,7 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
             origin_epoch=1,
         )
 
+        await tts.on_event("synthesis_started", "pipecat-generated-context")
         await tts.on_event("synthesis_ended", "pipecat-generated-context")
         assert host.state.speech[utterance_id].state.value == "delivery_unknown"
         assert len(worker.frames) == 2
@@ -652,6 +653,156 @@ def test_pause_control_stops_active_speech_before_confirmation() -> None:
     asyncio.run(run())
 
 
+def test_late_tts_callback_cannot_complete_replacement_utterance() -> None:
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        old = connection.scheduler.enqueue(
+            result_id="result-old",
+            work_item_id="work-old",
+            run_id="run-old",
+            text="Old answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        await tts.on_event("synthesis_started", "context-old")
+        connection.scheduler.pause("work-old")
+
+        replacement = connection.scheduler.enqueue(
+            result_id="result-new",
+            work_item_id="work-new",
+            run_id="run-new",
+            text="New answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        await tts.on_event("synthesis_started", "context-new")
+        events_before_stale_callback = host.state.events
+
+        await tts.on_event("synthesis_ended", "context-old")
+
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item == replacement
+        assert host.state.speech[replacement.utterance_id].state.value == "started"
+        assert host.state.speech[old.utterance_id].state.value == "paused"
+        assert host.state.events == events_before_stale_callback
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_resume_control_requeues_and_starts_targeted_paused_item() -> None:
+    async def run() -> None:
+        class ControlCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": ("work-active",),
+                        "control_action": "resume",
+                    },
+                )()
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=ControlCoordinator(),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        original = connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        connection.scheduler.pause("work-active")
+
+        await host._handle_transcript("resume work-active")
+
+        assert connection.scheduler.paused("work-active") is None
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item.work_item_id == "work-active"
+        assert connection.scheduler.active.item.utterance_id != original.utterance_id
+        assert connection.worker.frames[-1].text == "Active answer"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_fences_cancellation_resistant_worker_result_and_speech() -> None:
+    async def run() -> None:
+        class ResistantWorker(ResultWorker):
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                self.started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    return await super().search(
+                        query,
+                        turn_id=turn_id,
+                        origin_epoch=origin_epoch,
+                    )
+
+        class CancellableCoordinator(RoutedCoordinator):
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                if transcript.startswith("cancel"):
+                    return type(
+                        "Outcome",
+                        (),
+                        {
+                            "kind": "control",
+                            "decision": None,
+                            "work_items": ("work-turn-1",),
+                            "control_action": "cancel",
+                        },
+                    )()
+                return super().arbitrate(_session_id, transcript)
+
+        worker = ResistantWorker()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=CancellableCoordinator(worker),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        pending = asyncio.create_task(host._handle_transcript("slow search"))
+        await worker.started.wait()
+
+        await host._handle_transcript("cancel work-turn-1")
+        result = await pending
+
+        assert worker.cancelled.is_set()
+        assert result.text == "Answer for slow search"
+        assert host.state.result_history("worker-search") == ()
+        assert all(
+            not isinstance(frame, TTSSpeakFrame) or frame.text != result.spoken_text
+            for frame in connection.worker.frames
+        )
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_search_cancellation_cancels_child_without_retaining_it() -> None:
     async def run() -> None:
         class RetainingCoordinator:
@@ -691,6 +842,105 @@ def test_search_cancellation_cancels_child_without_retaining_it() -> None:
 
         assert child_cancelled.is_set()
         assert coordinator.retained == []
+
+    asyncio.run(run())
+
+
+def test_multi_intent_preserves_envelope_fallbacks_and_uses_submit() -> None:
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=4)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(text: str, _catalogue: object) -> object:
+                action = {
+                    "answer directly": "direct",
+                    "ask me": "clarify",
+                    "unsupported thing": "unsupported",
+                    "search it": "existing_worker",
+                }[text]
+                decision = type("Decision", (), {"action": action})()
+                prose = {
+                    "direct": "Direct answer.",
+                    "clarify": "Which one?",
+                    "unsupported": None,
+                    "existing_worker": None,
+                }[action]
+                return type("Envelope", (), {"decision": decision, "prose": prose})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+                self.submit_calls = 0
+
+            def dispatch(self, decision: object, **_: object) -> object:
+                assert getattr(decision, "action") == "existing_worker"
+                return worker
+
+            async def submit(self, *args: object, **kwargs: object) -> object:
+                self.submit_calls += 1
+                return await super().submit(*args, **kwargs)
+
+        coordinator = Coordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome",
+            (),
+            {
+                "work_items": (
+                    "answer directly",
+                    "ask me",
+                    "unsupported thing",
+                    "search it",
+                ),
+                "pending_dialogue": None,
+            },
+        )()
+
+        results = await host._handle_multi_intent(outcome, "", origin, "turn-compound")
+
+        assert [result.text for result in results] == [
+            "Direct answer.",
+            "Which one?",
+            "I cannot access that capability here.",
+            "Answer for search it",
+        ]
+        assert coordinator.submit_calls == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_new_dynamic_worker_is_registered_before_search_dispatch() -> None:
+    async def run() -> None:
+        runner = AsyncAddRunner()
+
+        class RegisteredBeforeSearchWorker(ProjectedResultWorker):
+            async def search(self, *args: object, **kwargs: object) -> GroundedResult:
+                assert self in runner.added
+                return await super().search(*args, **kwargs)
+
+        worker = RegisteredBeforeSearchWorker()
+        host = SessionHost(
+            runner_factory=lambda: runner,
+            coordinator=ProjectedCoordinator(worker),
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("historical capitals")
+
+        assert result.text == "Answer for historical capitals"
+        assert runner.added == [worker]
+        assert host._runner_handles["worker-search"] is worker
+        await host.shutdown()
 
     asyncio.run(run())
 

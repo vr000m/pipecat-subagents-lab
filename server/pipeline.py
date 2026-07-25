@@ -28,6 +28,7 @@ from .observers import RuntimeObserver
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
+from .rtvi_messages import RTVI_MESSAGE_KINDS
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
 from .work_item_coordinator import LateResult
@@ -83,18 +84,7 @@ except ImportError:  # pragma: no cover - dependency-free contract fallback
 class CanonicalResultAdapter(FrameProcessor):
     """Gate result envelopes without interrupting Pipecat frame lifecycles."""
 
-    _PUBLIC_RTVI_KINDS = frozenset(
-        {
-            "runtime_snapshot",
-            "result",
-            "speech",
-            "worker",
-            "speech_progress",
-            "routing",
-            "user_transcript",
-            "bot_transcript",
-        }
-    )
+    _PUBLIC_RTVI_KINDS = frozenset(RTVI_MESSAGE_KINDS)
 
     def __init__(self) -> None:
         if FrameProcessor is not object:
@@ -312,6 +302,9 @@ class SessionHost:
         self._background_shutdowns: set[asyncio.Task[None]] = set()
         self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
         self._turn_sequence = 0
+        self._inflight_work_tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        self._known_work_items: set[str] = set()
+        self._cancelled_work_items: set[str] = set()
         self.last_turn_metrics: dict[str, float | str] = {}
         self._closing = False
         self.started = False
@@ -355,14 +348,24 @@ class SessionHost:
             return
 
         for registered in self.registry.workers:
-            if registered.worker_id in self._runner_registered:
-                continue
-            handle = registered.worker
-            if isinstance(handle, BaseWorker):
-                result = add_workers(handle)
-                if inspect.isawaitable(result):
-                    await result
-                self._runner_registered.add(registered.worker_id)
+            if isinstance(registered.worker, BaseWorker):
+                await self._register_runner_worker(registered.worker)
+
+    async def _register_runner_worker(self, worker: Any) -> None:
+        metadata = getattr(worker, "metadata", None)
+        worker_id = getattr(metadata, "worker_id", None) or getattr(worker, "name", None)
+        if not isinstance(worker_id, str) or not worker_id:
+            return
+        if worker_id in self._runner_registered:
+            return
+        add_workers = getattr(self.runner, "add_workers", None)
+        if add_workers is None:
+            return
+        result = add_workers(worker)
+        if inspect.isawaitable(result):
+            await result
+        self._runner_handles[worker_id] = worker
+        self._runner_registered.add(worker_id)
 
     async def connect(self, handshake: Any) -> ConnectionPipeline:
         if self._closing:
@@ -425,37 +428,20 @@ class SessionHost:
                     callback_result = self._tts_on_event(event, context_id)
                     if inspect.isawaitable(callback_result):
                         callback_result = await callback_result
-                if (
-                    event == "synthesis_ended"
-                    and self.connection is pipeline
-                    and pipeline.active
-                    and pipeline.scheduler.active is not None
-                ):
-                    # Pipecat 1.6.0 creates its own TTSSpeakFrame context ID.
-                    # The scheduler's one-active-lease invariant is the only
-                    # correlation available without claiming playout completion.
-                    utterance_id = pipeline.scheduler.active.item.utterance_id
-                    pipeline.scheduler.synthesis_ended(utterance_id)
+                current = self.connection is pipeline and pipeline.active
+                if event == "synthesis_started":
+                    pipeline.scheduler.provider_started(context_id)
+                elif event == "synthesis_ended" and current:
+                    matched = pipeline.scheduler.provider_synthesis_ended(context_id)
                     # The pinned local service exposes synthesis completion, not
                     # browser playout completion. Release conservatively as
                     # unknown so later utterances cannot be starved.
-                    pipeline.scheduler.delivery_unknown(utterance_id)
-                elif (
-                    event == "delivery_completed"
-                    and self.connection is pipeline
-                    and pipeline.active
-                    and pipeline.scheduler.active is not None
-                ):
-                    pipeline.scheduler.delivery_completed(
-                        pipeline.scheduler.active.item.utterance_id
-                    )
-                elif (
-                    event == "delivery_unknown"
-                    and self.connection is pipeline
-                    and pipeline.active
-                    and pipeline.scheduler.active is not None
-                ):
-                    pipeline.scheduler.delivery_unknown(pipeline.scheduler.active.item.utterance_id)
+                    if matched:
+                        pipeline.scheduler.provider_delivery_unknown(context_id)
+                elif event == "delivery_completed" and current:
+                    pipeline.scheduler.provider_delivery_completed(context_id)
+                elif event == "delivery_unknown" and current:
+                    pipeline.scheduler.provider_delivery_unknown(context_id)
                 if (
                     event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
                     and self.connection is pipeline
@@ -563,12 +549,19 @@ class SessionHost:
                     )
                     origin.scheduler.pause(target)
                     await origin.scheduler.wait_for_stops()
+                elif action == "resume":
+                    target = outcome.work_items[0] if outcome.work_items else None
+                    replay = origin.scheduler.resume(target)
+                    if replay is not None:
+                        await origin.scheduler.start_next(replay.work_item_id)
                 elif action in {"cancel", "stop"}:
-                    origin.scheduler.interrupt(epoch=origin_epoch)
+                    target = outcome.work_items[0] if outcome.work_items else None
+                    self._cancel_work(target)
+                    origin.scheduler.cancel(target)
                     await origin.scheduler.wait_for_stops()
                 text = {
                     "pause": "Pausing the active response.",
-                    "resume": "Resume requested; no audio was replayed automatically.",
+                    "resume": "Resuming the paused response.",
                     "cancel": "Cancelling the active response.",
                     "stop": "Stopping the active response.",
                 }.get(action, "Control request noted.")
@@ -625,6 +618,7 @@ class SessionHost:
             )
         try:
             worker = self._dispatch(outcome.decision, getattr(outcome, "catalogue", None))
+            await self._register_runner_worker(worker)
         except (RoutingValidationError, UnsupportedWorkerType):
             return await self._commit_and_speak(
                 canonical_result(
@@ -656,6 +650,7 @@ class SessionHost:
                     15.0,
                 ),
                 worker_id=worker_id,
+                work_item_id=f"work-{turn_id}",
             )
             search_ms = (time.perf_counter() - search_started) * 1000
             if execution.status == "completed" and execution.result is not None:
@@ -711,11 +706,12 @@ class SessionHost:
             f"Turn latency {turn_id}: routing_ms={routing_ms:.1f} "
             f"search_ms={search_ms:.1f} total_ms={total_ms:.1f}"
         )
+        cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
         self._project_worker(
             worker,
             origin_epoch=origin_epoch,
             status="idle",
-            latest_result_id=result.result_id,
+            latest_result_id=None if cancelled else result.result_id,
         )
         return committed
 
@@ -731,51 +727,56 @@ class SessionHost:
         search = getattr(worker, "search", None)
         if search is None:
             return outcome
-        timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
-        try:
-            execution = await self._search_with_timeout(
-                search,
-                transcript,
-                turn_id=turn_id,
-                origin_epoch=origin.epoch,
-                timeout=timeout,
-                worker_id=owner_id or "main",
-                clarification_context=self._clarification_context(pending, transcript),
-            )
-            if execution.status == "completed" and execution.result is not None:
-                result = execution.result
-            elif execution.status == "retained":
-                result = canonical_result(
-                    worker_id=owner_id or "main",
+        await self._register_runner_worker(worker)
+        worker_id = owner_id or "main"
+        work_item_id = f"work-{turn_id}"
+        self._known_work_items.add(work_item_id)
+        clarification_context = self._clarification_context(pending, transcript)
+
+        async def execute(_worker_id: str, query: str) -> GroundedResult:
+            try:
+                kwargs: dict[str, Any] = {
+                    "turn_id": turn_id,
+                    "origin_epoch": origin.epoch,
+                }
+                if clarification_context is not None:
+                    kwargs["clarification_context"] = clarification_context
+                return await search(query, **kwargs)
+            except WorkerClarify as exc:
+                return self._worker_clarification_result(
+                    worker_id=worker_id,
                     turn_id=turn_id,
-                    text="That is taking longer than expected; I will continue in the background.",
+                    question=exc.question,
+                    original_query=(pending.original_query if pending is not None else query),
                     origin_epoch=origin.epoch,
                 )
-            else:
-                result = canonical_result(
-                    worker_id=owner_id or "main",
+            except WorkerDeclined:
+                return canonical_result(
+                    worker_id=worker_id,
                     turn_id=turn_id,
-                    text="The search service is busy; please try again shortly.",
+                    text="I could not find a reliable result for that request.",
                     origin_epoch=origin.epoch,
                 )
-        except TimeoutError:  # pragma: no cover - compatibility with injected search seams
+
+        submitted = await self.coordinator.submit(
+            work_item_id,
+            [(worker_id, transcript)],
+            execute,
+            on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+            work_item_ids=[work_item_id],
+        )
+        if submitted.results:
+            result = submitted.results[0]
+        elif submitted.pending_work_item_ids:
             result = canonical_result(
-                worker_id=owner_id or "main",
+                worker_id=worker_id,
                 turn_id=turn_id,
                 text="That is taking longer than expected; I will continue in the background.",
                 origin_epoch=origin.epoch,
             )
-        except WorkerClarify as exc:
-            result = self._worker_clarification_result(
-                worker_id=owner_id or "main",
-                turn_id=turn_id,
-                question=exc.question,
-                original_query=(pending.original_query if pending is not None else transcript),
-                origin_epoch=origin.epoch,
-            )
-        except Exception:
+        else:
             result = canonical_result(
-                worker_id=owner_id or "main",
+                worker_id=worker_id,
                 turn_id=turn_id,
                 text="The pending web request could not be completed.",
                 origin_epoch=origin.epoch,
@@ -787,7 +788,11 @@ class SessionHost:
     ) -> tuple[Any, ...]:
         """Execute bounded compound work in the user's stated order."""
         del transcript
-        results: list[Any] = []
+        results: dict[int, Any] = {}
+        runnable: list[tuple[str, str]] = []
+        runnable_indexes: list[int] = []
+        runnable_workers: dict[int, Any] = {}
+        contexts: dict[int, ClarificationContext | None] = {}
         pending = getattr(outcome, "pending_dialogue", None)
         for index, item_text in enumerate(outcome.work_items):
             worker = None
@@ -796,98 +801,138 @@ class SessionHost:
                 worker = registered.worker if registered is not None else None
             else:
                 catalogue = self.coordinator.registry.catalogue()
-                decision = await asyncio.to_thread(
-                    self.coordinator.router.route,
-                    item_text,
-                    catalogue,
-                )
+                try:
+                    envelope = await asyncio.to_thread(
+                        self.coordinator.router.route_envelope,
+                        item_text,
+                        catalogue,
+                    )
+                except Exception:
+                    results[index] = canonical_result(
+                        worker_id="main",
+                        turn_id=f"{turn_id}-{index}",
+                        text="Routing is temporarily unavailable. Please try that request again.",
+                        origin_epoch=origin.epoch,
+                    )
+                    continue
+                decision = envelope.decision
+                action = getattr(decision, "action", None)
+                if action in {"direct", "unsupported", "clarify"}:
+                    text = (
+                        envelope.prose
+                        or {
+                            "direct": "I could not produce a direct answer yet.",
+                            "unsupported": "I cannot access that capability here.",
+                            "clarify": "Could you clarify what you want me to search for?",
+                        }[action]
+                    )
+                    results[index] = canonical_result(
+                        worker_id="main",
+                        turn_id=f"{turn_id}-{index}",
+                        text=text,
+                        origin_epoch=origin.epoch,
+                    )
+                    continue
                 try:
                     worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
+                    await self._register_runner_worker(worker)
                 except (RoutingValidationError, UnsupportedWorkerType):
-                    results.append(
-                        await self._commit_and_speak(
-                            canonical_result(
-                                worker_id="main",
-                                turn_id=f"{turn_id}-{index + 1}",
-                                text="I cannot access that capability here.",
-                                origin_epoch=origin.epoch,
-                            ),
-                            origin,
-                        )
+                    results[index] = canonical_result(
+                        worker_id="main",
+                        turn_id=f"{turn_id}-{index}",
+                        text="I cannot access that capability here.",
+                        origin_epoch=origin.epoch,
                     )
                     continue
             search = getattr(worker, "search", None)
             if search is None:
+                results[index] = canonical_result(
+                    worker_id="main",
+                    turn_id=f"{turn_id}-{index}",
+                    text="I cannot access that capability here.",
+                    origin_epoch=origin.epoch,
+                )
                 continue
             worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
-            timeout = self.coordinator.config.multi_intent_wait_timeout_ms / 1000
+            runnable.append((worker_id, item_text))
+            runnable_indexes.append(index)
+            runnable_workers[index] = worker
+            contexts[index] = (
+                self._clarification_context(pending, item_text)
+                if index == 0 and pending is not None
+                else None
+            )
+
+        execution_indexes: dict[tuple[str, str], list[int]] = {}
+        for item_index, item in zip(runnable_indexes, runnable, strict=True):
+            execution_indexes.setdefault(item, []).append(item_index)
+
+        async def execute(worker_id: str, query: str) -> GroundedResult:
+            item_index = execution_indexes[(worker_id, query)].pop(0)
+            item_turn_id = f"{turn_id}-{item_index}"
+            search = runnable_workers[item_index].search
             try:
-                query = item_text
-                clarification_context = (
-                    self._clarification_context(pending, item_text)
-                    if index == 0 and pending is not None
-                    else None
-                )
-                item_turn_id = f"{turn_id}-{index + 1}"
-                execution = await self._search_with_timeout(
-                    search,
-                    query,
-                    turn_id=item_turn_id,
-                    origin_epoch=origin.epoch,
-                    timeout=timeout,
-                    worker_id=worker_id,
-                    clarification_context=clarification_context,
-                )
-                if execution.status == "completed" and execution.result is not None:
-                    result = execution.result
-                elif execution.status == "retained":
-                    result = canonical_result(
-                        worker_id=worker_id,
-                        turn_id=item_turn_id,
-                        text=(
-                            "That item is taking longer than expected; "
-                            "I will continue in the background."
-                        ),
-                        origin_epoch=origin.epoch,
-                    )
-                else:
-                    result = canonical_result(
-                        worker_id=worker_id,
-                        turn_id=item_turn_id,
-                        text="The search service is busy; please try again shortly.",
-                        origin_epoch=origin.epoch,
-                    )
-            except TimeoutError:  # pragma: no cover - compatibility with injected search seams
-                result = canonical_result(
-                    worker_id=worker_id,
-                    turn_id=f"{turn_id}-{index + 1}",
-                    text="That item is taking longer than expected; I will continue in the background.",
-                    origin_epoch=origin.epoch,
-                )
+                kwargs: dict[str, Any] = {
+                    "turn_id": item_turn_id,
+                    "origin_epoch": origin.epoch,
+                }
+                if contexts[item_index] is not None:
+                    kwargs["clarification_context"] = contexts[item_index]
+                return await search(query, **kwargs)
             except WorkerClarify as exc:
-                result = self._worker_clarification_result(
+                return self._worker_clarification_result(
                     worker_id=worker_id,
-                    turn_id=f"{turn_id}-{index + 1}",
+                    turn_id=item_turn_id,
                     question=exc.question,
                     original_query=query,
                     origin_epoch=origin.epoch,
                 )
             except WorkerDeclined:
-                result = canonical_result(
+                return canonical_result(
                     worker_id=worker_id,
-                    turn_id=f"{turn_id}-{index + 1}",
+                    turn_id=item_turn_id,
                     text="I could not find a reliable result for that request.",
                     origin_epoch=origin.epoch,
                 )
-            except Exception:
-                result = canonical_result(
-                    worker_id=worker_id,
-                    turn_id=f"{turn_id}-{index + 1}",
-                    text="The web search is temporarily unavailable.",
-                    origin_epoch=origin.epoch,
-                )
-            results.append(await self._commit_and_speak(result, origin))
-        return tuple(results)
+
+        work_item_ids = [f"work-{turn_id}-{index}" for index in runnable_indexes]
+        self._known_work_items.update(work_item_ids)
+        submitted = await self.coordinator.submit(
+            f"work-{turn_id}",
+            runnable,
+            execute,
+            on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+            work_item_ids=work_item_ids,
+        )
+        result_indexes = {
+            result.turn_id: index
+            for index in runnable_indexes
+            for result in submitted.results
+            if result.turn_id == f"{turn_id}-{index}"
+        }
+        for result in submitted.results:
+            results[result_indexes[result.turn_id]] = result
+        for work_item_id in submitted.pending_work_item_ids:
+            item_index = int(work_item_id.rsplit("-", 1)[1])
+            worker_id = runnable[runnable_indexes.index(item_index)][0]
+            results[item_index] = canonical_result(
+                worker_id=worker_id,
+                turn_id=f"{turn_id}-{item_index}",
+                text="That item is taking longer than expected; I will continue in the background.",
+                origin_epoch=origin.epoch,
+            )
+        for failure in submitted.failures:
+            item_index = int(failure.work_item_id.rsplit("-", 1)[1])
+            results[item_index] = canonical_result(
+                worker_id=failure.worker_id,
+                turn_id=f"{turn_id}-{item_index}",
+                text="The web search is temporarily unavailable.",
+                origin_epoch=origin.epoch,
+            )
+        committed = []
+        for index in sorted(results):
+            committed.append(await self._commit_and_speak(results[index], origin))
+        return tuple(committed)
 
     def _worker_clarification_result(
         self,
@@ -935,6 +980,7 @@ class SessionHost:
         origin_epoch: int,
         timeout: float,
         worker_id: str,
+        work_item_id: str | None = None,
         clarification_context: ClarificationContext | None = None,
     ) -> SearchExecution:
         kwargs: dict[str, Any] = {
@@ -951,6 +997,8 @@ class SessionHost:
         )
         if task is None:
             return SearchExecution("rejected")
+        work_item_id = work_item_id or f"work-{turn_id}"
+        self._track_work_task(work_item_id, task)
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
@@ -961,7 +1009,7 @@ class SessionHost:
             return SearchExecution("completed", await task)
         accepted = self.coordinator.retain_late_task(
             task,
-            work_item_id=f"work-{turn_id}",
+            work_item_id=work_item_id,
             worker_id=worker_id,
             on_complete=lambda late: self._commit_late_result(late, origin_epoch),
         )
@@ -974,13 +1022,21 @@ class SessionHost:
                 f"Late worker result failed for work_item={late.work_item_id} "
                 f"worker={late.worker_id}"
             )
+            self._known_work_items.discard(late.work_item_id)
+            return
+        if late.work_item_id in self._cancelled_work_items:
+            self._cancelled_work_items.discard(late.work_item_id)
+            self._known_work_items.discard(late.work_item_id)
             return
         result = late.result
         if not isinstance(result, GroundedResult):
+            self._known_work_items.discard(late.work_item_id)
             return
         if result.origin_epoch != origin_epoch:
+            self._known_work_items.discard(late.work_item_id)
             return
         self._commit_result_state(result)
+        self._known_work_items.discard(late.work_item_id)
         worker = self.state.workers.get(result.worker_id)
         if worker is not None and worker.origin_epoch == origin_epoch:
             self.state.set_worker(
@@ -1006,7 +1062,13 @@ class SessionHost:
     async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""
         origin_epoch = result.origin_epoch
+        work_item_id = f"work-{result.turn_id}"
+        if work_item_id in self._cancelled_work_items:
+            self._cancelled_work_items.discard(work_item_id)
+            self._known_work_items.discard(work_item_id)
+            return result
         self._commit_result_state(result)
+        self._known_work_items.discard(work_item_id)
         if (
             origin.tts is None
             or self.connection is not origin
@@ -1014,7 +1076,6 @@ class SessionHost:
             or not self.accepts(origin_epoch)
         ):
             return result
-        work_item_id = f"work-{result.turn_id}"
         origin.scheduler.enqueue(
             result_id=result.result_id,
             work_item_id=work_item_id,
@@ -1059,6 +1120,38 @@ class SessionHost:
         if catalogue is None:
             return self.coordinator.dispatch(decision)
         return self.coordinator.dispatch(decision, catalogue=catalogue)
+
+    def _track_work_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
+        self._known_work_items.add(work_item_id)
+        self._inflight_work_tasks.setdefault(work_item_id, set()).add(task)
+
+        def completed(completed_task: asyncio.Task[Any]) -> None:
+            tasks = self._inflight_work_tasks.get(work_item_id)
+            if tasks is None:
+                return
+            tasks.discard(completed_task)
+            if not tasks:
+                self._inflight_work_tasks.pop(work_item_id, None)
+
+        task.add_done_callback(completed)
+
+    def _cancel_work(self, work_item_id: str | None) -> None:
+        selected = tuple(
+            item_id
+            for item_id in self._inflight_work_tasks
+            if work_item_id is None or item_id == work_item_id
+        )
+        coordinator_cancel = getattr(self.coordinator, "cancel", None)
+        if coordinator_cancel is not None:
+            selected = tuple(dict.fromkeys((*selected, *coordinator_cancel(work_item_id))))
+        if work_item_id is not None:
+            selected = tuple(dict.fromkeys((*selected, work_item_id)))
+        else:
+            selected = tuple(dict.fromkeys((*selected, *self._known_work_items)))
+        self._cancelled_work_items.update(selected)
+        for item_id in selected:
+            for task in self._inflight_work_tasks.get(item_id, ()):
+                task.cancel()
 
     def _project_worker(
         self,

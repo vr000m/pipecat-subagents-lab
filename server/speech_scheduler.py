@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -42,6 +43,9 @@ class SpeechScheduler:
         self.stop = stop
         self._queues: dict[str, list[SpeechItem]] = {}
         self._active: UtteranceLease | None = None
+        self._paused: dict[str, SpeechItem] = {}
+        self._awaiting_provider_context: deque[str] = deque()
+        self._provider_contexts: dict[str, str] = {}
         self._stop_tasks: set[asyncio.Future[Any]] = set()
 
     def _signal_stop(self, item: SpeechItem) -> None:
@@ -68,6 +72,13 @@ class SpeechScheduler:
     @property
     def active(self) -> UtteranceLease | None:
         return self._active
+
+    def paused(self, work_item_id: str | None = None) -> SpeechItem | None:
+        if work_item_id is not None:
+            return self._paused.get(work_item_id)
+        if not self._paused:
+            return None
+        return self._paused[next(reversed(self._paused))]
 
     @staticmethod
     def _progress(item: SpeechItem) -> dict[str, Any]:
@@ -110,7 +121,10 @@ class SpeechScheduler:
         if item is None:
             return None
         self._queues[item.work_item_id].pop(0)
-        self._active = UtteranceLease(item, uuid4().hex)
+        lease = UtteranceLease(item, uuid4().hex)
+        self._active = lease
+        if self.speak is not None:
+            self._awaiting_provider_context.append(lease.token)
         self.state.speech_progress(**self._progress(item), state=DeliveryState.STARTED)
         try:
             if self.speak is not None:
@@ -118,10 +132,44 @@ class SpeechScheduler:
                 if isinstance(outcome, Awaitable):
                     await outcome
         except BaseException:
+            if self.speak is not None:
+                try:
+                    self._awaiting_provider_context.remove(lease.token)
+                except ValueError:
+                    pass
             self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_UNKNOWN)
             self._release(item.utterance_id)
             raise
         return item
+
+    def provider_started(self, context_id: str) -> None:
+        """Bind a Pipecat-generated TTS context to the lease that queued it."""
+        if context_id in self._provider_contexts or not self._awaiting_provider_context:
+            return
+        self._provider_contexts[context_id] = self._awaiting_provider_context.popleft()
+
+    def provider_synthesis_ended(self, context_id: str) -> bool:
+        item = self._provider_item(context_id)
+        if item is None:
+            return False
+        self.synthesis_ended(item.utterance_id)
+        return True
+
+    def provider_delivery_completed(self, context_id: str) -> bool:
+        item = self._provider_item(context_id)
+        if item is None:
+            return False
+        self.delivery_completed(item.utterance_id)
+        self._provider_contexts.pop(context_id, None)
+        return True
+
+    def provider_delivery_unknown(self, context_id: str) -> bool:
+        item = self._provider_item(context_id)
+        if item is None:
+            return False
+        self.delivery_unknown(item.utterance_id)
+        self._provider_contexts.pop(context_id, None)
+        return True
 
     def synthesis_ended(self, utterance_id: str) -> None:
         item = self._active_item(utterance_id)
@@ -178,13 +226,21 @@ class SpeechScheduler:
     def pause(self, work_item_id: str) -> None:
         if self._active and self._active.item.work_item_id == work_item_id:
             item = self._active.item
+            self._paused[work_item_id] = item
             self._signal_stop(item)
             self.state.speech_progress(**self._progress(item), state=DeliveryState.PAUSED)
             # Pausing releases the lease without recording a terminal
             # interruption; resume must be able to represent the next state.
             self._release(item.utterance_id)
 
-    def resume(self, item: SpeechItem) -> SpeechItem:
+    def resume(self, target: str | SpeechItem | None = None) -> SpeechItem | None:
+        work_item_id = target.work_item_id if isinstance(target, SpeechItem) else target
+        item = self.paused(work_item_id)
+        if item is None and isinstance(target, SpeechItem):
+            item = target
+        if item is None:
+            return None
+        self._paused.pop(item.work_item_id, None)
         replay = self.enqueue(
             result_id=item.result_id,
             work_item_id=item.work_item_id,
@@ -195,11 +251,52 @@ class SpeechScheduler:
         self.state.speech_progress(**self._progress(replay), state=DeliveryState.RESUMED)
         return replay
 
+    def cancel(self, work_item_id: str | None = None) -> tuple[SpeechItem, ...]:
+        """Cancel active, queued, and paused speech for one work item or all work."""
+        cancelled: list[SpeechItem] = []
+        if self._active is not None and (
+            work_item_id is None or self._active.item.work_item_id == work_item_id
+        ):
+            item = self._active.item
+            self._signal_stop(item)
+            self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+            self._release(item.utterance_id)
+            cancelled.append(item)
+        keys = [work_item_id] if work_item_id is not None else list(self._queues)
+        for key in keys:
+            for item in self._queues.pop(key, []):
+                self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+                cancelled.append(item)
+        paused_keys = [work_item_id] if work_item_id is not None else list(self._paused)
+        for key in paused_keys:
+            item = self._paused.pop(key, None)
+            if item is not None:
+                self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+                cancelled.append(item)
+        return tuple(cancelled)
+
     def _active_item(self, utterance_id: str) -> SpeechItem | None:
         if self._active is None or self._active.item.utterance_id != utterance_id:
             return None
         return self._active.item
 
+    def _provider_item(self, context_id: str) -> SpeechItem | None:
+        if self._active is None:
+            return None
+        if self._provider_contexts.get(context_id) != self._active.token:
+            return None
+        return self._active.item
+
     def _release(self, utterance_id: str) -> None:
         if self._active and self._active.item.utterance_id == utterance_id:
+            token = self._active.token
+            try:
+                self._awaiting_provider_context.remove(token)
+            except ValueError:
+                pass
+            self._provider_contexts = {
+                context_id: lease_token
+                for context_id, lease_token in self._provider_contexts.items()
+                if lease_token != token
+            }
             self._active = None

@@ -140,6 +140,7 @@ class WorkItemCoordinator:
         self._submission_tasks: set[asyncio.Task[Any]] = set()
         self._submit_tasks: set[asyncio.Task[Any]] = set()
         self._provider_tasks: set[asyncio.Task[Any]] = set()
+        self._work_tasks: dict[str, asyncio.Task[Any]] = {}
         self._background_task_order: deque[asyncio.Task[Any]] = deque()
         self._shutdown = False
 
@@ -329,6 +330,7 @@ class WorkItemCoordinator:
         self._submission_tasks.clear()
         self._submit_tasks.clear()
         self._provider_tasks.clear()
+        self._work_tasks.clear()
         self._background_task_order.clear()
         self._tails.clear()
 
@@ -369,16 +371,28 @@ class WorkItemCoordinator:
 
     @staticmethod
     def control_intent(transcript: str) -> tuple[str, str | None] | None:
-        match = re.match(
-            r"^\s*(pause|resume|cancel|stop|consent)\b(?:\s+(work(?:[-_ ]item)?[-_ ][\w-]+))?",
+        match = re.fullmatch(
+            r"\s*(pause|resume|cancel|stop|consent)"
+            r"(?:\s+(work(?:[-_ ]item)?[-_ ][\w-]+))?\s*[.!]?\s*",
             transcript,
             re.IGNORECASE,
         )
         if not match:
             return None
-        action = "cancel" if match.group(1).lower() == "stop" else match.group(1).lower()
+        action = match.group(1).lower()
         target = match.group(2).replace(" ", "_") if match.group(2) else None
         return action, target
+
+    def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]:
+        """Cancel accepted computation for one work item, or all active work."""
+        selected = tuple(
+            item_id
+            for item_id in self._work_tasks
+            if work_item_id is None or item_id == work_item_id
+        )
+        for item_id in selected:
+            self._work_tasks[item_id].cancel()
+        return selected
 
     @staticmethod
     def pending_intent(transcript: str) -> str:
@@ -478,7 +492,13 @@ class WorkItemCoordinator:
         return operation(worker.worker)
 
     async def submit(
-        self, turn_id: str, items: list[tuple[str, str]], worker: Callable[[str, str], Any]
+        self,
+        turn_id: str,
+        items: list[tuple[str, str]],
+        worker: Callable[[str, str], Any],
+        *,
+        on_late_complete: Callable[[LateResult], Any] | None = None,
+        work_item_ids: list[str] | None = None,
     ) -> SubmittedOutcome:
         self._ensure_open()
         submission_task = asyncio.current_task()
@@ -486,7 +506,14 @@ class WorkItemCoordinator:
             self._submission_tasks.add(submission_task)
         try:
             selected = items[: self.config.max_work_items_per_turn]
-            work = tuple(WorkItem(work_item_id=f"{turn_id}-{i}") for i, _ in enumerate(selected))
+            selected_ids = (
+                work_item_ids[: len(selected)]
+                if work_item_ids is not None
+                else [f"{turn_id}-{i}" for i, _ in enumerate(selected)]
+            )
+            if len(selected_ids) != len(selected):
+                raise ValueError("work_item_ids must cover every selected item")
+            work = tuple(WorkItem(work_item_id=item_id) for item_id in selected_ids)
 
             def materialize_result(value: Any) -> Any:
                 return Result(**value) if isinstance(value, dict) else value
@@ -527,8 +554,16 @@ class WorkItemCoordinator:
                     )
                     continue
                 indexed_tasks.append((index, task))
+                self._work_tasks[work[index].work_item_id] = task
                 self._submit_tasks.add(task)
                 task.add_done_callback(self._submit_tasks.discard)
+                task.add_done_callback(
+                    lambda completed, item_id=work[index].work_item_id: (
+                        self._work_tasks.pop(item_id, None)
+                        if self._work_tasks.get(item_id) is completed
+                        else None
+                    )
+                )
             tasks = [task for _, task in indexed_tasks]
             try:
                 if tasks:
@@ -565,6 +600,7 @@ class WorkItemCoordinator:
                     task,
                     work_item_id=work[index].work_item_id,
                     worker_id=selected[index][0],
+                    on_complete=on_late_complete,
                 )
                 if accepted:
                     pending_ids.append(work[index].work_item_id)
