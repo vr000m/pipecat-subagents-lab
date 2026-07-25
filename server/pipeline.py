@@ -291,6 +291,7 @@ class SessionHost:
         self.runner: Any = None
         self._runner_handles: dict[str, Any] = {}
         self._runner_registered: set[str] = set()
+        self._runner_registrations: dict[str, asyncio.Task[None]] = {}
         self._runner_task: asyncio.Task[Any] | None = None
         self.connection: ConnectionPipeline | None = None
         self._background_shutdowns: set[asyncio.Task[None]] = set()
@@ -357,11 +358,26 @@ class SessionHost:
         add_workers = getattr(self.runner, "add_workers", None)
         if add_workers is None:
             return
-        result = add_workers(worker)
-        if inspect.isawaitable(result):
-            await result
-        self._runner_handles[worker_id] = worker
-        self._runner_registered.add(worker_id)
+        registration = self._runner_registrations.get(worker_id)
+        if registration is None:
+
+            async def register() -> None:
+                result = add_workers(worker)
+                if inspect.isawaitable(result):
+                    await result
+                self._runner_handles[worker_id] = worker
+                self._runner_registered.add(worker_id)
+
+            registration = asyncio.create_task(register())
+            self._runner_registrations[worker_id] = registration
+            registration.add_done_callback(
+                lambda completed, registered_id=worker_id: (
+                    self._runner_registrations.pop(registered_id, None)
+                    if self._runner_registrations.get(registered_id) is completed
+                    else None
+                )
+            )
+        await asyncio.shield(registration)
 
     async def connect(self, handshake: Any) -> ConnectionPipeline:
         if self._closing:
@@ -1258,6 +1274,11 @@ class SessionHost:
             task.cancel()
         if turn_tasks:
             await asyncio.gather(*turn_tasks, return_exceptions=True)
+        registrations = tuple(self._runner_registrations.values())
+        for task in registrations:
+            task.cancel()
+        if registrations:
+            await asyncio.gather(*registrations, return_exceptions=True)
         shutdowns = set(self._background_shutdowns)
         if self.connection is not None:
             connection = self.connection

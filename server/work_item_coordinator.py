@@ -587,19 +587,36 @@ class WorkItemCoordinator:
             await asyncio.sleep(0)
             done = {task for task in tasks if task.done()}
             raw_results = tuple(
-                task.result() for task in tasks if task in done and task.exception() is None
+                task.result()
+                for task in tasks
+                if task in done and not task.cancelled() and task.exception() is None
             )
             results = tuple(materialize_result(value) for value in raw_results)
-            failures = tuple(capacity_failures) + tuple(
-                WorkItemFailure(
-                    work_item_id=work[index].work_item_id,
-                    worker_id=selected[index][0],
-                    error_type=type(task.exception()).__name__,
-                    error_message="worker execution failed",
-                )
-                for index, task in indexed_tasks
-                if task in done and task.exception() is not None
-            )
+            execution_failures: list[WorkItemFailure] = []
+            for index, task in indexed_tasks:
+                if task not in done:
+                    continue
+                if task.cancelled():
+                    execution_failures.append(
+                        WorkItemFailure(
+                            work_item_id=work[index].work_item_id,
+                            worker_id=selected[index][0],
+                            error_type="CancelledError",
+                            error_message="worker execution was cancelled",
+                        )
+                    )
+                    continue
+                exception = task.exception()
+                if exception is not None:
+                    execution_failures.append(
+                        WorkItemFailure(
+                            work_item_id=work[index].work_item_id,
+                            worker_id=selected[index][0],
+                            error_type=type(exception).__name__,
+                            error_message="worker execution failed",
+                        )
+                    )
+            failures = tuple(capacity_failures) + tuple(execution_failures)
             pending_ids: list[str] = []
             for index, task in indexed_tasks:
                 if task in done:

@@ -20,6 +20,7 @@ from websockets.asyncio.client import unix_connect as ws_unix_connect
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _HANDSHAKE_TIMEOUT_SECONDS = 10.0
 _OPERATION_TIMEOUT_SECONDS = 75.0
+_CLOSE_TIMEOUT_SECONDS = 5.0
 _MAX_HANDSHAKE_EVENTS = 128
 _MAX_EVENT_COUNT = 4096
 _MAX_MESSAGE_BYTES = 1024 * 1024
@@ -59,6 +60,14 @@ async def _receive_until(ws: Any, expected_types: set[str]) -> dict[str, Any]:
         if event.get("type") in expected_types:
             return event
     raise RuntimeError("local service handshake event limit exceeded")
+
+
+async def _close_socket(ws: Any) -> None:
+    """Bound websocket cleanup so a failed peer cannot retain the caller."""
+    try:
+        await asyncio.wait_for(ws.close(), timeout=_CLOSE_TIMEOUT_SECONDS)
+    except (TimeoutError, websockets.exceptions.ConnectionClosed):
+        pass
 
 
 async def _events(ws: Any) -> AsyncIterator[dict[str, Any]]:
@@ -101,29 +110,42 @@ class LocalSTTClient:
         self._ws: Any = None
 
     async def connect(self) -> None:
-        self._ws = await _connect(self.endpoint)
-        hello = await _receive_json(self._ws)
-        if hello.get("type") != "server.hello":
-            raise RuntimeError(f"expected STT server.hello, got {hello.get('type')}")
-        created = await _receive_json(self._ws)
-        if created.get("type") != "session.created":
-            raise RuntimeError(f"expected STT session.created, got {created.get('type')}")
-        if self.language:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "type": "session.update",
-                        "session": {
-                            "type": "transcription",
-                            "audio": {"input": {"language": self.language}},
-                        },
-                    }
-                )
-            )
-            await _receive_until(
-                self._ws,
-                {"session.updated", "transcription_session.updated"},
-            )
+        await self.close()
+        ws = None
+        try:
+            async with asyncio.timeout(_HANDSHAKE_TIMEOUT_SECONDS):
+                ws = await _connect(self.endpoint)
+                self._ws = ws
+                hello = await _receive_json(ws)
+                if hello.get("type") != "server.hello":
+                    raise RuntimeError(f"expected STT server.hello, got {hello.get('type')}")
+                created = await _receive_json(ws)
+                if created.get("type") != "session.created":
+                    raise RuntimeError(f"expected STT session.created, got {created.get('type')}")
+                if self.language:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "session.update",
+                                "session": {
+                                    "type": "transcription",
+                                    "audio": {"input": {"language": self.language}},
+                                },
+                            }
+                        )
+                    )
+                    await _receive_until(
+                        ws,
+                        {"session.updated", "transcription_session.updated"},
+                    )
+        except BaseException:
+            self._ws = None
+            if ws is not None:
+                try:
+                    await _close_socket(ws)
+                except Exception:
+                    pass
+            raise
 
     async def send_audio(self, audio: bytes) -> None:
         await asyncio.wait_for(self._ws.send(audio), timeout=_OPERATION_TIMEOUT_SECONDS)
@@ -138,9 +160,9 @@ class LocalSTTClient:
         return _events(self._ws)
 
     async def close(self) -> None:
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            await _close_socket(ws)
 
 
 class LocalTTSClient:
@@ -150,16 +172,31 @@ class LocalTTSClient:
         self._ws: Any = None
 
     async def connect(self) -> dict[str, Any]:
-        self._ws = await _connect(self.endpoint)
-        hello = await _receive_json(self._ws)
-        if hello.get("type") != "server.hello":
-            raise RuntimeError(f"expected TTS server.hello, got {hello.get('type')}")
-        if self.voice_id:
-            await self._ws.send(json.dumps({"type": "session.update", "voice": self.voice_id}))
-            created = await _receive_json(self._ws)
-            if created.get("type") not in {"session.created", "session.updated"}:
-                raise RuntimeError(f"expected TTS session.created, got {created.get('type')}")
-        return hello
+        await self.close()
+        ws = None
+        try:
+            async with asyncio.timeout(_HANDSHAKE_TIMEOUT_SECONDS):
+                ws = await _connect(self.endpoint)
+                self._ws = ws
+                hello = await _receive_json(ws)
+                if hello.get("type") != "server.hello":
+                    raise RuntimeError(f"expected TTS server.hello, got {hello.get('type')}")
+                if self.voice_id:
+                    await ws.send(json.dumps({"type": "session.update", "voice": self.voice_id}))
+                    created = await _receive_json(ws)
+                    if created.get("type") not in {"session.created", "session.updated"}:
+                        raise RuntimeError(
+                            f"expected TTS session.created, got {created.get('type')}"
+                        )
+                return hello
+        except BaseException:
+            self._ws = None
+            if ws is not None:
+                try:
+                    await _close_socket(ws)
+                except Exception:
+                    pass
+            raise
 
     async def append(self, text: str) -> None:
         await asyncio.wait_for(
@@ -177,9 +214,9 @@ class LocalTTSClient:
         return _events(self._ws)
 
     async def close(self) -> None:
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            await _close_socket(ws)
 
 
 def default_stt_client_factory(endpoint: Any, *, language: str | None = None) -> LocalSTTClient:

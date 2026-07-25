@@ -61,12 +61,7 @@ class LocalSTT(SegmentedSTTService):
         self.started = False
 
     async def cleanup(self) -> None:
-        close = getattr(self._client, "close", None)
-        if close is not None:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
-        self._client = None
+        await self._abort_client()
         await super().cleanup()
 
     def for_connection(self) -> LocalSTT:
@@ -105,25 +100,46 @@ class LocalSTT(SegmentedSTTService):
                 "pipecat-local-stt-server client factory before running audio"
             )
         on_final = self.on_final
-        if self._client is None:
-            self._client = self.client_factory(self.endpoint)
-            connect = getattr(self._client, "connect", None)
-            if connect is not None:
-                result = connect()
-                if inspect.isawaitable(result):
-                    await result
-        await self._client.send_audio(audio)
-        await self._client.commit()
-        logger.debug(f"{self}: committed {len(audio)} PCM bytes to local STT")
-        async for event in self._client.events():
-            if event.get("type", "").endswith("transcription.completed"):
-                text = event.get("transcript") or ""
-                logger.debug(f"{self}: local STT transcription completed")
-                if text:
-                    yield TranscriptionFrame(text, "", "")
-                    if on_final is not None:
-                        asyncio.create_task(self.handle_final_transcript(text, on_final))
-                return
-            if event.get("type") == "error":
-                yield ErrorFrame(f"local STT error: {event.get('message', event)}")
-                return
+        client = self._client
+        try:
+            if client is None:
+                client = self.client_factory(self.endpoint)
+                self._client = client
+                connect = getattr(client, "connect", None)
+                if connect is not None:
+                    result = connect()
+                    if inspect.isawaitable(result):
+                        await result
+            await client.send_audio(audio)
+            await client.commit()
+            logger.debug(f"{self}: committed {len(audio)} PCM bytes to local STT")
+            async for event in client.events():
+                if event.get("type", "").endswith("transcription.completed"):
+                    text = event.get("transcript") or ""
+                    logger.debug(f"{self}: local STT transcription completed")
+                    if text:
+                        yield TranscriptionFrame(text, "", "")
+                        if on_final is not None:
+                            asyncio.create_task(self.handle_final_transcript(text, on_final))
+                    return
+                if event.get("type") == "error":
+                    await self._abort_client(client)
+                    yield ErrorFrame(f"local STT error: {event.get('message', event)}")
+                    return
+            await self._abort_client(client)
+            yield ErrorFrame("local STT stream ended before transcription completion")
+        except BaseException:
+            await self._abort_client(client)
+            raise
+
+    async def _abort_client(self, client: Any | None = None) -> None:
+        client = self._client if client is None else client
+        if client is None:
+            return
+        if self._client is client:
+            self._client = None
+        close = getattr(client, "close", None)
+        if close is not None:
+            result = close()
+            if inspect.isawaitable(result):
+                await result

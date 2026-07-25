@@ -61,6 +61,7 @@ class LocalTTS(TTSService):
             lambda next_endpoint: default_tts_client_factory(next_endpoint, voice_id=voice_id)
         )
         self._client: Any = None
+        self._context_clients: dict[str, Any] = {}
         self._correlated_context_id: str | None = None
         self.started = False
 
@@ -96,10 +97,15 @@ class LocalTTS(TTSService):
         if self.client_factory is None:
             raise RuntimeError("local TTS wire client is unavailable")
         self._client = self.client_factory(self.endpoint)
-        connect = getattr(self._client, "connect", None)
-        hello = connect() if connect is not None else None
-        if inspect.isawaitable(hello):
-            hello = await hello
+        client = self._client
+        try:
+            connect = getattr(client, "connect", None)
+            hello = connect() if connect is not None else None
+            if inspect.isawaitable(hello):
+                hello = await hello
+        except BaseException:
+            await self._abort_client(client)
+            raise
         rate = (hello or {}).get("audio", {}).get("rate") if isinstance(hello, dict) else None
         if isinstance(rate, int) and rate > 0:
             self._sample_rate = rate
@@ -116,12 +122,7 @@ class LocalTTS(TTSService):
         self.started = False
 
     async def cleanup(self) -> None:
-        close = getattr(self._client, "close", None)
-        if close is not None:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
-        self._client = None
+        await self._abort_client()
         await super().cleanup()
 
     def for_connection(self) -> LocalTTS:
@@ -155,75 +156,82 @@ class LocalTTS(TTSService):
                 "pipecat-local-tts-server client factory before running audio"
             )
         await self.connect()
+        client = self._client
+        self._context_clients[context_id] = client
         # Keep a connection-bound callback stable for this synthesis. A reconnect
         # may install a callback for the replacement scheduler while this
         # generator is still draining.
         on_event = self.on_event
-        await self._client.append(text)
-        await self._client.commit()
-        if on_event is not None:
-            result = on_event("synthesis_started", context_id)
-            if inspect.isawaitable(result):
-                await result
-        yield TTSStartedFrame(context_id=context_id)
         completed = False
-        audio_bytes = 0
-        event_count = 0
-        async for event in self._client.events():
-            event_count += 1
-            if event_count > self.max_events_per_utterance:
-                await self._abort_client()
-                await self._notify_delivery_unknown(on_event, context_id)
-                raise RuntimeError("local TTS event limit exceeded")
-            kind = event.get("type", "")
-            if kind.endswith("audio.delta"):
-                import base64
-
-                try:
-                    audio = base64.b64decode(event["audio"], validate=True)
-                except (KeyError, TypeError, ValueError) as exc:
-                    await self._abort_client()
-                    await self._notify_delivery_unknown(on_event, context_id)
-                    raise RuntimeError("local TTS returned invalid audio") from exc
-                audio_bytes += len(audio)
-                if audio_bytes > self.max_audio_bytes_per_utterance:
-                    await self._abort_client()
-                    await self._notify_delivery_unknown(on_event, context_id)
-                    raise RuntimeError("local TTS audio limit exceeded")
-                yield TTSAudioRawFrame(
-                    audio=audio,
-                    sample_rate=self.sample_rate,
-                    num_channels=1,
-                )
-            elif kind.endswith("audio.done") or kind.endswith("cancelled"):
-                completed = True
-                if on_event is not None:
-                    result = on_event("synthesis_ended", context_id)
-                    if inspect.isawaitable(result):
-                        await result
-                yield TTSStoppedFrame(context_id=context_id)
-                return
-            elif kind in {"error", "response.failed"}:
-                message = str(event.get("message") or event.get("error") or "provider error")
-                if on_event is not None:
-                    result = on_event("delivery_unknown", context_id)
-                    if inspect.isawaitable(result):
-                        await result
-                raise RuntimeError(f"local TTS error: {message[:256]}")
-        if not completed:
+        try:
+            await client.append(text)
+            await client.commit()
             if on_event is not None:
-                result = on_event("delivery_unknown", context_id)
+                result = on_event("synthesis_started", context_id)
                 if inspect.isawaitable(result):
                     await result
-            raise RuntimeError("local TTS stream ended before audio completion")
+            yield TTSStartedFrame(context_id=context_id)
+            audio_bytes = 0
+            event_count = 0
+            async for event in client.events():
+                event_count += 1
+                if event_count > self.max_events_per_utterance:
+                    raise RuntimeError("local TTS event limit exceeded")
+                kind = event.get("type", "")
+                if kind.endswith("audio.delta"):
+                    import base64
 
-    async def _abort_client(self) -> None:
-        close = getattr(self._client, "close", None)
+                    try:
+                        audio = base64.b64decode(event["audio"], validate=True)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise RuntimeError("local TTS returned invalid audio") from exc
+                    audio_bytes += len(audio)
+                    if audio_bytes > self.max_audio_bytes_per_utterance:
+                        raise RuntimeError("local TTS audio limit exceeded")
+                    yield TTSAudioRawFrame(
+                        audio=audio,
+                        sample_rate=self.sample_rate,
+                        num_channels=1,
+                    )
+                elif kind.endswith("audio.done") or kind.endswith("cancelled"):
+                    completed = True
+                    if on_event is not None:
+                        result = on_event("synthesis_ended", context_id)
+                        if inspect.isawaitable(result):
+                            await result
+                    yield TTSStoppedFrame(context_id=context_id)
+                    return
+                elif kind in {"error", "response.failed"}:
+                    message = str(event.get("message") or event.get("error") or "provider error")
+                    raise RuntimeError(f"local TTS error: {message[:256]}")
+            raise RuntimeError("local TTS stream ended before audio completion")
+        finally:
+            if self._context_clients.get(context_id) is client:
+                self._context_clients.pop(context_id, None)
+            if not completed:
+                await self._abort_client(client)
+                await self._notify_delivery_unknown(on_event, context_id)
+
+    async def on_audio_context_interrupted(self, context_id: str) -> None:
+        """Fence an interrupted provider stream before Pipecat starts its successor."""
+        client = self._context_clients.pop(context_id, None)
+        if client is not None:
+            await self._abort_client(client)
+
+    async def _abort_client(self, client: Any | None = None) -> None:
+        client = self._client if client is None else client
+        if client is None:
+            return
+        if self._client is client:
+            self._client = None
+        for context_id, context_client in tuple(self._context_clients.items()):
+            if context_client is client:
+                self._context_clients.pop(context_id, None)
+        close = getattr(client, "close", None)
         if close is not None:
             result = close()
             if inspect.isawaitable(result):
                 await result
-        self._client = None
 
     @staticmethod
     async def _notify_delivery_unknown(

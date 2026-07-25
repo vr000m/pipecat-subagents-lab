@@ -1,6 +1,8 @@
 """The registry owns persistent context identities and immutable catalogues."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier, Event, Lock
 
 import pytest
 
@@ -185,6 +187,45 @@ def test_registry_keeps_two_workers_and_same_topic_identity_persistent() -> None
     assert news.worker_id != weather.worker_id
     assert registry.get(weather.worker_id).context is weather.context
     assert registry.policy.eviction_enabled is False
+
+
+def test_concurrent_identical_requests_publish_one_worker_and_one_catalogue_version() -> None:
+    request_count = 4
+    request_barrier = Barrier(request_count)
+    second_factory_call = Event()
+    factory_calls_lock = Lock()
+    factory_calls = 0
+
+    def worker_factory(worker_id: str) -> FakeContextWorker:
+        nonlocal factory_calls
+        with factory_calls_lock:
+            factory_calls += 1
+            call_number = factory_calls
+        if call_number == 1:
+            second_factory_call.wait(timeout=0.5)
+        else:
+            second_factory_call.set()
+        worker = FakeContextWorker(worker_id)
+        worker.metadata = replace(worker.metadata, topic="concurrent")
+        return worker
+
+    registry = WorkerRegistry(worker_factory=worker_factory)
+
+    def get_worker() -> object:
+        request_barrier.wait()
+        return registry.get_or_create(
+            topic="concurrent",
+            worker_type="web_search",
+            model_policy="deep",
+        )
+
+    with ThreadPoolExecutor(max_workers=request_count) as executor:
+        workers = tuple(executor.map(lambda _: get_worker(), range(request_count)))
+
+    assert all(worker is workers[0] for worker in workers)
+    assert factory_calls == 1
+    assert registry.workers == (workers[0],)
+    assert registry.catalogue().version == "catalogue-1"
 
 
 def test_registry_does_not_reuse_topic_with_incompatible_model_policy() -> None:

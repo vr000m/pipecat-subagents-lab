@@ -960,6 +960,48 @@ def test_unknown_cancel_target_does_not_poison_future_work_or_accumulate_state()
     asyncio.run(run())
 
 
+def test_concurrent_registration_of_one_worker_uses_one_runner_operation() -> None:
+    async def run() -> None:
+        class BlockingRunner:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def add_workers(self, _worker: object) -> None:
+                self.calls += 1
+                self.started.set()
+                await self.release.wait()
+
+        worker = type(
+            "Worker",
+            (),
+            {
+                "metadata": type(
+                    "Metadata",
+                    (),
+                    {"worker_id": "worker-1"},
+                )()
+            },
+        )()
+        runner = BlockingRunner()
+        host = SessionHost(runner_factory=LifecycleRunner)
+        host.runner = runner
+
+        first = asyncio.create_task(host._register_runner_worker(worker))
+        await runner.started.wait()
+        second = asyncio.create_task(host._register_runner_worker(worker))
+        await asyncio.sleep(0)
+        runner.release.set()
+        await asyncio.gather(first, second)
+
+        assert runner.calls == 1
+        assert host._runner_handles == {"worker-1": worker}
+        assert host._runner_registered == {"worker-1"}
+
+    asyncio.run(run())
+
+
 def test_search_cancellation_cancels_child_without_retaining_it() -> None:
     async def run() -> None:
         class RetainingCoordinator:

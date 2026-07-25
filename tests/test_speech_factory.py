@@ -1,12 +1,15 @@
 """Provider selection stays explicit and credential-safe."""
 
+import asyncio
+
 import pytest
+from pipecat.services.cartesia.tts import CartesiaTTSService
 
 from server.config import Config, ConfigError
 from server.services.factory import create_stt, create_tts
 from server.services.hosted import CartesiaTTS, DeepgramSTT
 from server.services.stt import LocalSTT
-from server.services.tts import LocalTTS
+from server.services.tts import CorrelatedTTSSpeakFrame, LocalTTS
 
 
 def test_factory_preserves_local_provider_defaults() -> None:
@@ -42,6 +45,32 @@ def test_factory_builds_connection_local_hosted_services() -> None:
     assert tts._settings.voice == "voice-uuid"
     assert "deepgram-secret" not in repr(config)
     assert "cartesia-secret" not in repr(config)
+
+
+def test_cartesia_uses_the_scheduler_utterance_as_its_pipecat_context(monkeypatch) -> None:
+    async def run() -> None:
+        observed: list[str] = []
+
+        async def process(service, _frame, _direction) -> None:
+            observed.append(service.create_context_id())
+
+        monkeypatch.setattr(CartesiaTTSService, "process_frame", process)
+        service = CartesiaTTS(
+            api_key="cartesia-test",
+            voice_id="voice-test",
+            model="sonic-3.5",
+        )
+        frame = service.correlated_speak_frame(
+            "hello",
+            correlation_id="utt-1",
+            append_to_context=False,
+        )
+
+        assert isinstance(frame, CorrelatedTTSSpeakFrame)
+        await service.process_frame(frame, None)
+        assert observed == ["utt-1"]
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(

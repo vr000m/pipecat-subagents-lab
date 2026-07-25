@@ -7,7 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from server.config import Config
-from server.work_item_coordinator import PendingDialogue, WorkItemCoordinator
+from server.work_item_coordinator import (
+    PendingDialogue,
+    WorkItemCoordinator,
+    WorkItemFailure,
+)
 
 
 class FakeSpeechScheduler:
@@ -308,6 +312,47 @@ def test_cancel_targets_only_the_selected_submitted_work_item() -> None:
         await asyncio.sleep(0)
         assert cancelled == ["0"]
         assert outcome.pending_work_item_ids == ("work-turn-0", "work-turn-1")
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_targeted_cancel_during_submit_preserves_completed_sibling() -> None:
+    async def run() -> None:
+        started = [asyncio.Event(), asyncio.Event()]
+        release_sibling = asyncio.Event()
+
+        async def worker(_worker_id: str, text: str) -> dict:
+            started[int(text)].set()
+            if text == "0":
+                await asyncio.Future()
+            await release_sibling.wait()
+            return {"text": text, "citations": []}
+
+        coordinator = WorkItemCoordinator(wait_timeout_ms=1_000)
+        submission = asyncio.create_task(
+            coordinator.submit(
+                "work-turn",
+                [("worker-a", "0"), ("worker-b", "1")],
+                worker,
+            )
+        )
+        await asyncio.gather(*(event.wait() for event in started))
+
+        assert coordinator.cancel("work-turn-0") == ("work-turn-0",)
+        release_sibling.set()
+        outcome = await submission
+
+        assert [result.text for result in outcome.results] == ["1"]
+        assert outcome.pending_work_item_ids == ()
+        assert outcome.failures == (
+            WorkItemFailure(
+                work_item_id="work-turn-0",
+                worker_id="worker-a",
+                error_type="CancelledError",
+                error_message="worker execution was cancelled",
+            ),
+        )
         await coordinator.shutdown()
 
     asyncio.run(run())
