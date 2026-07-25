@@ -8,13 +8,8 @@ const result = (resultId) => ({
   turn_id: "turn-1",
   timestamp: "2026-07-18T10:00:00Z",
   text: `Complete answer ${resultId}`,
-  ui_text: `Complete answer ${resultId}`,
   spoken_text: `Spoken answer ${resultId}`,
   citations: [{ title: "Weather service", url: "https://weather.example.test" }],
-  spoken_result_id: resultId,
-  ui_result_id: resultId,
-  spoken_citations: [{ title: "Weather service", url: "https://weather.example.test" }],
-  ui_citations: [{ title: "Weather service", url: "https://weather.example.test" }],
   origin_epoch: 1,
 });
 
@@ -304,7 +299,7 @@ describe("server-authoritative runtime reducer", () => {
       sequence: 3,
       session_id: "session-1",
       origin_epoch: 1,
-      data: { ...result("result-1"), ui_text: "late duplicate wording" },
+      data: { ...result("result-1"), text: "late duplicate wording" },
     });
 
     expect(state.results).toHaveLength(1);

@@ -23,8 +23,8 @@ from server.contracts import (
 GROUNDED_RESULT_SCHEMA = json.loads(
     (Path(__file__).parents[1] / "shared" / "schemas" / "grounded-result.json").read_text()
 )
-CANONICAL_PROJECTION_PAIRS = tuple(
-    tuple(pair) for pair in GROUNDED_RESULT_SCHEMA["x-equal-properties"]
+RUNTIME_SNAPSHOT_SCHEMA = json.loads(
+    (Path(__file__).parents[1] / "shared" / "schemas" / "runtime-snapshot.json").read_text()
 )
 
 
@@ -103,46 +103,52 @@ def test_canonical_result_drives_both_projections_and_preserves_origin_epoch() -
     assert result.spoken_result_id == result.ui_result_id == result.result_id
     assert result.spoken_citations == result.ui_citations == result.citations
     assert datetime.fromisoformat(result.timestamp).tzinfo is not None
-    assert result.model_dump(mode="json")["timestamp"] == result.timestamp
+    wire = result.model_dump(mode="json")
+    assert wire["timestamp"] == result.timestamp
+    assert set(wire) == set(GROUNDED_RESULT_SCHEMA["properties"])
     validate_contract(result)
 
 
 def test_shared_result_schema_declares_the_python_projection_invariants() -> None:
     assert set(GROUNDED_RESULT_SCHEMA["required"]) == set(GROUNDED_RESULT_SCHEMA["properties"])
-    assert CANONICAL_PROJECTION_PAIRS == (
-        ("spoken_result_id", "result_id"),
-        ("ui_result_id", "result_id"),
-        ("ui_text", "text"),
-        ("spoken_citations", "citations"),
-        ("ui_citations", "citations"),
-    )
-    for projection in ("spoken_result_id", "ui_result_id"):
-        assert GROUNDED_RESULT_SCHEMA["properties"][projection]["type"] == "string"
-    for projection in ("spoken_citations", "ui_citations"):
-        assert GROUNDED_RESULT_SCHEMA["properties"][projection]["type"] == "array"
+    assert {
+        "ui_text",
+        "spoken_result_id",
+        "ui_result_id",
+        "spoken_citations",
+        "ui_citations",
+    }.isdisjoint(GROUNDED_RESULT_SCHEMA["properties"])
+    assert RUNTIME_SNAPSHOT_SCHEMA["properties"]["results"]["items"] == {
+        "$ref": "grounded-result.json"
+    }
 
 
-@pytest.mark.parametrize(("projection", "canonical"), CANONICAL_PROJECTION_PAIRS)
-def test_python_contract_rejects_shared_projection_invariant_violations(
-    projection: str, canonical: str
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("result_id", ""),
+        ("worker_id", ""),
+        ("turn_id", ""),
+        ("timestamp", "not-a-date"),
+        ("timestamp", "2026-07-25T12:00:00"),
+    ),
+)
+def test_python_contract_rejects_invalid_wire_identity_and_timestamp(
+    field: str, value: str
 ) -> None:
-    payload = GroundedResult(
-        result_id="result-1",
-        worker_id="worker-weather",
-        turn_id="turn-1",
-        text="Canonical answer.",
-        citations=[{"title": "Source", "url": "https://example.com/source"}],
-        spoken_text="Spoken answer.",
-        ui_text="Canonical answer.",
-    ).model_dump(mode="json")
-    payload[projection] = (
-        [{"title": "Other", "url": "https://example.com/other"}]
-        if projection.endswith("_citations")
-        else f"different-{projection}"
-    )
-    assert payload[projection] != payload[canonical]
+    payload = {
+        "result_id": "result-1",
+        "worker_id": "worker-weather",
+        "turn_id": "turn-1",
+        "timestamp": "2026-07-25T12:00:00Z",
+        "text": "Canonical answer.",
+        "citations": [],
+        "spoken_text": "Spoken answer.",
+        "ui_text": "Canonical answer.",
+    }
+    payload[field] = value
 
-    with pytest.raises(ValueError, match="canonical|projection"):
+    with pytest.raises(ValueError):
         GroundedResult.model_validate(payload)
 
 

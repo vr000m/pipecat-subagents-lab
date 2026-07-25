@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CONTRACT_VERSION = "v1.0"
 
@@ -108,23 +108,34 @@ class WorkerState(StrictModel):
 
 
 class GroundedResult(StrictModel):
-    result_id: str
-    worker_id: str
-    turn_id: str
-    timestamp: str = Field(default_factory=utc_timestamp)
+    result_id: str = Field(min_length=1)
+    worker_id: str = Field(min_length=1)
+    turn_id: str = Field(min_length=1)
+    timestamp: str = Field(default_factory=utc_timestamp, min_length=1)
     text: str = Field(min_length=1)
     citations: list[Citation] = Field(default_factory=list)
     spoken_text: str = Field(min_length=1)
-    ui_text: str = Field(min_length=1)
-    spoken_result_id: str | None = None
-    ui_result_id: str | None = None
-    spoken_citations: list[Citation] | None = None
-    ui_citations: list[Citation] | None = None
+    ui_text: str | None = Field(default=None, min_length=1, exclude=True)
+    spoken_result_id: str | None = Field(default=None, exclude=True)
+    ui_result_id: str | None = Field(default=None, exclude=True)
+    spoken_citations: list[Citation] | None = Field(default=None, exclude=True)
+    ui_citations: list[Citation] | None = Field(default=None, exclude=True)
     origin_epoch: int | None = None
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("timestamp must be ISO-8601") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("timestamp must include a timezone")
+        return value
 
     @model_validator(mode="after")
     def derive_and_validate_projections(self) -> GroundedResult:
-        if self.ui_text != self.text:
+        if self.ui_text not in (None, self.text):
             raise ValueError("the UI projection must preserve the canonical result text")
         if not self.text.strip() or not self.spoken_text.strip():
             raise ValueError("result projections must not be blank")
@@ -142,6 +153,7 @@ class GroundedResult(StrictModel):
         object.__setattr__(self, "ui_result_id", self.result_id)
         object.__setattr__(self, "spoken_citations", list(self.citations))
         object.__setattr__(self, "ui_citations", list(self.citations))
+        object.__setattr__(self, "ui_text", self.text)
         return self
 
 

@@ -15,9 +15,6 @@ export const RTVI_MESSAGE_KINDS = Object.freeze([
 ]);
 const runtimeKinds = new Set(RTVI_MESSAGE_KINDS);
 const groundedResultKeys = Object.freeze(Object.keys(groundedResultSchema.properties));
-const groundedResultEqualProperties = Object.freeze(
-  groundedResultSchema["x-equal-properties"],
-);
 const runtimeSnapshotKeys = Object.freeze(Object.keys(runtimeSnapshotSchema.properties));
 const deliveryStates = new Set([
   "displayed",
@@ -43,28 +40,10 @@ function hasExactKeys(value, expectedKeys) {
     expectedKeys.every((key) => Object.hasOwn(value, key));
 }
 
-function equalContractValue(left, right) {
-  if (Object.is(left, right)) return true;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return Array.isArray(left) && Array.isArray(right) &&
-      left.length === right.length &&
-      left.every((item, index) => equalContractValue(item, right[index]));
-  }
-  if (!left || !right || typeof left !== "object" || typeof right !== "object") {
-    return false;
-  }
-  const leftKeys = Object.keys(left);
-  const rightKeys = Object.keys(right);
-  return leftKeys.length === rightKeys.length &&
-    leftKeys.every((key) => Object.hasOwn(right, key) &&
-      equalContractValue(left[key], right[key]));
-}
-
-function preservesCanonicalProjections(value) {
-  return Array.isArray(groundedResultEqualProperties) &&
-    groundedResultEqualProperties.every(
-      ([projection, canonical]) => equalContractValue(value[projection], value[canonical]),
-    );
+function validTimestamp(value) {
+  return typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
+    !Number.isNaN(Date.parse(value));
 }
 
 function validCitation(value) {
@@ -90,16 +69,14 @@ function validWorker(value) {
 function validResult(value) {
   if (!hasExactKeys(value, groundedResultKeys)) return false;
   return value && typeof value === "object" &&
-    typeof value.result_id === "string" && typeof value.worker_id === "string" &&
-    typeof value.turn_id === "string" && typeof value.timestamp === "string" &&
+    typeof value.result_id === "string" && value.result_id.length > 0 &&
+    typeof value.worker_id === "string" && value.worker_id.length > 0 &&
+    typeof value.turn_id === "string" && value.turn_id.length > 0 &&
+    validTimestamp(value.timestamp) &&
     typeof value.text === "string" && value.text.trim().length > 0 &&
     typeof value.spoken_text === "string" && value.spoken_text.trim().length > 0 &&
-    typeof value.ui_text === "string" && Array.isArray(value.citations) &&
-    value.citations.every(validCitation) && typeof value.spoken_result_id === "string" &&
-    typeof value.ui_result_id === "string" && Array.isArray(value.spoken_citations) &&
-    value.spoken_citations.every(validCitation) && Array.isArray(value.ui_citations) &&
-    value.ui_citations.every(validCitation) && validOrigin(value.origin_epoch) &&
-    preservesCanonicalProjections(value);
+    Array.isArray(value.citations) && value.citations.every(validCitation) &&
+    validOrigin(value.origin_epoch);
 }
 
 function validSpeech(value) {

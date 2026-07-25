@@ -51,9 +51,7 @@ function normalizedResult(result) {
     timestamp: result.timestamp,
     text: result.text,
     spoken_text: result.spoken_text,
-    ui_text: result.ui_text,
-    spoken_result_id: result.spoken_result_id,
-    ui_result_id: result.ui_result_id,
+    ui_text: result.text,
     origin_epoch: result.origin_epoch,
     citations: citations
       .map((citation) => ({ ...citation, url: normalizeUrl(citation?.url) }))

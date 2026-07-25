@@ -10,7 +10,7 @@
     "session_id": {"type": "string", "minLength": 1},
     "snapshot_sequence": {"type": "integer", "minimum": 0},
     "workers": {"type": "array", "items": {"$ref": "#/$defs/worker"}},
-    "results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
+    "results": {"type": "array", "items": {"$ref": "grounded-result.json"}},
     "speech_progress": {"type": "array", "items": {"$ref": "#/$defs/speech_progress"}},
     "routing": {"oneOf": [{"$ref": "#/$defs/routing"}, {"type": "null"}]},
     "transcript": {"type": "array", "items": {"$ref": "#/$defs/transcript_entry"}},
@@ -18,15 +18,6 @@
   },
   "$defs": {
     "origin_epoch": {"type": ["integer", "null"], "minimum": 0},
-    "citation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["title", "url"],
-      "properties": {
-        "title": {"type": "string"},
-        "url": {"type": "string", "pattern": "^https?://[^\\s]+$"}
-      }
-    },
     "worker": {
       "type": "object",
       "additionalProperties": false,
@@ -63,26 +54,6 @@
         "text": {"type": "string"},
         "turn_id": {"type": "string", "minLength": 1},
         "timestamp": {"type": "string", "minLength": 1},
-        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
-      }
-    },
-    "result": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "ui_text", "spoken_result_id", "ui_result_id", "spoken_citations", "ui_citations", "origin_epoch"],
-      "properties": {
-        "result_id": {"type": "string", "minLength": 1},
-        "worker_id": {"type": "string", "minLength": 1},
-        "turn_id": {"type": "string", "minLength": 1},
-        "timestamp": {"type": "string", "minLength": 1},
-        "text": {"type": "string"},
-        "citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}},
-        "spoken_text": {"type": "string"},
-        "ui_text": {"type": "string"},
-        "spoken_result_id": {"type": ["string", "null"]},
-        "ui_result_id": {"type": ["string", "null"]},
-        "spoken_citations": {"type": ["array", "null"], "items": {"$ref": "#/$defs/citation"}},
-        "ui_citations": {"type": ["array", "null"], "items": {"$ref": "#/$defs/citation"}},
         "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
       }
     },

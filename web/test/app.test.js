@@ -91,11 +91,6 @@ test("onServerMessage rejects unsupported contracts before applying state", () =
         text: "Answer",
         citations: [],
         spoken_text: "Answer",
-        ui_text: "Answer",
-        spoken_result_id: "result-1",
-        ui_result_id: "result-1",
-        spoken_citations: [],
-        ui_citations: [],
         origin_epoch: 1,
       },
     });

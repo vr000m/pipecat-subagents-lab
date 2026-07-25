@@ -4,14 +4,7 @@
   "title": "GroundedResult",
   "type": "object",
   "additionalProperties": false,
-  "required": ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "ui_text", "spoken_result_id", "ui_result_id", "spoken_citations", "ui_citations", "origin_epoch"],
-  "x-equal-properties": [
-    ["spoken_result_id", "result_id"],
-    ["ui_result_id", "result_id"],
-    ["ui_text", "text"],
-    ["spoken_citations", "citations"],
-    ["ui_citations", "citations"]
-  ],
+  "required": ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "origin_epoch"],
   "properties": {
     "result_id": {"type": "string", "minLength": 1},
     "worker_id": {"type": "string", "minLength": 1},
@@ -20,11 +13,6 @@
     "text": {"type": "string", "minLength": 1},
     "citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}},
     "spoken_text": {"type": "string", "minLength": 1},
-    "ui_text": {"type": "string", "minLength": 1},
-    "spoken_result_id": {"type": "string", "minLength": 1},
-    "ui_result_id": {"type": "string", "minLength": 1},
-    "spoken_citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}},
-    "ui_citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}},
     "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
   },
   "$defs": {

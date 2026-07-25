@@ -1,5 +1,6 @@
 """Deterministic, values-redacted preflight tests."""
 
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -82,6 +83,72 @@ def test_configured_probe_validates_hosted_provider_credentials_without_network(
     }
     assert report.config.stt_endpoint is None
     assert report.config.tts_endpoint is None
+
+
+@pytest.mark.parametrize(
+    ("service", "events"),
+    (
+        (
+            "stt",
+            (
+                {"type": "server.hello"},
+                {"type": "session.created"},
+                {"type": "error", "message": "unsupported language"},
+            ),
+        ),
+        (
+            "tts",
+            (
+                {"type": "server.hello"},
+                {"type": "error", "message": "unknown voice"},
+            ),
+        ),
+    ),
+)
+def test_configured_probe_rejects_failed_runtime_session_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    service: str,
+    events: tuple[dict[str, str], ...],
+) -> None:
+    class Socket:
+        def __init__(self) -> None:
+            self.events = [json.dumps(event) for event in events]
+            self.sent: list[dict[str, object]] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def recv(self, *, timeout: float) -> str:
+            assert timeout > 0
+            return self.events.pop(0)
+
+        def send(self, raw: str) -> None:
+            self.sent.append(json.loads(raw))
+
+    socket = Socket()
+    monkeypatch.setattr("server.preflight.ws_unix_connect", lambda *_args, **_kwargs: socket)
+    config = (
+        Config(
+            stt_endpoint=("uds", "/tmp/stt.sock"),
+            tts_provider="cartesia",
+            cartesia_api_key="cartesia-test",
+            cartesia_voice_id="voice-test",
+        )
+        if service == "stt"
+        else Config(
+            stt_provider="deepgram",
+            deepgram_api_key="deepgram-test",
+            tts_endpoint=("uds", "/tmp/tts.sock"),
+        )
+    )
+    report = run_preflight(config, probe=ConfiguredServiceProbe(config))
+
+    assert report.ok is False
+    assert service in report.failures
+    assert socket.sent
 
 
 def test_preflight_propagates_actionable_probe_failures_without_phase_three_imports(

@@ -62,7 +62,38 @@ class ConfiguredServiceProbe:
                 return False
             if service == "stt":
                 created = self._receive_json(websocket)
-                return created.get("type") == "session.created"
+                if created.get("type") != "session.created":
+                    return False
+                if self.config.stt_language:
+                    websocket.send(
+                        json.dumps(
+                            {
+                                "type": "session.update",
+                                "session": {
+                                    "type": "transcription",
+                                    "audio": {"input": {"language": self.config.stt_language}},
+                                },
+                            }
+                        )
+                    )
+                    return self._receive_until(
+                        websocket,
+                        {"session.updated", "transcription_session.updated"},
+                    )
+                return True
+            if self.config.tts_voice_id:
+                websocket.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "voice": self.config.tts_voice_id,
+                        }
+                    )
+                )
+                return self._receive_until(
+                    websocket,
+                    {"session.created", "session.updated"},
+                )
             return True
 
     def _receive_json(self, websocket: object) -> dict[str, object]:
@@ -71,6 +102,15 @@ class ConfiguredServiceProbe:
             return {}
         value = json.loads(raw)
         return value if isinstance(value, dict) else {}
+
+    def _receive_until(self, websocket: object, expected_types: set[str]) -> bool:
+        for _ in range(128):
+            event = self._receive_json(websocket)
+            if event.get("type") in expected_types:
+                return True
+            if event.get("type") in {"error", "response.failed"}:
+                return False
+        return False
 
 
 def record_phase_three_import(_: str) -> None:
