@@ -26,23 +26,38 @@
   "allOf": [
     {
       "if": {"properties": {"kind": {"const": "runtime_snapshot"}}},
-      "then": {"properties": {"data": {"$ref": "runtime-snapshot.json"}}}
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "runtime-snapshot.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
     },
     {
       "if": {"properties": {"kind": {"const": "result"}}},
-      "then": {"properties": {"data": {"$ref": "grounded-result.json"}}}
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "grounded-result.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
     },
     {
       "if": {"properties": {"kind": {"const": "speech_progress"}}},
-      "then": {"properties": {"data": {"$ref": "speech-progress.json"}}}
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "speech-progress.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
     },
     {
       "if": {"properties": {"kind": {"const": "worker"}}},
-      "then": {"properties": {"data": {"$ref": "worker-state.json"}}}
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "worker-state.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
     },
     {
       "if": {"properties": {"kind": {"const": "routing"}}},
-      "then": {"properties": {"data": {"$ref": "routing-state.json"}}}
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "routing-state.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
     },
     {
       "if": {"properties": {"kind": {"const": "user_transcript"}}},
@@ -51,6 +66,7 @@
           "data": {
             "allOf": [
               {"$ref": "transcript-entry.json"},
+              {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}},
               {"properties": {"role": {"const": "user"}}}
             ]
           }
@@ -64,6 +80,7 @@
           "data": {
             "allOf": [
               {"$ref": "transcript-entry.json"},
+              {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}},
               {"properties": {"role": {"const": "assistant"}}}
             ]
           }

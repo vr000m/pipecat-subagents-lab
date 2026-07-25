@@ -17,7 +17,6 @@ from pydantic import ValidationError
 
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
-    CONTRACT_VERSION,
     GroundedResult,
     RoutingDecision,
     RoutingState,
@@ -28,7 +27,7 @@ from .observers import RuntimeObserver
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
-from .rtvi_messages import RTVI_MESSAGE_KINDS
+from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
 from .work_item_coordinator import LateResult
@@ -84,8 +83,6 @@ except ImportError:  # pragma: no cover - dependency-free contract fallback
 class CanonicalResultAdapter(FrameProcessor):
     """Gate result envelopes without interrupting Pipecat frame lifecycles."""
 
-    _PUBLIC_RTVI_KINDS = frozenset(RTVI_MESSAGE_KINDS)
-
     def __init__(self) -> None:
         if FrameProcessor is not object:
             super().__init__()
@@ -127,21 +124,11 @@ class CanonicalResultAdapter(FrameProcessor):
             return CanonicalResultAdapter._normalized_result(frame) is not None
         if not isinstance(frame, RTVIServerMessageFrame) or not isinstance(data, dict):
             return False
-        sequence = data.get("sequence")
-        origin_epoch = data.get("origin_epoch")
-        return (
-            data.get("contract_version") == CONTRACT_VERSION
-            and isinstance(data.get("session_id"), str)
-            and isinstance(sequence, int)
-            and not isinstance(sequence, bool)
-            and sequence >= 0
-            and data.get("kind") in CanonicalResultAdapter._PUBLIC_RTVI_KINDS
-            and isinstance(data.get("data"), dict)
-            and (
-                origin_epoch is None
-                or (isinstance(origin_epoch, int) and not isinstance(origin_epoch, bool))
-            )
-        )
+        try:
+            RTVIMessage.model_validate(data)
+        except ValidationError:
+            return False
+        return True
 
     async def process_frame(self, frame: Any, direction: Any) -> None:
         """Gate result envelopes while preserving Pipecat pipeline frames."""
@@ -161,6 +148,8 @@ class CanonicalResultAdapter(FrameProcessor):
             return
         if not self.accepts(frame):
             return
+        if isinstance(frame, RTVIServerMessageFrame):
+            frame.data = RTVIMessage.model_validate(data).model_dump(mode="json")
         if isinstance(getattr(frame, "data", frame), dict) and (
             getattr(frame, "data", frame).get("kind") == "canonical_result"
             or all(
@@ -305,6 +294,7 @@ class SessionHost:
         self._inflight_work_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._known_work_items: set[str] = set()
         self._cancelled_work_items: set[str] = set()
+        self._clarification_candidates: dict[str, dict[str, str]] = {}
         self.last_turn_metrics: dict[str, float | str] = {}
         self._closing = False
         self.started = False
@@ -556,14 +546,17 @@ class SessionHost:
                         await origin.scheduler.start_next(replay.work_item_id)
                 elif action in {"cancel", "stop"}:
                     target = outcome.work_items[0] if outcome.work_items else None
-                    self._cancel_work(target)
-                    origin.scheduler.cancel(target)
+                    cancelled_work = self._cancel_work(target)
+                    cancelled_speech = origin.scheduler.cancel(target)
                     await origin.scheduler.wait_for_stops()
+                    if target is not None and not cancelled_work and not cancelled_speech:
+                        action = "unknown_target"
                 text = {
                     "pause": "Pausing the active response.",
                     "resume": "Resuming the paused response.",
                     "cancel": "Cancelling the active response.",
                     "stop": "Stopping the active response.",
+                    "unknown_target": "I could not find that active work item.",
                 }.get(action, "Control request noted.")
             elif outcome.kind == "multi_intent":
                 return await self._handle_multi_intent(outcome, transcript, origin, turn_id)
@@ -694,6 +687,7 @@ class SessionHost:
                 text="The web search is temporarily unavailable.",
                 origin_epoch=origin_epoch,
             )
+        was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
         committed = await self._commit_and_speak(result, origin)
         total_ms = (time.perf_counter() - turn_started) * 1000
         self.last_turn_metrics = {
@@ -706,12 +700,11 @@ class SessionHost:
             f"Turn latency {turn_id}: routing_ms={routing_ms:.1f} "
             f"search_ms={search_ms:.1f} total_ms={total_ms:.1f}"
         )
-        cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
         self._project_worker(
             worker,
             origin_epoch=origin_epoch,
             status="idle",
-            latest_result_id=None if cancelled else result.result_id,
+            latest_result_id=None if was_cancelled else result.result_id,
         )
         return committed
 
@@ -880,11 +873,16 @@ class SessionHost:
                     kwargs["clarification_context"] = contexts[item_index]
                 return await search(query, **kwargs)
             except WorkerClarify as exc:
+                original_query = (
+                    contexts[item_index].original_query
+                    if contexts[item_index] is not None
+                    else query
+                )
                 return self._worker_clarification_result(
                     worker_id=worker_id,
                     turn_id=item_turn_id,
                     question=exc.question,
-                    original_query=query,
+                    original_query=original_query,
                     origin_epoch=origin.epoch,
                 )
             except WorkerDeclined:
@@ -945,14 +943,12 @@ class SessionHost:
     ) -> GroundedResult:
         """Record a worker's clarifying question as the next turn's pending candidate."""
         result_id = f"result-{uuid4().hex}"
-        self.coordinator.add_worker_clarification(
-            session_id=self.state.session_id,
-            worker_id=worker_id,
-            turn_id=turn_id,
-            result_id=result_id,
-            original_query=original_query,
-            question=question,
-        )
+        self._clarification_candidates[result_id] = {
+            "worker_id": worker_id,
+            "turn_id": turn_id,
+            "original_query": original_query,
+            "question": question,
+        }
         return canonical_result(
             worker_id=worker_id,
             turn_id=turn_id,
@@ -1027,6 +1023,8 @@ class SessionHost:
         if late.work_item_id in self._cancelled_work_items:
             self._cancelled_work_items.discard(late.work_item_id)
             self._known_work_items.discard(late.work_item_id)
+            if isinstance(late.result, GroundedResult):
+                self._clarification_candidates.pop(late.result.result_id, None)
             return
         result = late.result
         if not isinstance(result, GroundedResult):
@@ -1058,6 +1056,13 @@ class SessionHost:
             )
         )
         self.state.append_result(result, origin_epoch=result.origin_epoch)
+        candidate = self._clarification_candidates.pop(result.result_id, None)
+        if candidate is not None and self.accepts(result.origin_epoch):
+            self.coordinator.add_worker_clarification(
+                session_id=self.state.session_id,
+                result_id=result.result_id,
+                **candidate,
+            )
 
     async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""
@@ -1066,6 +1071,7 @@ class SessionHost:
         if work_item_id in self._cancelled_work_items:
             self._cancelled_work_items.discard(work_item_id)
             self._known_work_items.discard(work_item_id)
+            self._clarification_candidates.pop(result.result_id, None)
             return result
         self._commit_result_state(result)
         self._known_work_items.discard(work_item_id)
@@ -1135,7 +1141,7 @@ class SessionHost:
 
         task.add_done_callback(completed)
 
-    def _cancel_work(self, work_item_id: str | None) -> None:
+    def _cancel_work(self, work_item_id: str | None) -> tuple[str, ...]:
         selected = tuple(
             item_id
             for item_id in self._inflight_work_tasks
@@ -1144,14 +1150,13 @@ class SessionHost:
         coordinator_cancel = getattr(self.coordinator, "cancel", None)
         if coordinator_cancel is not None:
             selected = tuple(dict.fromkeys((*selected, *coordinator_cancel(work_item_id))))
-        if work_item_id is not None:
-            selected = tuple(dict.fromkeys((*selected, work_item_id)))
-        else:
+        if work_item_id is None:
             selected = tuple(dict.fromkeys((*selected, *self._known_work_items)))
         self._cancelled_work_items.update(selected)
         for item_id in selected:
             for task in self._inflight_work_tasks.get(item_id, ()):
                 task.cancel()
+        return selected
 
     def _project_worker(
         self,

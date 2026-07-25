@@ -52,20 +52,26 @@ class _SpeechCompletionProcessor(FrameProcessor):
         self._runtime = runtime
 
     async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
-        from pipecat.frames.frames import TTSStoppedFrame
+        from pipecat.frames.frames import TTSStartedFrame, TTSStoppedFrame
 
         await super().process_frame(frame, direction)
+        if (
+            direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, TTSStartedFrame)
+            and self._host.connection is self._runtime
+            and self._runtime.active
+        ):
+            self._runtime.scheduler.provider_started(frame.context_id)
         if (
             direction == FrameDirection.DOWNSTREAM
             and isinstance(frame, TTSStoppedFrame)
             and self._host.connection is self._runtime
             and self._runtime.active
-            and self._runtime.scheduler.active is not None
         ):
-            utterance_id = self._runtime.scheduler.active.item.utterance_id
-            self._runtime.scheduler.synthesis_ended(utterance_id)
-            self._runtime.scheduler.delivery_unknown(utterance_id)
-            await self._runtime.scheduler.start_next()
+            matched = self._runtime.scheduler.provider_synthesis_ended(frame.context_id)
+            if matched:
+                self._runtime.scheduler.provider_delivery_unknown(frame.context_id)
+                await self._runtime.scheduler.start_next()
         await self.push_frame(frame, direction)
 
 

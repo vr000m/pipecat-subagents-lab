@@ -200,6 +200,15 @@ def test_python_message_kinds_match_the_shared_wire_schema() -> None:
     assert tuple(schema["properties"]["kind"]["enum"]) == RTVI_MESSAGE_KINDS
     assert "runtime_result" not in RTVI_MESSAGE_KINDS
     assert "speech" not in RTVI_MESSAGE_KINDS
+    for branch in schema["allOf"]:
+        payload = branch["then"]["properties"]["data"]
+        overlays = payload.get("allOf", [])
+        assert any(
+            "origin_epoch" in overlay.get("required", [])
+            and overlay.get("properties", {}).get("origin_epoch")
+            == {"type": "integer", "minimum": 0}
+            for overlay in overlays
+        )
 
 
 def test_every_versioned_message_kind_validates_its_direct_payload() -> None:

@@ -92,8 +92,9 @@ class WorkerRegistry:
         if worker is None:
             worker = self._create_web_search_worker(metadata)
         worker = self._require_web_search_capability(worker)
+        self._require_matching_identity(worker, metadata)
         if capabilities is None:
-            worker_capabilities = getattr(getattr(worker, "metadata", None), "capabilities", None)
+            worker_capabilities = getattr(worker.metadata, "capabilities", None)
             if worker_capabilities is None:
                 worker_capabilities = getattr(worker, "capabilities", {})
             metadata = WorkerMetadata(
@@ -114,6 +115,22 @@ class WorkerRegistry:
         if not callable(getattr(worker, "search", None)):
             raise TypeError("web_search worker must define a callable search method")
         return cast(WebSearchCapableWorker, worker)
+
+    @staticmethod
+    def _require_matching_identity(
+        worker: WebSearchCapableWorker, expected: WorkerMetadata
+    ) -> None:
+        metadata = getattr(worker, "metadata", None)
+        if metadata is None:
+            raise TypeError("web_search worker must define metadata")
+        for field in ("worker_id", "worker_type", "topic", "model_policy"):
+            actual = getattr(metadata, field, None)
+            wanted = getattr(expected, field)
+            if actual != wanted:
+                raise ValueError(
+                    f"web_search worker metadata mismatch for {field}: "
+                    f"expected {wanted!r}, got {actual!r}"
+                )
 
     def _create_web_search_worker(self, metadata: WorkerMetadata) -> WebSearchCapableWorker:
         if self.worker_factory is not None:

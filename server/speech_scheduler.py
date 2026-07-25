@@ -290,10 +290,10 @@ class SpeechScheduler:
     def _release(self, utterance_id: str) -> None:
         if self._active and self._active.item.utterance_id == utterance_id:
             token = self._active.token
-            try:
-                self._awaiting_provider_context.remove(token)
-            except ValueError:
-                pass
+            # Keep an unbound token as a tombstone. Pipecat allocates the
+            # provider context after TTSSpeakFrame is queued, so a delayed
+            # synthesis_started for this interrupted lease must consume this
+            # token instead of binding to the replacement utterance.
             self._provider_contexts = {
                 context_id: lease_token
                 for context_id, lease_token in self._provider_contexts.items()

@@ -16,6 +16,7 @@ from server.router import LazyRouterProvider, Router
 from server.services.stt import LocalSTT
 from server.services.tts import LocalTTS
 from server.work_item_coordinator import WorkItemCoordinator
+from server.workers.base import WorkerMetadata
 
 
 class FakeRunner:
@@ -61,6 +62,13 @@ class FakeSearchWorker:
 
     def __init__(self, worker_id: str) -> None:
         self.worker_id = worker_id
+        self.metadata = WorkerMetadata(
+            worker_id=worker_id,
+            worker_type="web_search",
+            topic="news",
+            topic_summary="",
+            model_policy="deep",
+        )
         self.calls: list[tuple[str, str, int | None]] = []
 
     async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:

@@ -13,6 +13,7 @@ from server.workers.web_search import (
     WebSearchWorker,
     WorkerClarify,
     WorkerDeclined,
+    _response_citations,
 )
 
 
@@ -132,6 +133,42 @@ def test_worker_deduplicates_and_caps_provider_sources() -> None:
         "https://example.com/1",
         "https://example.com/2",
     ]
+
+
+def test_citation_extraction_handles_deep_and_cyclic_provider_payloads() -> None:
+    root: dict[str, Any] = {}
+    root["cycle"] = root
+    nested = root
+    for _ in range(5_000):
+        child: dict[str, Any] = {}
+        nested["child"] = child
+        nested = child
+    nested["citation"] = {
+        "type": "url_citation",
+        "title": "Too deep",
+        "url": "https://example.com/deep",
+    }
+
+    assert _response_citations(root, max_candidates=12) == []
+
+
+def test_citation_extraction_enforces_node_and_candidate_work_limits() -> None:
+    broad = [
+        {
+            "type": "url_citation",
+            "title": f"Source {index}",
+            "url": f"https://example.com/{index}",
+        }
+        for index in range(10_000)
+    ]
+
+    candidates = _response_citations(
+        {"sources": broad},
+        max_candidates=7,
+        max_nodes=50,
+    )
+
+    assert len(candidates) == 7
 
 
 def test_clarification_context_preserves_answer_when_original_is_oversized() -> None:

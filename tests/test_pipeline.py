@@ -417,6 +417,42 @@ def test_worker_clarify_records_a_pending_dialogue_and_speaks_the_question() -> 
     asyncio.run(run())
 
 
+def test_stale_worker_clarification_cannot_take_pending_dialogue_after_reconnect() -> None:
+    async def run() -> None:
+        class BlockingClarifier(ClarifyingResultWorker):
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                self.started.set()
+                await self.release.wait()
+                return await super().search(
+                    query,
+                    turn_id=turn_id,
+                    origin_epoch=origin_epoch,
+                )
+
+        worker = BlockingClarifier()
+        coordinator = RoutedCoordinator(worker)
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        await host.connect(connection_handshake(host, 1))
+        pending = asyncio.create_task(host._handle_transcript("weather"))
+        await worker.started.wait()
+
+        await host.connect(connection_handshake(host, 2))
+        worker.release.set()
+        await pending
+
+        assert coordinator.clarifications == []
+        assert host._clarification_candidates == {}
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_natural_clarification_answer_resumes_original_query_on_same_worker() -> None:
     async def run() -> None:
         worker = ContinuationResultWorker()
@@ -697,6 +733,42 @@ def test_late_tts_callback_cannot_complete_replacement_utterance() -> None:
     asyncio.run(run())
 
 
+def test_late_tts_start_before_pause_does_not_bind_replacement_utterance() -> None:
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        old = connection.scheduler.enqueue(
+            result_id="result-old",
+            work_item_id="work-old",
+            run_id="run-old",
+            text="Old answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        connection.scheduler.pause("work-old")
+        replacement = connection.scheduler.enqueue(
+            result_id="result-new",
+            work_item_id="work-new",
+            run_id="run-new",
+            text="New answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+
+        await tts.on_event("synthesis_started", "context-old")
+        await tts.on_event("synthesis_ended", "context-old")
+
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item == replacement
+        assert host.state.speech[old.utterance_id].state.value == "paused"
+        assert host.state.speech[replacement.utterance_id].state.value == "started"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_resume_control_requeues_and_starts_targeted_paused_item() -> None:
     async def run() -> None:
         class ControlCoordinator:
@@ -798,6 +870,31 @@ def test_cancel_fences_cancellation_resistant_worker_result_and_speech() -> None
             not isinstance(frame, TTSSpeakFrame) or frame.text != result.spoken_text
             for frame in connection.worker.frames
         )
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_unknown_cancel_target_does_not_poison_future_work_or_accumulate_state() -> None:
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        for index in range(100):
+            host._cancel_work(f"work-turn-{index}")
+
+        assert host._cancelled_work_items == set()
+        future = GroundedResult(
+            result_id="future-result",
+            worker_id="worker-search",
+            turn_id="turn-50",
+            text="Future answer",
+            spoken_text="Future answer",
+            ui_text="Future answer",
+            origin_epoch=1,
+        )
+        await host._commit_and_speak(future, origin)
+        assert host.state.result_history("worker-search") == (future,)
         await host.shutdown()
 
     asyncio.run(run())
@@ -914,6 +1011,55 @@ def test_multi_intent_preserves_envelope_fallbacks_and_uses_submit() -> None:
             "Answer for search it",
         ]
         assert coordinator.submit_calls == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_reclarification_preserves_the_original_pending_query() -> None:
+    async def run() -> None:
+        class ReclarifyingWorker(ContinuationResultWorker):
+            async def search(
+                self,
+                query: str,
+                *,
+                turn_id: str,
+                origin_epoch: int | None,
+                clarification_context: ClarificationContext | None = None,
+            ) -> GroundedResult:
+                assert clarification_context is not None
+                raise WorkerClarify("Which date should I use?")
+
+        worker = ReclarifyingWorker()
+        registry = PendingRegistry(worker)
+        coordinator = WorkItemCoordinator(registry=registry)
+        host = SessionHost(
+            registry=registry,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
+        coordinator.add_worker_clarification(
+            session_id=host.state.session_id,
+            worker_id="worker-search",
+            turn_id="turn-original",
+            result_id="result-question",
+            original_query="What's the weather like?",
+            question="Which location should I use?",
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        pending = coordinator.pending(host.state.session_id)
+        outcome = type(
+            "Outcome",
+            (),
+            {"work_items": ("Riga",), "pending_dialogue": pending},
+        )()
+
+        await host._handle_multi_intent(outcome, "", origin, "turn-compound")
+
+        next_pending = coordinator.pending(host.state.session_id)
+        assert next_pending is not None
+        assert next_pending.original_query == "What's the weather like?"
+        assert next_pending.question == "Which date should I use?"
         await host.shutdown()
 
     asyncio.run(run())
@@ -1276,10 +1422,20 @@ def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
         frame = RTVIServerMessageFrame(
             data={
                 "contract_version": "v1.0",
-                "session_id": "session-1",
+                "session_id": "adapter-session",
                 "sequence": 4,
                 "kind": "runtime_snapshot",
-                "data": {"workers": [], "results": [], "speech_progress": []},
+                "data": {
+                    "contract_version": "v1.0",
+                    "session_id": "adapter-session",
+                    "snapshot_sequence": 4,
+                    "workers": [],
+                    "results": [],
+                    "speech_progress": [],
+                    "routing": None,
+                    "transcript": [],
+                    "origin_epoch": 2,
+                },
                 "origin_epoch": 2,
             }
         )
@@ -1296,6 +1452,18 @@ def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
         tts_frame = TTSSpeakFrame(text="hello")
         await adapter.process_frame(tts_frame, FrameDirection.DOWNSTREAM)
         assert forwarded[-1] is tts_frame
+
+        malformed = RTVIServerMessageFrame(
+            data={
+                "contract_version": "v1.0",
+                "session_id": "session-1",
+                "sequence": 5,
+                "kind": "result",
+                "data": {},
+                "origin_epoch": 2,
+            }
+        )
+        assert not adapter.accepts(malformed)
 
     asyncio.run(run())
 
@@ -1374,6 +1542,101 @@ def test_final_turn_transcript_waits_for_smart_turn_stop() -> None:
         assert routed == ["Can you look for the capital of India? over the last two hundred years."]
         assert not any(isinstance(frame, TranscriptionFrame) for frame in forwarded)
         assert sum(isinstance(frame, UserStoppedSpeakingFrame) for frame in forwarded) == 1
+
+    asyncio.run(run())
+
+
+def test_final_turn_dispatch_is_backpressured_and_cleanup_cancels_all_tasks() -> None:
+    async def run() -> None:
+        release = asyncio.Event()
+        started = 0
+
+        async def on_final(_text: str) -> None:
+            nonlocal started
+            started += 1
+            await release.wait()
+
+        processor = FinalTurnTranscriptProcessor(
+            on_final,
+            complete_grace_seconds=0,
+            max_pending_dispatches=3,
+        )
+
+        async def push(_frame: object, _direction: object) -> None:
+            return None
+
+        processor.push_frame = push  # type: ignore[method-assign]
+
+        async def produce_many_turns() -> None:
+            for index in range(100):
+                await processor.process_frame(
+                    TranscriptionFrame(f"turn {index}", "", ""),
+                    FrameDirection.DOWNSTREAM,
+                )
+                await processor.process_frame(
+                    UserStoppedSpeakingFrame(),
+                    FrameDirection.DOWNSTREAM,
+                )
+                while (
+                    processor._completion_task is not None and not processor._completion_committed
+                ):
+                    await asyncio.sleep(0)
+
+        producer = asyncio.create_task(produce_many_turns())
+        for _ in range(20):
+            if started == 3 and processor._completion_committed:
+                break
+            await asyncio.sleep(0)
+
+        assert started == 3
+        assert len(processor._dispatch_tasks) == 3
+        assert processor._completion_committed
+        assert not producer.done()
+
+        dispatch_tasks = list(processor._dispatch_tasks)
+        completion_task = processor._completion_task
+        producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+        await processor.cleanup()
+
+        assert processor._completion_task is None
+        assert processor._completion_tasks == set()
+        assert processor._dispatch_tasks == set()
+        assert completion_task is not None and completion_task.done()
+        assert all(task.done() for task in dispatch_tasks)
+
+    asyncio.run(run())
+
+
+def test_final_turn_transcript_input_is_capped() -> None:
+    async def run() -> None:
+        routed: list[str] = []
+        routed_event = asyncio.Event()
+
+        async def on_final(text: str) -> None:
+            routed.append(text)
+            routed_event.set()
+
+        processor = FinalTurnTranscriptProcessor(
+            on_final,
+            complete_grace_seconds=0,
+            max_transcript_chars=32,
+        )
+        processor.push_frame = lambda *_args: asyncio.sleep(0)  # type: ignore[method-assign]
+
+        await processor.process_frame(
+            TranscriptionFrame("a" * 20, "", ""),
+            FrameDirection.DOWNSTREAM,
+        )
+        await processor.process_frame(
+            TranscriptionFrame("b" * 20, "", ""),
+            FrameDirection.DOWNSTREAM,
+        )
+        await processor.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await asyncio.wait_for(routed_event.wait(), timeout=1)
+
+        assert routed == [f"{'a' * 20} {'b' * 11}"]
+        await processor.cleanup()
 
     asyncio.run(run())
 

@@ -373,7 +373,7 @@ class WorkItemCoordinator:
     def control_intent(transcript: str) -> tuple[str, str | None] | None:
         match = re.fullmatch(
             r"\s*(pause|resume|cancel|stop|consent)"
-            r"(?:\s+(work(?:[-_ ]item)?[-_ ][\w-]+))?\s*[.!]?\s*",
+            r"(?:\s+(work(?:[-_ ]item)?[-_ ][\w-]{1,128}))?\s*[.!]?\s*",
             transcript,
             re.IGNORECASE,
         )

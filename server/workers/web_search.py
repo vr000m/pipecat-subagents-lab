@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -229,38 +230,64 @@ def _response_answer(response: Any) -> WebSearchAnswer:
         raise WorkerDeclined("hosted web search returned an invalid answer envelope") from exc
 
 
-def _response_citations(response: Any) -> list[dict[str, str]]:
+def _response_citations(
+    response: Any,
+    *,
+    max_candidates: int,
+    max_depth: int = 64,
+    max_nodes: int = 10_000,
+) -> list[dict[str, str]]:
     citations: list[dict[str, str]] = []
+    pending: deque[tuple[Any, int]] = deque([(response, 0)])
+    seen: set[int] = set()
+    visited_nodes = 0
 
-    def visit(value: Any) -> None:
+    while pending and visited_nodes < max_nodes and len(citations) < max_candidates:
+        value, depth = pending.popleft()
+        visited_nodes += 1
+        if depth > max_depth:
+            continue
+        if not isinstance(value, (str, bytes, int, float, bool, type(None))):
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
         if isinstance(value, Mapping):
             url = value.get("url")
             if isinstance(url, str) and (
                 "citation" in str(value.get("type", "")).lower() or "title" in value
             ):
                 citations.append({"title": str(value.get("title") or ""), "url": url})
-            for child in value.values():
-                visit(child)
+            if depth < max_depth:
+                for child in value.values():
+                    if visited_nodes + len(pending) >= max_nodes:
+                        break
+                    pending.append((child, depth + 1))
         elif isinstance(value, (list, tuple)):
             for child in value:
-                visit(child)
+                if visited_nodes + len(pending) >= max_nodes:
+                    break
+                pending.append((child, depth + 1))
         else:
             url = _value(value, "url")
             if isinstance(url, str):
                 citations.append({"title": str(_value(value, "title", "") or ""), "url": url})
-            for child_name in (
-                "output",
-                "content",
-                "annotations",
-                "results",
-                "action",
-                "sources",
-            ):
-                child = _value(value, child_name)
-                if child is not None:
-                    visit(child)
-
-    visit(response)
+            if depth < max_depth:
+                for child_name in (
+                    "output",
+                    "content",
+                    "annotations",
+                    "results",
+                    "action",
+                    "sources",
+                ):
+                    if visited_nodes + len(pending) >= max_nodes:
+                        break
+                    child = _value(value, child_name)
+                    if child is not None:
+                        pending.append((child, depth + 1))
+        if len(citations) >= max_candidates:
+            break
     return citations
 
 
@@ -356,7 +383,12 @@ class WebSearchWorker(ContextWorker):
                 if inspect.isawaitable(response):
                     response = await response
             answer = _response_answer(response)
-            citations = normalize_citations(_response_citations(response))[: self.max_citations]
+            citations = normalize_citations(
+                _response_citations(
+                    response,
+                    max_candidates=max(self.max_citations * 4, self.max_citations),
+                )
+            )[: self.max_citations]
             result = canonical_result(
                 worker_id=self.metadata.worker_id,
                 turn_id=turn_id,
