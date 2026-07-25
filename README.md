@@ -116,6 +116,41 @@ bun run lint
 Run `bun run build` before opening or serving `web/index.html`: `dist/` is
 intentionally ignored, while lint writes its bundle only to `/tmp`.
 
+After the browser bundle is built, run the credential-free process smoke:
+
+```sh
+uv run python scripts/smoke_server.py
+```
+
+It starts the real FastAPI/Uvicorn process on an ephemeral loopback port,
+captures its logs, verifies health, browser assets, same-origin session
+discovery, cross-origin rejection, the versioned session handshake, and clean
+shutdown. It does not claim WebRTC media, STT, TTS, or hosted-model acceptance.
+
+With the configured local speech services running, verify the local
+TTS-to-PCM-to-STT round trip separately:
+
+```sh
+uv run python scripts/benchmark_speech.py --local-only --runs 1
+```
+
+This local-media smoke needs no hosted credentials and fails if STT does not
+recover the normalized fixture text. It deliberately remains outside the
+credential-free CI job because the local socket services are machine-owned.
+
+Finally, with `OPENAI_API_KEY` loaded, run one bounded paid router-to-worker
+smoke:
+
+```sh
+uv run python scripts/smoke_conversation.py
+```
+
+The command prints only timing, projection lengths, worker identity, and
+citation count. It fails on routing fallbacks, main-responder fallback, missing
+citations, an invalid spoken projection, or a default 120-second deadline. The
+deadline is enforced by an outer process so a provider call that ignores
+in-process cancellation cannot hang the merge check indefinitely.
+
 To compare the configured local services with Deepgram and Cartesia using the
 same text and PCM fixture:
 

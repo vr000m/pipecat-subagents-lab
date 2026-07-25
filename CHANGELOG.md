@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Credential-free real-process server smoke covering health, built browser
+  assets, origin enforcement, session discovery, and clean shutdown.
+- Local-only TTS-to-STT media smoke mode for the existing speech benchmark.
+- Bounded paid conversation smoke covering the real router, worker, structured
+  display/speech projections, and normalized citations without printing content.
+
+### Fixed
+
+- Complete only unambiguous nullable fields in a public-web `new_worker`
+  structured route, while continuing to reject explicit unsupported values.
+
 ## [0.1.0] - 2026-07-25
 
 ### Added

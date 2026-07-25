@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Compare warm speech-provider latency with identical text and audio.
+"""Smoke local speech or compare providers with identical text and audio.
 
-This is an opt-in paid benchmark. It reads credentials from the environment,
-prints aggregate timing only, and never prints provider payloads or secrets.
+The local-only mode is an opt-in service smoke requiring no hosted credentials.
+The comparison mode is a paid benchmark. Both print aggregate timing only and
+never print provider payloads or secrets.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import statistics
 import time
 from typing import Any
@@ -203,6 +205,10 @@ def _resample_to_16khz(audio: bytes, source_rate: int) -> bytes:
     return converted
 
 
+def _normalized_transcript(value: str) -> str:
+    return re.sub(r"[^\w]+", " ", value.casefold()).strip()
+
+
 async def _measure(
     runs: int,
     operation: Callable[[], Awaitable[Any]],
@@ -215,26 +221,36 @@ async def main() -> None:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--text", default="What is the capital of India?")
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="smoke the configured local TTS -> PCM -> local STT path without hosted services",
+    )
     args = parser.parse_args()
-    if args.runs < 2:
-        parser.error("--runs must be at least 2")
+    minimum_runs = 1 if args.local_only else 2
+    if args.runs < minimum_runs:
+        parser.error(f"--runs must be at least {minimum_runs}")
 
     config = load_config(config_file=args.config)
     if config.stt_endpoint is None or config.tts_endpoint is None:
         raise ConfigError("local STT and TTS endpoints are required for comparison")
-    if not config.deepgram_api_key:
+    if not args.local_only and not config.deepgram_api_key:
         raise ConfigError("DEEPGRAM_API_KEY is required for the hosted benchmark")
-    if not config.cartesia_api_key or not config.cartesia_voice_id:
+    if not args.local_only and (not config.cartesia_api_key or not config.cartesia_voice_id):
         raise ConfigError(
             "CARTESIA_API_KEY and CARTESIA_VOICE_ID are required for the hosted benchmark"
         )
 
     local_tts = LocalTTS(TTSEndpoint(*config.tts_endpoint), voice_id=config.tts_voice_id)
     local_stt = LocalSTT(STTEndpoint(*config.stt_endpoint), language=config.stt_language)
-    cartesia = CartesiaBenchmarkClient(
-        api_key=config.cartesia_api_key,
-        voice_id=config.cartesia_voice_id,
-        model=config.tts_model,
+    cartesia = (
+        None
+        if args.local_only
+        else CartesiaBenchmarkClient(
+            api_key=config.cartesia_api_key,
+            voice_id=config.cartesia_voice_id,
+            model=config.tts_model,
+        )
     )
     await local_tts.start()
     await local_stt.start()
@@ -242,44 +258,60 @@ async def main() -> None:
         local_connect_started = time.perf_counter()
         await local_tts.connect()
         local_tts_connect_ms = (time.perf_counter() - local_connect_started) * 1000
-        cartesia_connect_ms = await cartesia.connect()
+        cartesia_connect_ms = await cartesia.connect() if cartesia is not None else None
 
         local_tts_runs = await _measure(args.runs, lambda: _local_tts(local_tts, args.text))
-        cartesia_runs = await _measure(args.runs, lambda: cartesia.synthesize(args.text))
+        cartesia_runs = (
+            await _measure(args.runs, lambda: cartesia.synthesize(args.text))
+            if cartesia is not None
+            else []
+        )
 
         fixture = _resample_to_16khz(local_tts_runs[-1].audio, local_tts_runs[-1].sample_rate)
         local_stt_runs = await _measure(args.runs, lambda: _local_stt(local_stt, fixture))
         deepgram_runs: list[STTMeasurement] = []
         deepgram_connect: list[float] = []
-        for _ in range(args.runs):
-            connect_ms, measurement = await _deepgram_stt(
-                api_key=config.deepgram_api_key,
-                model=config.stt_model,
-                language=config.stt_language,
-                audio=fixture,
-            )
-            deepgram_connect.append(connect_ms)
-            deepgram_runs.append(measurement)
+        if not args.local_only:
+            for _ in range(args.runs):
+                connect_ms, measurement = await _deepgram_stt(
+                    api_key=config.deepgram_api_key,
+                    model=config.stt_model,
+                    language=config.stt_language,
+                    audio=fixture,
+                )
+                deepgram_connect.append(connect_ms)
+                deepgram_runs.append(measurement)
 
         print(f"runs={args.runs} fixture_pcm_ms={len(fixture) / 32:.1f}")
         print("tts.local.first_audio " + _summary([item.first_audio_ms for item in local_tts_runs]))
-        print(
-            "tts.cartesia.first_audio " + _summary([item.first_audio_ms for item in cartesia_runs])
-        )
         print("tts.local.complete " + _summary([item.complete_ms for item in local_tts_runs]))
-        print("tts.cartesia.complete " + _summary([item.complete_ms for item in cartesia_runs]))
         print("tts.local.connect " + _summary([local_tts_connect_ms]))
-        print("tts.cartesia.connect " + _summary([cartesia_connect_ms]))
         print("stt.local.final " + _summary([item.final_ms for item in local_stt_runs]))
-        print("stt.deepgram.final " + _summary([item.final_ms for item in deepgram_runs]))
-        print("stt.deepgram.connect " + _summary(deepgram_connect))
-        print(
-            "transcript_match "
-            f"local={all(item.transcript.casefold() == args.text.casefold() for item in local_stt_runs)} "
-            f"deepgram={all(item.transcript.casefold() == args.text.casefold() for item in deepgram_runs)}"
+        local_match = all(
+            _normalized_transcript(item.transcript) == _normalized_transcript(args.text)
+            for item in local_stt_runs
         )
+        if args.local_only:
+            print(f"transcript_match local={local_match}")
+            if not local_match:
+                raise RuntimeError("local speech smoke transcript did not match the fixture text")
+        else:
+            print(
+                "tts.cartesia.first_audio "
+                + _summary([item.first_audio_ms for item in cartesia_runs])
+            )
+            print("tts.cartesia.complete " + _summary([item.complete_ms for item in cartesia_runs]))
+            print("tts.cartesia.connect " + _summary([cartesia_connect_ms]))
+            print("stt.deepgram.final " + _summary([item.final_ms for item in deepgram_runs]))
+            print("stt.deepgram.connect " + _summary(deepgram_connect))
+            deepgram_match = all(
+                _normalized_transcript(item.transcript) == _normalized_transcript(args.text)
+                for item in deepgram_runs
+            )
+            print(f"transcript_match local={local_match} deepgram={deepgram_match}")
     finally:
-        await cartesia.close()
+        if cartesia is not None:
+            await cartesia.close()
         await local_stt.cleanup()
         await local_tts.cleanup()
 
