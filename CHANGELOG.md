@@ -13,12 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assets, origin enforcement, session discovery, and clean shutdown.
 - Local-only TTS-to-STT media smoke mode for the existing speech benchmark.
 - Bounded paid conversation smoke covering the real router, worker, structured
-  display/speech projections, and normalized citations without printing content.
+  display/speech projections, normalized citations, and explicit routing/search/
+  total latency budgets without printing content.
 
 ### Fixed
 
 - Complete only unambiguous nullable fields in a public-web `new_worker`
   structured route, while continuing to reject explicit unsupported values.
+- Bound direct, pending, and multi-intent searches with truthful
+  completed/retained/rejected ownership outcomes; capacity rejection no longer
+  claims that work will continue in the background.
+- Reserve coordinator capacity before provider work starts, release submission
+  callers when calls return, and bound shutdown when cancellation-resistant
+  work outlives its grace period.
+- Use cancellable asynchronous hosted-search clients with provider deadlines,
+  cap normalized citations, preserve long clarification answers, and request
+  minimal router reasoning under a separate routing deadline.
+- Fence connection callbacks before coordinator shutdown and log routing,
+  search, and total turn latency.
 
 ## [0.1.0] - 2026-07-25
 

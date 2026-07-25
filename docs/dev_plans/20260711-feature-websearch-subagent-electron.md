@@ -566,13 +566,23 @@ non-finite values.
 The same hardening pass keeps router prompts, decisions, and prose request-local
 across concurrent turns. Timed-out searches are retained in a bounded
 coordinator-owned set for late UI delivery without autoplay; callback-delivered
-results do not also accumulate in the polling queue. Session shutdown fences,
-cancels, and awaits retained searches, callback tasks, active submissions, and
-provider children, including cancellation-resistant work until it reaches a
-terminal state. Caller cancellation also cancels and awaits its child search.
+results do not also accumulate in the polling queue. A follow-up latency and
+lifecycle pass reserves coordinator capacity before provider work starts and
+uses typed completed/retained/rejected transfer outcomes, so rejected work is
+never reported as continuing in the background. Direct searches now share the
+bounded foreground behavior already used by pending and multi-intent work.
+Session shutdown fences connection callbacks first, cancels all coordinator
+work, waits only for an operator-configurable grace period, and safely consumes
+eventual completion from cancellation-resistant tasks. Production web workers
+use a cancellable asynchronous Responses client with a longer provider deadline.
+Caller cancellation also cancels and awaits its child search.
 Pause, cancel, and stop wait for Pipecat's interruption path before speaking a
 confirmation, and late provider failures are logged with fixed correlation
 fields rather than untrusted exception text. Regression tests cover each
 lifecycle invariant, including ambiguous weather request -> spoken
 clarification -> `Riga` -> the same worker receiving the original request plus
-the answer.
+the answer. Router, search, and total-turn timings are logged independently; the
+paid smoke enforces routing and total latency budgets. Hosted-search instructions
+prefer a small authoritative source set, normalized citations are capped, and
+typed clarification fields are bounded independently so a long original request
+cannot truncate the user's answer.

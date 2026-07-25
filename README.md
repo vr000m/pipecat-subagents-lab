@@ -46,6 +46,11 @@ model = "nova-3-general"
 smart_turn_timeout_seconds = 5.0
 smart_turn_complete_grace_seconds = 1.5
 pending_dialogue_timeout_seconds = 30.0
+foreground_search_timeout_seconds = 15.0
+router_timeout_seconds = 12.0
+provider_timeout_seconds = 75.0
+shutdown_grace_seconds = 2.0
+max_citations = 12
 
 [models]
 router_model = "gpt-5-mini"
@@ -86,6 +91,13 @@ that resumes within the default 1.5-second grace remains part of the same turn.
 `WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS` controls how long a worker's
 clarifying question remains available for continuation; the default is 30
 seconds. Its TOML equivalent is `[turn].pending_dialogue_timeout_seconds`.
+`WEBSEARCH_FOREGROUND_SEARCH_TIMEOUT_SECONDS` bounds how long a voice turn
+waits for one search before acknowledging safe background continuation.
+`WEBSEARCH_ROUTER_TIMEOUT_SECONDS` and `WEBSEARCH_PROVIDER_TIMEOUT_SECONDS`
+bound hosted routing and worker requests, while
+`WEBSEARCH_SHUTDOWN_GRACE_SECONDS` prevents cancellation-resistant work from
+blocking server shutdown. `WEBSEARCH_MAX_CITATIONS` caps the normalized source
+list. Their TOML equivalents use the same lowercase names under `[turn]`.
 `WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
 OpenAI model IDs without allowing model output to select an arbitrary model.
 
@@ -145,11 +157,13 @@ smoke:
 uv run python scripts/smoke_conversation.py
 ```
 
-The command prints only timing, projection lengths, worker identity, and
+The command prints only stage timings, projection lengths, worker identity, and
 citation count. It fails on routing fallbacks, main-responder fallback, missing
-citations, an invalid spoken projection, or a default 120-second deadline. The
-deadline is enforced by an outer process so a provider call that ignores
-in-process cancellation cannot hang the merge check indefinitely.
+citations, an invalid spoken projection, routing over 15 seconds, total turn
+latency over 60 seconds, or a default 120-second process deadline. Override the
+budgets with `--max-routing-seconds` and `--max-latency-seconds`. The outer
+deadline prevents a provider that ignores in-process cancellation from hanging
+the merge check indefinitely.
 
 To compare the configured local services with Deepgram and Cartesia using the
 same text and PCM fixture:

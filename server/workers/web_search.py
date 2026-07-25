@@ -12,7 +12,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from ..contracts import GroundedResult
-from ..results import canonical_result
+from ..results import canonical_result, normalize_citations
 from ..structured_outputs import structured_text_format
 from .base import ContextWorker, WorkerMetadata
 
@@ -38,10 +38,13 @@ class ClarificationContext:
     answer: str
 
     def provider_query(self) -> str:
+        def bounded(value: str, limit: int) -> str:
+            return " ".join(value.strip().split())[:limit]
+
         return (
-            f"Original request: {self.original_query}\n"
-            f"Clarification asked: {self.question}\n"
-            f"User answer: {self.answer}"
+            f"Original request: {bounded(self.original_query, 650)}\n"
+            f"Clarification asked: {bounded(self.question, 400)}\n"
+            f"User answer: {bounded(self.answer, 800)}"
         )
 
 
@@ -192,7 +195,8 @@ _WEB_SEARCH_INSTRUCTIONS = (
     "Markdown, URLs, citation markers, source lists, tables, headings, or stage directions. "
     "Preserve names, dates, quantities, qualifications, and uncertainty needed to answer the "
     "request accurately. Every claim in spoken_text must also be supported by display_text and "
-    "the same web-search sources; never introduce a fact only in the spoken projection."
+    "the same web-search sources; never introduce a fact only in the spoken projection. Prefer "
+    "three to six authoritative sources and avoid exhaustive source lists."
 )
 
 
@@ -272,6 +276,8 @@ class WebSearchWorker(ContextWorker):
         decline: Callable[[str], bool] | None = None,
         can_satisfy: Callable[[str], bool] | None = None,
         needs_clarification: Callable[[str], str | None] | None = None,
+        provider_timeout_seconds: float = 75.0,
+        max_citations: int = 12,
     ) -> None:
         metadata = WorkerMetadata(
             worker_id=worker_id,
@@ -288,6 +294,8 @@ class WebSearchWorker(ContextWorker):
             lambda query: can_satisfy(query) is False if can_satisfy else False
         )
         self.needs_clarification = needs_clarification or default_web_clarification
+        self.provider_timeout_seconds = provider_timeout_seconds
+        self.max_citations = max_citations
 
     @staticmethod
     def refine_query(query: str) -> str:
@@ -313,8 +321,10 @@ class WebSearchWorker(ContextWorker):
         origin_epoch: int | None = None,
         clarification_context: ClarificationContext | None = None,
     ) -> GroundedResult:
-        refined = self.refine_query(
-            clarification_context.provider_query() if clarification_context is not None else query
+        refined = (
+            clarification_context.provider_query()
+            if clarification_context is not None
+            else self.refine_query(query)
         )
         if self.decline(refined):
             raise WorkerDeclined("hosted web search cannot satisfy this request")
@@ -338,19 +348,21 @@ class WebSearchWorker(ContextWorker):
                 "store": False,
             }
             create = self.responses.create
-            if inspect.iscoroutinefunction(create):
-                response = create(**kwargs)
-            else:
-                response = await asyncio.to_thread(create, **kwargs)
-            if inspect.isawaitable(response):
-                response = await response
+            async with asyncio.timeout(self.provider_timeout_seconds):
+                if inspect.iscoroutinefunction(create):
+                    response = create(**kwargs)
+                else:
+                    response = await asyncio.to_thread(create, **kwargs)
+                if inspect.isawaitable(response):
+                    response = await response
             answer = _response_answer(response)
+            citations = normalize_citations(_response_citations(response))[: self.max_citations]
             result = canonical_result(
                 worker_id=self.metadata.worker_id,
                 turn_id=turn_id,
                 text=answer.display_text,
                 spoken_text=answer.spoken_text,
-                citations=_response_citations(response),
+                citations=(citation.model_dump() for citation in citations),
                 origin_epoch=origin_epoch,
             )
             self.append_context(

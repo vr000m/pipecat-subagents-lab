@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
-from .router import WorkerCatalogue, WorkerCatalogueEntry, build_openai_responses_client
+from .router import (
+    WorkerCatalogue,
+    WorkerCatalogueEntry,
+    build_openai_async_responses_client,
+)
 from .workers.base import ContextWorker, WorkerMetadata
 from .workers.web_search import WebSearchWorker
 
@@ -106,7 +110,10 @@ class WorkerRegistry:
         elif worker_type == "web_search":
             if self.responses is None:
                 if self.config.openai_api_key:
-                    self.responses = build_openai_responses_client(self.config.openai_api_key)
+                    self.responses = build_openai_async_responses_client(
+                        self.config.openai_api_key,
+                        timeout=self.config.provider_timeout_seconds,
+                    )
                 else:
                     self.responses = _UnavailableResponses()
             worker = WebSearchWorker(
@@ -115,6 +122,8 @@ class WorkerRegistry:
                 responses=self.responses,
                 worker_id=f"worker-{len(self._workers) + 1}",
                 topic=topic,
+                provider_timeout_seconds=self.config.provider_timeout_seconds,
+                max_citations=self.config.max_citations,
             )
         worker_capabilities = getattr(getattr(worker, "metadata", None), "capabilities", None)
         if worker_capabilities is None:

@@ -83,6 +83,8 @@ def test_lazy_router_provider_defers_credentials_and_provider_creation_until_rou
     assert factory_calls == 1
     assert calls[0]["model"] == "gpt-5-mini"
     assert calls[0]["store"] is False
+    assert calls[0]["timeout"] == 12.0
+    assert calls[0]["reasoning"] == {"effort": "minimal"}
     assert "tools" not in calls[0]
 
     schema = calls[0]["text"]["format"]["schema"]

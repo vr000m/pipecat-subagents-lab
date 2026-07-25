@@ -103,6 +103,51 @@ def test_worker_collects_object_sources_from_web_search_call_actions() -> None:
     ]
 
 
+def test_worker_deduplicates_and_caps_provider_sources() -> None:
+    sources = [
+        {"type": "url", "title": f"Source {index}", "url": f"https://example.com/{index}"}
+        for index in range(5)
+    ]
+    provider = FakeResponses(
+        {
+            **answer_payload(),
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {"sources": [sources[0], *sources]},
+                }
+            ],
+        }
+    )
+    worker = WebSearchWorker(
+        responses=provider,
+        model="verified-worker-model",
+        max_citations=3,
+    )
+
+    result = asyncio.run(worker.search("What happened?", turn_id="turn-1"))
+
+    assert [citation.url for citation in result.citations] == [
+        "https://example.com/0",
+        "https://example.com/1",
+        "https://example.com/2",
+    ]
+
+
+def test_clarification_context_preserves_answer_when_original_is_oversized() -> None:
+    context = ClarificationContext(
+        original_query="original " * 1_000,
+        question="Which location should I use?",
+        answer="Riga is the location I chose",
+    )
+
+    provider_query = context.provider_query()
+
+    assert len(provider_query) < 2_000
+    assert "User answer: Riga is the location I chose" in provider_query
+    assert "Clarification asked: Which location should I use?" in provider_query
+
+
 def test_worker_declines_or_clarifies_without_calling_search_when_web_cannot_satisfy_request() -> (
     None
 ):

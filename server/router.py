@@ -24,11 +24,18 @@ class RouterEnvelope(BaseModel):
     prose: str | None = None
 
 
-def build_openai_responses_client(api_key: str) -> Any:
-    """Construct the shared OpenAI Responses client used by the router and workers."""
+def build_openai_responses_client(api_key: str, *, timeout: float = 75.0) -> Any:
+    """Construct the synchronous Responses client used by the router."""
     from openai import OpenAI
 
-    return OpenAI(api_key=api_key).responses
+    return OpenAI(api_key=api_key, timeout=timeout).responses
+
+
+def build_openai_async_responses_client(api_key: str, *, timeout: float = 75.0) -> Any:
+    """Construct the cancellable async Responses client used by workers."""
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(api_key=api_key, timeout=timeout).responses
 
 
 def _response_text(response: Any) -> str:
@@ -67,16 +74,24 @@ class LazyRouterProvider:
                 "router provider is unavailable; configure an OpenAI credential "
                 "or inject a router provider"
             )
-        self._responses = build_openai_responses_client(self._config.openai_api_key)
+        self._responses = build_openai_responses_client(
+            self._config.openai_api_key,
+            timeout=self._config.provider_timeout_seconds,
+        )
         return self._responses
 
     def __call__(self, prompt: str) -> dict[str, Any]:
-        response = self._get_responses().create(
-            model=self._config.resolve_router_model("fast"),
-            input=prompt,
-            store=False,
-            text=structured_text_format(RouterEnvelope, "router_envelope"),
-        )
+        model = self._config.resolve_router_model("fast")
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "input": prompt,
+            "store": False,
+            "timeout": self._config.router_timeout_seconds,
+            "text": structured_text_format(RouterEnvelope, "router_envelope"),
+        }
+        if model.startswith("gpt-5"):
+            kwargs["reasoning"] = {"effort": "minimal"}
+        response = self._get_responses().create(**kwargs)
         try:
             payload = json.loads(_response_text(response))
         except json.JSONDecodeError as exc:
