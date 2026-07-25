@@ -31,6 +31,13 @@ speech uses `DEEPGRAM_API_KEY`, `CARTESIA_API_KEY`, and
 `CARTESIA_VOICE_ID`. Authenticated smoke tests and benchmarks are opt-in and
 must be kept separate from the credential-free test suite.
 
+Hosted web search sends OpenAI the current worker request and, when available,
+up to four prior entries from that same worker: each prior query plus at most
+1,200 characters of its answer. Requests set `store=False`. This repository
+does not independently verify or promise the provider's account-level or
+abuse-monitoring retention behaviour, so operators should treat those fields
+as external data egress and configure the provider account accordingly.
+
 The checked-in `config.toml` contains the local macOS socket defaults for the
 Nemotron STT service and the sibling TTS service:
 
