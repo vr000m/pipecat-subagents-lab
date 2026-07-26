@@ -32,6 +32,74 @@ uv run python scripts/benchmark_speech.py --runs 5
 
 Both STT providers matched the expected transcript in all five runs.
 
+## Pre-merge baseline — 2026-07-26
+
+The following smoke results were captured from commit `f062d84` immediately
+before the v0.1.0 merge. They are retained as a regression baseline, not as an
+SLA or a statistically robust provider comparison.
+
+### Live service and media smoke
+
+Values-redacted preflight found the local Nemotron UDS, Pocket TTS loopback
+websocket, and OpenAI credentials ready. The real-process server smoke also
+passed health, browser assets, origin policy, session handshake, and clean
+shutdown.
+
+One cold local-only run used a 2.64-second fixture:
+
+| Metric | Result |
+| --- | ---: |
+| Local TTS first audio | 202.6 ms |
+| Local TTS synthesis complete | 331.3 ms |
+| Local TTS connection setup | 6.1 ms |
+| Local STT final after speech end | 2125.2 ms |
+
+The local transcript matched exactly. The unusually slow cold STT sample did
+not repeat in the immediately following comparison, so both cold and warm
+observations are recorded rather than silently discarding the outlier.
+
+The minimum valid two-run local-versus-hosted comparison then produced:
+
+| Metric | Local median / p95 | Hosted median / p95 |
+| --- | ---: | ---: |
+| TTS time to first audio | 60.7 / 81.2 ms | 166.6 / 210.6 ms |
+| TTS synthesis complete | 231.5 / 291.0 ms | 396.3 / 444.8 ms |
+| STT final after speech end | 101.9 / 124.5 ms | 166.6 / 192.5 ms |
+| Connection setup | TTS 6.4 ms | Cartesia 1395.8 ms; Deepgram 546.5 / 628.0 ms |
+
+Local and Deepgram transcripts both matched exactly in both runs. With only two
+samples, the reported p95 is effectively the slower observation and should not
+be compared to a production percentile.
+
+### Router and hosted-search smoke
+
+The paid conversation smoke exercised the real router, a persistent hosted
+web-search worker, citation normalization, and separate display/TTS
+projections:
+
+| Stage | Result |
+| --- | ---: |
+| Routing | 3069.5 ms |
+| Hosted search | 50295.9 ms |
+| Total | 53376.4 ms |
+| Structured output | 508 display characters; 252 spoken characters; 12 citations |
+
+The smoke passed its 15-second routing and 60-second total budgets. Hosted
+search remained the dominant latency and consumed most of the total budget.
+
+Reproduce the pre-merge checks with:
+
+```sh
+set -a
+source ~/.secrets/ai.env
+set +a
+uv run python -m server.preflight
+uv run python scripts/benchmark_speech.py --local-only --runs 1
+uv run python scripts/benchmark_speech.py --runs 2
+uv run python scripts/smoke_conversation.py
+uv run python scripts/smoke_server.py
+```
+
 ## Interpretation
 
 Local speech is the lower-latency default on this machine. Cartesia and
@@ -39,12 +107,14 @@ Deepgram remain useful cloud deployment options, where local model processes
 and Unix sockets are unavailable, but this sample does not justify selecting
 them as a latency optimization.
 
-The speech providers are not the dominant response delay. A separate live
-diagnostic measured 10.1 seconds for one direct router response and 26.3
-seconds for one routed web-search response. Those are single samples rather
-than benchmark distributions, but they are two orders of magnitude larger than
-warm TTS time-to-first-audio. The configured 1.5 second Smart Turn completion
-grace is another deliberate fixed delay after a natural pause.
+The speech providers are not the dominant response delay. Earlier single
+samples measured 10.1 seconds for one direct router response and 26.3 seconds
+for one routed web-search response; the 2026-07-26 smoke instead routed in 3.1
+seconds but spent 50.3 seconds in hosted search. These are observations rather
+than benchmark distributions, but model/provider work remains two orders of
+magnitude larger than warm TTS time-to-first-audio. The configured 1.5-second
+Smart Turn completion grace is another deliberate fixed delay after a natural
+pause.
 
 The next latency work should therefore instrument and reduce router/worker
 model time before changing the local speech defaults. Keep provider connection
