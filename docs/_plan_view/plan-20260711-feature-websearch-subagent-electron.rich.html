@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="plan-view-rich-source-sha256" content="49a74215a1b26280f522f69afa0f6f2e190af13c5b94b31acd46efe20c05201f">
+<meta name="plan-view-rich-source-sha256" content="f3415f67c8b8ce0acf0ae9e4d987ce5da9fbeb821f32cf05a31e856535e88c34">
 <meta name="plan-view-rich-strategy" content="sections">
 <meta name="plan-view-rich-section-count" content="14">
 <title>Task: Pipecat Web-Search Subagent and Browser RTVI Lab — rich view</title>
@@ -173,7 +173,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 <header class="plan-hero">
   <div class="meta">plan-view · rich · 20260711-feature-websearch-subagent-electron</div>
   <h1>Task: Pipecat Web-Search Subagent and Browser RTVI Lab</h1>
-  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>49a74215a1b2</code> · 14 sections (assembled from fragments)</div>
+  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>f3415f67c8b8</code> · 14 sections (assembled from fragments)</div>
 </header>
 
 <div class="tabs" data-tabs-id="plan-20260711-feature-websearch-subagent-electron">
@@ -358,7 +358,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="technical-specifications">
-<!-- plan-view-rich-section-sha256: 53fd9f4d431ddfe4c9ee04e476675052c93e054277dc9352bfb672182f443193 -->
+<!-- plan-view-rich-section-sha256: fddd918f46e0fe35e98ee887d6127c63804e0ca3d42deaebdae062a3f8a20b6c -->
 <section class="section" aria-labelledby="technical-specifications-title">
   <h2 id="technical-specifications-title">Technical Specifications</h2>
 
@@ -412,9 +412,11 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
       <ul>
         <li>Prove browser voice, routing, state, and interruption contracts before a separately reviewed Electron phase.</li>
         <li>The tool-free main model returns one validated routing/prose envelope. Capability is chosen before topic; delegated search judgment belongs to the web worker.</li>
-        <li><code>SessionHost</code> owns one process-lifetime <code>WorkerRunner</code> and the authoritative stable-ID registry. Routing and dispatch share the same immutable catalogue snapshot.</li>
+        <li><code>SessionHost</code> owns one process-lifetime <code>WorkerRunner</code> for durable application workers and the authoritative stable-ID registry. Routing and dispatch share the same immutable catalogue snapshot.</li>
         <li>Because Pipecat 1.6.0 lacks the planned activation seam, <code>WorkItemCoordinator</code> and per-worker causal mailboxes schedule direct <code>search()</code> calls. Python alone controls worker creation, capability bundles, model-policy labels, epochs, and persistence.</li>
-        <li>Persistent worker contexts and result history outlive connections; each active browser gets a fresh connection-lifetime <code>PipelineWorker</code> and <code>BusBridgeProcessor</code>.</li>
+        <li>Persistent application workers, their contexts, and result history outlive browser connections on the process-lifetime runner.</li>
+        <li>Each promoted browser connection directly owns a fresh connection-lifetime <code>PipelineWorker.run()</code> task containing Small WebRTC, STT/TTS, <code>BusBridgeProcessor</code>, canonical-result projection, and RTVI state publication. The task is never registered with the durable runner.</li>
+        <li>Connection replacement fences the old epoch, cancels and awaits the old <code>PipelineWorker.run()</code> task, and only then builds the replacement pipeline, preserving durable application-worker contexts.</li>
         <li>The direct path makes at most two sequential LLM calls when pending candidates exist; worker delegation adds the hosted-search call.</li>
       </ul>
     </div>
@@ -937,10 +939,10 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="final-results">
-<!-- plan-view-rich-section-sha256: c7046785c7c65464e40477bf2280424f2c72d38eeebc5fdf3a0f197d411575b8 -->
+<!-- plan-view-rich-section-sha256: f209c54376c5cbfb52bcf6c1508023a6226a5cfe8d74a1b25d300315930b641c -->
 <section class="section" id="final-results">
   <h2>Final Results</h2>
-  <p>Transport selection is now explicit for the browser slice: local development uses Pipecat Small WebRTC, with <code>/api/session</code>, <code>/api/rtc</code>, and ICE PATCH signaling served by the FastAPI host. The browser obtains the durable session identity and proposed epoch before connecting, and the connection callback attaches a Pipecat <code>SmallWebRTCTransport</code>/<code>PipelineWorker</code> to the process-lifetime runner. Daily transport remains a deployment adapter to add only if this lab is deployed to a cloud runtime; it is not an alternate local transport path.</p>
+  <p>Transport selection is now explicit for the browser slice: local development uses Pipecat Small WebRTC, with <code>/api/session</code>, <code>/api/rtc</code>, and ICE PATCH signaling served by the FastAPI host. The browser obtains the durable session identity and proposed epoch before connecting, and the connection callback starts a directly owned Pipecat <code>SmallWebRTCTransport</code>/<code>PipelineWorker</code> task, then cancels that task when the connection closes. The process-lifetime runner owns only durable application workers. Daily transport remains a deployment adapter to add only if this lab is deployed to a cloud runtime; it is not an alternate local transport path.</p>
 
   <p>The configured local STT/TTS adapters now have a real websocket client path for UDS, TCP, WS, and WSS endpoints, while retaining an injectable factory seam for verified sibling-service clients. The live Small WebRTC worker and RTVI event path are wired and fenced. The credential-safe local media acceptance procedure proved browser microphone capture, live local STT/TTS, and audible browser output.</p>
 
@@ -962,7 +964,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 
 <footer class="plan-foot">
-  Rich view · assembled from 14 section fragments · source sha <code>49a74215a1b2</code>.
+  Rich view · assembled from 14 section fragments · source sha <code>f3415f67c8b8</code>.
   Source of truth: <code>20260711-feature-websearch-subagent-electron.md</code>.
 </footer>
 </body>
