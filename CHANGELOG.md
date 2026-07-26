@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-26
+
+### Added
+
+- Opt-in paid routing-regression smoke covering a greeting followed by two
+  weather requests against one live session.
+
+### Fixed
+
+- Route greetings, thanks, acknowledgements, goodbyes, and casual conversation
+  directly instead of creating persistent web-search workers.
+- Preserve immutable existing-worker catalogue metadata during routing so a new
+  transcript cannot mutate a worker's topic and trigger a false routing outage.
+- Queue same-epoch late results exactly once for deferred TTS without interrupting
+  active speech; stale-epoch and TTS-less results remain display-only and are
+  labelled `background result`.
+
 ## [0.1.0] - 2026-07-26
 
 ### Added
@@ -72,4 +89,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pre-push release gate.
 
 [Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/commits/main
+[0.1.1]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0

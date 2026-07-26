@@ -200,6 +200,20 @@ budgets with `--max-routing-seconds` and `--max-latency-seconds`. The outer
 deadline prevents a provider that ignores in-process cancellation from hanging
 the merge check indefinitely.
 
+For the 0.1.1 routing regression, with the same credential loaded, run the
+three-turn live sequence that starts with `Hi.` and then asks for weather in
+Riga and Helsinki:
+
+```sh
+uv run python scripts/smoke_conversation.py --routing-regression --timeout 180
+```
+
+It verifies that the greeting takes the direct path without creating a worker,
+then verifies that both weather turns route to workers rather than the main
+routing fallback. Citation and projection validation remains in the single-turn
+paid smoke above. This exercises the live OpenAI router and worker without
+requiring browser media or local STT/TTS services.
+
 To compare the configured local services with Deepgram and Cartesia using the
 same text and PCM fixture:
 
@@ -277,7 +291,11 @@ transport callbacks are rejected. Result text may appear before speech; the UI
 marks server transport completion separately from incomplete or unconfirmed
 speech and never claims verified browser audibility. Transcript turns show their
 server-authored local-time timestamp. Assistant turns show the exact concise TTS
-projection as the primary message. A `Subagent output` disclosure caret contains
+projection as the primary message once speech is queued. A result that arrives
+after a foreground timeout is queued once behind active speech when its original
+TTS connection is still active; stale-epoch or TTS-less results remain
+display-only and are labelled `background result`. A `Subagent output`
+disclosure caret contains
 the complete structured answer, worker/turn metadata, delivery state, and
 sources; the complete history remains available in the Result Log.
 
