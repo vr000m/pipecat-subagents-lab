@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="plan-view-rich-source-sha256" content="f3415f67c8b8ce0acf0ae9e4d987ce5da9fbeb821f32cf05a31e856535e88c34">
+<meta name="plan-view-rich-source-sha256" content="e404ff2d3d4b9cc74376d6f30c5f69e75373f843097fac22056120c1662d6e08">
 <meta name="plan-view-rich-strategy" content="sections">
 <meta name="plan-view-rich-section-count" content="14">
 <title>Task: Pipecat Web-Search Subagent and Browser RTVI Lab — rich view</title>
@@ -173,7 +173,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 <header class="plan-hero">
   <div class="meta">plan-view · rich · 20260711-feature-websearch-subagent-electron</div>
   <h1>Task: Pipecat Web-Search Subagent and Browser RTVI Lab</h1>
-  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>f3415f67c8b8</code> · 14 sections (assembled from fragments)</div>
+  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>e404ff2d3d4b</code> · 14 sections (assembled from fragments)</div>
 </header>
 
 <div class="tabs" data-tabs-id="plan-20260711-feature-websearch-subagent-electron">
@@ -235,7 +235,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
   </div>
 
   <div class="tab-panel" data-slot="preamble">
-<!-- plan-view-rich-section-sha256: 5dca5271e821b1fa8aae82d86920e4aa83987d00e4bff43bb0aa0527ada949ed -->
+<!-- plan-view-rich-section-sha256: 8b4e23348a3c0c45c1e5dc24649a9e7e96f9da08f5da2d04ac57fdd438e40930 -->
 <div class="card">
   <h1 style="margin:0 0 12px; font-size:22px; font-weight:700;">Pipecat Web-Search Subagent and Browser RTVI Lab</h1>
   <div style="display:flex; flex-wrap:wrap; gap:8px;">
@@ -245,7 +245,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
     <span class="chip amber">Priority: Medium</span>
     <span class="chip teal">Branch: feature/websearch-subagent-electron</span>
     <span class="chip grey">Created: 2026-07-11</span>
-    <span class="chip green">Completed: 2026-07-24</span>
+    <span class="chip green">Completed: 2026-07-26</span>
     <span class="chip green">Review Gates: full</span>
   </div>
 </div>
@@ -358,7 +358,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="technical-specifications">
-<!-- plan-view-rich-section-sha256: fddd918f46e0fe35e98ee887d6127c63804e0ca3d42deaebdae062a3f8a20b6c -->
+<!-- plan-view-rich-section-sha256: 084fc1fc9df167e90061bff3827c4bedce7d2dbabd721f77188dbe04cb7b56c4 -->
 <section class="section" aria-labelledby="technical-specifications-title">
   <h2 id="technical-specifications-title">Technical Specifications</h2>
 
@@ -475,7 +475,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
         <tr><td>WorkItemCoordinator</td><td>Ordered results, placeholders, clarification, late results, cancellation</td><td>Session state and scheduler</td><td>Timeout, late result, clarification, cancellation</td></tr>
         <tr><td>Web worker</td><td>Hosted-search response</td><td>Result normalizer</td><td>Provider shapes, citations, failures</td></tr>
         <tr><td>Worker runtime handle</td><td>Deferred capabilities, events, cancellation acknowledgement</td><td>Coordinator</td><td>Follow-up capability and event-order tests</td></tr>
-        <tr><td>Context-owning worker</td><td>Validated result/control frames over bridged edges</td><td>Connection bus bridge</td><td>Runner/bus ownership and pinned-version delivery</td></tr>
+        <tr><td><code>BaseWorker</code>-backed context worker and causal mailbox</td><td>Validated direct coordinator dispatch plus result/control frames at the bridge boundary</td><td><code>WorkItemCoordinator</code>, then the connection bus bridge</td><td>Mailbox ordering, runner ownership, direct dispatch, and pinned-version bridge delivery</td></tr>
         <tr><td>Result normalizer</td><td>Versioned grounded result</td><td>Speech and UI projectors</td><td>Projection equivalence invariant</td></tr>
         <tr><td>Speech projector / TTS</td><td>Correlated IDs, audio, synthesis lifecycle</td><td>Scheduler and WebRTC output</td><td>Tag propagation and lifecycle distinctions</td></tr>
         <tr><td>Interruption controller</td><td>Interruption frame plus item/utterance policy</td><td>Delivery state and worker policy</td><td>Pause/cancel/discard races</td></tr>
@@ -506,7 +506,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 </div>
 <div class="tab-panel" data-slot="architecture-call-flow">
-<!-- plan-view-rich-section-sha256: a5e3df2a944d77e37d3c3da06ca8b6dd689f3ea5ded32fb2c198bf2dd51240d6 -->
+<!-- plan-view-rich-section-sha256: 7caa86559a68d6f96cbecfba597d225365ab8d014c5953d1a598cf790bbf4f38 -->
 <section class="section">
   <h2>Architecture &amp; Call Flow</h2>
 
@@ -617,8 +617,8 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
         <tr>
           <td>4</td>
           <td>Registry snapshots workers and router returns decision</td>
-          <td>Catalogue plus capability, topic, worker, and policy label enter routing state</td>
-          <td>Snapshot and decision are retained with the turn</td>
+          <td>Catalogue and capability stay internal; reduced action, worker, topic, and policy fields enter browser routing state</td>
+          <td>Internal snapshot/decision stay with dispatch; reduced routing state stays with the turn</td>
           <td>No</td>
         </tr>
         <tr>
@@ -964,7 +964,7 @@ footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid va
 
 
 <footer class="plan-foot">
-  Rich view · assembled from 14 section fragments · source sha <code>f3415f67c8b8</code>.
+  Rich view · assembled from 14 section fragments · source sha <code>e404ff2d3d4b</code>.
   Source of truth: <code>20260711-feature-websearch-subagent-electron.md</code>.
 </footer>
 </body>

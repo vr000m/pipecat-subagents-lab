@@ -14,6 +14,20 @@ Both projections retain the same canonical result ID and normalized citations.
 The browser renders the complete answer while the connection-local speech
 scheduler sends only the concise projection to TTS.
 
+## Architecture and protocol
+
+The Python process owns durable session state, persistent workers, bounded work,
+and result history. Each accepted browser connection owns its Small WebRTC
+transport, speech adapters, RTVI publisher, and awaited Pipecat pipeline
+lifecycle; a server-issued epoch fences replaced connections and stale
+callbacks.
+
+See [Architecture](docs/architecture.md) for ownership, call flow, reconnect
+semantics, provider boundaries, and design decisions. The versioned
+Python-to-browser contract is documented in
+[Browser protocol v1](shared/protocol.md), with machine-readable schemas in
+`shared/schemas/`.
+
 ## Local runbook
 
 This repository is the browser-first verification slice. It keeps the Python
@@ -280,12 +294,15 @@ credential-safe unit and integration tests. Any semantic protocol change found
 during verification must return to the earlier contract/runtime/browser phases;
 Phase 5 documentation does not silently change those contracts.
 
-## Planned layout
+## Repository layout
 
 ```text
 server/          Python and Pipecat runtime
 web/             Bun-managed plain HTML, JavaScript, and CSS RTVI client
 shared/          Shared message schemas and protocol documentation
+docs/architecture.md
+                 Stable current-state architecture and design decisions
+docs/benchmarks/ Provider latency evidence
 docs/dev_plans/  Reviewed implementation plans
 ```
 

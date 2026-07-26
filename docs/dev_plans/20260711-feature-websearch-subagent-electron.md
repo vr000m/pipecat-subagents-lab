@@ -6,7 +6,7 @@
 **Priority**: Medium
 **Branch**: feature/websearch-subagent-electron
 **Created**: 2026-07-11
-**Completed**: 2026-07-24
+**Completed**: 2026-07-26
 **Review Gates**: full
 
 ## Objective
@@ -297,7 +297,7 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 | WorkItemCoordinator | v0.1 parent turn, ordered per-item results, timeout placeholders, clarification, retained UI-only late results, local cancellation | Session state and SpeechScheduler | Ordered timeout/late-result/clarification and local-cancellation tests |
 | Web worker | OpenAI hosted-search response | Canonical result normalizer | Mocked provider shapes, missing citations, and failure tests |
 | Worker runtime handle | Deferred: capability declarations, ordered work-item events, and backend cancellation acknowledgement | WorkItemCoordinator | Follow-up backend capability and event-order tests |
-| Context-owning worker (`LLMContextWorker`) | Validated canonical-result/control frames through its bridged edges | Connection `PipelineWorker`'s `BusBridgeProcessor` | Runner/bus ownership and bridge delivery test; verify against pinned Pipecat version |
+| `BaseWorker`-backed context worker and causal mailbox | Validated direct coordinator dispatch plus canonical-result/control frames at the bridge boundary | `WorkItemCoordinator`, then the connection `PipelineWorker`'s `BusBridgeProcessor` | Mailbox ordering, runner ownership, direct dispatch, and bridge delivery tests against pinned Pipecat 1.6.0 |
 | Result normalizer | Versioned grounded result | Speech projector and UI projector | Projection equivalence/invariant test |
 | Speech projector/selected TTS adapter (local or Cartesia) | `work_item_id`/`run_id`/utterance ID, audio frames, synthesis lifecycle | SpeechScheduler and Small WebRTC output | Frame-tag propagation, provider lifecycle, and synthesis/transport distinction tests |
 | Interruption controller | Pipecat interruption frame plus work-item/utterance policy | Session delivery state and worker-task policy | Task-local pause/cancel/discard matrix and race tests |
@@ -390,7 +390,7 @@ sequenceDiagram
 | 1 | Browser connects and becomes ready | Connection epoch and client/session identity | New epoch fences the prior transport; Python process state persists | No |
 | 2 | Server sends snapshot | Worker/result/delivery projection enters browser state | Replaced by newer sequenced state or next snapshot | No |
 | 3 | Local STT emits final transcript | User utterance enters pending-dialogue dispatcher | Routed to pending owner if valid; otherwise enters main router | Yes: user turn begins |
-| 4 | Registry snapshots workers and router returns decision | Catalogue plus capability, topic, worker, and policy label enter routing state | Snapshot and decision are retained with the turn | No |
+| 4 | Registry snapshots workers and router returns decision | Catalogue and capability classification stay internal; reduced action, worker, topic, and policy fields enter browser routing state | Internal snapshot/decision stay with dispatch; reduced routing state stays with the turn | No |
 | 5 | Existing/new worker accepts task | Utterance and relevant routing metadata enter exactly one worker context | Worker context persists until explicit future eviction | No |
 | 6 | Worker searches/clarifies/responds | Search queries, results, citations, and worker response enter worker context | Persist in that worker; clarification records temporary dialogue ownership | Yes: worker sub-turn completes |
 | 7 | Canonical result is accepted | Grounded result enters server session state | Persists for reconnect and later delivery inspection | No |

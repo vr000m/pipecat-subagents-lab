@@ -7,32 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Credential-free real-process server smoke covering health, built browser
-  assets, origin enforcement, session discovery, and clean shutdown.
-- Local-only TTS-to-STT media smoke mode for the existing speech benchmark.
-- Bounded paid conversation smoke covering the real router, worker, structured
-  display/speech projections, normalized citations, and explicit routing/search/
-  total latency budgets without printing content.
-
-### Fixed
-
-- Complete only unambiguous nullable fields in a public-web `new_worker`
-  structured route, while continuing to reject explicit unsupported values.
-- Bound direct, pending, and multi-intent searches with truthful
-  completed/retained/rejected ownership outcomes; capacity rejection no longer
-  claims that work will continue in the background.
-- Reserve coordinator capacity before provider work starts, release submission
-  callers when calls return, and bound shutdown when cancellation-resistant
-  work outlives its grace period.
-- Use cancellable asynchronous hosted-search clients with provider deadlines,
-  cap normalized citations, preserve long clarification answers, and request
-  minimal router reasoning under a separate routing deadline.
-- Fence connection callbacks before coordinator shutdown and log routing,
-  search, and total turn latency.
-
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-26
 
 ### Added
 
@@ -50,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete-turn grace period.
 - Repeatable local-versus-hosted speech latency benchmark.
 - Credential-safe Python and browser contract, integration, and regression tests.
+- Credential-free real-process server smoke covering health, built browser
+  assets, origin enforcement, session discovery, and clean shutdown.
+- Local-only TTS-to-STT media smoke mode for the existing speech benchmark.
+- Bounded paid conversation smoke covering the real router, worker, structured
+  display/speech projections, normalized citations, and explicit routing,
+  search, and total latency budgets without printing content.
+- Stable architecture and browser-protocol references covering runtime
+  ownership, provider boundaries, reconnect fencing, and deferred contracts.
 
 ### Fixed
 
@@ -68,6 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop active TTS before speaking pause or cancellation confirmation.
 - Keep router prompts, decisions, and prose request-local so concurrent turns
   cannot observe another turn's prompt or response text.
+- Complete only unambiguous nullable fields in a public-web `new_worker`
+  structured route, while continuing to reject explicit unsupported values.
+- Bound direct, pending, and multi-intent searches with truthful
+  completed/retained/rejected ownership outcomes; capacity rejection no longer
+  claims that work will continue in the background.
+- Reserve coordinator capacity before provider work starts, release submission
+  callers when calls return, and bound shutdown when cancellation-resistant
+  work outlives its grace period.
+- Use cancellable asynchronous hosted-search clients with provider deadlines,
+  cap normalized citations, preserve long clarification answers, and request
+  minimal router reasoning under a separate routing deadline.
+- Fence connection callbacks before coordinator shutdown and log routing,
+  search, and total turn latency.
+- Align Python, JSON Schema, and browser validation for non-negative connection
+  epochs and strict RFC 3339 transcript, result, and work-event timestamps.
+- Own each accepted connection's Pipecat pipeline lifecycle directly and
+  document the implemented `BaseWorker` mailbox boundary.
+- Scan the complete pull-request commit range for committed credentials during
+  the pre-push release gate.
 
 [Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/commits/main
-[0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/pull/1
+[0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0
