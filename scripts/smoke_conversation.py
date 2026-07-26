@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one bounded, paid router-to-web-search conversation smoke."""
+"""Run bounded, paid router-to-web-search conversation smoke(s)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,11 @@ from typing import Any
 
 
 DEFAULT_QUERY = "What is the latest stable Pipecat release?"
+ROUTING_REGRESSION_QUERIES = (
+    "Hi.",
+    "Tell me the weather in Riga. For today.",
+    "Could you tell me the weather in Helsinki today?",
+)
 RESULT_PREFIX = "SMOKE_RESULT="
 SAFE_FALLBACKS = {
     "Routing is temporarily unavailable. Please try that request again.",
@@ -27,6 +32,7 @@ async def _run_child(
     *,
     max_latency_seconds: float,
     max_routing_seconds: float,
+    routing_regression: bool,
 ) -> dict[str, Any]:
     from server.app import _default_session_host
 
@@ -59,6 +65,13 @@ async def _run_child(
                 "snapshot_sequence": 0,
             }
         )
+        if routing_regression:
+            return await _run_routing_regression(
+                host,
+                connection,
+                max_latency_seconds=max_latency_seconds,
+                max_routing_seconds=max_routing_seconds,
+            )
         started = time.perf_counter()
         value = await host._handle_transcript(query, origin=connection)
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -87,6 +100,7 @@ async def _run_child(
                 f"conversation exceeded {max_latency_seconds:.1f}s latency budget: {total_ms:.1f}ms"
             )
         return {
+            "scenario": "single",
             "worker": result.worker_id,
             "display_chars": len(result.ui_text),
             "spoken_chars": len(result.spoken_text),
@@ -100,12 +114,80 @@ async def _run_child(
         await host.shutdown()
 
 
-def _child(query: str, max_latency_seconds: float, max_routing_seconds: float) -> int:
+async def _run_routing_regression(
+    host: Any,
+    connection: Any,
+    *,
+    max_latency_seconds: float,
+    max_routing_seconds: float,
+) -> dict[str, Any]:
+    observations: list[dict[str, Any]] = []
+    for index, query in enumerate(ROUTING_REGRESSION_QUERIES):
+        started = time.perf_counter()
+        value = await host._handle_transcript(query, origin=connection)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        results = value if isinstance(value, tuple) else (value,)
+        if len(results) != 1:
+            raise RuntimeError(
+                f"routing regression returned {len(results)} results for turn {index + 1}"
+            )
+        result = results[0]
+        routing = getattr(host.state, "routing", None)
+        action = getattr(routing, "action", None)
+        if index == 0:
+            if action != "direct" or result.worker_id != "main":
+                raise RuntimeError("greeting was not handled as a direct main response")
+            if host.registry.workers:
+                raise RuntimeError("greeting created a persistent worker")
+        else:
+            if result.worker_id == "main" or result.ui_text in SAFE_FALLBACKS:
+                raise RuntimeError("weather turn returned a routing/search fallback")
+            if action not in {"new_worker", "existing_worker"}:
+                raise RuntimeError(f"weather turn used unexpected routing action: {action!r}")
+        stage_metrics = dict(host.last_turn_metrics)
+        routing_ms = float(stage_metrics.get("routing_ms", 0))
+        total_ms = float(stage_metrics.get("total_ms", elapsed_ms))
+        if routing_ms > max_routing_seconds * 1000:
+            raise RuntimeError(
+                f"routing regression turn {index + 1} exceeded {max_routing_seconds:.1f}s "
+                f"budget: {routing_ms:.1f}ms"
+            )
+        if total_ms > max_latency_seconds * 1000:
+            raise RuntimeError(
+                f"routing regression turn {index + 1} exceeded {max_latency_seconds:.1f}s "
+                f"latency budget: {total_ms:.1f}ms"
+            )
+        observations.append(
+            {
+                "action": action,
+                "worker": result.worker_id,
+                "routing_ms": round(routing_ms, 1),
+                "total_ms": round(total_ms, 1),
+            }
+        )
+    return {
+        "scenario": "routing-regression",
+        "turns": len(observations),
+        "worker_count_after_greeting": 0,
+        "actions": [item["action"] for item in observations],
+        "workers": [item["worker"] for item in observations],
+        "max_routing_ms": max(item["routing_ms"] for item in observations),
+        "max_total_ms": max(item["total_ms"] for item in observations),
+    }
+
+
+def _child(
+    query: str,
+    max_latency_seconds: float,
+    max_routing_seconds: float,
+    routing_regression: bool,
+) -> int:
     metrics = asyncio.run(
         _run_child(
             query,
             max_latency_seconds=max_latency_seconds,
             max_routing_seconds=max_routing_seconds,
+            routing_regression=routing_regression,
         )
     )
     print(RESULT_PREFIX + json.dumps(metrics, sort_keys=True))
@@ -117,6 +199,7 @@ def _parent(
     timeout: float,
     max_latency_seconds: float,
     max_routing_seconds: float,
+    routing_regression: bool,
 ) -> int:
     command = [
         sys.executable,
@@ -129,6 +212,8 @@ def _parent(
         "--max-routing-seconds",
         str(max_routing_seconds),
     ]
+    if routing_regression:
+        command.append("--routing-regression")
     try:
         completed = subprocess.run(
             command,
@@ -153,16 +238,26 @@ def _parent(
         print((completed.stdout + completed.stderr)[-8_000:], file=sys.stderr)
         raise RuntimeError("conversation smoke returned no result metrics")
     metrics = json.loads(result_line.removeprefix(RESULT_PREFIX))
-    print(
-        "conversation smoke passed: "
-        f"worker={metrics['worker']} "
-        f"display_chars={metrics['display_chars']} "
-        f"spoken_chars={metrics['spoken_chars']} "
-        f"citations={metrics['citations']} "
-        f"routing_ms={metrics['routing_ms']} "
-        f"search_ms={metrics['search_ms']} "
-        f"total_ms={metrics['total_ms']}"
-    )
+    if metrics.get("scenario") == "routing-regression":
+        print(
+            "routing regression smoke passed: "
+            f"turns={metrics['turns']} "
+            f"actions={','.join(metrics['actions'])} "
+            f"workers={','.join(metrics['workers'])} "
+            f"max_routing_ms={metrics['max_routing_ms']} "
+            f"max_total_ms={metrics['max_total_ms']}"
+        )
+    else:
+        print(
+            "conversation smoke passed: "
+            f"worker={metrics['worker']} "
+            f"display_chars={metrics['display_chars']} "
+            f"spoken_chars={metrics['spoken_chars']} "
+            f"citations={metrics['citations']} "
+            f"routing_ms={metrics['routing_ms']} "
+            f"search_ms={metrics['search_ms']} "
+            f"total_ms={metrics['total_ms']}"
+        )
     return 0
 
 
@@ -172,6 +267,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--max-latency-seconds", type=float, default=60)
     parser.add_argument("--max-routing-seconds", type=float, default=15)
+    parser.add_argument(
+        "--routing-regression",
+        action="store_true",
+        help="run the live Hi-then-weather routing regression sequence",
+    )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.query.strip():
@@ -189,6 +289,7 @@ def main() -> int:
             args.query,
             args.max_latency_seconds,
             args.max_routing_seconds,
+            args.routing_regression,
         )
         if args.child
         else _parent(
@@ -196,6 +297,7 @@ def main() -> int:
             args.timeout,
             args.max_latency_seconds,
             args.max_routing_seconds,
+            args.routing_regression,
         )
     )
 

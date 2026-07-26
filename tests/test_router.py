@@ -172,6 +172,13 @@ def test_router_rejects_hallucinated_worker_against_snapshot() -> None:
         Router(model=model).route("Search this", catalogue())
 
 
+def test_router_rejects_existing_worker_with_current_transcript_as_topic() -> None:
+    model = FakeRouterModel(decision_payload(topic="Tell me the weather in Riga today."))
+
+    with pytest.raises(RoutingValidationError, match="worker selection does not match"):
+        Router(model=model).route("Tell me the weather in Riga today.", catalogue())
+
+
 def test_router_rejects_unavailable_private_capability_even_when_topic_is_current() -> None:
     model = FakeRouterModel(
         decision_payload(
@@ -260,9 +267,13 @@ def test_empty_catalogue_prompt_bootstraps_public_web_and_reserves_unsupported()
         "What were the capitals of India through the last two hundred years?"
     )
 
+    assert "Greetings, thanks" in prompt
+    assert "Do not create a worker" in prompt
     assert "public factual, current, or historical" in prompt
     assert "action=new_worker" in prompt
     assert "worker_type=web_search" in prompt
+    assert "copy worker_id, worker_type, topic, and model_policy verbatim" in prompt
+    assert "topic is immutable worker metadata" in prompt
     assert "Use unsupported only" in prompt
 
 
