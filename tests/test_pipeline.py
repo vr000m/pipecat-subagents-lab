@@ -499,7 +499,7 @@ def test_natural_clarification_answer_resumes_original_query_on_same_worker() ->
     asyncio.run(run())
 
 
-def test_timed_out_pending_search_finishes_in_background_without_autoplay() -> None:
+def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -> None:
     async def run() -> None:
         class SlowWorker(ContinuationResultWorker):
             def __init__(self) -> None:
@@ -539,11 +539,12 @@ def test_timed_out_pending_search_finishes_in_background_without_autoplay() -> N
         config = Config(multi_intent_wait_timeout_ms=1)
         registry = PendingRegistry(worker, config)
         coordinator = WorkItemCoordinator(registry=registry, config=config)
+        tts = FakeTTS()
         host = SessionHost(
             registry=registry,
             runner_factory=LifecycleRunner,
             coordinator=coordinator,
-            tts=FakeTTS(),
+            tts=tts,
         )
         coordinator.add_worker_clarification(
             session_id=host.state.session_id,
@@ -568,7 +569,107 @@ def test_timed_out_pending_search_finishes_in_background_without_autoplay() -> N
         history = host.state.result_history("worker-search")
         assert len(history) == 2
         assert history[-1].text.startswith("Answer for Original request:")
+        late_progress = [
+            progress
+            for progress in host.state.speech.values()
+            if progress.result_id == history[-1].result_id
+        ]
+        assert len(late_progress) == 1
+        assert late_progress[0].state.value == "queued"
         assert sum(isinstance(frame, TTSSpeakFrame) for frame in connection.worker.frames) == 1
+
+        assert connection.scheduler.active is not None
+        foreground_utterance_id = connection.scheduler.active.item.utterance_id
+        assert tts.on_event is not None
+        await tts.on_event("synthesis_started", foreground_utterance_id)
+        await tts.on_event("synthesis_ended", foreground_utterance_id)
+
+        spoken_frames = [
+            frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
+        ]
+        assert len(spoken_frames) == 2
+        assert spoken_frames[-1].text == history[-1].spoken_text
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_late_result_from_replaced_epoch_remains_display_only() -> None:
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        first = await host.connect(connection_handshake(host, 1))
+        first.worker = QueueingPipelineWorker()
+        replacement = await host.connect(connection_handshake(host, 2))
+        replacement.worker = QueueingPipelineWorker()
+
+        result = GroundedResult(
+            result_id="result-old-epoch",
+            worker_id="worker-search",
+            turn_id="turn-old-epoch",
+            text="Old complete answer",
+            spoken_text="Old spoken answer",
+            origin_epoch=1,
+        )
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-old-epoch",
+                worker_id="worker-search",
+                result=result,
+            ),
+            1,
+        )
+
+        assert host.state.result_history("worker-search")[-1] == result
+        assert not any(
+            progress.result_id == result.result_id for progress in host.state.speech.values()
+        )
+        assert not any(isinstance(frame, TTSSpeakFrame) for frame in replacement.worker.frames)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_duplicate_late_result_callback_commits_and_enqueues_speech_once() -> None:
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        result = GroundedResult(
+            result_id="result-late-once",
+            worker_id="worker-search",
+            turn_id="turn-late-once",
+            text="Complete late answer",
+            spoken_text="Spoken late answer",
+            origin_epoch=1,
+        )
+        late = LateResult(
+            work_item_id="work-late-once",
+            worker_id="worker-search",
+            result=result,
+        )
+
+        await host._commit_late_result(late, 1)
+        await host._commit_late_result(late, 1)
+
+        assert host.state.result_history("worker-search") == (result,)
+        assert (
+            sum(
+                item.role == "assistant" and item.turn_id == result.turn_id
+                for item in host.state.transcript
+            )
+            == 1
+        )
+        assert (
+            sum(progress.result_id == result.result_id for progress in host.state.speech.values())
+            == 1
+        )
+        spoken_frames = [
+            frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
+        ]
+        assert len(spoken_frames) == 1
+        assert spoken_frames[0].text == result.spoken_text
         await host.shutdown()
 
     asyncio.run(run())

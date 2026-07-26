@@ -4,7 +4,7 @@
 **Component**: Pipecat subagents
 **Assigned to**: Codex
 **Priority**: Medium
-**Branch**: feature/websearch-subagent-electron
+**Branch**: feature/websearch-subagent-electron (v0.1.0), fix/router-intent-routing (v0.1.1)
 **Created**: 2026-07-11
 **Completed**: 2026-07-26
 **Review Gates**: full
@@ -33,7 +33,7 @@ A browser client is the smallest useful RTVI surface for this experiment. It avo
 - Treat worker capabilities/skills as server-configured policy bundles. A router may select an approved capability label for a task, but no model may load arbitrary files, invoke undeclared tools, or choose unrestricted skill code.
 - Support one active browser RTVI client at a known local server address; a replacement client may reconnect to the same Python process and workers.
 - Fence browser connections with a server-issued connection epoch. A replacement atomically becomes active; prior transports are disconnected or ignored for microphone/control input, snapshots, and incremental state.
-- Stamp every accepted turn, bounded work item, and in-flight operation with its originating connection epoch. On replacement, cancel old-epoch speech and mark each affected utterance `interrupted_by_reconnect`; router/search work may finish and commit its canonical result, but it cannot autoplay and only the active epoch receives it through the current stream or snapshot.
+- Stamp every accepted turn, bounded work item, and in-flight operation with its originating connection epoch. On replacement, cancel old-epoch speech and mark each affected utterance `interrupted_by_reconnect`; router/search work may finish and commit its canonical result, but old-epoch work cannot autoplay and only the active epoch receives it through the current stream or snapshot. A retained result completing on the still-active originating epoch is queued exactly once for deferred speech.
 - Use Pipecat Small WebRTC for browser microphone input and synthesized audio output.
 - Provide explicit Connect/Disconnect and microphone controls through the Pipecat client API; do not start microphone capture before a user action.
 - Produce one canonical grounded result record and derive both a concise spoken projection and a structured UI projection from it.
@@ -248,9 +248,9 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 - Phase 2's `WorkItemCoordinator` targets a narrow `SpeechScheduler` protocol stub for unit tests; Phase 3 supplies the concrete Pipecat scheduler/transport implementation and its frame-ownership tests, so Phase 2 does not depend on an unbuilt media seam.
 - **v0.1 multi-intent projection:** collect bounded work concurrently where safe, then commit and speak one canonical result per item in the user's original order. A timed-out item contributes an ordered “continuing in the background” placeholder. There is no aggregate main-model synthesis result in v0.1.
 - **Deferred aggregate synthesis:** a follow-up may feed ordered completed summaries to the tool-free main model and produce one aggregate spoken synthesis, including partial/clarification behavior and aggregate wait telemetry, without replacing the underlying per-item records.
-- **v0.1 late-result behavior:** a retained background result is committed to authoritative session/result state and becomes visible through the current UI stream or a later snapshot, without autoplay.
+- **v0.1.1 late-result behavior:** a retained result is committed to authoritative session/result state. If its originating connection epoch is still active and has TTS, enqueue its concise spoken projection exactly once without interrupting the current utterance; the scheduler starts it immediately when idle or after earlier queued speech. Old-epoch, cancelled, disconnected, or TTS-less completions remain display-only.
 - **Deferred reconnectable consent offers:** server-authoritative offer IDs/status/expiry, idle spoken prompts, queue ordering, accept/decline/defer controls, compound consent plus a new task, and reconnect restoration are not implemented in v0.1 and are not part of completed acceptance.
-- A current user turn has priority over a pending worker result that has not entered speech. In v0.1, commit the late result to UI/snapshot state without scheduling a later voice projection; consent-gated speech is deferred.
+- Active speech keeps its lease when a late result arrives. The late result joins the scheduler queue and cannot interrupt the current utterance; cancellation and connection-epoch fencing remain authoritative. Reconnectable consent offers remain deferred.
 - Semantic control separates speech delivery from local computation: “stop/pause” interrupts or defers speech, while explicit “cancel/forget it” requests local best-effort task cancellation. Distinct capability-aware work-item outcomes in the UI are deferred.
 - **v0.1 cancellation boundary:** cancellation selects known local work-item IDs, calls `Task.cancel()` on coordinator/pipeline tasks, and suppresses commits for IDs recorded locally as cancelled. It is best-effort process-local control only; it does not inspect backend capabilities, receive a provider acknowledgement, or emit `cancellation_requested`/`cancelled` work-item outcomes.
 - **Deferred capability-aware cancellation:** a follow-up must add a runtime capability declaration and normalized work-item events before the UI or assistant can distinguish requested, confirmed, unsupported, failed, or cancellation-resistant completion.
@@ -264,7 +264,7 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 - **Work-item coordinator:** in v0.1, `WorkItemCoordinator` owns parent-turn decomposition, ordered work items, bounded wait/timeout, pending clarification, retained late tasks, and local task cancellation. Aggregate synthesis, reconnectable late-result offers, and capability-aware event emission are deferred.
 - **Speech scheduler:** `SpeechScheduler` owns one active utterance lease and per-work-item speech queues. Every TTS/transport frame is tagged with `work_item_id`, `run_id`, and `utterance_id`; only the scheduler can pause, resume, cancel, discard, or requeue speech after a Pipecat interruption.
 - **Canonical result, two projections:** provider output becomes one strict validated envelope containing the full display answer and concise spoken form. Python binds both to one grounded result ID and citation set; factual equivalence remains an explicit provider instruction and a future evaluation target rather than a claim that v0.1 string validation proves semantics.
-- **Multi-intent projection:** v0.1 commits and speaks ordered per-item canonical results; it does not create one aggregate synthesis. Late results are UI-only without autoplay. Aggregate speech and short consent prompts are deferred follow-ups.
+- **Multi-intent projection:** v0.1.1 commits and speaks ordered per-item canonical results; it does not create one aggregate synthesis. Same-epoch late results receive one deferred speech attempt, while stale or TTS-less late results remain UI-only. Aggregate speech and short consent prompts are deferred follow-ups.
 - **Partial completion with clarification:** v0.1 preserves item order and exposes each completed, pending-placeholder, failure, or clarification result independently. One combined spoken/UI synthesis remains deferred.
 - **Result and delivery are separate:** complete UI text may appear before TTS finishes. Result state survives interruption; speech-delivery state records whether its audio completed.
 - **Separate lifecycle state-machine boundary:** v0.1 implements utterance-delivery outcomes independently from canonical result commits. The schema reserves work-item outcomes (`completed`, `cancelled`, `failed`), but production linking and emission of those events is deferred. A replay always receives a new utterance ID.
@@ -294,7 +294,7 @@ Corrections to verified paths, patterns, or dependencies above alter the immutab
 | Pending dialogue state | Session-scoped clarification owner and expiry | Transcript dispatcher | Continuation, cancellation, task-change, and expiry tests |
 | Pending-turn arbiter | `continue_pending`/`steer_same_topic`/`new_topic`/`multi_intent` plus candidate IDs | Prior worker, bounded dispatcher, or main router | Deterministic expiry, classification, decomposition, and ordering tests |
 | Control-intent classifier | v0.1 local `pause`/`resume`/`cancel` plus target `work_item_id`; `consent` token reserved without an offer producer | WorkItemCoordinator and SpeechScheduler | Local control tests with and without pending dialogue |
-| WorkItemCoordinator | v0.1 parent turn, ordered per-item results, timeout placeholders, clarification, retained UI-only late results, local cancellation | Session state and SpeechScheduler | Ordered timeout/late-result/clarification and local-cancellation tests |
+| WorkItemCoordinator | v0.1.1 parent turn, ordered per-item results, timeout placeholders, clarification, retained late results, local cancellation | Session state and SpeechScheduler | Ordered timeout/late-result/clarification tests proving one same-epoch deferred speech attempt and no stale-epoch speech |
 | Web worker | OpenAI hosted-search response | Canonical result normalizer | Mocked provider shapes, missing citations, and failure tests |
 | Worker runtime handle | Deferred: capability declarations, ordered work-item events, and backend cancellation acknowledgement | WorkItemCoordinator | Follow-up backend capability and event-order tests |
 | `BaseWorker`-backed context worker and causal mailbox | Validated direct coordinator dispatch plus canonical-result/control frames at the bridge boundary | `WorkItemCoordinator`, then the connection `PipelineWorker`'s `BusBridgeProcessor` | Mailbox ordering, runner ownership, direct dispatch, and bridge delivery tests against pinned Pipecat 1.6.0 |
@@ -404,7 +404,7 @@ sequenceDiagram
 - Unit tests use fake router/provider/local-service boundaries; they must not call paid APIs or require running STT/TTS servers.
 - Contract tests validate JSON Schema and Python model agreement, version rejection, monotonic sequence handling, and unknown-field policy.
 - Preflight tests cover missing credentials, every configured endpoint transport, precedence, unreachable services, health/protocol mismatch, model/tool compatibility reporting, and captured-output/exception redaction of supplied secret values.
-- Routing tests cover direct knowledge, current public facts, private calendar requests, underspecified weather/location requests, ambiguous topic follow-ups, and hallucinated worker/model choices.
+- Routing tests cover direct knowledge and conversational greetings, current public facts, private calendar requests, underspecified weather/location requests, ambiguous topic follow-ups, immutable existing-worker metadata, and hallucinated worker/model choices.
 - Boundary tests reject/ignore router-emitted search-query refinement fields and prove only the delegated web worker sanitizes/refines queries or asks domain clarification before hosted search.
 - Invariant tests prove every spoken and UI projection shares the canonical result ID and citation set, the UI preserves the complete canonical text, and only the bounded speech field reaches TTS. v0.1 does not mechanically evaluate whether the concise speech wording adds facts; that remains a provider instruction and future captured-output evaluation.
 - Interruption tests distinguish result availability from audio completion and prove that barge-in preserves UI/result state while closing the utterance as interrupted.
@@ -423,8 +423,9 @@ sequenceDiagram
 - Reconnect reducer/render tests seed stale runtime state plus local diagnostics, then prove snapshots replace only runtime projections while retaining diagnostics with an explicit local label.
 - Citation tests cover `javascript:`, `data:`, relative, malformed, duplicate, missing, and valid absolute HTTP(S) URLs before rendering.
 - Browser tests prove media acquisition/publication waits for an explicit user action, disconnect disables capture, and every external source link carries safe new-tab attributes.
-- Browser render tests prove user and assistant turns expose server-authored timestamps, committed assistant turns show the exact concise spoken projection, matching full structured output is available under a disclosure, and unmatched/transient turns do not claim a TTS projection.
+- Browser render tests prove user and assistant turns expose server-authored timestamps, committed assistant turns show the exact concise spoken projection, queued same-epoch late results are labelled `TTS`, results that remain display-only are labelled `background result`, matching full structured output is available under a disclosure, and unmatched/transient turns do not claim a TTS projection.
 - Local STT/TTS and Small WebRTC media acceptance is required and credential-safe; the authenticated OpenAI `web_search` smoke test remains opt-in and never exposes secret values.
+- The 0.1.1 paid routing-regression smoke is a required release gate and runs `Hi.` followed by Riga and Helsinki weather requests, proving the greeting remains direct and workerless while later live turns avoid catalogue-validation fallbacks. The conversational-direct policy is prompt behavior and therefore is not deterministically covered by the credential-safe pytest suite.
 - Web-worker test asserting outbound OpenAI Responses request kwargs include `store=False`, and that the pinned adapter does not drop it across successive same-worker calls.
 - Web-worker test for the decline path: the mocked classifier decides web search cannot satisfy the request, and the worker returns a decline/clarify result without calling hosted search — distinct from a routing-level `unsupported` outcome and from a hosted-search failure.
 - Session/readiness test asserting the first runtime snapshot is gated on the `client-ready` boundary and is not emitted during page initialization, complementing the existing reconnect-snapshot tests.
@@ -432,11 +433,12 @@ sequenceDiagram
 - Reducer test seeding a snapshot at sequence N, then delivering a stale increment with sequence < N, asserting the stale increment is discarded rather than applied.
 - Gap-recovery reducer/protocol test injecting a sequence gap, asserting exactly one snapshot request while recovery is pending, no unsafe incremental state is treated as complete, and ordered application resumes only after the replacement snapshot arrives.
 - Pending-dialogue tests cover follow-up versus steering versus new-topic classification, configured decomposition/order at limits `2`, `3`, and `4`, invalid-limit rejection, and expiry using an injected/fake clock rather than wall-clock elapsed time.
-- v0.1 multi-intent tests cover bounded decomposition, user-order per-item commit/speech, pending placeholders, clarification alongside completed results, and UI-only late-result emission after timeout. Aggregate synthesis tests are deferred.
-- v0.1 control tests cover local pause/resume/cancel parsing, explicit target work-item IDs, task cancellation, commit suppression, and late completion without autoplay. Backend capability/acknowledgement and normalized work-item-event tests are deferred.
+- v0.1.1 multi-intent tests cover bounded decomposition, user-order per-item commit/speech, pending placeholders, clarification alongside completed results, and exactly-once same-epoch late-result speech after timeout. Aggregate synthesis tests are deferred.
+- v0.1.1 control tests cover local pause/resume/cancel parsing, explicit target work-item IDs, task cancellation, commit suppression, same-epoch deferred late speech, and stale-epoch completion without autoplay. Backend capability/acknowledgement and normalized work-item-event tests are deferred.
 - Reconnectable late-result offer reducer tests (one-shot statuses, queue ordering, compound consent plus new task, reconnect restoration, stale/duplicate consent, and expiry) are deferred and are not v0.1 acceptance.
 - Aggregate wait/synthesis and late-result consent telemetry are deferred; v0.1 telemetry does not claim those outcomes.
 - Result-log tests prove the per-worker result history persists across reconnect (rebuilt from snapshot), preserves timestamp/turn ordering, and never silently truncates or evicts entries within the process lifetime.
+- The 2026-07-26 v0.1.1 verification passed 335 Python tests and 62 browser tests, plus Ruff format/check, ESLint, Bun build, and `uv lock --check`.
 
 ## Acceptance Criteria
 
@@ -459,9 +461,9 @@ sequenceDiagram
 - Browser state schema excludes raw logs and full prompts/context. Worker cards are limited to identity, topic, model-policy label, status, and an optional latest-result pointer; the separate Result Log carries the required timestamped finalized-result history. Pipecat logs remain the authoritative diagnostic trail.
 - The `direct`, `unsupported`, and main-owned `clarify` outcomes are produced by a single structured-output call; Python validates the returned envelope before emitting prose or causing side effects. The pending-intent classifier runs only when pending candidates exist, and v0.1 bounded multi-intent execution commits and speaks per-item results in user order without aggregate synthesis.
 - v0.1 cancellation is local best-effort task cancellation plus local commit suppression. Capability declarations, backend acknowledgements, and emitted `cancellation_requested`/confirmed `cancelled` work-item outcomes are explicitly deferred and are not required for completed v0.1 acceptance.
-- v0.1 late background results are committed to authoritative UI/snapshot state without autoplay. Reconnectable consent offers and spoken late-result prompts are explicitly deferred and are not required for completed v0.1 acceptance.
+- v0.1.1 late background results are committed to authoritative UI/snapshot state and queued exactly once for speech when their originating TTS connection epoch remains active. They do not interrupt active speech; stale-epoch, cancelled, disconnected, and TTS-less results never autoplay. Reconnectable consent offers remain deferred.
 - Full Python and browser test suites, formatting, linting, secret scan, documentation review, code review, and security review pass before push.
-- Required local acceptance evidence demonstrates user-initiated microphone capture, Small WebRTC media, live local STT/TTS, and audible output; paid OpenAI smoke verification is reported separately when credentials are available.
+- Required local acceptance evidence demonstrates user-initiated microphone capture, Small WebRTC media, live local STT/TTS, and audible output. Paid OpenAI smoke verification is reported separately; for 0.1.1, the live `--routing-regression` smoke must pass before tagging or publishing because the conversational-direct prompt policy has no deterministic credential-safe test.
 - Normal-versus-grey styling is backed by server transport completion rather than TTS synthesis completion and is labelled as delivery state, not verified audible speech.
 - If no reliable transport-completion seam is verified, the UI uses `delivery_unknown`/synthesis-only styling rather than claiming `delivery_completed`.
 - Each worker's finalized results accumulate in a persistent, timestamped log surviving reconnect (not just a "latest result" pointer), rendered separately from the live transcript view.
@@ -484,7 +486,7 @@ sequenceDiagram
 - Full result text and speech delivery are distinct timelines. The protocol must correlate them using stable IDs and must not infer word-level progress without a verified timing seam.
 - Task-local interruption strategies (pause/resume, cancel, discard) remain an explicit follow-up lab experiment. v0.1 records speech-delivery interruption and performs local best-effort task cancellation without treating the single-pipeline Pipecat interruption primitive as a complete multi-worker policy.
 - Post-implementation reconciliation defines the completed v0.1 multi-intent behavior as ordered per-item commit and speech; aggregate main-model synthesis remains a follow-up.
-- Late background results in v0.1 are authoritative UI/snapshot updates without autoplay. Server-owned, reconnectable consent offers remain a follow-up.
+- Late background results in v0.1.1 are authoritative UI/snapshot updates with one deferred speech attempt on the still-active originating TTS connection. Stale-epoch results remain display-only. Server-owned, reconnectable consent offers remain a follow-up.
 - Cancellation in v0.1 is local best-effort task cancellation and commit suppression. Capability-aware work-item events and backend-confirmed outcomes remain a follow-up.
 
 ## Issues & Solutions
@@ -496,6 +498,8 @@ sequenceDiagram
 - **Unstructured incomplete turns need a bounded fallback:** expose Pipecat's user-turn stop watchdog as `[turn].smart_turn_timeout_seconds` / `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS`, defaulting to five seconds. New speech resets the watchdog; silence after an `INCOMPLETE` decision eventually emits the semantic stop instead of retaining fragments indefinitely.
 - **Smart Turn `COMPLETE` could still fire before a natural pause ended:** add a separate application-owned completion grace, configured as `[turn].smart_turn_complete_grace_seconds` / `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` and defaulting to 1.5 seconds. New speech cancels the pending completion, raw STT fragments remain internal, and one combined transcript is routed after the grace expires.
 - **The empty catalogue produced a contradictory `unsupported` envelope:** make the router prompt's action policy explicit, reserve `unsupported` for genuinely unavailable capabilities, map public factual/current/historical requests to a `new_worker` web-search bootstrap, wrap semantic schema failures at the provider boundary, and return a safe canonical result if routing still fails. Verified defaults are `gpt-5-mini` for routing and `gpt-5` for hosted web search, with TOML/environment overrides.
+- **A greeting incorrectly bootstrapped a persistent web-search worker and later turns mutated its topic:** classify greetings and casual conversation as direct before worker selection, require existing-worker metadata to be copied verbatim from the immutable catalogue, retain fail-closed validation, and require the live `--routing-regression` smoke sequence as a 0.1.1 release gate.
+- **A retained result appeared after the timeout acknowledgement but was never spoken:** replace the v0.1 UI-only late-result policy with one same-epoch deferred speech attempt. Commit first, enqueue only on the still-active originating TTS epoch, preserve the active utterance lease, suppress duplicate callbacks, and keep stale-epoch or TTS-less results display-only.
 - **The browser showed raw fragments and no worker despite backend work:** project the semantic transcript, validated routing decision, and real worker running/idle state through authoritative session events and snapshots. Browser SDK transcript callbacks no longer mutate product state directly.
 - **Speech-provider latency needed an evidence-based deployment choice:** add explicit `[stt].provider = "local" | "deepgram"` and `[tts].provider = "local" | "cartesia"` policy, keep hosted credentials environment-only, preserve one connection-local service instance per browser epoch, and add an opt-in identical-fixture benchmark. On the 2026-07-24 development-machine sample, local TTS reached first audio in 25.0 ms median versus Cartesia's 92.2 ms, while local STT finalized 71.5 ms after speech end versus Deepgram's 240.5 ms. Local remains the latency default; hosted providers are deployment alternatives.
 
@@ -566,7 +570,7 @@ non-finite values.
 
 The same hardening pass keeps router prompts, decisions, and prose request-local
 across concurrent turns. Timed-out searches are retained in a bounded
-coordinator-owned set for late UI delivery without autoplay; callback-delivered
+coordinator-owned set for late UI delivery; callback-delivered
 results do not also accumulate in the polling queue. A follow-up latency and
 lifecycle pass reserves coordinator capacity before provider work starts and
 uses typed completed/retained/rejected transfer outcomes, so rejected work is
@@ -594,7 +598,21 @@ cannot truncate the user's answer.
 The completed v0.1 multi-intent path commits and speaks each item in the user's
 original order; it does not run one aggregate main-model synthesis. Work retained
 past the foreground timeout may commit later to authoritative result/UI state,
-including reconnect snapshots, but never autoplays and has no server-owned
-reconnectable consent offer. Aggregate synthesis, consent-offer lifecycle, and
+including reconnect snapshots. The v0.1.1 maintenance contract queues one
+deferred speech attempt when the originating TTS epoch is still active, while
+stale-epoch results remain display-only. There is no server-owned reconnectable
+consent offer. Aggregate synthesis, consent-offer lifecycle, and
 capability-aware cancellation events are deferred follow-up scope rather than
 completed acceptance.
+
+The 0.1.1 routing repair classifies greetings and casual conversation as direct
+main responses, prevents those turns from creating persistent workers, and keeps
+existing-worker metadata bound to the immutable catalogue snapshot. The branch
+adds `scripts/smoke_conversation.py --routing-regression` for the live three-turn
+Hi/Riga/Helsinki sequence. It is a required 0.1.1 release gate because the
+conversational-direct policy is provider prompt behavior with no deterministic
+credential-safe pytest assertion; it remains intentionally independent of
+browser media and local STT/TTS acceptance. A same-epoch late result now enters
+the speech scheduler exactly once and waits behind active audio; a result that
+cannot be queued because its TTS connection is stale or absent remains labelled
+`background result`.

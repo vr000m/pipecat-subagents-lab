@@ -1056,7 +1056,7 @@ class SessionHost:
         return SearchExecution("retained" if accepted else "rejected")
 
     async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
-        """Project a late result without autoplaying it."""
+        """Commit a late result and defer speech on its still-active TTS epoch."""
         if late.error is not None:
             logger.warning(
                 f"Late worker result failed for work_item={late.work_item_id} "
@@ -1077,6 +1077,9 @@ class SessionHost:
         if result.origin_epoch != origin_epoch:
             self._known_work_items.discard(late.work_item_id)
             return
+        if any(item.result_id == result.result_id for item in self.state.results.results):
+            self._known_work_items.discard(late.work_item_id)
+            return
         self._commit_result_state(result)
         self._known_work_items.discard(late.work_item_id)
         worker = self.state.workers.get(result.worker_id)
@@ -1089,6 +1092,23 @@ class SessionHost:
                     }
                 )
             )
+        origin = self.connection
+        if (
+            origin is None
+            or origin.tts is None
+            or not origin.active
+            or origin.epoch != origin_epoch
+            or not self.accepts(origin_epoch)
+        ):
+            return
+        origin.scheduler.enqueue(
+            result_id=result.result_id,
+            work_item_id=late.work_item_id,
+            run_id=f"run-{result.turn_id}",
+            text=result.spoken_text,
+            origin_epoch=origin_epoch,
+        )
+        await origin.scheduler.start_next()
 
     def _commit_result_state(self, result: GroundedResult) -> None:
         self.state.append_transcript(
