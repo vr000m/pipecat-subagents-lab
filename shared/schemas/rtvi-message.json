@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/rtvi-message.json",
+  "title": "RTVIMessage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "session_id", "sequence", "kind", "data", "origin_epoch"],
+  "properties": {
+    "contract_version": {"const": "v1.0"},
+    "session_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 0},
+    "kind": {
+      "enum": [
+        "runtime_snapshot",
+        "result",
+        "speech_progress",
+        "worker",
+        "routing",
+        "user_transcript",
+        "bot_transcript"
+      ]
+    },
+    "data": {"type": "object"},
+    "origin_epoch": {"type": "integer", "minimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "runtime_snapshot"}}},
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "runtime-snapshot.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "result"}}},
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "grounded-result.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "speech_progress"}}},
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "speech-progress.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "worker"}}},
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "worker-state.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "routing"}}},
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "routing-state.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "user_transcript"}}},
+      "then": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {"$ref": "transcript-entry.json"},
+              {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}},
+              {"properties": {"role": {"const": "user"}}}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "bot_transcript"}}},
+      "then": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {"$ref": "transcript-entry.json"},
+              {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}},
+              {"properties": {"role": {"const": "assistant"}}}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

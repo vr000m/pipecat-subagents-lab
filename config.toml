@@ -1,0 +1,44 @@
+# Non-secret local development defaults. Environment variables override these
+# values; do not add API keys or bearer tokens to this file.
+
+[stt]
+provider = "local" # local | deepgram
+stt_service = "websocket"
+stt_ws_socket = "~/Library/Caches/pipecat-stt/nemotron.sock"
+stt_language = "en"
+# Used when provider = "deepgram"; DEEPGRAM_API_KEY stays in the environment.
+model = "nova-3-general"
+
+[turn]
+# These two turn controls are environment-only (they are not TOML keys):
+# WEBSEARCH_MAX_WORK_ITEMS_PER_TURN defaults to 2 and accepts only 2, 3, or 4.
+# WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS defaults to 10000 and must be positive.
+# Fallback after Smart Turn reports INCOMPLETE and no further speech arrives.
+smart_turn_timeout_seconds = 5.0
+# Debounce a premature COMPLETE if speech resumes after a natural pause.
+smart_turn_complete_grace_seconds = 1.5
+# Expire an unanswered worker clarification after this many seconds.
+pending_dialogue_timeout_seconds = 30.0
+# Return a spoken acknowledgement while a slow search continues in the background.
+foreground_search_timeout_seconds = 15.0
+# Fail routing promptly instead of holding the entire voice turn open.
+router_timeout_seconds = 12.0
+# Bound the hosted model/search request itself; this must exceed the foreground timeout.
+provider_timeout_seconds = 75.0
+# Do not let cancellation-resistant tasks block process shutdown indefinitely.
+shutdown_grace_seconds = 2.0
+# Keep result payloads and the browser source list concise.
+max_citations = 12
+
+[models]
+router_model = "gpt-5-mini"
+worker_model = "gpt-5"
+
+[tts]
+provider = "local" # local | cartesia
+tts_ws_host = "127.0.0.1"
+tts_ws_port = 8965
+voice_id = "azelma"
+# Used when provider = "cartesia"; CARTESIA_API_KEY and CARTESIA_VOICE_ID
+# stay in the environment.
+model = "sonic-3.5"

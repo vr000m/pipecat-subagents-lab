@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/speech-progress.json",
+  "title": "SpeechProgress", "type": "object", "additionalProperties": false,
+  "required": ["result_id", "work_item_id", "run_id", "utterance_id", "state", "origin_epoch"],
+  "properties": {"result_id": {"type": "string"}, "work_item_id": {"type": "string"}, "run_id": {"type": "string"}, "utterance_id": {"type": "string"}, "state": {"enum": ["displayed", "queued", "started", "synthesis_ended", "delivery_completed", "delivery_unknown", "interrupted", "interrupted_by_reconnect", "paused", "resumed"]}, "origin_epoch": {"type": ["integer", "null"], "minimum": 0}}
+}

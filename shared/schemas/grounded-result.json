@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/grounded-result.json",
+  "title": "GroundedResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result_id", "worker_id", "turn_id", "timestamp", "text", "citations", "spoken_text", "origin_epoch"],
+  "properties": {
+    "result_id": {"type": "string", "minLength": 1},
+    "worker_id": {"type": "string", "minLength": 1},
+    "turn_id": {"type": "string", "minLength": 1},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "text": {"type": "string", "minLength": 1},
+    "citations": {"type": "array", "items": {"$ref": "#/$defs/citation"}},
+    "spoken_text": {"type": "string", "minLength": 1},
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
+  },
+  "$defs": {
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "url"],
+      "properties": {
+        "title": {"type": "string"},
+        "url": {"type": "string", "pattern": "^https?://[^\\s]+$"}
+      }
+    }
+  }
+}
