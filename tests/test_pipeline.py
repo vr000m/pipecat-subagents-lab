@@ -76,7 +76,6 @@ class ResultWorker:
             turn_id=turn_id,
             text=f"Answer for {query}",
             spoken_text=f"Spoken answer for {query}",
-            ui_text=f"Answer for {query}",
             origin_epoch=origin_epoch,
         )
 
@@ -950,7 +949,6 @@ def test_unknown_cancel_target_does_not_poison_future_work_or_accumulate_state()
             turn_id="turn-50",
             text="Future answer",
             spoken_text="Future answer",
-            ui_text="Future answer",
             origin_epoch=1,
         )
         await host._commit_and_speak(future, origin)
@@ -1451,7 +1449,6 @@ def test_connection_observer_projects_canonical_runtime_events_without_live_serv
                 turn_id="turn-1",
                 text="Answer",
                 spoken_text="Answer",
-                ui_text="Answer",
             ),
             origin_epoch=1,
         )
@@ -1476,7 +1473,6 @@ def test_observer_does_not_relabel_old_epoch_events_as_current() -> None:
                 turn_id="turn-old",
                 text="Old answer",
                 spoken_text="Old answer",
-                ui_text="Old answer",
                 origin_epoch=1,
             ),
             origin_epoch=1,
@@ -1505,7 +1501,6 @@ def test_canonical_adapter_rejects_raw_frames_and_only_admits_downstream_results
         "turn_id": "t",
         "text": "A complete answer.",
         "spoken_text": "A short answer.",
-        "ui_text": "A complete answer.",
         "citations": [],
     }
     assert adapter.accepts(frame) is True

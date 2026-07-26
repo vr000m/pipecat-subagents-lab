@@ -121,7 +121,6 @@ def test_replacement_interrupts_only_old_connection_speech_and_keeps_result_hist
                 turn_id="turn-1",
                 text="Answer",
                 spoken_text="Answer",
-                ui_text="Answer",
             ),
             origin_epoch=1,
         )
@@ -196,7 +195,6 @@ def test_replacement_fences_new_epoch_before_old_shutdown_and_rejects_old_callba
                 turn_id="turn-old",
                 text="Late",
                 spoken_text="Late",
-                ui_text="Late",
                 origin_epoch=1,
             ),
             origin_epoch=1,

@@ -68,7 +68,6 @@ def canonical_result(
         text=text,
         citations=normalize_citations(citations),
         spoken_text=text if spoken_text is None else spoken_text,
-        ui_text=text,
         origin_epoch=origin_epoch,
     )
     return result

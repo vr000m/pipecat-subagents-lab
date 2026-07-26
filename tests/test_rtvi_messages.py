@@ -26,7 +26,6 @@ def test_messages_have_monotonic_sequences_and_reject_stale_epoch_emission() -> 
         turn_id="turn-1",
         text="Rain is likely.",
         spoken_text="Rain is likely.",
-        ui_text="Rain is likely.",
     )
     first = publisher.result(result, origin_epoch=4)
     second = publisher.speech_progress(
@@ -121,7 +120,6 @@ def test_snapshot_contains_authoritative_history_and_delivery_state_after_reconn
                     turn_id="turn-1",
                     text="Answer",
                     spoken_text="Answer",
-                    ui_text="Answer",
                 )
             ],
             speech_progress=[
@@ -221,7 +219,6 @@ def test_every_versioned_message_kind_validates_its_direct_payload() -> None:
         turn_id="turn-1",
         text="Answer",
         spoken_text="Answer",
-        ui_text="Answer",
         origin_epoch=epoch,
     )
     payloads = {

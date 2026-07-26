@@ -79,7 +79,6 @@ class FakeSearchWorker:
             turn_id=turn_id,
             text="News result",
             spoken_text="News result",
-            ui_text="News result",
             origin_epoch=origin_epoch,
         )
 

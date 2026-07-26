@@ -94,7 +94,6 @@ def test_canonical_result_drives_both_projections_and_preserves_origin_epoch() -
         text="Rain is likely this afternoon, with clearing expected tonight.",
         citations=[{"title": "Forecast", "url": "https://weather.example/forecast"}],
         spoken_text="Expect rain this afternoon and clearing tonight.",
-        ui_text="Rain is likely this afternoon, with clearing expected tonight.",
         origin_epoch=None,
     )
 
@@ -131,6 +130,9 @@ def test_shared_result_schema_declares_the_python_projection_invariants() -> Non
         ("turn_id", ""),
         ("timestamp", "not-a-date"),
         ("timestamp", "2026-07-25T12:00:00"),
+        ("timestamp", "2026-07-25 12:00:00+00:00"),
+        ("timestamp", "2026-02-30T12:00:00Z"),
+        ("origin_epoch", -1),
     ),
 )
 def test_python_contract_rejects_invalid_wire_identity_and_timestamp(
@@ -144,12 +146,53 @@ def test_python_contract_rejects_invalid_wire_identity_and_timestamp(
         "text": "Canonical answer.",
         "citations": [],
         "spoken_text": "Spoken answer.",
-        "ui_text": "Canonical answer.",
+        "origin_epoch": 1,
     }
     payload[field] = value
 
     with pytest.raises(ValueError):
         GroundedResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "ui_text",
+        "spoken_result_id",
+        "ui_result_id",
+        "spoken_citations",
+        "ui_citations",
+    ),
+)
+def test_python_contract_rejects_internal_projection_fields_on_the_wire(field: str) -> None:
+    payload = {
+        "result_id": "result-1",
+        "worker_id": "worker-weather",
+        "turn_id": "turn-1",
+        "timestamp": "2026-07-25T12:00:00Z",
+        "text": "Canonical answer.",
+        "citations": [],
+        "spoken_text": "Spoken answer.",
+        "origin_epoch": 1,
+        field: [] if field.endswith("_citations") else "redundant",
+    }
+
+    with pytest.raises(ValueError):
+        GroundedResult.model_validate(payload)
+
+    snapshot_payload = {
+        "contract_version": CONTRACT_VERSION,
+        "session_id": "session-wire-rejection",
+        "snapshot_sequence": 1,
+        "workers": [],
+        "results": [payload],
+        "speech_progress": [],
+        "routing": None,
+        "transcript": [],
+        "origin_epoch": 1,
+    }
+    with pytest.raises(ValueError):
+        RuntimeSnapshot.model_validate(snapshot_payload)
 
 
 def test_speech_progress_is_distinct_from_result_completion_and_has_origin_epoch() -> None:

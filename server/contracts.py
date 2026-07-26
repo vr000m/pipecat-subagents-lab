@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CONTRACT_VERSION = "v1.0"
+RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def utc_timestamp() -> str:
@@ -115,46 +119,44 @@ class GroundedResult(StrictModel):
     text: str = Field(min_length=1)
     citations: list[Citation] = Field(default_factory=list)
     spoken_text: str = Field(min_length=1)
-    ui_text: str | None = Field(default=None, min_length=1, exclude=True)
-    spoken_result_id: str | None = Field(default=None, exclude=True)
-    ui_result_id: str | None = Field(default=None, exclude=True)
-    spoken_citations: list[Citation] | None = Field(default=None, exclude=True)
-    ui_citations: list[Citation] | None = Field(default=None, exclude=True)
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
 
     @field_validator("timestamp")
     @classmethod
     def validate_timestamp(cls, value: str) -> str:
+        if RFC3339_TIMESTAMP.fullmatch(value) is None:
+            raise ValueError("timestamp must be RFC 3339")
         try:
-            parsed = datetime.fromisoformat(value)
+            datetime.fromisoformat(value)
         except ValueError as exc:
-            raise ValueError("timestamp must be ISO-8601") from exc
-        if parsed.tzinfo is None:
-            raise ValueError("timestamp must include a timezone")
+            raise ValueError("timestamp must be a valid RFC 3339 date-time") from exc
         return value
 
     @model_validator(mode="after")
-    def derive_and_validate_projections(self) -> GroundedResult:
-        if self.ui_text not in (None, self.text):
-            raise ValueError("the UI projection must preserve the canonical result text")
+    def validate_projections(self) -> GroundedResult:
         if not self.text.strip() or not self.spoken_text.strip():
             raise ValueError("result projections must not be blank")
-        if self.spoken_result_id not in (None, self.result_id) or self.ui_result_id not in (
-            None,
-            self.result_id,
-        ):
-            raise ValueError("projections must reference the canonical result")
-        if self.spoken_citations not in (None, self.citations) or self.ui_citations not in (
-            None,
-            self.citations,
-        ):
-            raise ValueError("projections must preserve canonical citations")
-        object.__setattr__(self, "spoken_result_id", self.result_id)
-        object.__setattr__(self, "ui_result_id", self.result_id)
-        object.__setattr__(self, "spoken_citations", list(self.citations))
-        object.__setattr__(self, "ui_citations", list(self.citations))
-        object.__setattr__(self, "ui_text", self.text)
         return self
+
+    @property
+    def ui_text(self) -> str:
+        return self.text
+
+    @property
+    def spoken_result_id(self) -> str:
+        return self.result_id
+
+    @property
+    def ui_result_id(self) -> str:
+        return self.result_id
+
+    @property
+    def spoken_citations(self) -> list[Citation]:
+        return list(self.citations)
+
+    @property
+    def ui_citations(self) -> list[Citation]:
+        return list(self.citations)
 
 
 class SpeechProgress(StrictModel):

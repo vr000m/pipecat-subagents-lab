@@ -18,7 +18,6 @@ def result(result_id: str, worker_id: str = "worker-weather") -> GroundedResult:
         turn_id=f"turn-{result_id}",
         text=f"Answer {result_id}",
         spoken_text=f"Answer {result_id}",
-        ui_text=f"Answer {result_id}",
     )
 
 

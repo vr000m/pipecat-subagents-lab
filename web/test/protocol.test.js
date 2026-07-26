@@ -215,6 +215,9 @@ for (const [field, value] of [
   ["turn_id", ""],
   ["timestamp", "not-a-date"],
   ["timestamp", "2026-07-25T12:00:00"],
+  ["timestamp", "2026-07-25 12:00:00+00:00"],
+  ["timestamp", "2026-02-30T12:00:00Z"],
+  ["origin_epoch", -1],
 ]) {
   test(`rejects invalid grounded-result ${field}`, () => {
     const message = {
@@ -226,6 +229,21 @@ for (const [field, value] of [
       data: { ...result("result-1"), [field]: value },
     };
     expect(validateServerMessage(message)).toBe(false);
+    expect(validateServerMessage({
+      ...message,
+      kind: "runtime_snapshot",
+      data: {
+        contract_version: "v1.0",
+        session_id: "session-1",
+        snapshot_sequence: 4,
+        workers: [],
+        results: [message.data],
+        speech_progress: [],
+        routing: null,
+        transcript: [],
+        origin_epoch: 1,
+      },
+    })).toBe(false);
   });
 }
 
