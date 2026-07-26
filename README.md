@@ -200,9 +200,9 @@ budgets with `--max-routing-seconds` and `--max-latency-seconds`. The outer
 deadline prevents a provider that ignores in-process cancellation from hanging
 the merge check indefinitely.
 
-For the 0.1.1 routing regression, with the same credential loaded, run the
-three-turn live sequence that starts with `Hi.` and then asks for weather in
-Riga and Helsinki:
+For the 0.1.1 routing regression, the following paid live smoke is a required
+release gate. With the same credential loaded, run the three-turn sequence that
+starts with `Hi.` and then asks for weather in Riga and Helsinki:
 
 ```sh
 uv run python scripts/smoke_conversation.py --routing-regression --timeout 180
@@ -211,8 +211,11 @@ uv run python scripts/smoke_conversation.py --routing-regression --timeout 180
 It verifies that the greeting takes the direct path without creating a worker,
 then verifies that both weather turns route to workers rather than the main
 routing fallback. Citation and projection validation remains in the single-turn
-paid smoke above. This exercises the live OpenAI router and worker without
-requiring browser media or local STT/TTS services.
+paid smoke above. The conversational-direct policy is provider prompt behavior,
+so the credential-safe pytest suite cannot deterministically prove it; do not
+tag or publish 0.1.1 without a passing routing-regression run. This exercises the
+live OpenAI router and worker without requiring browser media or local STT/TTS
+services.
 
 To compare the configured local services with Deepgram and Cartesia using the
 same text and PCM fixture:

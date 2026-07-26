@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Opt-in paid routing-regression smoke covering a greeting followed by two
-  weather requests against one live session.
+- Required paid 0.1.1 routing-regression release gate covering a greeting
+  followed by two weather requests against one live session.
 
 ### Fixed
 

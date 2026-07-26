@@ -425,7 +425,7 @@ sequenceDiagram
 - Browser tests prove media acquisition/publication waits for an explicit user action, disconnect disables capture, and every external source link carries safe new-tab attributes.
 - Browser render tests prove user and assistant turns expose server-authored timestamps, committed assistant turns show the exact concise spoken projection, queued same-epoch late results are labelled `TTS`, results that remain display-only are labelled `background result`, matching full structured output is available under a disclosure, and unmatched/transient turns do not claim a TTS projection.
 - Local STT/TTS and Small WebRTC media acceptance is required and credential-safe; the authenticated OpenAI `web_search` smoke test remains opt-in and never exposes secret values.
-- The 0.1.1 paid routing-regression smoke runs `Hi.` followed by Riga and Helsinki weather requests, proving the greeting remains direct and workerless while later live turns avoid catalogue-validation fallbacks.
+- The 0.1.1 paid routing-regression smoke is a required release gate and runs `Hi.` followed by Riga and Helsinki weather requests, proving the greeting remains direct and workerless while later live turns avoid catalogue-validation fallbacks. The conversational-direct policy is prompt behavior and therefore is not deterministically covered by the credential-safe pytest suite.
 - Web-worker test asserting outbound OpenAI Responses request kwargs include `store=False`, and that the pinned adapter does not drop it across successive same-worker calls.
 - Web-worker test for the decline path: the mocked classifier decides web search cannot satisfy the request, and the worker returns a decline/clarify result without calling hosted search — distinct from a routing-level `unsupported` outcome and from a hosted-search failure.
 - Session/readiness test asserting the first runtime snapshot is gated on the `client-ready` boundary and is not emitted during page initialization, complementing the existing reconnect-snapshot tests.
@@ -463,7 +463,7 @@ sequenceDiagram
 - v0.1 cancellation is local best-effort task cancellation plus local commit suppression. Capability declarations, backend acknowledgements, and emitted `cancellation_requested`/confirmed `cancelled` work-item outcomes are explicitly deferred and are not required for completed v0.1 acceptance.
 - v0.1.1 late background results are committed to authoritative UI/snapshot state and queued exactly once for speech when their originating TTS connection epoch remains active. They do not interrupt active speech; stale-epoch, cancelled, disconnected, and TTS-less results never autoplay. Reconnectable consent offers remain deferred.
 - Full Python and browser test suites, formatting, linting, secret scan, documentation review, code review, and security review pass before push.
-- Required local acceptance evidence demonstrates user-initiated microphone capture, Small WebRTC media, live local STT/TTS, and audible output; paid OpenAI smoke verification is reported separately when credentials are available.
+- Required local acceptance evidence demonstrates user-initiated microphone capture, Small WebRTC media, live local STT/TTS, and audible output. Paid OpenAI smoke verification is reported separately; for 0.1.1, the live `--routing-regression` smoke must pass before tagging or publishing because the conversational-direct prompt policy has no deterministic credential-safe test.
 - Normal-versus-grey styling is backed by server transport completion rather than TTS synthesis completion and is labelled as delivery state, not verified audible speech.
 - If no reliable transport-completion seam is verified, the UI uses `delivery_unknown`/synthesis-only styling rather than claiming `delivery_completed`.
 - Each worker's finalized results accumulate in a persistent, timestamped log surviving reconnect (not just a "latest result" pointer), rendered separately from the live transcript view.
@@ -609,7 +609,9 @@ The 0.1.1 routing repair classifies greetings and casual conversation as direct
 main responses, prevents those turns from creating persistent workers, and keeps
 existing-worker metadata bound to the immutable catalogue snapshot. The branch
 adds `scripts/smoke_conversation.py --routing-regression` for the live three-turn
-Hi/Riga/Helsinki sequence; it is provider-backed but intentionally independent of
+Hi/Riga/Helsinki sequence. It is a required 0.1.1 release gate because the
+conversational-direct policy is provider prompt behavior with no deterministic
+credential-safe pytest assertion; it remains intentionally independent of
 browser media and local STT/TTS acceptance. A same-epoch late result now enters
 the speech scheduler exactly once and waits behind active audio; a result that
 cannot be queued because its TTS connection is stale or absent remains labelled
