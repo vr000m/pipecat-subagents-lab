@@ -120,6 +120,12 @@ epoch, and the last snapshot sequence. The new epoch is fenced before the
 snapshot is sent; old callbacks may append an immutable canonical result tied
 to their originating turn but cannot mutate active state or autoplay.
 
+A retained result completing on its still-active originating epoch is committed
+before its concise `spoken_text` is enqueued exactly once. It waits behind any
+active utterance and then follows the normal speech-progress state machine.
+Cancelled work, old epochs, disconnected sessions, and connections without TTS
+remain display-only and never create a speech attempt.
+
 ## Verified Pipecat 1.6.0 seam notes
 
 The pinned package does not expose the planned `LLMContextWorker` module.

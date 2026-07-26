@@ -50,12 +50,20 @@ function matchingResult(item, results = []) {
   return null;
 }
 
+function projectionLabel(result, state) {
+  const { deliveryState } = deliveryFor(result, state);
+  const displayOnly = deliveryState === "displayed";
+  const label = displayOnly ? "background result" : "TTS";
+  const className = displayOnly ? "projection-label background" : "projection-label";
+  return ` <span class="${className}">${label}</span>`;
+}
+
 function transcriptTurn(item, state) {
   const timestamp = item.timestamp;
   const result = matchingResult(item, state.results);
   const { incomplete = false } = result ? deliveryFor(result, state) : {};
   const text = result?.spoken_text || item.text || item.data?.text;
-  const projection = result ? ' <span class="projection-label">TTS</span>' : "";
+  const projection = result ? projectionLabel(result, state) : "";
   const hasStructuredDetails = result && (
     result.worker_id !== "main" ||
     result.spoken_text !== (result.ui_text || result.text) ||

@@ -84,6 +84,39 @@ test("shows the spoken projection and nests the full structured result under a c
   expect(html).not.toContain("result-card-measured");
 });
 
+test("marks a display-only result as a background result instead of TTS", () => {
+  const html = renderRuntime({
+    ...state,
+    speech: {},
+    transcript: [{
+      role: "assistant",
+      text: state.results[0].ui_text,
+      turn_id: "turn-1",
+      timestamp: "2026-07-18T10:00:16Z",
+    }],
+  });
+
+  expect(html).toContain('<span class="projection-label background">background result</span>');
+  expect(html).not.toContain('<span class="projection-label">TTS</span>');
+  expect(html).toContain("displayed — speech delivery incomplete or unconfirmed");
+});
+
+test("marks a queued late result as TTS instead of a display-only background result", () => {
+  const html = renderRuntime({
+    ...state,
+    speech: { "utterance-late": { result_id: "result-1", state: "queued" } },
+    transcript: [{
+      role: "assistant",
+      text: state.results[0].ui_text,
+      turn_id: "turn-1",
+      timestamp: "2026-07-18T10:00:16Z",
+    }],
+  });
+
+  expect(html).toContain('<span class="projection-label">TTS</span>');
+  expect(html).not.toContain("background result");
+});
+
 test("leaves unmatched transcript messages unchanged without claiming a TTS projection", () => {
   const html = renderRuntime({
     ...state,
@@ -112,6 +145,7 @@ test("does not invent subagent details for a main response with no separate proj
   const html = renderRuntime({
     ...state,
     results: [mainResult],
+    speech: { "utterance-main": { result_id: "result-main", state: "queued" } },
     transcript: [{
       role: "assistant",
       text: mainResult.ui_text,

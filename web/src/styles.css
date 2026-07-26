@@ -16,6 +16,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .turn time { color: #7d8490; font-size: .75rem; font-variant-numeric: tabular-nums; }
 .turn p, .answer { margin: .2rem 0 0; white-space: pre-wrap; }
 .projection-label { margin-left: .3rem; color: #7fd6a4; font-size: .65rem; letter-spacing: .06em; }
+.projection-label.background { color: #f0c26a; }
 .turn-details { margin-top: .5rem; border-left: 2px solid #5f4a8a; padding-left: .65rem; }
 .turn-details summary { cursor: pointer; color: #b79ae8; font-size: .78rem; }
 .turn-details-content { padding: .25rem 0 .15rem; }
