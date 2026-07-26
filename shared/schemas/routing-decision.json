@@ -11,6 +11,6 @@
     "topic": {"type": ["string", "null"]}, "capability": {"type": ["string", "null"]},
     "capability_available": {"type": "boolean"}, "model_policy": {"type": ["string", "null"]},
     "catalogue_version": {"type": "string"}, "catalogue_worker_ids": {"type": "array", "items": {"type": "string"}},
-    "origin_epoch": {"type": ["integer", "null"]}
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
   }
 }

@@ -16,8 +16,19 @@ RFC3339_TIMESTAMP = re.compile(
 
 
 def utc_timestamp() -> str:
-    """Return a producer-generated ISO-8601 timestamp for wire contracts."""
+    """Return a producer-generated RFC 3339 timestamp for wire contracts."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def validate_rfc3339_timestamp(value: str) -> str:
+    """Validate the strict date-time representation shared with the browser."""
+    if RFC3339_TIMESTAMP.fullmatch(value) is None:
+        raise ValueError("timestamp must be RFC 3339")
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("timestamp must be a valid RFC 3339 date-time") from exc
+    return value
 
 
 class StrictModel(BaseModel):
@@ -61,7 +72,7 @@ class RoutingDecision(StrictModel):
     model_policy: str | None = None
     catalogue_version: str
     catalogue_worker_ids: tuple[str, ...] = ()
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_selection(self) -> RoutingDecision:
@@ -91,7 +102,7 @@ class RoutingState(StrictModel):
     worker_type: str | None = None
     topic: str | None = None
     model_policy: str | None = None
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
 
 
 class TranscriptEntry(StrictModel):
@@ -99,7 +110,12 @@ class TranscriptEntry(StrictModel):
     text: str
     turn_id: str
     timestamp: str = Field(default_factory=utc_timestamp)
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        return validate_rfc3339_timestamp(value)
 
 
 class WorkerState(StrictModel):
@@ -108,7 +124,7 @@ class WorkerState(StrictModel):
     model_policy: str
     status: str
     latest_result_id: str | None = None
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
 
 
 class GroundedResult(StrictModel):
@@ -124,13 +140,7 @@ class GroundedResult(StrictModel):
     @field_validator("timestamp")
     @classmethod
     def validate_timestamp(cls, value: str) -> str:
-        if RFC3339_TIMESTAMP.fullmatch(value) is None:
-            raise ValueError("timestamp must be RFC 3339")
-        try:
-            datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise ValueError("timestamp must be a valid RFC 3339 date-time") from exc
-        return value
+        return validate_rfc3339_timestamp(value)
 
     @model_validator(mode="after")
     def validate_projections(self) -> GroundedResult:
@@ -165,7 +175,7 @@ class SpeechProgress(StrictModel):
     run_id: str
     utterance_id: str
     state: DeliveryState
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
 
 
 class RuntimeSnapshot(StrictModel):
@@ -177,7 +187,7 @@ class RuntimeSnapshot(StrictModel):
     speech_progress: list[SpeechProgress] = Field(default_factory=list)
     routing: RoutingState | None = None
     transcript: list[TranscriptEntry] = Field(default_factory=list)
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
     _highest_by_session: ClassVar[dict[str, int]] = {}
 
     @classmethod
@@ -204,7 +214,12 @@ class WorkItemEvent(StrictModel):
     event_sequence: int = Field(ge=0)
     state: WorkItemState
     timestamp: str
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        return validate_rfc3339_timestamp(value)
 
 
 class InterruptionEvent(StrictModel):
@@ -216,7 +231,7 @@ class InterruptionEvent(StrictModel):
     work_item_id: str
     run_id: str
     utterance_id: str
-    origin_epoch: int | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
 
 
 class SnapshotHandshake(StrictModel):

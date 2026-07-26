@@ -120,7 +120,7 @@ function validTranscript(value) {
   const keys = ["role", "text", "turn_id", "timestamp", "origin_epoch"];
   if (!value || typeof value !== "object" || Object.keys(value).some((key) => !keys.includes(key))) return false;
   return ["user", "assistant"].includes(value.role) && typeof value.text === "string" &&
-    typeof value.turn_id === "string" && typeof value.timestamp === "string" &&
+    typeof value.turn_id === "string" && validTimestamp(value.timestamp) &&
     Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
 }
 

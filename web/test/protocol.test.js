@@ -80,6 +80,7 @@ test("validates versioned RTVI messages and rejects aliases, wrappers, and priva
   };
   expect(validateServerMessage(message)).toBe(true);
   expect(validateServerMessage({ ...message, kind: "runtime_result" })).toBe(false);
+  expect(validateServerMessage({ ...message, kind: "future_kind" })).toBe(false);
   expect(validateServerMessage({ ...message, kind: "speech" })).toBe(false);
   expect(validateServerMessage({ ...message, data: { result: result("r1") } })).toBe(false);
   expect(validateServerMessage({ contract_version: "v1.0", kind: "result", sequence: 1, data: { prompt: "private" } })).toBe(false);
@@ -280,6 +281,79 @@ test("validates server-authored routing and semantic transcript messages", () =>
   expect(validateServerMessage(routing)).toBe(true);
   expect(validateServerMessage(transcript)).toBe(true);
   expect(validateServerMessage({ ...transcript, data: { ...transcript.data, role: "assistant" } })).toBe(false);
+  for (const timestamp of [
+    "not-a-date",
+    "2026-07-25T12:00:00",
+    "2026-07-25 12:00:00+00:00",
+    "2026-02-30T12:00:00Z",
+  ]) {
+    expect(validateServerMessage({
+      ...transcript,
+      data: { ...transcript.data, timestamp },
+    })).toBe(false);
+  }
+});
+
+test("rejects negative epochs throughout nested runtime snapshots", () => {
+  const snapshot = {
+    contract_version: "v1.0",
+    kind: "runtime_snapshot",
+    sequence: 4,
+    session_id: "session-1",
+    origin_epoch: 1,
+    data: {
+      contract_version: "v1.0",
+      session_id: "session-1",
+      snapshot_sequence: 4,
+      workers: [],
+      results: [],
+      speech_progress: [],
+      routing: null,
+      transcript: [],
+      origin_epoch: 1,
+    },
+  };
+  const nestedValues = {
+    workers: [{
+      worker_id: "worker-1",
+      topic: "weather",
+      model_policy: "fast",
+      status: "idle",
+      latest_result_id: null,
+      origin_epoch: -1,
+    }],
+    speech_progress: [{
+      result_id: "result-1",
+      work_item_id: "work-1",
+      run_id: "run-1",
+      utterance_id: "utterance-1",
+      state: "queued",
+      origin_epoch: -1,
+    }],
+    routing: {
+      turn_id: "turn-1",
+      action: "direct",
+      worker_id: null,
+      worker_type: null,
+      topic: null,
+      model_policy: null,
+      origin_epoch: -1,
+    },
+    transcript: [{
+      role: "user",
+      text: "Hello",
+      turn_id: "turn-1",
+      timestamp: "2026-07-25T12:00:00Z",
+      origin_epoch: -1,
+    }],
+  };
+
+  for (const [field, value] of Object.entries(nestedValues)) {
+    expect(validateServerMessage({
+      ...snapshot,
+      data: { ...snapshot.data, [field]: value },
+    })).toBe(false);
+  }
 });
 
 test("validates every canonical increment payload and matching epoch fence", () => {

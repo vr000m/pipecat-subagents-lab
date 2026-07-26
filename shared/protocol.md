@@ -10,9 +10,9 @@ The current contract version is `v1.0`. Every state-bearing message includes
 stable identifiers and an origin epoch. Internal records may use a nullable
 epoch before a browser connection is accepted; active-connection events require
 the accepted epoch. JSON objects reject unknown fields.
-Unknown future message types may be ignored only when their version is known;
-an unknown contract version is rejected. `snapshot_sequence` and incremental
-`event_sequence` values are monotonic. A reconnect replaces runtime projections
+The browser rejects unknown message kinds even when their contract version is
+known, and rejects unknown contract versions. `snapshot_sequence` and the RTVI
+envelope `sequence` are monotonic. A reconnect replaces runtime projections
 with a fresh snapshot; local connection diagnostics are retained only with an
 explicit local label.
 
@@ -48,22 +48,27 @@ turn, `work_item_id` identifies one bounded item within that turn, `run_id`
 identifies one execution/retry, `event_id` identifies one event, `result_id`
 identifies one canonical result, and `utterance_id` identifies one speech
 delivery attempt. `worker_id` is a stable context-owner identity. Timestamps
-are producer-generated ISO-8601 strings. `origin_epoch` is nullable only for
-pre-arbiter internal records and must be populated for accepted callbacks.
+are producer-generated RFC 3339 date-time strings with an explicit `Z` or
+numeric UTC offset. Every populated `origin_epoch` is a non-negative integer;
+it is nullable only for pre-arbiter internal records and must be populated for
+accepted callbacks.
 
 ## Routing and capability
 
 Routing actions are `direct`, `unsupported`, `clarify`, `existing_worker`, and
-`new_worker`. A worker route carries a catalogue version, worker identity,
-topic, capability label/availability, and configured model-policy label. Model
-IDs emitted by a model are never trusted. Dispatch validates the decision
-against the identical immutable catalogue snapshot; unavailable private
-capabilities cannot be converted into topical web search.
+`new_worker`. The internal Python `RoutingDecision` carries catalogue identity,
+capability label/availability, worker selection, topic, and configured
+model-policy label. Model IDs emitted by a model are never trusted. Dispatch
+validates that decision against the identical immutable catalogue snapshot;
+unavailable private capabilities cannot be converted into topical web search.
+
+The browser receives only the reduced `RoutingState`: turn, action, selected
+worker/type, topic, model-policy label, and origin epoch. Catalogue contents and
+capability classification stay server-side and are not RTVI payload fields.
 
 ## Work and speech states
 
-Work-item/result states are `started`, `progress`, `cancellation_requested`,
-`cancelled`, `completed`, and `failed`. Delivery states are `displayed`,
+The active browser protocol exposes delivery states `displayed`,
 `queued`, `started`, `synthesis_ended`, `delivery_completed`,
 `delivery_unknown`, `interrupted`, `interrupted_by_reconnect`, `paused`, and
 `resumed`. Work completion and speech delivery are separate state machines.
@@ -73,6 +78,14 @@ delivery precedence is reconnect interruption, interruption, confirmed
 completion, unknown delivery, then cancellation; duplicate or late events
 cannot replace an already terminal outcome. Word-level progress is reserved
 for a future, verified Phase-3 extension.
+
+`WorkItemEvent` reserves work states `started`, `progress`,
+`cancellation_requested`, `cancelled`, `completed`, and `failed`.
+`InterruptionEvent` similarly reserves normalized interruption telemetry. These
+models and schemas are internal/future seams in v1.0: the production runtime
+does not emit them as RTVI message kinds. Their `event_sequence` is monotonic
+within a future work-item event stream, independently of the active RTVI
+envelope `sequence`.
 
 ## Canonical results and snapshots
 
@@ -91,6 +104,16 @@ turns, worker state, canonical results, and speech progress but never prompts,
 private context, raw STT fragments, or raw logs.
 Transcript entries are created by the server only after the application turn
 boundary closes; browser SDK transcript callbacks are not authoritative state.
+
+## Contract inventory
+
+- `rtvi-message.json` and its seven payload schemas define the active
+  server-to-browser boundary listed above.
+- `snapshot-handshake.json` defines same-origin HTTP session discovery and
+  reconnect negotiation; it is not an RTVI state message.
+- `routing-decision.json` defines the internal router-to-dispatch decision.
+- `work-item-event.json` and `interruption-event.json` reserve deferred
+  lifecycle contracts and are not emitted by v1.0.
 
 Reconnect uses `session_id`, a resume token/known-process identity, proposed
 epoch, and the last snapshot sequence. The new epoch is fenced before the

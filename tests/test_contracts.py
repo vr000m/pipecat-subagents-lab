@@ -10,11 +10,13 @@ from server.contracts import (
     CONTRACT_VERSION,
     DeliveryState,
     GroundedResult,
+    InterruptionEvent,
     RoutingDecision,
     RoutingState,
     RuntimeSnapshot,
     SpeechProgress,
     TranscriptEntry,
+    WorkItemEvent,
     WorkerState,
     WorkItemState,
     validate_contract,
@@ -152,6 +154,184 @@ def test_python_contract_rejects_invalid_wire_identity_and_timestamp(
 
     with pytest.raises(ValueError):
         GroundedResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    (
+        "not-a-date",
+        "2026-07-25T12:00:00",
+        "2026-07-25 12:00:00+00:00",
+        "2026-02-30T12:00:00Z",
+    ),
+)
+def test_transcript_and_work_item_timestamps_require_valid_rfc3339(timestamp: str) -> None:
+    with pytest.raises(ValueError):
+        TranscriptEntry(
+            role="user",
+            text="Hello",
+            turn_id="turn-1",
+            timestamp=timestamp,
+            origin_epoch=1,
+        )
+
+    with pytest.raises(ValueError):
+        WorkItemEvent(
+            work_item_id="work-1",
+            run_id="run-1",
+            worker_id="worker-1",
+            turn_id="turn-1",
+            event_id="event-1",
+            event_sequence=1,
+            state="started",
+            timestamp=timestamp,
+            origin_epoch=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    (
+        (
+            RoutingDecision,
+            {
+                "action": "direct",
+                "catalogue_version": "catalogue-1",
+                "origin_epoch": -1,
+            },
+        ),
+        (
+            RoutingState,
+            {
+                "turn_id": "turn-1",
+                "action": "direct",
+                "origin_epoch": -1,
+            },
+        ),
+        (
+            TranscriptEntry,
+            {
+                "role": "user",
+                "text": "Hello",
+                "turn_id": "turn-1",
+                "origin_epoch": -1,
+            },
+        ),
+        (
+            WorkerState,
+            {
+                "worker_id": "worker-1",
+                "topic": "weather",
+                "model_policy": "fast",
+                "status": "idle",
+                "origin_epoch": -1,
+            },
+        ),
+        (
+            SpeechProgress,
+            {
+                "result_id": "result-1",
+                "work_item_id": "work-1",
+                "run_id": "run-1",
+                "utterance_id": "utterance-1",
+                "state": "queued",
+                "origin_epoch": -1,
+            },
+        ),
+        (
+            WorkItemEvent,
+            {
+                "work_item_id": "work-1",
+                "run_id": "run-1",
+                "worker_id": "worker-1",
+                "turn_id": "turn-1",
+                "event_id": "event-1",
+                "event_sequence": 1,
+                "state": "started",
+                "timestamp": "2026-07-25T12:00:00Z",
+                "origin_epoch": -1,
+            },
+        ),
+        (
+            InterruptionEvent,
+            {
+                "interruption_id": "interruption-1",
+                "stage": "speech_active",
+                "policy": "pause",
+                "template_used": False,
+                "resume_outcome": "resumed",
+                "work_item_id": "work-1",
+                "run_id": "run-1",
+                "utterance_id": "utterance-1",
+                "origin_epoch": -1,
+            },
+        ),
+    ),
+)
+def test_epoch_bearing_contracts_reject_negative_values(
+    model: type, payload: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError):
+        model.model_validate(payload)
+
+
+@pytest.mark.parametrize("nested_field", ("workers", "speech_progress", "routing", "transcript"))
+def test_runtime_snapshot_rejects_negative_nested_origin_epochs(nested_field: str) -> None:
+    payload: dict[str, object] = {
+        "contract_version": CONTRACT_VERSION,
+        "session_id": f"session-negative-{nested_field}",
+        "snapshot_sequence": 1,
+        "workers": [],
+        "results": [],
+        "speech_progress": [],
+        "routing": None,
+        "transcript": [],
+        "origin_epoch": 1,
+    }
+    nested_values = {
+        "workers": [
+            {
+                "worker_id": "worker-1",
+                "topic": "weather",
+                "model_policy": "fast",
+                "status": "idle",
+                "latest_result_id": None,
+                "origin_epoch": -1,
+            }
+        ],
+        "speech_progress": [
+            {
+                "result_id": "result-1",
+                "work_item_id": "work-1",
+                "run_id": "run-1",
+                "utterance_id": "utterance-1",
+                "state": "queued",
+                "origin_epoch": -1,
+            }
+        ],
+        "routing": {
+            "turn_id": "turn-1",
+            "action": "direct",
+            "worker_id": None,
+            "worker_type": None,
+            "topic": None,
+            "model_policy": None,
+            "origin_epoch": -1,
+        },
+        "transcript": [
+            {
+                "role": "user",
+                "text": "Hello",
+                "turn_id": "turn-1",
+                "timestamp": "2026-07-25T12:00:00Z",
+                "origin_epoch": -1,
+            }
+        ],
+    }
+    payload[nested_field] = nested_values[nested_field]
+
+    with pytest.raises(ValueError):
+        RuntimeSnapshot.model_validate(payload)
 
 
 @pytest.mark.parametrize(
