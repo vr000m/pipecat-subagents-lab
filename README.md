@@ -315,6 +315,55 @@ credential-safe unit and integration tests. Any semantic protocol change found
 during verification must return to the earlier contract/runtime/browser phases;
 Phase 5 documentation does not silently change those contracts.
 
+## Performance telemetry (`PERF_METRIC`)
+
+Every performance record is one console line beginning `PERF_METRIC
+event=<name> schema=1`, defined in `server/perf_metrics.py`. Select all
+records with:
+
+```sh
+rg 'PERF_METRIC'
+```
+
+Narrow to one event, and further to one correlation ID, with:
+
+```sh
+rg 'PERF_METRIC event=user_bot_latency'
+rg 'PERF_METRIC event=work_item_foreground' | rg 'turn_id="turn-7"'
+```
+
+Framework-owned events come from Pipecat 1.6.0 observers attached to each
+browser connection's `PipelineWorker` — one `StartupTimingObserver`, one
+`UserBotLatencyObserver`, and handlers on the worker's own default
+`turn_tracking_observer` (no duplicate turn tracker is created):
+
+- `pipeline_startup`, `transport_ready` — processor and Small WebRTC
+  connection timing. `bot_connected_ms` is SFU-only and is omitted (never
+  zero-filled) under the Small WebRTC transport this app uses.
+- `pipecat_turn_start`, `pipecat_turn_end` — Pipecat's own conversation-turn
+  boundaries, identified only by `pipecat_turn`; this is not the application
+  `turn_id`.
+- `first_bot_speech_latency`, `user_bot_latency`, `service_latency` — speech
+  latency and, when `PipelineParams(enable_metrics=True)` and a processor
+  actually reports a `MetricsFrame`, its per-service breakdown
+  (`ttfb`/`text_aggregation`/`function_calls`/`user_turn_secs`). Missing
+  values are omitted, never invented as zero.
+
+Application-owned events (`app_turn_foreground`, `work_item_foreground`,
+`work_item_background`) measure routing, worker dispatch, and retained
+background completion outside the Pipecat frame graph; their producers land
+in a later phase, but the schema — required/optional fields, closed outcome
+enums, and the child-counter contract — already ships in
+`server/perf_metrics.py`.
+
+Every producer emits through one `MeasurementSink` owned by `SessionHost` for
+its process lifetime: `ConsoleMeasurementSink` in production, and
+`CollectingMeasurementSink` (indexed by event, `turn_id`, and `work_item_id`)
+in tests and the smoke harness, injected via
+`_default_session_host(measurement_sink=...)`. No record ever contains
+transcript, prompt, response, citation, or credential content — this stays
+console-only and does not project into RTVI or browser state.
+
 ## Repository layout
 
 ```text

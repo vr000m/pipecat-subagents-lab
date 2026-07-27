@@ -1908,10 +1908,25 @@ class FakeRTVI:
         self.bot_ready_calls += 1
 
 
+class FakeTurnTrackingObserver:
+    """Stands in for Pipecat's default ``worker.turn_tracking_observer``."""
+
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+
+    def event_handler(self, name: str):
+        def register(function: object) -> object:
+            self.handlers[name] = function
+            return function
+
+        return register
+
+
 class FakePipelineWorker:
     def __init__(self, pipeline: object, **_: object) -> None:
         self.pipeline = pipeline
         self.rtvi = FakeRTVI()
+        self.turn_tracking_observer = FakeTurnTrackingObserver()
 
     async def queue_frame(self, _frame: object) -> None:
         pass
@@ -2012,5 +2027,190 @@ def test_connection_attach_registers_worker_with_async_runner(
         # only publishes the application-level client-ready state.
         assert rtvi.bot_ready is False
         assert rtvi.bot_ready_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: framework observer identity, console-only staleness, and
+# real-PipelineWorker parity between enable_metrics=False and True.
+# ---------------------------------------------------------------------------
+
+
+def _monkeypatch_attach_connection_scaffolding(
+    monkeypatch: pytest.MonkeyPatch, *, pipeline_args: list[object]
+) -> None:
+    """Same passthrough monkeypatching as the async-runner attach test above,
+    but leaves StartupTimingObserver/UserBotLatencyObserver as the real
+    Pipecat classes so real PERF_METRIC handler closures get registered.
+    """
+    monkeypatch.setattr(app_module, "SmallWebRTCTransport", lambda *_args: FakeTransport())
+    monkeypatch.setattr(app_module, "SileroVADAnalyzer", lambda *, sample_rate: object())
+    monkeypatch.setattr(app_module, "VADProcessor", lambda *, vad_analyzer: object())
+    monkeypatch.setattr(app_module, "smart_turn_processor", lambda *, timeout_seconds: object())
+    monkeypatch.setattr(
+        app_module,
+        "FinalTurnTranscriptProcessor",
+        lambda callback, *, complete_grace_seconds: object(),
+    )
+    monkeypatch.setattr(app_module, "TransportParams", lambda **kwargs: kwargs)
+    monkeypatch.setattr(app_module, "PipelineParams", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        app_module, "Pipeline", lambda processors: pipeline_args.append(processors) or processors
+    )
+    monkeypatch.setattr(app_module, "PipelineWorker", FakePipelineWorker)
+
+
+class _NonRetainingAddRunner:
+    """Like AsyncAddRunner, but does not keep a permanent list of added
+    workers — a real WorkerRunner does not hold connection-replaced workers
+    alive either, so a non-retaining test double is required to observe
+    garbage collection of the replaced connection's worker.
+    """
+
+    async def start(self) -> None:
+        pass
+
+    async def add_workers(self, *_workers: object) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+
+def test_stale_epoch_observer_callbacks_stay_console_only_and_become_collectible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old-epoch framework observers survive only as console-only, collectible
+    callbacks after connection replacement (Acceptance Criteria: "Observer
+    callbacks retain no replaced host/runtime/worker/publisher state; old
+    connection objects are collectible and stale callbacks only reach the
+    console sink.")
+    """
+    import gc
+    import weakref
+
+    from server.perf_metrics import CollectingMeasurementSink
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=_NonRetainingAddRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+            measurement_sink=sink,
+        )
+        await host.start()
+
+        pipeline_args: list[object] = []
+        _monkeypatch_attach_connection_scaffolding(monkeypatch, pipeline_args=pipeline_args)
+
+        await app_module._attach_connection(
+            host,
+            object(),
+            app_module.SnapshotHandshake(
+                session_id=host.state.session_id,
+                resume_token=host.state.resume_token,
+                proposed_epoch=1,
+                snapshot_sequence=0,
+            ),
+        )
+        first_worker = host.connection.worker
+        first_tracker = first_worker.turn_tracking_observer
+        stale_turn_ended = first_tracker.handlers["on_turn_ended"]
+        worker_ref = weakref.ref(first_worker)
+        tracker_ref = weakref.ref(first_tracker)
+
+        await app_module._attach_connection(
+            host,
+            object(),
+            app_module.SnapshotHandshake(
+                session_id=host.state.session_id,
+                resume_token=host.state.resume_token,
+                proposed_epoch=2,
+                snapshot_sequence=0,
+            ),
+        )
+
+        # Connection replacement fences the old connection and schedules its
+        # shutdown as a background task; await it so the coroutine frame
+        # (which references the old worker) is released before collecting.
+        pending_shutdowns = set(host._background_shutdowns)
+        if pending_shutdowns:
+            await asyncio.gather(*pending_shutdowns)
+
+        del first_worker, first_tracker
+        for _ in range(3):
+            gc.collect()
+
+        assert worker_ref() is None
+        assert tracker_ref() is None
+
+        # The stale closure itself captured no worker/host/runtime reference,
+        # so it is still callable and still reaches only the console sink.
+        sequence_before = host.state.sequence
+        await stale_turn_ended(object(), 7, 1.5, False)
+
+        assert host.state.sequence == sequence_before
+        matching = [r for r in sink.records if r.event == "pipecat_turn_end"]
+        assert len(matching) == 1
+        assert matching[0].fields["origin_epoch"] == 1  # the stale, replaced epoch
+
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_enable_metrics_toggle_does_not_change_real_pipeline_worker_frame_flow() -> None:
+    """Paired synthetic traces through the real locked PipelineWorker: enabling
+    processor metrics and attaching the Phase 1 framework observers must not
+    change processor order, frame flow, or downstream frame types.
+    """
+    from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
+        Frame,
+        MetricsFrame,
+    )
+    from pipecat.observers.startup_timing_observer import StartupTimingObserver
+    from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+    from pipecat.pipeline.worker import PipelineParams
+    from pipecat.processors.frame_processor import FrameProcessor
+    from pipecat.tests.utils import run_test
+
+    class _PassthroughProcessor(FrameProcessor):
+        async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+            await super().process_frame(frame, direction)
+            await self.push_frame(frame, direction)
+
+    async def trace(*, enable_metrics: bool) -> list[type]:
+        observers = [StartupTimingObserver(), UserBotLatencyObserver()]
+        down, _up = await run_test(
+            _PassthroughProcessor(),
+            frames_to_send=[
+                UserStartedSpeakingFrame(),
+                VADUserStoppedSpeakingFrame(stop_secs=0.2),
+                UserStoppedSpeakingFrame(),
+                BotStartedSpeakingFrame(),
+                BotStoppedSpeakingFrame(),
+            ],
+            observers=observers,
+            pipeline_params=PipelineParams(enable_metrics=enable_metrics),
+        )
+        # Excluding expected metrics-observation frames per the plan's Testing
+        # Notes: enable_metrics=True legitimately adds an initial empty
+        # MetricsFrame (PipelineParams.send_initial_empty_metrics), which is
+        # not a change to transcript/TTS/media frame flow.
+        return [type(frame) for frame in down if not isinstance(frame, MetricsFrame)]
+
+    async def run() -> None:
+        disabled_trace = await trace(enable_metrics=False)
+        enabled_trace = await trace(enable_metrics=True)
+
+        assert disabled_trace == enabled_trace
+        assert disabled_trace == [
+            UserStartedSpeakingFrame,
+            VADUserStoppedSpeakingFrame,
+            UserStoppedSpeakingFrame,
+            BotStartedSpeakingFrame,
+            BotStoppedSpeakingFrame,
+        ]
 
     asyncio.run(run())

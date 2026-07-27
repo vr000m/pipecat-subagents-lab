@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.observers.startup_timing_observer import StartupTimingObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.audio.vad_processor import VADProcessor
@@ -31,6 +33,7 @@ from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
+from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
 from .registry import WorkerRegistry
@@ -190,15 +193,37 @@ async def _attach_connection(
             processors.extend(_tts_processors(host, runtime))
         processors.append(transport.output())
         task_manager = TaskManager(loop=asyncio.get_running_loop())
+        connection_worker_name = f"browser-{runtime.epoch}"
+        startup_observer = StartupTimingObserver()
+        latency_observer = UserBotLatencyObserver()
         worker = PipelineWorker(
             Pipeline(processors),
-            name=f"browser-{runtime.epoch}",
+            name=connection_worker_name,
             params=PipelineParams(
-                audio_in_sample_rate=16000, audio_out_sample_rate=output_sample_rate
+                audio_in_sample_rate=16000,
+                audio_out_sample_rate=output_sample_rate,
+                enable_metrics=True,
             ),
             enable_rtvi=True,
             idle_timeout_secs=None,
             task_manager=task_manager,
+            observers=[startup_observer, latency_observer],
+        )
+        turn_tracking_observer = worker.turn_tracking_observer
+        if turn_tracking_observer is None:
+            raise RuntimeError(
+                "PipelineWorker did not construct its default turn tracking observer"
+            )
+        attach_framework_observers(
+            startup_observer=startup_observer,
+            latency_observer=latency_observer,
+            turn_tracking_observer=turn_tracking_observer,
+            context=PerfConnectionContext(
+                session_id=host.state.session_id,
+                origin_epoch=runtime.epoch,
+                connection_worker=connection_worker_name,
+            ),
+            sink=host.measurement_sink,
         )
     except BaseException:
         host.abort_connection(runtime)
@@ -286,6 +311,7 @@ def _default_session_host(
     *,
     router: Router | None = None,
     router_responses_factory: Callable[[], Any] | None = None,
+    measurement_sink: MeasurementSink | None = None,
 ) -> SessionHost:
     """Build the default host while keeping credentialed providers lazy."""
     config = load_config()
@@ -301,7 +327,13 @@ def _default_session_host(
     )
     stt = create_stt(config)
     tts = create_tts(config)
-    return SessionHost(registry=registry, stt=stt, tts=tts, coordinator=coordinator)
+    return SessionHost(
+        registry=registry,
+        stt=stt,
+        tts=tts,
+        coordinator=coordinator,
+        measurement_sink=measurement_sink,
+    )
 
 
 def create_app(

@@ -24,6 +24,7 @@ from .contracts import (
     WorkerState,
 )
 from .observers import RuntimeObserver
+from .perf_metrics import ConsoleMeasurementSink, MeasurementSink
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
@@ -277,6 +278,8 @@ class SessionHost:
         stt: Any | None = None,
         tts: Any | None = None,
         coordinator: Any | None = None,
+        *,
+        measurement_sink: MeasurementSink | None = None,
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
@@ -305,6 +308,7 @@ class SessionHost:
         self._cancelled_work_items: set[str] = set()
         self._clarification_candidates: dict[str, dict[str, str]] = {}
         self.last_turn_metrics: dict[str, float | str] = {}
+        self.measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
         self._closing = False
         self.started = False
 
