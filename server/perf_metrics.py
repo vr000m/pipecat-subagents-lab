@@ -3,10 +3,11 @@
 Every record is one physical console line: ``PERF_METRIC event=<name> schema=1
 key=value ...``. This module owns the closed event registry, the safe
 formatter that rejects anything outside that registry, the injectable
-measurement sink protocol, and the Pipecat 1.6.0 observer callback factories
-that translate framework timing reports into records. Application-turn and
-retained-work producers land in a later phase; this module already knows
-their event shapes so the console contract is versioned as one whole.
+measurement sink protocol, the Pipecat 1.6.0 observer callback factories
+that translate framework timing reports into records, and the application
+recorders (``AppTurnRecorder``, ``WorkItemRecorder``, ``RetainedRecorder``)
+that translate application-turn and retained-work timing into the same
+records.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -166,7 +168,12 @@ def _validate_service_latency(fields: Mapping[str, Any]) -> None:
 def _validate_app_turn_foreground(fields: Mapping[str, Any]) -> None:
     child_count = fields["child_count"]
     counted = sum(fields.get(name, 0) for name in _APP_TURN_COUNTER_FIELDS)
-    if counted != child_count:
+    # A dispatched child_count of 0 legitimately allows a nonzero category
+    # counter: a direct/unsupported/clarify turn resolved by the router
+    # itself attributes its own outcome to that counter without dispatching
+    # (and therefore without counting) a child work item. Once any child was
+    # actually dispatched (child_count > 0), the sum must match exactly.
+    if child_count != 0 and counted != child_count:
         raise PerfMetricError(
             f"app_turn_foreground: child_count={child_count} does not match counter sum {counted}"
         )
@@ -612,3 +619,321 @@ def attach_framework_observers(
     on_turn_started, on_turn_ended = make_turn_tracking_handlers(context, sink)
     turn_tracking_observer.event_handler("on_turn_started")(on_turn_started)
     turn_tracking_observer.event_handler("on_turn_ended")(on_turn_ended)
+
+
+# --------------------------------------------------------------------------
+# Application-turn and retained-work recorders
+# --------------------------------------------------------------------------
+
+
+_CHILD_COUNTER_FOR_OUTCOME: Mapping[str, str] = MappingProxyType(
+    {
+        "direct": "direct_count",
+        "unsupported": "unsupported_count",
+        "completed": "completed_count",
+        "retained": "retained_count",
+        "clarify": "clarification_count",
+        "declined": "declined_count",
+        "failed": "failed_count",
+        "cancelled": "cancelled_count",
+        "missing_worker": "failed_count",
+        "missing_search": "failed_count",
+        "capacity_rejected": "failed_count",
+        "retention_rejected": "failed_count",
+    }
+)
+
+_PARENT_OUTCOME_FOR_COUNTER: Mapping[str, str] = MappingProxyType(
+    {
+        "direct_count": "direct",
+        "unsupported_count": "unsupported",
+        "completed_count": "completed",
+        "retained_count": "retained",
+        "clarification_count": "clarify",
+        "declined_count": "declined",
+        "failed_count": "failed",
+        "cancelled_count": "cancelled",
+    }
+)
+
+
+class AppTurnRecorder:
+    """Parent ``app_turn_foreground`` recorder: one per accepted semantic turn.
+
+    Callers record zero or more children through :meth:`record_child`, then
+    call :meth:`finalize` exactly once. ``finalize`` is idempotent so a stray
+    second call from a defensive branch cannot double-emit; the emission
+    itself is contained by :func:`_safe_emit`, so a producer bug here cannot
+    change routing/result/speech behavior.
+    """
+
+    def __init__(
+        self,
+        sink: MeasurementSink,
+        *,
+        session_id: str,
+        origin_epoch: int,
+        turn_id: str,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        self._sink = sink
+        self._session_id = session_id
+        self._origin_epoch = origin_epoch
+        self._turn_id = turn_id
+        self._clock = clock
+        self._start = clock()
+        self._counters: dict[str, int] = dict.fromkeys(_APP_TURN_COUNTER_FIELDS, 0)
+        self._dispatched_children = 0
+        self._finalized = False
+        self.routing_ms: float | None = None
+        self.commit_ms: float | None = None
+
+    @property
+    def turn_id(self) -> str:
+        return self._turn_id
+
+    @property
+    def finalized(self) -> bool:
+        return self._finalized
+
+    def record_child(self, outcome: str) -> None:
+        """Attribute one dispatched child's outcome to its exhaustive counter
+        and count it toward ``child_count``."""
+        counter = _CHILD_COUNTER_FOR_OUTCOME.get(outcome)
+        if counter is None:
+            logger.warning(f"app_turn_foreground: unrecognized child outcome {outcome!r}")
+            return
+        self._counters[counter] += 1
+        self._dispatched_children += 1
+
+    def record_zero_child_outcome(self, outcome: str) -> None:
+        """Attribute the turn's own category counter without a dispatched
+        child. Used for direct/unsupported/clarify responses resolved by the
+        router itself, which never reach worker dispatch: the turn still
+        belongs to its own outcome category, but ``child_count`` stays 0."""
+        counter = _CHILD_COUNTER_FOR_OUTCOME.get(outcome)
+        if counter is None:
+            logger.warning(f"app_turn_foreground: unrecognized child outcome {outcome!r}")
+            return
+        self._counters[counter] += 1
+
+    def record_routing(self, routing_ms: float) -> None:
+        self.routing_ms = routing_ms
+
+    def record_commit(self, commit_ms: float) -> None:
+        self.commit_ms = commit_ms
+
+    def finalize(
+        self,
+        *,
+        outcome: str | None = None,
+        control_action: str | None = None,
+        control_outcome: str | None = None,
+    ) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        total_ms = (self._clock() - self._start) * 1000
+        if outcome is None:
+            nonzero = [name for name in _APP_TURN_COUNTER_FIELDS if self._counters[name]]
+            if len(nonzero) == 1:
+                outcome = _PARENT_OUTCOME_FOR_COUNTER[nonzero[0]]
+            elif len(nonzero) > 1:
+                outcome = "mixed"
+            else:
+                logger.warning(
+                    f"app_turn_foreground: no outcome could be derived for turn_id={self._turn_id!r}"
+                )
+                return
+        fields: dict[str, Any] = {
+            "session_id": self._session_id,
+            "origin_epoch": self._origin_epoch,
+            "turn_id": self._turn_id,
+            "outcome": outcome,
+            "total_ms": total_ms,
+            "child_count": self._dispatched_children,
+            **self._counters,
+        }
+        if control_action is not None:
+            fields["control_action"] = control_action
+        if control_outcome is not None:
+            fields["control_outcome"] = control_outcome
+        if self.routing_ms is not None:
+            fields["routing_ms"] = self.routing_ms
+        if self.commit_ms is not None:
+            fields["commit_ms"] = self.commit_ms
+        _safe_emit(self._sink, "app_turn_foreground", fields)
+
+
+class WorkItemRecorder:
+    """Child ``work_item_foreground`` recorder: one per dispatched work item."""
+
+    def __init__(
+        self,
+        sink: MeasurementSink,
+        *,
+        session_id: str,
+        origin_epoch: int,
+        turn_id: str,
+        work_item_id: str,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        self._sink = sink
+        self._session_id = session_id
+        self._origin_epoch = origin_epoch
+        self._turn_id = turn_id
+        self._work_item_id = work_item_id
+        self._clock = clock
+        self._start = clock()
+        self._finalized = False
+
+    @property
+    def finalized(self) -> bool:
+        return self._finalized
+
+    def finalize(
+        self,
+        *,
+        outcome: str,
+        app_worker_id: str | None = None,
+        result_id: str | None = None,
+        search_ms: float | None = None,
+        commit_ms: float | None = None,
+    ) -> str:
+        """Emit once and return ``outcome`` so callers can feed the parent counter."""
+        if self._finalized:
+            return outcome
+        self._finalized = True
+        total_ms = (self._clock() - self._start) * 1000
+        fields: dict[str, Any] = {
+            "session_id": self._session_id,
+            "origin_epoch": self._origin_epoch,
+            "turn_id": self._turn_id,
+            "work_item_id": self._work_item_id,
+            "outcome": outcome,
+            "total_ms": total_ms,
+        }
+        if app_worker_id is not None:
+            fields["app_worker_id"] = app_worker_id
+        if result_id is not None:
+            fields["result_id"] = result_id
+        if search_ms is not None:
+            fields["search_ms"] = search_ms
+        if commit_ms is not None:
+            fields["commit_ms"] = commit_ms
+        _safe_emit(self._sink, "work_item_foreground", fields)
+        return outcome
+
+
+class RetainedRecorder:
+    """Host-owned, telemetry-only recorder for one retained work item.
+
+    State machine: ``pending`` -> ``claimed`` -> ``commit_recorded`` ->
+    ``speech_recorded`` -> ``finalized``. Every transition is idempotent so a
+    duplicate or late callback cannot corrupt an already-progressing or
+    already-finalized recorder. This registry is telemetry-only: it never
+    participates in cancellation/dedup decisions, which remain owned by
+    ``SessionHost``'s existing bookkeeping sets.
+    """
+
+    def __init__(
+        self,
+        sink: MeasurementSink,
+        *,
+        session_id: str,
+        origin_epoch: int,
+        turn_id: str,
+        work_item_id: str,
+        app_worker_id: str,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        self._sink = sink
+        self._session_id = session_id
+        self._origin_epoch = origin_epoch
+        self._turn_id = turn_id
+        self._work_item_id = work_item_id
+        self._app_worker_id = app_worker_id
+        self._clock = clock
+        self._start = clock()
+        self.state = "pending"
+        self.work_outcome: str | None = None
+        self.commit_outcome: str | None = None
+        self.speech_outcome: str | None = None
+        self.result_id: str | None = None
+
+    @property
+    def finalized(self) -> bool:
+        return self.state == "finalized"
+
+    def claim(self, terminal_kind: str) -> bool:
+        """Advance ``pending`` -> ``claimed`` with the classified terminal kind.
+
+        Invoked synchronously from the coordinator's ``on_late_terminal`` hook,
+        before completion-callback shutdown suppression can run, so a claimed
+        work outcome is captured even when the normal completion path is
+        suppressed.
+        """
+        if self.state != "pending":
+            return False
+        self.work_outcome = terminal_kind
+        self.state = "claimed"
+        return True
+
+    def record_commit(self, commit_outcome: str, *, result_id: str | None = None) -> bool:
+        if self.state == "finalized":
+            return False
+        self.commit_outcome = commit_outcome
+        if result_id is not None:
+            self.result_id = result_id
+        if self.state == "claimed":
+            self.state = "commit_recorded"
+        return True
+
+    def record_speech(self, speech_outcome: str) -> bool:
+        if self.state == "finalized":
+            return False
+        self.speech_outcome = speech_outcome
+        if self.state == "commit_recorded":
+            self.state = "speech_recorded"
+        return True
+
+    def finalize(
+        self,
+        *,
+        work_outcome: str | None = None,
+        commit_outcome: str | None = None,
+        speech_outcome: str | None = None,
+        result_id: str | None = None,
+    ) -> bool:
+        """Emit the terminal ``work_item_background`` record and close the recorder.
+
+        Idempotent: a callback arriving after finalization is a no-op, which is
+        exactly the "callback after recorder already finalized" contract.
+        """
+        if self.state == "finalized":
+            return False
+        if work_outcome is not None:
+            self.work_outcome = work_outcome
+        if commit_outcome is not None:
+            self.commit_outcome = commit_outcome
+        if speech_outcome is not None:
+            self.speech_outcome = speech_outcome
+        if result_id is not None:
+            self.result_id = result_id
+        self.state = "finalized"
+        background_ms = (self._clock() - self._start) * 1000
+        fields: dict[str, Any] = {
+            "session_id": self._session_id,
+            "origin_epoch": self._origin_epoch,
+            "turn_id": self._turn_id,
+            "work_item_id": self._work_item_id,
+            "app_worker_id": self._app_worker_id,
+            "background_ms": background_ms,
+            "work_outcome": self.work_outcome,
+            "commit_outcome": self.commit_outcome,
+            "speech_outcome": self.speech_outcome,
+        }
+        if self.result_id is not None:
+            fields["result_id"] = self.result_id
+        _safe_emit(self._sink, "work_item_background", fields)
+        return True

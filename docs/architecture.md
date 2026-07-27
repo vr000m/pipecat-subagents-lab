@@ -115,7 +115,19 @@ Two independent producers share that one contract:
   acknowledgement, commit, and retained background completion are not all
   metric-emitting Pipecat service processors, so they get explicit monotonic
   timers around the parent semantic turn (`app_turn_foreground`) and its child
-  work items (`work_item_foreground`, `work_item_background`).
+  work items (`work_item_foreground`, `work_item_background`). A provisional
+  `RetainedRecorder` is created at work-dispatch time, before the coordinator
+  callback that could claim it is registered; `SessionHost` owns a
+  process-lifetime registry of these recorders that survives connection
+  replacement and is telemetry-only — the existing `_known_work_items`/
+  `_cancelled_work_items` sets remain the sole behavioral authority for
+  cancellation and duplicate detection. A synchronous, telemetry-only
+  `on_late_terminal` hook on the coordinator classifies each retained task's
+  terminal kind (`completed`/`failed`/`cancelled`) before the coordinator's
+  shutdown guard can suppress its normal completion callback, so
+  `SessionHost.shutdown` can finalize any still-open recorder from its
+  claimed terminal kind and reached commit/speech stage after
+  `coordinator.shutdown()` settles outstanding work.
 
 Pipecat turn numbers (`pipecat_turn`) and application turn IDs (`turn_id`) are
 deliberately separate identifiers; a framework event omits `turn_id` rather

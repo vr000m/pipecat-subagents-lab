@@ -84,6 +84,13 @@ class LateResult:
     worker_id: str
     result: Any = None
     error: str | None = None
+    terminal_kind: str | None = None
+    """Structured completion class: ``completed``, ``failed``, or ``cancelled``.
+
+    Classified directly from the completed task, independent of ``error``'s
+    free-text content, so telemetry never has to infer cancellation from an
+    error string.
+    """
 
 
 @dataclass(frozen=True)
@@ -256,8 +263,17 @@ class WorkItemCoordinator:
         work_item_id: str,
         worker_id: str,
         on_complete: Callable[[LateResult], Any] | None = None,
+        on_late_terminal: Callable[[str, str], Any] | None = None,
     ) -> bool:
-        """Retain a timed-out task, returning false when shutdown rejects ownership."""
+        """Retain a timed-out task, returning false when shutdown rejects ownership.
+
+        ``on_late_terminal`` is a synchronous, telemetry-only hook invoked with
+        ``(work_item_id, terminal_kind)`` as the very first action inside the
+        completion callback, before the shutdown guard below can suppress
+        ``on_complete``. This lets a host-owned recorder observe every retained
+        task's terminal classification even when shutdown suppresses the normal
+        completion path.
+        """
         if self._shutdown:
             self._track_cancelling_task(task)
             return False
@@ -268,6 +284,14 @@ class WorkItemCoordinator:
         self._background_task_order.append(task)
 
         def completed(completed_task: asyncio.Task[Any]) -> None:
+            if completed_task.cancelled():
+                terminal_kind = "cancelled"
+            elif completed_task.exception() is not None:
+                terminal_kind = "failed"
+            else:
+                terminal_kind = "completed"
+            if on_late_terminal is not None:
+                on_late_terminal(work_item_id, terminal_kind)
             self._discard_ordered_task(
                 completed_task,
                 self._late_tasks,
@@ -282,18 +306,21 @@ class WorkItemCoordinator:
                     work_item_id=work_item_id,
                     worker_id=worker_id,
                     error="CancelledError: worker task was cancelled",
+                    terminal_kind=terminal_kind,
                 )
             except Exception as exc:  # noqa: BLE001  # intentional catch-all: any worker task failure must surface as a LateResult, not crash the coordinator
                 late = LateResult(
                     work_item_id=work_item_id,
                     worker_id=worker_id,
                     error=f"{type(exc).__name__}: {exc}",
+                    terminal_kind=terminal_kind,
                 )
             else:
                 late = LateResult(
                     work_item_id=work_item_id,
                     worker_id=worker_id,
                     result=Result(**value) if isinstance(value, dict) else value,
+                    terminal_kind=terminal_kind,
                 )
             if on_complete is None:
                 self._late_results.append(late)
@@ -508,6 +535,7 @@ class WorkItemCoordinator:
         *,
         on_late_complete: Callable[[LateResult], Any] | None = None,
         work_item_ids: list[str] | None = None,
+        on_late_terminal: Callable[[str, str], Any] | None = None,
     ) -> SubmittedOutcome:
         self._ensure_open()
         submission_task = asyncio.current_task()
@@ -629,6 +657,7 @@ class WorkItemCoordinator:
                     work_item_id=work[index].work_item_id,
                     worker_id=selected[index][0],
                     on_complete=on_late_complete,
+                    on_late_terminal=on_late_terminal,
                 )
                 if accepted:
                     pending_ids.append(work[index].work_item_id)
@@ -637,7 +666,7 @@ class WorkItemCoordinator:
                         WorkItemFailure(
                             work_item_id=work[index].work_item_id,
                             worker_id=selected[index][0],
-                            error_type="CapacityError",
+                            error_type="RetentionCapacityError",
                             error_message="worker execution could not continue in background",
                         ),
                     )

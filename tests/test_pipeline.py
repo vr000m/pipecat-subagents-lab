@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 
 import pytest
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -23,6 +24,7 @@ import server.app as app_module
 import server.pipeline as pipeline_module
 from server.config import Config
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
+from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
 from server.services.tts import CorrelatedTTSSpeakFrame
@@ -2088,8 +2090,6 @@ def test_stale_epoch_observer_callbacks_stay_console_only_and_become_collectible
     import gc
     import weakref
 
-    from server.perf_metrics import CollectingMeasurementSink
-
     async def run() -> None:
         sink = CollectingMeasurementSink()
         host = SessionHost(
@@ -2214,3 +2214,1169 @@ def test_enable_metrics_toggle_does_not_change_real_pipeline_worker_frame_flow()
         ]
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------
+# Phase 2: application-turn foreground and retained-work background timing.
+#
+# These tests are black-box: they only construct SessionHost with a
+# CollectingMeasurementSink and inspect the emitted PERF_METRIC records, so
+# they do not depend on the shape of whatever parent/child/retained recorder
+# classes the Phase 2 implementation adds. They cover representative rows of
+# the plan's Foreground Branch and Fault Matrix and Retained Branch and Race
+# Matrix, not literally every row (see the test-writer's final report for the
+# rows intentionally left uncovered).
+# --------------------------------------------------------------------------
+
+
+def _events(sink: CollectingMeasurementSink, name: str) -> tuple[object, ...]:
+    return tuple(record for record in sink.records if record.event == name)
+
+
+def test_direct_response_emits_zero_child_app_turn_foreground() -> None:
+    async def run() -> None:
+        class DirectCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "routed",
+                        "decision": type("Decision", (), {"action": "direct"})(),
+                        "prose": "Here is a direct answer.",
+                        "transcript": transcript,
+                    },
+                )()
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=DirectCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("what is 2+2")
+
+        assert result.text == "Here is a direct answer."
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        fields = parents[0].fields
+        assert fields["outcome"] == "direct"
+        assert fields["child_count"] == 0
+        assert fields["direct_count"] == 1
+        assert all(
+            fields[name] == 0
+            for name in (
+                "unsupported_count",
+                "completed_count",
+                "retained_count",
+                "clarification_count",
+                "declined_count",
+                "failed_count",
+                "cancelled_count",
+            )
+        )
+        assert _events(sink, "work_item_foreground") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_unsupported_capability_emits_zero_child_app_turn_foreground() -> None:
+    async def run() -> None:
+        class UnsupportedActionCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "routed",
+                        "decision": type("Decision", (), {"action": "unsupported"})(),
+                        "prose": None,
+                        "transcript": transcript,
+                    },
+                )()
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=UnsupportedActionCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("open my calendar")
+
+        assert result.text == "I cannot access that capability here."
+        fields = _events(sink, "app_turn_foreground")[0].fields
+        assert fields["outcome"] == "unsupported"
+        assert fields["child_count"] == 0
+        assert fields["unsupported_count"] == 1
+        assert _events(sink, "work_item_foreground") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_router_clarification_emits_clarify_outcome_with_zero_child() -> None:
+    async def run() -> None:
+        class ClarifyActionCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "routed",
+                        "decision": type("Decision", (), {"action": "clarify"})(),
+                        "prose": None,
+                        "transcript": transcript,
+                    },
+                )()
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=ClarifyActionCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("search for something vague")
+
+        fields = _events(sink, "app_turn_foreground")[0].fields
+        assert fields["outcome"] == "clarify"
+        assert fields["child_count"] == 0
+        assert fields["clarification_count"] == 1
+        assert _events(sink, "work_item_foreground") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_control_emits_control_action_and_applied_outcome() -> None:
+    async def run() -> None:
+        class ControlCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": (),
+                        "control_action": "cancel",
+                    },
+                )()
+
+        sink = CollectingMeasurementSink()
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            coordinator=ControlCoordinator(),
+            measurement_sink=sink,
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+
+        await host._handle_transcript("cancel")
+
+        fields = _events(sink, "app_turn_foreground")[0].fields
+        assert fields["outcome"] == "control"
+        assert fields["control_action"] == "cancel"
+        assert fields["control_outcome"] == "applied"
+        assert fields["child_count"] == 0
+        assert _events(sink, "work_item_foreground") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_unknown_cancel_target_emits_control_with_unknown_target_outcome() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(runner_factory=LifecycleRunner, measurement_sink=sink)
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("cancel work-item-does-not-exist")
+
+        fields = _events(sink, "app_turn_foreground")[0].fields
+        assert fields["outcome"] == "control"
+        assert fields["control_action"] == "cancel"
+        assert fields["control_outcome"] == "unknown_target"
+        assert fields["child_count"] == 0
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_consent_without_pending_dialogue_emits_control_no_pending_outcome() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(runner_factory=LifecycleRunner, measurement_sink=sink)
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("consent")
+
+        fields = _events(sink, "app_turn_foreground")[0].fields
+        assert fields["outcome"] == "control"
+        assert fields["control_action"] == "consent"
+        assert fields["control_outcome"] == "no_pending"
+        assert fields["child_count"] == 0
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_worker_clarification_emits_clarify_parent_and_one_child() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(ClarifyingResultWorker()),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("weather")
+
+        assert result.text == "Which city's weather do you mean?"
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "clarify"
+        assert parent["child_count"] == 1
+        assert parent["clarification_count"] == 1
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "clarify"
+        assert children[0].fields["turn_id"] == parent["turn_id"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_worker_decline_emits_declined_parent_and_one_child() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(DecliningResultWorker()),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("private calendar")
+
+        assert result.text == "I could not find a reliable result for that request."
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "declined"
+        assert parent["child_count"] == 1
+        assert parent["declined_count"] == 1
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "declined"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_missing_worker_emits_failed_parent_and_missing_worker_child() -> None:
+    async def run() -> None:
+        class NoWorkerCoordinator(RoutedCoordinator):
+            def dispatch(self, _decision: object) -> object:
+                return None
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=NoWorkerCoordinator(None),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("dispatch to missing worker")
+
+        # Existing behavior (unchanged): the raw routed outcome is returned
+        # when dispatch cannot resolve a worker.
+        assert getattr(result, "kind", None) == "routed"
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        assert parent["child_count"] == 1
+        assert parent["failed_count"] == 1
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "missing_worker"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_missing_search_capability_emits_failed_parent_and_missing_search_child() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(object()),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("no search capability")
+
+        assert getattr(result, "kind", None) == "routed"
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        assert parent["child_count"] == 1
+        assert parent["failed_count"] == 1
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "missing_search"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_delegated_foreground_success_emits_completed_parent_and_one_child() -> None:
+    async def run() -> None:
+        search = ProjectedResultWorker()
+        coordinator = ProjectedCoordinator(search)
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("historical capitals")
+
+        assert result.text == "Answer for historical capitals"
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "completed"
+        assert parent["child_count"] == 1
+        assert parent["completed_count"] == 1
+        assert all(
+            parent[name] == 0
+            for name in (
+                "direct_count",
+                "unsupported_count",
+                "retained_count",
+                "clarification_count",
+                "declined_count",
+                "failed_count",
+                "cancelled_count",
+            )
+        )
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        child = children[0].fields
+        assert child["outcome"] == "completed"
+        assert child["turn_id"] == parent["turn_id"]
+        assert "search_ms" in child
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_delegated_foreground_timeout_emits_retained_parent_and_child_then_background_completion() -> (
+    None
+):
+    async def run() -> None:
+        worker = BlockingResultWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "slow search", "model_policy": "deep"},
+        )()
+
+        class RetainingRoutedCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(worker)
+                self.owner = WorkItemCoordinator(
+                    config=Config(foreground_search_timeout_seconds=0.001)
+                )
+                self.config = self.owner.config
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                return self.owner.start_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **kwargs: object) -> bool:
+                return self.owner.retain_late_task(task, **kwargs)
+
+            async def shutdown(self) -> None:
+                await self.owner.shutdown()
+
+        sink = CollectingMeasurementSink()
+        coordinator = RetainingRoutedCoordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        foreground = await host._handle_transcript("slow query")
+        assert "continue in the background" in foreground.text
+
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "retained"
+        assert parent["retained_count"] == 1
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "retained"
+        assert _events(sink, "work_item_background") == ()
+
+        worker.release.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(host.state.result_history("worker-search")) == 2:
+                break
+
+        background = _events(sink, "work_item_background")
+        assert len(background) == 1
+        assert background[0].fields["work_outcome"] == "completed"
+        assert background[0].fields["turn_id"] == parent["turn_id"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_router_exception_emits_failed_parent_and_no_child() -> None:
+    async def run() -> None:
+        class FailingCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                raise RuntimeError("provider detail must stay in server logs")
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=FailingCoordinator(), measurement_sink=sink
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("search for India's historical capitals")
+
+        assert result.text == "Routing is temporarily unavailable. Please try that request again."
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        assert parent["child_count"] == 0
+        assert _events(sink, "work_item_foreground") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_dispatch_exception_emits_failed_parent_with_no_completed_child() -> None:
+    """Dispatch raising UnsupportedWorkerType/RoutingValidationError falls back
+    to a safe result (existing behavior) but must be labelled ``failed``: the
+    matrix's "Router, dispatch, ... raises Exception" row, distinct from the
+    router's own ``unsupported`` routing action.
+    """
+
+    async def run() -> None:
+        class UnsupportedCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {"kind": "routed", "decision": object(), "transcript": transcript},
+                )()
+
+            def dispatch(self, _decision: object) -> object:
+                raise UnsupportedWorkerType("unsupported worker type: calendar")
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=UnsupportedCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("private calendar")
+
+        assert result.text == "I cannot access that capability here."
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_router_cancellation_emits_cancelled_parent_and_no_child() -> None:
+    async def run() -> None:
+        class BlockingRouterCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(ResultWorker())
+                self.routing_started = threading.Event()
+                self.release_routing = threading.Event()
+
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                if transcript == "cancel":
+                    return type(
+                        "Outcome",
+                        (),
+                        {
+                            "kind": "control",
+                            "decision": None,
+                            "work_items": (),
+                            "control_action": "cancel",
+                        },
+                    )()
+                self.routing_started.set()
+                self.release_routing.wait(timeout=2)
+                return super().arbitrate(_session_id, transcript)
+
+        sink = CollectingMeasurementSink()
+        coordinator = BlockingRouterCoordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=coordinator,
+            measurement_sink=sink,
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        pending = asyncio.create_task(host._handle_transcript("slow route"))
+        await asyncio.to_thread(coordinator.routing_started.wait, 1)
+
+        cancellation = await host._handle_transcript("cancel")
+        coordinator.release_routing.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        assert cancellation.text == "Cancelling the active response."
+        cancelled_parents = [
+            record
+            for record in _events(sink, "app_turn_foreground")
+            if record.fields["outcome"] == "cancelled"
+        ]
+        assert len(cancelled_parents) == 1
+        assert cancelled_parents[0].fields["child_count"] == 0
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_mixed_outcomes_emit_one_child_per_item_and_mixed_parent() -> None:
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=4)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(text: str, _catalogue: object) -> object:
+                action = {
+                    "answer directly": "direct",
+                    "ask me": "clarify",
+                    "unsupported thing": "unsupported",
+                    "search it": "existing_worker",
+                }[text]
+                decision = type("Decision", (), {"action": action})()
+                prose = {
+                    "direct": "Direct answer.",
+                    "clarify": "Which one?",
+                    "unsupported": None,
+                    "existing_worker": None,
+                }[action]
+                return type("Envelope", (), {"decision": decision, "prose": prose})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+            def dispatch(self, decision: object, **_: object) -> object:
+                assert decision.action == "existing_worker"
+                return worker
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome",
+            (),
+            {
+                "work_items": (
+                    "answer directly",
+                    "ask me",
+                    "unsupported thing",
+                    "search it",
+                ),
+                "pending_dialogue": None,
+            },
+        )()
+
+        results = await host._handle_multi_intent(outcome, "", origin, "turn-compound")
+
+        assert [result.text for result in results] == [
+            "Direct answer.",
+            "Which one?",
+            "I cannot access that capability here.",
+            "Answer for search it",
+        ]
+        parent = _events(sink, "app_turn_foreground")
+        assert len(parent) == 1
+        parent_fields = parent[0].fields
+        assert parent_fields["outcome"] == "mixed"
+        assert parent_fields["turn_id"] == "turn-compound"
+        assert parent_fields["child_count"] == 4
+        assert parent_fields["direct_count"] == 1
+        assert parent_fields["clarification_count"] == 1
+        assert parent_fields["unsupported_count"] == 1
+        assert parent_fields["completed_count"] == 1
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 4
+        assert {child.fields["outcome"] for child in children} == {
+            "direct",
+            "clarify",
+            "unsupported",
+            "completed",
+        }
+        assert all(child.fields["turn_id"] == "turn-compound" for child in children)
+        assert len({child.fields["work_item_id"] for child in children}) == 4
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_all_completed_emits_completed_parent_and_all_completed_children() -> None:
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(_text: str, _catalogue: object) -> object:
+                decision = type("Decision", (), {"action": "existing_worker"})()
+                return type("Envelope", (), {"decision": decision, "prose": None})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome",
+            (),
+            {"work_items": ("first item", "second item"), "pending_dialogue": None},
+        )()
+
+        await host._handle_multi_intent(outcome, "", origin, "turn-all-complete")
+
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "completed"
+        assert parent["child_count"] == 2
+        assert parent["completed_count"] == 2
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 2
+        assert all(child.fields["outcome"] == "completed" for child in children)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_foreground_timing_fields_respect_start_stop_boundary_ordering() -> None:
+    """Deterministic-clock stand-in: exact per-field durations against the
+    Timing Boundaries table require knowing the Phase 2 recorder's internal
+    ``time.perf_counter()`` call sites, which are implementation-internal and
+    not yet built (see ``needs_impl_clarification`` in the final report).
+    This asserts the observable relationships the boundaries imply instead:
+    ``routing_ms``/``search_ms`` are each individually bounded below by a
+    real, injected delay, and ``total_ms`` is at least their sum.
+    """
+
+    async def run() -> None:
+        class SlowRoutingCoordinator(RoutedCoordinator):
+            def arbitrate(self, session_id: str, transcript: str) -> object:
+                # `coordinator.arbitrate` runs inside `asyncio.to_thread`, so a
+                # thread-blocking sleep produces a real, measurable delay.
+                time.sleep(0.05)
+                return super().arbitrate(session_id, transcript)
+
+        class SlowSearchWorker(ResultWorker):
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                await asyncio.sleep(0.05)
+                return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=SlowRoutingCoordinator(SlowSearchWorker()),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("Riga weather")
+
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        child = _events(sink, "work_item_foreground")[0].fields
+
+        assert parent.get("routing_ms", 0) >= 30
+        assert child.get("search_ms", 0) >= 30
+        assert parent["total_ms"] >= parent.get("routing_ms", 0) + child.get("search_ms", 0) - 5
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def _background_records(sink: CollectingMeasurementSink) -> tuple[object, ...]:
+    return _events(sink, "work_item_background")
+
+
+def test_retained_completion_with_speech_emits_completed_committed_queued() -> None:
+    async def run() -> None:
+        tts = FakeTTS()
+        sink = CollectingMeasurementSink()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts, measurement_sink=sink)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        result = GroundedResult(
+            result_id="result-retained-ok",
+            worker_id="worker-search",
+            turn_id="turn-retained-ok",
+            text="Complete late answer",
+            spoken_text="Spoken late answer",
+            origin_epoch=1,
+        )
+        late = LateResult(
+            work_item_id="work-retained-ok",
+            worker_id="worker-search",
+            result=result,
+            terminal_kind="completed",
+        )
+
+        await host._commit_late_result(late, 1)
+
+        records = _background_records(sink)
+        assert len(records) == 1
+        fields = records[0].fields
+        assert fields["work_outcome"] == "completed"
+        assert fields["commit_outcome"] == "committed"
+        assert fields["speech_outcome"] == "queued"
+        assert fields["work_item_id"] == "work-retained-ok"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retained_worker_exception_emits_failed_not_applicable_axes() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-failed",
+                worker_id="worker-search",
+                error="RuntimeError: provider exploded",
+                terminal_kind="failed",
+            ),
+            1,
+        )
+
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "failed"
+        assert fields["commit_outcome"] == "not_applicable"
+        assert fields["speech_outcome"] == "not_applicable"
+        assert host.state.result_history("worker-search") == ()
+
+    asyncio.run(run())
+
+
+def test_retained_worker_cancellation_emits_cancelled_axes() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-cancelled",
+                worker_id="worker-search",
+                error="CancelledError: worker task was cancelled",
+                terminal_kind="cancelled",
+            ),
+            1,
+        )
+
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "cancelled"
+        assert fields["commit_outcome"] == "suppressed_cancelled"
+        assert fields["speech_outcome"] == "cancelled"
+
+    asyncio.run(run())
+
+
+def test_retained_user_cancelled_work_item_suppresses_commit_and_speech() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+        host._cancelled_work_items.add("work-user-cancelled")
+        result = GroundedResult(
+            result_id="result-user-cancelled",
+            worker_id="worker-search",
+            turn_id="turn-user-cancelled",
+            text="Should not commit",
+            spoken_text="Should not commit",
+            origin_epoch=1,
+        )
+
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-user-cancelled", worker_id="worker-search", result=result
+            ),
+            1,
+        )
+
+        assert host.state.result_history("worker-search") == ()
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "cancelled"
+        assert fields["commit_outcome"] == "suppressed_cancelled"
+
+    asyncio.run(run())
+
+
+def test_retained_invalid_result_type_emits_invalid_result_axes() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-invalid",
+                worker_id="worker-search",
+                result="not a GroundedResult",
+            ),
+            1,
+        )
+
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "invalid_result"
+        assert fields["commit_outcome"] == "not_applicable"
+        assert fields["speech_outcome"] == "not_applicable"
+
+    asyncio.run(run())
+
+
+def test_retained_duplicate_result_id_suppresses_commit() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+        existing = GroundedResult(
+            result_id="result-dup",
+            worker_id="worker-search",
+            turn_id="turn-dup",
+            text="First",
+            spoken_text="First",
+            origin_epoch=1,
+        )
+        host.state.append_result(existing, origin_epoch=1)
+        duplicate = GroundedResult(
+            result_id="result-dup",
+            worker_id="worker-search",
+            turn_id="turn-dup",
+            text="First",
+            spoken_text="First",
+            origin_epoch=1,
+        )
+
+        await host._commit_late_result(
+            LateResult(work_item_id="work-dup", worker_id="worker-search", result=duplicate),
+            1,
+        )
+
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "completed"
+        assert fields["commit_outcome"] == "suppressed_duplicate"
+        assert fields["speech_outcome"] == "not_applicable"
+
+    asyncio.run(run())
+
+
+def test_retained_result_after_connection_replaced_commits_but_marks_speech_stale() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        tts = FakeTTS()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts, measurement_sink=sink)
+        first = await host.connect(connection_handshake(host, 1))
+        first.worker = QueueingPipelineWorker()
+        second = await host.connect(connection_handshake(host, 2))
+        second.worker = QueueingPipelineWorker()
+
+        result = GroundedResult(
+            result_id="result-replaced-epoch",
+            worker_id="worker-search",
+            turn_id="turn-replaced-epoch",
+            text="Complete",
+            spoken_text="Complete",
+            origin_epoch=1,
+        )
+
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-replaced-epoch", worker_id="worker-search", result=result
+            ),
+            1,
+        )
+
+        assert host.state.result_history("worker-search")[-1] == result
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "completed"
+        assert fields["commit_outcome"] == "committed"
+        assert fields["speech_outcome"] == "stale_connection"
+        assert not any(isinstance(frame, TTSSpeakFrame) for frame in second.worker.frames)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retained_result_from_replaced_origin_epoch_suppresses_commit_as_stale() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+        result = GroundedResult(
+            result_id="result-stale-origin",
+            worker_id="worker-search",
+            turn_id="turn-stale-origin",
+            text="Old",
+            spoken_text="Old",
+            origin_epoch=1,
+        )
+
+        await host._commit_late_result(
+            LateResult(work_item_id="work-stale-origin", worker_id="worker-search", result=result),
+            2,
+        )
+
+        assert host.state.result_history("worker-search") == ()
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "completed"
+        assert fields["commit_outcome"] == "suppressed_stale"
+        assert fields["speech_outcome"] == "not_applicable"
+
+    asyncio.run(run())
+
+
+def test_retained_result_without_active_connection_marks_speech_disconnected() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+        result = GroundedResult(
+            result_id="result-disconnected",
+            worker_id="worker-search",
+            turn_id="turn-disconnected",
+            text="Complete",
+            spoken_text="Complete",
+            origin_epoch=1,
+        )
+
+        await host._commit_late_result(
+            LateResult(work_item_id="work-disconnected", worker_id="worker-search", result=result),
+            1,
+        )
+
+        assert host.state.result_history("worker-search")[-1] == result
+        fields = _background_records(sink)[0].fields
+        assert fields["commit_outcome"] == "committed"
+        assert fields["speech_outcome"] == "disconnected"
+
+    asyncio.run(run())
+
+
+def test_retained_result_without_tts_service_marks_speech_no_tts() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(runner_factory=LifecycleRunner, measurement_sink=sink)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        result = GroundedResult(
+            result_id="result-no-tts",
+            worker_id="worker-search",
+            turn_id="turn-no-tts",
+            text="Complete",
+            spoken_text="Complete",
+            origin_epoch=1,
+        )
+
+        await host._commit_late_result(
+            LateResult(work_item_id="work-no-tts", worker_id="worker-search", result=result),
+            1,
+        )
+
+        fields = _background_records(sink)[0].fields
+        assert fields["commit_outcome"] == "committed"
+        assert fields["speech_outcome"] == "no_tts"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_shutdown_finalizes_open_retained_recorder_after_coordinator_settles() -> None:
+    async def run() -> None:
+        class BlockingForeverWorker(ResultWorker):
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                await asyncio.Future()
+                raise AssertionError("unreachable")  # pragma: no cover
+
+        worker = BlockingForeverWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "slow", "model_policy": "deep"},
+        )()
+        sink = CollectingMeasurementSink()
+
+        class RetainingRoutedCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(worker)
+                self.owner = WorkItemCoordinator(
+                    config=Config(foreground_search_timeout_seconds=0.001)
+                )
+                self.config = self.owner.config
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                return self.owner.start_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **kwargs: object) -> bool:
+                return self.owner.retain_late_task(task, **kwargs)
+
+            async def shutdown(self) -> None:
+                await self.owner.shutdown()
+
+        coordinator = RetainingRoutedCoordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        foreground = await host._handle_transcript("slow forever")
+        assert "continue in the background" in foreground.text
+        assert _background_records(sink) == ()
+
+        await host.shutdown()
+
+        background = _background_records(sink)
+        assert len(background) == 1
+        assert background[0].fields["work_outcome"] == "cancelled"
+
+    asyncio.run(run())
+
+
+def test_raising_sink_does_not_change_turn_result_or_speech_behavior() -> None:
+    async def run() -> None:
+        class RaisingSink:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def emit(self, record: object) -> None:
+                self.attempts += 1
+                raise RuntimeError("sink exploded")
+
+        search = ProjectedResultWorker()
+        coordinator = ProjectedCoordinator(search)
+        tts = FakeTTS()
+        sink = RaisingSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, tts=tts, coordinator=coordinator, measurement_sink=sink
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+
+        result = await host._handle_transcript("historical capitals")
+
+        assert result.text == "Answer for historical capitals"
+        assert host.state.result_history("worker-search") == (result,)
+        assert any(isinstance(frame, TTSSpeakFrame) for frame in connection.worker.frames)
+        assert sink.attempts >= 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_stale_observer_callback_after_shutdown_is_console_only_and_state_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=_NonRetainingAddRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+            measurement_sink=sink,
+        )
+        await host.start()
+
+        pipeline_args: list[object] = []
+        _monkeypatch_attach_connection_scaffolding(monkeypatch, pipeline_args=pipeline_args)
+
+        await app_module._attach_connection(
+            host,
+            object(),
+            app_module.SnapshotHandshake(
+                session_id=host.state.session_id,
+                resume_token=host.state.resume_token,
+                proposed_epoch=1,
+                snapshot_sequence=0,
+            ),
+        )
+        tracker = host.connection.worker.turn_tracking_observer
+        stale_turn_ended = tracker.handlers["on_turn_ended"]
+
+        await host.shutdown()
+
+        sequence_before = host.state.sequence
+        await stale_turn_ended(object(), 9, 2.0, False)
+
+        assert host.state.sequence == sequence_before
+        matching = [record for record in sink.records if record.event == "pipecat_turn_end"]
+        assert len(matching) == 1
+        assert matching[0].fields["pipecat_turn"] == 9
+
+    asyncio.run(run())
+
+
+def test_stale_latest_value_turn_metrics_cache_is_fully_removed() -> None:
+    """Repo-wide search: the legacy latest-value cache and all consumers must
+    be fully removed after Phase 2 (Acceptance Criteria). The needle is built
+    by concatenation so this assertion does not match its own source line.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    needle = "last_turn" + "_metrics"
+    offenders = [
+        f"{path}:{lineno}: {line.strip()}"
+        for directory in ("server", "scripts", "tests")
+        for path in (root / directory).rglob("*.py")
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1)
+        if needle in line
+    ]
+    assert offenders == [], f"legacy {needle} reference(s) found: {offenders}"

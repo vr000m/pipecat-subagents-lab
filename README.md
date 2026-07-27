@@ -349,20 +349,33 @@ browser connection's `PipelineWorker` — one `StartupTimingObserver`, one
   (`ttfb`/`text_aggregation`/`function_calls`/`user_turn_secs`). Missing
   values are omitted, never invented as zero.
 
-Application-owned events (`app_turn_foreground`, `work_item_foreground`,
-`work_item_background`) measure routing, worker dispatch, and retained
-background completion outside the Pipecat frame graph; their producers land
-in a later phase, but the schema — required/optional fields, closed outcome
-enums, and the child-counter contract — already ships in
-`server/perf_metrics.py`.
+Application-owned events measure routing, worker dispatch, and retained
+background completion outside the Pipecat frame graph:
+
+- `app_turn_foreground` — exactly one per accepted semantic turn, identified
+  by the application `turn_id` (never the Pipecat `pipecat_turn`). Reports a
+  closed `outcome` (`direct`/`unsupported`/`control`/`clarify`/`completed`/
+  `mixed`/`retained`/`declined`/`failed`/`cancelled`) plus exhaustive
+  `*_count` fan-out counters. A single-intent direct/unsupported/clarify
+  response resolved by the router attributes its own category counter without
+  dispatching (and so without counting toward) a child work item.
+- `work_item_foreground` — one per dispatched single- or multi-intent child,
+  carrying the parent `turn_id` and its own `work_item_id`.
+- `work_item_background` — one per registered retained work item, reporting
+  independent `work_outcome`/`commit_outcome`/`speech_outcome` axes so a
+  successful search whose result is suppressed or cannot be spoken is never
+  mislabeled as a failed search.
 
 Every producer emits through one `MeasurementSink` owned by `SessionHost` for
 its process lifetime: `ConsoleMeasurementSink` in production, and
 `CollectingMeasurementSink` (indexed by event, `turn_id`, and `work_item_id`)
 in tests and the smoke harness, injected via
-`_default_session_host(measurement_sink=...)`. No record ever contains
-transcript, prompt, response, citation, or credential content — this stays
-console-only and does not project into RTVI or browser state.
+`_default_session_host(measurement_sink=...)`. `scripts/smoke_conversation.py`
+reads its correlated turn/child records straight off the collecting sink
+instead of a latest-value cache, so a preceding turn can never supply the
+current turn's budget values. No record ever contains transcript, prompt,
+response, citation, or credential content — this stays console-only and does
+not project into RTVI or browser state.
 
 ## Repository layout
 

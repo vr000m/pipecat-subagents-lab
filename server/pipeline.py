@@ -24,14 +24,20 @@ from .contracts import (
     WorkerState,
 )
 from .observers import RuntimeObserver
-from .perf_metrics import ConsoleMeasurementSink, MeasurementSink
+from .perf_metrics import (
+    AppTurnRecorder,
+    ConsoleMeasurementSink,
+    MeasurementSink,
+    RetainedRecorder,
+    WorkItemRecorder,
+)
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
-from .work_item_coordinator import LateResult
+from .work_item_coordinator import LateResult, WorkItemCoordinator, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 try:
@@ -291,7 +297,13 @@ class SessionHost:
             raise ValueError("SessionHost and coordinator must share one WorkerRegistry")
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
-        self.coordinator = coordinator
+        # A bare host still needs to resolve control intents (cancel/pause/
+        # resume/consent), which arbitrate() handles without a registry or
+        # router; only routed dispatch requires the caller to supply a real
+        # coordinator with those dependencies wired in.
+        self.coordinator = (
+            coordinator if coordinator is not None else WorkItemCoordinator(registry=self.registry)
+        )
         self._tts_on_event = getattr(tts, "on_event", None)
         self.runner: Any = None
         self._runner_handles: dict[str, Any] = {}
@@ -307,7 +319,7 @@ class SessionHost:
         self._known_work_items: set[str] = set()
         self._cancelled_work_items: set[str] = set()
         self._clarification_candidates: dict[str, dict[str, str]] = {}
-        self.last_turn_metrics: dict[str, float | str] = {}
+        self._retained_recorders: dict[str, RetainedRecorder] = {}
         self.measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
         self._closing = False
         self.started = False
@@ -498,6 +510,53 @@ class SessionHost:
         self._turn_sequence += 1
         return f"turn-{self._turn_sequence}"
 
+    def _new_app_turn_recorder(self, *, origin_epoch: int, turn_id: str) -> AppTurnRecorder:
+        return AppTurnRecorder(
+            self.measurement_sink,
+            session_id=self.state.session_id,
+            origin_epoch=origin_epoch,
+            turn_id=turn_id,
+        )
+
+    def _new_work_item_recorder(
+        self, *, origin_epoch: int, turn_id: str, work_item_id: str
+    ) -> WorkItemRecorder:
+        return WorkItemRecorder(
+            self.measurement_sink,
+            session_id=self.state.session_id,
+            origin_epoch=origin_epoch,
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+        )
+
+    def _new_retained_recorder(
+        self, *, origin_epoch: int, turn_id: str, work_item_id: str, app_worker_id: str
+    ) -> RetainedRecorder:
+        return RetainedRecorder(
+            self.measurement_sink,
+            session_id=self.state.session_id,
+            origin_epoch=origin_epoch,
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            app_worker_id=app_worker_id,
+        )
+
+    def _register_retained_recorder_if_open(
+        self, work_item_id: str, recorder: RetainedRecorder
+    ) -> None:
+        """Register a provisional retained recorder only if it has not already
+        raced to completion between dispatch and accepted retention."""
+        if not recorder.finalized:
+            self._retained_recorders[work_item_id] = recorder
+
+    @staticmethod
+    def _failure_child_outcome(failure: WorkItemFailure) -> str:
+        return {
+            "CapacityError": "capacity_rejected",
+            "RetentionCapacityError": "retention_rejected",
+            "CancelledError": "cancelled",
+        }.get(failure.error_type, "failed")
+
     def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
         self._prune_handshake_tokens()
         entry = self._handshake_tokens.get(token)
@@ -531,7 +590,6 @@ class SessionHost:
         self, transcript: str, *, origin: ConnectionPipeline | None = None
     ) -> Any:
         """Route a final local-STT turn through the application coordinator."""
-        turn_started = time.perf_counter()
         origin = origin or self.connection
         if (
             self.coordinator is None
@@ -544,224 +602,285 @@ class SessionHost:
         origin_epoch = origin.epoch
         turn_id = self._next_turn_id()
         work_item_id = f"work-{turn_id}"
-        turn_task = asyncio.current_task()
-        if turn_task is not None:
-            self._track_turn_task(work_item_id, turn_task)
-        self.state.append_transcript(
-            TranscriptEntry(
-                role="user",
-                text=transcript,
-                turn_id=turn_id,
-                origin_epoch=origin_epoch,
-            )
-        )
+        turn_recorder = self._new_app_turn_recorder(origin_epoch=origin_epoch, turn_id=turn_id)
         try:
-            routing_started = time.perf_counter()
-            outcome = await asyncio.to_thread(
-                self.coordinator.arbitrate, self.state.session_id, transcript
-            )
-            routing_ms = (time.perf_counter() - routing_started) * 1000
-        except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
-            logger.exception(
-                f"Routing failed for {turn_id}; returning a safe result without provider details"
-            )
-            return await self._commit_and_speak(
-                canonical_result(
-                    worker_id="main",
+            turn_task = asyncio.current_task()
+            if turn_task is not None:
+                self._track_turn_task(work_item_id, turn_task)
+            self.state.append_transcript(
+                TranscriptEntry(
+                    role="user",
+                    text=transcript,
                     turn_id=turn_id,
-                    text="Routing is temporarily unavailable. Please try that request again.",
                     origin_epoch=origin_epoch,
-                ),
-                origin,
+                )
             )
-        if outcome.kind != "routed" or outcome.decision is None:
-            if outcome.kind == "control":
-                action = getattr(outcome, "control_action", None)
-                if action == "pause" and origin.scheduler.active is not None:
-                    target = (
-                        outcome.work_items[0]
-                        if outcome.work_items
-                        else origin.scheduler.active.item.work_item_id
+            try:
+                routing_started = time.perf_counter()
+                outcome = await asyncio.to_thread(
+                    self.coordinator.arbitrate, self.state.session_id, transcript
+                )
+                routing_ms = (time.perf_counter() - routing_started) * 1000
+                turn_recorder.record_routing(routing_ms)
+            except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
+                logger.exception(
+                    f"Routing failed for {turn_id}; returning a safe result without provider details"
+                )
+                result = await self._commit_and_speak(
+                    canonical_result(
+                        worker_id="main",
+                        turn_id=turn_id,
+                        text="Routing is temporarily unavailable. Please try that request again.",
+                        origin_epoch=origin_epoch,
+                    ),
+                    origin,
+                )
+                turn_recorder.finalize(outcome="failed")
+                return result
+            if outcome.kind != "routed" or outcome.decision is None:
+                control_action: str | None = None
+                control_outcome: str | None = None
+                if outcome.kind == "control":
+                    action = getattr(outcome, "control_action", None)
+                    control_action = action
+                    control_outcome = (
+                        "no_active" if action in {"pause", "resume"} else "unknown_target"
                     )
-                    origin.scheduler.pause(target)
-                    await origin.scheduler.wait_for_stops()
-                elif action == "resume":
-                    target = outcome.work_items[0] if outcome.work_items else None
-                    replay = origin.scheduler.resume(target)
-                    if replay is not None:
-                        await origin.scheduler.start_next(replay.work_item_id)
-                elif action in {"cancel", "stop"}:
-                    target = outcome.work_items[0] if outcome.work_items else None
-                    cancelled_work = self._cancel_work(
-                        target,
-                        exclude_work_item_id=work_item_id,
+                    if action == "pause" and origin.scheduler.active is not None:
+                        target = (
+                            outcome.work_items[0]
+                            if outcome.work_items
+                            else origin.scheduler.active.item.work_item_id
+                        )
+                        origin.scheduler.pause(target)
+                        await origin.scheduler.wait_for_stops()
+                        control_outcome = "applied"
+                    elif action == "resume":
+                        target = outcome.work_items[0] if outcome.work_items else None
+                        replay = origin.scheduler.resume(target)
+                        if replay is not None:
+                            await origin.scheduler.start_next(replay.work_item_id)
+                            control_outcome = "applied"
+                    elif action in {"cancel", "stop"}:
+                        target = outcome.work_items[0] if outcome.work_items else None
+                        cancelled_work = self._cancel_work(
+                            target,
+                            exclude_work_item_id=work_item_id,
+                        )
+                        cancelled_speech = origin.scheduler.cancel(target)
+                        await origin.scheduler.wait_for_stops()
+                        if not cancelled_work and not cancelled_speech:
+                            action = "unknown_target" if target is not None else "no_active"
+                            control_outcome = action
+                        else:
+                            control_outcome = "applied"
+                    elif action == "consent":
+                        control_outcome = "no_pending"
+                    text = {
+                        "pause": "Pausing the active response.",
+                        "resume": "Resuming the paused response.",
+                        "cancel": "Cancelling the active response.",
+                        "stop": "Stopping the active response.",
+                        "unknown_target": "I could not find that active work item.",
+                        "no_active": "There is no active response to cancel.",
+                    }.get(action, "Control request noted.")
+                elif outcome.kind == "multi_intent":
+                    return await self._handle_multi_intent(outcome, transcript, origin, turn_id)
+                elif outcome.kind == "continue_pending":
+                    return await self._handle_pending(outcome, transcript, origin, turn_id)
+                else:
+                    text = None
+                if text is None:
+                    turn_recorder.finalize(outcome="failed")
+                    return outcome
+                result = await self._commit_and_speak(
+                    canonical_result(
+                        worker_id="main",
+                        turn_id=turn_id,
+                        text=text,
+                        origin_epoch=origin_epoch,
+                    ),
+                    origin,
+                )
+                turn_recorder.finalize(
+                    outcome="control",
+                    control_action=control_action,
+                    control_outcome=control_outcome,
+                )
+                return result
+            if isinstance(outcome.decision, RoutingDecision):
+                self.state.set_routing(
+                    RoutingState(
+                        turn_id=turn_id,
+                        action=outcome.decision.action,
+                        worker_id=outcome.decision.worker_id,
+                        worker_type=outcome.decision.worker_type,
+                        topic=outcome.decision.topic,
+                        model_policy=outcome.decision.model_policy,
+                        origin_epoch=origin_epoch,
                     )
-                    cancelled_speech = origin.scheduler.cancel(target)
-                    await origin.scheduler.wait_for_stops()
-                    if not cancelled_work and not cancelled_speech:
-                        action = "unknown_target" if target is not None else "no_active"
-                text = {
-                    "pause": "Pausing the active response.",
-                    "resume": "Resuming the paused response.",
-                    "cancel": "Cancelling the active response.",
-                    "stop": "Stopping the active response.",
-                    "unknown_target": "I could not find that active work item.",
-                    "no_active": "There is no active response to cancel.",
-                }.get(action, "Control request noted.")
-            elif outcome.kind == "multi_intent":
-                return await self._handle_multi_intent(outcome, transcript, origin, turn_id)
-            elif outcome.kind == "continue_pending":
-                return await self._handle_pending(outcome, transcript, origin, turn_id)
-            else:
-                text = None
-            if text is None:
+                )
+                logger.info(
+                    f"Routing {turn_id}: action={outcome.decision.action}, "
+                    f"worker={outcome.decision.worker_id or outcome.decision.worker_type or 'main'}"
+                )
+            action = getattr(outcome.decision, "action", None)
+            if action in {"direct", "unsupported", "clarify"}:
+                text = getattr(outcome, "prose", None)
+                if not text:
+                    text = {
+                        "direct": "I could not produce a direct answer yet.",
+                        "unsupported": "I cannot access that capability here.",
+                        "clarify": "Could you clarify what you want me to search for?",
+                    }[action]
+                result = await self._commit_and_speak(
+                    canonical_result(
+                        worker_id="main",
+                        turn_id=turn_id,
+                        text=text,
+                        origin_epoch=origin_epoch,
+                    ),
+                    origin,
+                )
+                turn_recorder.record_zero_child_outcome(action)
+                turn_recorder.finalize(outcome=action)
+                return result
+            try:
+                worker = self._dispatch(outcome.decision, getattr(outcome, "catalogue", None))
+                await self._register_runner_worker(worker)
+            except (RoutingValidationError, UnsupportedWorkerType):
+                result = await self._commit_and_speak(
+                    canonical_result(
+                        worker_id="main",
+                        turn_id=turn_id,
+                        text="I cannot access that capability here.",
+                        origin_epoch=origin_epoch,
+                    ),
+                    origin,
+                )
+                turn_recorder.finalize(outcome="failed")
+                return result
+            if worker is None:
+                child = self._new_work_item_recorder(
+                    origin_epoch=origin_epoch, turn_id=turn_id, work_item_id=work_item_id
+                )
+                child_outcome = child.finalize(outcome="missing_worker")
+                turn_recorder.record_child(child_outcome)
+                turn_recorder.finalize(outcome="failed")
                 return outcome
-            return await self._commit_and_speak(
-                canonical_result(
-                    worker_id="main",
-                    turn_id=turn_id,
-                    text=text,
-                    origin_epoch=origin_epoch,
-                ),
-                origin,
+            self._project_worker(worker, origin_epoch=origin_epoch, status="running")
+            search = getattr(worker, "search", None)
+            worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
+            if search is None:
+                child = self._new_work_item_recorder(
+                    origin_epoch=origin_epoch, turn_id=turn_id, work_item_id=work_item_id
+                )
+                child_outcome = child.finalize(outcome="missing_search", app_worker_id=worker_id)
+                turn_recorder.record_child(child_outcome)
+                turn_recorder.finalize(outcome="failed")
+                return outcome
+            child = self._new_work_item_recorder(
+                origin_epoch=origin_epoch, turn_id=turn_id, work_item_id=work_item_id
             )
-        if isinstance(outcome.decision, RoutingDecision):
-            self.state.set_routing(
-                RoutingState(
+            try:
+                search_started = time.perf_counter()
+                execution = await self._search_with_timeout(
+                    search,
+                    transcript,
                     turn_id=turn_id,
-                    action=outcome.decision.action,
-                    worker_id=outcome.decision.worker_id,
-                    worker_type=outcome.decision.worker_type,
-                    topic=outcome.decision.topic,
-                    model_policy=outcome.decision.model_policy,
+                    origin_epoch=origin_epoch,
+                    timeout=getattr(
+                        getattr(self.coordinator, "config", None)
+                        or getattr(self.registry, "config", None),
+                        "foreground_search_timeout_seconds",
+                        15.0,
+                    ),
+                    worker_id=worker_id,
+                    work_item_id=work_item_id,
+                )
+                search_ms = (time.perf_counter() - search_started) * 1000
+                if execution.status == "completed" and execution.result is not None:
+                    result = execution.result
+                    child_outcome_label = "completed"
+                elif execution.status == "retained":
+                    result = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=turn_id,
+                        text="That is taking longer than expected; I will continue in the background.",
+                        origin_epoch=origin_epoch,
+                    )
+                    child_outcome_label = "retained"
+                else:
+                    result = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=turn_id,
+                        text="The search service is busy; please try again shortly.",
+                        origin_epoch=origin_epoch,
+                    )
+                    child_outcome_label = (
+                        execution.status
+                        if execution.status in {"capacity_rejected", "retention_rejected"}
+                        else "failed"
+                    )
+            except WorkerClarify as exc:
+                search_ms = (time.perf_counter() - search_started) * 1000
+                result = self._worker_clarification_result(
+                    worker_id=worker_id,
+                    turn_id=turn_id,
+                    question=exc.question,
+                    original_query=transcript,
                     origin_epoch=origin_epoch,
                 )
-            )
-            logger.info(
-                f"Routing {turn_id}: action={outcome.decision.action}, "
-                f"worker={outcome.decision.worker_id or outcome.decision.worker_type or 'main'}"
-            )
-        action = getattr(outcome.decision, "action", None)
-        if action in {"direct", "unsupported", "clarify"}:
-            text = getattr(outcome, "prose", None)
-            if not text:
-                text = {
-                    "direct": "I could not produce a direct answer yet.",
-                    "unsupported": "I cannot access that capability here.",
-                    "clarify": "Could you clarify what you want me to search for?",
-                }[action]
-            return await self._commit_and_speak(
-                canonical_result(
-                    worker_id="main",
-                    turn_id=turn_id,
-                    text=text,
-                    origin_epoch=origin_epoch,
-                ),
-                origin,
-            )
-        try:
-            worker = self._dispatch(outcome.decision, getattr(outcome, "catalogue", None))
-            await self._register_runner_worker(worker)
-        except (RoutingValidationError, UnsupportedWorkerType):
-            return await self._commit_and_speak(
-                canonical_result(
-                    worker_id="main",
-                    turn_id=turn_id,
-                    text="I cannot access that capability here.",
-                    origin_epoch=origin_epoch,
-                ),
-                origin,
-            )
-        if worker is None:
-            return outcome
-        self._project_worker(worker, origin_epoch=origin_epoch, status="running")
-        search = getattr(worker, "search", None)
-        if search is None:
-            return outcome
-        worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
-        try:
-            search_started = time.perf_counter()
-            execution = await self._search_with_timeout(
-                search,
-                transcript,
-                turn_id=turn_id,
-                origin_epoch=origin_epoch,
-                timeout=getattr(
-                    getattr(self.coordinator, "config", None)
-                    or getattr(self.registry, "config", None),
-                    "foreground_search_timeout_seconds",
-                    15.0,
-                ),
-                worker_id=worker_id,
-                work_item_id=work_item_id,
-            )
-            search_ms = (time.perf_counter() - search_started) * 1000
-            if execution.status == "completed" and execution.result is not None:
-                result = execution.result
-            elif execution.status == "retained":
+                child_outcome_label = "clarify"
+            except WorkerDeclined:
+                search_ms = (time.perf_counter() - search_started) * 1000
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="That is taking longer than expected; I will continue in the background.",
+                    text="I could not find a reliable result for that request.",
                     origin_epoch=origin_epoch,
                 )
-            else:
+                child_outcome_label = "declined"
+            except Exception:  # noqa: BLE001  # intentional catch-all: search worker failures are arbitrary provider errors that must fall back to a safe result
+                logger.exception(f"Web search failed for {turn_id}; returning a safe result")
+                search_ms = (time.perf_counter() - search_started) * 1000
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="The search service is busy; please try again shortly.",
+                    text="The web search is temporarily unavailable.",
                     origin_epoch=origin_epoch,
                 )
-        except WorkerClarify as exc:
-            search_ms = (time.perf_counter() - search_started) * 1000
-            result = self._worker_clarification_result(
-                worker_id=worker_id,
-                turn_id=turn_id,
-                question=exc.question,
-                original_query=transcript,
-                origin_epoch=origin_epoch,
+                child_outcome_label = "failed"
+            was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
+            commit_started = time.perf_counter()
+            committed = await self._commit_and_speak(result, origin)
+            commit_ms = (time.perf_counter() - commit_started) * 1000
+            child_outcome = child.finalize(
+                outcome=child_outcome_label,
+                app_worker_id=worker_id,
+                result_id=result.result_id,
+                search_ms=search_ms,
+                commit_ms=commit_ms,
             )
-        except WorkerDeclined:
-            search_ms = (time.perf_counter() - search_started) * 1000
-            result = canonical_result(
-                worker_id=worker_id,
-                turn_id=turn_id,
-                text="I could not find a reliable result for that request.",
+            turn_recorder.record_child(child_outcome)
+            turn_recorder.record_commit(commit_ms)
+            turn_recorder.finalize()
+            self._project_worker(
+                worker,
                 origin_epoch=origin_epoch,
+                status="idle",
+                latest_result_id=None if was_cancelled else result.result_id,
             )
-        except Exception:  # noqa: BLE001  # intentional catch-all: search worker failures are arbitrary provider errors that must fall back to a safe result
-            logger.exception(f"Web search failed for {turn_id}; returning a safe result")
-            search_ms = (time.perf_counter() - search_started) * 1000
-            result = canonical_result(
-                worker_id=worker_id,
-                turn_id=turn_id,
-                text="The web search is temporarily unavailable.",
-                origin_epoch=origin_epoch,
-            )
-        was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
-        committed = await self._commit_and_speak(result, origin)
-        total_ms = (time.perf_counter() - turn_started) * 1000
-        self.last_turn_metrics = {
-            "turn_id": turn_id,
-            "routing_ms": round(routing_ms, 1),
-            "search_ms": round(search_ms, 1),
-            "total_ms": round(total_ms, 1),
-        }
-        logger.info(
-            f"Turn latency {turn_id}: routing_ms={routing_ms:.1f} "
-            f"search_ms={search_ms:.1f} total_ms={total_ms:.1f}"
-        )
-        self._project_worker(
-            worker,
-            origin_epoch=origin_epoch,
-            status="idle",
-            latest_result_id=None if was_cancelled else result.result_id,
-        )
-        return committed
+            return committed
+        except asyncio.CancelledError:
+            if not turn_recorder.finalized:
+                turn_recorder.finalize(outcome="cancelled")
+            raise
 
     async def _handle_pending(
         self, outcome: Any, transcript: str, origin: Any, turn_id: str
     ) -> Any:
+        turn_recorder = self._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id)
         pending = getattr(outcome, "pending_dialogue", None)
         owner_id = pending.owner_id if pending is not None else None
         if owner_id is None:
@@ -769,15 +888,36 @@ class SessionHost:
         registered = self.coordinator.registry.get(owner_id) if owner_id else None
         worker = registered.worker if registered is not None else None
         search = getattr(worker, "search", None)
+        work_item_id = f"work-{turn_id}"
         if search is None:
+            child = self._new_work_item_recorder(
+                origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=work_item_id
+            )
+            child_outcome = child.finalize(outcome="missing_search", app_worker_id=owner_id)
+            turn_recorder.record_child(child_outcome)
+            turn_recorder.finalize(outcome="failed")
             return outcome
         await self._register_runner_worker(worker)
         worker_id = owner_id or "main"
-        work_item_id = f"work-{turn_id}"
         self._known_work_items.add(work_item_id)
         clarification_context = self._clarification_context(pending, transcript)
+        child = self._new_work_item_recorder(
+            origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=work_item_id
+        )
+        retained_recorder = self._new_retained_recorder(
+            origin_epoch=origin.epoch,
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            app_worker_id=worker_id,
+        )
+        outcome_label = "completed"
+
+        def on_late_terminal(item_id: str, terminal_kind: str) -> None:
+            if item_id == work_item_id:
+                retained_recorder.claim(terminal_kind)
 
         async def execute(_worker_id: str, query: str) -> GroundedResult:
+            nonlocal outcome_label
             try:
                 kwargs: dict[str, Any] = {
                     "turn_id": turn_id,
@@ -785,8 +925,11 @@ class SessionHost:
                 }
                 if clarification_context is not None:
                     kwargs["clarification_context"] = clarification_context
-                return await search(query, **kwargs)
+                result = await search(query, **kwargs)
+                outcome_label = "completed"
+                return result
             except WorkerClarify as exc:
+                outcome_label = "clarify"
                 return self._worker_clarification_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
@@ -795,6 +938,7 @@ class SessionHost:
                     origin_epoch=origin.epoch,
                 )
             except WorkerDeclined:
+                outcome_label = "declined"
                 return canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
@@ -808,9 +952,13 @@ class SessionHost:
             execute,
             on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
             work_item_ids=[work_item_id],
+            on_late_terminal=on_late_terminal,
         )
         if submitted.results:
             result = submitted.results[0]
+            child_outcome = child.finalize(
+                outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
+            )
         elif submitted.pending_work_item_ids:
             result = canonical_result(
                 worker_id=worker_id,
@@ -818,27 +966,45 @@ class SessionHost:
                 text="That is taking longer than expected; I will continue in the background.",
                 origin_epoch=origin.epoch,
             )
+            child_outcome = child.finalize(outcome="retained", app_worker_id=worker_id)
+            self._register_retained_recorder_if_open(work_item_id, retained_recorder)
         else:
+            failure_outcome = (
+                self._failure_child_outcome(submitted.failures[0])
+                if submitted.failures
+                else "failed"
+            )
             result = canonical_result(
                 worker_id=worker_id,
                 turn_id=turn_id,
                 text="The pending web request could not be completed.",
                 origin_epoch=origin.epoch,
             )
-        return await self._commit_and_speak(result, origin)
+            child_outcome = child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
+        turn_recorder.record_child(child_outcome)
+        committed = await self._commit_and_speak(result, origin)
+        turn_recorder.finalize()
+        return committed
 
     async def _handle_multi_intent(
         self, outcome: Any, transcript: str, origin: Any, turn_id: str
     ) -> tuple[Any, ...]:
         """Execute bounded compound work in the user's stated order."""
         del transcript
+        turn_recorder = self._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id)
         results: dict[int, Any] = {}
         runnable: list[tuple[str, str]] = []
         runnable_indexes: list[int] = []
         runnable_workers: dict[int, Any] = {}
         contexts: dict[int, ClarificationContext | None] = {}
+        child_recorders: dict[int, WorkItemRecorder] = {}
         pending = getattr(outcome, "pending_dialogue", None)
         for index, item_text in enumerate(outcome.work_items):
+            item_work_item_id = f"work-{turn_id}-{index}"
+            child = self._new_work_item_recorder(
+                origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=item_work_item_id
+            )
+            child_recorders[index] = child
             worker = None
             if index == 0 and pending is not None:
                 registered = self.coordinator.registry.get(pending.owner_id)
@@ -861,6 +1027,7 @@ class SessionHost:
                         text="Routing is temporarily unavailable. Please try that request again.",
                         origin_epoch=origin.epoch,
                     )
+                    turn_recorder.record_child(child.finalize(outcome="failed"))
                     continue
                 decision = envelope.decision
                 action = getattr(decision, "action", None)
@@ -879,6 +1046,7 @@ class SessionHost:
                         text=text,
                         origin_epoch=origin.epoch,
                     )
+                    turn_recorder.record_child(child.finalize(outcome=action))
                     continue
                 try:
                     worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
@@ -890,6 +1058,7 @@ class SessionHost:
                         text="I cannot access that capability here.",
                         origin_epoch=origin.epoch,
                     )
+                    turn_recorder.record_child(child.finalize(outcome="failed"))
                     continue
             search = getattr(worker, "search", None)
             if search is None:
@@ -898,6 +1067,17 @@ class SessionHost:
                     turn_id=f"{turn_id}-{index}",
                     text="I cannot access that capability here.",
                     origin_epoch=origin.epoch,
+                )
+                worker_id_for_child = (
+                    getattr(getattr(worker, "metadata", None), "worker_id", None)
+                    if worker is not None
+                    else None
+                )
+                turn_recorder.record_child(
+                    child.finalize(
+                        outcome="missing_worker" if worker is None else "missing_search",
+                        app_worker_id=worker_id_for_child,
+                    )
                 )
                 continue
             worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
@@ -914,6 +1094,8 @@ class SessionHost:
         for item_index, item in zip(runnable_indexes, runnable, strict=True):
             execution_indexes.setdefault(item, []).append(item_index)
 
+        outcome_labels: dict[int, str] = {}
+
         async def execute(worker_id: str, query: str) -> GroundedResult:
             item_index = execution_indexes[(worker_id, query)].pop(0)
             item_turn_id = f"{turn_id}-{item_index}"
@@ -925,8 +1107,11 @@ class SessionHost:
                 }
                 if contexts[item_index] is not None:
                     kwargs["clarification_context"] = contexts[item_index]
-                return await search(query, **kwargs)
+                result = await search(query, **kwargs)
+                outcome_labels[item_index] = "completed"
+                return result
             except WorkerClarify as exc:
+                outcome_labels[item_index] = "clarify"
                 original_query = (
                     contexts[item_index].original_query
                     if contexts[item_index] is not None
@@ -940,6 +1125,7 @@ class SessionHost:
                     origin_epoch=origin.epoch,
                 )
             except WorkerDeclined:
+                outcome_labels[item_index] = "declined"
                 return canonical_result(
                     worker_id=worker_id,
                     turn_id=item_turn_id,
@@ -949,12 +1135,28 @@ class SessionHost:
 
         work_item_ids = [f"work-{turn_id}-{index}" for index in runnable_indexes]
         self._known_work_items.update(work_item_ids)
+        retained_recorders: dict[str, RetainedRecorder] = {
+            f"work-{turn_id}-{index}": self._new_retained_recorder(
+                origin_epoch=origin.epoch,
+                turn_id=turn_id,
+                work_item_id=f"work-{turn_id}-{index}",
+                app_worker_id=runnable[runnable_indexes.index(index)][0],
+            )
+            for index in runnable_indexes
+        }
+
+        def on_late_terminal(item_id: str, terminal_kind: str) -> None:
+            recorder = retained_recorders.get(item_id)
+            if recorder is not None:
+                recorder.claim(terminal_kind)
+
         submitted = await self.coordinator.submit(
             f"work-{turn_id}",
             runnable,
             execute,
             on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
             work_item_ids=work_item_ids,
+            on_late_terminal=on_late_terminal,
         )
         result_indexes = {
             result.turn_id: index
@@ -963,7 +1165,16 @@ class SessionHost:
             if result.turn_id == f"{turn_id}-{index}"
         }
         for result in submitted.results:
-            results[result_indexes[result.turn_id]] = result
+            index = result_indexes[result.turn_id]
+            results[index] = result
+            worker_id = runnable[runnable_indexes.index(index)][0]
+            turn_recorder.record_child(
+                child_recorders[index].finalize(
+                    outcome=outcome_labels.get(index, "completed"),
+                    app_worker_id=worker_id,
+                    result_id=result.result_id,
+                )
+            )
         for work_item_id in submitted.pending_work_item_ids:
             item_index = int(work_item_id.rsplit("-", 1)[1])
             worker_id = runnable[runnable_indexes.index(item_index)][0]
@@ -973,6 +1184,12 @@ class SessionHost:
                 text="That item is taking longer than expected; I will continue in the background.",
                 origin_epoch=origin.epoch,
             )
+            turn_recorder.record_child(
+                child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
+            )
+            recorder = retained_recorders.get(work_item_id)
+            if recorder is not None:
+                self._register_retained_recorder_if_open(work_item_id, recorder)
         for failure in submitted.failures:
             item_index = int(failure.work_item_id.rsplit("-", 1)[1])
             results[item_index] = canonical_result(
@@ -981,9 +1198,16 @@ class SessionHost:
                 text="The web search is temporarily unavailable.",
                 origin_epoch=origin.epoch,
             )
+            turn_recorder.record_child(
+                child_recorders[item_index].finalize(
+                    outcome=self._failure_child_outcome(failure),
+                    app_worker_id=failure.worker_id,
+                )
+            )
         committed = []
         for index in sorted(results):
             committed.append(await self._commit_and_speak(results[index], origin))
+        turn_recorder.finalize()
         return tuple(committed)
 
     def _worker_clarification_result(
@@ -1046,9 +1270,19 @@ class SessionHost:
             else asyncio.create_task(search(query, **kwargs))
         )
         if task is None:
-            return SearchExecution("rejected")
+            return SearchExecution("capacity_rejected")
         work_item_id = work_item_id or f"work-{turn_id}"
         self._track_work_task(work_item_id, task)
+        # The provisional retained recorder is created here, at dispatch time,
+        # before the foreground wait -- not only if it later times out -- so
+        # background_ms always starts at work dispatch (Timing Boundaries).
+        # It is discarded unregistered if the foreground wait completes first.
+        retained_recorder = self._new_retained_recorder(
+            origin_epoch=origin_epoch,
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            app_worker_id=worker_id,
+        )
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
@@ -1062,35 +1296,111 @@ class SessionHost:
             work_item_id=work_item_id,
             worker_id=worker_id,
             on_complete=lambda late: self._commit_late_result(late, origin_epoch),
+            on_late_terminal=lambda item_id, terminal_kind: (
+                retained_recorder.claim(terminal_kind) if item_id == work_item_id else None
+            ),
         )
-        return SearchExecution("retained" if accepted else "rejected")
+        if not accepted:
+            return SearchExecution("retention_rejected")
+        self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+        return SearchExecution("retained")
 
     async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
         """Commit a late result and defer speech on its still-active TTS epoch."""
+        # Popping (rather than peeking) makes a callback arriving after a
+        # dispatch-registered recorder's finalization a structural no-op for
+        # that recorder. When no dispatch-time recorder was registered (e.g.
+        # this coroutine is invoked directly, as the paid-search coordinator
+        # path does not always go through), build one on demand so every
+        # accepted late result still reaches its background terminal metric.
+        recorder = self._retained_recorders.pop(late.work_item_id, None)
+        if recorder is None:
+            recorder = self._new_retained_recorder(
+                origin_epoch=origin_epoch,
+                turn_id=(
+                    late.result.turn_id
+                    if isinstance(late.result, GroundedResult)
+                    else late.work_item_id
+                ),
+                work_item_id=late.work_item_id,
+                app_worker_id=late.worker_id,
+            )
+        if late.terminal_kind is not None:
+            recorder.claim(late.terminal_kind)
         if late.error is not None:
+            self._known_work_items.discard(late.work_item_id)
+            if recorder is not None:
+                # A worker task cancellation reaching this normal completion
+                # path is always a live "suppressed_cancelled" outcome. Pure
+                # shutdown-triggered cancellation never reaches here: the
+                # coordinator's shutdown guard suppresses this callback
+                # entirely, so that case is finalized separately by
+                # ``SessionHost.shutdown``'s still-open-recorder sweep.
+                if late.terminal_kind == "cancelled":
+                    commit_outcome, speech_outcome = "suppressed_cancelled", "cancelled"
+                else:
+                    commit_outcome, speech_outcome = "not_applicable", "not_applicable"
+                recorder.finalize(
+                    work_outcome=late.terminal_kind or "failed",
+                    commit_outcome=commit_outcome,
+                    speech_outcome=speech_outcome,
+                )
             logger.warning(
                 f"Late worker result failed for work_item={late.work_item_id} "
                 f"worker={late.worker_id}"
             )
-            self._known_work_items.discard(late.work_item_id)
             return
         if late.work_item_id in self._cancelled_work_items:
             self._cancelled_work_items.discard(late.work_item_id)
             self._known_work_items.discard(late.work_item_id)
             if isinstance(late.result, GroundedResult):
                 self._clarification_candidates.pop(late.result.result_id, None)
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="cancelled",
+                    commit_outcome="suppressed_cancelled",
+                    speech_outcome="cancelled",
+                )
             return
         result = late.result
         if not isinstance(result, GroundedResult):
             self._known_work_items.discard(late.work_item_id)
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="invalid_result",
+                    commit_outcome="not_applicable",
+                    speech_outcome="not_applicable",
+                )
             return
         if result.origin_epoch != origin_epoch:
             self._known_work_items.discard(late.work_item_id)
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="completed",
+                    commit_outcome="suppressed_stale",
+                    speech_outcome="not_applicable",
+                )
             return
         if any(item.result_id == result.result_id for item in self.state.results.results):
             self._known_work_items.discard(late.work_item_id)
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="completed",
+                    commit_outcome="suppressed_duplicate",
+                    speech_outcome="not_applicable",
+                )
             return
-        self._commit_result_state(result)
+        try:
+            self._commit_result_state(result)
+        except Exception:
+            self._known_work_items.discard(late.work_item_id)
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="completed",
+                    commit_outcome="failed",
+                    speech_outcome="not_applicable",
+                )
+            raise
         self._known_work_items.discard(late.work_item_id)
         worker = self.state.workers.get(result.worker_id)
         if worker is not None and worker.origin_epoch == origin_epoch:
@@ -1103,22 +1413,58 @@ class SessionHost:
                 )
             )
         origin = self.connection
-        if (
-            origin is None
-            or origin.tts is None
-            or not origin.active
-            or origin.epoch != origin_epoch
-            or not self.accepts(origin_epoch)
-        ):
+        if origin is None:
+            speech_outcome: str | None = "disconnected"
+        elif origin.tts is None:
+            speech_outcome = "no_tts"
+        elif not origin.active or origin.epoch != origin_epoch or not self.accepts(origin_epoch):
+            speech_outcome = "stale_connection"
+        else:
+            speech_outcome = None
+        if speech_outcome is not None:
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="completed",
+                    commit_outcome="committed",
+                    speech_outcome=speech_outcome,
+                    result_id=result.result_id,
+                )
             return
-        origin.scheduler.enqueue(
-            result_id=result.result_id,
-            work_item_id=late.work_item_id,
-            run_id=f"run-{result.turn_id}",
-            text=result.spoken_text,
-            origin_epoch=origin_epoch,
-        )
-        await origin.scheduler.start_next()
+        try:
+            origin.scheduler.enqueue(
+                result_id=result.result_id,
+                work_item_id=late.work_item_id,
+                run_id=f"run-{result.turn_id}",
+                text=result.spoken_text,
+                origin_epoch=origin_epoch,
+            )
+        except Exception:
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="completed",
+                    commit_outcome="committed",
+                    speech_outcome="enqueue_failed",
+                    result_id=result.result_id,
+                )
+            raise
+        try:
+            await origin.scheduler.start_next()
+        except Exception:
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome="completed",
+                    commit_outcome="committed",
+                    speech_outcome="start_failed",
+                    result_id=result.result_id,
+                )
+            raise
+        if recorder is not None:
+            recorder.finalize(
+                work_outcome="completed",
+                commit_outcome="committed",
+                speech_outcome="queued",
+                result_id=result.result_id,
+            )
 
     def _commit_result_state(self, result: GroundedResult) -> None:
         self.state.append_transcript(
@@ -1337,6 +1683,17 @@ class SessionHost:
             result = coordinator_shutdown()
             if inspect.isawaitable(result):
                 await result
+        # Coordinator work/callback tasks have now settled. Finalize every
+        # retained recorder still open: unclaimed work is shutdown-cancelled,
+        # while claimed work uses its recorded terminal kind and whatever
+        # commit/speech stage it had already reached.
+        for work_item_id, recorder in tuple(self._retained_recorders.items()):
+            recorder.finalize(
+                work_outcome=recorder.work_outcome or "cancelled",
+                commit_outcome=recorder.commit_outcome or "suppressed_shutdown",
+                speech_outcome=recorder.speech_outcome or "cancelled",
+            )
+            self._retained_recorders.pop(work_item_id, None)
         stop = getattr(self.runner, "stop", None)
         if stop is not None:
             result = stop()
