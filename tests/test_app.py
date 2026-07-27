@@ -2,14 +2,15 @@
 
 import asyncio
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
 
 import server.app as app_module
-from server.contracts import GroundedResult
 from server.app import create_app
 from server.config import Config
+from server.contracts import GroundedResult
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
 from server.router import LazyRouterProvider, Router
@@ -58,7 +59,7 @@ class FakeRouterModel:
 
 
 class FakeSearchWorker:
-    capabilities = {"public_web": True}
+    capabilities: ClassVar[dict[str, bool]] = {"public_web": True}
 
     def __init__(self, worker_id: str) -> None:
         self.worker_id = worker_id

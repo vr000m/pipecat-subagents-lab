@@ -12,11 +12,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
+from loguru import logger
+
 from .config import Config
 from .contracts import RoutingDecision
 from .registry import WorkerRegistry
 from .router import Router, WorkerCatalogue, validate_decision
-
 
 _SEPARATE_REQUEST_VERBS = (
     r"search|find|look\s+up|check|show\s+me|tell\s+me|get|open|create|write|summarize"
@@ -282,7 +283,7 @@ class WorkItemCoordinator:
                     worker_id=worker_id,
                     error="CancelledError: worker task was cancelled",
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # intentional catch-all: any worker task failure must surface as a LateResult, not crash the coordinator
                 late = LateResult(
                     work_item_id=work_item_id,
                     worker_id=worker_id,
@@ -535,8 +536,10 @@ class WorkItemCoordinator:
                         current = asyncio.current_task()
                         if current is not None and current.cancelling():
                             raise
-                    except Exception:
-                        pass
+                    except Exception:  # noqa: BLE001  # intentional catch-all: a failed prior tail task must not block the next queued task for this worker
+                        logger.debug(
+                            f"prior tail task for {worker_id} raised while awaiting shield"
+                        )
                 task = asyncio.create_task(worker(worker_id, text))
                 self._provider_tasks.add(task)
                 self._tails[worker_id] = task

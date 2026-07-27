@@ -51,7 +51,7 @@ class SpeechScheduler:
             return
         try:
             outcome = self.stop(item)
-        except BaseException:
+        except BaseException:  # noqa: BLE001  # intentional catch-all: a failing stop callback must not block scheduler cleanup
             return
         if isinstance(outcome, Awaitable):
             try:

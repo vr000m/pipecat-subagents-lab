@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TranscriptionFrame
+from pipecat.frames.frames import ErrorFrame, TranscriptionFrame, TTSAudioRawFrame
 
 from server.services.stt import LocalSTT, STTEndpoint
 from server.services.tts import LocalTTS, TTSEndpoint

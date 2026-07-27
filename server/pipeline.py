@@ -34,7 +34,9 @@ from .work_item_coordinator import LateResult
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 try:
-    from pipecat.bus.bridge_processor import BusBridgeProcessor as BusBridgeProcessor
+    from pipecat.bus.bridge_processor import (
+        BusBridgeProcessor as BusBridgeProcessor,  # noqa: PLC0414  # explicit re-export: name must match the except-branch fallback class below
+    )
     from pipecat.bus.bus import WorkerBus
 except ImportError:  # pragma: no cover - only for dependency-free contract tests
 
@@ -231,15 +233,15 @@ class ConnectionPipeline:
                     result = cancel(reason=reason)
                     if hasattr(result, "__await__"):
                         await result
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001  # intentional catch-all: worker cancellation failures must not block connection teardown
+                    logger.debug(f"worker cancel raised during shutdown for {reason}")
             self.worker = None
         if self.worker_task is not None:
             self.worker_task.cancel()
             try:
                 await self.worker_task
-            except BaseException:
-                pass
+            except BaseException:  # noqa: BLE001  # intentional catch-all: awaiting a cancelled task can raise CancelledError/other BaseException; teardown must proceed regardless
+                logger.debug("worker task raised while awaiting cancellation during shutdown")
             finally:
                 self.worker_task = None
         self.observer.unsubscribe()
@@ -251,8 +253,8 @@ class ConnectionPipeline:
                 result = cleanup()
                 if inspect.isawaitable(result):
                     await result
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001  # intentional catch-all: a single service's cleanup failure must not block teardown of the other services
+                logger.debug(f"{service} cleanup raised during shutdown")
 
 
 @dataclass(frozen=True)
@@ -555,7 +557,7 @@ class SessionHost:
                 self.coordinator.arbitrate, self.state.session_id, transcript
             )
             routing_ms = (time.perf_counter() - routing_started) * 1000
-        except Exception:
+        except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
             logger.exception(
                 f"Routing failed for {turn_id}; returning a safe result without provider details"
             )
@@ -723,7 +725,8 @@ class SessionHost:
                 text="I could not find a reliable result for that request.",
                 origin_epoch=origin_epoch,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # intentional catch-all: search worker failures are arbitrary provider errors that must fall back to a safe result
+            logger.exception(f"Web search failed for {turn_id}; returning a safe result")
             search_ms = (time.perf_counter() - search_started) * 1000
             result = canonical_result(
                 worker_id=worker_id,
@@ -844,7 +847,10 @@ class SessionHost:
                         item_text,
                         catalogue,
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
+                    logger.exception(
+                        f"Routing failed for {turn_id}-{index}; returning a safe result"
+                    )
                     results[index] = canonical_result(
                         worker_id="main",
                         turn_id=f"{turn_id}-{index}",

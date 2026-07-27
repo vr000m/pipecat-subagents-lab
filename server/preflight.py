@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Protocol
 
 from websockets.sync.client import connect as ws_connect
 from websockets.sync.client import unix_connect as ws_unix_connect
@@ -153,7 +154,7 @@ def run_preflight(
                 failures[service] = (
                     f"{service} endpoint is unreachable or health/protocol incompatible"
                 )
-        except Exception as exc:  # probe errors become actionable, secret-free diagnostics
+        except Exception as exc:  # noqa: BLE001  # intentional catch-all: probe errors become actionable, secret-free diagnostics
             failures[service] = f"{service} endpoint preflight failed: {type(exc).__name__}"
     capability = (
         authenticated_capability_check(config) if authenticated_capability_check else "unavailable"

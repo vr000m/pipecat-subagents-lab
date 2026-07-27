@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import websockets
+from loguru import logger
 from websockets.asyncio.client import connect as ws_connect
 from websockets.asyncio.client import unix_connect as ws_unix_connect
 
@@ -47,7 +48,7 @@ async def _connect(endpoint: Any) -> Any:
 async def _receive_json(ws: Any) -> dict[str, Any]:
     raw = await asyncio.wait_for(ws.recv(), timeout=_HANDSHAKE_TIMEOUT_SECONDS)
     if isinstance(raw, (bytes, bytearray)):
-        raise RuntimeError("unexpected binary frame during local service handshake")
+        raise TypeError("unexpected binary frame during local service handshake")
     if len(raw.encode("utf-8")) > _MAX_MESSAGE_BYTES:
         raise RuntimeError("local service handshake message limit exceeded")
     return json.loads(raw)
@@ -143,8 +144,8 @@ class LocalSTTClient:
             if ws is not None:
                 try:
                     await _close_socket(ws)
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001  # intentional catch-all: closing the socket during error teardown must not mask the original exception
+                    logger.debug("failed to close local service socket during error teardown")
             raise
 
     async def send_audio(self, audio: bytes) -> None:
@@ -194,8 +195,8 @@ class LocalTTSClient:
             if ws is not None:
                 try:
                     await _close_socket(ws)
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001  # intentional catch-all: closing the socket during error teardown must not mask the original exception
+                    logger.debug("failed to close local service socket during error teardown")
             raise
 
     async def append(self, text: str) -> None:

@@ -193,7 +193,7 @@ class LocalTTS(TTSService):
                         sample_rate=self.sample_rate,
                         num_channels=1,
                     )
-                elif kind.endswith("audio.done") or kind.endswith("cancelled"):
+                elif kind.endswith(("audio.done", "cancelled")):
                     completed = True
                     if on_event is not None:
                         result = on_event("synthesis_ended", context_id)

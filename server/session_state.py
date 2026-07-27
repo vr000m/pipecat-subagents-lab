@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 from .contracts import (
@@ -17,7 +18,6 @@ from .contracts import (
     WorkerState,
 )
 from .results import ResultLog
-
 
 _TERMINAL = {
     DeliveryState.DELIVERY_COMPLETED,
@@ -41,7 +41,7 @@ _RANK = {
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass(frozen=True)

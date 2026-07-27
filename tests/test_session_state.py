@@ -67,13 +67,13 @@ def test_routing_and_semantic_transcript_are_authoritative_snapshot_state() -> N
 
 def test_speech_progress_is_monotonic_and_synthesis_end_is_not_delivery_completion() -> None:
     state = SessionState(session_id="session-1")
-    kwargs = dict(
-        result_id="result-1",
-        work_item_id="work-1",
-        run_id="run-1",
-        utterance_id="utt-1",
-        origin_epoch=2,
-    )
+    kwargs = {
+        "result_id": "result-1",
+        "work_item_id": "work-1",
+        "run_id": "run-1",
+        "utterance_id": "utt-1",
+        "origin_epoch": 2,
+    }
     for state_value in (
         DeliveryState.DISPLAYED,
         DeliveryState.QUEUED,
@@ -96,12 +96,12 @@ def test_speech_progress_is_monotonic_and_synthesis_end_is_not_delivery_completi
 
 def test_terminal_interruption_wins_over_late_completion_and_duplicate_progress() -> None:
     state = SessionState(session_id="session-1")
-    kwargs = dict(
-        result_id="result-1",
-        work_item_id="work-1",
-        run_id="run-1",
-        utterance_id="utt-1",
-    )
+    kwargs = {
+        "result_id": "result-1",
+        "work_item_id": "work-1",
+        "run_id": "run-1",
+        "utterance_id": "utt-1",
+    }
 
     state.speech_progress(state=DeliveryState.STARTED, **kwargs)
     state.speech_progress(state=DeliveryState.INTERRUPTED, **kwargs)

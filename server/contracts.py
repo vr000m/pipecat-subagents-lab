@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import Enum
 import re
+from datetime import UTC, datetime
+from enum import Enum
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -17,7 +17,7 @@ RFC3339_TIMESTAMP = re.compile(
 
 def utc_timestamp() -> str:
     """Return a producer-generated RFC 3339 timestamp for wire contracts."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def validate_rfc3339_timestamp(value: str) -> str:
@@ -81,9 +81,12 @@ class RoutingDecision(StrictModel):
                 raise ValueError("worker routes require worker_type, topic, and model_policy")
             if self.action == "existing_worker" and not self.worker_id:
                 raise ValueError("existing-worker routes require worker_id")
-            if self.action == "existing_worker" and self.catalogue_worker_ids:
-                if self.worker_id not in self.catalogue_worker_ids:
-                    raise ValueError("worker_id is not present in the catalogue snapshot")
+            if (
+                self.action == "existing_worker"
+                and self.catalogue_worker_ids
+                and self.worker_id not in self.catalogue_worker_ids
+            ):
+                raise ValueError("worker_id is not present in the catalogue snapshot")
             if self.worker_id and "hallucinated" in self.worker_id.lower():
                 raise ValueError("worker_id is not an allowlisted catalogue identity")
             if not self.capability_available and self.capability not in {None, "private_calendar"}:

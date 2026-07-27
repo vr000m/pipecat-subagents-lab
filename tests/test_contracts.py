@@ -16,8 +16,8 @@ from server.contracts import (
     RuntimeSnapshot,
     SpeechProgress,
     TranscriptEntry,
-    WorkItemEvent,
     WorkerState,
+    WorkItemEvent,
     WorkItemState,
     validate_contract,
 )

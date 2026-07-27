@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -32,13 +33,12 @@ from .config import Config, load_config
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
-from .rtvi_messages import RTVIMessagePublisher
 from .registry import WorkerRegistry
 from .router import LazyRouterProvider, Router
+from .rtvi_messages import RTVIMessagePublisher
 from .services.factory import create_stt, create_tts
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from .work_item_coordinator import WorkItemCoordinator
-
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})

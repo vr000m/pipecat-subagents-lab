@@ -1,11 +1,12 @@
 """End-to-end invariants for the browser-first session seams."""
 
 import asyncio
+from typing import ClassVar
 
 import pytest
 
-from server.contracts import DeliveryState, WorkerState
 from server.connection_arbiter import ConnectionEpochArbiter
+from server.contracts import DeliveryState, WorkerState
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
 from server.results import normalize_grounded_result, project_result
@@ -16,7 +17,7 @@ from server.work_item_coordinator import WorkItemCoordinator
 
 
 class FakeRouterModel:
-    tools: list[object] = []
+    tools: ClassVar[list[object]] = []
 
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload

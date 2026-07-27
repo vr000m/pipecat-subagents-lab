@@ -489,9 +489,11 @@ def test_natural_clarification_answer_resumes_original_query_on_same_worker() ->
 
         assert result.text.startswith("Answer for Original request: What's the weather like?")
         assert worker.queries == [
-            "Original request: What's the weather like?\n"
-            "Clarification asked: Which location should I use?\n"
-            "User answer: Riga"
+            (
+                "Original request: What's the weather like?\n"
+                "Clarification asked: Which location should I use?\n"
+                "User answer: Riga"
+            )
         ]
         assert coordinator.pending(host.state.session_id) is None
         await host.shutdown()
@@ -1179,7 +1181,7 @@ def test_multi_intent_preserves_envelope_fallbacks_and_uses_submit() -> None:
                 self.submit_calls = 0
 
             def dispatch(self, decision: object, **_: object) -> object:
-                assert getattr(decision, "action") == "existing_worker"
+                assert decision.action == "existing_worker"
                 return worker
 
             async def submit(self, *args: object, **kwargs: object) -> object:

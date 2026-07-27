@@ -12,7 +12,6 @@ import time
 from dataclasses import replace
 from typing import Any
 
-
 DEFAULT_QUERY = "What is the latest stable Pipecat release?"
 ROUTING_REGRESSION_QUERIES = (
     "Hi.",

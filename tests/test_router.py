@@ -3,6 +3,7 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import ClassVar
 
 import pytest
 
@@ -17,7 +18,7 @@ from server.router import (
 
 
 class FakeRouterModel:
-    tools = []
+    tools: ClassVar[list[object]] = []
 
     def __init__(self, payload: dict) -> None:
         self.payload = payload
