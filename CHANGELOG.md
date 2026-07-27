@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-28
+
+### Added
+
+- Grep-friendly `PERF_METRIC` console telemetry contract: one single-line
+  `key=value` record per event, with a stable event registry, closed outcome
+  enums, and unknown-field/unknown-event rejection.
+- Pipecat 1.6.0 `StartupTimingObserver` and `UserBotLatencyObserver` wired into
+  each browser connection's `PipelineWorker`, alongside the framework's default
+  `TurnTrackingObserver`, reporting pipeline startup, transport readiness,
+  Pipecat turn start/end, interruption, first-bot-speech latency, user-to-bot
+  latency, and available per-service metric breakdowns.
+- Application-owned foreground timing: one `app_turn_foreground` event per
+  accepted semantic turn and one `work_item_foreground` event per dispatched
+  child, covering direct, unsupported, control, clarification, decline,
+  completed, mixed, retained, and failed/cancelled outcomes across
+  `_handle_transcript_impl`, `_handle_pending`, and `_handle_multi_intent`.
+- Application-owned retained-work timing: one correlated `work_item_background`
+  terminal event per registered retained item, reporting independent
+  `work_outcome`, `commit_outcome`, and `speech_outcome` axes so a successful
+  search whose result is suppressed or cannot be spoken is not mislabeled as a
+  failed search.
+- Injectable measurement sink (`ConsoleMeasurementSink` production default,
+  `CollectingMeasurementSink` for tests and the paid smoke harness) owned once
+  by `SessionHost` for its process lifetime.
+
+### Changed
+
+- Migrate the paid conversation smoke harness off `SessionHost.last_turn_metrics`
+  onto an injected `CollectingMeasurementSink`, so a direct turn can no longer
+  inherit a preceding delegated turn's stale latency budget.
+
 ## [0.1.1] - 2026-07-26
 
 ### Added
@@ -89,5 +121,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pre-push release gate.
 
 [Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/commits/main
+[0.1.2]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.2
 [0.1.1]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0
