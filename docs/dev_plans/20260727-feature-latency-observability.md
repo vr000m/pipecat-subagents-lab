@@ -133,6 +133,10 @@ does not project performance telemetry through RTVI or add it to browser state.
 
 ## Implementation Checklist
 
+All three phases land as sequential commits on `feature/latency-observability-v0.1.2`
+per AGENTS.md's feature-branch workflow; the branch merges to `main` only after
+Phase 3's validation gate passes, not phase-by-phase.
+
 ### Phase 1: Performance log contract and Pipecat observers
 
 **Impl files:** `server/perf_metrics.py`, `server/app.py`,
@@ -179,6 +183,9 @@ console contract without duplicating Pipecat's default turn tracker.
   `MetricsFrame` breakdowns. Omit unavailable values without zero-filling or
   errors, while proving processor order, sample rates, transcript flow, TTS,
   and media behavior are unchanged.
+- Test that `transport_ready` omits `bot_connected_ms` under the Small WebRTC
+  transport this app uses (SFU-only field) and includes it only when the
+  transport actually supplies it; never zero-fill it.
 - Run paired synthetic pipelines through the real locked `PipelineWorker`, once
   with processor metrics disabled and once enabled. Assert identical processor
   order, sample rates, transcript/TTS calls, and downstream media-frame traces
@@ -215,7 +222,10 @@ reconnect behavior.
   `terminal_kind` (`completed`, `failed`, or `cancelled`) so application
   telemetry does not infer cancellation from an error string. Preserve existing
   sanitized error/result fields and coordinator callback-suppression behavior;
-  land its focused tests before consumers depend on it.
+  land its focused tests before consumers depend on it. This is its own commit
+  within Phase 2: `terminal_kind` and its tests must merge before the
+  `on_late_terminal` hook or registry (below) reference it, so no
+  within-phase commit leaves `on_late_terminal` depending on an untested field.
 - Add an optional synchronous coordinator `on_late_terminal(work_item_id,
   terminal_kind)` hook that claims the recorder whenever retained work becomes
   terminal, before the existing shutdown guard can suppress
@@ -650,7 +660,9 @@ persists:
 ### Test Approach
 
 - Unit-test every registered event with its required and optional fields,
-  deterministic ordering, one-decimal millisecond formatting, enum validation,
+  deterministic ordering — including one fixture asserting `app_turn_foreground`
+  renders `routing_ms` before `commit_ms` (registry table order) whenever both
+  are present — one-decimal millisecond formatting, enum validation,
   identifier escaping, zero-duration acceptance, and rejection of empty
   required or supplied optional identifiers, negative durations, unknown keys,
   nested values, non-finite numbers, CR/LF, control characters, bool-as-int,
