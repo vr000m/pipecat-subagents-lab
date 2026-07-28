@@ -610,6 +610,12 @@ class SessionHost:
             self.connection = None
             self.state.active_epoch = None
 
+    def _require_coordinator(self) -> Any:
+        coordinator = self.coordinator
+        if coordinator is None:
+            raise RuntimeError("coordinator is required to execute work")
+        return coordinator
+
     async def _handle_transcript(
         self, transcript: str, *, origin: ConnectionPipeline | None = None
     ) -> Any:
@@ -931,12 +937,13 @@ class SessionHost:
         turn_id: str,
         turn_recorder: AppTurnRecorder,
     ) -> Any:
+        coordinator = self._require_coordinator()
         try:
             pending = getattr(outcome, "pending_dialogue", None)
             owner_id = pending.owner_id if pending is not None else None
             if owner_id is None:
                 owner_id = outcome.work_items[0] if outcome.work_items else None
-            registered = self.coordinator.registry.get(owner_id) if owner_id else None
+            registered = coordinator.registry.get(owner_id) if owner_id else None
             worker = registered.worker if registered is not None else None
             search = getattr(worker, "search", None)
             work_item_id = f"work-{turn_id}"
@@ -989,7 +996,7 @@ class SessionHost:
                         origin_epoch=origin.epoch,
                     )
 
-            submitted = await self.coordinator.submit(
+            submitted = await coordinator.submit(
                 work_item_id,
                 [(worker_id, transcript)],
                 execute,
@@ -1046,6 +1053,7 @@ class SessionHost:
     ) -> tuple[Any, ...]:
         """Execute bounded compound work in the user's stated order."""
         del transcript
+        coordinator = self._require_coordinator()
         try:
             results: dict[int, Any] = {}
             runnable: list[tuple[str, str]] = []
@@ -1060,13 +1068,13 @@ class SessionHost:
                 child_recorders[index] = child
                 worker = None
                 if index == 0 and pending is not None:
-                    registered = self.coordinator.registry.get(pending.owner_id)
+                    registered = coordinator.registry.get(pending.owner_id)
                     worker = registered.worker if registered is not None else None
                 else:
-                    catalogue = self.coordinator.registry.catalogue()
+                    catalogue = coordinator.registry.catalogue()
                     try:
                         envelope = await asyncio.to_thread(
-                            self.coordinator.router.route_envelope,
+                            coordinator.router.route_envelope,
                             item_text,
                             catalogue,
                         )
@@ -1200,7 +1208,7 @@ class SessionHost:
             }
             on_late_terminal = self._make_late_terminal_handler(retained_recorders)
 
-            submitted = await self.coordinator.submit(
+            submitted = await coordinator.submit(
                 f"work-{turn_id}",
                 runnable,
                 execute,
@@ -1341,6 +1349,7 @@ class SessionHost:
         work_item_id: str | None = None,
         clarification_context: ClarificationContext | None = None,
     ) -> SearchExecution:
+        coordinator = self._require_coordinator()
         kwargs: dict[str, Any] = {
             "turn_id": turn_id,
             "origin_epoch": origin_epoch,
@@ -1380,7 +1389,7 @@ class SessionHost:
         # time that callback could possibly run -- regardless of whether a
         # future refactor inserts an await between the two calls.
         self._register_retained_recorder_if_open(work_item_id, retained_recorder)
-        accepted = self.coordinator.retain_late_task(
+        accepted = coordinator.retain_late_task(
             task,
             work_item_id=work_item_id,
             worker_id=worker_id,
@@ -1555,7 +1564,7 @@ class SessionHost:
         self.state.append_result(result, origin_epoch=result.origin_epoch)
         candidate = self._clarification_candidates.pop(result.result_id, None)
         if candidate is not None and self.accepts(result.origin_epoch):
-            self.coordinator.add_worker_clarification(
+            self._require_coordinator().add_worker_clarification(
                 session_id=self.state.session_id,
                 result_id=result.result_id,
                 **candidate,
@@ -1620,9 +1629,10 @@ class SessionHost:
             self._handshake_tokens.pop(token, None)
 
     def _dispatch(self, decision: Any, catalogue: Any = None) -> Any:
+        coordinator = self._require_coordinator()
         if catalogue is None:
-            return self.coordinator.dispatch(decision)
-        return self.coordinator.dispatch(decision, catalogue=catalogue)
+            return coordinator.dispatch(decision)
+        return coordinator.dispatch(decision, catalogue=catalogue)
 
     def _track_work_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
         self._known_work_items.add(work_item_id)
