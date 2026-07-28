@@ -1008,3 +1008,97 @@ class TestAppTurnRecorderFinalizeTotality:
 
         assert len(sink.records) == 1
         assert sink.records[0].fields["outcome"] == "failed"
+
+
+class TestAppTurnRecorderChildOwnership:
+    """Every child created under a turn gets exactly one terminal record.
+
+    The parent owns its children, so a turn cancelled (or raising) between
+    child construction and the child's own finalize cannot orphan it.
+    """
+
+    @staticmethod
+    def _recorder(sink: CollectingMeasurementSink) -> AppTurnRecorder:
+        return AppTurnRecorder(
+            sink,
+            session_id="session-1",
+            origin_epoch=1,
+            turn_id="turn-1",
+        )
+
+    @staticmethod
+    def _children(sink: CollectingMeasurementSink) -> list[object]:
+        return [record for record in sink.records if record.event == "work_item_foreground"]
+
+    @staticmethod
+    def _parent(sink: CollectingMeasurementSink) -> object:
+        parents = [record for record in sink.records if record.event == "app_turn_foreground"]
+        assert len(parents) == 1
+        return parents[0]
+
+    def test_cancelled_turn_sweeps_only_the_still_open_child(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        done = recorder.new_child(work_item_id="work-1")
+        recorder.new_child(work_item_id="work-2")
+        done.finalize(outcome="completed")
+
+        recorder.finalize(outcome="cancelled")
+
+        children = self._children(sink)
+        assert len(children) == 2
+        assert {child.fields["work_item_id"]: child.fields["outcome"] for child in children} == {
+            "work-1": "completed",
+            "work-2": "cancelled",
+        }
+        parent = self._parent(sink).fields
+        assert parent["outcome"] == "cancelled"
+        assert parent["child_count"] == 2
+        assert parent["completed_count"] == 1
+        assert parent["cancelled_count"] == 1
+
+    def test_sweep_runs_before_outcome_derivation(self) -> None:
+        """A bare finalize whose only child is swept must derive its outcome
+        from the swept counter, not from the no-children fallback."""
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        recorder.new_child(work_item_id="work-1")
+
+        recorder.finalize()
+
+        children = self._children(sink)
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "failed"
+        parent = self._parent(sink).fields
+        assert parent["outcome"] == "failed"
+        assert parent["child_count"] == 1
+        assert parent["failed_count"] == 1
+
+    def test_already_finalized_child_is_not_swept_again(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        child = recorder.new_child(work_item_id="work-1")
+        child.finalize(outcome="completed")
+        child.finalize(outcome="failed")
+
+        recorder.finalize()
+
+        children = self._children(sink)
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "completed"
+        parent = self._parent(sink).fields
+        assert parent["outcome"] == "completed"
+        assert parent["child_count"] == 1
+        assert parent["completed_count"] == 1
+
+    def test_child_inherits_the_parents_identity(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        recorder.new_child(work_item_id="work-1").finalize(outcome="completed")
+
+        fields = self._children(sink)[0].fields
+        assert fields["session_id"] == "session-1"
+        assert fields["origin_epoch"] == 1
+        assert fields["turn_id"] == "turn-1"
+        assert fields["work_item_id"] == "work-1"

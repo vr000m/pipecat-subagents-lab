@@ -3034,8 +3034,16 @@ def test_pending_search_submit_exception_still_emits_failed_parent() -> None:
 
         parent = _events(sink, "app_turn_foreground")[0].fields
         assert parent["outcome"] == "failed"
-        assert parent["child_count"] == 0
-        assert _events(sink, "work_item_foreground") == ()
+        # The child recorder is created before ``submit`` is called, so the
+        # work item is already dispatched when submit raises. It was previously
+        # asserted as child_count == 0 with no child record at all, which
+        # encoded the orphaned-child defect: the parent now sweeps it to a
+        # terminal ``failed`` record instead of dropping it.
+        assert parent["child_count"] == 1
+        assert parent["failed_count"] == 1
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "failed"
         await host.shutdown()
 
     asyncio.run(run())
@@ -4240,6 +4248,169 @@ def test_control_turn_without_control_action_emits_failed_parent_and_same_speech
         assert fields["outcome"] == "failed"
         assert "control_action" not in fields
         assert "control_outcome" not in fields
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancelling_a_turn_mid_search_emits_a_cancelled_child_and_counts_it() -> None:
+    """A turn cancelled while its search is in flight must still emit the
+    child's terminal record. The child recorder is created before the search
+    begins, so cancellation used to orphan it: the parent reported
+    ``child_count=0`` and no ``work_item_foreground`` was ever emitted."""
+
+    async def run() -> None:
+        worker = BlockingResultWorker()
+
+        class CancellableCoordinator(RoutedCoordinator):
+            def arbitrate(self, session_id: str, transcript: str) -> object:
+                if transcript == "cancel":
+                    return type(
+                        "Outcome",
+                        (),
+                        {
+                            "kind": "control",
+                            "decision": None,
+                            "work_items": (),
+                            "control_action": "cancel",
+                        },
+                    )()
+                return super().arbitrate(session_id, transcript)
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=CancellableCoordinator(worker),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        pending = asyncio.create_task(host._handle_transcript("slow query"))
+        await asyncio.wait_for(worker.started.wait(), 1)
+
+        await host._handle_transcript("cancel")
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "cancelled"
+        cancelled_parents = [
+            record
+            for record in _events(sink, "app_turn_foreground")
+            if record.fields["outcome"] == "cancelled"
+        ]
+        assert len(cancelled_parents) == 1
+        assert cancelled_parents[0].fields["child_count"] == 1
+        assert cancelled_parents[0].fields["cancelled_count"] == 1
+        assert cancelled_parents[0].fields["turn_id"] == children[0].fields["turn_id"]
+        worker.release.set()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_exception_after_a_completed_search_sweeps_the_child_as_failed() -> None:
+    """``_commit_and_speak`` raises between the search completing and the
+    child recorder being finalized, so the child is swept to ``failed``
+    rather than left with no terminal record at all."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        async def raising_commit_and_speak(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("commit exploded")
+
+        host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit exploded"):
+            await host._handle_transcript("Riga weather")
+
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "failed"
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert parents[0].fields["outcome"] == "failed"
+        assert parents[0].fields["child_count"] == 1
+        assert parents[0].fields["failed_count"] == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_turn_cancelled_mid_submit_sweeps_the_child_as_cancelled() -> None:
+    """The ``_handle_pending`` path owns its child the same way: a turn
+    cancelled while ``coordinator.submit`` is in flight still emits one
+    terminal ``work_item_foreground``."""
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+                self.submitting = asyncio.Event()
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                self.submitting.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        pending_dialogue = type(
+            "Pending",
+            (),
+            {
+                "owner_id": "worker-search",
+                "original_query": "continue please",
+                "question": "Which one?",
+            },
+        )()
+        outcome = type("Outcome", (), {"pending_dialogue": pending_dialogue, "work_items": ()})()
+
+        turn = asyncio.create_task(
+            host._handle_pending(
+                outcome,
+                "continue please",
+                origin,
+                "turn-pending-cancel",
+                host._new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending-cancel"
+                ),
+            )
+        )
+        await asyncio.wait_for(coordinator.submitting.wait(), 1)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "cancelled"
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert parents[0].fields["outcome"] == "cancelled"
+        assert parents[0].fields["child_count"] == 1
+        assert parents[0].fields["cancelled_count"] == 1
         await host.shutdown()
 
     asyncio.run(run())

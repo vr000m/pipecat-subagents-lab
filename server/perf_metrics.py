@@ -668,11 +668,17 @@ _PARENT_OUTCOME_FOR_COUNTER: Mapping[str, str] = MappingProxyType(
 class AppTurnRecorder:
     """Parent ``app_turn_foreground`` recorder: one per accepted semantic turn.
 
-    Callers record zero or more children through :meth:`record_child`, then
-    call :meth:`finalize` exactly once. ``finalize`` is idempotent so a stray
-    second call from a defensive branch cannot double-emit; the emission
-    itself is contained by :func:`_safe_emit`, so a producer bug here cannot
-    change routing/result/speech behavior.
+    Callers create children through :meth:`new_child`, which registers each
+    one with this parent; a child attributes itself to the parent's counters
+    when it finalizes. Any child still open when :meth:`finalize` runs is
+    swept to a terminal record first, so every child created under a turn is
+    guaranteed exactly one ``work_item_foreground`` record even if the turn
+    is cancelled or raises between construction and finalization.
+
+    ``finalize`` is called exactly once and is idempotent so a stray second
+    call from a defensive branch cannot double-emit; the emission itself is
+    contained by :func:`_safe_emit`, so a producer bug here cannot change
+    routing/result/speech behavior.
     """
 
     def __init__(
@@ -692,6 +698,7 @@ class AppTurnRecorder:
         self._start = clock()
         self._counters: dict[str, int] = dict.fromkeys(_APP_TURN_COUNTER_FIELDS, 0)
         self._dispatched_children = 0
+        self._open_children: dict[str, WorkItemRecorder] = {}
         self._finalized = False
         self._routing_ms: float | None = None
         self._commit_ms: float | None = None
@@ -704,9 +711,34 @@ class AppTurnRecorder:
     def finalized(self) -> bool:
         return self._finalized
 
-    def record_child(self, outcome: str) -> None:
+    def new_child(self, *, work_item_id: str, **kwargs: Any) -> WorkItemRecorder:
+        """Create one child recorder owned by this turn.
+
+        The child attributes itself to this parent when it finalizes, and is
+        swept to a terminal record by :meth:`finalize` if it never does.
+        """
+        child = WorkItemRecorder(
+            self._sink,
+            session_id=self._session_id,
+            origin_epoch=self._origin_epoch,
+            turn_id=self._turn_id,
+            work_item_id=work_item_id,
+            clock=self._clock,
+            on_finalize=lambda outcome, item_id=work_item_id: self._record_child(item_id, outcome),
+            **kwargs,
+        )
+        self._open_children[work_item_id] = child
+        return child
+
+    def _record_child(self, work_item_id: str, outcome: str) -> None:
         """Attribute one dispatched child's outcome to its exhaustive counter
         and count it toward ``child_count``."""
+        if self._open_children.pop(work_item_id, None) is None:
+            logger.warning(
+                f"app_turn_foreground: finalize callback for unknown or already-recorded "
+                f"child work_item_id={work_item_id!r}"
+            )
+            return
         counter = _CHILD_COUNTER_FOR_OUTCOME.get(outcome)
         if counter is None:
             logger.warning(f"app_turn_foreground: unrecognized child outcome {outcome!r}")
@@ -730,6 +762,16 @@ class AppTurnRecorder:
         if self._finalized:
             return
         self._finalized = True
+        # Sweep before deriving the outcome so a fully-swept turn still derives
+        # a real outcome from its counters instead of the no-children fallback.
+        if self._open_children:
+            sweep_outcome = "cancelled" if outcome == "cancelled" else "failed"
+            for child in tuple(self._open_children.values()):
+                logger.warning(
+                    f"app_turn_foreground: child work_item was never finalized for "
+                    f"turn_id={self._turn_id!r}; recording outcome={sweep_outcome}"
+                )
+                child.finalize(outcome=sweep_outcome)
         total_ms = (self._clock() - self._start) * 1000
         if outcome is None:
             nonzero = [name for name in _APP_TURN_COUNTER_FIELDS if self._counters[name]]
@@ -781,7 +823,12 @@ class AppTurnRecorder:
 
 
 class WorkItemRecorder:
-    """Child ``work_item_foreground`` recorder: one per dispatched work item."""
+    """Child ``work_item_foreground`` recorder: one per dispatched work item.
+
+    Created through :meth:`AppTurnRecorder.new_child`, which supplies the
+    ``on_finalize`` callback that attributes this item's outcome to the parent
+    turn. The callback runs exactly once, on the emitting finalize call.
+    """
 
     def __init__(
         self,
@@ -792,6 +839,7 @@ class WorkItemRecorder:
         turn_id: str,
         work_item_id: str,
         clock: Callable[[], float] = time.perf_counter,
+        on_finalize: Callable[[str], None] | None = None,
     ) -> None:
         self._sink = sink
         self._session_id = session_id
@@ -799,6 +847,7 @@ class WorkItemRecorder:
         self._turn_id = turn_id
         self._work_item_id = work_item_id
         self._clock = clock
+        self._on_finalize = on_finalize
         self._start = clock()
         self._finalized = False
 
@@ -815,7 +864,7 @@ class WorkItemRecorder:
         search_ms: float | None = None,
         commit_ms: float | None = None,
     ) -> str:
-        """Emit once and return ``outcome`` so callers can feed the parent counter."""
+        """Emit once, notify the owning turn, and return ``outcome``."""
         if self._finalized:
             return outcome
         self._finalized = True
@@ -837,6 +886,8 @@ class WorkItemRecorder:
         if commit_ms is not None:
             fields["commit_ms"] = commit_ms
         _safe_emit(self._sink, "work_item_foreground", fields)
+        if self._on_finalize is not None:
+            self._on_finalize(outcome)
         return outcome
 
 

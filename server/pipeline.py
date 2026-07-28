@@ -521,17 +521,6 @@ class SessionHost:
             turn_id=turn_id,
         )
 
-    def _new_work_item_recorder(
-        self, *, origin_epoch: int, turn_id: str, work_item_id: str
-    ) -> WorkItemRecorder:
-        return WorkItemRecorder(
-            self.measurement_sink,
-            session_id=self.state.session_id,
-            origin_epoch=origin_epoch,
-            turn_id=turn_id,
-            work_item_id=work_item_id,
-        )
-
     def _new_retained_recorder(
         self, *, origin_epoch: int, turn_id: str, work_item_id: str, app_worker_id: str
     ) -> RetainedRecorder:
@@ -802,27 +791,19 @@ class SessionHost:
                 turn_recorder.finalize(outcome="failed")
                 return result
             if worker is None:
-                child = self._new_work_item_recorder(
-                    origin_epoch=origin_epoch, turn_id=turn_id, work_item_id=work_item_id
-                )
-                child_outcome = child.finalize(outcome="missing_worker")
-                turn_recorder.record_child(child_outcome)
+                child = turn_recorder.new_child(work_item_id=work_item_id)
+                child.finalize(outcome="missing_worker")
                 turn_recorder.finalize(outcome="failed")
                 return outcome
             self._project_worker(worker, origin_epoch=origin_epoch, status="running")
             search = getattr(worker, "search", None)
             worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
             if search is None:
-                child = self._new_work_item_recorder(
-                    origin_epoch=origin_epoch, turn_id=turn_id, work_item_id=work_item_id
-                )
-                child_outcome = child.finalize(outcome="missing_search", app_worker_id=worker_id)
-                turn_recorder.record_child(child_outcome)
+                child = turn_recorder.new_child(work_item_id=work_item_id)
+                child.finalize(outcome="missing_search", app_worker_id=worker_id)
                 turn_recorder.finalize(outcome="failed")
                 return outcome
-            child = self._new_work_item_recorder(
-                origin_epoch=origin_epoch, turn_id=turn_id, work_item_id=work_item_id
-            )
+            child = turn_recorder.new_child(work_item_id=work_item_id)
             try:
                 search_started = time.perf_counter()
                 execution = await self._search_with_timeout(
@@ -899,14 +880,13 @@ class SessionHost:
             commit_started = time.perf_counter()
             committed = await self._commit_and_speak(result, origin)
             commit_ms = (time.perf_counter() - commit_started) * 1000
-            child_outcome = child.finalize(
+            child.finalize(
                 outcome=child_outcome_label,
                 app_worker_id=worker_id,
                 result_id=result.result_id,
                 search_ms=search_ms,
                 commit_ms=commit_ms,
             )
-            turn_recorder.record_child(child_outcome)
             turn_recorder.record_commit(commit_ms)
             turn_recorder.finalize()
             self._project_worker(
@@ -943,20 +923,15 @@ class SessionHost:
             search = getattr(worker, "search", None)
             work_item_id = f"work-{turn_id}"
             if search is None:
-                child = self._new_work_item_recorder(
-                    origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=work_item_id
-                )
-                child_outcome = child.finalize(outcome="missing_search", app_worker_id=owner_id)
-                turn_recorder.record_child(child_outcome)
+                child = turn_recorder.new_child(work_item_id=work_item_id)
+                child.finalize(outcome="missing_search", app_worker_id=owner_id)
                 turn_recorder.finalize(outcome="failed")
                 return outcome
             await self._register_runner_worker(worker)
             worker_id = owner_id or "main"
             self._known_work_items.add(work_item_id)
             clarification_context = self._clarification_context(pending, transcript)
-            child = self._new_work_item_recorder(
-                origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=work_item_id
-            )
+            child = turn_recorder.new_child(work_item_id=work_item_id)
             retained_recorder = self._new_retained_recorder(
                 origin_epoch=origin.epoch,
                 turn_id=turn_id,
@@ -1006,7 +981,7 @@ class SessionHost:
             )
             if submitted.results:
                 result = submitted.results[0]
-                child_outcome = child.finalize(
+                child.finalize(
                     outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
                 )
             elif submitted.pending_work_item_ids:
@@ -1016,7 +991,7 @@ class SessionHost:
                     text="That is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
-                child_outcome = child.finalize(outcome="retained", app_worker_id=worker_id)
+                child.finalize(outcome="retained", app_worker_id=worker_id)
                 self._register_retained_recorder_if_open(work_item_id, retained_recorder)
             else:
                 failure_outcome = (
@@ -1030,8 +1005,7 @@ class SessionHost:
                     text="The pending web request could not be completed.",
                     origin_epoch=origin.epoch,
                 )
-                child_outcome = child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
-            turn_recorder.record_child(child_outcome)
+                child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             committed = await self._commit_and_speak(result, origin)
             turn_recorder.finalize()
             return committed
@@ -1064,9 +1038,7 @@ class SessionHost:
             pending = getattr(outcome, "pending_dialogue", None)
             for index, item_text in enumerate(outcome.work_items):
                 item_work_item_id = f"work-{turn_id}-{index}"
-                child = self._new_work_item_recorder(
-                    origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=item_work_item_id
-                )
+                child = turn_recorder.new_child(work_item_id=item_work_item_id)
                 child_recorders[index] = child
                 worker = None
                 if index == 0 and pending is not None:
@@ -1091,7 +1063,7 @@ class SessionHost:
                             text="Routing is temporarily unavailable. Please try that request again.",
                             origin_epoch=origin.epoch,
                         )
-                        turn_recorder.record_child(child.finalize(outcome="failed"))
+                        child.finalize(outcome="failed")
                         continue
                     decision = envelope.decision
                     action = getattr(decision, "action", None)
@@ -1110,7 +1082,7 @@ class SessionHost:
                             text=text,
                             origin_epoch=origin.epoch,
                         )
-                        turn_recorder.record_child(child.finalize(outcome=action))
+                        child.finalize(outcome=action)
                         continue
                     try:
                         worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
@@ -1122,7 +1094,7 @@ class SessionHost:
                             text="I cannot access that capability here.",
                             origin_epoch=origin.epoch,
                         )
-                        turn_recorder.record_child(child.finalize(outcome="failed"))
+                        child.finalize(outcome="failed")
                         continue
                 search = getattr(worker, "search", None)
                 if search is None:
@@ -1137,11 +1109,9 @@ class SessionHost:
                         if worker is not None
                         else None
                     )
-                    turn_recorder.record_child(
-                        child.finalize(
-                            outcome="missing_worker" if worker is None else "missing_search",
-                            app_worker_id=worker_id_for_child,
-                        )
+                    child.finalize(
+                        outcome="missing_worker" if worker is None else "missing_search",
+                        app_worker_id=worker_id_for_child,
                     )
                     continue
                 worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
@@ -1230,12 +1200,10 @@ class SessionHost:
                 index = result_indexes[result.turn_id]
                 results[index] = result
                 worker_id = index_to_worker_id[index][0]
-                turn_recorder.record_child(
-                    child_recorders[index].finalize(
-                        outcome=outcome_labels.get(index, "completed"),
-                        app_worker_id=worker_id,
-                        result_id=result.result_id,
-                    )
+                child_recorders[index].finalize(
+                    outcome=outcome_labels.get(index, "completed"),
+                    app_worker_id=worker_id,
+                    result_id=result.result_id,
                 )
             for work_item_id in submitted.pending_work_item_ids:
                 item_index = int(work_item_id.rsplit("-", 1)[1])
@@ -1246,11 +1214,7 @@ class SessionHost:
                     text="That item is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
-                turn_recorder.record_child(
-                    child_recorders[item_index].finalize(
-                        outcome="retained", app_worker_id=worker_id
-                    )
-                )
+                child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
                 recorder = retained_recorders.get(work_item_id)
                 if recorder is not None:
                     self._register_retained_recorder_if_open(work_item_id, recorder)
@@ -1262,11 +1226,9 @@ class SessionHost:
                     text="The web search is temporarily unavailable.",
                     origin_epoch=origin.epoch,
                 )
-                turn_recorder.record_child(
-                    child_recorders[item_index].finalize(
-                        outcome=self._failure_child_outcome(failure),
-                        app_worker_id=failure.worker_id,
-                    )
+                child_recorders[item_index].finalize(
+                    outcome=self._failure_child_outcome(failure),
+                    app_worker_id=failure.worker_id,
                 )
             committed = []
             for index in sorted(results):
