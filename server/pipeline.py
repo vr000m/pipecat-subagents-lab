@@ -76,14 +76,23 @@ if WorkerBus is not None:
     _ProbeBus = _RealProbeBus
 
 
-_CONTROL_ACK_TEXT: dict[str | None, str] = {
+_CONTROL_ACK_TEXT: dict[ControlAction, str] = {
     "pause": "Pausing the active response.",
     "resume": "Resuming the paused response.",
     "cancel": "Cancelling the active response.",
     "stop": "Stopping the active response.",
+}
+"""Acknowledgement spoken for a control action that was understood."""
+
+_CONTROL_MISS_ACK_TEXT: dict[ControlOutcome, str] = {
     "unknown_target": "I could not find that active work item.",
     "no_active": "There is no active response to cancel.",
 }
+"""Acknowledgement spoken when a cancel/stop named nothing it could act on.
+
+Keyed by ``ControlOutcome``, a vocabulary disjoint from ``ControlAction``;
+they are separate tables so neither key type has to widen to ``str | None``.
+"""
 
 
 def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
@@ -590,8 +599,15 @@ class SessionHost:
         ``error_type`` is free-text diagnostic and must never drive
         classification: renaming a worker exception class would otherwise
         silently reclassify its telemetry outcome.
+
+        The ``failure_kind in FAILURE_KINDS`` check below is redundant against
+        the static type but not against runtime: ``SessionHost.coordinator`` is
+        an injected ``Any``, so ``submitted.failures`` is unchecked at both call
+        sites and a duck-typed coordinator can supply an off-domain kind. Left
+        unguarded it would reach the enum-validated ``outcome`` field and the
+        whole record would be silently dropped instead of downgraded.
         """
-        kind = getattr(failure, "failure_kind", None)
+        kind = failure.failure_kind
         if kind in FAILURE_KINDS:
             return kind
         logger.warning(
@@ -690,8 +706,12 @@ class SessionHost:
             if outcome.kind != "routed" or outcome.decision is None:
                 control_action: ControlAction | None = None
                 control_outcome: ControlOutcome | None = None
+                ack_override: str | None = None
                 if outcome.kind == "control":
-                    action = getattr(outcome, "control_action", None)
+                    # Explicit ``Any`` (not inferred): getattr's 3-arg overload with a
+                    # literal ``None`` default types as ``Any | None``, and that ``| None``
+                    # is not assignable where a Literal-keyed dict is looked up below.
+                    action: Any = getattr(outcome, "control_action", None)
                     control_action = action
                     control_outcome = (
                         "no_active" if action in {"pause", "resume"} else "unknown_target"
@@ -723,12 +743,12 @@ class SessionHost:
                             control_outcome = (
                                 "unknown_target" if target is not None else "no_active"
                             )
-                            action = control_outcome
+                            ack_override = _CONTROL_MISS_ACK_TEXT[control_outcome]
                         else:
                             control_outcome = "applied"
                     elif action == "consent":
                         control_outcome = "no_pending"
-                    text = _CONTROL_ACK_TEXT.get(action, "Control request noted.")
+                    text = ack_override or _CONTROL_ACK_TEXT.get(action, "Control request noted.")
                 elif outcome.kind == "multi_intent":
                     return await self._handle_multi_intent(
                         outcome, transcript, origin, turn_id, turn_recorder
@@ -1229,7 +1249,11 @@ class SessionHost:
             index_for_work_item_id = {
                 f"work-{turn_id}-{index}": index for index in runnable_indexes
             }
-            attributed_indexes: set[int] = set()
+            # Two passes: settle last-wins content first, then attribute each
+            # matched item exactly once from the result that actually commits.
+            # Finalizing on first sight would name a discarded result_id in the
+            # child record while a later duplicate won the committed content.
+            final_result_for_index: dict[int, Any] = {}
             for result in submitted.results:
                 matched = index_for_item_turn_id.get(result.turn_id)
                 if matched is None:
@@ -1238,22 +1262,20 @@ class SessionHost:
                         f"turn_id does not match any dispatched work item"
                     )
                     continue
-                index = matched
-                # Content attribution stays last-wins on a duplicate; only the
-                # child's terminal record is emitted once.
-                results[index] = result
-                if index in attributed_indexes:
+                if matched in final_result_for_index:
                     logger.warning(
                         f"multi-intent fan-in for {turn_id}: duplicate result for the same "
-                        f"work item; keeping the last result and not re-recording the child"
+                        f"work item; keeping the last result for both the committed "
+                        f"content and the child record"
                     )
-                    continue
-                attributed_indexes.add(index)
+                results[matched] = result
+                final_result_for_index[matched] = result
+            for index, final_result in final_result_for_index.items():
                 worker_id = index_to_worker_id[index][0]
                 child_recorders[index].finalize(
                     outcome=outcome_labels.get(index, "completed"),
                     app_worker_id=worker_id,
-                    result_id=result.result_id,
+                    result_id=final_result.result_id,
                 )
             for work_item_id in submitted.pending_work_item_ids:
                 matched = index_for_work_item_id.get(work_item_id)

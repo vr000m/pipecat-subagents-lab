@@ -2484,6 +2484,34 @@ def test_unknown_cancel_target_emits_control_with_unknown_target_outcome() -> No
     asyncio.run(run())
 
 
+def test_unknown_cancel_target_speaks_the_miss_acknowledgement_text() -> None:
+    """A cancel naming a target that matches neither work nor speech must
+    speak the dedicated miss acknowledgement from ``_CONTROL_MISS_ACK_TEXT``
+    (keyed by ``ControlOutcome``, looked up via ``ack_override``), not the
+    generic ``_CONTROL_ACK_TEXT`` table keyed by ``action`` — which would
+    otherwise fall through to "Control request noted.".
+    """
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=WorkItemCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("cancel work-item-does-not-exist")
+
+        assert result.text == "I could not find that active work item."
+        fields = _events(sink, "app_turn_foreground")[0].fields
+        assert fields["control_action"] == "cancel"
+        assert fields["control_outcome"] == "unknown_target"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_consent_without_pending_dialogue_emits_control_no_pending_outcome() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
@@ -4529,7 +4557,8 @@ def test_multi_intent_unmatched_result_turn_id_is_dropped_without_losing_the_tur
 
 def test_multi_intent_duplicate_result_turn_ids_keep_last_content_and_one_child_record() -> None:
     """Two results colliding on one turn_id preserve the existing last-wins
-    commit semantics while emitting exactly one child record for that item."""
+    commit semantics while emitting exactly one child record for that item,
+    and that child record names the same last-wins result that committed."""
 
     async def run() -> None:
         sink = CollectingMeasurementSink()
@@ -4559,6 +4588,7 @@ def test_multi_intent_duplicate_result_turn_ids_keep_last_content_and_one_child_
         ]
         assert len(item_zero) == 1
         assert item_zero[0].fields["outcome"] == "completed"
+        assert item_zero[0].fields["result_id"] == "result-turn-dup-0-second answer"
         parent = _events(sink, "app_turn_foreground")[0].fields
         assert parent["child_count"] == len(children)
         await host.shutdown()
