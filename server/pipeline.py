@@ -733,11 +733,22 @@ class SessionHost:
                     ),
                     origin,
                 )
-                turn_recorder.finalize(
-                    outcome="control",
-                    control_action=control_action,
-                    control_outcome=control_outcome,
-                )
+                if control_action is None:
+                    # ``outcome=control`` requires both control fields; a
+                    # control turn that never named an action cannot produce a
+                    # schema-valid control record, so it is recorded as failed
+                    # rather than dropped. Spoken text is unaffected.
+                    logger.warning(
+                        f"Control turn {turn_id} carried no control_action; "
+                        f"recording app_turn_foreground outcome=failed"
+                    )
+                    turn_recorder.finalize(outcome="failed")
+                else:
+                    turn_recorder.finalize(
+                        outcome="control",
+                        control_action=control_action,
+                        control_outcome=control_outcome,
+                    )
                 return result
             if isinstance(outcome.decision, RoutingDecision):
                 self.state.set_routing(

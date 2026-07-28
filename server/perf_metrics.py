@@ -739,9 +739,27 @@ class AppTurnRecorder:
                 outcome = "mixed"
             else:
                 logger.warning(
-                    f"app_turn_foreground: no outcome could be derived for turn_id={self._turn_id!r}"
+                    f"app_turn_foreground: no outcome could be derived for "
+                    f"turn_id={self._turn_id!r}; recording outcome=failed"
                 )
-                return
+                outcome = "failed"
+        if (control_action is None) != (control_outcome is None) or (
+            outcome == "control" and control_action is None
+        ):
+            # The validator rejects a half-populated control pair, and a
+            # rejected record is a dropped record. Degrade to a schema-valid
+            # ``failed`` so this method stays total for every argument
+            # combination rather than depending on every caller getting the
+            # pair right.
+            logger.warning(
+                f"app_turn_foreground: inconsistent control fields for "
+                f"turn_id={self._turn_id!r} (outcome={outcome!r}, "
+                f"control_action={control_action!r}, control_outcome={control_outcome!r}); "
+                f"recording outcome=failed without control fields"
+            )
+            control_action = None
+            control_outcome = None
+            outcome = "failed"
         fields: dict[str, Any] = {
             "session_id": self._session_id,
             "origin_epoch": self._origin_epoch,

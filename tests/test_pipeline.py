@@ -4153,3 +4153,93 @@ def test_routing_failure_logs_exception_type_without_traceback_or_message() -> N
             pipeline_module.logger.remove(sink_id)
 
     asyncio.run(run())
+
+
+def test_multi_intent_with_no_work_items_still_emits_exactly_one_parent() -> None:
+    """A multi-intent turn that dispatches nothing must still produce one
+    ``app_turn_foreground``: ``finalize`` derives ``failed`` rather than
+    latching finalized and emitting nothing at all."""
+
+    async def run() -> None:
+        class EmptyMultiIntentCoordinator:
+            @staticmethod
+            def arbitrate(_session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "multi_intent",
+                        "decision": None,
+                        "work_items": (),
+                        "pending_dialogue": None,
+                    },
+                )()
+
+            @staticmethod
+            async def submit(*_args: object, **_kwargs: object) -> object:
+                return type(
+                    "Submitted",
+                    (),
+                    {
+                        "results": (),
+                        "pending_work_item_ids": (),
+                        "failures": (),
+                    },
+                )()
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=EmptyMultiIntentCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        assert await host._handle_transcript("do two things") == ()
+
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert parents[0].fields["outcome"] == "failed"
+        assert parents[0].fields["child_count"] == 0
+        assert _events(sink, "work_item_foreground") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_control_turn_without_control_action_emits_failed_parent_and_same_speech() -> None:
+    """A control outcome carrying no ``control_action`` cannot form a valid
+    ``outcome=control`` record (the pair is half-populated and the validator
+    rejects it, dropping the record). It is recorded as ``failed`` instead,
+    with the spoken fallback text unchanged."""
+
+    async def run() -> None:
+        class ActionlessControlCoordinator:
+            @staticmethod
+            def arbitrate(_session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {"kind": "control", "decision": None, "work_items": ()},
+                )()
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=ActionlessControlCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("do the control thing")
+
+        assert result.text == "Control request noted."
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        fields = parents[0].fields
+        assert fields["outcome"] == "failed"
+        assert "control_action" not in fields
+        assert "control_outcome" not in fields
+        await host.shutdown()
+
+    asyncio.run(run())

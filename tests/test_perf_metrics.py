@@ -47,6 +47,7 @@ from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 
 from server.perf_metrics import (
     EVENT_REGISTRY,
+    AppTurnRecorder,
     CollectingMeasurementSink,
     ConsoleMeasurementSink,
     PerfConnectionContext,
@@ -902,3 +903,108 @@ class TestRetainedRecorderFinalizeDefaults:
         assert record.fields["work_outcome"] == "completed"
         assert record.fields["commit_outcome"] == "suppressed_stale"
         assert record.fields["speech_outcome"] == "not_applicable"
+
+
+class TestAppTurnRecorderFinalizeTotality:
+    """``AppTurnRecorder.finalize`` must emit exactly one schema-valid record
+    for every state/argument combination.
+
+    The recorder latches ``_finalized`` before deriving anything, so any path
+    that returned without emitting would leave the turn permanently
+    unrecorded while still reporting ``finalized is True``.
+    """
+
+    @staticmethod
+    def _recorder(sink: CollectingMeasurementSink) -> AppTurnRecorder:
+        return AppTurnRecorder(
+            sink,
+            session_id="session-1",
+            origin_epoch=1,
+            turn_id="turn-1",
+        )
+
+    @staticmethod
+    def _warnings(records: list[object]) -> list[object]:
+        return [record for record in records if record["level"].name == "WARNING"]
+
+    def test_bare_finalize_with_no_children_emits_one_failed_record(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        captured: list[object] = []
+        handler_id = loguru_logger.add(lambda message: captured.append(message.record))
+        try:
+            recorder.finalize()
+        finally:
+            loguru_logger.remove(handler_id)
+
+        assert recorder.finalized is True
+        assert len(sink.records) == 1
+        fields = sink.records[0].fields
+        assert fields["outcome"] == "failed"
+        assert fields["child_count"] == 0
+        assert all(
+            fields[name] == 0
+            for name in (
+                "direct_count",
+                "unsupported_count",
+                "completed_count",
+                "retained_count",
+                "clarification_count",
+                "declined_count",
+                "failed_count",
+                "cancelled_count",
+            )
+        )
+        assert self._warnings(captured)
+
+    def test_control_outcome_without_control_action_degrades_to_failed(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        captured: list[object] = []
+        handler_id = loguru_logger.add(lambda message: captured.append(message.record))
+        try:
+            recorder.finalize(
+                outcome="control", control_action=None, control_outcome="unknown_target"
+            )
+        finally:
+            loguru_logger.remove(handler_id)
+
+        assert len(sink.records) == 1
+        fields = sink.records[0].fields
+        assert fields["outcome"] == "failed"
+        assert "control_action" not in fields
+        assert "control_outcome" not in fields
+        assert self._warnings(captured)
+
+    def test_control_action_without_control_outcome_degrades_to_failed(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        recorder.finalize(outcome="control", control_action="pause", control_outcome=None)
+
+        assert len(sink.records) == 1
+        fields = sink.records[0].fields
+        assert fields["outcome"] == "failed"
+        assert "control_action" not in fields
+        assert "control_outcome" not in fields
+
+    def test_complete_control_pair_is_preserved(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        recorder.finalize(outcome="control", control_action="pause", control_outcome="applied")
+
+        fields = sink.records[0].fields
+        assert fields["outcome"] == "control"
+        assert fields["control_action"] == "pause"
+        assert fields["control_outcome"] == "applied"
+
+    def test_second_finalize_never_emits_a_second_record(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        recorder.finalize()
+        recorder.finalize(outcome="completed")
+
+        assert len(sink.records) == 1
+        assert sink.records[0].fields["outcome"] == "failed"
