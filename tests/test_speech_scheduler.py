@@ -71,6 +71,21 @@ def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
     asyncio.run(run())
 
 
+def test_discard_queued_is_task_local_and_does_not_interrupt_active_speech() -> None:
+    scheduler = SpeechScheduler(SessionState())
+    active = enqueue(scheduler, "work-active", "active")
+    stale = enqueue(scheduler, "work-stale", "stale")
+    other = enqueue(scheduler, "work-other", "other")
+    asyncio.run(scheduler.start_next())
+
+    discarded = scheduler.discard_queued("work-stale")
+
+    assert discarded == (stale,)
+    assert scheduler.active is not None and scheduler.active.item == active
+    assert scheduler.state.speech[stale.utterance_id].state == DeliveryState.INTERRUPTED
+    assert scheduler._queues["work-other"] == [other]
+
+
 def test_interrupt_signals_provider_stop_before_releasing_active_lease() -> None:
     stopped: list[str] = []
     scheduler = SpeechScheduler(

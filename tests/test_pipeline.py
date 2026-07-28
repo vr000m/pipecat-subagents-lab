@@ -598,6 +598,73 @@ def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -
     asyncio.run(run())
 
 
+def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None:
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+
+        active = connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Helsinki weather",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+
+        timeout = GroundedResult(
+            result_id="result-timeout",
+            worker_id="worker-search",
+            turn_id="turn-sf",
+            text="That is taking longer than expected; I will continue in the background.",
+            spoken_text="That is taking longer than expected; I will continue in the background.",
+            origin_epoch=1,
+        )
+        await host._commit_and_speak(timeout, connection)
+        stale = connection.scheduler._queues["work-turn-sf"][0]
+
+        final = GroundedResult(
+            result_id="result-final",
+            worker_id="worker-search",
+            turn_id="turn-sf",
+            text="The current temperature in San Francisco is 69 degrees Fahrenheit.",
+            spoken_text="The current temperature in San Francisco is 69 degrees Fahrenheit.",
+            origin_epoch=1,
+        )
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-turn-sf",
+                worker_id="worker-search",
+                result=final,
+            ),
+            1,
+        )
+
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item == active
+        assert host.state.speech[stale.utterance_id].state.value == "interrupted"
+        queued = connection.scheduler._queues["work-turn-sf"]
+        assert len(queued) == 1
+        assert queued[0].result_id == final.result_id
+
+        assert tts.on_event is not None
+        await tts.on_event("synthesis_started", active.utterance_id)
+        await tts.on_event("synthesis_ended", active.utterance_id)
+
+        spoken_frames = [
+            frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
+        ]
+        assert [frame.text for frame in spoken_frames] == [
+            "Helsinki weather",
+            final.spoken_text,
+        ]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_late_result_from_replaced_epoch_remains_display_only() -> None:
     async def run() -> None:
         tts = FakeTTS()

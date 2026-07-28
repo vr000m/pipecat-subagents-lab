@@ -1553,6 +1553,10 @@ class SessionHost:
                     result_id = result.result_id
                     if speakable is not None:
                         try:
+                            # A retained result supersedes its timeout notice
+                            # only while that notice is still queued. Never
+                            # interrupt an utterance that has already started.
+                            speakable.scheduler.discard_queued(late.work_item_id)
                             speakable.scheduler.enqueue(
                                 result_id=result.result_id,
                                 work_item_id=late.work_item_id,
