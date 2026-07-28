@@ -46,30 +46,34 @@ from .speech_scheduler import SpeechScheduler
 from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
+
+class _FallbackBridge:
+    """Dependency-free marker used only when the pinned bridge API is absent."""
+
+    framework_fallback = True
+
+
 try:
     from pipecat.bus.bridge_processor import (
-        BusBridgeProcessor as BusBridgeProcessor,  # noqa: PLC0414  # explicit re-export: name must match the except-branch fallback class below
+        BusBridgeProcessor as BusBridgeProcessor,  # noqa: PLC0414  # explicit re-export: the bridge type is part of this module's public surface
     )
     from pipecat.bus.bus import WorkerBus
 except ImportError:  # pragma: no cover - only for dependency-free contract tests
-
-    class BusBridgeProcessor:
-        """Dependency-free marker used only when the pinned bridge API is absent."""
-
-        framework_fallback = True
-
+    BusBridgeProcessor = _FallbackBridge  # type: ignore[assignment,misc]
     WorkerBus = None  # type: ignore[assignment,misc]
 
 
+_ProbeBus: Any = None
+
 if WorkerBus is not None:
 
-    class _ProbeBus(WorkerBus):
+    class _RealProbeBus(WorkerBus):
         """No-op bus used only to construct dependency-free contract pipelines."""
 
         async def publish(self, _message: Any) -> None:
             return None
-else:  # pragma: no cover
-    _ProbeBus = None
+
+    _ProbeBus = _RealProbeBus
 
 
 _CONTROL_ACK_TEXT: dict[str | None, str] = {
@@ -85,7 +89,7 @@ _CONTROL_ACK_TEXT: dict[str | None, str] = {
 def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
     """Construct the pinned framework bridge with connection-local output frames."""
     if getattr(BusBridgeProcessor, "framework_fallback", False):
-        return BusBridgeProcessor()
+        return _FallbackBridge()
     excluded = kwargs.pop("exclude_frames", ())
     kwargs["exclude_frames"] = tuple(dict.fromkeys((TTSSpeakFrame, *excluded)))
     return BusBridgeProcessor(bus=bus, worker_name=worker_name, **kwargs)
@@ -219,7 +223,7 @@ def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
     bridge = (
         framework_bridge(bus=bus, worker_name="contract-pipeline")
         if bus is not None
-        else BusBridgeProcessor()
+        else _FallbackBridge()
     )
     return LabPipeline(
         transport=transport,
