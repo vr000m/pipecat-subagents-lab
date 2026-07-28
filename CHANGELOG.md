@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are now `Literal`-alias-derived rather than hand-duplicated frozensets, so a
   typo or future rename in an outcome literal fails CI instead of silently
   dropping a metric in production.
+- Invert the `mypy` gate from an allowlist (`server.*` ignored by default,
+  three modules un-ignored) to a denylist (`server.*` checked by default, an
+  explicit legacy-debt list of the 12 modules with pre-existing errors
+  exempted). A newly added `server/*.py` file is now gated automatically
+  instead of silently unchecked. Behavior-neutral: `uv run mypy` output is
+  unchanged.
 
 ### Fixed
 
@@ -67,6 +73,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `turn_id` or `work_item_id`: the turn now degrades gracefully (partial
   results still commit and speak; only the unattributable item drops, with a
   warning) instead of the entire turn silently failing.
+- Validate `AppTurnRecorder.finalize`'s `outcome` and `WorkItemRecorder
+  .finalize`'s `outcome` against their closed vocabularies before emitting,
+  degrading an out-of-vocabulary value to `"failed"` instead of letting the
+  record drop silently inside `_safe_emit` after the recorder was already
+  latched finalized (no retry possible).
+- Classify `_failure_child_outcome` directly from `failure.failure_kind`
+  instead of a defensive `getattr` default, restoring the static type
+  guarantee `mypy` proves in `server.pipeline`; the runtime membership check
+  is kept, since the coordinator seam is untyped and a duck-typed caller can
+  still supply an off-domain kind.
+- Attribute the multi-intent fan-in's `work_item_foreground` record to the
+  actually-committed result on a duplicate `turn_id`, instead of the first
+  (discarded) one, so telemetry and committed content never diverge.
+- Decouple `AppTurnRecorder`'s child-outcome counting from the finalize
+  sweep's open-child tracking, so a caller-bug duplicate `work_item_id` no
+  longer leaves an emitted `work_item_foreground` record uncounted.
+- Split the control-turn acknowledgement text into two vocabulary-correct
+  lookup tables (`ControlAction`, `ControlOutcome`) instead of one table
+  keyed by their union with a mid-function variable reassignment.
 
 ## [0.1.1] - 2026-07-26
 

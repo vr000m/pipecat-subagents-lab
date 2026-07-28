@@ -1207,6 +1207,18 @@ type-checker adoption round that closed the resulting `server.pipeline`/
 across the full `server/` tree. PR #3 opened
 (https://github.com/vr000m/pipecat-subagents-lab/pull/3).
 
+`/skein:deep-review --continue` (incremental mode, `fcc5394..29fbd71`,
+5 lenses) reviewed the mypy-adoption fix round itself and found 12 more
+findings (3 Important, 9 Minor) — architect/implement/verify subagents
+grouped by file into 3 clusters (`server/perf_metrics.py`,
+`server/pipeline.py`, `pyproject.toml`) fixed all 12 across 3 commits
+(e58113e, 2121274, 035e0c4). Independent verification of the first pass
+found 2 of the 3 clusters' fixes real but a third partially wrong (see
+Learnings); a second architect/implement/verify round on just that
+cluster closed the residual gaps, re-verified with hand-traced and
+executed counter-examples. 513/513 tests passing; `ruff` and `mypy`
+clean.
+
 ### Outcomes
 
 - One console `PERF_METRIC` contract covers both Pipecat-native framework
@@ -1279,6 +1291,28 @@ across the full `server/` tree. PR #3 opened
   (the file the original finding pointed at, `server/pipeline.py`, was
   not actually covered) and the user chose to close it in a follow-up
   round rather than let it linger as a permanent exception.
+- A "fix for the fix" needs its own skeptical verify pass, not just
+  re-running tests. The first implementation round for the 12-finding
+  continuation review passed its own new tests and the full suite, but
+  independent re-verification with hand-traced counter-examples found
+  two of the five `perf_metrics.py` fixes were real regressions
+  disguised as fixes: an "unrecognized outcome" fix that counted a
+  child that was never actually emitted (a phantom child — `_safe_emit`
+  had already dropped the raw unrecognized value before the counting
+  fix ran), and a "duplicate work_item_id" registration guard that
+  protected the wrong end of the problem, so a real caller finalizing
+  both the tracked and untracked child could still get an emitted
+  record with no matching counter increment (a phantom omission, the
+  mirror-image bug). Both traced to the same root cause: the fix
+  patched the counting side without validating the emission side first.
+  The corrected fix moved outcome validation into `WorkItemRecorder
+  .finalize` itself (validate-then-emit, symmetric with the parent's
+  existing pattern) and decoupled counting from sweep-tracking, since a
+  `WorkItemRecorder` can only invoke its attribution callback once by
+  construction. Passing tests is necessary, not sufficient, evidence a
+  review finding is closed — the verify subagent constructing the
+  original finding's exact counter-example against the fixed code, not
+  just re-running the suite, is what caught both regressions.
 
 ### Follow-up Work
 
