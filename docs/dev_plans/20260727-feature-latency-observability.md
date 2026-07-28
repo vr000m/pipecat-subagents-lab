@@ -1,6 +1,6 @@
 # Task: Add Pipecat-native latency observability
 
-**Status**: Complete (review-gauntlet fix rounds in progress)
+**Status**: Complete (deep-review round 2 + mypy adoption landed, PR not yet opened)
 **Component**: Pipecat subagents
 **Assigned to**: Codex
 **Priority**: Medium
@@ -1134,6 +1134,47 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
   API keys into console tracebacks via this feature's new exception
   handlers. All 11 findings fixed in c10a54b (467/467 tests passing, 23
   new regression tests).
+- A second `/deep-review` round (5 lenses: logic, security, spec,
+  architecture, documentation; opus/high except haiku/low docs) against
+  `d83657c..fcc5394` found 8 Important and 13 Minor findings. Three
+  Important findings were independently corroborated by 2-3 lenses at
+  once, the strongest signal in either review round: `error_type`
+  pattern-matching instead of the structured `failure_kind` field
+  (logic + architecture + spec), silent zero-emission on an empty
+  multi-intent fan-out, and an unguarded `KeyError` in the multi-intent
+  fan-in that could drop an entire turn's commit/speech, not just its
+  telemetry. All 8 Important and all 13 Minor findings were architected,
+  implemented, and independently re-verified by fresh-context subagents
+  (architect, then implement, then verify) across 10 commits
+  (0beed9b..1ce51ca): reverted the `SessionHost` default-
+  `WorkItemCoordinator` scope creep; suppressed RTVI metrics forwarding
+  (`RTVIObserverParams(metrics_enabled=False)`) to close a live
+  console-only-scope violation; made `AppTurnRecorder.finalize` total
+  (no path can silently skip emission); gave the parent recorder
+  ownership of its children with a sweep on finalize (closes the
+  cancellation/commit-exception orphaning gap); hardened the
+  multi-intent fan-in against mismatched worker-echoed
+  `turn_id`/`work_item_id` values with a user-approved graceful-degrade
+  behavior change (partial results still commit and speak; only the
+  unattributable item drops, with a warning, instead of the whole turn
+  going silent); and adopted `Literal`-derived outcome vocabularies with
+  a real `mypy` CI gate. Two decisions were explicitly signed off by the
+  user before implementation: adopting a type checker at all (the repo
+  had none), and the fan-in behavior change. 502/502 tests passing after
+  the findings-fix round.
+- The mypy adoption above initially gated only `server.perf_metrics`
+  (the module owning the vocabularies) because `server.pipeline` and
+  `server.work_item_coordinator` carried 34 and 2 pre-existing,
+  unrelated type errors respectively (mostly `Any | None` narrowing gaps
+  predating this feature). The user chose to close that gap rather than
+  accept it as a permanent exception: a follow-up architect/implement/
+  verify round fixed all 36 errors (mostly type-narrowing annotations;
+  one deliberate, signed-off behavior change adding a
+  `_require_coordinator()` accessor that raises `RuntimeError` instead
+  of a bare `AttributeError` on an already-unreachable None-coordinator
+  path) and extended the CI gate to all three modules, across 5 more
+  commits (a9ad400..7de43ca). 502/502 tests still passing; `mypy` clean
+  across all 28 checked source files.
 
 ## Final Results
 
@@ -1157,6 +1198,14 @@ scope) — the fixes were verified via targeted regression tests plus a
 full-suite run and the final security-review pass, not a fresh
 multi-lens sweep.
 
+A second, independent `/deep-review` pass found 8 more Important and 13
+Minor findings (see Issues & Solutions), all fixed and independently
+re-verified across 10 commits (0beed9b..1ce51ca), followed by a
+type-checker adoption round that closed the resulting `server.pipeline`/
+`server.work_item_coordinator` mypy coverage gap across 5 more commits
+(a9ad400..7de43ca). 502/502 tests passing; `ruff` and `mypy` both clean
+across the full `server/` tree. PR not yet opened.
+
 ### Outcomes
 
 - One console `PERF_METRIC` contract covers both Pipecat-native framework
@@ -1171,6 +1220,21 @@ multi-lens sweep.
 - `WorkItemFailure` and `LateResult` both now carry structured
   classification fields (`failure_kind`, `terminal_kind`) instead of
   string-matching on exception class names or free-text error strings.
+- `AppTurnRecorder` now owns its children: a parent finalize sweeps any
+  `WorkItemRecorder` left open (e.g. by cancellation or a raising
+  commit/speak step) instead of silently under-reporting `child_count`,
+  and `finalize` itself is total — no argument combination can latch
+  `_finalized=True` and skip emission.
+- RTVI metrics forwarding is explicitly suppressed
+  (`RTVIObserverParams(metrics_enabled=False)`); `enable_metrics=True`
+  now provably stays console-only, closing a gap between the feature's
+  stated scope and its actual wire behavior.
+- The outcome vocabularies (`WORK_ITEM_OUTCOMES`, `APP_TURN_OUTCOMES`,
+  etc.) are `Literal`-alias-derived rather than hand-duplicated
+  frozensets, and `mypy` is a real CI gate across `server/perf_metrics.py`,
+  `server/pipeline.py`, and `server/work_item_coordinator.py` — a typo in
+  an outcome literal now fails CI instead of silently dropping a metric
+  in production.
 
 ### Learnings
 
@@ -1191,6 +1255,29 @@ multi-lens sweep.
   concurrent `git add`/edits mid-round; verifying every claimed change
   was actually present in the final staged diff (not just trusting each
   agent's self-report) was necessary before committing.
+- A second independent `/deep-review` pass, run after the first round's
+  fixes had already landed and the branch was believed review-clean,
+  still found 8 more Important findings — three of them the exact same
+  underlying defect (`failure_kind` vs `error_type`), independently
+  rediscovered by three different lenses in the same run. Review
+  convergence is not guaranteed by one clean pass; a second pass on the
+  same diff range is not redundant, especially for an invariant
+  ("exactly one terminal event") that spans multiple call sites and
+  exception paths.
+- Two decisions surfaced during the fix round that were genuinely the
+  user's to make, not the implementer's: whether to change the
+  multi-intent fan-in's user-facing behavior (silent whole-turn failure
+  vs. graceful partial degrade) and whether to adopt a project-wide type
+  checker the repo had never had. Both were raised explicitly before any
+  code was written, rather than decided unilaterally and reported after
+  the fact.
+- Scoping mypy's initial CI gate to just the module owning the
+  vocabularies (`server.perf_metrics`), rather than blocking on fixing
+  ~119 repo-wide pre-existing errors, let the fix land without also
+  taking on an unrelated nullability refactor — but the gap was real
+  (the file the original finding pointed at, `server/pipeline.py`, was
+  not actually covered) and the user chose to close it in a follow-up
+  round rather than let it linger as a permanent exception.
 
 ### Follow-up Work
 
