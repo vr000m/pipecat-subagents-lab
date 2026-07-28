@@ -21,6 +21,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -217,6 +218,9 @@ async def _attach_connection(
                 enable_metrics=True,
             ),
             enable_rtvi=True,
+            # enable_metrics=True feeds MetricsFrames to the RTVI observer, which
+            # defaults to forwarding them to the client. This release is console-only.
+            rtvi_observer_params=RTVIObserverParams(metrics_enabled=False),
             idle_timeout_secs=None,
             task_manager=task_manager,
             observers=[startup_observer, latency_observer],

@@ -2228,6 +2228,55 @@ def test_enable_metrics_toggle_does_not_change_real_pipeline_worker_frame_flow()
     asyncio.run(run())
 
 
+def test_rtvi_observer_params_suppress_metrics_messages_to_the_client() -> None:
+    """The console-only release must not leak MetricsFrames over the RTVI wire."""
+    from pipecat.frames.frames import MetricsFrame
+    from pipecat.metrics.metrics import TTFBMetricsData
+    from pipecat.observers.base_observer import FramePushed
+    from pipecat.processors.frame_processor import FrameProcessor
+    from pipecat.processors.frameworks.rtvi import (
+        RTVIObserver,
+        RTVIObserverParams,
+        RTVIProcessor,
+    )
+
+    async def sent_messages(params: RTVIObserverParams) -> list[object]:
+        rtvi = RTVIProcessor()
+        sent: list[object] = []
+
+        async def record(model: object, exclude_none: bool = True) -> None:
+            sent.append(model)
+
+        rtvi.push_transport_message = record  # type: ignore[method-assign]
+        observer = RTVIObserver(rtvi, params=params)
+        source = FrameProcessor(name="metrics-source")
+        await observer.on_push_frame(
+            FramePushed(
+                source=source,
+                destination=source,
+                frame=MetricsFrame(
+                    data=[TTFBMetricsData(processor="tts", value=0.25)],
+                ),
+                direction=FrameDirection.DOWNSTREAM,
+                timestamp=0,
+            )
+        )
+        return sent
+
+    async def run() -> None:
+        suppressed = await sent_messages(RTVIObserverParams(metrics_enabled=False))
+        assert suppressed == []
+
+        # Positive control: the same push does produce a wire message by default,
+        # so the assertion above is about the flag and not a frame that never
+        # reached the dispatcher.
+        default = await sent_messages(RTVIObserverParams())
+        assert len(default) == 1
+        assert default[0].data["ttfb"][0]["value"] == 0.25
+
+    asyncio.run(run())
+
+
 # --------------------------------------------------------------------------
 # Phase 2: application-turn foreground and retained-work background timing.
 #

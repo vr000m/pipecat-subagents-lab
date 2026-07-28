@@ -131,7 +131,12 @@ does not project performance telemetry through RTVI or add it to browser state.
   or structurally invalid fields, while producer tests prove sensitive/content
   inputs never enter allowed identity fields.
 - Confirm the scope remains console-only and causes no RTVI protocol or browser
-  state drift.
+  state drift. `enable_metrics=True` alone is not sufficient for this: it feeds
+  `MetricsFrame`s to the RTVI observer, whose `RTVIObserverParams.metrics_enabled`
+  defaults to `True` and forwards them to the client. `server/app.py` therefore
+  passes `rtvi_observer_params=RTVIObserverParams(metrics_enabled=False)` to
+  `PipelineWorker`, and only that field is overridden so future framework
+  defaults are not frozen.
 
 ## Implementation Checklist
 

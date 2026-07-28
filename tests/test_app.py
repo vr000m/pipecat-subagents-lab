@@ -1,12 +1,14 @@
 """HTTP entry-point tests for the local Small WebRTC server."""
 
 import asyncio
+import dataclasses
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
+from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 
 import server.app as app_module
 from server.app import create_app
@@ -492,6 +494,38 @@ def test_attach_connection_enables_pipecat_processor_metrics() -> None:
 
         worker = CapturingPipelineWorker.constructed[0]
         assert worker.params["enable_metrics"] is True
+
+    asyncio.run(run())
+
+
+def test_attach_connection_suppresses_rtvi_metrics_messages_only() -> None:
+    """Console-only release: metrics stay on for the server, off over the wire."""
+
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch, host=host, startup_observers=[], latency_observers=[]
+            )
+        finally:
+            monkeypatch.undo()
+
+        worker = CapturingPipelineWorker.constructed[0]
+        assert worker.params["enable_metrics"] is True
+
+        captured = worker.kwargs["rtvi_observer_params"]
+        assert isinstance(captured, RTVIObserverParams)
+        assert captured.metrics_enabled is False
+
+        stock = RTVIObserverParams()
+        differing = {
+            field.name
+            for field in dataclasses.fields(RTVIObserverParams)
+            if getattr(captured, field.name) != getattr(stock, field.name)
+        }
+        assert differing == {"metrics_enabled"}
 
     asyncio.run(run())
 
