@@ -2416,7 +2416,11 @@ def test_cancel_control_emits_control_action_and_applied_outcome() -> None:
 def test_unknown_cancel_target_emits_control_with_unknown_target_outcome() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
-        host = SessionHost(runner_factory=LifecycleRunner, measurement_sink=sink)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=WorkItemCoordinator(),
+            measurement_sink=sink,
+        )
         await host.connect(connection_handshake(host, 1))
 
         await host._handle_transcript("cancel work-item-does-not-exist")
@@ -2434,7 +2438,11 @@ def test_unknown_cancel_target_emits_control_with_unknown_target_outcome() -> No
 def test_consent_without_pending_dialogue_emits_control_no_pending_outcome() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
-        host = SessionHost(runner_factory=LifecycleRunner, measurement_sink=sink)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=WorkItemCoordinator(),
+            measurement_sink=sink,
+        )
         await host.connect(connection_handshake(host, 1))
 
         await host._handle_transcript("consent")

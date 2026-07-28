@@ -37,7 +37,7 @@ from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
-from .work_item_coordinator import LateResult, WorkItemCoordinator, WorkItemFailure
+from .work_item_coordinator import LateResult, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 try:
@@ -297,13 +297,7 @@ class SessionHost:
             raise ValueError("SessionHost and coordinator must share one WorkerRegistry")
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
-        # A bare host still needs to resolve control intents (cancel/pause/
-        # resume/consent), which arbitrate() handles without a registry or
-        # router; only routed dispatch requires the caller to supply a real
-        # coordinator with those dependencies wired in.
-        self.coordinator = (
-            coordinator if coordinator is not None else WorkItemCoordinator(registry=self.registry)
-        )
+        self.coordinator = coordinator
         self._tts_on_event = getattr(tts, "on_event", None)
         self.runner: Any = None
         self._runner_handles: dict[str, Any] = {}
