@@ -722,11 +722,16 @@ class AppTurnRecorder:
     def finalized(self) -> bool:
         return self._finalized
 
-    def new_child(self, *, work_item_id: str, **kwargs: Any) -> WorkItemRecorder:
+    def new_child(self, *, work_item_id: str) -> WorkItemRecorder:
         """Create one child recorder owned by this turn.
 
         The child attributes itself to this parent when it finalizes, and is
         swept to a terminal record by :meth:`finalize` if it never does.
+
+        A duplicate ``work_item_id`` cannot displace the already-tracked child:
+        the new recorder is still returned so the caller is not broken, but it
+        is not registered for the sweep, since overwriting would silently
+        orphan the first child from :meth:`finalize`'s sweep.
         """
         child = WorkItemRecorder(
             self._sink,
@@ -736,24 +741,42 @@ class AppTurnRecorder:
             work_item_id=work_item_id,
             clock=self._clock,
             on_finalize=partial(self._record_child, work_item_id),
-            **kwargs,
         )
+        if work_item_id in self._open_children:
+            logger.warning(
+                f"app_turn_foreground: duplicate work_item_id={work_item_id!r} for "
+                f"turn_id={self._turn_id!r}; the new child recorder will not be "
+                f"tracked for the finalize sweep"
+            )
+            return child
         self._open_children[work_item_id] = child
         return child
 
     def _record_child(self, work_item_id: str, outcome: WorkItemOutcome) -> None:
         """Attribute one dispatched child's outcome to its exhaustive counter
-        and count it toward ``child_count``."""
-        if self._open_children.pop(work_item_id, None) is None:
-            logger.warning(
-                f"app_turn_foreground: finalize callback for unknown or already-recorded "
-                f"child work_item_id={work_item_id!r}"
-            )
-            return
+        and count it toward ``child_count``.
+
+        Counting is unconditional: each ``WorkItemRecorder`` instance invokes
+        this at most once, guarded by its own finalize latch, so a duplicate
+        ``work_item_id`` producing two independently-finalizing children must
+        still count both. ``_open_children`` is popped best-effort, keyed only
+        by ``work_item_id``: for a duplicate id it may de-register whichever
+        child currently holds that key rather than the specific caller, so
+        under a duplicate id at most one of the pair is ever reachable by the
+        finalize sweep, and it is not guaranteed to be a particular one.
+        """
+        self._open_children.pop(work_item_id, None)
+        # ``outcome`` is validated (and degraded to "failed" if unrecognized)
+        # by ``WorkItemRecorder.finalize`` before it emits and invokes this
+        # callback, so ``_CHILD_COUNTER_FOR_OUTCOME`` is exhaustive here by
+        # construction; the fallback below is defense-in-depth only.
         counter = _CHILD_COUNTER_FOR_OUTCOME.get(outcome)
         if counter is None:
-            logger.warning(f"app_turn_foreground: unrecognized child outcome {outcome!r}")
-            return
+            logger.warning(
+                f"app_turn_foreground: unrecognized child outcome {outcome!r}; "
+                f"counting it as failed"
+            )
+            counter = "failed_count"
         self._counters[counter] += 1
         self._dispatched_children += 1
 
@@ -796,14 +819,32 @@ class AppTurnRecorder:
                     f"turn_id={self._turn_id!r}; recording outcome=failed"
                 )
                 outcome = "failed"
-        if (control_action is None) != (control_outcome is None) or (
-            outcome == "control" and control_action is None
-        ):
-            # The validator rejects a half-populated control pair, and a
-            # rejected record is a dropped record. Degrade to a schema-valid
-            # ``failed`` so this method stays total for every argument
-            # combination rather than depending on every caller getting the
-            # pair right.
+        # ``_validate_app_turn_foreground`` enforces three rules: outcome=control
+        # requires both control fields, a half-populated pair is rejected, and
+        # control fields are forbidden when outcome != control. A rejected record
+        # is a dropped record and ``_finalized`` is already latched, so it can
+        # never be retried. Check all three here — plus vocabulary membership,
+        # which the validator only catches later inside ``_safe_emit`` — so this
+        # method stays total for every argument combination rather than depending
+        # on every caller getting the pair right.
+        # ``outcome`` itself is checked here too: an out-of-vocabulary value
+        # (from a caller passing an unchecked string) would otherwise reach
+        # the enum validator inside ``_safe_emit`` after ``_finalized`` is
+        # already latched, dropping the record with no retry — the same
+        # failure mode the control-field checks above exist to prevent.
+        outcome_vocabulary_ok = outcome in APP_TURN_OUTCOMES
+        control_pair_present = control_action is not None and control_outcome is not None
+        control_pair_absent = control_action is None and control_outcome is None
+        control_vocabulary_ok = (control_action is None or control_action in CONTROL_ACTIONS) and (
+            control_outcome is None or control_outcome in CONTROL_OUTCOMES
+        )
+        control_consistent = (
+            outcome_vocabulary_ok
+            and control_vocabulary_ok
+            and (control_pair_present or control_pair_absent)
+            and (outcome == "control") == control_pair_present
+        )
+        if not control_consistent:
             logger.warning(
                 f"app_turn_foreground: inconsistent control fields for "
                 f"turn_id={self._turn_id!r} (outcome={outcome!r}, "
@@ -838,7 +879,8 @@ class WorkItemRecorder:
 
     Created through :meth:`AppTurnRecorder.new_child`, which supplies the
     ``on_finalize`` callback that attributes this item's outcome to the parent
-    turn. The callback runs exactly once, on the emitting finalize call.
+    turn. The callback runs exactly once, on the emitting finalize call; its
+    failures are contained, never re-raised.
     """
 
     def __init__(
@@ -875,10 +917,27 @@ class WorkItemRecorder:
         search_ms: float | None = None,
         commit_ms: float | None = None,
     ) -> WorkItemOutcome:
-        """Emit once, notify the owning turn, and return ``outcome``."""
+        """Emit once, notify the owning turn, and return ``outcome``.
+
+        A failure inside the owning turn's attribution callback is logged and
+        swallowed: parent accounting is telemetry, and must never propagate
+        into the caller's control flow.
+        """
         if self._finalized:
             return outcome
         self._finalized = True
+        if outcome not in WORK_ITEM_OUTCOMES:
+            # An unrecognized outcome would otherwise fail the enum validator
+            # deep inside ``_safe_emit`` after ``_finalized`` is already
+            # latched, dropping the record with no retry. Degrade to
+            # "failed" here so emission and the parent's attribution
+            # (``AppTurnRecorder._record_child``) always agree on what was
+            # counted.
+            logger.warning(
+                f"work_item_foreground: unrecognized outcome {outcome!r} for "
+                f"work_item_id={self._work_item_id!r}; recording outcome=failed"
+            )
+            outcome = "failed"
         total_ms = (self._clock() - self._start) * 1000
         fields: dict[str, Any] = {
             "session_id": self._session_id,
@@ -898,7 +957,13 @@ class WorkItemRecorder:
             fields["commit_ms"] = commit_ms
         _safe_emit(self._sink, "work_item_foreground", fields)
         if self._on_finalize is not None:
-            self._on_finalize(outcome)
+            try:
+                self._on_finalize(outcome)
+            except Exception:  # noqa: BLE001  # parent accounting must never propagate into the caller
+                logger.exception(
+                    f"app_turn_foreground: failed to attribute child outcome={outcome!r} "
+                    f"for work_item_id={self._work_item_id!r}"
+                )
         return outcome
 
 

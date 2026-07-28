@@ -26,7 +26,7 @@ import asyncio
 import dataclasses
 import math
 import shlex
-from typing import Any, get_args
+from typing import Any, cast, get_args
 
 import pytest
 from loguru import logger as loguru_logger
@@ -47,6 +47,7 @@ from pipecat.observers.user_bot_latency_observer import (
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 
 from server.perf_metrics import (
+    _APP_TURN_COUNTER_FIELDS,
     _CHILD_COUNTER_FOR_OUTCOME,
     _PARENT_OUTCOME_FOR_COUNTER,
     APP_TURN_OUTCOMES,
@@ -71,6 +72,7 @@ from server.perf_metrics import (
     RetainedRecorder,
     SpeechOutcome,
     WorkItemOutcome,
+    WorkItemRecorder,
     WorkOutcome,
     attach_framework_observers,
     build_record,
@@ -133,6 +135,12 @@ def test_every_work_item_outcome_maps_to_a_parent_counter() -> None:
 
 def test_derived_parent_outcomes_are_app_turn_outcomes() -> None:
     assert frozenset(_PARENT_OUTCOME_FOR_COUNTER.values()) <= APP_TURN_OUTCOMES
+
+
+def test_every_child_counter_is_a_real_parent_counter_field() -> None:
+    """A counter name that drifts out of _APP_TURN_COUNTER_FIELDS would raise
+    KeyError inside the parent's attribution callback."""
+    assert frozenset(_CHILD_COUNTER_FOR_OUTCOME.values()) <= frozenset(_APP_TURN_COUNTER_FIELDS)
 
 
 def test_every_registry_enum_field_is_bound_to_its_intended_vocabulary() -> None:
@@ -1094,6 +1102,33 @@ class TestAppTurnRecorderFinalizeTotality:
         assert len(sink.records) == 1
         assert sink.records[0].fields["outcome"] == "failed"
 
+    def test_out_of_vocabulary_control_action_degrades_to_failed(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        recorder.finalize(
+            outcome="control",
+            control_action=cast(Any, "reboot"),
+            control_outcome="applied",
+        )
+
+        assert len(sink.records) == 1
+        fields = sink.records[0].fields
+        assert fields["outcome"] == "failed"
+        assert "control_action" not in fields
+
+    def test_control_fields_with_non_control_outcome_degrade_to_failed(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        recorder.finalize(outcome="completed", control_action="pause", control_outcome="applied")
+
+        assert len(sink.records) == 1
+        fields = sink.records[0].fields
+        assert fields["outcome"] == "failed"
+        assert "control_action" not in fields
+        assert "control_outcome" not in fields
+
 
 class TestAppTurnRecorderChildOwnership:
     """Every child created under a turn gets exactly one terminal record.
@@ -1187,3 +1222,115 @@ class TestAppTurnRecorderChildOwnership:
         assert fields["origin_epoch"] == 1
         assert fields["turn_id"] == "turn-1"
         assert fields["work_item_id"] == "work-1"
+
+    def test_unrecognized_child_outcome_is_counted_as_failed(self) -> None:
+        """Drives the real path (WorkItemRecorder.finalize -> on_finalize),
+        not the private _record_child hook directly: the emitted record and
+        the parent's counters must agree on what was recorded."""
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        child = recorder.new_child(work_item_id="work-1")
+
+        result = child.finalize(outcome=cast(Any, "not_a_real_outcome"))
+        recorder.finalize()
+
+        assert result == "failed"
+        children = self._children(sink)
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "failed"
+        parent = self._parent(sink).fields
+        assert parent["child_count"] == 1
+        assert parent["failed_count"] == 1
+
+    def test_duplicate_work_item_id_the_untracked_child_is_not_swept(self) -> None:
+        """Only the first-registered child of a duplicate id is tracked for
+        the finalize sweep; the second is returned but not swept, and must be
+        finalized explicitly by the caller. This is an accepted, documented
+        limitation for the caller-bug case of a duplicate id — it does not
+        affect accounting when both children are finalized explicitly (see
+        test_duplicate_work_item_id_both_children_are_counted_when_both_finalize)."""
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        first = recorder.new_child(work_item_id="work-1")
+        second = recorder.new_child(work_item_id="work-1")
+
+        recorder.finalize(outcome="cancelled")
+
+        assert first.finalized is True
+        assert second.finalized is False
+        assert len(self._children(sink)) == 1
+        parent = self._parent(sink).fields
+        assert parent["child_count"] == 1
+        assert parent["cancelled_count"] == 1
+
+    def test_duplicate_work_item_id_both_children_are_counted_when_both_finalize(
+        self,
+    ) -> None:
+        """The emitted-vs-counted invariant (child_count == number of emitted
+        work_item_foreground records) holds even for a duplicate work_item_id,
+        as long as each child is finalized — counting no longer depends on
+        the child still being tracked in _open_children."""
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        first = recorder.new_child(work_item_id="work-1")
+        second = recorder.new_child(work_item_id="work-1")
+
+        first.finalize(outcome="completed")
+        second.finalize(outcome="failed")
+        recorder.finalize()
+
+        children = self._children(sink)
+        assert len(children) == 2
+        parent = self._parent(sink).fields
+        assert parent["child_count"] == len(children)
+        assert parent["completed_count"] == 1
+        assert parent["failed_count"] == 1
+
+    def test_out_of_vocabulary_outcome_degrades_to_failed(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        recorder.finalize(outcome=cast(Any, "not_a_real_outcome"))
+
+        assert len(sink.records) == 1
+        assert sink.records[0].fields["outcome"] == "failed"
+
+
+def test_work_item_finalize_contains_a_raising_attribution_callback() -> None:
+    sink = CollectingMeasurementSink()
+
+    def boom(_outcome: WorkItemOutcome) -> None:
+        raise RuntimeError("parent accounting bug")
+
+    recorder = WorkItemRecorder(
+        sink,
+        session_id="session-1",
+        origin_epoch=1,
+        turn_id="turn-1",
+        work_item_id="work-1",
+        on_finalize=boom,
+    )
+
+    assert recorder.finalize(outcome="completed") == "completed"
+    assert len(sink.records) == 1
+    assert sink.records[0].fields["outcome"] == "completed"
+
+
+def test_work_item_finalize_degrades_unrecognized_outcome_to_failed() -> None:
+    """An unrecognized outcome would otherwise fail the enum validator deep
+    inside _safe_emit after _finalized is already latched, dropping the
+    record with no retry — validate and degrade before emitting instead."""
+    sink = CollectingMeasurementSink()
+    recorder = WorkItemRecorder(
+        sink,
+        session_id="session-1",
+        origin_epoch=1,
+        turn_id="turn-1",
+        work_item_id="work-1",
+    )
+
+    result = recorder.finalize(outcome=cast(Any, "not_a_real_outcome"))
+
+    assert result == "failed"
+    assert len(sink.records) == 1
+    assert sink.records[0].fields["outcome"] == "failed"
