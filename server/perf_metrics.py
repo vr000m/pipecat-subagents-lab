@@ -19,6 +19,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, get_args
 
@@ -644,7 +645,7 @@ def attach_framework_observers(
 # --------------------------------------------------------------------------
 
 
-_CHILD_COUNTER_FOR_OUTCOME: Mapping[str, str] = MappingProxyType(
+_CHILD_COUNTER_FOR_OUTCOME: Mapping[WorkItemOutcome, str] = MappingProxyType(
     {
         "direct": "direct_count",
         "unsupported": "unsupported_count",
@@ -661,7 +662,7 @@ _CHILD_COUNTER_FOR_OUTCOME: Mapping[str, str] = MappingProxyType(
     }
 )
 
-_PARENT_OUTCOME_FOR_COUNTER: Mapping[str, str] = MappingProxyType(
+_PARENT_OUTCOME_FOR_COUNTER: Mapping[str, AppTurnOutcome] = MappingProxyType(
     {
         "direct_count": "direct",
         "unsupported_count": "unsupported",
@@ -734,13 +735,13 @@ class AppTurnRecorder:
             turn_id=self._turn_id,
             work_item_id=work_item_id,
             clock=self._clock,
-            on_finalize=lambda outcome, item_id=work_item_id: self._record_child(item_id, outcome),
+            on_finalize=partial(self._record_child, work_item_id),
             **kwargs,
         )
         self._open_children[work_item_id] = child
         return child
 
-    def _record_child(self, work_item_id: str, outcome: str) -> None:
+    def _record_child(self, work_item_id: str, outcome: WorkItemOutcome) -> None:
         """Attribute one dispatched child's outcome to its exhaustive counter
         and count it toward ``child_count``."""
         if self._open_children.pop(work_item_id, None) is None:
@@ -765,9 +766,9 @@ class AppTurnRecorder:
     def finalize(
         self,
         *,
-        outcome: str | None = None,
-        control_action: str | None = None,
-        control_outcome: str | None = None,
+        outcome: AppTurnOutcome | None = None,
+        control_action: ControlAction | None = None,
+        control_outcome: ControlOutcome | None = None,
     ) -> None:
         if self._finalized:
             return
@@ -775,7 +776,7 @@ class AppTurnRecorder:
         # Sweep before deriving the outcome so a fully-swept turn still derives
         # a real outcome from its counters instead of the no-children fallback.
         if self._open_children:
-            sweep_outcome = "cancelled" if outcome == "cancelled" else "failed"
+            sweep_outcome: WorkItemOutcome = "cancelled" if outcome == "cancelled" else "failed"
             for child in tuple(self._open_children.values()):
                 logger.warning(
                     f"app_turn_foreground: child work_item was never finalized for "
@@ -849,7 +850,7 @@ class WorkItemRecorder:
         turn_id: str,
         work_item_id: str,
         clock: Callable[[], float] = time.perf_counter,
-        on_finalize: Callable[[str], None] | None = None,
+        on_finalize: Callable[[WorkItemOutcome], None] | None = None,
     ) -> None:
         self._sink = sink
         self._session_id = session_id
@@ -868,12 +869,12 @@ class WorkItemRecorder:
     def finalize(
         self,
         *,
-        outcome: str,
+        outcome: WorkItemOutcome,
         app_worker_id: str | None = None,
         result_id: str | None = None,
         search_ms: float | None = None,
         commit_ms: float | None = None,
-    ) -> str:
+    ) -> WorkItemOutcome:
         """Emit once, notify the owning turn, and return ``outcome``."""
         if self._finalized:
             return outcome
@@ -932,16 +933,16 @@ class RetainedRecorder:
         self._clock = clock
         self._start = clock()
         self.state = "pending"
-        self.work_outcome: str | None = None
-        self.commit_outcome: str | None = None
-        self.speech_outcome: str | None = None
+        self.work_outcome: WorkOutcome | None = None
+        self.commit_outcome: CommitOutcome | None = None
+        self.speech_outcome: SpeechOutcome | None = None
         self.result_id: str | None = None
 
     @property
     def finalized(self) -> bool:
         return self.state == "finalized"
 
-    def claim(self, terminal_kind: str) -> bool:
+    def claim(self, terminal_kind: WorkOutcome) -> bool:
         """Advance ``pending`` -> ``claimed`` with the classified terminal kind.
 
         Invoked synchronously from the coordinator's ``on_late_terminal`` hook,
@@ -955,7 +956,7 @@ class RetainedRecorder:
         self.state = "claimed"
         return True
 
-    def record_commit(self, commit_outcome: str, *, result_id: str | None = None) -> bool:
+    def record_commit(self, commit_outcome: CommitOutcome, *, result_id: str | None = None) -> bool:
         if self.state == "finalized":
             return False
         self.commit_outcome = commit_outcome
@@ -965,7 +966,7 @@ class RetainedRecorder:
             self.state = "commit_recorded"
         return True
 
-    def record_speech(self, speech_outcome: str) -> bool:
+    def record_speech(self, speech_outcome: SpeechOutcome) -> bool:
         if self.state == "finalized":
             return False
         self.speech_outcome = speech_outcome
@@ -976,9 +977,9 @@ class RetainedRecorder:
     def finalize(
         self,
         *,
-        work_outcome: str | None = None,
-        commit_outcome: str | None = None,
-        speech_outcome: str | None = None,
+        work_outcome: WorkOutcome | None = None,
+        commit_outcome: CommitOutcome | None = None,
+        speech_outcome: SpeechOutcome | None = None,
         result_id: str | None = None,
     ) -> bool:
         """Emit the terminal ``work_item_background`` record and close the recorder.
