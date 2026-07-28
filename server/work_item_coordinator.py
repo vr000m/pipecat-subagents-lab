@@ -542,19 +542,27 @@ class WorkItemCoordinator:
         if self.registry is None:
             raise RuntimeError("dispatch requires a worker registry")
         validate_decision(decision, catalogue or self.registry.catalogue())
-        if decision.action == "new_worker":
-            worker = self.registry.get_or_create(
+        worker = (
+            self.registry.get_or_create(
                 topic=decision.topic or "",
                 worker_type=decision.worker_type or "",
                 model_policy=decision.model_policy or "",
             )
-        else:
-            worker = self.registry.get(decision.worker_id) if decision.worker_id else None
+            if decision.action == "new_worker"
+            else (self.registry.get(decision.worker_id) if decision.worker_id else None)
+        )
         if worker is None:
             return None
         if operation is None:
             return worker.worker
         return operation(worker.worker)
+
+    def _work_task_cleanup(self, item_id: str) -> Callable[[asyncio.Task[Any]], None]:
+        def completed(completed_task: asyncio.Task[Any]) -> None:
+            if self._work_tasks.get(item_id) is completed_task:
+                self._work_tasks.pop(item_id, None)
+
+        return completed
 
     async def submit(
         self,
@@ -626,13 +634,7 @@ class WorkItemCoordinator:
                 self._work_tasks[work[index].work_item_id] = task
                 self._submit_tasks.add(task)
                 task.add_done_callback(self._submit_tasks.discard)
-                task.add_done_callback(
-                    lambda completed, item_id=work[index].work_item_id: (
-                        self._work_tasks.pop(item_id, None)
-                        if self._work_tasks.get(item_id) is completed
-                        else None
-                    )
-                )
+                task.add_done_callback(self._work_task_cleanup(work[index].work_item_id))
             tasks = [task for _, task in indexed_tasks]
             try:
                 if tasks:
