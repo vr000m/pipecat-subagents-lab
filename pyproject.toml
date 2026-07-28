@@ -27,13 +27,12 @@ testpaths = ["tests"]
 target-version = "py312"
 line-length = 100
 
-# Type checking is enforced per-module, not repo-wide. The codebase carries
-# ~119 pre-existing errors (mostly Optional narrowing and untyped third-party
-# seams) that are out of scope to fix here, so CI would be red on day one.
-# Modules listed under `enforced` below check clean and are gated; everything
-# else is reported-but-ignored until it is brought clean and moved up.
-# Follow-up: bring server.work_item_coordinator (2 errors) and server.pipeline
-# (34 errors) clean, then the rest of server/.
+# Type checking is enforced per-module, not repo-wide. The rest of server/
+# carries pre-existing errors (mostly Optional narrowing and untyped
+# third-party seams) that are out of scope to fix here, so a repo-wide gate
+# would be red on day one. The modules listed in the second override below
+# check clean and are gated; everything else is reported-but-ignored until it
+# is brought clean and moved up.
 [tool.mypy]
 python_version = "3.12"
 files = ["server"]
@@ -44,7 +43,7 @@ module = "server.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-module = "server.perf_metrics"
+module = ["server.perf_metrics", "server.pipeline", "server.work_item_coordinator"]
 ignore_errors = false
 
 [build-system]
