@@ -7,7 +7,7 @@ import inspect
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from loguru import logger
@@ -26,10 +26,16 @@ from .contracts import (
 from .observers import RuntimeObserver
 from .perf_metrics import (
     AppTurnRecorder,
+    CommitOutcome,
     ConsoleMeasurementSink,
+    ControlAction,
+    ControlOutcome,
     MeasurementSink,
     RetainedRecorder,
+    SpeechOutcome,
+    WorkItemOutcome,
     WorkItemRecorder,
+    WorkOutcome,
 )
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
@@ -264,11 +270,14 @@ class ConnectionPipeline:
                 logger.debug(f"{service} cleanup raised during shutdown")
 
 
+SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "retention_rejected"]
+
+
 @dataclass(frozen=True)
 class SearchExecution:
     """Result of a foreground search and any ownership transfer."""
 
-    status: str
+    status: SearchExecutionStatus
     result: GroundedResult | None = None
 
 
@@ -544,11 +553,17 @@ class SessionHost:
     @staticmethod
     def _make_late_terminal_handler(
         recorders: Mapping[str, RetainedRecorder],
-    ) -> Callable[[str, str], None]:
+    ) -> Callable[[str, WorkOutcome], None]:
         """Build a coordinator ``on_late_terminal`` callback that claims the
-        matching retained recorder, if any, for a late-completing work item."""
+        matching retained recorder, if any, for a late-completing work item.
 
-        def on_late_terminal(item_id: str, terminal_kind: str) -> None:
+        Typed against the wider ``WorkOutcome`` rather than the coordinator's
+        narrower ``TerminalKind``: by contravariance this still satisfies the
+        coordinator's hook type, while remaining assignable wherever a full
+        work outcome (including ``invalid_result``) is claimed.
+        """
+
+        def on_late_terminal(item_id: str, terminal_kind: WorkOutcome) -> None:
             recorder = recorders.get(item_id)
             if recorder is not None:
                 recorder.claim(terminal_kind)
@@ -556,7 +571,7 @@ class SessionHost:
         return on_late_terminal
 
     @staticmethod
-    def _failure_child_outcome(failure: WorkItemFailure) -> str:
+    def _failure_child_outcome(failure: WorkItemFailure) -> WorkItemOutcome:
         """Classify a work-item failure from its structured ``failure_kind``.
 
         ``error_type`` is free-text diagnostic and must never drive
@@ -654,8 +669,8 @@ class SessionHost:
                 turn_recorder.finalize(outcome="failed")
                 return result
             if outcome.kind != "routed" or outcome.decision is None:
-                control_action: str | None = None
-                control_outcome: str | None = None
+                control_action: ControlAction | None = None
+                control_outcome: ControlOutcome | None = None
                 if outcome.kind == "control":
                     action = getattr(outcome, "control_action", None)
                     control_action = action
@@ -686,8 +701,10 @@ class SessionHost:
                         cancelled_speech = origin.scheduler.cancel(target)
                         await origin.scheduler.wait_for_stops()
                         if not cancelled_work and not cancelled_speech:
-                            action = "unknown_target" if target is not None else "no_active"
-                            control_outcome = action
+                            control_outcome = (
+                                "unknown_target" if target is not None else "no_active"
+                            )
+                            action = control_outcome
                         else:
                             control_outcome = "applied"
                     elif action == "consent":
@@ -821,6 +838,7 @@ class SessionHost:
                     work_item_id=work_item_id,
                 )
                 search_ms = (time.perf_counter() - search_started) * 1000
+                child_outcome_label: WorkItemOutcome
                 if execution.status == "completed" and execution.result is not None:
                     result = execution.result
                     child_outcome_label = "completed"
@@ -938,7 +956,7 @@ class SessionHost:
                 work_item_id=work_item_id,
                 app_worker_id=worker_id,
             )
-            outcome_label = "completed"
+            outcome_label: WorkItemOutcome = "completed"
             on_late_terminal = self._make_late_terminal_handler({work_item_id: retained_recorder})
 
             async def execute(_worker_id: str, query: str) -> GroundedResult:
@@ -994,7 +1012,7 @@ class SessionHost:
                 child.finalize(outcome="retained", app_worker_id=worker_id)
                 self._register_retained_recorder_if_open(work_item_id, retained_recorder)
             else:
-                failure_outcome = (
+                failure_outcome: WorkItemOutcome = (
                     self._failure_child_outcome(submitted.failures[0])
                     if submitted.failures
                     else "failed"
@@ -1130,7 +1148,7 @@ class SessionHost:
             for item_index, item in zip(runnable_indexes, runnable, strict=True):
                 execution_indexes.setdefault(item, []).append(item_index)
 
-            outcome_labels: dict[int, str] = {}
+            outcome_labels: dict[int, WorkItemOutcome] = {}
 
             async def execute(worker_id: str, query: str) -> GroundedResult:
                 item_index = execution_indexes[(worker_id, query)].pop(0)
@@ -1388,9 +1406,9 @@ class SessionHost:
         if recorder is not None and late.terminal_kind is not None:
             recorder.claim(late.terminal_kind)
 
-        work_outcome: str | None = None
-        commit_outcome: str | None = None
-        speech_outcome: str | None = None
+        work_outcome: WorkOutcome | None = None
+        commit_outcome: CommitOutcome | None = None
+        speech_outcome: SpeechOutcome | None = None
         result_id: str | None = None
         pending_exception: Exception | None = None
 

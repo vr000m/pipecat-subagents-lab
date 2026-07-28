@@ -47,6 +47,8 @@ from pipecat.observers.user_bot_latency_observer import (
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 
 from server.perf_metrics import (
+    _CHILD_COUNTER_FOR_OUTCOME,
+    _PARENT_OUTCOME_FOR_COUNTER,
     APP_TURN_OUTCOMES,
     COMMIT_OUTCOMES,
     CONTROL_ACTIONS,
@@ -76,6 +78,8 @@ from server.perf_metrics import (
     make_turn_tracking_handlers,
     make_user_bot_latency_handlers,
 )
+from server.pipeline import SearchExecutionStatus
+from server.work_item_coordinator import TerminalKind
 
 # The alias is the single source of truth; the frozenset is derived from it.
 # Each pair is asserted identical so a member added to only one side fails
@@ -109,6 +113,26 @@ _ENUM_FIELD_VOCABULARY = {
 @pytest.mark.parametrize(("alias", "vocabulary"), _ALIAS_TO_FROZENSET)
 def test_each_frozenset_matches_its_literal_alias(alias: Any, vocabulary: frozenset[str]) -> None:
     assert frozenset(get_args(alias)) == vocabulary
+
+
+def test_search_execution_statuses_are_work_item_outcomes() -> None:
+    assert frozenset(get_args(SearchExecutionStatus)) <= WORK_ITEM_OUTCOMES
+
+
+def test_coordinator_terminal_kinds_are_work_outcomes() -> None:
+    """The coordinator declares TerminalKind independently to avoid depending on
+    telemetry; this pins the two vocabularies together without the import."""
+    assert frozenset(get_args(TerminalKind)) <= WORK_OUTCOMES
+
+
+def test_every_work_item_outcome_maps_to_a_parent_counter() -> None:
+    """Exhaustive both ways: an outcome with no counter is silently dropped from
+    child_count, and a counter key outside the vocabulary is unreachable."""
+    assert frozenset(_CHILD_COUNTER_FOR_OUTCOME) == WORK_ITEM_OUTCOMES
+
+
+def test_derived_parent_outcomes_are_app_turn_outcomes() -> None:
+    assert frozenset(_PARENT_OUTCOME_FOR_COUNTER.values()) <= APP_TURN_OUTCOMES
 
 
 def test_every_registry_enum_field_is_bound_to_its_intended_vocabulary() -> None:

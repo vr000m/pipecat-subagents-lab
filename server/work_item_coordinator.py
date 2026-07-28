@@ -73,6 +73,16 @@ class SubmittedOutcome:
 FailureKind = Literal["capacity_rejected", "retention_rejected", "cancelled", "failed"]
 FAILURE_KINDS: frozenset[str] = frozenset(get_args(FailureKind))
 
+TerminalKind = Literal["completed", "failed", "cancelled"]
+"""How a late background task finished, classified from the task itself.
+
+Deliberately declared here rather than imported from ``perf_metrics``: the
+coordinator knows nothing about telemetry vocabularies, and importing one
+would invert the dependency. A test pins this as a subset of the telemetry
+side's ``WORK_OUTCOMES``.
+"""
+TERMINAL_KINDS: frozenset[str] = frozenset(get_args(TerminalKind))
+
 
 @dataclass(frozen=True)
 class WorkItemFailure:
@@ -97,7 +107,7 @@ class LateResult:
     worker_id: str
     result: Any = None
     error: str | None = None
-    terminal_kind: str | None = None
+    terminal_kind: TerminalKind | None = None
     """Structured completion class: ``completed``, ``failed``, or ``cancelled``.
 
     Classified directly from the completed task, independent of ``error``'s
@@ -276,7 +286,7 @@ class WorkItemCoordinator:
         work_item_id: str,
         worker_id: str,
         on_complete: Callable[[LateResult], Any] | None = None,
-        on_late_terminal: Callable[[str, str], Any] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
     ) -> bool:
         """Retain a timed-out task, returning false when shutdown rejects ownership.
 
@@ -297,6 +307,7 @@ class WorkItemCoordinator:
         self._background_task_order.append(task)
 
         def completed(completed_task: asyncio.Task[Any]) -> None:
+            terminal_kind: TerminalKind
             if completed_task.cancelled():
                 terminal_kind = "cancelled"
             elif completed_task.exception() is not None:
@@ -553,7 +564,7 @@ class WorkItemCoordinator:
         *,
         on_late_complete: Callable[[LateResult], Any] | None = None,
         work_item_ids: list[str] | None = None,
-        on_late_terminal: Callable[[str, str], Any] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
     ) -> SubmittedOutcome:
         self._ensure_open()
         submission_task = asyncio.current_task()
