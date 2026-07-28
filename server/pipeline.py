@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -550,6 +550,20 @@ class SessionHost:
             self._retained_recorders[work_item_id] = recorder
 
     @staticmethod
+    def _make_late_terminal_handler(
+        recorders: Mapping[str, RetainedRecorder],
+    ) -> Callable[[str, str], None]:
+        """Build a coordinator ``on_late_terminal`` callback that claims the
+        matching retained recorder, if any, for a late-completing work item."""
+
+        def on_late_terminal(item_id: str, terminal_kind: str) -> None:
+            recorder = recorders.get(item_id)
+            if recorder is not None:
+                recorder.claim(terminal_kind)
+
+        return on_late_terminal
+
+    @staticmethod
     def _failure_child_outcome(failure: WorkItemFailure) -> str:
         return {
             "CapacityError": "capacity_rejected",
@@ -912,10 +926,7 @@ class SessionHost:
                 app_worker_id=worker_id,
             )
             outcome_label = "completed"
-
-            def on_late_terminal(item_id: str, terminal_kind: str) -> None:
-                if item_id == work_item_id:
-                    retained_recorder.claim(terminal_kind)
+            on_late_terminal = self._make_late_terminal_handler({work_item_id: retained_recorder})
 
             async def execute(_worker_id: str, query: str) -> GroundedResult:
                 nonlocal outcome_label
@@ -1100,6 +1111,8 @@ class SessionHost:
                     else None
                 )
 
+            index_to_worker_id = dict(zip(runnable_indexes, runnable, strict=True))
+
             execution_indexes: dict[tuple[str, str], list[int]] = {}
             for item_index, item in zip(runnable_indexes, runnable, strict=True):
                 execution_indexes.setdefault(item, []).append(item_index)
@@ -1150,15 +1163,11 @@ class SessionHost:
                     origin_epoch=origin.epoch,
                     turn_id=turn_id,
                     work_item_id=f"work-{turn_id}-{index}",
-                    app_worker_id=runnable[runnable_indexes.index(index)][0],
+                    app_worker_id=index_to_worker_id[index][0],
                 )
                 for index in runnable_indexes
             }
-
-            def on_late_terminal(item_id: str, terminal_kind: str) -> None:
-                recorder = retained_recorders.get(item_id)
-                if recorder is not None:
-                    recorder.claim(terminal_kind)
+            on_late_terminal = self._make_late_terminal_handler(retained_recorders)
 
             submitted = await self.coordinator.submit(
                 f"work-{turn_id}",
@@ -1177,7 +1186,7 @@ class SessionHost:
             for result in submitted.results:
                 index = result_indexes[result.turn_id]
                 results[index] = result
-                worker_id = runnable[runnable_indexes.index(index)][0]
+                worker_id = index_to_worker_id[index][0]
                 turn_recorder.record_child(
                     child_recorders[index].finalize(
                         outcome=outcome_labels.get(index, "completed"),
@@ -1187,7 +1196,7 @@ class SessionHost:
                 )
             for work_item_id in submitted.pending_work_item_ids:
                 item_index = int(work_item_id.rsplit("-", 1)[1])
-                worker_id = runnable[runnable_indexes.index(item_index)][0]
+                worker_id = index_to_worker_id[item_index][0]
                 results[item_index] = canonical_result(
                     worker_id=worker_id,
                     turn_id=f"{turn_id}-{item_index}",
@@ -1316,9 +1325,7 @@ class SessionHost:
             work_item_id=work_item_id,
             worker_id=worker_id,
             on_complete=lambda late: self._commit_late_result(late, origin_epoch),
-            on_late_terminal=lambda item_id, terminal_kind: (
-                retained_recorder.claim(terminal_kind) if item_id == work_item_id else None
-            ),
+            on_late_terminal=self._make_late_terminal_handler({work_item_id: retained_recorder}),
         )
         if not accepted:
             return SearchExecution("retention_rejected")
@@ -1338,144 +1345,130 @@ class SessionHost:
         recorder = self._retained_recorders.pop(late.work_item_id, None)
         if recorder is not None and late.terminal_kind is not None:
             recorder.claim(late.terminal_kind)
+
+        work_outcome: str | None = None
+        commit_outcome: str | None = None
+        speech_outcome: str | None = None
+        result_id: str | None = None
+        pending_exception: Exception | None = None
+
         if late.error is not None:
             self._known_work_items.discard(late.work_item_id)
-            if recorder is not None:
-                # A worker task cancellation reaching this normal completion
-                # path is always a live "suppressed_cancelled" outcome. Pure
-                # shutdown-triggered cancellation never reaches here: the
-                # coordinator's shutdown guard suppresses this callback
-                # entirely, so that case is finalized separately by
-                # ``SessionHost.shutdown``'s still-open-recorder sweep.
-                if late.terminal_kind == "cancelled":
-                    commit_outcome, speech_outcome = "suppressed_cancelled", "cancelled"
-                else:
-                    commit_outcome, speech_outcome = "not_applicable", "not_applicable"
-                recorder.finalize(
-                    work_outcome=late.terminal_kind or "failed",
-                    commit_outcome=commit_outcome,
-                    speech_outcome=speech_outcome,
-                )
+            # A worker task cancellation reaching this normal completion path
+            # is always a live "suppressed_cancelled" outcome. Pure
+            # shutdown-triggered cancellation never reaches here: the
+            # coordinator's shutdown guard suppresses this callback entirely,
+            # so that case is finalized separately by
+            # ``SessionHost.shutdown``'s still-open-recorder sweep.
+            work_outcome = late.terminal_kind or "failed"
+            if late.terminal_kind == "cancelled":
+                commit_outcome, speech_outcome = "suppressed_cancelled", "cancelled"
+            else:
+                commit_outcome, speech_outcome = "not_applicable", "not_applicable"
             logger.warning(
                 f"Late worker result failed for work_item={late.work_item_id} "
                 f"worker={late.worker_id}"
             )
-            return
-        if late.work_item_id in self._cancelled_work_items:
+        elif late.work_item_id in self._cancelled_work_items:
             self._cancelled_work_items.discard(late.work_item_id)
             self._known_work_items.discard(late.work_item_id)
             if isinstance(late.result, GroundedResult):
                 self._clarification_candidates.pop(late.result.result_id, None)
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="cancelled",
-                    commit_outcome="suppressed_cancelled",
-                    speech_outcome="cancelled",
-                )
-            return
-        result = late.result
-        if not isinstance(result, GroundedResult):
-            self._known_work_items.discard(late.work_item_id)
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="invalid_result",
-                    commit_outcome="not_applicable",
-                    speech_outcome="not_applicable",
-                )
-            return
-        if result.origin_epoch != origin_epoch:
-            self._known_work_items.discard(late.work_item_id)
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="completed",
-                    commit_outcome="suppressed_stale",
-                    speech_outcome="not_applicable",
-                )
-            return
-        if any(item.result_id == result.result_id for item in self.state.results.results):
-            self._known_work_items.discard(late.work_item_id)
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="completed",
-                    commit_outcome="suppressed_duplicate",
-                    speech_outcome="not_applicable",
-                )
-            return
-        try:
-            self._commit_result_state(result)
-        except Exception:
-            self._known_work_items.discard(late.work_item_id)
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="completed",
-                    commit_outcome="failed",
-                    speech_outcome="not_applicable",
-                )
-            raise
-        self._known_work_items.discard(late.work_item_id)
-        worker = self.state.workers.get(result.worker_id)
-        if worker is not None and worker.origin_epoch == origin_epoch:
-            self.state.set_worker(
-                worker.model_copy(
-                    update={
-                        "status": "idle",
-                        "latest_result_id": result.result_id,
-                    }
-                )
+            work_outcome, commit_outcome, speech_outcome = (
+                "cancelled",
+                "suppressed_cancelled",
+                "cancelled",
             )
-        origin = self.connection
-        if origin is None:
-            speech_outcome: str | None = "disconnected"
-        elif origin.tts is None:
-            speech_outcome = "no_tts"
-        elif not origin.active or origin.epoch != origin_epoch or not self.accepts(origin_epoch):
-            speech_outcome = "stale_connection"
+        elif not isinstance(late.result, GroundedResult):
+            self._known_work_items.discard(late.work_item_id)
+            work_outcome, commit_outcome, speech_outcome = (
+                "invalid_result",
+                "not_applicable",
+                "not_applicable",
+            )
+        elif late.result.origin_epoch != origin_epoch:
+            self._known_work_items.discard(late.work_item_id)
+            work_outcome, commit_outcome, speech_outcome = (
+                "completed",
+                "suppressed_stale",
+                "not_applicable",
+            )
+        elif any(item.result_id == late.result.result_id for item in self.state.results.results):
+            self._known_work_items.discard(late.work_item_id)
+            work_outcome, commit_outcome, speech_outcome = (
+                "completed",
+                "suppressed_duplicate",
+                "not_applicable",
+            )
         else:
-            speech_outcome = None
-        if speech_outcome is not None:
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="completed",
-                    commit_outcome="committed",
-                    speech_outcome=speech_outcome,
-                    result_id=result.result_id,
+            result = late.result
+            try:
+                self._commit_result_state(result)
+            except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
+                self._known_work_items.discard(late.work_item_id)
+                work_outcome, commit_outcome, speech_outcome = (
+                    "completed",
+                    "failed",
+                    "not_applicable",
                 )
-            return
-        try:
-            origin.scheduler.enqueue(
-                result_id=result.result_id,
-                work_item_id=late.work_item_id,
-                run_id=f"run-{result.turn_id}",
-                text=result.spoken_text,
-                origin_epoch=origin_epoch,
-            )
-        except Exception:
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="completed",
-                    commit_outcome="committed",
-                    speech_outcome="enqueue_failed",
-                    result_id=result.result_id,
-                )
-            raise
-        try:
-            await origin.scheduler.start_next()
-        except Exception:
-            if recorder is not None:
-                recorder.finalize(
-                    work_outcome="completed",
-                    commit_outcome="committed",
-                    speech_outcome="start_failed",
-                    result_id=result.result_id,
-                )
-            raise
+                pending_exception = exc
+            else:
+                self._known_work_items.discard(late.work_item_id)
+                worker = self.state.workers.get(result.worker_id)
+                if worker is not None and worker.origin_epoch == origin_epoch:
+                    self.state.set_worker(
+                        worker.model_copy(
+                            update={
+                                "status": "idle",
+                                "latest_result_id": result.result_id,
+                            }
+                        )
+                    )
+                origin = self.connection
+                if origin is None:
+                    speech_outcome = "disconnected"
+                elif origin.tts is None:
+                    speech_outcome = "no_tts"
+                elif (
+                    not origin.active
+                    or origin.epoch != origin_epoch
+                    or not self.accepts(origin_epoch)
+                ):
+                    speech_outcome = "stale_connection"
+                else:
+                    speech_outcome = None
+                work_outcome, commit_outcome = "completed", "committed"
+                result_id = result.result_id
+                if speech_outcome is None:
+                    try:
+                        origin.scheduler.enqueue(
+                            result_id=result.result_id,
+                            work_item_id=late.work_item_id,
+                            run_id=f"run-{result.turn_id}",
+                            text=result.spoken_text,
+                            origin_epoch=origin_epoch,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
+                        speech_outcome = "enqueue_failed"
+                        pending_exception = exc
+                    else:
+                        try:
+                            await origin.scheduler.start_next()
+                        except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
+                            speech_outcome = "start_failed"
+                            pending_exception = exc
+                        else:
+                            speech_outcome = "queued"
+
         if recorder is not None:
             recorder.finalize(
-                work_outcome="completed",
-                commit_outcome="committed",
-                speech_outcome="queued",
-                result_id=result.result_id,
+                work_outcome=work_outcome,
+                commit_outcome=commit_outcome,
+                speech_outcome=speech_outcome,
+                result_id=result_id,
             )
+        if pending_exception is not None:
+            raise pending_exception
 
     def _commit_result_state(self, result: GroundedResult) -> None:
         self.state.append_transcript(

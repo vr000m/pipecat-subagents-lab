@@ -18,7 +18,7 @@ import re
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -195,14 +195,22 @@ class EventSpec:
     required: tuple[FieldSpec, ...]
     optional: tuple[FieldSpec, ...] = ()
     validate: Callable[[Mapping[str, Any]], None] | None = None
+    _by_name: Mapping[str, FieldSpec] = field(init=False, repr=False, compare=False)
+    _ordered_names: tuple[str, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_by_name", {f.name: f for f in (*self.required, *self.optional)})
+        object.__setattr__(
+            self, "_ordered_names", tuple(f.name for f in (*self.required, *self.optional))
+        )
 
     @property
     def by_name(self) -> Mapping[str, FieldSpec]:
-        return {f.name: f for f in (*self.required, *self.optional)}
+        return self._by_name
 
     @property
     def ordered_names(self) -> tuple[str, ...]:
-        return tuple(f.name for f in (*self.required, *self.optional))
+        return self._ordered_names
 
 
 EVENT_REGISTRY: Mapping[str, EventSpec] = MappingProxyType(

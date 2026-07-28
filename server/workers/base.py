@@ -24,6 +24,10 @@ class WorkerMetadata:
     model_policy: str
     capabilities: dict[str, bool] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not self.worker_id or not self.worker_id.strip():
+            raise ValueError("worker_id must not be empty")
+
 
 class ContextWorker(_NativeWorker):
     """A small durable worker with one causal mailbox per context owner."""
