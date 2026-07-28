@@ -1138,20 +1138,54 @@ Implemented across Phases 1-3 (commits fb8f88a, 4cbfcfa, fdf5820): a
 console-only `PERF_METRIC` telemetry contract, Pipecat 1.6.0 observer
 wiring (`StartupTimingObserver`, `UserBotLatencyObserver`, default
 `TurnTrackingObserver`), and application-turn/retained-work timing
-recorders across all three accepted-turn terminal-path owners. Currently
-in the review-gauntlet's fix rounds: `/code-review -xhigh` findings
-fixed in 9f9f234/a76e664; `skein:deep-review --verbose` findings
-(dual-recorder ownership, `record_zero_child_outcome` counter
-invariant, Loguru diagnose leak, and minor hardening items) in
-progress. `/security-review` still pending.
+recorders across all three accepted-turn terminal-path owners.
+
+Review-gauntlet (plan's `Review Gates: full`) complete: `/code-review
+-xhigh` (8 findings fixed, 9f9f234/a76e664), Codex adversarial review
+skipped (Codex out of tokens), `skein:deep-review --verbose` (11
+findings fixed, c10a54b), `/security-review` (zero HIGH/MEDIUM
+findings; independently verified the Loguru diagnose fix is correctly
+applied and regression-tested). 467/467 tests passing, ruff clean. No
+full-corpus confirming re-review pass was run after the deep-review fix
+round (would normally restart gate 1 given the fixes' structural
+scope) — the fixes were verified via targeted regression tests plus a
+full-suite run and the final security-review pass, not a fresh
+multi-lens sweep.
 
 ### Outcomes
 
-- (fill when review-gauntlet converges)
+- One console `PERF_METRIC` contract covers both Pipecat-native framework
+  timing and application-owned semantic-turn/retained-work timing, with
+  a single injectable sink (`ConsoleMeasurementSink` production,
+  `CollectingMeasurementSink` tests/smoke) and no latest-value
+  compatibility cache.
+- Every accepted semantic turn across all three terminal-path owners
+  (`_handle_transcript_impl`, `_handle_pending`, `_handle_multi_intent`)
+  now shares one recorder instance, closing a duplicate-emission bug
+  that review surfaced but the original phased implementation missed.
+- `WorkItemFailure` and `LateResult` both now carry structured
+  classification fields (`failure_kind`, `terminal_kind`) instead of
+  string-matching on exception class names or free-text error strings.
 
 ### Learnings
 
-- (fill when review-gauntlet converges)
+- The phased `/conduct` implementation (parallel implementer/test-writer
+  per phase) shipped a feature that passed its own phase-boundary tests
+  cleanly, but multi-lens review (code-review, then deep-review's logic
+  + architecture lenses independently) caught a real duplicate-metric
+  bug that no single phase's test suite exercised: cancellation of a
+  *delegated* turn specifically. Parallel implementer/test-writer pairs
+  working from the same plan text can still both miss a cross-function
+  invariant (one recorder per turn_id) that isn't stated as an explicit
+  test case in the plan's own branch/fault matrix.
+- Running 4 fix agents in parallel on overlapping files (server/pipeline.py,
+  server/perf_metrics.py touched by 3-4 agents each) worked, but only
+  because each agent was scoped to explicit non-overlapping functions/
+  classes and instructed to report scope conflicts rather than guess.
+  Two agents independently caught and flagged live clobbering from
+  concurrent `git add`/edits mid-round; verifying every claimed change
+  was actually present in the final staged diff (not just trusting each
+  agent's self-report) was necessary before committing.
 
 ### Follow-up Work
 
