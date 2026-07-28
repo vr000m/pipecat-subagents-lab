@@ -38,6 +38,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrate the paid conversation smoke harness off `SessionHost.last_turn_metrics`
   onto an injected `CollectingMeasurementSink`, so a direct turn can no longer
   inherit a preceding delegated turn's stale latency budget.
+- Adopt `mypy` in CI, gated on `server/perf_metrics.py`, `server/pipeline.py`,
+  and `server/work_item_coordinator.py`. The `PERF_METRIC` outcome vocabularies
+  are now `Literal`-alias-derived rather than hand-duplicated frozensets, so a
+  typo or future rename in an outcome literal fails CI instead of silently
+  dropping a metric in production.
+
+### Fixed
+
+- Suppress RTVI metrics forwarding to the browser client
+  (`RTVIObserverParams(metrics_enabled=False)`); `enable_metrics=True` no
+  longer leaks `MetricsFrame`s over the wire protocol, closing a gap between
+  this feature's console-only scope and its actual behavior.
+- Revert `SessionHost`'s default `WorkItemCoordinator` construction; a bare
+  `SessionHost(...)` again leaves `coordinator=None` instead of silently
+  acquiring a router-less coordinator that would fail on non-control turns.
+- Classify work-item failures from the structured `failure_kind` field
+  instead of pattern-matching the free-text `error_type` (exception class
+  name), which could mislabel a worker exception merely named after a known
+  sentinel string.
+- Make `AppTurnRecorder.finalize` total: no argument combination (an empty
+  multi-intent fan-out, a control turn with no resolvable action) can latch
+  the recorder as finalized while silently skipping emission.
+- Give `AppTurnRecorder` ownership of its child `WorkItemRecorder`s: a parent
+  finalize now sweeps any child left open by a cancelled turn or a raising
+  commit/speak step, instead of under-reporting `child_count`.
+- Harden the multi-intent fan-in against a worker returning an unexpected
+  `turn_id` or `work_item_id`: the turn now degrades gracefully (partial
+  results still commit and speak; only the unattributable item drops, with a
+  warning) instead of the entire turn silently failing.
 
 ## [0.1.1] - 2026-07-26
 
