@@ -320,9 +320,18 @@ class SessionHost:
         self._cancelled_work_items: set[str] = set()
         self._clarification_candidates: dict[str, dict[str, str]] = {}
         self._retained_recorders: dict[str, RetainedRecorder] = {}
-        self.measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
+        self._measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
         self._closing = False
         self.started = False
+
+    @property
+    def measurement_sink(self) -> MeasurementSink:
+        """The sink resolved exactly once for this host's lifetime.
+
+        Read-only so no caller can swap it mid-session, per the Measurement
+        Sink Contract in the latency observability dev plan.
+        """
+        return self._measurement_sink
 
     async def start(self) -> None:
         if self.started:
@@ -636,9 +645,10 @@ class SessionHost:
                 )
                 routing_ms = (time.perf_counter() - routing_started) * 1000
                 turn_recorder.record_routing(routing_ms)
-            except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
-                logger.exception(
-                    f"Routing failed for {turn_id}; returning a safe result without provider details"
+            except Exception as exc:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
+                logger.warning(
+                    f"Routing failed for {turn_id}; returning a safe result "
+                    f"without provider details: {type(exc).__name__}"
                 )
                 result = await self._commit_and_speak(
                     canonical_result(
@@ -699,9 +709,13 @@ class SessionHost:
                         "no_active": "There is no active response to cancel.",
                     }.get(action, "Control request noted.")
                 elif outcome.kind == "multi_intent":
-                    return await self._handle_multi_intent(outcome, transcript, origin, turn_id)
+                    return await self._handle_multi_intent(
+                        outcome, transcript, origin, turn_id, turn_recorder
+                    )
                 elif outcome.kind == "continue_pending":
-                    return await self._handle_pending(outcome, transcript, origin, turn_id)
+                    return await self._handle_pending(
+                        outcome, transcript, origin, turn_id, turn_recorder
+                    )
                 else:
                     text = None
                 if text is None:
@@ -756,7 +770,6 @@ class SessionHost:
                     ),
                     origin,
                 )
-                turn_recorder.record_zero_child_outcome(action)
                 turn_recorder.finalize(outcome=action)
                 return result
             try:
@@ -855,8 +868,11 @@ class SessionHost:
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "declined"
-            except Exception:  # noqa: BLE001  # intentional catch-all: search worker failures are arbitrary provider errors that must fall back to a safe result
-                logger.exception(f"Web search failed for {turn_id}; returning a safe result")
+            except Exception as exc:  # noqa: BLE001  # intentional catch-all: search worker failures are arbitrary provider errors that must fall back to a safe result
+                logger.warning(
+                    f"Web search failed for {turn_id}; returning a safe result: "
+                    f"{type(exc).__name__}"
+                )
                 search_ms = (time.perf_counter() - search_started) * 1000
                 result = canonical_result(
                     worker_id=worker_id,
@@ -890,11 +906,19 @@ class SessionHost:
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="cancelled")
             raise
+        except Exception:
+            if not turn_recorder.finalized:
+                turn_recorder.finalize(outcome="failed")
+            raise
 
     async def _handle_pending(
-        self, outcome: Any, transcript: str, origin: Any, turn_id: str
+        self,
+        outcome: Any,
+        transcript: str,
+        origin: Any,
+        turn_id: str,
+        turn_recorder: AppTurnRecorder,
     ) -> Any:
-        turn_recorder = self._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id)
         try:
             pending = getattr(outcome, "pending_dialogue", None)
             owner_id = pending.owner_id if pending is not None else None
@@ -1007,11 +1031,15 @@ class SessionHost:
             raise
 
     async def _handle_multi_intent(
-        self, outcome: Any, transcript: str, origin: Any, turn_id: str
+        self,
+        outcome: Any,
+        transcript: str,
+        origin: Any,
+        turn_id: str,
+        turn_recorder: AppTurnRecorder,
     ) -> tuple[Any, ...]:
         """Execute bounded compound work in the user's stated order."""
         del transcript
-        turn_recorder = self._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id)
         try:
             results: dict[int, Any] = {}
             runnable: list[tuple[str, str]] = []
@@ -1038,9 +1066,10 @@ class SessionHost:
                             item_text,
                             catalogue,
                         )
-                    except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
-                        logger.exception(
-                            f"Routing failed for {turn_id}-{index}; returning a safe result"
+                    except Exception as exc:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
+                        logger.warning(
+                            f"Routing failed for {turn_id}-{index}; returning a safe result: "
+                            f"{type(exc).__name__}"
                         )
                         results[index] = canonical_result(
                             worker_id="main",
@@ -1320,6 +1349,11 @@ class SessionHost:
             raise
         if task in done:
             return SearchExecution("completed", await task)
+        # Register the provisional recorder before handing the completion
+        # callback to the coordinator, so it is always in the registry by the
+        # time that callback could possibly run -- regardless of whether a
+        # future refactor inserts an await between the two calls.
+        self._register_retained_recorder_if_open(work_item_id, retained_recorder)
         accepted = self.coordinator.retain_late_task(
             task,
             work_item_id=work_item_id,
@@ -1328,8 +1362,8 @@ class SessionHost:
             on_late_terminal=self._make_late_terminal_handler({work_item_id: retained_recorder}),
         )
         if not accepted:
+            self._retained_recorders.pop(work_item_id, None)
             return SearchExecution("retention_rejected")
-        self._register_retained_recorder_if_open(work_item_id, retained_recorder)
         return SearchExecution("retained")
 
     async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
@@ -1352,121 +1386,134 @@ class SessionHost:
         result_id: str | None = None
         pending_exception: Exception | None = None
 
-        if late.error is not None:
-            self._known_work_items.discard(late.work_item_id)
-            # A worker task cancellation reaching this normal completion path
-            # is always a live "suppressed_cancelled" outcome. Pure
-            # shutdown-triggered cancellation never reaches here: the
-            # coordinator's shutdown guard suppresses this callback entirely,
-            # so that case is finalized separately by
-            # ``SessionHost.shutdown``'s still-open-recorder sweep.
-            work_outcome = late.terminal_kind or "failed"
-            if late.terminal_kind == "cancelled":
-                commit_outcome, speech_outcome = "suppressed_cancelled", "cancelled"
-            else:
-                commit_outcome, speech_outcome = "not_applicable", "not_applicable"
-            logger.warning(
-                f"Late worker result failed for work_item={late.work_item_id} "
-                f"worker={late.worker_id}"
-            )
-        elif late.work_item_id in self._cancelled_work_items:
-            self._cancelled_work_items.discard(late.work_item_id)
-            self._known_work_items.discard(late.work_item_id)
-            if isinstance(late.result, GroundedResult):
-                self._clarification_candidates.pop(late.result.result_id, None)
-            work_outcome, commit_outcome, speech_outcome = (
-                "cancelled",
-                "suppressed_cancelled",
-                "cancelled",
-            )
-        elif not isinstance(late.result, GroundedResult):
-            self._known_work_items.discard(late.work_item_id)
-            work_outcome, commit_outcome, speech_outcome = (
-                "invalid_result",
-                "not_applicable",
-                "not_applicable",
-            )
-        elif late.result.origin_epoch != origin_epoch:
-            self._known_work_items.discard(late.work_item_id)
-            work_outcome, commit_outcome, speech_outcome = (
-                "completed",
-                "suppressed_stale",
-                "not_applicable",
-            )
-        elif any(item.result_id == late.result.result_id for item in self.state.results.results):
-            self._known_work_items.discard(late.work_item_id)
-            work_outcome, commit_outcome, speech_outcome = (
-                "completed",
-                "suppressed_duplicate",
-                "not_applicable",
-            )
-        else:
-            result = late.result
-            try:
-                self._commit_result_state(result)
-            except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
+        # The recorder was already popped above, so it is only reachable from
+        # this stack frame from here on. A CancelledError delivered during the
+        # ``await origin.scheduler.start_next()`` below (e.g. from
+        # WorkItemCoordinator.shutdown cancelling this coordinator-owned
+        # callback task) must not unwind past finalization: that would both
+        # skip the work_item_background record AND leave no still-registered
+        # recorder for SessionHost.shutdown's sweep to catch as a backstop.
+        # The try/finally makes finalization unconditional regardless of how
+        # this block exits; RetainedRecorder.finalize supplies terminal
+        # defaults for any outcome field still unset at that point.
+        try:
+            if late.error is not None:
+                self._known_work_items.discard(late.work_item_id)
+                # A worker task cancellation reaching this normal completion path
+                # is always a live "suppressed_cancelled" outcome. Pure
+                # shutdown-triggered cancellation never reaches here: the
+                # coordinator's shutdown guard suppresses this callback entirely,
+                # so that case is finalized separately by
+                # ``SessionHost.shutdown``'s still-open-recorder sweep.
+                work_outcome = late.terminal_kind or "failed"
+                if late.terminal_kind == "cancelled":
+                    commit_outcome, speech_outcome = "suppressed_cancelled", "cancelled"
+                else:
+                    commit_outcome, speech_outcome = "not_applicable", "not_applicable"
+                logger.warning(
+                    f"Late worker result failed for work_item={late.work_item_id} "
+                    f"worker={late.worker_id}"
+                )
+            elif late.work_item_id in self._cancelled_work_items:
+                self._cancelled_work_items.discard(late.work_item_id)
+                self._known_work_items.discard(late.work_item_id)
+                if isinstance(late.result, GroundedResult):
+                    self._clarification_candidates.pop(late.result.result_id, None)
+                work_outcome, commit_outcome, speech_outcome = (
+                    "cancelled",
+                    "suppressed_cancelled",
+                    "cancelled",
+                )
+            elif not isinstance(late.result, GroundedResult):
+                self._known_work_items.discard(late.work_item_id)
+                work_outcome, commit_outcome, speech_outcome = (
+                    "invalid_result",
+                    "not_applicable",
+                    "not_applicable",
+                )
+            elif late.result.origin_epoch != origin_epoch:
                 self._known_work_items.discard(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
                     "completed",
-                    "failed",
+                    "suppressed_stale",
                     "not_applicable",
                 )
-                pending_exception = exc
-            else:
+            elif any(
+                item.result_id == late.result.result_id for item in self.state.results.results
+            ):
                 self._known_work_items.discard(late.work_item_id)
-                worker = self.state.workers.get(result.worker_id)
-                if worker is not None and worker.origin_epoch == origin_epoch:
-                    self.state.set_worker(
-                        worker.model_copy(
-                            update={
-                                "status": "idle",
-                                "latest_result_id": result.result_id,
-                            }
-                        )
+                work_outcome, commit_outcome, speech_outcome = (
+                    "completed",
+                    "suppressed_duplicate",
+                    "not_applicable",
+                )
+            else:
+                result = late.result
+                try:
+                    self._commit_result_state(result)
+                except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
+                    self._known_work_items.discard(late.work_item_id)
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "completed",
+                        "failed",
+                        "not_applicable",
                     )
-                origin = self.connection
-                if origin is None:
-                    speech_outcome = "disconnected"
-                elif origin.tts is None:
-                    speech_outcome = "no_tts"
-                elif (
-                    not origin.active
-                    or origin.epoch != origin_epoch
-                    or not self.accepts(origin_epoch)
-                ):
-                    speech_outcome = "stale_connection"
+                    pending_exception = exc
                 else:
-                    speech_outcome = None
-                work_outcome, commit_outcome = "completed", "committed"
-                result_id = result.result_id
-                if speech_outcome is None:
-                    try:
-                        origin.scheduler.enqueue(
-                            result_id=result.result_id,
-                            work_item_id=late.work_item_id,
-                            run_id=f"run-{result.turn_id}",
-                            text=result.spoken_text,
-                            origin_epoch=origin_epoch,
+                    self._known_work_items.discard(late.work_item_id)
+                    worker = self.state.workers.get(result.worker_id)
+                    if worker is not None and worker.origin_epoch == origin_epoch:
+                        self.state.set_worker(
+                            worker.model_copy(
+                                update={
+                                    "status": "idle",
+                                    "latest_result_id": result.result_id,
+                                }
+                            )
                         )
-                    except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
-                        speech_outcome = "enqueue_failed"
-                        pending_exception = exc
+                    origin = self.connection
+                    if origin is None:
+                        speech_outcome = "disconnected"
+                    elif origin.tts is None:
+                        speech_outcome = "no_tts"
+                    elif (
+                        not origin.active
+                        or origin.epoch != origin_epoch
+                        or not self.accepts(origin_epoch)
+                    ):
+                        speech_outcome = "stale_connection"
                     else:
+                        speech_outcome = None
+                    work_outcome, commit_outcome = "completed", "committed"
+                    result_id = result.result_id
+                    if speech_outcome is None:
                         try:
-                            await origin.scheduler.start_next()
-                        except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
-                            speech_outcome = "start_failed"
+                            origin.scheduler.enqueue(
+                                result_id=result.result_id,
+                                work_item_id=late.work_item_id,
+                                run_id=f"run-{result.turn_id}",
+                                text=result.spoken_text,
+                                origin_epoch=origin_epoch,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
+                            speech_outcome = "enqueue_failed"
                             pending_exception = exc
                         else:
-                            speech_outcome = "queued"
-
-        if recorder is not None:
-            recorder.finalize(
-                work_outcome=work_outcome,
-                commit_outcome=commit_outcome,
-                speech_outcome=speech_outcome,
-                result_id=result_id,
-            )
+                            try:
+                                await origin.scheduler.start_next()
+                            except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
+                                speech_outcome = "start_failed"
+                                pending_exception = exc
+                            else:
+                                speech_outcome = "queued"
+        finally:
+            if recorder is not None:
+                recorder.finalize(
+                    work_outcome=work_outcome,
+                    commit_outcome=commit_outcome,
+                    speech_outcome=speech_outcome,
+                    result_id=result_id,
+                )
         if pending_exception is not None:
             raise pending_exception
 
@@ -1692,11 +1739,7 @@ class SessionHost:
         # while claimed work uses its recorded terminal kind and whatever
         # commit/speech stage it had already reached.
         for work_item_id, recorder in tuple(self._retained_recorders.items()):
-            recorder.finalize(
-                work_outcome=recorder.work_outcome or "cancelled",
-                commit_outcome=recorder.commit_outcome or "suppressed_shutdown",
-                speech_outcome=recorder.speech_outcome or "cancelled",
-            )
+            recorder.finalize()
             self._retained_recorders.pop(work_item_id, None)
         stop = getattr(self.runner, "stop", None)
         if stop is not None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,6 +13,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger as _loguru_logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.observers.startup_timing_observer import StartupTimingObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
@@ -45,6 +47,16 @@ from .work_item_coordinator import WorkItemCoordinator
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _configure_logging() -> None:
+    """Disable Loguru's diagnose/backtrace rendering so tracebacks never dump
+    local variable values (transcripts, provider payloads, API keys) to logs."""
+    _loguru_logger.remove()
+    _loguru_logger.add(sys.stderr, backtrace=False, diagnose=False)
+
+
+_configure_logging()
 
 
 class _SpeechCompletionProcessor(FrameProcessor):

@@ -351,6 +351,7 @@ def test_targeted_cancel_during_submit_preserves_completed_sibling() -> None:
                 worker_id="worker-a",
                 error_type="CancelledError",
                 error_message="worker execution was cancelled",
+                failure_kind="cancelled",
             ),
         )
         await coordinator.shutdown()
@@ -484,6 +485,35 @@ def test_immediate_worker_failure_is_retained_without_reordering_successes() -> 
         assert outcome.failures[0].worker_id == "worker-b"
         assert outcome.failures[0].error_type == "ValueError"
         assert outcome.failures[0].error_message == "worker execution failed"
+        assert outcome.failures[0].failure_kind == "failed"
+
+    asyncio.run(run())
+
+
+def test_worker_failure_classifies_via_failure_kind_regardless_of_exception_class_name() -> None:
+    """A worker exception whose class name matches no known sentinel string
+    must still classify as ``failed`` through the structured ``failure_kind``
+    field, not through pattern-matching ``error_type`` against a hardcoded
+    name list."""
+
+    class SomeRenamedExceptionClassNotInAnySentinelList(Exception):
+        pass
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2, wait_timeout_ms=100)
+
+        async def worker(worker_id: str, text: str) -> dict:
+            if text == "fail":
+                raise SomeRenamedExceptionClassNotInAnySentinelList("boom")
+            return {"text": text, "citations": []}
+
+        outcome = await coordinator.submit(
+            "turn-rename", [("worker-a", "fail"), ("worker-b", "ok")], worker
+        )
+
+        assert len(outcome.failures) == 1
+        assert outcome.failures[0].error_type == "SomeRenamedExceptionClassNotInAnySentinelList"
+        assert outcome.failures[0].failure_kind == "failed"
 
     asyncio.run(run())
 

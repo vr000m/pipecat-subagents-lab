@@ -21,20 +21,27 @@ ROUTING_REGRESSION_QUERIES = (
 RESULT_PREFIX = "SMOKE_RESULT="
 
 
-def _latest_turn_stage_metrics(sink: Any, elapsed_ms: float) -> dict[str, float]:
-    """Read the just-emitted turn's correlated PERF_METRIC records.
+def _latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
+    """Read the given ``turn_id``'s correlated PERF_METRIC records.
 
-    Each call to ``_handle_transcript`` appends exactly one new
-    ``app_turn_foreground`` record (and, for a delegated turn, one
-    ``work_item_foreground`` record) to the collecting sink, so the newest
-    record of each kind always belongs to the turn that just completed --
-    never a stale prior turn's measurement.
+    Selecting by the caller's own ``turn_id`` (rather than the newest record
+    of each kind) is required so a turn that emits no ``work_item_foreground``
+    record -- any direct/unsupported/clarify router turn -- never silently
+    inherits a preceding delegated turn's ``search_ms``/``total_ms``.
     """
-    turn_records = [record for record in sink.records if record.event == "app_turn_foreground"]
+    turn_records = [
+        record
+        for record in sink.records
+        if record.event == "app_turn_foreground" and record.fields.get("turn_id") == turn_id
+    ]
     if not turn_records:
-        raise RuntimeError("no app_turn_foreground metric was emitted for this turn")
+        raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
     turn_record = turn_records[-1]
-    work_records = [record for record in sink.records if record.event == "work_item_foreground"]
+    work_records = [
+        record
+        for record in sink.records
+        if record.event == "work_item_foreground" and record.fields.get("turn_id") == turn_id
+    ]
     work_record = work_records[-1] if work_records else None
     return {
         "routing_ms": float(turn_record.fields.get("routing_ms", 0)),
@@ -113,7 +120,7 @@ async def _run_child(
             raise RuntimeError("public-web smoke returned an invalid spoken projection")
         if not result.citations:
             raise RuntimeError("public-web smoke returned no normalized citations")
-        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms)
+        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
         routing_ms = stage_metrics["routing_ms"]
         search_ms = stage_metrics["search_ms"]
         total_ms = stage_metrics["total_ms"]
@@ -171,7 +178,7 @@ async def _run_routing_regression(
                 raise RuntimeError("weather turn returned a routing/search fallback")
             if action not in {"new_worker", "existing_worker"}:
                 raise RuntimeError(f"weather turn used unexpected routing action: {action!r}")
-        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms)
+        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
         routing_ms = stage_metrics["routing_ms"]
         total_ms = stage_metrics["total_ms"]
         if routing_ms > max_routing_seconds * 1000:

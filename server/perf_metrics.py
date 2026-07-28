@@ -45,10 +45,11 @@ class FieldSpec:
     kind: str  # "id" | "int" | "ms" | "bool" | "enum"
     enum_values: frozenset[str] | None = None
     minimum: int = 0
+    maxlen: int = 128
 
 
-def _id(name: str) -> FieldSpec:
-    return FieldSpec(name, "id")
+def _id(name: str, *, maxlen: int = 128) -> FieldSpec:
+    return FieldSpec(name, "id", maxlen=maxlen)
 
 
 def _int(name: str, *, minimum: int = 0) -> FieldSpec:
@@ -168,12 +169,7 @@ def _validate_service_latency(fields: Mapping[str, Any]) -> None:
 def _validate_app_turn_foreground(fields: Mapping[str, Any]) -> None:
     child_count = fields["child_count"]
     counted = sum(fields.get(name, 0) for name in _APP_TURN_COUNTER_FIELDS)
-    # A dispatched child_count of 0 legitimately allows a nonzero category
-    # counter: a direct/unsupported/clarify turn resolved by the router
-    # itself attributes its own outcome to that counter without dispatching
-    # (and therefore without counting) a child work item. Once any child was
-    # actually dispatched (child_count > 0), the sum must match exactly.
-    if child_count != 0 and counted != child_count:
+    if counted != child_count:
         raise PerfMetricError(
             f"app_turn_foreground: child_count={child_count} does not match counter sum {counted}"
         )
@@ -348,6 +344,10 @@ def _format_value(spec: FieldSpec, value: Any) -> str:
             raise PerfMetricError(
                 f"{spec.name}: identifiers must not contain quotes or control characters, got {value!r}"
             )
+        if len(value) > spec.maxlen:
+            raise PerfMetricError(
+                f"{spec.name}: expected at most {spec.maxlen} characters, got {len(value)}"
+            )
         return json.dumps(value)
     if spec.kind == "int":
         if isinstance(value, bool) or not isinstance(value, int):
@@ -503,7 +503,7 @@ class PerfConnectionContext:
     origin_epoch: int
     connection_worker: str
 
-    def _base_fields(self) -> dict[str, Any]:
+    def base_fields(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
             "origin_epoch": self.origin_epoch,
@@ -517,13 +517,13 @@ def make_startup_timing_handlers(
     """Build ``on_startup_timing_report``/``on_transport_timing_report`` handlers."""
 
     async def on_startup_timing_report(_observer: Any, report: Any) -> None:
-        fields = context._base_fields()
+        fields = context.base_fields()
         fields["total_ms"] = report.total_duration_secs * 1000
         fields["processor_count"] = len(report.processor_timings)
         _safe_emit(sink, "pipeline_startup", fields)
 
     async def on_transport_timing_report(_observer: Any, report: Any) -> None:
-        fields = context._base_fields()
+        fields = context.base_fields()
         fields["client_connected_ms"] = report.client_connected_secs * 1000
         if report.bot_connected_secs is not None:
             fields["bot_connected_ms"] = report.bot_connected_secs * 1000
@@ -538,18 +538,18 @@ def make_user_bot_latency_handlers(
     """Build ``on_first_bot_speech_latency``/``on_latency_measured``/``on_latency_breakdown`` handlers."""
 
     async def on_first_bot_speech_latency(_observer: Any, latency_seconds: float) -> None:
-        fields = context._base_fields()
+        fields = context.base_fields()
         fields["latency_ms"] = latency_seconds * 1000
         _safe_emit(sink, "first_bot_speech_latency", fields)
 
     async def on_latency_measured(_observer: Any, latency_seconds: float) -> None:
-        fields = context._base_fields()
+        fields = context.base_fields()
         fields["latency_ms"] = latency_seconds * 1000
         _safe_emit(sink, "user_bot_latency", fields)
 
     async def on_latency_breakdown(_observer: Any, breakdown: Any) -> None:
         for ttfb in breakdown.ttfb:
-            fields = context._base_fields()
+            fields = context.base_fields()
             fields["metric_kind"] = "ttfb"
             fields["value_ms"] = ttfb.duration_secs * 1000
             fields["processor"] = ttfb.processor
@@ -557,21 +557,21 @@ def make_user_bot_latency_handlers(
 
         if breakdown.text_aggregation is not None:
             ta = breakdown.text_aggregation
-            fields = context._base_fields()
+            fields = context.base_fields()
             fields["metric_kind"] = "text_aggregation"
             fields["value_ms"] = ta.duration_secs * 1000
             fields["processor"] = ta.processor
             _safe_emit(sink, "service_latency", fields)
 
         for call in breakdown.function_calls:
-            fields = context._base_fields()
+            fields = context.base_fields()
             fields["metric_kind"] = "function_calls"
             fields["value_ms"] = call.duration_secs * 1000
             fields["function_name"] = call.function_name
             _safe_emit(sink, "service_latency", fields)
 
         if breakdown.user_turn_secs is not None:
-            fields = context._base_fields()
+            fields = context.base_fields()
             fields["metric_kind"] = "user_turn_secs"
             fields["value_ms"] = breakdown.user_turn_secs * 1000
             _safe_emit(sink, "service_latency", fields)
@@ -585,14 +585,14 @@ def make_turn_tracking_handlers(
     """Build ``on_turn_started``/``on_turn_ended`` handlers for the default turn tracker."""
 
     async def on_turn_started(_observer: Any, turn_count: int) -> None:
-        fields = context._base_fields()
+        fields = context.base_fields()
         fields["pipecat_turn"] = turn_count
         _safe_emit(sink, "pipecat_turn_start", fields)
 
     async def on_turn_ended(
         _observer: Any, turn_count: int, duration_secs: float, was_interrupted: bool
     ) -> None:
-        fields = context._base_fields()
+        fields = context.base_fields()
         fields["pipecat_turn"] = turn_count
         fields["duration_ms"] = duration_secs * 1000
         fields["interrupted"] = bool(was_interrupted)
@@ -693,8 +693,8 @@ class AppTurnRecorder:
         self._counters: dict[str, int] = dict.fromkeys(_APP_TURN_COUNTER_FIELDS, 0)
         self._dispatched_children = 0
         self._finalized = False
-        self.routing_ms: float | None = None
-        self.commit_ms: float | None = None
+        self._routing_ms: float | None = None
+        self._commit_ms: float | None = None
 
     @property
     def turn_id(self) -> str:
@@ -714,22 +714,11 @@ class AppTurnRecorder:
         self._counters[counter] += 1
         self._dispatched_children += 1
 
-    def record_zero_child_outcome(self, outcome: str) -> None:
-        """Attribute the turn's own category counter without a dispatched
-        child. Used for direct/unsupported/clarify responses resolved by the
-        router itself, which never reach worker dispatch: the turn still
-        belongs to its own outcome category, but ``child_count`` stays 0."""
-        counter = _CHILD_COUNTER_FOR_OUTCOME.get(outcome)
-        if counter is None:
-            logger.warning(f"app_turn_foreground: unrecognized child outcome {outcome!r}")
-            return
-        self._counters[counter] += 1
-
     def record_routing(self, routing_ms: float) -> None:
-        self.routing_ms = routing_ms
+        self._routing_ms = routing_ms
 
     def record_commit(self, commit_ms: float) -> None:
-        self.commit_ms = commit_ms
+        self._commit_ms = commit_ms
 
     def finalize(
         self,
@@ -766,10 +755,10 @@ class AppTurnRecorder:
             fields["control_action"] = control_action
         if control_outcome is not None:
             fields["control_outcome"] = control_outcome
-        if self.routing_ms is not None:
-            fields["routing_ms"] = self.routing_ms
-        if self.commit_ms is not None:
-            fields["commit_ms"] = self.commit_ms
+        if self._routing_ms is not None:
+            fields["routing_ms"] = self._routing_ms
+        if self._commit_ms is not None:
+            fields["commit_ms"] = self._commit_ms
         _safe_emit(self._sink, "app_turn_foreground", fields)
 
 
@@ -917,6 +906,13 @@ class RetainedRecorder:
 
         Idempotent: a callback arriving after finalization is a no-op, which is
         exactly the "callback after recorder already finalized" contract.
+
+        ``work_outcome``, ``commit_outcome``, and ``speech_outcome`` are
+        required fields in the event registry. Any left unset by the caller
+        (and not already set by a prior ``claim``/``record_commit``/
+        ``record_speech`` call) default here to the same terminal values a
+        shutdown-triggered finalize implies, so this method can never
+        construct an incomplete record.
         """
         if self.state == "finalized":
             return False
@@ -928,6 +924,9 @@ class RetainedRecorder:
             self.speech_outcome = speech_outcome
         if result_id is not None:
             self.result_id = result_id
+        self.work_outcome = self.work_outcome or "cancelled"
+        self.commit_outcome = self.commit_outcome or "suppressed_shutdown"
+        self.speech_outcome = self.speech_outcome or "cancelled"
         self.state = "finalized"
         background_ms = (self._clock() - self._start) * 1000
         fields: dict[str, Any] = {

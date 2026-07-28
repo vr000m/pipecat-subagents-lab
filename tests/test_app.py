@@ -600,3 +600,42 @@ def test_create_app_preserves_the_supplied_hosts_measurement_sink() -> None:
     host = SessionHost(runner_factory=FakeRunner, measurement_sink=sink)
     create_app(host)
     assert host.measurement_sink is sink
+
+
+class TestLoguruStartupConfiguration:
+    """Importing server.app must disable Loguru's diagnose/backtrace rendering
+    process-wide, since the default sink otherwise prints every local
+    variable's value (transcripts, provider payloads, API keys) on any
+    traceback, including frames above the one that caught the exception."""
+
+    def test_default_sink_has_diagnose_and_backtrace_disabled(self) -> None:
+        from loguru import logger as loguru_logger
+
+        handlers = list(loguru_logger._core.handlers.values())
+        assert handlers, "server.app import must configure at least one Loguru sink"
+        for handler in handlers:
+            assert handler._exception_formatter._diagnose is False
+            assert handler._exception_formatter._backtrace is False
+
+    def test_configured_logger_does_not_leak_local_variable_values(self, capfd) -> None:
+        """Loguru's diagnose mode only annotates variables that appear in a
+        displayed traceback source line (e.g. a call argument), not every
+        local in the frame — so the repro must pass the secret as an
+        argument, matching how a transcript/result reaches a raising call.
+
+        The default sink is added at import time, before capsys can patch
+        sys.stderr, so it writes through the original file descriptor;
+        capfd (OS-level fd capture) is required to observe it."""
+        secret = "SUPER-SECRET-API-KEY-DO-NOT-LEAK"
+
+        def _boom(_value: str) -> None:
+            raise ValueError("boom")
+
+        try:
+            _boom(secret)
+        except ValueError:
+            app_module._loguru_logger.exception("failed")
+
+        captured = capfd.readouterr()
+        assert secret not in captured.err
+        assert secret not in captured.out

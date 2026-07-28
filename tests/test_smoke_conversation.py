@@ -11,7 +11,11 @@ so they stay deterministic and credential-free.
 
 import asyncio
 
-from scripts.smoke_conversation import ROUTING_REGRESSION_QUERIES, _run_routing_regression
+from scripts.smoke_conversation import (
+    ROUTING_REGRESSION_QUERIES,
+    _latest_turn_stage_metrics,
+    _run_routing_regression,
+)
 from server.config import Config
 from server.contracts import Citation, GroundedResult, RoutingDecision
 from server.perf_metrics import CollectingMeasurementSink
@@ -203,6 +207,72 @@ def test_direct_turn_between_delegated_turns_does_not_inherit_delegated_worker_i
         assert slow.worker_id == "worker-weather"
         assert fast.worker_id == "main"
         assert fast.text == "Quick direct answer."
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_direct_turn_stage_metrics_do_not_inherit_a_preceding_delegated_turns_search_ms() -> None:
+    """``_latest_turn_stage_metrics`` must select records by the caller's own
+    ``turn_id``, not the newest record of each kind, so a direct turn (which
+    emits no ``work_item_foreground`` record) never inherits the preceding
+    delegated turn's ``search_ms``/``total_ms``."""
+
+    async def run() -> None:
+        class DirectThenSlowCoordinator:
+            def __init__(self) -> None:
+                self.config = Config()
+                self.registry = type("Registry", (), {"workers": ()})()
+
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                if transcript == "search slowly":
+                    return type(
+                        "Outcome",
+                        (),
+                        {
+                            "kind": "routed",
+                            "decision": RoutingDecision(
+                                action="existing_worker",
+                                worker_id="worker-weather",
+                                worker_type="web_search",
+                                topic="weather",
+                                model_policy="deep",
+                                catalogue_version="catalogue-0",
+                            ),
+                            "prose": None,
+                            "transcript": transcript,
+                        },
+                    )()
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "routed",
+                        "decision": RoutingDecision(
+                            action="direct", catalogue_version="catalogue-0"
+                        ),
+                        "prose": "Quick direct answer.",
+                        "transcript": transcript,
+                    },
+                )()
+
+            def dispatch(self, _decision: object) -> object:
+                return _TimedWorker(0.2, "worker-weather")
+
+        sink = CollectingMeasurementSink()
+        host, connection = await _connected_host(DirectThenSlowCoordinator(), sink)
+
+        slow = await host._handle_transcript("search slowly", origin=connection)
+        fast = await host._handle_transcript("what is your name", origin=connection)
+
+        slow_metrics = _latest_turn_stage_metrics(sink, 0.0, slow.turn_id)
+        fast_metrics = _latest_turn_stage_metrics(sink, 0.0, fast.turn_id)
+
+        # The slow delegated turn actually searched, so it must report a
+        # nonzero search_ms; a leaking helper would make the direct turn
+        # report this same nonzero value instead of its own zero.
+        assert slow_metrics["search_ms"] > 0.0
+        assert fast_metrics["search_ms"] == 0.0
         await host.shutdown()
 
     asyncio.run(run())

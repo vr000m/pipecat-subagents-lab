@@ -51,6 +51,7 @@ from server.perf_metrics import (
     ConsoleMeasurementSink,
     PerfConnectionContext,
     PerfMetricError,
+    RetainedRecorder,
     attach_framework_observers,
     build_record,
     make_startup_timing_handlers,
@@ -446,6 +447,40 @@ class TestFormatterFieldSafety:
                 total_ms=1.0,
             )
 
+    def test_overlong_identifier_rejected(self) -> None:
+        with pytest.raises(PerfMetricError):
+            build_record(
+                "pipeline_startup",
+                session_id="s" * 129,
+                origin_epoch=1,
+                connection_worker="browser-1",
+                total_ms=1.0,
+            )
+
+    def test_identifier_at_maxlen_accepted(self) -> None:
+        record = build_record(
+            "pipeline_startup",
+            session_id="s" * 128,
+            origin_epoch=1,
+            connection_worker="browser-1",
+            total_ms=1.0,
+        )
+        assert "session_id=" in record.line
+
+    def test_overlong_function_name_rejected(self) -> None:
+        """function_name can originate from an LLM tool call, so an
+        adversarial/hallucinated over-length value must not reach the log line."""
+        with pytest.raises(PerfMetricError):
+            build_record(
+                "service_latency",
+                session_id="session-1",
+                origin_epoch=1,
+                connection_worker="browser-1",
+                metric_kind="function_calls",
+                value_ms=1.0,
+                function_name="f" * 129,
+            )
+
     def test_identifiers_with_spaces_and_equals_do_not_split_fields(self) -> None:
         """Identifiers are JSON-string encoded so `=` and spaces cannot inject fields."""
         record = build_record(
@@ -485,6 +520,28 @@ class TestFormatterFieldSafety:
                 direct_count=0,
                 unsupported_count=0,
                 completed_count=1,  # sums to 1, not 2
+                retained_count=0,
+                clarification_count=0,
+                declined_count=0,
+                failed_count=0,
+                cancelled_count=0,
+            )
+
+    def test_app_turn_foreground_zero_child_count_rejects_nonzero_counter(self) -> None:
+        """The child_count/counter sum check is unconditional: a zero-child
+        turn must carry every counter at zero."""
+        with pytest.raises(PerfMetricError):
+            build_record(
+                "app_turn_foreground",
+                session_id="session-1",
+                origin_epoch=1,
+                turn_id="turn-1",
+                outcome="direct",
+                total_ms=1.0,
+                child_count=0,
+                direct_count=1,
+                unsupported_count=0,
+                completed_count=0,
                 retained_count=0,
                 clarification_count=0,
                 declined_count=0,
@@ -781,3 +838,67 @@ class TestAttachFrameworkObservers:
             "on_latency_breakdown",
         ]
         assert turn_tracking_observer.registered == ["on_turn_started", "on_turn_ended"]
+
+
+class TestRetainedRecorderFinalizeDefaults:
+    """RetainedRecorder.finalize() must never construct an incomplete record.
+
+    ``work_outcome``, ``commit_outcome``, and ``speech_outcome`` are required
+    per EVENT_REGISTRY's ``work_item_background`` spec but are typed optional
+    on the recorder. finalize() must supply its own terminal defaults for any
+    still-unset field so shutdown-time (and any other) callers don't have to
+    hand-write fallback ``or`` expressions to avoid a silently swallowed
+    formatter error.
+    """
+
+    @staticmethod
+    def _recorder(sink: CollectingMeasurementSink) -> RetainedRecorder:
+        return RetainedRecorder(
+            sink,
+            session_id="session-1",
+            origin_epoch=1,
+            turn_id="turn-1",
+            work_item_id="work-1",
+            app_worker_id="worker-1",
+        )
+
+    def test_finalize_with_no_arguments_produces_a_complete_record(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        assert recorder.finalize() is True
+
+        record = sink.records[0]
+        assert record.fields["work_outcome"] == "cancelled"
+        assert record.fields["commit_outcome"] == "suppressed_shutdown"
+        assert record.fields["speech_outcome"] == "cancelled"
+        assert EVENT_REGISTRY["work_item_background"].by_name  # sanity: registry has the event
+
+    def test_finalize_fills_only_the_fields_left_unset(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+        recorder.claim("completed")
+        recorder.record_commit("committed", result_id="result-1")
+
+        assert recorder.finalize() is True
+
+        record = sink.records[0]
+        assert record.fields["work_outcome"] == "completed"
+        assert record.fields["commit_outcome"] == "committed"
+        assert record.fields["speech_outcome"] == "cancelled"
+        assert record.fields["result_id"] == "result-1"
+
+    def test_finalize_explicit_arguments_still_take_precedence_over_defaults(self) -> None:
+        sink = CollectingMeasurementSink()
+        recorder = self._recorder(sink)
+
+        assert recorder.finalize(
+            work_outcome="completed",
+            commit_outcome="suppressed_stale",
+            speech_outcome="not_applicable",
+        )
+
+        record = sink.records[0]
+        assert record.fields["work_outcome"] == "completed"
+        assert record.fields["commit_outcome"] == "suppressed_stale"
+        assert record.fields["speech_outcome"] == "not_applicable"

@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 
@@ -70,12 +70,24 @@ class SubmittedOutcome:
     failures: tuple[WorkItemFailure, ...] = ()
 
 
+FailureKind = Literal["capacity_rejected", "retention_rejected", "cancelled", "failed"]
+
+
 @dataclass(frozen=True)
 class WorkItemFailure:
     work_item_id: str
     worker_id: str
     error_type: str
     error_message: str
+    failure_kind: FailureKind
+    """Structured classification, set explicitly at each raise/catch site.
+
+    ``error_type`` remains free-text diagnostic (worker exception class name
+    or a hand-written sentinel) for anything else that consumes it, but
+    telemetry classification must read this field instead of pattern-matching
+    on ``error_type``, so renaming a worker exception class cannot silently
+    reclassify its outcome.
+    """
 
 
 @dataclass(frozen=True)
@@ -594,6 +606,7 @@ class WorkItemCoordinator:
                             worker_id=worker_id,
                             error_type="CapacityError",
                             error_message="worker execution capacity is exhausted",
+                            failure_kind="capacity_rejected",
                         )
                     )
                     continue
@@ -639,6 +652,7 @@ class WorkItemCoordinator:
                             worker_id=selected[index][0],
                             error_type="CancelledError",
                             error_message="worker execution was cancelled",
+                            failure_kind="cancelled",
                         )
                     )
                     continue
@@ -650,6 +664,7 @@ class WorkItemCoordinator:
                             worker_id=selected[index][0],
                             error_type=type(exception).__name__,
                             error_message="worker execution failed",
+                            failure_kind="failed",
                         )
                     )
             failures = tuple(capacity_failures) + tuple(execution_failures)
@@ -673,6 +688,7 @@ class WorkItemCoordinator:
                             worker_id=selected[index][0],
                             error_type="RetentionCapacityError",
                             error_message="worker execution could not continue in background",
+                            failure_kind="retention_rejected",
                         ),
                     )
             return SubmittedOutcome(work, results, tuple(pending_ids), failures)

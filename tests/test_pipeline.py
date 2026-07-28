@@ -1207,7 +1207,13 @@ def test_multi_intent_preserves_envelope_fallbacks_and_uses_submit() -> None:
             },
         )()
 
-        results = await host._handle_multi_intent(outcome, "", origin, "turn-compound")
+        results = await host._handle_multi_intent(
+            outcome,
+            "",
+            origin,
+            "turn-compound",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-compound"),
+        )
 
         assert [result.text for result in results] == [
             "Direct answer.",
@@ -1259,7 +1265,13 @@ def test_multi_intent_reclarification_preserves_the_original_pending_query() -> 
             {"work_items": ("Riga",), "pending_dialogue": pending},
         )()
 
-        await host._handle_multi_intent(outcome, "", origin, "turn-compound")
+        await host._handle_multi_intent(
+            outcome,
+            "",
+            origin,
+            "turn-compound",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-compound"),
+        )
 
         next_pending = coordinator.pending(host.state.session_id)
         assert next_pending is not None
@@ -2264,10 +2276,10 @@ def test_direct_response_emits_zero_child_app_turn_foreground() -> None:
         fields = parents[0].fields
         assert fields["outcome"] == "direct"
         assert fields["child_count"] == 0
-        assert fields["direct_count"] == 1
         assert all(
             fields[name] == 0
             for name in (
+                "direct_count",
                 "unsupported_count",
                 "completed_count",
                 "retained_count",
@@ -2312,7 +2324,7 @@ def test_unsupported_capability_emits_zero_child_app_turn_foreground() -> None:
         fields = _events(sink, "app_turn_foreground")[0].fields
         assert fields["outcome"] == "unsupported"
         assert fields["child_count"] == 0
-        assert fields["unsupported_count"] == 1
+        assert fields["unsupported_count"] == 0
         assert _events(sink, "work_item_foreground") == ()
         await host.shutdown()
 
@@ -2347,7 +2359,7 @@ def test_router_clarification_emits_clarify_outcome_with_zero_child() -> None:
         fields = _events(sink, "app_turn_foreground")[0].fields
         assert fields["outcome"] == "clarify"
         assert fields["child_count"] == 0
-        assert fields["clarification_count"] == 1
+        assert fields["clarification_count"] == 0
         assert _events(sink, "work_item_foreground") == ()
         await host.shutdown()
 
@@ -2818,7 +2830,13 @@ def test_multi_intent_mixed_outcomes_emit_one_child_per_item_and_mixed_parent() 
             },
         )()
 
-        results = await host._handle_multi_intent(outcome, "", origin, "turn-compound")
+        results = await host._handle_multi_intent(
+            outcome,
+            "",
+            origin,
+            "turn-compound",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-compound"),
+        )
 
         assert [result.text for result in results] == [
             "Direct answer.",
@@ -2887,7 +2905,13 @@ def test_multi_intent_all_completed_emits_completed_parent_and_all_completed_chi
             {"work_items": ("first item", "second item"), "pending_dialogue": None},
         )()
 
-        await host._handle_multi_intent(outcome, "", origin, "turn-all-complete")
+        await host._handle_multi_intent(
+            outcome,
+            "",
+            origin,
+            "turn-all-complete",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-all-complete"),
+        )
 
         parent = _events(sink, "app_turn_foreground")[0].fields
         assert parent["outcome"] == "completed"
@@ -2943,7 +2967,13 @@ def test_pending_search_submit_exception_still_emits_failed_parent() -> None:
         outcome = type("Outcome", (), {"pending_dialogue": pending, "work_items": ()})()
 
         with pytest.raises(RuntimeError, match="submit exploded"):
-            await host._handle_pending(outcome, "continue please", origin, "turn-pending-fail")
+            await host._handle_pending(
+                outcome,
+                "continue please",
+                origin,
+                "turn-pending-fail",
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending-fail"),
+            )
 
         parent = _events(sink, "app_turn_foreground")[0].fields
         assert parent["outcome"] == "failed"
@@ -3000,7 +3030,15 @@ def test_multi_intent_commit_exception_still_emits_failed_parent() -> None:
         host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
 
         with pytest.raises(RuntimeError, match="commit exploded"):
-            await host._handle_multi_intent(outcome, "", origin, "turn-multi-commit-fail")
+            await host._handle_multi_intent(
+                outcome,
+                "",
+                origin,
+                "turn-multi-commit-fail",
+                host._new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-multi-commit-fail"
+                ),
+            )
 
         parent = _events(sink, "app_turn_foreground")[0].fields
         assert parent["outcome"] == "failed"
@@ -3111,6 +3149,61 @@ def test_retained_completion_with_speech_emits_completed_committed_queued() -> N
         assert fields["commit_outcome"] == "committed"
         assert fields["speech_outcome"] == "queued"
         assert fields["work_item_id"] == "work-retained-ok"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retained_late_result_cancelled_during_speech_start_still_emits_background_record() -> None:
+    """A CancelledError delivered during the post-pop
+    ``await origin.scheduler.start_next()`` window inside ``_commit_late_result``
+    must not skip finalization: the recorder was already popped from the
+    registry above that await, so a skipped finalize would both drop the
+    ``work_item_background`` record and remove the shutdown-sweep backstop."""
+
+    async def run() -> None:
+        tts = FakeTTS()
+        sink = CollectingMeasurementSink()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts, measurement_sink=sink)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+
+        async def raising_start_next(work_item_id: str | None = None) -> object:
+            raise asyncio.CancelledError()
+
+        connection.scheduler.start_next = raising_start_next  # type: ignore[method-assign]
+
+        result = GroundedResult(
+            result_id="result-cancel-during-start",
+            worker_id="worker-search",
+            turn_id="turn-cancel-during-start",
+            text="Complete late answer",
+            spoken_text="Spoken late answer",
+            origin_epoch=1,
+        )
+        _register_dispatch_recorder(
+            host, "work-cancel-during-start", turn_id="turn-cancel-during-start"
+        )
+        late = LateResult(
+            work_item_id="work-cancel-during-start",
+            worker_id="worker-search",
+            result=result,
+            terminal_kind="completed",
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await host._commit_late_result(late, 1)
+
+        records = _background_records(sink)
+        assert len(records) == 1
+        fields = records[0].fields
+        assert fields["work_item_id"] == "work-cancel-during-start"
+        assert fields["work_outcome"] == "completed"
+        assert fields["commit_outcome"] == "committed"
+        # start_next raised before it could set "queued"; finalize's own
+        # terminal default fills the still-unset speech axis.
+        assert fields["speech_outcome"] == "cancelled"
+        assert "work-cancel-during-start" not in host._retained_recorders
         await host.shutdown()
 
     asyncio.run(run())
@@ -3515,6 +3608,91 @@ def test_retained_background_ms_spans_dispatch_to_completion_for_late_callbacks(
     asyncio.run(run())
 
 
+def test_search_with_timeout_registers_recorder_before_retention_captures_eager_completion() -> (
+    None
+):
+    """Finding 3 regression: the provisional recorder is now registered
+    before the coordinator call that could trigger the completion callback,
+    not after. A fake coordinator here fires ``on_complete`` eagerly --
+    synchronously inside ``retain_late_task``, standing in for whatever a
+    future refactor might do -- to prove the reordered call sequence still
+    finds the recorder in the registry. Under the old order (register after
+    retain_late_task), this would have found no recorder to pop, silently
+    dropped the work_item_background record, and then registered a recorder
+    for already-completed work that only shutdown would later finalize as an
+    incorrect ``cancelled``/``suppressed_shutdown``."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+
+        class EagerCoordinator:
+            def __init__(self) -> None:
+                self.search_task: asyncio.Task[object] | None = None
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                self.search_task = asyncio.ensure_future(operation)
+                return self.search_task
+
+            def retain_late_task(
+                self,
+                task: asyncio.Task[object],
+                *,
+                work_item_id: str,
+                worker_id: str,
+                on_complete: object = None,
+                on_late_terminal: object = None,
+            ) -> bool:
+                task.cancel()
+                if on_late_terminal is not None:
+                    on_late_terminal(work_item_id, "completed")
+                if on_complete is not None:
+                    result = GroundedResult(
+                        result_id="result-eager",
+                        worker_id=worker_id,
+                        turn_id="turn-eager",
+                        text="Eager result",
+                        spoken_text="Eager result",
+                        origin_epoch=1,
+                    )
+                    late = LateResult(
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        result=result,
+                        terminal_kind="completed",
+                    )
+                    self._callback = asyncio.ensure_future(on_complete(late))
+                return True
+
+        host.coordinator = EagerCoordinator()
+
+        async def never_completes(*_args: object, **_kwargs: object) -> GroundedResult:
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        execution = await host._search_with_timeout(
+            never_completes,
+            "query",
+            turn_id="turn-eager",
+            origin_epoch=1,
+            timeout=0.001,
+            worker_id="worker-search",
+            work_item_id="work-eager",
+        )
+        assert execution.status == "retained"
+
+        await host.coordinator._callback
+        await asyncio.gather(host.coordinator.search_task, return_exceptions=True)
+
+        assert "work-eager" not in host._retained_recorders
+        fields = _background_records(sink)[0].fields
+        assert fields["work_item_id"] == "work-eager"
+        assert fields["work_outcome"] == "completed"
+        assert fields["commit_outcome"] == "committed"
+
+    asyncio.run(run())
+
+
 def test_raising_sink_does_not_change_turn_result_or_speech_behavior() -> None:
     async def run() -> None:
         class RaisingSink:
@@ -3604,3 +3782,287 @@ def test_stale_latest_value_turn_metrics_cache_is_fully_removed() -> None:
         if needle in line
     ]
     assert offenders == [], f"legacy {needle} reference(s) found: {offenders}"
+
+
+class _DelegatingRegistry:
+    config = Config(max_work_items_per_turn=2)
+
+    @staticmethod
+    def catalogue() -> object:
+        return object()
+
+
+class _DelegatingRouter:
+    @staticmethod
+    def route_envelope(_text: str, _catalogue: object) -> object:
+        decision = type("Decision", (), {"action": "existing_worker"})()
+        return type("Envelope", (), {"decision": decision, "prose": None})()
+
+
+def test_cancelled_delegated_turn_emits_exactly_one_parent_event() -> None:
+    """A multi_intent turn cancelled inside the delegate must emit exactly one
+    ``app_turn_foreground`` record: ``_handle_transcript_impl`` and the
+    delegate share a single recorder, so the outer ``finalized`` guard sees
+    the same object the delegate already closed.
+    """
+
+    async def run() -> None:
+        worker = ResultWorker()
+        submit_started = asyncio.Event()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=_DelegatingRegistry(), router=_DelegatingRouter())
+
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "multi_intent",
+                        "decision": None,
+                        "work_items": ("first item", "second item"),
+                        "pending_dialogue": None,
+                    },
+                )()
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                submit_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        turn = asyncio.create_task(host._handle_transcript("do two things"))
+        await asyncio.wait_for(submit_started.wait(), timeout=2)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert parents[0].fields["outcome"] == "cancelled"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_delegated_turn_parent_carries_routing_ms_and_total_ms_including_routing() -> None:
+    """A delegated turn's parent event must carry the ``routing_ms`` measured
+    by ``_handle_transcript_impl``, and its ``total_ms`` must start at parent
+    turn_id allocation (before routing), per the plan's Timing Boundaries.
+    """
+
+    async def run() -> None:
+        worker = ResultWorker()
+        routing_delay_seconds = 0.05
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=_DelegatingRegistry(), router=_DelegatingRouter())
+
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                time.sleep(routing_delay_seconds)
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "multi_intent",
+                        "decision": None,
+                        "work_items": ("first item",),
+                        "pending_dialogue": None,
+                    },
+                )()
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("do one thing")
+
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        fields = parents[0].fields
+        routing_floor_ms = routing_delay_seconds * 1000 * 0.8
+        assert fields["routing_ms"] >= routing_floor_ms
+        assert fields["total_ms"] >= fields["routing_ms"]
+
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_uncaught_exception_in_handle_transcript_emits_one_failed_parent() -> None:
+    """A non-cancellation exception escaping ``_handle_transcript_impl`` must
+    still emit exactly one ``app_turn_foreground`` record with
+    ``outcome=failed``, matching the two delegate handlers.
+    """
+
+    async def run() -> None:
+        class DirectCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "routed",
+                        "decision": type("Decision", (), {"action": "direct"})(),
+                        "prose": "Here is a direct answer.",
+                        "transcript": transcript,
+                    },
+                )()
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=DirectCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        async def raising_commit_and_speak(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("commit exploded")
+
+        host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit exploded"):
+            await host._handle_transcript("what is 2+2")
+
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert parents[0].fields["outcome"] == "failed"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_router_resolved_direct_turn_reports_all_counters_zero() -> None:
+    """A router-resolved direct turn dispatches no child, so ``child_count``
+    and every category counter (including ``direct_count``) are zero while
+    ``outcome`` still names the category.
+    """
+
+    async def run() -> None:
+        class DirectCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "routed",
+                        "decision": type("Decision", (), {"action": "direct"})(),
+                        "prose": "Here is a direct answer.",
+                        "transcript": transcript,
+                    },
+                )()
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=DirectCoordinator(),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("what is 2+2")
+
+        fields = _events(sink, "app_turn_foreground")[0].fields
+        assert fields["outcome"] == "direct"
+        assert fields["child_count"] == 0
+        assert all(
+            fields[name] == 0
+            for name in (
+                "direct_count",
+                "unsupported_count",
+                "completed_count",
+                "retained_count",
+                "clarification_count",
+                "declined_count",
+                "failed_count",
+                "cancelled_count",
+            )
+        )
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("error_type", "failure_kind", "expected_outcome"),
+    [
+        ("CapacityError", "capacity_rejected", "capacity_rejected"),
+        ("RetentionCapacityError", "retention_rejected", "retention_rejected"),
+        ("CancelledError", "cancelled", "cancelled"),
+        ("ValueError", "failed", "failed"),
+        # A renamed/unrecognized exception class name must not change the
+        # classification: it is read from the explicit failure_kind field,
+        # never inferred by pattern-matching error_type against a sentinel.
+        ("SomeRenamedExceptionClassNotInAnySentinelList", "failed", "failed"),
+    ],
+)
+def test_failure_child_outcome_classifies_via_structured_failure_kind_not_error_type_name(
+    error_type: str, failure_kind: str, expected_outcome: str
+) -> None:
+    from server.work_item_coordinator import WorkItemFailure
+
+    failure = WorkItemFailure(
+        work_item_id="work-turn-0",
+        worker_id="worker-a",
+        error_type=error_type,
+        error_message="worker execution failed",
+        failure_kind=failure_kind,
+    )
+    assert SessionHost._failure_child_outcome(failure) == expected_outcome
+
+
+def test_routing_failure_logs_exception_type_without_traceback_or_message() -> None:
+    """Routing failures must log only the exception's class name. A traceback
+    (or the exception's own message) can carry provider payloads and secrets
+    into the console, so the handler uses ``logger.warning`` rather than
+    ``logger.exception``.
+    """
+
+    async def run() -> None:
+        secret = "sk-live-do-not-log-this"
+
+        class ExplodingCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                raise RuntimeError(f"provider rejected token {secret}")
+
+        records: list[object] = []
+        sink_id = pipeline_module.logger.add(lambda message: records.append(message.record))
+        try:
+            host = SessionHost(
+                runner_factory=LifecycleRunner,
+                coordinator=ExplodingCoordinator(),
+                measurement_sink=CollectingMeasurementSink(),
+            )
+            await host.connect(connection_handshake(host, 1))
+
+            result = await host._handle_transcript("what is 2+2")
+
+            assert result.text.startswith("Routing is temporarily unavailable")
+            routing_logs = [record for record in records if "Routing failed" in record["message"]]
+            assert len(routing_logs) == 1
+            entry = routing_logs[0]
+            assert entry["level"].name == "WARNING"
+            assert "RuntimeError" in entry["message"]
+            assert secret not in entry["message"]
+            assert entry["exception"] is None
+            await host.shutdown()
+        finally:
+            pipeline_module.logger.remove(sink_id)
+
+    asyncio.run(run())
