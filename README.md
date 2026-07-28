@@ -152,6 +152,7 @@ uv sync
 uv run pytest
 uv run ruff format --check .
 uv run ruff check .
+uv run mypy
 gitleaks git --no-banner --redact
 cd web
 bun install
@@ -159,6 +160,12 @@ bun run build
 bun test
 bun run lint
 ```
+
+`uv run mypy` enforces type checking per-module rather than repo-wide: the
+modules listed clean in `[tool.mypy]` are gated, the rest are reported but
+ignored until brought clean. `server/perf_metrics.py` is gated because it owns
+the closed `PERF_METRIC` vocabularies, where an unchecked string literal
+becomes a dropped telemetry record at runtime.
 
 Run `bun run build` before opening or serving `web/index.html`: `dist/` is
 intentionally ignored, while lint writes its bundle only to `/tmp`.
