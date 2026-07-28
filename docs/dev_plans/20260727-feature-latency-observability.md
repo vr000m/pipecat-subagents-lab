@@ -1114,6 +1114,21 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
   Codex adversarial review was skipped (out of Codex tokens); the
   review-gauntlet's remaining gates (deep-review, security-review) run
   in its place.
+- `skein:deep-review --verbose` (logic, security, architecture, docs
+  lenses) found 4 Important and 7 Minor findings, the most serious being
+  a dual-recorder-ownership bug independently confirmed by both the
+  logic and architecture lenses: `_handle_pending`/`_handle_multi_intent`
+  each constructed a second `AppTurnRecorder` for the same `turn_id`
+  instead of using the parent's, causing a duplicate `app_turn_foreground`
+  emission on cancellation and silently dropping `routing_ms`/understating
+  `total_ms` for delegated turns. Also found: `record_zero_child_outcome`
+  broke the plan's own `child_count` sum invariant with no waiver
+  recorded (resolved by dropping the zero-child counter increment,
+  option (a) — matches the plan as written); and a reproduced security
+  bug where Loguru's default `diagnose=True` leaked raw transcripts and
+  API keys into console tracebacks via this feature's new exception
+  handlers. All 11 findings fixed in c10a54b (467/467 tests passing, 23
+  new regression tests).
 
 ## Final Results
 
