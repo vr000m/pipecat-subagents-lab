@@ -89,6 +89,52 @@ messages.
 - Small WebRTC is the local transport. A future cloud deployment may add Daily
   behind the same session and browser protocol contracts.
 
+## Performance observability boundary
+
+`server/perf_metrics.py` owns one console-only `PERF_METRIC` contract with a
+closed event registry, safe formatting, and an injectable `MeasurementSink`.
+`SessionHost` holds one sink instance for its process lifetime
+(`ConsoleMeasurementSink` in production, `CollectingMeasurementSink` in tests
+and the smoke harness) and hands it to both framework observers and
+application recorders — there is no latest-value compatibility cache.
+
+Two independent producers share that one contract:
+
+- **Pipecat owns media timing.** Each browser connection's `PipelineWorker`
+  gets one `StartupTimingObserver`, one `UserBotLatencyObserver`, and handlers
+  registered on the worker's own default `turn_tracking_observer` (never a
+  second `TurnTrackingObserver`). `PipelineParams(enable_metrics=True)` lets
+  `UserBotLatencyObserver` emit a per-service breakdown for whatever
+  processors actually produced a `MetricsFrame`; missing values are omitted,
+  never zero-filled. Observer callback closures capture only an immutable
+  `PerfConnectionContext` (`session_id`, `origin_epoch`, `connection_worker`),
+  the sink, and the logger — never the host, runtime, worker, or RTVI
+  publisher — so a replaced connection's stale callbacks stay console-only and
+  collectible.
+- **The application owns semantic timing.** Routing, worker dispatch,
+  acknowledgement, commit, and retained background completion are not all
+  metric-emitting Pipecat service processors, so they get explicit monotonic
+  timers around the parent semantic turn (`app_turn_foreground`) and its child
+  work items (`work_item_foreground`, `work_item_background`). A provisional
+  `RetainedRecorder` is created at work-dispatch time, before the coordinator
+  callback that could claim it is registered; `SessionHost` owns a
+  process-lifetime registry of these recorders that survives connection
+  replacement and is telemetry-only — the existing `_known_work_items`/
+  `_cancelled_work_items` sets remain the sole behavioral authority for
+  cancellation and duplicate detection. A synchronous, telemetry-only
+  `on_late_terminal` hook on the coordinator classifies each retained task's
+  terminal kind (`completed`/`failed`/`cancelled`) before the coordinator's
+  shutdown guard can suppress its normal completion callback, so
+  `SessionHost.shutdown` can finalize any still-open recorder from its
+  claimed terminal kind and reached commit/speech stage after
+  `coordinator.shutdown()` settles outstanding work.
+
+Pipecat turn numbers (`pipecat_turn`) and application turn IDs (`turn_id`) are
+deliberately separate identifiers; a framework event omits `turn_id` rather
+than guess a mapping that overlap, interruption, or late background speech
+could make wrong. This stays console-only in v0.1.2: no RTVI projection,
+browser state, or persistence is added.
+
 ## Design boundaries
 
 - Server state is authoritative; browser SDK transcript callbacks and raw logs

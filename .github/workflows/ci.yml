@@ -32,6 +32,9 @@ jobs:
           uv run ruff format --check .
           uv run ruff check .
 
+      - name: Type-check Python
+        run: uv run mypy
+
       - name: Test Python
         run: uv run pytest
 

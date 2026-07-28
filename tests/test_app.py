@@ -1,15 +1,22 @@
 """HTTP entry-point tests for the local Small WebRTC server."""
 
 import asyncio
+import dataclasses
+import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
+from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 
 import server.app as app_module
-from server.contracts import GroundedResult
 from server.app import create_app
 from server.config import Config
+from server.contracts import GroundedResult
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
 from server.router import LazyRouterProvider, Router
@@ -58,7 +65,7 @@ class FakeRouterModel:
 
 
 class FakeSearchWorker:
-    capabilities = {"public_web": True}
+    capabilities: ClassVar[dict[str, bool]] = {"public_web": True}
 
     def __init__(self, worker_id: str) -> None:
         self.worker_id = worker_id
@@ -181,8 +188,20 @@ def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
     import uvicorn
 
     calls: list[dict[str, object]] = []
+    configured: list[bool] = []
+    configure_logging = app_module._configure_logging
+
+    def configure_logging_for_main() -> None:
+        configure_logging()
+        configured.append(True)
+
     monkeypatch.setattr(
         app_module, "load_config", lambda: Config(bind_host="127.0.0.2", bind_port=9000)
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_configure_logging",
+        configure_logging_for_main,
     )
     monkeypatch.setattr(
         uvicorn, "run", lambda target, **kwargs: calls.append({"target": target, **kwargs})
@@ -190,6 +209,7 @@ def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
 
     app_module.main()
 
+    assert configured == [True]
     assert calls == [{"target": "server.app:app", "host": "127.0.0.2", "port": 9000}]
 
 
@@ -308,3 +328,383 @@ def test_session_discovery_uses_configured_client_origin() -> None:
     with TestClient(create_app(host)) as client:
         response = client.get("/api/session", headers={"origin": "https://client.example.test"})
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Pipecat observer construction/wiring in _attach_connection.
+#
+# docs/dev_plans/20260727-feature-latency-observability.md requires: one
+# StartupTimingObserver and one UserBotLatencyObserver per connection,
+# enable_metrics=True, and the worker's *default* turn_tracking_observer used
+# once rather than a duplicate TurnTrackingObserver.
+# ---------------------------------------------------------------------------
+
+
+class RecordingFrameworkObserver:
+    """Stands in for StartupTimingObserver/UserBotLatencyObserver."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.handlers: dict[str, object] = {}
+
+    def event_handler(self, name: str):
+        def register(function: object) -> object:
+            self.handlers[name] = function
+            return function
+
+        return register
+
+
+class RecordingTurnTrackingObserver:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+
+    def event_handler(self, name: str):
+        def register(function: object) -> object:
+            self.handlers[name] = function
+            return function
+
+        return register
+
+
+class CapturingPipelineWorker:
+    """Fake PipelineWorker that records the kwargs app.py constructs it with."""
+
+    constructed: ClassVar[list["CapturingPipelineWorker"]] = []
+    turn_tracker_factory: ClassVar[Callable[[], object | None]] = RecordingTurnTrackingObserver
+
+    def __init__(self, pipeline: object, **kwargs: object) -> None:
+        self.pipeline = pipeline
+        self.kwargs = kwargs
+        self.observers = kwargs.get("observers")
+        self.params = kwargs.get("params")
+        self.turn_tracking_observer = type(self).turn_tracker_factory()
+        self.rtvi = FakeRTVIForApp()
+        type(self).constructed.append(self)
+
+    async def queue_frame(self, _frame: object) -> None:
+        pass
+
+
+class FakeRTVIForApp:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+
+    def event_handler(self, name: str):
+        def register(function: object) -> object:
+            self.handlers[name] = function
+            return function
+
+        return register
+
+    async def set_bot_ready(self) -> None:
+        pass
+
+
+class AsyncAddRunnerForApp:
+    def __init__(self) -> None:
+        self.added: list[object] = []
+
+    async def start(self) -> None:
+        pass
+
+    async def add_workers(self, *workers: object) -> None:
+        self.added.extend(workers)
+
+    async def stop(self) -> None:
+        pass
+
+
+class FakeTransportForApp:
+    def input(self) -> str:
+        return "input"
+
+    def output(self) -> str:
+        return "output"
+
+
+async def _attach_fake_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    host: SessionHost,
+    startup_observers: list[RecordingFrameworkObserver],
+    latency_observers: list[RecordingFrameworkObserver],
+    worker_class: type = CapturingPipelineWorker,
+) -> None:
+    monkeypatch.setattr(app_module, "SmallWebRTCTransport", lambda *_args: FakeTransportForApp())
+    monkeypatch.setattr(app_module, "SileroVADAnalyzer", lambda *, sample_rate: object())
+    monkeypatch.setattr(app_module, "VADProcessor", lambda *, vad_analyzer: object())
+    monkeypatch.setattr(app_module, "smart_turn_processor", lambda *, timeout_seconds: object())
+    monkeypatch.setattr(
+        app_module,
+        "FinalTurnTranscriptProcessor",
+        lambda callback, *, complete_grace_seconds: object(),
+    )
+    monkeypatch.setattr(app_module, "TransportParams", lambda **kwargs: kwargs)
+    monkeypatch.setattr(app_module, "PipelineParams", lambda **kwargs: kwargs)
+    monkeypatch.setattr(app_module, "Pipeline", lambda processors: processors)
+    monkeypatch.setattr(app_module, "PipelineWorker", worker_class)
+
+    def make_startup_observer(*args: object, **kwargs: object) -> RecordingFrameworkObserver:
+        observer = RecordingFrameworkObserver(*args, **kwargs)
+        startup_observers.append(observer)
+        return observer
+
+    def make_latency_observer(*args: object, **kwargs: object) -> RecordingFrameworkObserver:
+        observer = RecordingFrameworkObserver(*args, **kwargs)
+        latency_observers.append(observer)
+        return observer
+
+    monkeypatch.setattr(app_module, "StartupTimingObserver", make_startup_observer)
+    monkeypatch.setattr(app_module, "UserBotLatencyObserver", make_latency_observer)
+
+    await host.start()
+    await app_module._attach_connection(
+        host,
+        object(),
+        app_module.SnapshotHandshake(
+            session_id=host.state.session_id,
+            resume_token=host.state.resume_token,
+            proposed_epoch=1,
+            snapshot_sequence=0,
+        ),
+    )
+
+
+def test_attach_connection_constructs_one_startup_and_one_latency_observer_per_connection() -> None:
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        startup_observers: list[RecordingFrameworkObserver] = []
+        latency_observers: list[RecordingFrameworkObserver] = []
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=startup_observers,
+                latency_observers=latency_observers,
+            )
+        finally:
+            monkeypatch.undo()
+
+        assert len(startup_observers) == 1
+        assert len(latency_observers) == 1
+        assert len(CapturingPipelineWorker.constructed) == 1
+        worker = CapturingPipelineWorker.constructed[0]
+        assert worker.observers == [startup_observers[0], latency_observers[0]]
+
+    asyncio.run(run())
+
+
+def test_attach_connection_enables_pipecat_processor_metrics() -> None:
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch, host=host, startup_observers=[], latency_observers=[]
+            )
+        finally:
+            monkeypatch.undo()
+
+        worker = CapturingPipelineWorker.constructed[0]
+        assert worker.params["enable_metrics"] is True
+
+    asyncio.run(run())
+
+
+def test_attach_connection_suppresses_rtvi_metrics_messages_only() -> None:
+    """Console-only release: metrics stay on for the server, off over the wire."""
+
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch, host=host, startup_observers=[], latency_observers=[]
+            )
+        finally:
+            monkeypatch.undo()
+
+        worker = CapturingPipelineWorker.constructed[0]
+        assert worker.params["enable_metrics"] is True
+
+        captured = worker.kwargs["rtvi_observer_params"]
+        assert isinstance(captured, RTVIObserverParams)
+        assert captured.metrics_enabled is False
+
+        stock = RTVIObserverParams()
+        differing = {
+            field.name
+            for field in dataclasses.fields(RTVIObserverParams)
+            if getattr(captured, field.name) != getattr(stock, field.name)
+        }
+        assert differing == {"metrics_enabled"}
+
+    asyncio.run(run())
+
+
+def test_attach_connection_registers_handlers_on_the_workers_default_turn_tracker() -> None:
+    """No duplicate TurnTrackingObserver: handlers land on worker.turn_tracking_observer."""
+
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch, host=host, startup_observers=[], latency_observers=[]
+            )
+        finally:
+            monkeypatch.undo()
+
+        worker = CapturingPipelineWorker.constructed[0]
+        tracker = worker.turn_tracking_observer
+        assert isinstance(tracker, RecordingTurnTrackingObserver)
+        assert set(tracker.handlers) == {"on_turn_started", "on_turn_ended"}
+
+        # app.py must never import/construct a second TurnTrackingObserver of
+        # its own; it only ever reads worker.turn_tracking_observer.
+        assert "TurnTrackingObserver" not in dir(app_module) or not callable(
+            getattr(app_module, "TurnTrackingObserver", None)
+        )
+
+    asyncio.run(run())
+
+
+def test_attach_connection_registers_handlers_on_the_real_startup_and_latency_observers() -> None:
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        startup_observers: list[RecordingFrameworkObserver] = []
+        latency_observers: list[RecordingFrameworkObserver] = []
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=startup_observers,
+                latency_observers=latency_observers,
+            )
+        finally:
+            monkeypatch.undo()
+
+        assert set(startup_observers[0].handlers) == {
+            "on_startup_timing_report",
+            "on_transport_timing_report",
+        }
+        assert set(latency_observers[0].handlers) == {
+            "on_first_bot_speech_latency",
+            "on_latency_measured",
+            "on_latency_breakdown",
+        }
+
+    asyncio.run(run())
+
+
+def test_attach_connection_fails_clearly_when_default_turn_tracker_is_missing() -> None:
+    """Fail loudly if Pipecat's enabled-by-default turn tracker contract changes."""
+
+    class NoTurnTrackerWorker(CapturingPipelineWorker):
+        turn_tracker_factory = staticmethod(lambda: None)
+
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            with pytest.raises(RuntimeError, match="turn tracking observer"):
+                await _attach_fake_connection(
+                    monkeypatch,
+                    host=host,
+                    startup_observers=[],
+                    latency_observers=[],
+                    worker_class=NoTurnTrackerWorker,
+                )
+        finally:
+            monkeypatch.undo()
+
+    asyncio.run(run())
+
+
+def test_default_session_host_forwards_measurement_sink_keyword() -> None:
+    sink = object()
+    host = app_module._default_session_host(
+        router=Router(call=lambda *, transcript, catalogue: {}, config=Config()),
+        measurement_sink=sink,
+    )
+    assert host.measurement_sink is sink
+
+
+def test_session_host_defaults_measurement_sink_to_console_sink() -> None:
+    from server.perf_metrics import ConsoleMeasurementSink
+
+    host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+    assert isinstance(host.measurement_sink, ConsoleMeasurementSink)
+
+
+def test_create_app_preserves_the_supplied_hosts_measurement_sink() -> None:
+    sink = object()
+    host = SessionHost(runner_factory=FakeRunner, measurement_sink=sink)
+    create_app(host)
+    assert host.measurement_sink is sink
+
+
+class TestLoguruStartupConfiguration:
+    """The executable entrypoint must disable unsafe Loguru traceback rendering."""
+
+    def test_import_preserves_preexisting_handler(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+from loguru import logger
+
+handler_id = logger.add(lambda _message: None)
+import server.app
+
+assert handler_id in logger._core.handlers
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+    def test_configured_sink_has_diagnose_and_backtrace_disabled(self) -> None:
+        from loguru import logger as loguru_logger
+
+        app_module._configure_logging()
+        handlers = list(loguru_logger._core.handlers.values())
+        assert handlers, "the executable entrypoint must configure a Loguru sink"
+        for handler in handlers:
+            assert handler._exception_formatter._diagnose is False
+            assert handler._exception_formatter._backtrace is False
+
+    def test_configured_logger_does_not_leak_local_variable_values(self, capfd) -> None:
+        """Loguru's diagnose mode only annotates variables that appear in a
+        displayed traceback source line (e.g. a call argument), not every
+        local in the frame — so the repro must pass the secret as an
+        argument, matching how a transcript/result reaches a raising call.
+
+        The default sink is added by the entrypoint, before capsys can patch
+        sys.stderr, so it writes through the original file descriptor;
+        capfd (OS-level fd capture) is required to observe it."""
+        secret = "SUPER-SECRET-API-KEY-DO-NOT-LEAK"
+
+        def _boom(_value: str) -> None:
+            raise ValueError("boom")
+
+        try:
+            _boom(secret)
+        except ValueError:
+            app_module._loguru_logger.exception("failed")
+
+        captured = capfd.readouterr()
+        assert secret not in captured.err
+        assert secret not in captured.out

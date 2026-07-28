@@ -2,9 +2,9 @@
 
 import asyncio
 
+from server.contracts import DeliveryState
 from server.session_state import SessionState
 from server.speech_scheduler import SpeechScheduler
-from server.contracts import DeliveryState
 
 
 def enqueue(scheduler: SpeechScheduler, work_item_id: str, text: str):

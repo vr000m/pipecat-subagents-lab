@@ -12,7 +12,6 @@ import time
 from dataclasses import replace
 from typing import Any
 
-
 DEFAULT_QUERY = "What is the latest stable Pipecat release?"
 ROUTING_REGRESSION_QUERIES = (
     "Hi.",
@@ -20,6 +19,37 @@ ROUTING_REGRESSION_QUERIES = (
     "Could you tell me the weather in Helsinki today?",
 )
 RESULT_PREFIX = "SMOKE_RESULT="
+
+
+def _latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
+    """Read the given ``turn_id``'s correlated PERF_METRIC records.
+
+    Selecting by the caller's own ``turn_id`` (rather than the newest record
+    of each kind) is required so a turn that emits no ``work_item_foreground``
+    record -- any direct/unsupported/clarify router turn -- never silently
+    inherits a preceding delegated turn's ``search_ms``/``total_ms``.
+    """
+    turn_records = [
+        record
+        for record in sink.records
+        if record.event == "app_turn_foreground" and record.fields.get("turn_id") == turn_id
+    ]
+    if not turn_records:
+        raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
+    turn_record = turn_records[-1]
+    work_records = [
+        record
+        for record in sink.records
+        if record.event == "work_item_foreground" and record.fields.get("turn_id") == turn_id
+    ]
+    work_record = work_records[-1] if work_records else None
+    return {
+        "routing_ms": float(turn_record.fields.get("routing_ms", 0)),
+        "search_ms": float(work_record.fields.get("search_ms", 0)) if work_record else 0.0,
+        "total_ms": float(turn_record.fields.get("total_ms", elapsed_ms)),
+    }
+
+
 SAFE_FALLBACKS = {
     "Routing is temporarily unavailable. Please try that request again.",
     "The web search is temporarily unavailable.",
@@ -35,8 +65,10 @@ async def _run_child(
     routing_regression: bool,
 ) -> dict[str, Any]:
     from server.app import _default_session_host
+    from server.perf_metrics import CollectingMeasurementSink
 
-    host = _default_session_host()
+    sink = CollectingMeasurementSink()
+    host = _default_session_host(measurement_sink=sink)
     # The semantic smoke waits longer than the interactive foreground path so
     # it validates the final provider result rather than the background-work
     # acknowledgement. The total latency budget remains independently enforced.
@@ -69,6 +101,7 @@ async def _run_child(
             return await _run_routing_regression(
                 host,
                 connection,
+                sink,
                 max_latency_seconds=max_latency_seconds,
                 max_routing_seconds=max_routing_seconds,
             )
@@ -87,10 +120,10 @@ async def _run_child(
             raise RuntimeError("public-web smoke returned an invalid spoken projection")
         if not result.citations:
             raise RuntimeError("public-web smoke returned no normalized citations")
-        stage_metrics = dict(host.last_turn_metrics)
-        routing_ms = float(stage_metrics.get("routing_ms", 0))
-        search_ms = float(stage_metrics.get("search_ms", 0))
-        total_ms = float(stage_metrics.get("total_ms", elapsed_ms))
+        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+        routing_ms = stage_metrics["routing_ms"]
+        search_ms = stage_metrics["search_ms"]
+        total_ms = stage_metrics["total_ms"]
         if routing_ms > max_routing_seconds * 1000:
             raise RuntimeError(
                 f"routing exceeded {max_routing_seconds:.1f}s budget: {routing_ms:.1f}ms"
@@ -117,6 +150,7 @@ async def _run_child(
 async def _run_routing_regression(
     host: Any,
     connection: Any,
+    sink: Any,
     *,
     max_latency_seconds: float,
     max_routing_seconds: float,
@@ -144,9 +178,9 @@ async def _run_routing_regression(
                 raise RuntimeError("weather turn returned a routing/search fallback")
             if action not in {"new_worker", "existing_worker"}:
                 raise RuntimeError(f"weather turn used unexpected routing action: {action!r}")
-        stage_metrics = dict(host.last_turn_metrics)
-        routing_ms = float(stage_metrics.get("routing_ms", 0))
-        total_ms = float(stage_metrics.get("total_ms", elapsed_ms))
+        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+        routing_ms = stage_metrics["routing_ms"]
+        total_ms = stage_metrics["total_ms"]
         if routing_ms > max_routing_seconds * 1000:
             raise RuntimeError(
                 f"routing regression turn {index + 1} exceeded {max_routing_seconds:.1f}s "

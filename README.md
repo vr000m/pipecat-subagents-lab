@@ -152,6 +152,7 @@ uv sync
 uv run pytest
 uv run ruff format --check .
 uv run ruff check .
+uv run mypy
 gitleaks git --no-banner --redact
 cd web
 bun install
@@ -159,6 +160,14 @@ bun run build
 bun test
 bun run lint
 ```
+
+`uv run mypy` checks every module under `server/` by default, so a newly added
+file is type-gated without anyone remembering to opt it in. The explicit
+override list in `pyproject.toml` exempts the modules that still carry
+pre-existing errors; it is legacy debt to shrink, not a policy, and new code
+should never be added to it. `server/perf_metrics.py` is among the checked
+modules because it owns the closed `PERF_METRIC` vocabularies, where an
+unchecked string literal becomes a dropped telemetry record at runtime.
 
 Run `bun run build` before opening or serving `web/index.html`: `dist/` is
 intentionally ignored, while lint writes its bundle only to `/tmp`.
@@ -314,6 +323,68 @@ acceptance are environment-dependent. Report them separately from the
 credential-safe unit and integration tests. Any semantic protocol change found
 during verification must return to the earlier contract/runtime/browser phases;
 Phase 5 documentation does not silently change those contracts.
+
+## Performance telemetry (`PERF_METRIC`)
+
+Every performance record is one console line beginning `PERF_METRIC
+event=<name> schema=1`, defined in `server/perf_metrics.py`. Select all
+records with:
+
+```sh
+rg 'PERF_METRIC'
+```
+
+Narrow to one event, and further to one correlation ID, with:
+
+```sh
+rg 'PERF_METRIC event=user_bot_latency'
+rg 'PERF_METRIC event=work_item_foreground' | rg 'turn_id="turn-7"'
+```
+
+Framework-owned events come from Pipecat 1.6.0 observers attached to each
+browser connection's `PipelineWorker` — one `StartupTimingObserver`, one
+`UserBotLatencyObserver`, and handlers on the worker's own default
+`turn_tracking_observer` (no duplicate turn tracker is created):
+
+- `pipeline_startup`, `transport_ready` — processor and Small WebRTC
+  connection timing. `bot_connected_ms` is SFU-only and is omitted (never
+  zero-filled) under the Small WebRTC transport this app uses.
+- `pipecat_turn_start`, `pipecat_turn_end` — Pipecat's own conversation-turn
+  boundaries, identified only by `pipecat_turn`; this is not the application
+  `turn_id`.
+- `first_bot_speech_latency`, `user_bot_latency`, `service_latency` — speech
+  latency and, when `PipelineParams(enable_metrics=True)` and a processor
+  actually reports a `MetricsFrame`, its per-service breakdown
+  (`ttfb`/`text_aggregation`/`function_calls`/`user_turn_secs`). Missing
+  values are omitted, never invented as zero.
+
+Application-owned events measure routing, worker dispatch, and retained
+background completion outside the Pipecat frame graph:
+
+- `app_turn_foreground` — exactly one per accepted semantic turn, identified
+  by the application `turn_id` (never the Pipecat `pipecat_turn`). Reports a
+  closed `outcome` (`direct`/`unsupported`/`control`/`clarify`/`completed`/
+  `mixed`/`retained`/`declined`/`failed`/`cancelled`) plus exhaustive
+  `*_count` fan-out counters. A single-intent direct/unsupported/clarify
+  response resolved by the router attributes its own category counter without
+  dispatching (and so without counting toward) a child work item.
+- `work_item_foreground` — one per dispatched single- or multi-intent child,
+  carrying the parent `turn_id` and its own `work_item_id`.
+- `work_item_background` — one per registered retained work item, reporting
+  independent `work_outcome`/`commit_outcome`/`speech_outcome` axes so a
+  successful search whose result is suppressed or cannot be spoken is never
+  mislabeled as a failed search.
+
+Every producer emits through one `MeasurementSink` owned by `SessionHost` for
+its process lifetime: `ConsoleMeasurementSink` in production, and
+`CollectingMeasurementSink` (indexed by event, `turn_id`, and `work_item_id`)
+in tests and the smoke harness, injected via
+`_default_session_host(measurement_sink=...)`. `scripts/smoke_conversation.py`
+reads its correlated turn/child records straight off the collecting sink
+instead of a latest-value cache, so a preceding turn can never supply the
+current turn's budget values. No record ever contains transcript, prompt,
+response, citation, or credential content — this stays console-only and does
+not project into RTVI or browser state.
 
 ## Repository layout
 

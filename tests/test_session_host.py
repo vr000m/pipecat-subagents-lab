@@ -3,8 +3,10 @@
 import asyncio
 
 from server.contracts import DeliveryState, GroundedResult, WorkerState
+from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
+from server.work_item_coordinator import LateResult
 
 
 class FakeRunner:
@@ -205,3 +207,61 @@ def test_replacement_fences_new_epoch_before_old_shutdown_and_rejects_old_callba
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def test_shutdown_finalizes_retained_recorders_only_after_coordinator_shutdown_returns() -> None:
+    """SessionHost.shutdown() must let coordinator.shutdown() settle retained
+    work and its callback tasks first, and only then finalize any recorder
+    still open — never before or concurrently with the coordinator settling
+    (plan Architecture Decision: "Host owns retained finalization";
+    server/pipeline.py:1290 per the Files to Modify note for this test).
+    """
+
+    async def run() -> None:
+        order: list[str] = []
+
+        class SlowShutdownCoordinator:
+            async def shutdown(self) -> None:
+                order.append("coordinator-shutdown-start")
+                await asyncio.sleep(0.02)
+                order.append("coordinator-shutdown-end")
+
+        class OrderTrackingSink:
+            def __init__(self, inner: CollectingMeasurementSink) -> None:
+                self._inner = inner
+
+            def emit(self, record: object) -> None:
+                if getattr(record, "event", None) == "work_item_background":
+                    order.append("background-finalized")
+                self._inner.emit(record)
+
+        inner_sink = CollectingMeasurementSink()
+        host = SessionHost(
+            coordinator=SlowShutdownCoordinator(), measurement_sink=OrderTrackingSink(inner_sink)
+        )
+
+        # Register a retained work item the way the real timeout path does,
+        # so the host has an open recorder to finalize during shutdown.
+        host._known_work_items.add("work-open-at-shutdown")
+
+        await host.shutdown()
+
+        assert order[0] == "coordinator-shutdown-start"
+        assert "coordinator-shutdown-end" in order
+        end_index = order.index("coordinator-shutdown-end")
+        # Any host-side finalization of a still-open recorder must appear
+        # strictly after the coordinator's shutdown() call has returned.
+        assert all(
+            order.index(marker) > end_index for marker in order if marker == "background-finalized"
+        )
+
+    asyncio.run(run())
+
+
+def test_late_result_terminal_kind_field_is_backward_compatible_with_legacy_construction() -> None:
+    """Legacy call sites that construct LateResult without ``terminal_kind``
+    (e.g. this repo's own drain_late_results consumers) must keep working
+    after Phase 2 adds the field (plan: "backward-compatible structured
+    terminal_kind")."""
+    late = LateResult(work_item_id="work-1", worker_id="worker-1", result=None)
+    assert late.terminal_kind is None or isinstance(late.terminal_kind, str)

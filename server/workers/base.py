@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
+
+from loguru import logger
 
 try:  # Pipecat versions with distributed worker support can provide this class.
     from pipecat.processors.frameworks.llm_context import LLMContextWorker as _NativeWorker
@@ -20,6 +23,10 @@ class WorkerMetadata:
     topic_summary: str
     model_policy: str
     capabilities: dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.worker_id or not self.worker_id.strip():
+            raise ValueError("worker_id must not be empty")
 
 
 class ContextWorker(_NativeWorker):
@@ -48,11 +55,13 @@ class ContextWorker(_NativeWorker):
             if previous is not None:
                 try:
                     await previous
-                except BaseException:
-                    # A failed operation must not poison the durable mailbox for
-                    # every later submission. The failed task still propagates
-                    # to its own caller; later tasks may start a fresh run.
-                    pass
+                except BaseException:  # noqa: BLE001  # intentional catch-all: a failed
+                    # operation must not poison the durable mailbox for every later
+                    # submission. The failed task still propagates to its own caller;
+                    # later tasks may start a fresh run.
+                    logger.debug(
+                        f"{self.metadata.worker_id}: previous submission raised while awaiting tail"
+                    )
             self.status = "running"
             try:
                 value = operation()

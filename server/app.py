@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger as _loguru_logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.observers.startup_timing_observer import StartupTimingObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -30,18 +36,25 @@ from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
+from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
-from .rtvi_messages import RTVIMessagePublisher
 from .registry import WorkerRegistry
 from .router import LazyRouterProvider, Router
+from .rtvi_messages import RTVIMessagePublisher
 from .services.factory import create_stt, create_tts
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from .work_item_coordinator import WorkItemCoordinator
 
-
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _configure_logging() -> None:
+    """Disable Loguru's diagnose/backtrace rendering so tracebacks never dump
+    local variable values (transcripts, provider payloads, API keys) to logs."""
+    _loguru_logger.remove()
+    _loguru_logger.add(sys.stderr, backtrace=False, diagnose=False)
 
 
 class _SpeechCompletionProcessor(FrameProcessor):
@@ -190,15 +203,40 @@ async def _attach_connection(
             processors.extend(_tts_processors(host, runtime))
         processors.append(transport.output())
         task_manager = TaskManager(loop=asyncio.get_running_loop())
+        connection_worker_name = f"browser-{runtime.epoch}"
+        startup_observer = StartupTimingObserver()
+        latency_observer = UserBotLatencyObserver()
         worker = PipelineWorker(
             Pipeline(processors),
-            name=f"browser-{runtime.epoch}",
+            name=connection_worker_name,
             params=PipelineParams(
-                audio_in_sample_rate=16000, audio_out_sample_rate=output_sample_rate
+                audio_in_sample_rate=16000,
+                audio_out_sample_rate=output_sample_rate,
+                enable_metrics=True,
             ),
             enable_rtvi=True,
+            # enable_metrics=True feeds MetricsFrames to the RTVI observer, which
+            # defaults to forwarding them to the client. This release is console-only.
+            rtvi_observer_params=RTVIObserverParams(metrics_enabled=False),
             idle_timeout_secs=None,
             task_manager=task_manager,
+            observers=[startup_observer, latency_observer],
+        )
+        turn_tracking_observer = worker.turn_tracking_observer
+        if turn_tracking_observer is None:
+            raise RuntimeError(
+                "PipelineWorker did not construct its default turn tracking observer"
+            )
+        attach_framework_observers(
+            startup_observer=startup_observer,
+            latency_observer=latency_observer,
+            turn_tracking_observer=turn_tracking_observer,
+            context=PerfConnectionContext(
+                session_id=host.state.session_id,
+                origin_epoch=runtime.epoch,
+                connection_worker=connection_worker_name,
+            ),
+            sink=host.measurement_sink,
         )
     except BaseException:
         host.abort_connection(runtime)
@@ -286,6 +324,7 @@ def _default_session_host(
     *,
     router: Router | None = None,
     router_responses_factory: Callable[[], Any] | None = None,
+    measurement_sink: MeasurementSink | None = None,
 ) -> SessionHost:
     """Build the default host while keeping credentialed providers lazy."""
     config = load_config()
@@ -301,7 +340,13 @@ def _default_session_host(
     )
     stt = create_stt(config)
     tts = create_tts(config)
-    return SessionHost(registry=registry, stt=stt, tts=tts, coordinator=coordinator)
+    return SessionHost(
+        registry=registry,
+        stt=stt,
+        tts=tts,
+        coordinator=coordinator,
+        measurement_sink=measurement_sink,
+    )
 
 
 def create_app(
@@ -416,6 +461,7 @@ def main() -> None:
     """Serve the browser app using the validated bind configuration."""
     import uvicorn
 
+    _configure_logging()
     config = load_config()
     uvicorn.run("server.app:app", host=config.bind_host, port=config.bind_port)
 

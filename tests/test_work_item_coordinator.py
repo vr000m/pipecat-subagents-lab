@@ -351,6 +351,7 @@ def test_targeted_cancel_during_submit_preserves_completed_sibling() -> None:
                 worker_id="worker-a",
                 error_type="CancelledError",
                 error_message="worker execution was cancelled",
+                failure_kind="cancelled",
             ),
         )
         await coordinator.shutdown()
@@ -484,6 +485,35 @@ def test_immediate_worker_failure_is_retained_without_reordering_successes() -> 
         assert outcome.failures[0].worker_id == "worker-b"
         assert outcome.failures[0].error_type == "ValueError"
         assert outcome.failures[0].error_message == "worker execution failed"
+        assert outcome.failures[0].failure_kind == "failed"
+
+    asyncio.run(run())
+
+
+def test_worker_failure_classifies_via_failure_kind_regardless_of_exception_class_name() -> None:
+    """A worker exception whose class name matches no known sentinel string
+    must still classify as ``failed`` through the structured ``failure_kind``
+    field, not through pattern-matching ``error_type`` against a hardcoded
+    name list."""
+
+    class SomeRenamedExceptionClassNotInAnySentinelList(Exception):
+        pass
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2, wait_timeout_ms=100)
+
+        async def worker(worker_id: str, text: str) -> dict:
+            if text == "fail":
+                raise SomeRenamedExceptionClassNotInAnySentinelList("boom")
+            return {"text": text, "citations": []}
+
+        outcome = await coordinator.submit(
+            "turn-rename", [("worker-a", "fail"), ("worker-b", "ok")], worker
+        )
+
+        assert len(outcome.failures) == 1
+        assert outcome.failures[0].error_type == "SomeRenamedExceptionClassNotInAnySentinelList"
+        assert outcome.failures[0].failure_kind == "failed"
 
     asyncio.run(run())
 
@@ -831,5 +861,224 @@ def test_shutdown_cancels_active_submit_and_provider_tasks() -> None:
         assert coordinator._submission_tasks == set()
         assert coordinator._submit_tasks == set()
         assert coordinator._provider_tasks == set()
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------
+# Phase 2: structured LateResult.terminal_kind and the synchronous
+# on_late_terminal(work_item_id, terminal_kind) hook (plan's Retained
+# Branch and Race Matrix / "shared multi-intent callback identity").
+# --------------------------------------------------------------------------
+
+
+def test_late_result_terminal_kind_is_completed_for_a_normal_result() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        observed: list[object] = []
+
+        async def provider() -> dict:
+            return {"text": "answer", "citations": []}
+
+        task = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            task,
+            work_item_id="work-completed",
+            worker_id="worker-1",
+            on_complete=observed.append,
+        )
+        await task
+        await asyncio.sleep(0)
+
+        assert len(observed) == 1
+        assert observed[0].terminal_kind == "completed"
+        assert observed[0].error is None
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_late_result_terminal_kind_is_failed_for_a_raised_exception() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        observed: list[object] = []
+
+        async def provider() -> dict:
+            raise RuntimeError("provider exploded")
+
+        task = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            task,
+            work_item_id="work-failed",
+            worker_id="worker-1",
+            on_complete=observed.append,
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert len(observed) == 1
+        assert observed[0].terminal_kind == "failed"
+        assert observed[0].error is not None
+
+    asyncio.run(run())
+
+
+def test_late_result_terminal_kind_is_cancelled_for_a_cancelled_task() -> None:
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        observed: list[object] = []
+        started = asyncio.Event()
+
+        async def provider() -> dict:
+            started.set()
+            await asyncio.Future()
+
+        task = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            task,
+            work_item_id="work-cancelled",
+            worker_id="worker-1",
+            on_complete=observed.append,
+        )
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert len(observed) == 1
+        assert observed[0].terminal_kind == "cancelled"
+
+    asyncio.run(run())
+
+
+def test_on_late_terminal_hook_fires_synchronously_before_shutdown_suppresses_on_complete() -> None:
+    """The plan requires ``on_late_terminal`` to be invoked as the first
+    statement inside the completion callback, before the ``self._shutdown``
+    guard can suppress ``on_complete`` — so it must fire even when the
+    coordinator is shut down before the retained task's callback runs.
+    """
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        claimed: list[tuple[str, str]] = []
+        completed_calls: list[object] = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def provider() -> dict:
+            started.set()
+            await release.wait()
+            return {"text": "late", "citations": []}
+
+        task = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            task,
+            work_item_id="work-terminal-hook",
+            worker_id="worker-1",
+            on_complete=completed_calls.append,
+            on_late_terminal=lambda work_item_id, terminal_kind: claimed.append(
+                (work_item_id, terminal_kind)
+            ),
+        )
+        await started.wait()
+
+        # Flip the shutdown flag directly (rather than calling coordinator.shutdown(),
+        # which would cancel the still-running task before it can complete) so the
+        # completed() callback's `if self._shutdown: return` guard is exercised while
+        # the task still finishes normally.
+        coordinator._shutdown = True
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        assert claimed == [("work-terminal-hook", "completed")]
+        assert completed_calls == []
+
+    asyncio.run(run())
+
+
+def test_raising_on_late_terminal_hook_does_not_block_cleanup_or_on_complete() -> None:
+    """``on_late_terminal`` is telemetry-only: if the caller-supplied hook
+    raises, the completion callback must still discard the task from
+    bookkeeping and still deliver ``on_complete``/``LateResult`` — the hook
+    failing must never drop the worker's completed result or leak task state.
+    """
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        completed_calls: list[object] = []
+
+        async def provider() -> dict:
+            return {"text": "late", "citations": []}
+
+        def raising_hook(_work_item_id: str, _terminal_kind: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        task = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            task,
+            work_item_id="work-terminal-hook-raises",
+            worker_id="worker-1",
+            on_complete=completed_calls.append,
+            on_late_terminal=raising_hook,
+        )
+        await task
+        await asyncio.sleep(0)
+
+        assert task not in coordinator._late_tasks
+        assert task not in coordinator._background_task_order
+        assert len(completed_calls) == 1
+        assert completed_calls[0].work_item_id == "work-terminal-hook-raises"
+        assert completed_calls[0].worker_id == "worker-1"
+        assert completed_calls[0].terminal_kind == "completed"
+        assert completed_calls[0].result.text == "late"
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_shared_multi_intent_callback_receives_distinct_late_results_per_item() -> None:
+    """Multi-intent submission shares one ``on_late_complete`` callback across
+    every decomposed work item; each invocation must carry that item's own
+    identity and terminal kind, never a conflated/reused record.
+    """
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2, wait_timeout_ms=1)
+        observed: list[object] = []
+
+        async def slow_worker(worker_id: str, text: str) -> dict:
+            if worker_id == "worker-b":
+                raise RuntimeError("worker-b failed")
+            await asyncio.sleep(0.05)
+            return {"text": text, "citations": []}
+
+        outcome = await coordinator.submit(
+            "turn-shared",
+            [("worker-a", "first"), ("worker-b", "second")],
+            slow_worker,
+            on_late_complete=observed.append,
+            work_item_ids=["work-a", "work-b"],
+        )
+
+        assert set(outcome.pending_work_item_ids) | {f.work_item_id for f in outcome.failures} == {
+            "work-a",
+            "work-b",
+        }
+
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if len(observed) >= 1:
+                break
+
+        assert observed
+        for late in observed:
+            assert late.work_item_id in {"work-a", "work-b"}
+            if late.work_item_id == "work-b":
+                assert late.terminal_kind == "failed"
+            else:
+                assert late.terminal_kind == "completed"
+        assert len({id(late) for late in observed}) == len(observed)
+        await coordinator.shutdown()
 
     asyncio.run(run())

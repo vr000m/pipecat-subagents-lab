@@ -120,3 +120,33 @@ The next latency work should therefore instrument and reduce router/worker
 model time before changing the local speech defaults. Keep provider connection
 setup outside the per-turn path by preserving connection-local service
 instances for the lifetime of a browser epoch.
+
+## Recording future live runs — v0.1.2 `PERF_METRIC` telemetry
+
+The benchmark and smoke results above are the fixed pre-`PERF_METRIC` baseline
+and are not rewritten by later runs. v0.1.2 adds grep-friendly `PERF_METRIC`
+console telemetry (see `README.md`'s "Performance telemetry" section) that
+gives every accepted turn and retained background item a correlated duration
+without changing the router, search, speech, or benchmark harness behavior
+exercised above.
+
+To capture a live comparison sample against this baseline:
+
+1. Run the existing benchmark and smoke commands unchanged (see "Reproduce the
+   pre-merge checks" above); they still measure the same TTS/STT/routing/search
+   stages.
+2. Capture the server's stdout/stderr for the same run and extract the
+   relevant `PERF_METRIC` lines, for example:
+
+   ```sh
+   rg 'PERF_METRIC event=app_turn_foreground' server.log
+   rg 'PERF_METRIC event=work_item_foreground' server.log
+   rg 'PERF_METRIC event=work_item_background' server.log
+   ```
+
+3. Append a new, dated `## Live PERF_METRIC sample — <date>` section below this
+   one with the extracted `total_ms`, `routing_ms`, `search_ms`, and
+   `background_ms` values and the exact `rg` filters used. Do not edit the
+   `## Results` or `## Pre-merge baseline` sections above — they document what
+   was measured before this telemetry existed and remain the historical
+   comparison point.

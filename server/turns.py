@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from loguru import logger
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -72,7 +73,7 @@ class FinalTurnTranscriptProcessor(FrameProcessor):
             result = self._on_final(text)
             if inspect.isawaitable(result):
                 await result
-        except Exception:
+        except Exception:  # noqa: BLE001  # intentional catch-all: the caller-provided completion handler can raise arbitrary errors that must not crash turn dispatch
             logger.exception(f"{self}: failed to route completed user turn")
 
     async def _dispatch_with_slot(self, text: str) -> None:

@@ -10,13 +10,14 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal, get_args
+
+from loguru import logger
 
 from .config import Config
 from .contracts import RoutingDecision
 from .registry import WorkerRegistry
 from .router import Router, WorkerCatalogue, validate_decision
-
 
 _SEPARATE_REQUEST_VERBS = (
     r"search|find|look\s+up|check|show\s+me|tell\s+me|get|open|create|write|summarize"
@@ -69,12 +70,35 @@ class SubmittedOutcome:
     failures: tuple[WorkItemFailure, ...] = ()
 
 
+FailureKind = Literal["capacity_rejected", "retention_rejected", "cancelled", "failed"]
+FAILURE_KINDS: frozenset[str] = frozenset(get_args(FailureKind))
+
+TerminalKind = Literal["completed", "failed", "cancelled"]
+"""How a late background task finished, classified from the task itself.
+
+Deliberately declared here rather than imported from ``perf_metrics``: the
+coordinator knows nothing about telemetry vocabularies, and importing one
+would invert the dependency. A test pins this as a subset of the telemetry
+side's ``WORK_OUTCOMES``.
+"""
+TERMINAL_KINDS: frozenset[str] = frozenset(get_args(TerminalKind))
+
+
 @dataclass(frozen=True)
 class WorkItemFailure:
     work_item_id: str
     worker_id: str
     error_type: str
     error_message: str
+    failure_kind: FailureKind
+    """Structured classification, set explicitly at each raise/catch site.
+
+    ``error_type`` remains free-text diagnostic (worker exception class name
+    or a hand-written sentinel) for anything else that consumes it, but
+    telemetry classification must read this field instead of pattern-matching
+    on ``error_type``, so renaming a worker exception class cannot silently
+    reclassify its outcome.
+    """
 
 
 @dataclass(frozen=True)
@@ -83,6 +107,13 @@ class LateResult:
     worker_id: str
     result: Any = None
     error: str | None = None
+    terminal_kind: TerminalKind | None = None
+    """Structured completion class: ``completed``, ``failed``, or ``cancelled``.
+
+    Classified directly from the completed task, independent of ``error``'s
+    free-text content, so telemetry never has to infer cancellation from an
+    error string.
+    """
 
 
 @dataclass(frozen=True)
@@ -255,8 +286,17 @@ class WorkItemCoordinator:
         work_item_id: str,
         worker_id: str,
         on_complete: Callable[[LateResult], Any] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
     ) -> bool:
-        """Retain a timed-out task, returning false when shutdown rejects ownership."""
+        """Retain a timed-out task, returning false when shutdown rejects ownership.
+
+        ``on_late_terminal`` is a synchronous, telemetry-only hook invoked with
+        ``(work_item_id, terminal_kind)`` as the very first action inside the
+        completion callback, before the shutdown guard below can suppress
+        ``on_complete``. This lets a host-owned recorder observe every retained
+        task's terminal classification even when shutdown suppresses the normal
+        completion path.
+        """
         if self._shutdown:
             self._track_cancelling_task(task)
             return False
@@ -267,6 +307,20 @@ class WorkItemCoordinator:
         self._background_task_order.append(task)
 
         def completed(completed_task: asyncio.Task[Any]) -> None:
+            terminal_kind: TerminalKind
+            if completed_task.cancelled():
+                terminal_kind = "cancelled"
+            elif completed_task.exception() is not None:
+                terminal_kind = "failed"
+            else:
+                terminal_kind = "completed"
+            if on_late_terminal is not None:
+                try:
+                    on_late_terminal(work_item_id, terminal_kind)
+                except Exception:  # noqa: BLE001  # telemetry-only hook must never block task cleanup or result delivery
+                    logger.exception(
+                        f"on_late_terminal hook raised for {work_item_id} ({terminal_kind})"
+                    )
             self._discard_ordered_task(
                 completed_task,
                 self._late_tasks,
@@ -281,18 +335,21 @@ class WorkItemCoordinator:
                     work_item_id=work_item_id,
                     worker_id=worker_id,
                     error="CancelledError: worker task was cancelled",
+                    terminal_kind=terminal_kind,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # intentional catch-all: any worker task failure must surface as a LateResult, not crash the coordinator
                 late = LateResult(
                     work_item_id=work_item_id,
                     worker_id=worker_id,
                     error=f"{type(exc).__name__}: {exc}",
+                    terminal_kind=terminal_kind,
                 )
             else:
                 late = LateResult(
                     work_item_id=work_item_id,
                     worker_id=worker_id,
                     result=Result(**value) if isinstance(value, dict) else value,
+                    terminal_kind=terminal_kind,
                 )
             if on_complete is None:
                 self._late_results.append(late)
@@ -485,19 +542,27 @@ class WorkItemCoordinator:
         if self.registry is None:
             raise RuntimeError("dispatch requires a worker registry")
         validate_decision(decision, catalogue or self.registry.catalogue())
-        if decision.action == "new_worker":
-            worker = self.registry.get_or_create(
+        worker = (
+            self.registry.get_or_create(
                 topic=decision.topic or "",
                 worker_type=decision.worker_type or "",
                 model_policy=decision.model_policy or "",
             )
-        else:
-            worker = self.registry.get(decision.worker_id) if decision.worker_id else None
+            if decision.action == "new_worker"
+            else (self.registry.get(decision.worker_id) if decision.worker_id else None)
+        )
         if worker is None:
             return None
         if operation is None:
             return worker.worker
         return operation(worker.worker)
+
+    def _work_task_cleanup(self, item_id: str) -> Callable[[asyncio.Task[Any]], None]:
+        def completed(completed_task: asyncio.Task[Any]) -> None:
+            if self._work_tasks.get(item_id) is completed_task:
+                self._work_tasks.pop(item_id, None)
+
+        return completed
 
     async def submit(
         self,
@@ -507,6 +572,7 @@ class WorkItemCoordinator:
         *,
         on_late_complete: Callable[[LateResult], Any] | None = None,
         work_item_ids: list[str] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
     ) -> SubmittedOutcome:
         self._ensure_open()
         submission_task = asyncio.current_task()
@@ -535,8 +601,10 @@ class WorkItemCoordinator:
                         current = asyncio.current_task()
                         if current is not None and current.cancelling():
                             raise
-                    except Exception:
-                        pass
+                    except Exception:  # noqa: BLE001  # intentional catch-all: a failed prior tail task must not block the next queued task for this worker
+                        logger.debug(
+                            f"prior tail task for {worker_id} raised while awaiting shield"
+                        )
                 task = asyncio.create_task(worker(worker_id, text))
                 self._provider_tasks.add(task)
                 self._tails[worker_id] = task
@@ -558,6 +626,7 @@ class WorkItemCoordinator:
                             worker_id=worker_id,
                             error_type="CapacityError",
                             error_message="worker execution capacity is exhausted",
+                            failure_kind="capacity_rejected",
                         )
                     )
                     continue
@@ -565,13 +634,7 @@ class WorkItemCoordinator:
                 self._work_tasks[work[index].work_item_id] = task
                 self._submit_tasks.add(task)
                 task.add_done_callback(self._submit_tasks.discard)
-                task.add_done_callback(
-                    lambda completed, item_id=work[index].work_item_id: (
-                        self._work_tasks.pop(item_id, None)
-                        if self._work_tasks.get(item_id) is completed
-                        else None
-                    )
-                )
+                task.add_done_callback(self._work_task_cleanup(work[index].work_item_id))
             tasks = [task for _, task in indexed_tasks]
             try:
                 if tasks:
@@ -603,6 +666,7 @@ class WorkItemCoordinator:
                             worker_id=selected[index][0],
                             error_type="CancelledError",
                             error_message="worker execution was cancelled",
+                            failure_kind="cancelled",
                         )
                     )
                     continue
@@ -614,6 +678,7 @@ class WorkItemCoordinator:
                             worker_id=selected[index][0],
                             error_type=type(exception).__name__,
                             error_message="worker execution failed",
+                            failure_kind="failed",
                         )
                     )
             failures = tuple(capacity_failures) + tuple(execution_failures)
@@ -626,6 +691,7 @@ class WorkItemCoordinator:
                     work_item_id=work[index].work_item_id,
                     worker_id=selected[index][0],
                     on_complete=on_late_complete,
+                    on_late_terminal=on_late_terminal,
                 )
                 if accepted:
                     pending_ids.append(work[index].work_item_id)
@@ -634,8 +700,9 @@ class WorkItemCoordinator:
                         WorkItemFailure(
                             work_item_id=work[index].work_item_id,
                             worker_id=selected[index][0],
-                            error_type="CapacityError",
+                            error_type="RetentionCapacityError",
                             error_message="worker execution could not continue in background",
+                            failure_kind="retention_rejected",
                         ),
                     )
             return SubmittedOutcome(work, results, tuple(pending_ids), failures)

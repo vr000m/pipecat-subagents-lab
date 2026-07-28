@@ -6,16 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_CONTRACT = "v1.0"
@@ -166,7 +165,7 @@ def main() -> int:
     try:
         _wait_until_ready(process, base_url, args.startup_timeout)
         _verify_server(base_url)
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001  # intentional catch-all: must capture Ctrl-C/SystemExit too so the subprocess is always cleaned up, then re-raised below
         failure = exc
     finally:
         if process.poll() is None:

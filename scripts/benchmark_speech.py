@@ -11,19 +11,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import re
 import statistics
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from websockets.asyncio.client import connect
-
 from loguru import logger
+from websockets.asyncio.client import connect
 
 from server.config import ConfigError, load_config
 from server.services.stt import LocalSTT, STTEndpoint

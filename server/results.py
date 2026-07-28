@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from typing import Any
-from uuid import uuid4
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from .contracts import Citation, GroundedResult
 

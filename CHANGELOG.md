@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-28
+
+### Added
+
+- Grep-friendly `PERF_METRIC` console telemetry contract: one single-line
+  `key=value` record per event, with a stable event registry, closed outcome
+  enums, and unknown-field/unknown-event rejection.
+- Pipecat 1.6.0 `StartupTimingObserver` and `UserBotLatencyObserver` wired into
+  each browser connection's `PipelineWorker`, alongside the framework's default
+  `TurnTrackingObserver`, reporting pipeline startup, transport readiness,
+  Pipecat turn start/end, interruption, first-bot-speech latency, user-to-bot
+  latency, and available per-service metric breakdowns.
+- Application-owned foreground timing: one `app_turn_foreground` event per
+  accepted semantic turn and one `work_item_foreground` event per dispatched
+  child, covering direct, unsupported, control, clarification, decline,
+  completed, mixed, retained, and failed/cancelled outcomes across
+  `_handle_transcript_impl`, `_handle_pending`, and `_handle_multi_intent`.
+- Application-owned retained-work timing: one correlated `work_item_background`
+  terminal event per registered retained item, reporting independent
+  `work_outcome`, `commit_outcome`, and `speech_outcome` axes so a successful
+  search whose result is suppressed or cannot be spoken is not mislabeled as a
+  failed search.
+- Injectable measurement sink (`ConsoleMeasurementSink` production default,
+  `CollectingMeasurementSink` for tests and the paid smoke harness) owned once
+  by `SessionHost` for its process lifetime.
+
+### Changed
+
+- Migrate the paid conversation smoke harness off `SessionHost.last_turn_metrics`
+  onto an injected `CollectingMeasurementSink`, so a direct turn can no longer
+  inherit a preceding delegated turn's stale latency budget.
+- Adopt `mypy` in CI, gated on `server/perf_metrics.py`, `server/pipeline.py`,
+  and `server/work_item_coordinator.py`. The `PERF_METRIC` outcome vocabularies
+  are now `Literal`-alias-derived rather than hand-duplicated frozensets, so a
+  typo or future rename in an outcome literal fails CI instead of silently
+  dropping a metric in production.
+- Invert the `mypy` gate from an allowlist (`server.*` ignored by default,
+  three modules un-ignored) to a denylist (`server.*` checked by default, an
+  explicit legacy-debt list of the 12 modules with pre-existing errors
+  exempted). A newly added `server/*.py` file is now gated automatically
+  instead of silently unchecked. Behavior-neutral: `uv run mypy` output is
+  unchanged.
+
+### Fixed
+
+- Suppress RTVI metrics forwarding to the browser client
+  (`RTVIObserverParams(metrics_enabled=False)`); `enable_metrics=True` no
+  longer leaks `MetricsFrame`s over the wire protocol, closing a gap between
+  this feature's console-only scope and its actual behavior.
+- Revert `SessionHost`'s default `WorkItemCoordinator` construction; a bare
+  `SessionHost(...)` again leaves `coordinator=None` instead of silently
+  acquiring a router-less coordinator that would fail on non-control turns.
+- Classify work-item failures from the structured `failure_kind` field
+  instead of pattern-matching the free-text `error_type` (exception class
+  name), which could mislabel a worker exception merely named after a known
+  sentinel string.
+- Make `AppTurnRecorder.finalize` total: no argument combination (an empty
+  multi-intent fan-out, a control turn with no resolvable action) can latch
+  the recorder as finalized while silently skipping emission.
+- Give `AppTurnRecorder` ownership of its child `WorkItemRecorder`s: a parent
+  finalize now sweeps any child left open by a cancelled turn or a raising
+  commit/speak step, instead of under-reporting `child_count`.
+- Harden the multi-intent fan-in against a worker returning an unexpected
+  `turn_id` or `work_item_id`: the turn now degrades gracefully (partial
+  results still commit and speak; only the unattributable item drops, with a
+  warning) instead of the entire turn silently failing.
+- Validate `AppTurnRecorder.finalize`'s `outcome` and `WorkItemRecorder
+  .finalize`'s `outcome` against their closed vocabularies before emitting,
+  degrading an out-of-vocabulary value to `"failed"` instead of letting the
+  record drop silently inside `_safe_emit` after the recorder was already
+  latched finalized (no retry possible).
+- Classify `_failure_child_outcome` directly from `failure.failure_kind`
+  instead of a defensive `getattr` default, restoring the static type
+  guarantee `mypy` proves in `server.pipeline`; the runtime membership check
+  is kept, since the coordinator seam is untyped and a duck-typed caller can
+  still supply an off-domain kind.
+- Attribute the multi-intent fan-in's `work_item_foreground` record to the
+  actually-committed result on a duplicate `turn_id`, instead of the first
+  (discarded) one, so telemetry and committed content never diverge.
+- Decouple `AppTurnRecorder`'s child-outcome counting from the finalize
+  sweep's open-child tracking, so a caller-bug duplicate `work_item_id` no
+  longer leaves an emitted `work_item_foreground` record uncounted.
+- Split the control-turn acknowledgement text into two vocabulary-correct
+  lookup tables (`ControlAction`, `ControlOutcome`) instead of one table
+  keyed by their union with a mid-function variable reassignment.
+
 ## [0.1.1] - 2026-07-26
 
 ### Added
@@ -89,5 +175,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pre-push release gate.
 
 [Unreleased]: https://github.com/vr000m/pipecat-subagents-lab/commits/main
+[0.1.2]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.2
 [0.1.1]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vr000m/pipecat-subagents-lab/releases/tag/v0.1.0

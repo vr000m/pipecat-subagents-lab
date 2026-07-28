@@ -1,11 +1,13 @@
 """Direct, unsupported, and router-owned clarification use one tool-free call."""
 
+from typing import ClassVar
+
 from server.main_responder import MainResponder, MainResponse
 from server.results import ResultLog
 
 
 class FakeStructuredModel:
-    tools = []
+    tools: ClassVar[list[object]] = []
 
     def __init__(self, payload: dict) -> None:
         self.payload = payload
