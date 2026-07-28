@@ -26,6 +26,7 @@ import asyncio
 import dataclasses
 import math
 import shlex
+from typing import Any, get_args
 
 import pytest
 from loguru import logger as loguru_logger
@@ -46,19 +47,79 @@ from pipecat.observers.user_bot_latency_observer import (
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 
 from server.perf_metrics import (
+    APP_TURN_OUTCOMES,
+    COMMIT_OUTCOMES,
+    CONTROL_ACTIONS,
+    CONTROL_OUTCOMES,
     EVENT_REGISTRY,
+    METRIC_KINDS,
+    SPEECH_OUTCOMES,
+    WORK_ITEM_OUTCOMES,
+    WORK_OUTCOMES,
+    AppTurnOutcome,
     AppTurnRecorder,
     CollectingMeasurementSink,
+    CommitOutcome,
     ConsoleMeasurementSink,
+    ControlAction,
+    ControlOutcome,
+    MetricKind,
     PerfConnectionContext,
     PerfMetricError,
     RetainedRecorder,
+    SpeechOutcome,
+    WorkItemOutcome,
+    WorkOutcome,
     attach_framework_observers,
     build_record,
     make_startup_timing_handlers,
     make_turn_tracking_handlers,
     make_user_bot_latency_handlers,
 )
+
+# The alias is the single source of truth; the frozenset is derived from it.
+# Each pair is asserted identical so a member added to only one side fails
+# loudly instead of silently splitting static and runtime vocabularies.
+_ALIAS_TO_FROZENSET = (
+    (MetricKind, METRIC_KINDS),
+    (AppTurnOutcome, APP_TURN_OUTCOMES),
+    (ControlAction, CONTROL_ACTIONS),
+    (ControlOutcome, CONTROL_OUTCOMES),
+    (WorkItemOutcome, WORK_ITEM_OUTCOMES),
+    (WorkOutcome, WORK_OUTCOMES),
+    (CommitOutcome, COMMIT_OUTCOMES),
+    (SpeechOutcome, SPEECH_OUTCOMES),
+)
+
+# Every ``enum`` field in the closed registry, mapped to the vocabulary it is
+# contractually supposed to carry. Catches a copy-paste that wires the wrong
+# frozenset onto a field.
+_ENUM_FIELD_VOCABULARY = {
+    ("service_latency", "metric_kind"): METRIC_KINDS,
+    ("app_turn_foreground", "outcome"): APP_TURN_OUTCOMES,
+    ("app_turn_foreground", "control_action"): CONTROL_ACTIONS,
+    ("app_turn_foreground", "control_outcome"): CONTROL_OUTCOMES,
+    ("work_item_foreground", "outcome"): WORK_ITEM_OUTCOMES,
+    ("work_item_background", "work_outcome"): WORK_OUTCOMES,
+    ("work_item_background", "commit_outcome"): COMMIT_OUTCOMES,
+    ("work_item_background", "speech_outcome"): SPEECH_OUTCOMES,
+}
+
+
+@pytest.mark.parametrize(("alias", "vocabulary"), _ALIAS_TO_FROZENSET)
+def test_each_frozenset_matches_its_literal_alias(alias: Any, vocabulary: frozenset[str]) -> None:
+    assert frozenset(get_args(alias)) == vocabulary
+
+
+def test_every_registry_enum_field_is_bound_to_its_intended_vocabulary() -> None:
+    bound = {
+        (event, spec_field.name): spec_field.enum_values
+        for event, spec in EVENT_REGISTRY.items()
+        for spec_field in (*spec.required, *spec.optional)
+        if spec_field.kind == "enum"
+    }
+    assert bound == _ENUM_FIELD_VOCABULARY
+
 
 # ---------------------------------------------------------------------------
 # Verified Starting Facts: exact locked Pipecat 1.6.0 observer contract.

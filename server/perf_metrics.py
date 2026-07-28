@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, get_args
 
 from loguru import logger
 
@@ -68,64 +68,74 @@ def _enum(name: str, values: frozenset[str]) -> FieldSpec:
     return FieldSpec(name, "enum", enum_values=values)
 
 
-METRIC_KINDS = frozenset({"ttfb", "text_aggregation", "function_calls", "user_turn_secs"})
+# Each closed vocabulary is declared once as a ``Literal`` alias and its
+# runtime frozenset is derived from that alias, so a member can never exist
+# statically without also being accepted at runtime (or the reverse).
 
-APP_TURN_OUTCOMES = frozenset(
-    {
-        "direct",
-        "unsupported",
-        "control",
-        "clarify",
-        "completed",
-        "mixed",
-        "retained",
-        "declined",
-        "failed",
-        "cancelled",
-    }
-)
-CONTROL_ACTIONS = frozenset({"pause", "resume", "cancel", "stop", "consent"})
-CONTROL_OUTCOMES = frozenset({"applied", "unknown_target", "no_active", "no_pending"})
-WORK_ITEM_OUTCOMES = frozenset(
-    {
-        "direct",
-        "unsupported",
-        "completed",
-        "retained",
-        "clarify",
-        "declined",
-        "failed",
-        "cancelled",
-        "missing_worker",
-        "missing_search",
-        "capacity_rejected",
-        "retention_rejected",
-    }
-)
-WORK_OUTCOMES = frozenset({"completed", "failed", "cancelled", "invalid_result"})
-COMMIT_OUTCOMES = frozenset(
-    {
-        "committed",
-        "not_applicable",
-        "suppressed_cancelled",
-        "suppressed_stale",
-        "suppressed_duplicate",
-        "suppressed_shutdown",
-        "failed",
-    }
-)
-SPEECH_OUTCOMES = frozenset(
-    {
-        "queued",
-        "no_tts",
-        "disconnected",
-        "stale_connection",
-        "cancelled",
-        "not_applicable",
-        "enqueue_failed",
-        "start_failed",
-    }
-)
+MetricKind = Literal["ttfb", "text_aggregation", "function_calls", "user_turn_secs"]
+METRIC_KINDS: frozenset[str] = frozenset(get_args(MetricKind))
+
+AppTurnOutcome = Literal[
+    "direct",
+    "unsupported",
+    "control",
+    "clarify",
+    "completed",
+    "mixed",
+    "retained",
+    "declined",
+    "failed",
+    "cancelled",
+]
+APP_TURN_OUTCOMES: frozenset[str] = frozenset(get_args(AppTurnOutcome))
+
+ControlAction = Literal["pause", "resume", "cancel", "stop", "consent"]
+CONTROL_ACTIONS: frozenset[str] = frozenset(get_args(ControlAction))
+
+ControlOutcome = Literal["applied", "unknown_target", "no_active", "no_pending"]
+CONTROL_OUTCOMES: frozenset[str] = frozenset(get_args(ControlOutcome))
+
+WorkItemOutcome = Literal[
+    "direct",
+    "unsupported",
+    "completed",
+    "retained",
+    "clarify",
+    "declined",
+    "failed",
+    "cancelled",
+    "missing_worker",
+    "missing_search",
+    "capacity_rejected",
+    "retention_rejected",
+]
+WORK_ITEM_OUTCOMES: frozenset[str] = frozenset(get_args(WorkItemOutcome))
+
+WorkOutcome = Literal["completed", "failed", "cancelled", "invalid_result"]
+WORK_OUTCOMES: frozenset[str] = frozenset(get_args(WorkOutcome))
+
+CommitOutcome = Literal[
+    "committed",
+    "not_applicable",
+    "suppressed_cancelled",
+    "suppressed_stale",
+    "suppressed_duplicate",
+    "suppressed_shutdown",
+    "failed",
+]
+COMMIT_OUTCOMES: frozenset[str] = frozenset(get_args(CommitOutcome))
+
+SpeechOutcome = Literal[
+    "queued",
+    "no_tts",
+    "disconnected",
+    "stale_connection",
+    "cancelled",
+    "not_applicable",
+    "enqueue_failed",
+    "start_failed",
+]
+SPEECH_OUTCOMES: frozenset[str] = frozenset(get_args(SpeechOutcome))
 
 _APP_TURN_COUNTER_FIELDS = (
     "direct_count",
