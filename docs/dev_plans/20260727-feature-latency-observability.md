@@ -1099,7 +1099,17 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
 
 ## Issues & Solutions
 
-- (append implementation issues and resolutions here)
+- `/code-review -xhigh` on the landed Phase 1-3 diff found three
+  exactly-once telemetry gaps: `_handle_pending`/`_handle_multi_intent`
+  could exit via exception without finalizing `app_turn_foreground`;
+  `on_late_terminal` was unguarded inside the coordinator's task
+  done-callback, so a raising hook could drop `on_complete` delivery
+  entirely; and `_commit_late_result`'s on-the-spot fallback recorder
+  construction made `background_ms` report near-zero. Fixed in 9f9f234
+  with regression tests (444/444 passing). Five lower-severity findings
+  (an empty-`app_worker_id` validation gap, and four
+  efficiency/duplication findings in `_handle_multi_intent`/
+  `_commit_late_result`/`perf_metrics.py`) were deferred, not fixed.
 
 ## Final Results
 
