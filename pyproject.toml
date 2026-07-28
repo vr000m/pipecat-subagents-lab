@@ -27,24 +27,34 @@ testpaths = ["tests"]
 target-version = "py312"
 line-length = 100
 
-# Type checking is enforced per-module, not repo-wide. The rest of server/
-# carries pre-existing errors (mostly Optional narrowing and untyped
-# third-party seams) that are out of scope to fix here, so a repo-wide gate
-# would be red on day one. The modules listed in the second override below
-# check clean and are gated; everything else is reported-but-ignored until it
-# is brought clean and moved up.
+# Type checking is fail-closed: every module under server/ is checked by
+# default, so a newly added file is gated automatically. The modules listed in
+# the override below carry pre-existing errors (mostly Optional narrowing and
+# untyped third-party seams) that are out of scope to fix here; that list is
+# legacy debt to be burnt down, not policy. Shrink it as modules are brought
+# clean; never extend it for new code.
 [tool.mypy]
 python_version = "3.12"
 files = ["server"]
 ignore_missing_imports = true
 
+# Legacy debt: pre-existing errors, exempted until fixed. Do not add new entries.
 [[tool.mypy.overrides]]
-module = "server.*"
+module = [
+    "server.app",
+    "server.config",
+    "server.interruptions",
+    "server.main_responder",
+    "server.observers",
+    "server.registry",
+    "server.results",
+    "server.router",
+    "server.rtvi_messages",
+    "server.services.stt",
+    "server.services.tts",
+    "server.speech_scheduler",
+]
 ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = ["server.perf_metrics", "server.pipeline", "server.work_item_coordinator"]
-ignore_errors = false
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]

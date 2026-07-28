@@ -161,11 +161,13 @@ bun test
 bun run lint
 ```
 
-`uv run mypy` enforces type checking per-module rather than repo-wide: the
-modules listed clean in `[tool.mypy]` are gated, the rest are reported but
-ignored until brought clean. `server/perf_metrics.py` is gated because it owns
-the closed `PERF_METRIC` vocabularies, where an unchecked string literal
-becomes a dropped telemetry record at runtime.
+`uv run mypy` checks every module under `server/` by default, so a newly added
+file is type-gated without anyone remembering to opt it in. The explicit
+override list in `pyproject.toml` exempts the modules that still carry
+pre-existing errors; it is legacy debt to shrink, not a policy, and new code
+should never be added to it. `server/perf_metrics.py` is among the checked
+modules because it owns the closed `PERF_METRIC` vocabularies, where an
+unchecked string literal becomes a dropped telemetry record at runtime.
 
 Run `bun run build` before opening or serving `web/index.html`: `dist/` is
 intentionally ignored, while lint writes its bundle only to `/tmp`.
