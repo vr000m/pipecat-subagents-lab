@@ -72,6 +72,16 @@ else:  # pragma: no cover
     _ProbeBus = None
 
 
+_CONTROL_ACK_TEXT: dict[str | None, str] = {
+    "pause": "Pausing the active response.",
+    "resume": "Resuming the paused response.",
+    "cancel": "Cancelling the active response.",
+    "stop": "Stopping the active response.",
+    "unknown_target": "I could not find that active work item.",
+    "no_active": "There is no active response to cancel.",
+}
+
+
 def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
     """Construct the pinned framework bridge with connection-local output frames."""
     if getattr(BusBridgeProcessor, "framework_fallback", False):
@@ -400,13 +410,12 @@ class SessionHost:
 
             registration = asyncio.create_task(register())
             self._runner_registrations[worker_id] = registration
-            registration.add_done_callback(
-                lambda completed, registered_id=worker_id: (
-                    self._runner_registrations.pop(registered_id, None)
-                    if self._runner_registrations.get(registered_id) is completed
-                    else None
-                )
-            )
+
+            def completed(completed_task: asyncio.Task[Any]) -> None:
+                if self._runner_registrations.get(worker_id) is completed_task:
+                    self._runner_registrations.pop(worker_id, None)
+
+            registration.add_done_callback(completed)
         await asyncio.shield(registration)
 
     async def connect(self, handshake: Any) -> ConnectionPipeline:
@@ -715,14 +724,7 @@ class SessionHost:
                             control_outcome = "applied"
                     elif action == "consent":
                         control_outcome = "no_pending"
-                    text = {
-                        "pause": "Pausing the active response.",
-                        "resume": "Resuming the paused response.",
-                        "cancel": "Cancelling the active response.",
-                        "stop": "Stopping the active response.",
-                        "unknown_target": "I could not find that active work item.",
-                        "no_active": "There is no active response to cancel.",
-                    }.get(action, "Control request noted.")
+                    text = _CONTROL_ACK_TEXT.get(action, "Control request noted.")
                 elif outcome.kind == "multi_intent":
                     return await self._handle_multi_intent(
                         outcome, transcript, origin, turn_id, turn_recorder
@@ -1174,11 +1176,8 @@ class SessionHost:
                     return result
                 except WorkerClarify as exc:
                     outcome_labels[item_index] = "clarify"
-                    original_query = (
-                        contexts[item_index].original_query
-                        if contexts[item_index] is not None
-                        else query
-                    )
+                    context = contexts[item_index]
+                    original_query = context.original_query if context is not None else query
                     return self._worker_clarification_result(
                         worker_id=worker_id,
                         turn_id=item_turn_id,
@@ -1228,13 +1227,14 @@ class SessionHost:
             }
             attributed_indexes: set[int] = set()
             for result in submitted.results:
-                index = index_for_item_turn_id.get(result.turn_id)
-                if index is None:
+                matched = index_for_item_turn_id.get(result.turn_id)
+                if matched is None:
                     logger.warning(
                         f"multi-intent fan-in for {turn_id}: dropping a result whose "
                         f"turn_id does not match any dispatched work item"
                     )
                     continue
+                index = matched
                 # Content attribution stays last-wins on a duplicate; only the
                 # child's terminal record is emitted once.
                 results[index] = result
@@ -1252,13 +1252,14 @@ class SessionHost:
                     result_id=result.result_id,
                 )
             for work_item_id in submitted.pending_work_item_ids:
-                item_index = index_for_work_item_id.get(work_item_id)
-                if item_index is None:
+                matched = index_for_work_item_id.get(work_item_id)
+                if matched is None:
                     logger.warning(
                         f"multi-intent fan-in for {turn_id}: dropping a pending work_item_id "
                         f"that does not match any dispatched work item"
                     )
                     continue
+                item_index = matched
                 worker_id = index_to_worker_id[item_index][0]
                 results[item_index] = canonical_result(
                     worker_id=worker_id,
@@ -1271,13 +1272,14 @@ class SessionHost:
                 if recorder is not None:
                     self._register_retained_recorder_if_open(work_item_id, recorder)
             for failure in submitted.failures:
-                item_index = index_for_work_item_id.get(failure.work_item_id)
-                if item_index is None:
+                matched = index_for_work_item_id.get(failure.work_item_id)
+                if matched is None:
                     logger.warning(
                         f"multi-intent fan-in for {turn_id}: dropping a failure whose "
                         f"work_item_id does not match any dispatched work item"
                     )
                     continue
+                item_index = matched
                 results[item_index] = canonical_result(
                     worker_id=failure.worker_id,
                     turn_id=f"{turn_id}-{item_index}",
@@ -1507,6 +1509,7 @@ class SessionHost:
                             )
                         )
                     origin = self.connection
+                    speakable: ConnectionPipeline | None = None
                     if origin is None:
                         speech_outcome = "disconnected"
                     elif origin.tts is None:
@@ -1519,11 +1522,12 @@ class SessionHost:
                         speech_outcome = "stale_connection"
                     else:
                         speech_outcome = None
+                        speakable = origin
                     work_outcome, commit_outcome = "completed", "committed"
                     result_id = result.result_id
-                    if speech_outcome is None:
+                    if speakable is not None:
                         try:
-                            origin.scheduler.enqueue(
+                            speakable.scheduler.enqueue(
                                 result_id=result.result_id,
                                 work_item_id=late.work_item_id,
                                 run_id=f"run-{result.turn_id}",
@@ -1535,7 +1539,7 @@ class SessionHost:
                             pending_exception = exc
                         else:
                             try:
-                                await origin.scheduler.start_next()
+                                await speakable.scheduler.start_next()
                             except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
                                 speech_outcome = "start_failed"
                                 pending_exception = exc
@@ -1570,7 +1574,9 @@ class SessionHost:
                 **candidate,
             )
 
-    async def _commit_and_speak(self, result: GroundedResult, origin: Any) -> GroundedResult:
+    async def _commit_and_speak(
+        self, result: GroundedResult, origin: ConnectionPipeline
+    ) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""
         origin_epoch = result.origin_epoch
         work_item_id = f"work-{result.turn_id}"
@@ -1702,7 +1708,11 @@ class SessionHost:
         worker_id = getattr(metadata, "worker_id", None)
         topic = getattr(metadata, "topic", None)
         model_policy = getattr(metadata, "model_policy", None)
-        if not all(isinstance(value, str) and value for value in (worker_id, topic, model_policy)):
+        if (
+            not (isinstance(worker_id, str) and worker_id)
+            or not (isinstance(topic, str) and topic)
+            or not (isinstance(model_policy, str) and model_policy)
+        ):
             return
         previous = self.state.workers.get(worker_id)
         self.state.set_worker(
@@ -1722,7 +1732,7 @@ class SessionHost:
             )
         )
 
-    def accepts(self, epoch: int) -> bool:
+    def accepts(self, epoch: int | None) -> bool:
         return (
             not self._closing
             and self.arbiter.accepts(epoch)
