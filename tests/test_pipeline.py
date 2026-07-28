@@ -4414,3 +4414,201 @@ def test_pending_turn_cancelled_mid_submit_sweeps_the_child_as_cancelled() -> No
         await host.shutdown()
 
     asyncio.run(run())
+
+
+class _FanInRegistry:
+    config = Config(max_work_items_per_turn=4)
+
+    @staticmethod
+    def catalogue() -> object:
+        return object()
+
+
+class _FanInRouter:
+    @staticmethod
+    def route_envelope(_text: str, _catalogue: object) -> object:
+        decision = type("Decision", (), {"action": "existing_worker"})()
+        return type("Envelope", (), {"decision": decision, "prose": None})()
+
+
+def _fan_in_host(submitted: object, sink: CollectingMeasurementSink) -> tuple[SessionHost, object]:
+    """A host whose coordinator returns a hand-built ``submit`` outcome, so the
+    multi-intent fan-in loops can be driven with mismatched echoes."""
+    worker = ResultWorker()
+
+    class Coordinator(WorkItemCoordinator):
+        def __init__(self) -> None:
+            super().__init__(registry=_FanInRegistry(), router=_FanInRouter())
+
+        def dispatch(self, _decision: object, **_: object) -> object:
+            return worker
+
+        async def submit(self, *_args: object, **_kwargs: object) -> object:
+            return submitted
+
+    return (
+        SessionHost(
+            runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+        ),
+        worker,
+    )
+
+
+def _submitted(
+    *,
+    results: tuple[object, ...] = (),
+    pending_work_item_ids: tuple[str, ...] = (),
+    failures: tuple[object, ...] = (),
+) -> object:
+    return type(
+        "Submitted",
+        (),
+        {
+            "results": results,
+            "pending_work_item_ids": pending_work_item_ids,
+            "failures": failures,
+        },
+    )()
+
+
+def _multi_intent_outcome(*items: str) -> object:
+    return type("Outcome", (), {"work_items": items, "pending_dialogue": None})()
+
+
+def _fan_in_result(turn_id: str, text: str) -> GroundedResult:
+    return GroundedResult(
+        result_id=f"result-{turn_id}-{text}",
+        worker_id="worker-search",
+        turn_id=turn_id,
+        text=text,
+        spoken_text=text,
+        origin_epoch=1,
+    )
+
+
+def test_multi_intent_unmatched_result_turn_id_is_dropped_without_losing_the_turn() -> None:
+    """A worker-echoed turn_id that matches no dispatched work item must not
+    take down the whole turn: siblings still commit and emit, and the
+    unattributable item is swept to a terminal ``failed`` record."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(
+                results=(
+                    _fan_in_result("turn-fan-0", "first answer"),
+                    _fan_in_result("turn-fan-not-a-dispatched-item", "orphan answer"),
+                )
+            ),
+            sink,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        committed = await host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "",
+            origin,
+            "turn-fan",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-fan"),
+        )
+
+        assert [result.text for result in committed] == ["first answer"]
+        children = _events(sink, "work_item_foreground")
+        assert {child.fields["work_item_id"]: child.fields["outcome"] for child in children} == {
+            "work-turn-fan-0": "completed",
+            "work-turn-fan-1": "failed",
+        }
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["child_count"] == len(children)
+        assert parent["completed_count"] == 1
+        assert parent["failed_count"] == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_duplicate_result_turn_ids_keep_last_content_and_one_child_record() -> None:
+    """Two results colliding on one turn_id preserve the existing last-wins
+    commit semantics while emitting exactly one child record for that item."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(
+                results=(
+                    _fan_in_result("turn-dup-0", "first answer"),
+                    _fan_in_result("turn-dup-0", "second answer"),
+                )
+            ),
+            sink,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        committed = await host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "",
+            origin,
+            "turn-dup",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-dup"),
+        )
+
+        assert [result.text for result in committed] == ["second answer"]
+        children = _events(sink, "work_item_foreground")
+        item_zero = [
+            child for child in children if child.fields["work_item_id"] == "work-turn-dup-0"
+        ]
+        assert len(item_zero) == 1
+        assert item_zero[0].fields["outcome"] == "completed"
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["child_count"] == len(children)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_malformed_pending_and_failure_ids_warn_instead_of_raising() -> None:
+    """A non-numeric work_item_id suffix and an out-of-range index must both
+    warn and continue: neither can raise out of the handler and silently drop
+    the whole turn."""
+
+    async def run() -> None:
+        from server.work_item_coordinator import WorkItemFailure
+
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(
+                results=(_fan_in_result("turn-bad-0", "first answer"),),
+                pending_work_item_ids=("work-turn-bad-not-an-index",),
+                failures=(
+                    WorkItemFailure(
+                        work_item_id="work-turn-bad-99",
+                        worker_id="worker-search",
+                        error_type="RuntimeError",
+                        error_message="boom",
+                        failure_kind="failed",
+                    ),
+                ),
+            ),
+            sink,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        committed = await host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "",
+            origin,
+            "turn-bad",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-bad"),
+        )
+
+        assert [result.text for result in committed] == ["first answer"]
+        children = _events(sink, "work_item_foreground")
+        assert {child.fields["work_item_id"]: child.fields["outcome"] for child in children} == {
+            "work-turn-bad-0": "completed",
+            "work-turn-bad-1": "failed",
+        }
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["child_count"] == len(children)
+        await host.shutdown()
+
+    asyncio.run(run())

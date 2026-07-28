@@ -1190,15 +1190,35 @@ class SessionHost:
                 work_item_ids=work_item_ids,
                 on_late_terminal=on_late_terminal,
             )
-            result_indexes = {
-                result.turn_id: index
-                for index in runnable_indexes
-                for result in submitted.results
-                if result.turn_id == f"{turn_id}-{index}"
+            # Both maps are built from this turn's own dispatched indexes, never
+            # from worker- or coordinator-echoed strings, so a mismatched echo
+            # can only miss the lookup. Every fan-in loop below warns and skips
+            # on a miss rather than raising: the whole turn's remaining results
+            # still commit and speak, and the unattributable item's child is
+            # swept to a terminal ``failed`` record when the turn finalizes.
+            index_for_item_turn_id = {f"{turn_id}-{index}": index for index in runnable_indexes}
+            index_for_work_item_id = {
+                f"work-{turn_id}-{index}": index for index in runnable_indexes
             }
+            attributed_indexes: set[int] = set()
             for result in submitted.results:
-                index = result_indexes[result.turn_id]
+                index = index_for_item_turn_id.get(result.turn_id)
+                if index is None:
+                    logger.warning(
+                        f"multi-intent fan-in for {turn_id}: dropping a result whose "
+                        f"turn_id does not match any dispatched work item"
+                    )
+                    continue
+                # Content attribution stays last-wins on a duplicate; only the
+                # child's terminal record is emitted once.
                 results[index] = result
+                if index in attributed_indexes:
+                    logger.warning(
+                        f"multi-intent fan-in for {turn_id}: duplicate result for the same "
+                        f"work item; keeping the last result and not re-recording the child"
+                    )
+                    continue
+                attributed_indexes.add(index)
                 worker_id = index_to_worker_id[index][0]
                 child_recorders[index].finalize(
                     outcome=outcome_labels.get(index, "completed"),
@@ -1206,7 +1226,13 @@ class SessionHost:
                     result_id=result.result_id,
                 )
             for work_item_id in submitted.pending_work_item_ids:
-                item_index = int(work_item_id.rsplit("-", 1)[1])
+                item_index = index_for_work_item_id.get(work_item_id)
+                if item_index is None:
+                    logger.warning(
+                        f"multi-intent fan-in for {turn_id}: dropping a pending work_item_id "
+                        f"that does not match any dispatched work item"
+                    )
+                    continue
                 worker_id = index_to_worker_id[item_index][0]
                 results[item_index] = canonical_result(
                     worker_id=worker_id,
@@ -1219,7 +1245,13 @@ class SessionHost:
                 if recorder is not None:
                     self._register_retained_recorder_if_open(work_item_id, recorder)
             for failure in submitted.failures:
-                item_index = int(failure.work_item_id.rsplit("-", 1)[1])
+                item_index = index_for_work_item_id.get(failure.work_item_id)
+                if item_index is None:
+                    logger.warning(
+                        f"multi-intent fan-in for {turn_id}: dropping a failure whose "
+                        f"work_item_id does not match any dispatched work item"
+                    )
+                    continue
                 results[item_index] = canonical_result(
                     worker_id=failure.worker_id,
                     turn_id=f"{turn_id}-{item_index}",
