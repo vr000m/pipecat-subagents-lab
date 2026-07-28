@@ -1,6 +1,6 @@
 # Task: Add Pipecat-native latency observability
 
-**Status**: Not Started
+**Status**: Complete (review-gauntlet fix rounds in progress)
 **Component**: Pipecat subagents
 **Assigned to**: Codex
 **Priority**: Medium
@@ -1119,15 +1119,24 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
 
 ### Summary
 
-Not implemented.
+Implemented across Phases 1-3 (commits fb8f88a, 4cbfcfa, fdf5820): a
+console-only `PERF_METRIC` telemetry contract, Pipecat 1.6.0 observer
+wiring (`StartupTimingObserver`, `UserBotLatencyObserver`, default
+`TurnTrackingObserver`), and application-turn/retained-work timing
+recorders across all three accepted-turn terminal-path owners. Currently
+in the review-gauntlet's fix rounds: `/code-review -xhigh` findings
+fixed in 9f9f234/a76e664; `skein:deep-review --verbose` findings
+(dual-recorder ownership, `record_zero_child_outcome` counter
+invariant, Loguru diagnose leak, and minor hardening items) in
+progress. `/security-review` still pending.
 
 ### Outcomes
 
-- (fill when complete)
+- (fill when review-gauntlet converges)
 
 ### Learnings
 
-- (fill when complete)
+- (fill when review-gauntlet converges)
 
 ### Follow-up Work
 
