@@ -1073,9 +1073,9 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
 
 ## Progress
 
-- [ ] Phase 1: Performance log contract and Pipecat observers
-- [ ] Phase 2: Complete application-turn and retained-work timing
-- [ ] Phase 3: Release validation and benchmark evidence
+- [x] Phase 1: Performance log contract and Pipecat observers
+- [x] Phase 2: Complete application-turn and retained-work timing
+- [x] Phase 3: Release validation and benchmark evidence
 
 ## Findings
 
