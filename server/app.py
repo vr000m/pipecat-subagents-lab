@@ -57,9 +57,6 @@ def _configure_logging() -> None:
     _loguru_logger.add(sys.stderr, backtrace=False, diagnose=False)
 
 
-_configure_logging()
-
-
 class _SpeechCompletionProcessor(FrameProcessor):
     """Release the active speech lease when any TTS provider finishes."""
 
@@ -464,6 +461,7 @@ def main() -> None:
     """Serve the browser app using the validated bind configuration."""
     import uvicorn
 
+    _configure_logging()
     config = load_config()
     uvicorn.run("server.app:app", host=config.bind_host, port=config.bind_port)
 

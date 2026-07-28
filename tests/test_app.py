@@ -2,7 +2,10 @@
 
 import asyncio
 import dataclasses
+import subprocess
+import sys
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -185,8 +188,20 @@ def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
     import uvicorn
 
     calls: list[dict[str, object]] = []
+    configured: list[bool] = []
+    configure_logging = app_module._configure_logging
+
+    def configure_logging_for_main() -> None:
+        configure_logging()
+        configured.append(True)
+
     monkeypatch.setattr(
         app_module, "load_config", lambda: Config(bind_host="127.0.0.2", bind_port=9000)
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_configure_logging",
+        configure_logging_for_main,
     )
     monkeypatch.setattr(
         uvicorn, "run", lambda target, **kwargs: calls.append({"target": target, **kwargs})
@@ -194,6 +209,7 @@ def test_main_uses_validated_bind_configuration(monkeypatch) -> None:
 
     app_module.main()
 
+    assert configured == [True]
     assert calls == [{"target": "server.app:app", "host": "127.0.0.2", "port": 9000}]
 
 
@@ -637,16 +653,35 @@ def test_create_app_preserves_the_supplied_hosts_measurement_sink() -> None:
 
 
 class TestLoguruStartupConfiguration:
-    """Importing server.app must disable Loguru's diagnose/backtrace rendering
-    process-wide, since the default sink otherwise prints every local
-    variable's value (transcripts, provider payloads, API keys) on any
-    traceback, including frames above the one that caught the exception."""
+    """The executable entrypoint must disable unsafe Loguru traceback rendering."""
 
-    def test_default_sink_has_diagnose_and_backtrace_disabled(self) -> None:
+    def test_import_preserves_preexisting_handler(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+from loguru import logger
+
+handler_id = logger.add(lambda _message: None)
+import server.app
+
+assert handler_id in logger._core.handlers
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+    def test_configured_sink_has_diagnose_and_backtrace_disabled(self) -> None:
         from loguru import logger as loguru_logger
 
+        app_module._configure_logging()
         handlers = list(loguru_logger._core.handlers.values())
-        assert handlers, "server.app import must configure at least one Loguru sink"
+        assert handlers, "the executable entrypoint must configure a Loguru sink"
         for handler in handlers:
             assert handler._exception_formatter._diagnose is False
             assert handler._exception_formatter._backtrace is False
@@ -657,7 +692,7 @@ class TestLoguruStartupConfiguration:
         local in the frame — so the repro must pass the secret as an
         argument, matching how a transcript/result reaches a raising call.
 
-        The default sink is added at import time, before capsys can patch
+        The default sink is added by the entrypoint, before capsys can patch
         sys.stderr, so it writes through the original file descriptor;
         capfd (OS-level fd capture) is required to observe it."""
         secret = "SUPER-SECRET-API-KEY-DO-NOT-LEAK"
