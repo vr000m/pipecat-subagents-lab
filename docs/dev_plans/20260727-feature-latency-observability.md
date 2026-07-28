@@ -1106,10 +1106,14 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
   done-callback, so a raising hook could drop `on_complete` delivery
   entirely; and `_commit_late_result`'s on-the-spot fallback recorder
   construction made `background_ms` report near-zero. Fixed in 9f9f234
-  with regression tests (444/444 passing). Five lower-severity findings
-  (an empty-`app_worker_id` validation gap, and four
-  efficiency/duplication findings in `_handle_multi_intent`/
-  `_commit_late_result`/`perf_metrics.py`) were deferred, not fixed.
+  with regression tests (444/444 passing). The remaining five
+  lower-severity findings (an empty-`app_worker_id` validation gap, and
+  four efficiency/duplication findings in `_handle_multi_intent`/
+  `_commit_late_result`/`perf_metrics.py`) were fixed in a76e664 (no
+  behavior change; verified branch-by-branch and via the full suite).
+  Codex adversarial review was skipped (out of Codex tokens); the
+  review-gauntlet's remaining gates (deep-review, security-review) run
+  in its place.
 
 ## Final Results
 
