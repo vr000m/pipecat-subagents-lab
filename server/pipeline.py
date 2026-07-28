@@ -37,7 +37,7 @@ from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
 from .speech_scheduler import SpeechScheduler
-from .work_item_coordinator import LateResult, WorkItemFailure
+from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 try:
@@ -568,11 +568,20 @@ class SessionHost:
 
     @staticmethod
     def _failure_child_outcome(failure: WorkItemFailure) -> str:
-        return {
-            "CapacityError": "capacity_rejected",
-            "RetentionCapacityError": "retention_rejected",
-            "CancelledError": "cancelled",
-        }.get(failure.error_type, "failed")
+        """Classify a work-item failure from its structured ``failure_kind``.
+
+        ``error_type`` is free-text diagnostic and must never drive
+        classification: renaming a worker exception class would otherwise
+        silently reclassify its telemetry outcome.
+        """
+        kind = getattr(failure, "failure_kind", None)
+        if kind in FAILURE_KINDS:
+            return kind
+        logger.warning(
+            f"work item {failure.work_item_id} carries unclassified "
+            f"failure_kind={kind!r}; recording outcome=failed"
+        )
+        return "failed"
 
     def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
         self._prune_handshake_tokens()

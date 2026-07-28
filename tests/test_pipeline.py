@@ -4056,32 +4056,62 @@ def test_router_resolved_direct_turn_reports_all_counters_zero() -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize(
-    ("error_type", "failure_kind", "expected_outcome"),
-    [
-        ("CapacityError", "capacity_rejected", "capacity_rejected"),
-        ("RetentionCapacityError", "retention_rejected", "retention_rejected"),
-        ("CancelledError", "cancelled", "cancelled"),
-        ("ValueError", "failed", "failed"),
-        # A renamed/unrecognized exception class name must not change the
-        # classification: it is read from the explicit failure_kind field,
-        # never inferred by pattern-matching error_type against a sentinel.
-        ("SomeRenamedExceptionClassNotInAnySentinelList", "failed", "failed"),
-    ],
-)
-def test_failure_child_outcome_classifies_via_structured_failure_kind_not_error_type_name(
-    error_type: str, failure_kind: str, expected_outcome: str
-) -> None:
+def _work_item_failure(error_type: str, failure_kind: str) -> object:
     from server.work_item_coordinator import WorkItemFailure
 
-    failure = WorkItemFailure(
+    return WorkItemFailure(
         work_item_id="work-turn-0",
         worker_id="worker-a",
         error_type=error_type,
         error_message="worker execution failed",
         failure_kind=failure_kind,
     )
+
+
+@pytest.mark.parametrize(
+    ("error_type", "failure_kind", "expected_outcome"),
+    [
+        # Every row deliberately disagrees between the free-text ``error_type``
+        # and the structured ``failure_kind``: the classification must follow
+        # ``failure_kind`` alone, so pattern-matching ``error_type`` against a
+        # sentinel table would fail these.
+        ("CapacityError", "failed", "failed"),
+        ("RetentionCapacityError", "failed", "failed"),
+        ("CancelledError", "failed", "failed"),
+        ("ValueError", "capacity_rejected", "capacity_rejected"),
+        ("SomeRenamedClass", "cancelled", "cancelled"),
+        ("ValueError", "retention_rejected", "retention_rejected"),
+    ],
+)
+def test_failure_child_outcome_classifies_via_structured_failure_kind_not_error_type_name(
+    error_type: str, failure_kind: str, expected_outcome: str
+) -> None:
+    failure = _work_item_failure(error_type, failure_kind)
     assert SessionHost._failure_child_outcome(failure) == expected_outcome
+
+
+def test_failure_child_outcome_falls_back_to_failed_and_warns_for_off_domain_kind() -> None:
+    records: list[object] = []
+    sink_id = pipeline_module.logger.add(lambda message: records.append(message.record))
+    try:
+        failure = _work_item_failure("CapacityError", "nonsense")
+        assert SessionHost._failure_child_outcome(failure) == "failed"
+    finally:
+        pipeline_module.logger.remove(sink_id)
+
+    warnings = [record for record in records if "unclassified failure_kind" in record["message"]]
+    assert len(warnings) == 1
+    assert warnings[0]["level"].name == "WARNING"
+    assert "'nonsense'" in warnings[0]["message"]
+
+
+def test_failure_kinds_are_a_subset_of_work_item_outcomes() -> None:
+    """Drift guard: every classification this helper can return must be a
+    value the ``work_item_foreground`` outcome enum accepts."""
+    from server.perf_metrics import WORK_ITEM_OUTCOMES
+    from server.work_item_coordinator import FAILURE_KINDS
+
+    assert FAILURE_KINDS <= WORK_ITEM_OUTCOMES
 
 
 def test_routing_failure_logs_exception_type_without_traceback_or_message() -> None:

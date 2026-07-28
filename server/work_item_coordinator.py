@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from loguru import logger
 
@@ -71,6 +71,7 @@ class SubmittedOutcome:
 
 
 FailureKind = Literal["capacity_rejected", "retention_rejected", "cancelled", "failed"]
+FAILURE_KINDS: frozenset[str] = frozenset(get_args(FailureKind))
 
 
 @dataclass(frozen=True)
