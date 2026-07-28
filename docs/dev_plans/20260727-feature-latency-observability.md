@@ -111,7 +111,9 @@ does not project performance telemetry through RTVI or add it to browser state.
 ## Review Focus
 
 - Prove that each accepted semantic turn emits exactly one foreground terminal
-  event across every return and exception path in `_handle_transcript_impl`.
+  event across every return and exception path in `_handle_transcript_impl`,
+  `_handle_pending`, and `_handle_multi_intent` — all three are terminal-path
+  owners for accepted semantic turns.
 - Prove that every registered retained work item emits exactly one background
   terminal event, while callbacks after finalization emit none, and that stale,
   cancelled, invalid, duplicate, disconnected, and TTS-less outcomes are
@@ -152,11 +154,25 @@ console contract without duplicating Pipecat's default turn tracker.
   and Small WebRTC timing fields against the exact installed/locked Pipecat
   1.6.0 artifact. Capture this as focused import/signature tests and an observer
   runtime smoke; if it disagrees with Context Hub results, update the plan and
-  re-run review before coding around the mismatch.
+  re-run review before coding around the mismatch. This verification step
+  lands as its own first commit within Phase 1, gating every subsequent
+  observer-wiring commit behind it — a failed verification here invalidates
+  the review marker per Verified Starting Facts.
 - Add a small performance logging module that implements the normative registry
   below, rejects unknown events and fields, accepts only allowlisted scalar
   values, formats milliseconds consistently, and emits one
   `PERF_METRIC event=... schema=1 ...` line through an injectable sink.
+- Add both `ConsoleMeasurementSink` and `CollectingMeasurementSink` in this
+  phase, in `server/perf_metrics.py`. Both are Phase 1 deliverables:
+  `ConsoleMeasurementSink` is the production default, and
+  `CollectingMeasurementSink` is required by this phase's own
+  collector-identity-injection tests, not deferred to Phase 2.
+- Add a keyword-only `measurement_sink: MeasurementSink | None = None`
+  parameter to `_default_session_host` (server/app.py:285), forwarded into the
+  `SessionHost(...)` constructor call — consistent with that function's
+  existing pattern of optional keyword params (`router`,
+  `router_responses_factory`). This is the seam Phase 2's smoke migration
+  depends on.
 - Add immutable `PerfConnectionContext` and callback factories that capture
   only that value object, the sink, and logger.
 - Add the `SessionHost` sink constructor/storage seam in this phase, default it
@@ -202,15 +218,32 @@ console contract without duplicating Pipecat's default turn tracker.
 `server/work_item_coordinator.py`, `scripts/smoke_conversation.py`,
 `README.md`, `docs/architecture.md`
 **Test files:** `tests/test_pipeline.py`, `tests/test_perf_metrics.py`,
-`tests/test_work_item_coordinator.py`, `tests/test_smoke_conversation.py`
-**Test command:** `uv run pytest tests/test_pipeline.py tests/test_perf_metrics.py tests/test_work_item_coordinator.py tests/test_smoke_conversation.py -q`
+`tests/test_work_item_coordinator.py`, `tests/test_smoke_conversation.py`,
+`tests/test_session_host.py`
+**Test command:** `uv run pytest tests/test_pipeline.py tests/test_perf_metrics.py tests/test_work_item_coordinator.py tests/test_smoke_conversation.py tests/test_session_host.py -q`
 **Goal:** Every accepted application turn and retained work item must reach one
 unambiguous terminal metric without altering routing, search, speech, or
-reconnect behavior.
+reconnect behavior. This covers all three terminal-path owners:
+`_handle_transcript_impl`, `_handle_pending`, and `_handle_multi_intent`.
 
 - Replace the delegated-path-only timing assignment with a parent turn recorder
   and child work-item recorders that use `time.perf_counter()` and finalize
   once.
+- Cover all three accepted-turn terminal-path owners, not only
+  `_handle_transcript_impl`: `_handle_pending` and `_handle_multi_intent` are
+  separate functions with their own early-exit returns and must carry the
+  parent recorder too. Map each verified early-exit branch to its outcome:
+  `_handle_transcript_impl`'s `if worker is None: return outcome`
+  (pipeline.py:669) is parent `failed` / child `missing_worker`; its
+  `if search is None: return outcome` (pipeline.py:673) is parent `failed` /
+  child `missing_search`; `_handle_pending`'s `if search is None: return
+  outcome` (pipeline.py:765) is parent `failed` / child `missing_search` for
+  the continued pending work item. `_handle_multi_intent`'s per-item early
+  returns (routing exception, direct/unsupported/clarify, dispatch exception
+  at pipeline.py:848/866/877/886) already assign explicit per-item result text
+  inline; each already corresponds one-to-one with a child outcome/counter, and
+  the child telemetry recorder must be created and finalized at those exact
+  per-item branch points.
 - Record routing, delegated search, commit/enqueue, foreground acknowledgement,
   and foreground-total durations when those stages exist; omit unavailable
   stages instead of writing misleading zeroes.
@@ -224,17 +257,38 @@ reconnect behavior.
   sanitized error/result fields and coordinator callback-suppression behavior;
   land its focused tests before consumers depend on it. This is its own commit
   within Phase 2: `terminal_kind` and its tests must merge before the
-  `on_late_terminal` hook or registry (below) reference it, so no
-  within-phase commit leaves `on_late_terminal` depending on an untested field.
+  `on_late_terminal` hook or registry (below) share its enum values, so no
+  within-phase commit leaves `on_late_terminal` depending on an untested
+  vocabulary. `on_late_terminal` does not read `LateResult.terminal_kind`
+  directly — it fires before `LateResult` is constructed (see below) and
+  derives the same three-value classification independently from the task
+  object; `LateResult.terminal_kind` is what the normal (non-shutdown-guarded)
+  callback path and other consumers use once `LateResult` exists.
 - Add an optional synchronous coordinator `on_late_terminal(work_item_id,
   terminal_kind)` hook that claims the recorder whenever retained work becomes
   terminal, before the existing shutdown guard can suppress
   `on_late_complete`. The hook performs no application mutation and does not
-  change existing completion-callback suppression.
+  change existing completion-callback suppression. Concretely: in
+  `retain_late_task`'s `completed()` done-callback closure
+  (work_item_coordinator.py:269-306), the `if self._shutdown: return` guard
+  (line 275) exits before the try/except terminal-kind classification block
+  (277-296) runs, so `on_late_terminal` must be invoked as the very first
+  statement inside `completed()`, before that guard, classifying terminal_kind
+  directly from the task object (`completed_task.cancelled()` → `cancelled`;
+  `completed_task.exception() is not None` → `failed`; else → `completed`)
+  rather than from the `LateResult` built later — this is the only way the
+  hook fires under both the normal path and the shutdown-guard-suppressed
+  path.
 - Add the host-owned retained-recorder registry and an atomic recorder state
   machine: `pending`, `claimed`, `commit_recorded`, `speech_recorded`,
   `finalized`. Each transition is idempotent and stores its explicit outcome
-  before the next await.
+  before the next await. The existing `_known_work_items` and
+  `_cancelled_work_items` sets (pipeline.py:302-303) remain the sole
+  behavioral authority for cancellation/dedup logic; the new registry is
+  telemetry-only. Recorder outcome classification in `_commit_late_result`
+  must derive from the same branch conditions that already mutate those two
+  sets, never from an independent re-derivation, so the two bookkeeping
+  structures cannot diverge.
 - Create each provisional retained recorder before registering its coordinator
   callback. For single work, the callback captures the recorder directly. For
   multi-intent submission, build an immutable recorder map keyed by the
@@ -259,7 +313,10 @@ reconnect behavior.
   identifiers where the application owns that mapping.
 - Inject a collector into tests and smoke runs instead of preserving
   `last_turn_metrics`; never let a direct turn inherit measurements from the
-  preceding delegated turn.
+  preceding delegated turn. `scripts/smoke_conversation.py` calls
+  `_default_session_host(measurement_sink=CollectingMeasurementSink())`
+  (using the Phase 1 keyword-only seam) instead of the current bare
+  `_default_session_host()` (scripts/smoke_conversation.py:39).
 - Migrate the smoke harness and its deterministic stale-turn tests in the same
   phase/commit that removes `last_turn_metrics`, preserving routing/total
   budgets and the `SMOKE_RESULT=` summary contract.
@@ -298,7 +355,11 @@ remain reproducible.
   shutdown.
 - Prove the base diff contains no changes under `shared/`,
   `server/rtvi_messages.py`, or `web/src/`, and that dependency manifests differ
-  only in the approved v0.1.1-to-v0.1.2 version fields.
+  only in the approved v0.1.1-to-v0.1.2 version fields. Run this as documented
+  shell commands, not a checked-in script: `git diff --stat`/`git diff
+  --name-only` against the merge-base, plus a `jq`/manual parse of
+  `pyproject.toml`, `uv.lock`, and `web/package.json` version fields,
+  executed immediately before the `Validation cmd` line.
 
 ## Technical Specifications
 
@@ -319,8 +380,10 @@ remain reproducible.
 - `SessionHost.last_turn_metrics` is one mutable dictionary at
   `server/pipeline.py:305`.
 - The only current assignment and `Turn latency` log are after delegated search
-  at `server/pipeline.py:734-745`; earlier routing and direct-result returns do
-  not pass through that block.
+  at `server/pipeline.py:734-746` (the cancelled-work check and
+  `_commit_and_speak` call are at 734-735; the `last_turn_metrics` assignment
+  and log itself start at line 737); earlier routing and direct-result returns
+  do not pass through that block.
 - Retained background results have multiple terminal and suppression paths in
   `server/pipeline.py:1060-1111` and currently emit no correlated duration.
 - The paid smoke reads an unqualified copy of `host.last_turn_metrics` at
@@ -344,6 +407,17 @@ Every record has the prefix `PERF_METRIC`, followed by `event=<name>` and
 when unknown. No producer may invent zeroes, empty identifiers, or cross-domain
 IDs to satisfy the schema.
 
+Every Pipecat 1.6.0 observer payload consumed by this plan is expressed in
+**seconds** (`TransportTimingReport.client_connected_secs`/
+`bot_connected_secs`, `UserBotLatencyObserver` latency floats,
+`LatencyBreakdown.*.duration_secs`, `TurnTrackingObserver` `duration_secs`),
+while every `PERF_METRIC` field is `_ms`. Framework-event producers must
+multiply by 1000 before formatting; a raw seconds-to-`_ms` pass-through is
+wrong by 1000x and would still pass formatter validation (finite,
+non-negative). Phase 1 adds a test asserting the conversion: feed a known
+`duration_secs` value through the real observer callback and assert the
+emitted `_ms` field equals `duration_secs * 1000`, not a raw pass-through.
+
 | Event | Cardinality | Required fields | Optional fields |
 |-------|-------------|-----------------|-----------------|
 | `pipeline_startup` | Once per pipeline start report | `session_id`, `origin_epoch`, `connection_worker`, `total_ms` | `processor_count` |
@@ -352,7 +426,7 @@ IDs to satisfy the schema.
 | `pipecat_turn_end` | Once per Pipecat turn end | `session_id`, `origin_epoch`, `connection_worker`, `pipecat_turn`, `duration_ms`, `interrupted` | None |
 | `first_bot_speech_latency` | At most once per observer cycle | `session_id`, `origin_epoch`, `connection_worker`, `latency_ms` | None |
 | `user_bot_latency` | At most once per completed observer cycle | `session_id`, `origin_epoch`, `connection_worker`, `latency_ms` | None |
-| `service_latency` | Once per Pipecat breakdown datum | `session_id`, `origin_epoch`, `connection_worker`, `metric_kind`, `processor`, `value_ms` | `pipecat_turn` only when supplied unambiguously by Pipecat |
+| `service_latency` | Once per Pipecat breakdown datum | `session_id`, `origin_epoch`, `connection_worker`, `metric_kind`, `value_ms` | `processor` (required for `ttfb`/`text_aggregation` kinds, absent for `function_calls`/`user_turn_secs`); `pipecat_turn` only when supplied unambiguously by Pipecat |
 | `app_turn_foreground` | Exactly once per accepted semantic turn | `session_id`, `origin_epoch`, `turn_id`, `outcome`, `total_ms`, `child_count`, `direct_count`, `unsupported_count`, `completed_count`, `retained_count`, `clarification_count`, `declined_count`, `failed_count`, `cancelled_count` | `control_action`, `control_outcome`, `routing_ms`, `commit_ms` |
 | `work_item_foreground` | Exactly once per delegated single-intent child or decomposed multi-intent child | `session_id`, `origin_epoch`, `turn_id`, `work_item_id`, `outcome`, `total_ms` | `app_worker_id`, `result_id`, `search_ms`, `commit_ms` |
 | `work_item_background` | Exactly once per registered retained child work item | `session_id`, `origin_epoch`, `turn_id`, `work_item_id`, `app_worker_id`, `background_ms`, `work_outcome`, `commit_outcome`, `speech_outcome` | `result_id` |
@@ -403,7 +477,13 @@ Allowed outcomes are closed enums:
   `cancelled`, `not_applicable`, `enqueue_failed`, `start_failed`.
 
 `metric_kind` is limited to the exact Pipecat metric kinds verified in Phase 1;
-do not pass arbitrary provider labels through. Event and field names match
+do not pass arbitrary provider labels through. The required/optional field set
+is fixed per `metric_kind` during that same Phase 1 verification: against the
+installed pipecat-ai 1.6.0 `LatencyBreakdown` shape, `processor` is present
+only for `ttfb` and `text_aggregation` kinds — `function_calls` entries carry
+`function_name` instead and `user_turn_secs` is a bare scalar with neither.
+`service_latency.processor` is required only for `ttfb`/`text_aggregation`
+datums. Event and field names match
 `[a-z][a-z0-9_]*`. Integers and booleans are canonical decimal and lowercase
 `true`/`false`; durations are finite non-negative decimals rounded to one
 millisecond decimal place. Identifiers and processor names are encoded as
@@ -419,6 +499,26 @@ zero; `pipecat_turn` is an integer greater than or equal to one. Booleans are
 never accepted as integers, and integer fields reject fractional or string
 representations. `app_turn_foreground` validation enforces the normative
 child-counter sum before emission.
+
+### Timing Boundaries
+
+Every duration field's start/stop instant is grounded in the Context
+Lifecycle table (see Architecture & Call Flow, rows 4-8):
+
+- `total_ms` (`app_turn_foreground`): starts at semantic-turn acceptance /
+  parent `turn_id` allocation (row 4), ends at parent terminal-event emission.
+- `routing_ms`: starts when routing is requested, ends when the routing
+  decision is received — a sub-span within `total_ms`.
+- `search_ms` / `commit_ms` (`work_item_foreground`, child): start at work
+  dispatch (row 5), end at child terminal-event emission.
+- `background_ms` (`work_item_background`): starts at work dispatch /
+  provisional-recorder creation — the same instant as row 5, since the
+  provisional retained recorder is created before callback registration, at
+  dispatch time, not at foreground-timeout/retention-acceptance — and ends at
+  background terminal-event emission (row 8).
+
+The deterministic-clock tests in Testing Notes assert exact values against
+these boundaries.
 
 ### Measurement Sink Contract
 
@@ -459,6 +559,9 @@ only this object, the sink, and logger. They may not close over `SessionHost`,
 
 - `server/app.py` — construct observers, register connection-scoped handlers,
   enable processor metrics, and attach handlers to the default turn tracker.
+  `server/observers.py` (existing `RuntimeObserver`, RTVI event projection) is
+  untouched by this plan; all new Pipecat timing-observer wiring lives in
+  `server/perf_metrics.py` and `server/app.py`.
 - `server/pipeline.py` — measure every accepted application turn and every
   retained background terminal outcome; own the retained-recorder registry and
   finalize open recorders after coordinator work/callback tasks settle.
@@ -475,6 +578,10 @@ only this object, the sink, and logger. They may not close over `SessionHost`,
   pipeline worker to model the default turn tracker.
 - `tests/test_work_item_coordinator.py` — verify structured late terminal kinds,
   shared multi-intent callback identity, and unchanged shutdown suppression.
+- `tests/test_session_host.py` — verify the new `measurement_sink` constructor
+  parameter and the post-`coordinator.shutdown()` recorder-finalization step
+  (server/pipeline.py:1290) without changing existing shutdown-ordering
+  assertions.
 - `README.md` — document console filters, event meanings, and smoke usage.
 - `docs/architecture.md` — document framework-observer versus application-timer
   ownership and the console-only observability boundary.
@@ -488,7 +595,9 @@ only this object, the sink, and logger. They may not close over `SessionHost`,
 ### New Files to Create
 
 - `server/perf_metrics.py` — stable event names, safe one-line formatting,
-  turn-scoped recorder, and observer callback wiring helpers.
+  turn-scoped recorder, and observer callback wiring helpers, plus
+  `ConsoleMeasurementSink` and `CollectingMeasurementSink` (both Phase 1
+  deliverables).
 - `tests/test_perf_metrics.py` — formatter, safety, callback, event-name, and
   exactly-once recorder tests.
 - `tests/test_smoke_conversation.py` — deterministic smoke metric-selection and
@@ -524,7 +633,11 @@ only this object, the sink, and logger. They may not close over `SessionHost`,
   callback suppression. `WorkItemCoordinator.shutdown()` settles work and
   callback tasks, then the host finalizes any still-open recorder from its
   claimed terminal kind and reached commit/speech stages. Existing application
-  completion-callback semantics remain unchanged.
+  completion-callback semantics remain unchanged. The existing
+  `_known_work_items`/`_cancelled_work_items` sets remain the sole behavioral
+  authority for cancellation and duplicate detection; the recorder registry
+  is telemetry-only and classifies from the same branch conditions, never a
+  parallel re-derivation.
 - **Orthogonal retained outcomes:** work execution, authoritative commit, and
   speech delivery are reported independently.
 - **Partial breakdown is valid:** processor-level fields appear only when
@@ -552,7 +665,7 @@ only this object, the sink, and logger. They may not close over `SessionHost`,
 | Measurement delivery | Phase 1 sink protocol | `SessionHost` composition root, then observers and application recorders | One host-owned sink instance; console in production, collector in tests/smoke; never latest-value state |
 | Pipecat frame observations | Phase 1 observer instances | Connection-scoped `PipelineWorker` | Handlers capture immutable connection context, attach before run, release with the worker, and never mutate session state |
 | Default turn tracking | `PipelineWorker` | Phase 1 turn handlers | Use `worker.turn_tracking_observer` once; preserve Pipecat turn-number semantics |
-| Application foreground timing | Phase 2 parent and child recorders | `_handle_transcript_impl` and Phase 2 smoke | One parent per accepted `turn_id`, one child per dispatched `work_item_id`; absent stages are omitted |
+| Application foreground timing | Phase 2 parent and child recorders | `_handle_transcript_impl`, `_handle_pending`, `_handle_multi_intent`, and Phase 2 smoke | One parent per accepted `turn_id`, one child per dispatched `work_item_id`; absent stages are omitted |
 | Retained background timing | Phase 2 provisional recorder map and host registry | Synchronous coordinator terminal hook, structured completion callback, `_commit_late_result`, and `SessionHost.shutdown` | Terminal hook claims before suppression; stage machine records before awaits; coordinator settles callbacks before host finalization; registry survives reconnect |
 | Smoke budget selection | Phase 2 collecting sink | Phase 2 smoke harness | Select the requested `turn_id` and expected child; stale prior measurements are invalid |
 | Operator evidence | Runtime console | README and benchmark procedure | Grep-friendly records are ephemeral unless the operator captures stdout/stderr |
@@ -685,7 +798,15 @@ persists:
   observations.
 - Assert framework identity under overlapping turns, interruption, and two
   connection epochs: framework records use only `pipecat_turn`; startup and
-  user-bot records omit IDs Pipecat did not supply.
+  user-bot records omit IDs Pipecat did not supply. Extend this identity test
+  to `service_latency`: a `MetricsFrame` breakdown datum under
+  overlapping/ambiguous turn attribution emits `service_latency` without
+  `pipecat_turn`; an unambiguous one includes it.
+- Define "observer cycle" for `first_bot_speech_latency`/`user_bot_latency`
+  cardinality as one Pipecat conversation turn tracked by the default
+  `TurnTrackingObserver` (turn start to turn end/interruption). Add a test
+  case: an interrupted turn with no bot speech emits zero
+  `first_bot_speech_latency`/`user_bot_latency` events for that turn.
 - Inspect each registered observer callback's closure/default state and assert
   its reachable captures are limited to `PerfConnectionContext`, the shared
   sink, and logger. Weak-reference the old RTVI publisher as well as runtime,
@@ -707,8 +828,9 @@ persists:
   exception behavior.
 - Inject a deterministic monotonic clock and assert exact `routing_ms`,
   `search_ms`, `commit_ms`, `total_ms`, and `background_ms` for representative
-  foreground success, retained completion, and failure paths, including the
-  specified start and terminal boundaries.
+  foreground success, retained completion, and failure paths, against the
+  start and terminal boundaries defined in Technical Specifications ###
+  Timing Boundaries.
 - Parameterize the retained branch/race matrix below. Assert exactly one
   background event per accepted retained item and no event after finalization,
   truthful work/commit/speech axes, registry removal, and unchanged
@@ -735,7 +857,10 @@ persists:
   and mutate no host/session state. Drop references and use weak references plus
   `gc.collect()` to prove the old runtime, worker, and observers are collectible.
   Separately prove retained recorders survive connection replacement and are
-  finalized only by late completion or process-session shutdown.
+  finalized only by late completion or process-session shutdown. Extend the
+  same stale-callback assertion to a callback firing after
+  `SessionHost.shutdown()` completes, not only after connection replacement —
+  console-only output, no state mutation.
 - Inject a sink that raises and prove routing, result commit, TTS enqueue,
   cancellation, and shutdown behavior remain unchanged. Assert one terminal
   sink attempt, finalized/removed recorder state, no retry or fallback metric,
@@ -784,6 +909,7 @@ emit exactly one `work_item_foreground` event per child.
 | Multi-intent all completed | `completed` | One completed child per item |
 | Multi-intent all retained | `retained` | One retained child per item |
 | Multi-intent direct plus delegated | `mixed` | Deterministic child ID for each item; absent `app_worker_id` on direct child |
+| Multi-intent containing an unsupported item | Matching category or `mixed` | One `unsupported` child, `unsupported_count` incremented |
 | Multi-intent clarification or decline | Matching category or `mixed` | One child per decomposed item and exhaustive counters |
 | Multi-intent missing worker/search or per-child routing failure | `failed` or `mixed` | One failed-class child per affected item |
 | Multi-intent capacity exhausted before start | `failed` or `mixed` | One `capacity_rejected` child per affected item; no recorder |
@@ -874,8 +1000,14 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
 - Integer fields enforce their documented ranges and reject booleans,
   fractions, strings, and negative counts; application child counters must sum
   exactly to `child_count`.
-- Each connection has one startup observer, one user-bot latency observer, and
-  exactly one active default turn tracker.
+- Each connection has one startup observer, exactly one
+  **application-registered** `UserBotLatencyObserver`, and exactly one active
+  default turn tracker. `PipelineWorker` itself constructs an internal
+  `UserBotLatencyObserver` when `enable_tracing` is on and tracing is
+  available (verified in the installed pipecat-ai 1.6.0 source,
+  `pipeline/worker.py` around line 360-365); this plan's connection setup does
+  not enable tracing, so no double-instance exists today, but the criterion
+  does not assume that stays true.
 - Pipeline startup, Small WebRTC client readiness, Pipecat turn lifecycle,
   first-bot-speech latency, user-to-bot latency, and available processor
   breakdowns are logged from Pipecat-native observers.
@@ -937,7 +1069,7 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
 - When the environment is available, local-media and paid routing/search smoke
   results are recorded separately from deterministic test evidence.
 
-<!-- reviewed: pending -->
+<!-- reviewed: 2026-07-27 @ 6db80b75eecb9f9a1179046f3a8d443df4202149 -->
 
 ## Progress
 
@@ -953,6 +1085,17 @@ PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoc
   it is not the Smart Turn analyzer's incomplete-user-speech timeout.
 - `UserBotLatencyObserver` provides the end-to-end speech measurement, while
   router/search attribution still requires explicit application timers.
+
+### Review Waivers
+
+- `/review-plan` codebase-claims finding (Verified Starting Facts branch/tag
+  citation, originally flagged Critical): waived, no plan change needed.
+  Verified directly: the annotated `v0.1.1` tag's target commit is exactly
+  `d83657c381bdca8619a364f1c8dd82f1dd6ae41c` as the plan claims (`git tag -l
+  v0.1.1 --format='%(objectname) %(*objectname)'`). The branch HEAD has since
+  moved forward, which is precisely the "normal git-ref movement after
+  creation does not [invalidate review]" case the plan's own Verified
+  Starting Facts section already documents. Confirmed correct, not a defect.
 
 ## Issues & Solutions
 
