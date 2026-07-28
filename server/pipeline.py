@@ -881,110 +881,119 @@ class SessionHost:
         self, outcome: Any, transcript: str, origin: Any, turn_id: str
     ) -> Any:
         turn_recorder = self._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id)
-        pending = getattr(outcome, "pending_dialogue", None)
-        owner_id = pending.owner_id if pending is not None else None
-        if owner_id is None:
-            owner_id = outcome.work_items[0] if outcome.work_items else None
-        registered = self.coordinator.registry.get(owner_id) if owner_id else None
-        worker = registered.worker if registered is not None else None
-        search = getattr(worker, "search", None)
-        work_item_id = f"work-{turn_id}"
-        if search is None:
+        try:
+            pending = getattr(outcome, "pending_dialogue", None)
+            owner_id = pending.owner_id if pending is not None else None
+            if owner_id is None:
+                owner_id = outcome.work_items[0] if outcome.work_items else None
+            registered = self.coordinator.registry.get(owner_id) if owner_id else None
+            worker = registered.worker if registered is not None else None
+            search = getattr(worker, "search", None)
+            work_item_id = f"work-{turn_id}"
+            if search is None:
+                child = self._new_work_item_recorder(
+                    origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=work_item_id
+                )
+                child_outcome = child.finalize(outcome="missing_search", app_worker_id=owner_id)
+                turn_recorder.record_child(child_outcome)
+                turn_recorder.finalize(outcome="failed")
+                return outcome
+            await self._register_runner_worker(worker)
+            worker_id = owner_id or "main"
+            self._known_work_items.add(work_item_id)
+            clarification_context = self._clarification_context(pending, transcript)
             child = self._new_work_item_recorder(
                 origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=work_item_id
             )
-            child_outcome = child.finalize(outcome="missing_search", app_worker_id=owner_id)
+            retained_recorder = self._new_retained_recorder(
+                origin_epoch=origin.epoch,
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                app_worker_id=worker_id,
+            )
+            outcome_label = "completed"
+
+            def on_late_terminal(item_id: str, terminal_kind: str) -> None:
+                if item_id == work_item_id:
+                    retained_recorder.claim(terminal_kind)
+
+            async def execute(_worker_id: str, query: str) -> GroundedResult:
+                nonlocal outcome_label
+                try:
+                    kwargs: dict[str, Any] = {
+                        "turn_id": turn_id,
+                        "origin_epoch": origin.epoch,
+                    }
+                    if clarification_context is not None:
+                        kwargs["clarification_context"] = clarification_context
+                    result = await search(query, **kwargs)
+                    outcome_label = "completed"
+                    return result
+                except WorkerClarify as exc:
+                    outcome_label = "clarify"
+                    return self._worker_clarification_result(
+                        worker_id=worker_id,
+                        turn_id=turn_id,
+                        question=exc.question,
+                        original_query=(pending.original_query if pending is not None else query),
+                        origin_epoch=origin.epoch,
+                    )
+                except WorkerDeclined:
+                    outcome_label = "declined"
+                    return canonical_result(
+                        worker_id=worker_id,
+                        turn_id=turn_id,
+                        text="I could not find a reliable result for that request.",
+                        origin_epoch=origin.epoch,
+                    )
+
+            submitted = await self.coordinator.submit(
+                work_item_id,
+                [(worker_id, transcript)],
+                execute,
+                on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+                work_item_ids=[work_item_id],
+                on_late_terminal=on_late_terminal,
+            )
+            if submitted.results:
+                result = submitted.results[0]
+                child_outcome = child.finalize(
+                    outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
+                )
+            elif submitted.pending_work_item_ids:
+                result = canonical_result(
+                    worker_id=worker_id,
+                    turn_id=turn_id,
+                    text="That is taking longer than expected; I will continue in the background.",
+                    origin_epoch=origin.epoch,
+                )
+                child_outcome = child.finalize(outcome="retained", app_worker_id=worker_id)
+                self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+            else:
+                failure_outcome = (
+                    self._failure_child_outcome(submitted.failures[0])
+                    if submitted.failures
+                    else "failed"
+                )
+                result = canonical_result(
+                    worker_id=worker_id,
+                    turn_id=turn_id,
+                    text="The pending web request could not be completed.",
+                    origin_epoch=origin.epoch,
+                )
+                child_outcome = child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             turn_recorder.record_child(child_outcome)
-            turn_recorder.finalize(outcome="failed")
-            return outcome
-        await self._register_runner_worker(worker)
-        worker_id = owner_id or "main"
-        self._known_work_items.add(work_item_id)
-        clarification_context = self._clarification_context(pending, transcript)
-        child = self._new_work_item_recorder(
-            origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=work_item_id
-        )
-        retained_recorder = self._new_retained_recorder(
-            origin_epoch=origin.epoch,
-            turn_id=turn_id,
-            work_item_id=work_item_id,
-            app_worker_id=worker_id,
-        )
-        outcome_label = "completed"
-
-        def on_late_terminal(item_id: str, terminal_kind: str) -> None:
-            if item_id == work_item_id:
-                retained_recorder.claim(terminal_kind)
-
-        async def execute(_worker_id: str, query: str) -> GroundedResult:
-            nonlocal outcome_label
-            try:
-                kwargs: dict[str, Any] = {
-                    "turn_id": turn_id,
-                    "origin_epoch": origin.epoch,
-                }
-                if clarification_context is not None:
-                    kwargs["clarification_context"] = clarification_context
-                result = await search(query, **kwargs)
-                outcome_label = "completed"
-                return result
-            except WorkerClarify as exc:
-                outcome_label = "clarify"
-                return self._worker_clarification_result(
-                    worker_id=worker_id,
-                    turn_id=turn_id,
-                    question=exc.question,
-                    original_query=(pending.original_query if pending is not None else query),
-                    origin_epoch=origin.epoch,
-                )
-            except WorkerDeclined:
-                outcome_label = "declined"
-                return canonical_result(
-                    worker_id=worker_id,
-                    turn_id=turn_id,
-                    text="I could not find a reliable result for that request.",
-                    origin_epoch=origin.epoch,
-                )
-
-        submitted = await self.coordinator.submit(
-            work_item_id,
-            [(worker_id, transcript)],
-            execute,
-            on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
-            work_item_ids=[work_item_id],
-            on_late_terminal=on_late_terminal,
-        )
-        if submitted.results:
-            result = submitted.results[0]
-            child_outcome = child.finalize(
-                outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
-            )
-        elif submitted.pending_work_item_ids:
-            result = canonical_result(
-                worker_id=worker_id,
-                turn_id=turn_id,
-                text="That is taking longer than expected; I will continue in the background.",
-                origin_epoch=origin.epoch,
-            )
-            child_outcome = child.finalize(outcome="retained", app_worker_id=worker_id)
-            self._register_retained_recorder_if_open(work_item_id, retained_recorder)
-        else:
-            failure_outcome = (
-                self._failure_child_outcome(submitted.failures[0])
-                if submitted.failures
-                else "failed"
-            )
-            result = canonical_result(
-                worker_id=worker_id,
-                turn_id=turn_id,
-                text="The pending web request could not be completed.",
-                origin_epoch=origin.epoch,
-            )
-            child_outcome = child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
-        turn_recorder.record_child(child_outcome)
-        committed = await self._commit_and_speak(result, origin)
-        turn_recorder.finalize()
-        return committed
+            committed = await self._commit_and_speak(result, origin)
+            turn_recorder.finalize()
+            return committed
+        except asyncio.CancelledError:
+            if not turn_recorder.finalized:
+                turn_recorder.finalize(outcome="cancelled")
+            raise
+        except Exception:
+            if not turn_recorder.finalized:
+                turn_recorder.finalize(outcome="failed")
+            raise
 
     async def _handle_multi_intent(
         self, outcome: Any, transcript: str, origin: Any, turn_id: str
@@ -992,223 +1001,234 @@ class SessionHost:
         """Execute bounded compound work in the user's stated order."""
         del transcript
         turn_recorder = self._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id)
-        results: dict[int, Any] = {}
-        runnable: list[tuple[str, str]] = []
-        runnable_indexes: list[int] = []
-        runnable_workers: dict[int, Any] = {}
-        contexts: dict[int, ClarificationContext | None] = {}
-        child_recorders: dict[int, WorkItemRecorder] = {}
-        pending = getattr(outcome, "pending_dialogue", None)
-        for index, item_text in enumerate(outcome.work_items):
-            item_work_item_id = f"work-{turn_id}-{index}"
-            child = self._new_work_item_recorder(
-                origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=item_work_item_id
-            )
-            child_recorders[index] = child
-            worker = None
-            if index == 0 and pending is not None:
-                registered = self.coordinator.registry.get(pending.owner_id)
-                worker = registered.worker if registered is not None else None
-            else:
-                catalogue = self.coordinator.registry.catalogue()
-                try:
-                    envelope = await asyncio.to_thread(
-                        self.coordinator.router.route_envelope,
-                        item_text,
-                        catalogue,
-                    )
-                except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
-                    logger.exception(
-                        f"Routing failed for {turn_id}-{index}; returning a safe result"
-                    )
-                    results[index] = canonical_result(
-                        worker_id="main",
-                        turn_id=f"{turn_id}-{index}",
-                        text="Routing is temporarily unavailable. Please try that request again.",
-                        origin_epoch=origin.epoch,
-                    )
-                    turn_recorder.record_child(child.finalize(outcome="failed"))
-                    continue
-                decision = envelope.decision
-                action = getattr(decision, "action", None)
-                if action in {"direct", "unsupported", "clarify"}:
-                    text = (
-                        envelope.prose
-                        or {
-                            "direct": "I could not produce a direct answer yet.",
-                            "unsupported": "I cannot access that capability here.",
-                            "clarify": "Could you clarify what you want me to search for?",
-                        }[action]
-                    )
-                    results[index] = canonical_result(
-                        worker_id="main",
-                        turn_id=f"{turn_id}-{index}",
-                        text=text,
-                        origin_epoch=origin.epoch,
-                    )
-                    turn_recorder.record_child(child.finalize(outcome=action))
-                    continue
-                try:
-                    worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
-                    await self._register_runner_worker(worker)
-                except (RoutingValidationError, UnsupportedWorkerType):
+        try:
+            results: dict[int, Any] = {}
+            runnable: list[tuple[str, str]] = []
+            runnable_indexes: list[int] = []
+            runnable_workers: dict[int, Any] = {}
+            contexts: dict[int, ClarificationContext | None] = {}
+            child_recorders: dict[int, WorkItemRecorder] = {}
+            pending = getattr(outcome, "pending_dialogue", None)
+            for index, item_text in enumerate(outcome.work_items):
+                item_work_item_id = f"work-{turn_id}-{index}"
+                child = self._new_work_item_recorder(
+                    origin_epoch=origin.epoch, turn_id=turn_id, work_item_id=item_work_item_id
+                )
+                child_recorders[index] = child
+                worker = None
+                if index == 0 and pending is not None:
+                    registered = self.coordinator.registry.get(pending.owner_id)
+                    worker = registered.worker if registered is not None else None
+                else:
+                    catalogue = self.coordinator.registry.catalogue()
+                    try:
+                        envelope = await asyncio.to_thread(
+                            self.coordinator.router.route_envelope,
+                            item_text,
+                            catalogue,
+                        )
+                    except Exception:  # noqa: BLE001  # intentional catch-all: routing can raise arbitrary provider/model errors that must fall back to a safe result
+                        logger.exception(
+                            f"Routing failed for {turn_id}-{index}; returning a safe result"
+                        )
+                        results[index] = canonical_result(
+                            worker_id="main",
+                            turn_id=f"{turn_id}-{index}",
+                            text="Routing is temporarily unavailable. Please try that request again.",
+                            origin_epoch=origin.epoch,
+                        )
+                        turn_recorder.record_child(child.finalize(outcome="failed"))
+                        continue
+                    decision = envelope.decision
+                    action = getattr(decision, "action", None)
+                    if action in {"direct", "unsupported", "clarify"}:
+                        text = (
+                            envelope.prose
+                            or {
+                                "direct": "I could not produce a direct answer yet.",
+                                "unsupported": "I cannot access that capability here.",
+                                "clarify": "Could you clarify what you want me to search for?",
+                            }[action]
+                        )
+                        results[index] = canonical_result(
+                            worker_id="main",
+                            turn_id=f"{turn_id}-{index}",
+                            text=text,
+                            origin_epoch=origin.epoch,
+                        )
+                        turn_recorder.record_child(child.finalize(outcome=action))
+                        continue
+                    try:
+                        worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
+                        await self._register_runner_worker(worker)
+                    except (RoutingValidationError, UnsupportedWorkerType):
+                        results[index] = canonical_result(
+                            worker_id="main",
+                            turn_id=f"{turn_id}-{index}",
+                            text="I cannot access that capability here.",
+                            origin_epoch=origin.epoch,
+                        )
+                        turn_recorder.record_child(child.finalize(outcome="failed"))
+                        continue
+                search = getattr(worker, "search", None)
+                if search is None:
                     results[index] = canonical_result(
                         worker_id="main",
                         turn_id=f"{turn_id}-{index}",
                         text="I cannot access that capability here.",
                         origin_epoch=origin.epoch,
                     )
-                    turn_recorder.record_child(child.finalize(outcome="failed"))
+                    worker_id_for_child = (
+                        getattr(getattr(worker, "metadata", None), "worker_id", None)
+                        if worker is not None
+                        else None
+                    )
+                    turn_recorder.record_child(
+                        child.finalize(
+                            outcome="missing_worker" if worker is None else "missing_search",
+                            app_worker_id=worker_id_for_child,
+                        )
+                    )
                     continue
-            search = getattr(worker, "search", None)
-            if search is None:
-                results[index] = canonical_result(
-                    worker_id="main",
-                    turn_id=f"{turn_id}-{index}",
-                    text="I cannot access that capability here.",
-                    origin_epoch=origin.epoch,
-                )
-                worker_id_for_child = (
-                    getattr(getattr(worker, "metadata", None), "worker_id", None)
-                    if worker is not None
+                worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
+                runnable.append((worker_id, item_text))
+                runnable_indexes.append(index)
+                runnable_workers[index] = worker
+                contexts[index] = (
+                    self._clarification_context(pending, item_text)
+                    if index == 0 and pending is not None
                     else None
                 )
+
+            execution_indexes: dict[tuple[str, str], list[int]] = {}
+            for item_index, item in zip(runnable_indexes, runnable, strict=True):
+                execution_indexes.setdefault(item, []).append(item_index)
+
+            outcome_labels: dict[int, str] = {}
+
+            async def execute(worker_id: str, query: str) -> GroundedResult:
+                item_index = execution_indexes[(worker_id, query)].pop(0)
+                item_turn_id = f"{turn_id}-{item_index}"
+                search = runnable_workers[item_index].search
+                try:
+                    kwargs: dict[str, Any] = {
+                        "turn_id": item_turn_id,
+                        "origin_epoch": origin.epoch,
+                    }
+                    if contexts[item_index] is not None:
+                        kwargs["clarification_context"] = contexts[item_index]
+                    result = await search(query, **kwargs)
+                    outcome_labels[item_index] = "completed"
+                    return result
+                except WorkerClarify as exc:
+                    outcome_labels[item_index] = "clarify"
+                    original_query = (
+                        contexts[item_index].original_query
+                        if contexts[item_index] is not None
+                        else query
+                    )
+                    return self._worker_clarification_result(
+                        worker_id=worker_id,
+                        turn_id=item_turn_id,
+                        question=exc.question,
+                        original_query=original_query,
+                        origin_epoch=origin.epoch,
+                    )
+                except WorkerDeclined:
+                    outcome_labels[item_index] = "declined"
+                    return canonical_result(
+                        worker_id=worker_id,
+                        turn_id=item_turn_id,
+                        text="I could not find a reliable result for that request.",
+                        origin_epoch=origin.epoch,
+                    )
+
+            work_item_ids = [f"work-{turn_id}-{index}" for index in runnable_indexes]
+            self._known_work_items.update(work_item_ids)
+            retained_recorders: dict[str, RetainedRecorder] = {
+                f"work-{turn_id}-{index}": self._new_retained_recorder(
+                    origin_epoch=origin.epoch,
+                    turn_id=turn_id,
+                    work_item_id=f"work-{turn_id}-{index}",
+                    app_worker_id=runnable[runnable_indexes.index(index)][0],
+                )
+                for index in runnable_indexes
+            }
+
+            def on_late_terminal(item_id: str, terminal_kind: str) -> None:
+                recorder = retained_recorders.get(item_id)
+                if recorder is not None:
+                    recorder.claim(terminal_kind)
+
+            submitted = await self.coordinator.submit(
+                f"work-{turn_id}",
+                runnable,
+                execute,
+                on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+                work_item_ids=work_item_ids,
+                on_late_terminal=on_late_terminal,
+            )
+            result_indexes = {
+                result.turn_id: index
+                for index in runnable_indexes
+                for result in submitted.results
+                if result.turn_id == f"{turn_id}-{index}"
+            }
+            for result in submitted.results:
+                index = result_indexes[result.turn_id]
+                results[index] = result
+                worker_id = runnable[runnable_indexes.index(index)][0]
                 turn_recorder.record_child(
-                    child.finalize(
-                        outcome="missing_worker" if worker is None else "missing_search",
-                        app_worker_id=worker_id_for_child,
+                    child_recorders[index].finalize(
+                        outcome=outcome_labels.get(index, "completed"),
+                        app_worker_id=worker_id,
+                        result_id=result.result_id,
                     )
                 )
-                continue
-            worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
-            runnable.append((worker_id, item_text))
-            runnable_indexes.append(index)
-            runnable_workers[index] = worker
-            contexts[index] = (
-                self._clarification_context(pending, item_text)
-                if index == 0 and pending is not None
-                else None
-            )
-
-        execution_indexes: dict[tuple[str, str], list[int]] = {}
-        for item_index, item in zip(runnable_indexes, runnable, strict=True):
-            execution_indexes.setdefault(item, []).append(item_index)
-
-        outcome_labels: dict[int, str] = {}
-
-        async def execute(worker_id: str, query: str) -> GroundedResult:
-            item_index = execution_indexes[(worker_id, query)].pop(0)
-            item_turn_id = f"{turn_id}-{item_index}"
-            search = runnable_workers[item_index].search
-            try:
-                kwargs: dict[str, Any] = {
-                    "turn_id": item_turn_id,
-                    "origin_epoch": origin.epoch,
-                }
-                if contexts[item_index] is not None:
-                    kwargs["clarification_context"] = contexts[item_index]
-                result = await search(query, **kwargs)
-                outcome_labels[item_index] = "completed"
-                return result
-            except WorkerClarify as exc:
-                outcome_labels[item_index] = "clarify"
-                original_query = (
-                    contexts[item_index].original_query
-                    if contexts[item_index] is not None
-                    else query
-                )
-                return self._worker_clarification_result(
+            for work_item_id in submitted.pending_work_item_ids:
+                item_index = int(work_item_id.rsplit("-", 1)[1])
+                worker_id = runnable[runnable_indexes.index(item_index)][0]
+                results[item_index] = canonical_result(
                     worker_id=worker_id,
-                    turn_id=item_turn_id,
-                    question=exc.question,
-                    original_query=original_query,
+                    turn_id=f"{turn_id}-{item_index}",
+                    text="That item is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
-            except WorkerDeclined:
-                outcome_labels[item_index] = "declined"
-                return canonical_result(
-                    worker_id=worker_id,
-                    turn_id=item_turn_id,
-                    text="I could not find a reliable result for that request.",
+                turn_recorder.record_child(
+                    child_recorders[item_index].finalize(
+                        outcome="retained", app_worker_id=worker_id
+                    )
+                )
+                recorder = retained_recorders.get(work_item_id)
+                if recorder is not None:
+                    self._register_retained_recorder_if_open(work_item_id, recorder)
+            for failure in submitted.failures:
+                item_index = int(failure.work_item_id.rsplit("-", 1)[1])
+                results[item_index] = canonical_result(
+                    worker_id=failure.worker_id,
+                    turn_id=f"{turn_id}-{item_index}",
+                    text="The web search is temporarily unavailable.",
                     origin_epoch=origin.epoch,
                 )
-
-        work_item_ids = [f"work-{turn_id}-{index}" for index in runnable_indexes]
-        self._known_work_items.update(work_item_ids)
-        retained_recorders: dict[str, RetainedRecorder] = {
-            f"work-{turn_id}-{index}": self._new_retained_recorder(
-                origin_epoch=origin.epoch,
-                turn_id=turn_id,
-                work_item_id=f"work-{turn_id}-{index}",
-                app_worker_id=runnable[runnable_indexes.index(index)][0],
-            )
-            for index in runnable_indexes
-        }
-
-        def on_late_terminal(item_id: str, terminal_kind: str) -> None:
-            recorder = retained_recorders.get(item_id)
-            if recorder is not None:
-                recorder.claim(terminal_kind)
-
-        submitted = await self.coordinator.submit(
-            f"work-{turn_id}",
-            runnable,
-            execute,
-            on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
-            work_item_ids=work_item_ids,
-            on_late_terminal=on_late_terminal,
-        )
-        result_indexes = {
-            result.turn_id: index
-            for index in runnable_indexes
-            for result in submitted.results
-            if result.turn_id == f"{turn_id}-{index}"
-        }
-        for result in submitted.results:
-            index = result_indexes[result.turn_id]
-            results[index] = result
-            worker_id = runnable[runnable_indexes.index(index)][0]
-            turn_recorder.record_child(
-                child_recorders[index].finalize(
-                    outcome=outcome_labels.get(index, "completed"),
-                    app_worker_id=worker_id,
-                    result_id=result.result_id,
+                turn_recorder.record_child(
+                    child_recorders[item_index].finalize(
+                        outcome=self._failure_child_outcome(failure),
+                        app_worker_id=failure.worker_id,
+                    )
                 )
-            )
-        for work_item_id in submitted.pending_work_item_ids:
-            item_index = int(work_item_id.rsplit("-", 1)[1])
-            worker_id = runnable[runnable_indexes.index(item_index)][0]
-            results[item_index] = canonical_result(
-                worker_id=worker_id,
-                turn_id=f"{turn_id}-{item_index}",
-                text="That item is taking longer than expected; I will continue in the background.",
-                origin_epoch=origin.epoch,
-            )
-            turn_recorder.record_child(
-                child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
-            )
-            recorder = retained_recorders.get(work_item_id)
-            if recorder is not None:
-                self._register_retained_recorder_if_open(work_item_id, recorder)
-        for failure in submitted.failures:
-            item_index = int(failure.work_item_id.rsplit("-", 1)[1])
-            results[item_index] = canonical_result(
-                worker_id=failure.worker_id,
-                turn_id=f"{turn_id}-{item_index}",
-                text="The web search is temporarily unavailable.",
-                origin_epoch=origin.epoch,
-            )
-            turn_recorder.record_child(
-                child_recorders[item_index].finalize(
-                    outcome=self._failure_child_outcome(failure),
-                    app_worker_id=failure.worker_id,
-                )
-            )
-        committed = []
-        for index in sorted(results):
-            committed.append(await self._commit_and_speak(results[index], origin))
-        turn_recorder.finalize()
-        return tuple(committed)
+            committed = []
+            for index in sorted(results):
+                committed.append(await self._commit_and_speak(results[index], origin))
+            turn_recorder.finalize()
+            return tuple(committed)
+        except asyncio.CancelledError:
+            if not turn_recorder.finalized:
+                turn_recorder.finalize(outcome="cancelled")
+            raise
+        except Exception:
+            if not turn_recorder.finalized:
+                turn_recorder.finalize(outcome="failed")
+            raise
 
     def _worker_clarification_result(
         self,
@@ -1309,23 +1329,14 @@ class SessionHost:
         """Commit a late result and defer speech on its still-active TTS epoch."""
         # Popping (rather than peeking) makes a callback arriving after a
         # dispatch-registered recorder's finalization a structural no-op for
-        # that recorder. When no dispatch-time recorder was registered (e.g.
-        # this coroutine is invoked directly, as the paid-search coordinator
-        # path does not always go through), build one on demand so every
-        # accepted late result still reaches its background terminal metric.
+        # that recorder. Every retained work item registers its provisional
+        # recorder at dispatch, so a missing recorder means this work item's
+        # background metric is already closed (or was never retained): the
+        # remainder of this method stays telemetry-silent rather than opening a
+        # replacement recorder, whose start instant would be completion time
+        # and whose `background_ms` would therefore be near zero.
         recorder = self._retained_recorders.pop(late.work_item_id, None)
-        if recorder is None:
-            recorder = self._new_retained_recorder(
-                origin_epoch=origin_epoch,
-                turn_id=(
-                    late.result.turn_id
-                    if isinstance(late.result, GroundedResult)
-                    else late.work_item_id
-                ),
-                work_item_id=late.work_item_id,
-                app_worker_id=late.worker_id,
-            )
-        if late.terminal_kind is not None:
+        if recorder is not None and late.terminal_kind is not None:
             recorder.claim(late.terminal_kind)
         if late.error is not None:
             self._known_work_items.discard(late.work_item_id)

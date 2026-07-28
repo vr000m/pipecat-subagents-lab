@@ -2901,6 +2901,114 @@ def test_multi_intent_all_completed_emits_completed_parent_and_all_completed_chi
     asyncio.run(run())
 
 
+def test_pending_search_submit_exception_still_emits_failed_parent() -> None:
+    """``_handle_pending`` must finalize ``app_turn_foreground`` as ``failed``
+    even when ``coordinator.submit`` raises before returning, matching the
+    matrix's "Router, dispatch, search, commit, or enqueue helper raises
+    Exception" row that ``_handle_transcript_impl`` already honors.
+    """
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                raise RuntimeError("submit exploded")
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        pending = type(
+            "Pending",
+            (),
+            {
+                "owner_id": "worker-search",
+                "original_query": "continue please",
+                "question": "Which one?",
+            },
+        )()
+        outcome = type("Outcome", (), {"pending_dialogue": pending, "work_items": ()})()
+
+        with pytest.raises(RuntimeError, match="submit exploded"):
+            await host._handle_pending(outcome, "continue please", origin, "turn-pending-fail")
+
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        assert parent["child_count"] == 0
+        assert _events(sink, "work_item_foreground") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_commit_exception_still_emits_failed_parent() -> None:
+    """``_handle_multi_intent`` must finalize ``app_turn_foreground`` as
+    ``failed`` even when ``_commit_and_speak`` raises after work items have
+    already completed, matching the same matrix row as the sibling test
+    above and ``_handle_transcript_impl``'s existing exception safety.
+    """
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(_text: str, _catalogue: object) -> object:
+                decision = type("Decision", (), {"action": "existing_worker"})()
+                return type("Envelope", (), {"decision": decision, "prose": None})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome", (), {"work_items": ("first item", "second item"), "pending_dialogue": None}
+        )()
+
+        async def raising_commit_and_speak(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("commit exploded")
+
+        host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit exploded"):
+            await host._handle_multi_intent(outcome, "", origin, "turn-multi-commit-fail")
+
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_foreground_timing_fields_respect_start_stop_boundary_ordering() -> None:
     """Deterministic-clock stand-in: exact per-field durations against the
     Timing Boundaries table require knowing the Phase 2 recorder's internal
@@ -2951,6 +3059,26 @@ def _background_records(sink: CollectingMeasurementSink) -> tuple[object, ...]:
     return _events(sink, "work_item_background")
 
 
+def _register_dispatch_recorder(
+    host: SessionHost,
+    work_item_id: str,
+    *,
+    origin_epoch: int = 1,
+    turn_id: str = "turn-retained",
+    worker_id: str = "worker-search",
+) -> object:
+    """Stand in for the dispatch-time provisional recorder registration that
+    every retained work item goes through before its late callback can run."""
+    recorder = host._new_retained_recorder(
+        origin_epoch=origin_epoch,
+        turn_id=turn_id,
+        work_item_id=work_item_id,
+        app_worker_id=worker_id,
+    )
+    host._retained_recorders[work_item_id] = recorder
+    return recorder
+
+
 def test_retained_completion_with_speech_emits_completed_committed_queued() -> None:
     async def run() -> None:
         tts = FakeTTS()
@@ -2966,6 +3094,7 @@ def test_retained_completion_with_speech_emits_completed_committed_queued() -> N
             spoken_text="Spoken late answer",
             origin_epoch=1,
         )
+        _register_dispatch_recorder(host, "work-retained-ok", turn_id="turn-retained-ok")
         late = LateResult(
             work_item_id="work-retained-ok",
             worker_id="worker-search",
@@ -2991,6 +3120,7 @@ def test_retained_worker_exception_emits_failed_not_applicable_axes() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
         host = SessionHost(measurement_sink=sink)
+        _register_dispatch_recorder(host, "work-failed")
 
         await host._commit_late_result(
             LateResult(
@@ -3015,6 +3145,7 @@ def test_retained_worker_cancellation_emits_cancelled_axes() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
         host = SessionHost(measurement_sink=sink)
+        _register_dispatch_recorder(host, "work-cancelled")
 
         await host._commit_late_result(
             LateResult(
@@ -3039,6 +3170,7 @@ def test_retained_user_cancelled_work_item_suppresses_commit_and_speech() -> Non
         sink = CollectingMeasurementSink()
         host = SessionHost(measurement_sink=sink)
         host._cancelled_work_items.add("work-user-cancelled")
+        _register_dispatch_recorder(host, "work-user-cancelled", turn_id="turn-user-cancelled")
         result = GroundedResult(
             result_id="result-user-cancelled",
             worker_id="worker-search",
@@ -3067,6 +3199,7 @@ def test_retained_invalid_result_type_emits_invalid_result_axes() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
         host = SessionHost(measurement_sink=sink)
+        _register_dispatch_recorder(host, "work-invalid")
 
         await host._commit_late_result(
             LateResult(
@@ -3107,6 +3240,8 @@ def test_retained_duplicate_result_id_suppresses_commit() -> None:
             origin_epoch=1,
         )
 
+        _register_dispatch_recorder(host, "work-dup", turn_id="turn-dup")
+
         await host._commit_late_result(
             LateResult(work_item_id="work-dup", worker_id="worker-search", result=duplicate),
             1,
@@ -3139,6 +3274,8 @@ def test_retained_result_after_connection_replaced_commits_but_marks_speech_stal
             origin_epoch=1,
         )
 
+        _register_dispatch_recorder(host, "work-replaced-epoch", turn_id="turn-replaced-epoch")
+
         await host._commit_late_result(
             LateResult(
                 work_item_id="work-replaced-epoch", worker_id="worker-search", result=result
@@ -3170,6 +3307,10 @@ def test_retained_result_from_replaced_origin_epoch_suppresses_commit_as_stale()
             origin_epoch=1,
         )
 
+        _register_dispatch_recorder(
+            host, "work-stale-origin", origin_epoch=2, turn_id="turn-stale-origin"
+        )
+
         await host._commit_late_result(
             LateResult(work_item_id="work-stale-origin", worker_id="worker-search", result=result),
             2,
@@ -3196,6 +3337,8 @@ def test_retained_result_without_active_connection_marks_speech_disconnected() -
             spoken_text="Complete",
             origin_epoch=1,
         )
+
+        _register_dispatch_recorder(host, "work-disconnected", turn_id="turn-disconnected")
 
         await host._commit_late_result(
             LateResult(work_item_id="work-disconnected", worker_id="worker-search", result=result),
@@ -3224,6 +3367,8 @@ def test_retained_result_without_tts_service_marks_speech_no_tts() -> None:
             spoken_text="Complete",
             origin_epoch=1,
         )
+
+        _register_dispatch_recorder(host, "work-no-tts", turn_id="turn-no-tts")
 
         await host._commit_late_result(
             LateResult(work_item_id="work-no-tts", worker_id="worker-search", result=result),
@@ -3287,6 +3432,85 @@ def test_shutdown_finalizes_open_retained_recorder_after_coordinator_settles() -
         background = _background_records(sink)
         assert len(background) == 1
         assert background[0].fields["work_outcome"] == "cancelled"
+
+    asyncio.run(run())
+
+
+def test_retained_background_ms_spans_dispatch_to_completion_for_late_callbacks() -> None:
+    """``background_ms`` must measure dispatch-to-completion, and a duplicate
+    late callback must not open a replacement recorder whose start instant is
+    completion time (which would emit a second, near-zero record)."""
+
+    async def run() -> None:
+        class SlowWorker(ResultWorker):
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                await asyncio.sleep(0.08)
+                return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+        worker = SlowWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "slow", "model_policy": "deep"},
+        )()
+        sink = CollectingMeasurementSink()
+
+        class RetainingRoutedCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(worker)
+                self.owner = WorkItemCoordinator(
+                    config=Config(foreground_search_timeout_seconds=0.001)
+                )
+                self.config = self.owner.config
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                return self.owner.start_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **kwargs: object) -> bool:
+                return self.owner.retain_late_task(task, **kwargs)
+
+            async def shutdown(self) -> None:
+                await self.owner.shutdown()
+
+        coordinator = RetainingRoutedCoordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        foreground = await host._handle_transcript("slow but finishing")
+        assert "continue in the background" in foreground.text
+
+        deadline = time.perf_counter() + 2.0
+        while not _background_records(sink) and time.perf_counter() < deadline:
+            await asyncio.sleep(0.01)
+
+        records = _background_records(sink)
+        assert len(records) == 1
+        fields = records[0].fields
+        assert fields["work_outcome"] == "completed"
+        # The provisional recorder starts at dispatch, so the 80 ms worker delay
+        # is inside the span; a recorder built when the late result arrived
+        # would report near zero instead.
+        assert fields["background_ms"] >= 70
+
+        committed = host.state.result_history("worker-search")[-1]
+        await host._commit_late_result(
+            LateResult(
+                work_item_id=fields["work_item_id"],
+                worker_id="worker-search",
+                result=committed,
+                terminal_kind="completed",
+            ),
+            1,
+        )
+        after_duplicate = _background_records(sink)
+        assert len(after_duplicate) == 1
+        assert all(record.fields["background_ms"] >= 70 for record in after_duplicate)
+
+        await host.shutdown()
 
     asyncio.run(run())
 

@@ -967,6 +967,46 @@ def test_on_late_terminal_hook_fires_synchronously_before_shutdown_suppresses_on
     asyncio.run(run())
 
 
+def test_raising_on_late_terminal_hook_does_not_block_cleanup_or_on_complete() -> None:
+    """``on_late_terminal`` is telemetry-only: if the caller-supplied hook
+    raises, the completion callback must still discard the task from
+    bookkeeping and still deliver ``on_complete``/``LateResult`` — the hook
+    failing must never drop the worker's completed result or leak task state.
+    """
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_work_items_per_turn=2)
+        completed_calls: list[object] = []
+
+        async def provider() -> dict:
+            return {"text": "late", "citations": []}
+
+        def raising_hook(_work_item_id: str, _terminal_kind: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        task = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            task,
+            work_item_id="work-terminal-hook-raises",
+            worker_id="worker-1",
+            on_complete=completed_calls.append,
+            on_late_terminal=raising_hook,
+        )
+        await task
+        await asyncio.sleep(0)
+
+        assert task not in coordinator._late_tasks
+        assert task not in coordinator._background_task_order
+        assert len(completed_calls) == 1
+        assert completed_calls[0].work_item_id == "work-terminal-hook-raises"
+        assert completed_calls[0].worker_id == "worker-1"
+        assert completed_calls[0].terminal_kind == "completed"
+        assert completed_calls[0].result.text == "late"
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
 def test_shared_multi_intent_callback_receives_distinct_late_results_per_item() -> None:
     """Multi-intent submission shares one ``on_late_complete`` callback across
     every decomposed work item; each invocation must carry that item's own

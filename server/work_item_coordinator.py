@@ -291,7 +291,12 @@ class WorkItemCoordinator:
             else:
                 terminal_kind = "completed"
             if on_late_terminal is not None:
-                on_late_terminal(work_item_id, terminal_kind)
+                try:
+                    on_late_terminal(work_item_id, terminal_kind)
+                except Exception:  # noqa: BLE001  # telemetry-only hook must never block task cleanup or result delivery
+                    logger.exception(
+                        f"on_late_terminal hook raised for {work_item_id} ({terminal_kind})"
+                    )
             self._discard_ordered_task(
                 completed_task,
                 self._late_tasks,
