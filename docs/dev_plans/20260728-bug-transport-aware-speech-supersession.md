@@ -581,7 +581,7 @@ sequenceDiagram
 
 - [x] Phase 1: Add the correlated generation state machine and transport slot
 - [x] Phase 2: Make queued timeout supersession explicit and work-scoped
-- [ ] Phase 3: Document the boundary and run cross-phase validation
+- [x] Phase 3: Document the boundary and run cross-phase validation
 
 ## Findings
 
@@ -589,11 +589,30 @@ sequenceDiagram
   playback state diverge after synthesis completion.
 - Commit `73d1a7c` implements queue-only work-item discard but cannot remove a notice
   already submitted to the output transport.
+- Phase 1 fix loop surfaced a genuine wiring bug (missing `await` on
+  `SpeechLifecycleCoordinator.on_transport_bot_stopped`) and a missing
+  `start_next()`/marker-consumption gap on the interruption/pause path; both were
+  fixed within the fix loop. Iteration 2 correctly identified 3 remaining test
+  failures as test-contract mismatches (tests asserting behavior the plan
+  explicitly forbids) rather than implementation bugs; the test-writer then
+  aligned those 3 assertions with the already-tested Phase 1 contract.
 
 ## Issues & Solutions
 
-_To be filled during implementation._
+- Phase 1, iterations 0-1: `SpeechLifecycleCoordinator.on_transport_bot_stopped`
+  was called without `await` in `server/pipeline.py`, and the coordinator did not
+  call `start_next()` after synthesis completion + transport release in all
+  paths. Fixed by the implementer across two fix-loop iterations.
+- Phase 1, iteration 2: 3 tests in `tests/test_pipeline.py` asserted behavior
+  contradicting explicit Phase 1 requirements (synthesis-end-alone must not
+  release the transport slot; a `SpeechGenerationMarkerFrame` must precede every
+  `TTSSpeakFrame` including control acks). The implementer flagged
+  `test_contract_mismatch: true`; the test-writer fixed the 3 assertions to
+  match the established, already-tested contract instead.
 
 ## Final Results
 
-_To be filled on completion._
+All 3 phases implemented via `/skein:conduct --autonomous`. Final state: 578/578
+tests pass, `ruff format --check` and `ruff check` clean. Commits:
+`6124040` (phase 1), `13d1044` (phase 2), `df0d5e0` (phase 3), plus progress
+bookkeeping commits `9ff8f70` and `3a5f6c9`.
