@@ -66,6 +66,8 @@ model = "nova-3-general"
 [turn]
 smart_turn_timeout_seconds = 5.0
 smart_turn_complete_grace_seconds = 1.5
+speech_start_timeout_seconds = 10.0
+speech_transport_grace_seconds = 1.0
 pending_dialogue_timeout_seconds = 30.0
 foreground_search_timeout_seconds = 15.0
 router_timeout_seconds = 12.0
@@ -109,6 +111,15 @@ speech boundary resets this timer; five silent seconds finalize the accumulated
 transcript by default. `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` controls a
 separate application debounce after Smart Turn reports a complete turn. Speech
 that resumes within the default 1.5-second grace remains part of the same turn.
+`WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS` bounds how long a generation handed
+to TTS may wait for a correlated start/audio/provider-error event before the
+speech lifecycle coordinator releases it as `delivery_unknown`; the default
+is 10 seconds. `WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS` is the grace added
+after synthesis end (plus accumulated audio duration) or after an
+interruption/pause is forwarded, before the coordinator tears down the
+transport slot; the default is 1 second. Their TOML equivalents are
+`[turn].speech_start_timeout_seconds` and
+`[turn].speech_transport_grace_seconds`.
 `WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS` controls how long a worker's
 clarifying question remains available for continuation; the default is 30
 seconds. Its TOML equivalent is `[turn].pending_dialogue_timeout_seconds`.

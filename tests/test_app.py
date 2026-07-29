@@ -604,6 +604,48 @@ def test_attach_connection_registers_handlers_on_the_real_startup_and_latency_ob
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "tts",
+    [
+        pytest.param(SimpleNamespace(on_event=None), id="local-event-capable-path"),
+        pytest.param(SimpleNamespace(), id="generic-tts-path"),
+    ],
+)
+def test_attach_connection_installs_one_shared_lifecycle_processor_before_transport_output(
+    tts: object,
+) -> None:
+    """Phase 1 requires one shared TransportSpeechLifecycleProcessor installed
+    immediately before transport.output() for both the local event-capable
+    and generic TTS integration paths -- it must not be duplicated per path
+    and must sit after whichever TTS processor(s) ``_tts_processors`` selects.
+    """
+    from server.speech_lifecycle import TransportSpeechLifecycleProcessor
+
+    async def run() -> None:
+        CapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp, tts=tts)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch, host=host, startup_observers=[], latency_observers=[]
+            )
+        finally:
+            monkeypatch.undo()
+
+        worker = CapturingPipelineWorker.constructed[0]
+        processors = list(worker.pipeline)
+        assert processors[-1] == "output", "the transport output sentinel must be last"
+        lifecycle_processors = [
+            processor
+            for processor in processors
+            if isinstance(processor, TransportSpeechLifecycleProcessor)
+        ]
+        assert len(lifecycle_processors) == 1
+        assert processors[-2] is lifecycle_processors[0]
+
+    asyncio.run(run())
+
+
 def test_attach_connection_fails_clearly_when_default_turn_tracker_is_missing() -> None:
     """Fail loudly if Pipecat's enabled-by-default turn tracker contract changes."""
 

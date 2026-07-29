@@ -1,0 +1,719 @@
+"""Contract tests for the Phase 1 correlated speech lifecycle coordinator.
+
+Exercises ``server/speech_lifecycle.py`` against the invariant the plan
+(``docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md``)
+requires: per-work queues feed one coordinator-owned transport slot,
+generation identity is established before TTS, and synthesis completion,
+cleanup deadlines, and late frames must never release the wrong generation.
+``ManualTimerScheduler`` (defined in the module under test) drives both
+monotonic reads and timer wakeups deterministically -- no wall-clock sleeps.
+
+The coordinator's terminal-path methods (``on_transport_bot_stopped``,
+``provider_error``, ``acknowledge_tts_lane_flush``, ``teardown_complete``)
+and its timer callbacks are async, so every test here runs inside
+``asyncio.run()`` (matching this repo's existing convention, e.g.
+``tests/test_speech_scheduler.py``) and flushes timer-fired coroutines with
+``await tick(clock, seconds)`` rather than a bare ``clock.advance()``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from server.speech_lifecycle import (
+    DeliveryDisposition,
+    GenerationIdentity,
+    GenerationPhase,
+    ManualTimerScheduler,
+    SpeechLifecycleCoordinator,
+)
+
+
+def make_coordinator(
+    clock: ManualTimerScheduler | None = None,
+    **overrides: object,
+) -> tuple[SpeechLifecycleCoordinator, ManualTimerScheduler]:
+    clock = clock or ManualTimerScheduler()
+    kwargs: dict[str, object] = {
+        "speech_start_timeout_seconds": 10.0,
+        "speech_transport_grace_seconds": 1.0,
+    }
+    kwargs.update(overrides)
+    coordinator = SpeechLifecycleCoordinator(clock=clock, timers=clock, **kwargs)
+    return coordinator, clock
+
+
+def identity(work_item_id: str = "work-1", utterance_id: str = "utt-1", origin_epoch=None):
+    return GenerationIdentity(utterance_id, work_item_id, origin_epoch)
+
+
+def admit_and_hand_to_tts(
+    coordinator: SpeechLifecycleCoordinator, work_item_id: str, utterance_id: str
+):
+    generation = coordinator.try_admit(identity(work_item_id, utterance_id))
+    assert generation is not None
+    coordinator.mark_handed_to_tts(generation.token)
+    return generation
+
+
+def synth_audio(*, seconds: float, sample_rate: int = 16000, num_channels: int = 1) -> bytes:
+    """Real 16-bit PCM byte payload of the given duration for on_tts_audio()."""
+    num_frames = round(seconds * sample_rate)
+    return bytes(num_frames * num_channels * 2)
+
+
+async def tick(clock: ManualTimerScheduler, seconds: float) -> None:
+    """Advance the manual clock and let any timer-fired coroutine finish.
+
+    A due timer's callback is scheduled with ``asyncio.ensure_future`` from
+    inside ``ManualTimerScheduler._fire_due`` (synchronous), so the actual
+    coroutine body only runs once the event loop gets a turn.
+    """
+    clock.advance(seconds)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+def run(coro_fn) -> None:
+    asyncio.run(coro_fn())
+
+
+# ---------------------------------------------------------------------------
+# SpeechGeneration / GenerationPhase state machine
+# ---------------------------------------------------------------------------
+
+
+def test_generation_admitted_phase_before_any_tts_activity() -> None:
+    coordinator, _ = make_coordinator()
+
+    generation = coordinator.try_admit(identity())
+
+    assert generation is not None
+    assert generation.phase == GenerationPhase.ADMITTED
+    assert generation.disposition is None
+
+
+def test_marker_hands_generation_to_tts_phase() -> None:
+    coordinator, _ = make_coordinator()
+    generation = coordinator.try_admit(identity())
+
+    coordinator.mark_handed_to_tts(generation.token)
+
+    assert coordinator.generation_for_token(generation.token).phase == GenerationPhase.HANDED_TO_TTS
+
+
+def test_bound_context_progresses_to_synthesizing_then_synthesis_ended() -> None:
+    coordinator, _ = make_coordinator()
+    generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+    coordinator.bind_context(generation.token, "ctx-1")
+    coordinator.on_tts_started("ctx-1")
+    assert coordinator.generation_for_token(generation.token).phase == GenerationPhase.SYNTHESIZING
+
+    assert coordinator.on_tts_stopped("ctx-1") is True
+    assert (
+        coordinator.generation_for_token(generation.token).phase == GenerationPhase.SYNTHESIS_ENDED
+    )
+
+
+def test_on_tts_stopped_and_on_tts_audio_reject_a_stale_or_unknown_context() -> None:
+    coordinator, _ = make_coordinator()
+
+    assert coordinator.on_tts_stopped("never-admitted") is False
+    assert (
+        coordinator.on_tts_audio(
+            "never-admitted", audio=b"\x00\x00", sample_rate=16000, num_channels=1
+        )
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Single global transport slot
+# ---------------------------------------------------------------------------
+
+
+def test_only_one_generation_may_occupy_the_global_slot() -> None:
+    coordinator, _ = make_coordinator()
+    first = coordinator.try_admit(identity("work-1", "utt-1"))
+    assert first is not None
+
+    second = coordinator.try_admit(identity("work-2", "utt-2"))
+
+    assert second is None
+    assert coordinator.slot_token == first.token
+    assert coordinator.occupied is True
+
+
+def test_synthesis_end_does_not_clear_the_slot_or_admit_next() -> None:
+    coordinator, _ = make_coordinator()
+    generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+    coordinator.bind_context(generation.token, "ctx-1")
+    coordinator.on_tts_started("ctx-1")
+
+    coordinator.on_tts_stopped("ctx-1")
+
+    assert coordinator.occupied is True
+    assert coordinator.slot_token == generation.token
+    blocked = coordinator.try_admit(identity("work-2", "utt-2"))
+    assert blocked is None
+
+
+def test_raw_drain_timer_expiry_does_not_clear_an_output_active_slot_without_teardown() -> None:
+    """A timer expiry may initiate cleanup but must not itself release a slot
+    that has already submitted audio to output -- only ``teardown_complete``
+    (proxying completed connection-scoped output teardown) may."""
+
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_audio(
+            "ctx-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+        )
+        coordinator.on_tts_stopped("ctx-1")
+
+        # Drain deadline = synthesis_end + audio_duration(0.1s) + grace(1.0s).
+        await tick(clock, 1.1 + 1e-6)
+
+        generation_state = coordinator.generation_for_token(generation.token)
+        assert generation_state.cleanup_pending is True
+        assert coordinator.occupied is True, (
+            "output-submitted expiry must await teardown_complete(), not silently free the slot"
+        )
+        assert generation_state.terminalized is False
+
+    run(body)
+
+
+def test_teardown_complete_releases_the_slot_after_output_submitted_expiry() -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_audio(
+            "ctx-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+        )
+        coordinator.on_tts_stopped("ctx-1")
+        await tick(clock, 1.1 + 1e-6)
+        assert coordinator.occupied is True
+
+        await coordinator.teardown_complete(generation.token)
+
+        assert coordinator.occupied is False
+        assert coordinator.generation_for_token(generation.token).terminalized is True
+        next_generation = coordinator.try_admit(identity("work-2", "utt-2"))
+        assert next_generation is not None
+
+    run(body)
+
+
+def test_fieldless_transport_stopped_is_the_normal_slot_release() -> None:
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_stopped("ctx-1")
+
+        await coordinator.on_transport_bot_stopped()
+
+        assert coordinator.occupied is False
+        assert (
+            coordinator.generation_for_token(generation.token).phase
+            == GenerationPhase.TRANSPORT_STOPPED
+        )
+        next_generation = coordinator.try_admit(identity("work-2", "utt-2"))
+        assert next_generation is not None
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Fieldless bot frames only ever apply to the sole occupied slot
+# ---------------------------------------------------------------------------
+
+
+def test_fieldless_transport_started_applies_to_the_sole_occupied_slot() -> None:
+    coordinator, _ = make_coordinator()
+    generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+    coordinator.bind_context(generation.token, "ctx-1")
+
+    coordinator.on_transport_bot_started()
+
+    assert (
+        coordinator.generation_for_token(generation.token).phase
+        == GenerationPhase.TRANSPORT_STARTED
+    )
+
+
+def test_fieldless_transport_stopped_with_empty_slot_is_a_noop() -> None:
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+
+        await coordinator.on_transport_bot_stopped()  # no active generation at all
+
+        assert coordinator.occupied is False
+
+    run(body)
+
+
+def test_late_fieldless_a_stop_after_teardown_cannot_release_b() -> None:
+    """A-fallback -> attempted B admission -> late fieldless A stop.
+
+    The single hardest ordering in the plan's Review Focus: once A's audio
+    has crossed into output and its drain deadline has expired, B is
+    admitted only after ``teardown_complete`` retires A's slot; a later
+    fieldless stop that is really A's old, torn-down lane must never be
+    observed as if it were confirming B.
+    """
+
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+        coordinator.bind_context(generation_a.token, "ctx-a")
+        coordinator.on_tts_started("ctx-a")
+        coordinator.on_tts_audio(
+            "ctx-a", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+        )
+        coordinator.on_tts_stopped("ctx-a")
+        await tick(clock, 1.1 + 1e-6)  # drain deadline expiry with output-submitted audio
+
+        blocked = coordinator.try_admit(identity("work-2", "utt-b"))
+        assert blocked is None, "B must not be admitted until A's old lane completes teardown"
+
+        await coordinator.teardown_complete(generation_a.token)
+        generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
+        assert generation_b is not None
+        coordinator.bind_context(generation_b.token, "ctx-b")
+        coordinator.on_transport_bot_started()
+
+        # A very late fieldless stop, arriving after B has already started.
+        await coordinator.on_transport_bot_stopped()
+
+        assert coordinator.occupied is False
+        assert (
+            coordinator.generation_for_token(generation_b.token).phase
+            == GenerationPhase.TRANSPORT_STOPPED
+        )
+        # A's own generation must not be mutated a second time by the late stop.
+        assert (
+            coordinator.generation_for_token(generation_a.token).phase
+            == GenerationPhase.SYNTHESIS_ENDED
+        )
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Stale-frame fence / tombstones
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pause",
+    [pytest.param(False, id="interrupted"), pytest.param(True, id="paused")],
+)
+def test_stale_frame_fence_drops_late_a_frames_after_interruption_or_pause(pause: bool) -> None:
+    coordinator, _ = make_coordinator()
+    generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+    coordinator.bind_context(generation_a.token, "ctx-a")
+    coordinator.on_tts_started("ctx-a")
+
+    coordinator.record_interruption(generation_a.token, pause=pause)
+
+    assert coordinator.drop_stale_frame("ctx-a") is True
+    # A late TTS-stopped frame for A must be dropped before it can touch
+    # anything, per TransportSpeechLifecycleProcessor's own drop_stale_frame
+    # gate around on_tts_stopped/on_tts_audio.
+    assert coordinator.on_tts_stopped("ctx-a") is False
+
+
+def test_drop_stale_frame_is_false_for_a_live_untombstoned_context() -> None:
+    coordinator, _ = make_coordinator()
+    generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+    coordinator.bind_context(generation.token, "ctx-1")
+
+    assert coordinator.drop_stale_frame("ctx-1") is False
+
+
+def test_drop_stale_frame_is_true_once_terminalized() -> None:
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_stopped("ctx-1")
+
+        await coordinator.on_transport_bot_stopped()  # terminalizes
+
+        assert coordinator.drop_stale_frame("ctx-1") is True
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Manual-clock watchdogs
+# ---------------------------------------------------------------------------
+
+
+def test_start_timeout_fires_delivery_unknown_after_ten_seconds_with_no_correlated_event() -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        await tick(clock, 10.0 + 1e-6)
+
+        generation_state = coordinator.generation_for_token(generation.token)
+        assert generation_state.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        # No audio was ever submitted, so the coordinator's own no-audio
+        # flush acknowledgement retires the slot without an external ack.
+        assert generation_state.terminalized is True
+        assert coordinator.occupied is False
+
+    run(body)
+
+
+def test_start_timeout_is_cancelled_by_the_first_correlated_tts_started_event() -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+
+        await tick(clock, 10.0 + 1e-6)
+
+        assert coordinator.generation_for_token(generation.token).disposition is None
+        assert coordinator.occupied is True
+
+    run(body)
+
+
+def test_drain_deadline_uses_synthesis_end_plus_accumulated_audio_plus_grace() -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_audio(
+            "ctx-1", audio=synth_audio(seconds=0.5), sample_rate=16000, num_channels=1
+        )
+        coordinator.on_tts_stopped("ctx-1")
+
+        await tick(clock, 0.5 + 1.0 - 1e-3)  # just under the deadline
+        assert coordinator.generation_for_token(generation.token).disposition is None
+
+        await tick(clock, 2e-3)  # cross the deadline
+        assert coordinator.generation_for_token(generation.token).disposition == (
+            DeliveryDisposition.DELIVERY_UNKNOWN
+        )
+
+    run(body)
+
+
+def test_zero_audio_synthesis_uses_only_the_grace_deadline() -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_stopped("ctx-1")  # no audio ever arrived
+
+        await tick(clock, 1.0 - 1e-3)
+        assert coordinator.generation_for_token(generation.token).disposition is None
+
+        await tick(clock, 2e-3)
+        assert coordinator.generation_for_token(generation.token).disposition == (
+            DeliveryDisposition.DELIVERY_UNKNOWN
+        )
+        # Zero-audio cleanup self-acknowledges, so the slot is retired too.
+        assert coordinator.occupied is False
+
+    run(body)
+
+
+def test_interruption_cleanup_deadline_is_forwarded_at_plus_grace() -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+
+        coordinator.record_interruption(generation.token)
+        await tick(clock, 1.0 - 1e-3)
+        assert coordinator.occupied is True, "barrier must hold until the interruption deadline"
+
+        await tick(clock, 2e-3)
+        assert coordinator.occupied is False
+
+    run(body)
+
+
+@pytest.mark.parametrize("stop_first", [True, False])
+def test_stop_versus_expiry_race_resolves_deterministically_in_both_orders(
+    stop_first: bool,
+) -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_stopped("ctx-1")  # zero-audio: grace-only deadline
+
+        if stop_first:
+            await coordinator.on_transport_bot_stopped()
+            await tick(clock, 1.0 + 1e-6)  # deadline firing after stop must be a no-op
+        else:
+            await tick(clock, 1.0 + 1e-6)  # deadline fires first, self-acknowledges (zero audio)
+            await coordinator.on_transport_bot_stopped()  # a stale/late stop must be a no-op
+
+        assert coordinator.occupied is False
+        # Exactly one terminal disposition/slot-release, regardless of order.
+        generation_state = coordinator.generation_for_token(generation.token)
+        assert generation_state.terminalized is True
+        assert generation_state.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Provider error ingress: generic upstream ErrorFrame vs local context-bearing
+# ---------------------------------------------------------------------------
+
+
+def test_provider_error_transitions_the_captured_token_to_delivery_unknown() -> None:
+    """Both the generic upstream ErrorFrame path (attributed by captured
+    token + ErrorFrame.processor, since it carries no context_id) and the
+    local context-bearing provider callback converge on the same
+    ``provider_error(token)`` transition."""
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        await coordinator.provider_error(generation.token)
+
+        generation_state = coordinator.generation_for_token(generation.token)
+        assert generation_state.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        assert generation_state.terminalized is True  # no audio was ever submitted
+
+    run(body)
+
+
+def test_local_context_bearing_error_resolves_its_context_to_the_bound_token_first() -> None:
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+
+        token = coordinator.token_for_context("ctx-1")
+        assert token == generation.token
+        await coordinator.provider_error(token)
+
+        assert coordinator.generation_for_token(generation.token).disposition == (
+            DeliveryDisposition.DELIVERY_UNKNOWN
+        )
+
+    run(body)
+
+
+def test_error_for_a_stale_captured_token_does_not_corrupt_the_next_generation() -> None:
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+        coordinator.record_interruption(generation_a.token)
+        # Interruption alone does not free the slot until its own cleanup
+        # deadline resolves or the old lane acknowledges.
+        await coordinator.acknowledge_tts_lane_flush(generation_a.token)
+        generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
+        assert generation_b is not None
+
+        await coordinator.provider_error(generation_a.token)  # stale error for A's captured token
+
+        assert coordinator.generation_for_token(generation_b.token).disposition is None
+        assert coordinator.occupied is True
+        assert coordinator.slot_token == generation_b.token
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Barge-in and explicit pause
+# ---------------------------------------------------------------------------
+
+
+def test_record_interruption_tombstones_and_sets_disposition_synchronously() -> None:
+    """The plan requires disposition + tombstone recorded *before* the
+    interruption is forwarded downstream. ``record_interruption`` itself is
+    synchronous and mutates both before returning, so a caller that awaits
+    it (or simply calls it, since it is not a coroutine) before forwarding
+    InterruptionFrame satisfies the ordering."""
+    coordinator, _ = make_coordinator()
+    generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+    coordinator.bind_context(generation.token, "ctx-1")
+    coordinator.on_tts_started("ctx-1")
+
+    coordinator.record_interruption(generation.token, pause=False)
+
+    assert coordinator.drop_stale_frame("ctx-1") is True
+    assert coordinator.generation_for_token(generation.token).disposition == (
+        DeliveryDisposition.INTERRUPTED
+    )
+
+
+def test_barge_in_never_automatically_admits_the_next_generation() -> None:
+    coordinator, _ = make_coordinator()
+    generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+    coordinator.bind_context(generation_a.token, "ctx-a")
+    coordinator.on_tts_started("ctx-a")
+
+    coordinator.record_interruption(generation_a.token, pause=False)
+
+    # The coordinator's own interruption bookkeeping never calls try_admit;
+    # the barrier stays fenced until the interruption-cleanup deadline (or
+    # an external ack/teardown) resolves it -- a caller must explicitly
+    # decide to admit the next generation.
+    assert coordinator.occupied is True
+    assert coordinator.slot_token == generation_a.token
+
+
+def test_pause_records_paused_disposition_and_retains_the_barrier() -> None:
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+
+        coordinator.record_interruption(generation.token, pause=True)
+
+        assert coordinator.generation_for_token(generation.token).disposition == (
+            DeliveryDisposition.PAUSED
+        )
+        assert coordinator.occupied is True, "old barrier must hold through the deadline"
+
+        too_early = coordinator.try_admit(identity("work-1", "utt-resume-early"))
+        assert too_early is None
+
+        await tick(clock, 1.0 + 1e-6)
+        resumed = coordinator.try_admit(identity("work-1", "utt-resume"))
+        assert resumed is not None
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Exactly-once terminalization / on_terminal callback
+# ---------------------------------------------------------------------------
+
+
+def test_on_terminal_callback_fires_exactly_once_per_generation() -> None:
+    async def body() -> None:
+        terminal_calls: list[tuple[str, DeliveryDisposition]] = []
+
+        def on_terminal(token, identity_, disposition) -> None:
+            terminal_calls.append((token, disposition))
+
+        coordinator, clock = make_coordinator(on_terminal=on_terminal)
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        await tick(clock, 10.0 + 1e-6)  # start-timeout fires once
+        await tick(clock, 10.0)  # nothing left pending; must not fire again
+
+        assert terminal_calls == [(generation.token, DeliveryDisposition.DELIVERY_UNKNOWN)]
+
+    run(body)
+
+
+def test_dispatch_cleanup_and_teardown_hooks_receive_the_captured_token_and_identity() -> None:
+    async def body() -> None:
+        cleanup_calls: list[tuple[str, GenerationIdentity]] = []
+        teardown_calls: list[tuple[str, GenerationIdentity]] = []
+
+        coordinator, clock = make_coordinator(
+            dispatch_cleanup=lambda token, ident: cleanup_calls.append((token, ident)),
+            dispatch_teardown=lambda token, ident: teardown_calls.append((token, ident)),
+        )
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_audio(
+            "ctx-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+        )
+        coordinator.on_tts_stopped("ctx-1")
+
+        await tick(clock, 1.1 + 1e-6)
+
+        assert cleanup_calls == [(generation.token, generation.identity)]
+        assert teardown_calls == [(generation.token, generation.identity)]  # audio_submitted=True
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Real, credential-free pinned SmallWebRTC output-lane contract
+# ---------------------------------------------------------------------------
+
+
+def test_real_raw_audio_track_future_only_resolves_after_the_chunk_is_consumed() -> None:
+    """Prove the primitive a real output lane's drain wait depends on is
+    real: ``RawAudioTrack.add_audio_bytes()`` (from pipecat's pinned
+    SmallWebRTC transport) returns a future that resolves only once
+    ``recv()`` has actually drained the chunk, not merely once it was
+    queued. A slot-release decision gated on synthesis completion alone
+    (rather than this future or the transport's own bot-stop frame) is
+    exactly the bug this plan fixes.
+    """
+    from pipecat.transports.smallwebrtc.transport import RawAudioTrack
+
+    async def body() -> None:
+        track = RawAudioTrack(sample_rate=16000, auto_silence=False)
+        # 10ms of silence at 16kHz mono 16-bit PCM (bytes_per_10ms).
+        chunk = bytes(16000 * 10 // 1000 * 2)
+
+        future = track.add_audio_bytes(chunk)
+        assert not future.done(), "future must not resolve merely because bytes were queued"
+
+        await track.recv()
+
+        assert future.done(), "future must resolve once the real track actually drains the chunk"
+
+    run(body)
+
+
+def test_output_lane_wrapper_gates_transport_stopped_on_the_real_final_audio_future() -> None:
+    """Wire the real RawAudioTrack future alongside the coordinator's
+    transport lifecycle. A fieldless stop arriving before the final audio
+    future has resolved is exactly the "late A stop" shape the plan calls
+    out; the coordinator must still resolve the generation correctly (via
+    its own on_tts_stopped/on_transport_bot_stopped sequencing) once the
+    real track has actually drained. Full pipeline wiring through
+    TransportSpeechLifecycleProcessor and the real SmallWebRTCOutputTransport
+    is exercised once server/app.py installs it.
+    """
+    from pipecat.transports.smallwebrtc.transport import RawAudioTrack
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+
+        track = RawAudioTrack(sample_rate=16000, auto_silence=False)
+        chunk = bytes(16000 * 10 // 1000 * 2)
+        final_audio_future = track.add_audio_bytes(chunk)
+        coordinator.on_tts_audio("ctx-1", audio=chunk, sample_rate=16000, num_channels=1)
+        coordinator.on_tts_stopped("ctx-1")
+
+        assert not final_audio_future.done()
+        await coordinator.on_transport_bot_stopped()
+        assert coordinator.occupied is False
+
+        await track.recv()  # drains the real chunk; future now resolves
+        assert final_audio_future.done()
+
+    run(body)

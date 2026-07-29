@@ -4,6 +4,7 @@ import asyncio
 
 from server.contracts import DeliveryState
 from server.session_state import SessionState
+from server.speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
 from server.speech_scheduler import SpeechScheduler
 
 
@@ -185,6 +186,38 @@ def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:
     assert scheduler.active.item.utterance_id == new_item.utterance_id
     assert scheduler.state.events == events_before_callbacks
     assert scheduler.state.speech[new_item.utterance_id].state == DeliveryState.STARTED
+
+
+def test_start_next_defers_admission_to_an_injected_lifecycle_coordinator() -> None:
+    """Phase 1 makes SpeechLifecycleCoordinator the sole admission authority:
+    the scheduler owns queue selection but must ask the coordinator before
+    starting speech, and must not start when the coordinator's global slot
+    is occupied (matches the plan's Integration Seams entry "Work queues ->
+    global slot" -> ``SpeechLifecycleCoordinator.try_admit()``)."""
+    coordinator = SpeechLifecycleCoordinator()
+    scheduler = SpeechScheduler(SessionState(), lifecycle=coordinator)
+    item = enqueue(scheduler, "work-1", "one")
+
+    result = asyncio.run(scheduler.start_next())
+
+    assert result is not None
+    assert coordinator.occupied is True
+    assert coordinator.generation_for_token(scheduler.active.token) is not None
+    assert coordinator.generation_for_token(scheduler.active.token).identity.utterance_id == (
+        item.utterance_id
+    )
+
+
+def test_start_next_does_not_start_when_the_coordinator_slot_is_already_occupied() -> None:
+    coordinator = SpeechLifecycleCoordinator()
+    coordinator.try_admit(GenerationIdentity("occupied-by-someone-else", "work-other"))
+    scheduler = SpeechScheduler(SessionState(), lifecycle=coordinator)
+    enqueue(scheduler, "work-1", "one")
+
+    result = asyncio.run(scheduler.start_next())
+
+    assert result is None
+    assert scheduler.active is None
 
 
 def test_dropped_prestart_context_cannot_claim_replacement_utterance() -> None:

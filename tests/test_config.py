@@ -346,6 +346,74 @@ def test_environment_endpoint_overrides_toml_socket(tmp_path) -> None:
     assert config.stt_endpoint == ("uds", "/tmp/from-env.sock")
 
 
+def test_speech_liveness_timeout_defaults() -> None:
+    config = Config()
+
+    assert config.speech_start_timeout_seconds == 10.0
+    assert config.speech_transport_grace_seconds == 1.0
+
+
+def test_speech_liveness_timeouts_reject_zero_or_non_finite_values() -> None:
+    with pytest.raises(ConfigError):
+        Config(speech_start_timeout_seconds=0)
+
+    with pytest.raises(ConfigError):
+        Config(speech_start_timeout_seconds=float("inf"))
+
+    with pytest.raises(ConfigError):
+        Config(speech_transport_grace_seconds=0)
+
+    with pytest.raises(ConfigError):
+        Config(speech_transport_grace_seconds=float("nan"))
+
+
+def test_speech_liveness_timeouts_load_from_environment() -> None:
+    config = load_config(
+        env={
+            "WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS": "12.5",
+            "WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS": "2.5",
+        }
+    )
+
+    assert config.speech_start_timeout_seconds == 12.5
+    assert config.speech_transport_grace_seconds == 2.5
+
+
+def test_speech_liveness_timeouts_load_from_toml_and_environment_wins(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "[turn]\nspeech_start_timeout_seconds = 8.0\nspeech_transport_grace_seconds = 0.5\n"
+    )
+
+    from_toml = load_config(config_file=config_file, env={})
+    from_environment = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS": "9.0"},
+    )
+
+    assert from_toml.speech_start_timeout_seconds == 8.0
+    assert from_toml.speech_transport_grace_seconds == 0.5
+    assert from_environment.speech_start_timeout_seconds == 9.0
+    assert from_environment.speech_transport_grace_seconds == 0.5
+
+
+def test_invalid_speech_start_timeout_environment_value_has_config_error_boundary() -> None:
+    with pytest.raises(ConfigError, match="WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS"):
+        load_config(env={"WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS": "not-a-number"})
+
+
+def test_invalid_speech_transport_grace_environment_value_has_config_error_boundary() -> None:
+    with pytest.raises(ConfigError, match="WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS"):
+        load_config(env={"WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS": "not-a-number"})
+
+
+def test_repository_config_declares_speech_liveness_timeouts() -> None:
+    config = load_config(config_file=Path(__file__).parents[1] / "config.toml", env={})
+
+    assert config.speech_start_timeout_seconds == 10.0
+    assert config.speech_transport_grace_seconds == 1.0
+
+
 def test_tts_uri_precedes_socket_and_host_port(tmp_path) -> None:
     config_file = tmp_path / "config.toml"
     config_file.write_text(

@@ -242,6 +242,26 @@ def connection_handshake(host: SessionHost, epoch: int) -> dict[str, object]:
     }
 
 
+async def release_lifecycle_slot(connection: object, token: str, context_id: str) -> None:
+    """Stand in for what ``TransportSpeechLifecycleProcessor`` does to a real
+    frame pipeline: bind the marker token to a generated context, observe
+    synthesis start/stop, then the fieldless upstream bot stop. Phase 1 makes
+    the coordinator (not synthesis end alone) the sole authority for
+    releasing the transport slot and admitting the next generation, so tests
+    built around ``QueueingPipelineWorker`` (no real frame pipeline) must
+    drive the coordinator explicitly rather than relying on
+    ``tts.on_event("synthesis_ended", ...)`` to do it.
+    """
+    lifecycle = connection.lifecycle
+    if lifecycle is None:
+        return
+    lifecycle.bind_context(token, context_id)
+    lifecycle.on_tts_started(context_id)
+    lifecycle.on_tts_stopped(context_id)
+    lifecycle.on_transport_bot_stopped()
+    await asyncio.sleep(0)  # let on_terminal's fire-and-forget task run
+
+
 def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
     async def run() -> None:
         tts = FakeTTS()
@@ -266,11 +286,12 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         result = await host._handle_transcript("Riga weather")
 
         assert start_calls == 1
-        assert len(worker.frames) == 1
-        assert isinstance(worker.frames[0], TTSSpeakFrame)
-        assert worker.frames[0].text == result.spoken_text
-        assert worker.frames[0].text != result.text
-        assert worker.frames[0].append_to_context is False
+        speak_frames = [frame for frame in worker.frames if isinstance(frame, TTSSpeakFrame)]
+        assert len(speak_frames) == 1
+        speak_frame = speak_frames[0]
+        assert speak_frame.text == result.spoken_text
+        assert speak_frame.text != result.text
+        assert speak_frame.append_to_context is False
         assert connection.scheduler.active is not None
         utterance_id = connection.scheduler.active.item.utterance_id
         connection.scheduler.enqueue(
@@ -281,13 +302,59 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
             origin_epoch=1,
         )
 
-        assert worker.frames[0].correlation_id == utterance_id
+        assert speak_frame.correlation_id == utterance_id
+        active_token = connection.scheduler.active.token
         await tts.on_event("synthesis_started", utterance_id)
         await tts.on_event("synthesis_ended", utterance_id)
+        assert host.state.speech[utterance_id].state.value == "synthesis_ended"
+        assert connection.scheduler.active is not None, (
+            "synthesis end alone must not release the transport slot or admit the next item"
+        )
+
+        await release_lifecycle_slot(connection, active_token, utterance_id)
+
         assert host.state.speech[utterance_id].state.value == "delivery_unknown"
-        assert len(worker.frames) == 2
+        speak_frames = [frame for frame in worker.frames if isinstance(frame, TTSSpeakFrame)]
+        assert len(speak_frames) == 2
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.result_id == "result-next"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_speak_request_emits_a_generation_marker_immediately_before_the_tts_speak_frame() -> None:
+    """Phase 1 requires a private, token-bearing SpeechGenerationMarkerFrame
+    inserted immediately before each TTSSpeakFrame, so the post-TTS lifecycle
+    bridge can bind the next generated TTS context_id without ever inferring
+    identity from a fieldless bot frame. This asserts pipeline-level wiring;
+    if server/pipeline.py names the marker frame differently, reconcile the
+    import/name here rather than dropping the ordering assertion.
+    """
+    from server.speech_lifecycle import SpeechGenerationMarkerFrame
+
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        worker = QueueingPipelineWorker()
+        connection.worker = worker
+
+        await host._handle_transcript("Riga weather")
+
+        speak_index = next(
+            index for index, frame in enumerate(worker.frames) if isinstance(frame, TTSSpeakFrame)
+        )
+        assert speak_index > 0, "a marker frame must precede the TTSSpeakFrame"
+        marker = worker.frames[speak_index - 1]
+        assert isinstance(marker, SpeechGenerationMarkerFrame)
+        assert connection.scheduler.active is not None
+        assert marker.utterance_id == connection.scheduler.active.item.utterance_id
+
         await host.shutdown()
 
     asyncio.run(run())
@@ -584,9 +651,11 @@ def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -
 
         assert connection.scheduler.active is not None
         foreground_utterance_id = connection.scheduler.active.item.utterance_id
+        foreground_token = connection.scheduler.active.token
         assert tts.on_event is not None
         await tts.on_event("synthesis_started", foreground_utterance_id)
         await tts.on_event("synthesis_ended", foreground_utterance_id)
+        await release_lifecycle_slot(connection, foreground_token, foreground_utterance_id)
 
         spoken_frames = [
             frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
@@ -650,8 +719,11 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
         assert queued[0].result_id == final.result_id
 
         assert tts.on_event is not None
+        assert connection.scheduler.active is not None
+        active_token = connection.scheduler.active.token
         await tts.on_event("synthesis_started", active.utterance_id)
         await tts.on_event("synthesis_ended", active.utterance_id)
+        await release_lifecycle_slot(connection, active_token, active.utterance_id)
 
         spoken_frames = [
             frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
@@ -791,6 +863,8 @@ def test_router_provider_failure_becomes_a_safe_canonical_result() -> None:
 
 
 def test_cancel_control_interrupts_active_speech() -> None:
+    from server.speech_lifecycle import SpeechGenerationMarkerFrame
+
     async def run() -> None:
         class ControlCoordinator:
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
@@ -825,14 +899,23 @@ def test_cancel_control_interrupts_active_speech() -> None:
         assert host.state.speech[item.utterance_id].state.value == "interrupted"
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.result_id != item.result_id
-        assert isinstance(connection.worker.frames[-2], InterruptionFrame)
         assert isinstance(connection.worker.frames[-1], TTSSpeakFrame)
+        assert isinstance(connection.worker.frames[-2], SpeechGenerationMarkerFrame)
+        interruption_index = next(
+            index
+            for index, frame in enumerate(connection.worker.frames)
+            if isinstance(frame, InterruptionFrame)
+        )
+        speak_index = len(connection.worker.frames) - 1
+        assert interruption_index < speak_index
         await host.shutdown()
 
     asyncio.run(run())
 
 
 def test_pause_control_stops_active_speech_before_confirmation() -> None:
+    from server.speech_lifecycle import SpeechGenerationMarkerFrame
+
     async def run() -> None:
         class ControlCoordinator:
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
@@ -865,9 +948,16 @@ def test_pause_control_stops_active_speech_before_confirmation() -> None:
 
         await host._handle_transcript("pause")
 
-        assert isinstance(connection.worker.frames[-2], InterruptionFrame)
         assert isinstance(connection.worker.frames[-1], TTSSpeakFrame)
         assert connection.worker.frames[-1].text == "Pausing the active response."
+        assert isinstance(connection.worker.frames[-2], SpeechGenerationMarkerFrame)
+        interruption_index = next(
+            index
+            for index, frame in enumerate(connection.worker.frames)
+            if isinstance(frame, InterruptionFrame)
+        )
+        speak_index = len(connection.worker.frames) - 1
+        assert interruption_index < speak_index
         await host.shutdown()
 
     asyncio.run(run())

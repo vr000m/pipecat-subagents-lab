@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from .contracts import DeliveryState
 from .session_state import SessionState
+from .speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
 
 
 @dataclass(frozen=True)
@@ -36,10 +37,12 @@ class SpeechScheduler:
         state: SessionState | None = None,
         speak: Callable[[SpeechItem], Any] | None = None,
         stop: Callable[[SpeechItem], Any] | None = None,
+        lifecycle: SpeechLifecycleCoordinator | None = None,
     ) -> None:
         self.state = state or SessionState()
         self.speak = speak
         self.stop = stop
+        self.lifecycle = lifecycle
         self._queues: dict[str, list[SpeechItem]] = {}
         self._active: UtteranceLease | None = None
         self._paused: dict[str, SpeechItem] = {}
@@ -112,16 +115,26 @@ class SpeechScheduler:
         return item
 
     async def start_next(self, work_item_id: str | None = None) -> SpeechItem | None:
-        if self._active is not None:
+        if self._active is not None or (self.lifecycle is not None and self.lifecycle.occupied):
             return None
         keys = [work_item_id] if work_item_id else list(self._queues)
         item = next((self._queues[key][0] for key in keys if self._queues.get(key)), None)
         if item is None:
             return None
+        generation = None
+        if self.lifecycle is not None:
+            generation = self.lifecycle.try_admit(
+                GenerationIdentity(item.utterance_id, item.work_item_id, item.origin_epoch)
+            )
+            if generation is None:
+                return None
         self._queues[item.work_item_id].pop(0)
-        lease = UtteranceLease(item, uuid4().hex)
+        token = generation.token if generation is not None else uuid4().hex
+        lease = UtteranceLease(item, token)
         self._active = lease
         self.state.speech_progress(**self._progress(item), state=DeliveryState.STARTED)
+        if self.lifecycle is not None:
+            self.lifecycle.mark_handed_to_tts(token)
         try:
             if self.speak is not None:
                 outcome = self.speak(item)
@@ -221,9 +234,14 @@ class SpeechScheduler:
     def pause(self, work_item_id: str) -> None:
         if self._active and self._active.item.work_item_id == work_item_id:
             item = self._active.item
+            token = self._active.token
+            if self.lifecycle is not None:
+                self.lifecycle.record_interruption(token, pause=True)
             self._paused[work_item_id] = item
             self._signal_stop(item)
             self.state.speech_progress(**self._progress(item), state=DeliveryState.PAUSED)
+            if self.lifecycle is not None:
+                self.lifecycle.release_flushed_lane(token)
             # Pausing releases the lease without recording a terminal
             # interruption; resume must be able to represent the next state.
             self._release(item.utterance_id)
@@ -253,8 +271,13 @@ class SpeechScheduler:
             work_item_id is None or self._active.item.work_item_id == work_item_id
         ):
             item = self._active.item
+            token = self._active.token
+            if self.lifecycle is not None:
+                self.lifecycle.record_interruption(token, pause=False)
             self._signal_stop(item)
             self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+            if self.lifecycle is not None:
+                self.lifecycle.release_flushed_lane(token)
             self._release(item.utterance_id)
             cancelled.append(item)
         keys = [work_item_id] if work_item_id is not None else list(self._queues)

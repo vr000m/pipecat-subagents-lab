@@ -15,6 +15,7 @@ from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
+from .config import Config
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     GroundedResult,
@@ -42,6 +43,14 @@ from .results import canonical_result
 from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
+from .speech_lifecycle import (
+    DeliveryDisposition,
+    EventLoopTimerScheduler,
+    GenerationIdentity,
+    MonotonicClock,
+    SpeechGenerationMarkerFrame,
+    SpeechLifecycleCoordinator,
+)
 from .speech_scheduler import SpeechScheduler
 from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
@@ -247,6 +256,7 @@ class ConnectionPipeline:
     epoch: int
     observer: RuntimeObserver
     scheduler: SpeechScheduler
+    lifecycle: SpeechLifecycleCoordinator | None = None
     stt: Any | None = None
     tts: Any | None = None
     transport: Any | None = None
@@ -455,6 +465,16 @@ class SessionHost:
                 raise RuntimeError("speech target is not the active TTS connection")
             if pipeline.worker is None:
                 raise RuntimeError("active connection has no Pipecat worker for TTS")
+            lease = pipeline.scheduler.active
+            if pipeline.lifecycle is not None and lease is not None:
+                await pipeline.worker.queue_frame(
+                    SpeechGenerationMarkerFrame(
+                        token=lease.token,
+                        utterance_id=item.utterance_id,
+                        work_item_id=item.work_item_id,
+                        origin_epoch=item.origin_epoch,
+                    )
+                )
             frame_factory = getattr(connection_tts, "correlated_speak_frame", None)
             frame = (
                 frame_factory(
@@ -473,6 +493,47 @@ class SessionHost:
                 return
             await pipeline.worker.queue_frame(InterruptionFrame())
 
+        async def on_lifecycle_terminal(
+            token: str, identity: GenerationIdentity, disposition: DeliveryDisposition
+        ) -> None:
+            del token
+            if self.connection is not pipeline or not pipeline.active:
+                return
+            if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
+                pipeline.scheduler.delivery_unknown(identity.utterance_id)
+            if pipeline.scheduler.active is None:
+                await pipeline.scheduler.start_next()
+
+        async def dispatch_lifecycle_cleanup(token: str, identity: GenerationIdentity) -> None:
+            del token, identity
+            await stop_speech(None)
+
+        async def dispatch_lifecycle_teardown(token: str, identity: GenerationIdentity) -> None:
+            # Deviation: the coordinator's teardown seam expects a caller to
+            # await connection-scoped SmallWebRTC output cancellation and
+            # only then call `teardown_complete`. This host does not yet
+            # expose that per-lane completion signal, so it acknowledges
+            # immediately after cleanup dispatch rather than blocking queued
+            # speech admission indefinitely.
+            del identity
+            if pipeline.lifecycle is not None:
+                await pipeline.lifecycle.teardown_complete(token)
+
+        connection_config = getattr(self.registry, "config", None) or Config()
+        lifecycle = (
+            SpeechLifecycleCoordinator(
+                clock=MonotonicClock(),
+                timers=EventLoopTimerScheduler(),
+                speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
+                speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
+                on_terminal=on_lifecycle_terminal,
+                dispatch_cleanup=dispatch_lifecycle_cleanup,
+                dispatch_teardown=dispatch_lifecycle_teardown,
+            )
+            if connection_tts is not None
+            else None
+        )
+
         pipeline = ConnectionPipeline(
             connection.epoch,
             RuntimeObserver(self.state, connection.epoch),
@@ -480,7 +541,9 @@ class SessionHost:
                 self.state,
                 speak=queue_speech if connection_tts is not None else None,
                 stop=stop_speech if connection_tts is not None else None,
+                lifecycle=lifecycle,
             ),
+            lifecycle=lifecycle,
             stt=connection_stt,
             tts=connection_tts,
         )
@@ -501,21 +564,31 @@ class SessionHost:
                     if inspect.isawaitable(callback_result):
                         callback_result = await callback_result
                 current = self.connection is pipeline and pipeline.active
+                has_lifecycle = pipeline.lifecycle is not None
                 if event == "synthesis_started":
                     pipeline.scheduler.provider_started(context_id)
                 elif event == "synthesis_ended" and current:
-                    matched = pipeline.scheduler.provider_synthesis_ended(context_id)
-                    # The pinned local service exposes synthesis completion, not
-                    # browser playout completion. Release conservatively as
-                    # unknown so later utterances cannot be starved.
-                    if matched:
+                    pipeline.scheduler.provider_synthesis_ended(context_id)
+                    # Non-terminal: the real TTSStoppedFrame observed by
+                    # TransportSpeechLifecycleProcessor arms the coordinator's
+                    # drain deadline. Without a coordinator, fall back to the
+                    # old conservative immediate release so later utterances
+                    # cannot be starved.
+                    if not has_lifecycle:
                         pipeline.scheduler.provider_delivery_unknown(context_id)
                 elif event == "delivery_completed" and current:
                     pipeline.scheduler.provider_delivery_completed(context_id)
                 elif event == "delivery_unknown" and current:
-                    pipeline.scheduler.provider_delivery_unknown(context_id)
+                    token = (
+                        pipeline.lifecycle.token_for_context(context_id) if has_lifecycle else None
+                    )
+                    if token is not None:
+                        await pipeline.lifecycle.provider_error(token)
+                    else:
+                        pipeline.scheduler.provider_delivery_unknown(context_id)
                 if (
-                    event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
+                    not has_lifecycle
+                    and event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
                     and self.connection is pipeline
                     and pipeline.active
                     and pipeline.scheduler.active is None
@@ -722,6 +795,9 @@ class SessionHost:
                             if outcome.work_items
                             else origin.scheduler.active.item.work_item_id
                         )
+                        active_lease = origin.scheduler.active
+                        if origin.lifecycle is not None and active_lease is not None:
+                            origin.lifecycle.record_interruption(active_lease.token, pause=True)
                         origin.scheduler.pause(target)
                         await origin.scheduler.wait_for_stops()
                         control_outcome = "applied"
@@ -737,6 +813,13 @@ class SessionHost:
                             target,
                             exclude_work_item_id=work_item_id,
                         )
+                        active_lease = origin.scheduler.active
+                        if (
+                            origin.lifecycle is not None
+                            and active_lease is not None
+                            and (target is None or active_lease.item.work_item_id == target)
+                        ):
+                            origin.lifecycle.record_interruption(active_lease.token, pause=False)
                         cancelled_speech = origin.scheduler.cancel(target)
                         await origin.scheduler.wait_for_stops()
                         if not cancelled_work and not cancelled_speech:

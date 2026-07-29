@@ -17,6 +17,12 @@ model = "nova-3-general"
 smart_turn_timeout_seconds = 5.0
 # Debounce a premature COMPLETE if speech resumes after a natural pause.
 smart_turn_complete_grace_seconds = 1.5
+# Fallback release if a generation handed to TTS never reports a correlated
+# start/audio/provider-error event.
+speech_start_timeout_seconds = 10.0
+# Grace added after synthesis end (plus accumulated audio duration) or after
+# an interruption/pause is forwarded, before the transport slot is torn down.
+speech_transport_grace_seconds = 1.0
 # Expire an unanswered worker clarification after this many seconds.
 pending_dialogue_timeout_seconds = 30.0
 # Return a spoken acknowledgement while a slow search continues in the background.

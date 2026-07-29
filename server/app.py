@@ -43,6 +43,7 @@ from .registry import WorkerRegistry
 from .router import LazyRouterProvider, Router
 from .rtvi_messages import RTVIMessagePublisher
 from .services.factory import create_stt, create_tts
+from .speech_lifecycle import GenericProviderErrorObserver, TransportSpeechLifecycleProcessor
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from .work_item_coordinator import WorkItemCoordinator
 
@@ -58,7 +59,14 @@ def _configure_logging() -> None:
 
 
 class _SpeechCompletionProcessor(FrameProcessor):
-    """Release the active speech lease when any TTS provider finishes."""
+    """Record provider synthesis state for the scheduler's public progress.
+
+    Non-terminal: it never releases the active speech lease itself. Release
+    is owned by `SpeechLifecycleCoordinator`, which learns synthesis end from
+    the same `TTSStoppedFrame` through `TransportSpeechLifecycleProcessor`
+    further downstream and only clears the slot on a correlated transport
+    stop or completed cleanup.
+    """
 
     def __init__(self, host: SessionHost, runtime: Any) -> None:
         super().__init__()
@@ -83,7 +91,9 @@ class _SpeechCompletionProcessor(FrameProcessor):
             and self._runtime.active
         ):
             matched = self._runtime.scheduler.provider_synthesis_ended(frame.context_id)
-            if matched:
+            if matched and self._runtime.lifecycle is None:
+                # No coordinator installed (e.g. a TTS-less/test runtime):
+                # fall back to the old conservative immediate release.
                 self._runtime.scheduler.provider_delivery_unknown(frame.context_id)
                 await self._runtime.scheduler.start_next()
         await self.push_frame(frame, direction)
@@ -200,7 +210,11 @@ async def _attach_connection(
         if bridge is not None:
             processors.extend((bridge, CanonicalResultAdapter()))
         if runtime.tts is not None:
+            if runtime.lifecycle is not None:
+                processors.append(GenericProviderErrorObserver(runtime.lifecycle, runtime.tts))
             processors.extend(_tts_processors(host, runtime))
+        if runtime.lifecycle is not None:
+            processors.append(TransportSpeechLifecycleProcessor(runtime.lifecycle))
         processors.append(transport.output())
         task_manager = TaskManager(loop=asyncio.get_running_loop())
         connection_worker_name = f"browser-{runtime.epoch}"
