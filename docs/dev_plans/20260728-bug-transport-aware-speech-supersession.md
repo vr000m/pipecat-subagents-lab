@@ -579,7 +579,7 @@ sequenceDiagram
 
 ## Progress
 
-- [ ] Phase 1: Add the correlated generation state machine and transport slot
+- [x] Phase 1: Add the correlated generation state machine and transport slot
 - [ ] Phase 2: Make queued timeout supersession explicit and work-scoped
 - [ ] Phase 3: Document the boundary and run cross-phase validation
 
