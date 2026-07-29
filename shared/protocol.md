@@ -79,6 +79,33 @@ completion, unknown delivery, then cancellation; duplicate or late events
 cannot replace an already terminal outcome. Word-level progress is reserved
 for a future, verified Phase-3 extension.
 
+### Transport-aware lease boundary
+
+Scheduler ownership of an admitted speech generation is not released on
+provider synthesis end. The server-internal `SpeechLifecycleCoordinator`
+(`server/speech_lifecycle.py`) holds the single global transport slot for a
+generation until either the output transport reports its normal fieldless
+stop for that still-occupied lane, or the connection-scoped output lane has
+completed cancellation/teardown. `TTSStoppedFrame` and provider
+`synthesis_ended` record synthesis state only and do not by themselves
+admit another generation to TTS or output; a bare timer expiry cannot clear
+a slot that has already submitted audio to output either.
+
+This is a strictly stronger liveness proof than synthesis completion: it
+rules out the case where a later result's timeout notice has already left
+scheduler ownership by the time synthesis reports done, which previously let
+a stale notice queue-jump into the transport ahead of the real answer. It is
+not a stronger *audibility* proof. Transport stop confirms the server handed
+the utterance off cleanly (or tore the lane down) but proves nothing about
+browser-side decode, playout, or whether the listener actually heard it.
+Browser playout acknowledgement remains out of scope and is deferred to a
+later plan, per the Objective of
+`docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md`.
+
+A timeout notice is supersedable only while it remains in its own per-work
+queue; once its generation occupies the global transport slot, a
+later-arriving final result for the same work item does not interrupt it.
+
 `WorkItemEvent` reserves work states `started`, `progress`,
 `cancellation_requested`, `cancelled`, `completed`, and `failed`.
 `InterruptionEvent` similarly reserves normalized interruption telemetry. These

@@ -685,6 +685,244 @@ def test_real_raw_audio_track_future_only_resolves_after_the_chunk_is_consumed()
     run(body)
 
 
+def test_ordered_event_log_for_start_timeout_cleanup_matches_the_planned_sequence() -> None:
+    """``fence A cleanup-pending -> dispatch cancel/flush A -> record
+    delivery_unknown -> acknowledge A's lane -> clear slot -> optionally
+    admit B``, exactly as the plan's fallback sequence diagram orders it."""
+
+    async def body() -> None:
+        events: list[str] = []
+
+        def on_terminal(token, ident, disposition) -> None:
+            events.append(f"record_{disposition.value}")
+
+        def dispatch_cleanup(token, ident) -> None:
+            events.append("dispatch_cleanup")
+
+        coordinator, clock = make_coordinator(
+            on_terminal=on_terminal, dispatch_cleanup=dispatch_cleanup
+        )
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        assert generation.cleanup_pending is False
+        assert coordinator.occupied is True
+
+        await tick(clock, 10.0 + 1e-6)
+
+        assert generation.cleanup_pending is True, "deadline expiry must fence cleanup_pending"
+        assert events == ["dispatch_cleanup", "record_delivery_unknown"], (
+            "cancel/flush dispatch must precede the recorded terminal disposition"
+        )
+        assert coordinator.occupied is False, "slot clears once, after the recorded disposition"
+        assert generation.terminalized is True
+
+        admitted = coordinator.try_admit(identity("work-2", "utt-2"))
+        assert admitted is not None, "a cleared slot may optionally admit the next generation"
+
+    run(body)
+
+
+@pytest.mark.parametrize(
+    "pause",
+    [pytest.param(False, id="barge_in"), pytest.param(True, id="pause")],
+)
+def test_ordered_event_log_for_interruption_or_pause_records_before_cleanup_with_no_admission(
+    pause: bool,
+) -> None:
+    """``record disposition/tombstone -> (caller forwards InterruptionFrame)
+    -> stop or teardown``. ``record_interruption``'s own mutations are
+    complete before it returns, so a caller that forwards
+    ``InterruptionFrame`` immediately afterwards (as ``server/pipeline.py``
+    does around every ``record_interruption`` call site) can never observe
+    a stale, un-recorded generation. Neither the interruption call nor its
+    later cleanup dispatch ever calls ``try_admit``/``start_next`` -- the
+    coordinator has no reference to ``SpeechScheduler`` at all, so it is
+    structurally incapable of starting the next generation on its own; only
+    an explicit caller-issued admission (mirrored here) does that."""
+
+    async def body() -> None:
+        events: list[str] = []
+
+        def dispatch_cleanup(token, ident) -> None:
+            events.append("dispatch_cleanup")
+
+        coordinator, clock = make_coordinator(dispatch_cleanup=dispatch_cleanup)
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+
+        coordinator.record_interruption(generation.token, pause=pause)
+        events.append("recorded")
+
+        # Disposition and tombstone are visible immediately -- before any
+        # forwarded InterruptionFrame or cleanup dispatch could have run.
+        assert events == ["recorded"]
+        assert coordinator.generation_for_token(generation.token).disposition == (
+            DeliveryDisposition.PAUSED if pause else DeliveryDisposition.INTERRUPTED
+        )
+        assert coordinator.generation_for_token(generation.token).tombstoned is True
+        # No admission happens as a side effect of the interruption call.
+        assert coordinator.try_admit(identity("work-2", "utt-blocked")) is None
+
+        await tick(clock, 1.0 + 1e-6)  # interruption-cleanup deadline
+
+        assert events == ["recorded", "dispatch_cleanup"]
+        assert coordinator.occupied is False
+        # A late/stale stop after the barrier already resolved is a no-op,
+        # not a second admission trigger.
+        await coordinator.on_transport_bot_stopped()
+        assert events == ["recorded", "dispatch_cleanup"]
+
+        admitted = coordinator.try_admit(identity("work-2", "utt-2"))
+        assert admitted is not None
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: full terminal matrix -- every terminal reason drops late A frames,
+# never lets a late fieldless A stop be observed as B's, leaves B unchanged,
+# and progresses exactly once.
+# ---------------------------------------------------------------------------
+
+
+async def _terminalize_generation_a(
+    coordinator: SpeechLifecycleCoordinator,
+    clock: ManualTimerScheduler,
+    generation: object,
+    *,
+    reason: str,
+    audio_submitted: bool,
+) -> None:
+    """Drive generation A to its terminal state via the coordinator-level
+    path the plan assigns to each terminal reason.
+
+    Cancellation and barge-in share the same coordinator-level path
+    (``record_interruption(pause=False)``) because
+    ``server/pipeline.py``'s cancel-control handler calls
+    ``lifecycle.record_interruption(active_lease.token, pause=False)``
+    directly, exactly as barge-in does. Reconnect and shutdown share the
+    drain/teardown path because the coordinator exposes no reconnect- or
+    shutdown-specific hook: a fresh connection-scoped lane is this same
+    coordinator's post-``teardown_complete`` state (``connection_epoch``
+    bump), per the plan's fallback sequence diagram and
+    ``server/pipeline.py``'s per-connection ``lifecycle`` field.
+    """
+    if reason in ("interruption", "cancellation", "pause"):
+        coordinator.record_interruption(generation.token, pause=(reason == "pause"))
+        await tick(clock, 1.0 + 1e-6)  # interruption-cleanup deadline
+    elif reason == "start_timeout":
+        await tick(clock, 10.0 + 1e-6)
+    elif reason in ("drain_fallback", "reconnect", "shutdown"):
+        coordinator.on_tts_stopped("ctx-a")
+        await tick(clock, generation.audio_duration_seconds + 1.0 + 1e-6)
+    elif reason in ("generic_error", "local_error"):
+        await coordinator.provider_error(generation.token)
+    else:  # pragma: no cover - guards against a mistyped parametrize id
+        raise AssertionError(reason)
+
+    if audio_submitted:
+        await coordinator.teardown_complete(generation.token)
+
+
+_TERMINAL_MATRIX_REASONS = [
+    pytest.param("start_timeout", False, id="start_timeout"),
+    pytest.param("drain_fallback", True, id="drain_fallback"),
+    pytest.param("interruption", True, id="interruption"),
+    pytest.param("pause", True, id="pause"),
+    pytest.param("cancellation", True, id="cancellation"),
+    pytest.param("reconnect", True, id="reconnect"),
+    pytest.param("shutdown", True, id="shutdown"),
+    pytest.param("generic_error", True, id="generic_error"),
+    pytest.param("local_error", True, id="local_error"),
+]
+
+
+@pytest.mark.parametrize("reason, audio_submitted", _TERMINAL_MATRIX_REASONS)
+def test_terminal_matrix_drops_late_a_frames_leaves_b_unchanged_and_progresses_once(
+    reason: str, audio_submitted: bool
+) -> None:
+    """The full terminal matrix -- interruption, pause, reconnect,
+    cancellation, shutdown, start-timeout, drain fallback, generic error,
+    and local error -- must each: drop late context-bearing A frames before
+    output, never let a late fieldless A stop be observed as anything other
+    than B's own event once B legally occupies the slot, leave B
+    unaffected, and terminalize A exactly once.
+
+    ``start_timeout`` fires precisely because no correlated TTS event ever
+    arrives, so it never binds a context and has no context-bearing A frame
+    to drop -- its matrix row instead proves the slot still clears via
+    self-acknowledged flush and admits B cleanly, same as every other
+    reason.
+    """
+
+    async def body() -> None:
+        terminal_calls: list[tuple[str, DeliveryDisposition]] = []
+
+        def on_terminal(token, ident, disposition) -> None:
+            terminal_calls.append((token, disposition))
+
+        coordinator, clock = make_coordinator(on_terminal=on_terminal)
+        generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+        if reason != "start_timeout":
+            coordinator.bind_context(generation_a.token, "ctx-a")
+            coordinator.on_tts_started("ctx-a")
+            if audio_submitted:
+                coordinator.on_tts_audio(
+                    "ctx-a", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+                )
+
+        await _terminalize_generation_a(
+            coordinator, clock, generation_a, reason=reason, audio_submitted=audio_submitted
+        )
+
+        generation_a_state = coordinator.generation_for_token(generation_a.token)
+        assert generation_a_state.terminalized is True
+        assert terminal_calls == [(generation_a.token, generation_a_state.disposition)]
+
+        if reason != "start_timeout":
+            # Late context-bearing A frames are dropped before they could
+            # reach output.
+            assert coordinator.drop_stale_frame("ctx-a") is True
+            assert (
+                coordinator.on_tts_audio(
+                    "ctx-a", audio=synth_audio(seconds=0.05), sample_rate=16000, num_channels=1
+                )
+                is False
+            )
+            assert coordinator.on_tts_stopped("ctx-a") is False
+
+        # B is admitted only once A's lane is fully retired, and B's own
+        # state is untouched by anything A did.
+        generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
+        assert generation_b is not None, "B must be admitted once A's lane is retired"
+        coordinator.bind_context(generation_b.token, "ctx-b")
+        coordinator.on_transport_bot_started()
+        assert (
+            coordinator.generation_for_token(generation_b.token).phase
+            == GenerationPhase.TRANSPORT_STARTED
+        )
+
+        # A late fieldless stop can only ever be observed as the sole
+        # occupied lane's own event: by the time B occupies the slot, A's
+        # lane has already been fully retired (self-acked or torn down) and
+        # can emit nothing further, so this resolves B -- never A a second
+        # time.
+        await coordinator.on_transport_bot_stopped()
+
+        assert coordinator.occupied is False
+        assert (
+            coordinator.generation_for_token(generation_b.token).phase
+            == GenerationPhase.TRANSPORT_STOPPED
+        )
+        assert terminal_calls == [
+            (generation_a.token, generation_a_state.disposition),
+            (generation_b.token, DeliveryDisposition.DELIVERY_UNKNOWN),
+        ], "A must not be terminalized a second time by a late stop meant for it"
+
+    run(body)
+
+
 def test_output_lane_wrapper_gates_transport_stopped_on_the_real_final_audio_future() -> None:
     """Wire the real RawAudioTrack future alongside the coordinator's
     transport lifecycle. A fieldless stop arriving before the final audio

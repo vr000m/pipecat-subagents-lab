@@ -14,6 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale notice no longer plays after the real answer is ready. A notice that
   has already started speaking is left to finish rather than interrupted
   mid-utterance.
+- Keep scheduler ownership of an admitted speech generation until the output
+  transport reports its normal stop or the connection-scoped output lane
+  completes teardown, instead of releasing it on provider synthesis end.
+  Previously a still-playing utterance's synthesis could finish before an
+  unrelated later result was ready, letting that result's timeout notice
+  cross into the transport ahead of the real answer where queue-only
+  supersession could no longer remove it. Adds a private, token-fenced
+  `SpeechGeneration`/`SpeechLifecycleCoordinator` lifecycle
+  (`server/speech_lifecycle.py`), a work-scoped notice-specific replacement
+  in place of broad queue discard, and start/drain/interruption watchdogs
+  backed by an injectable clock and timer scheduler. No package version
+  change; ships as a release-neutral precursor to
+  `docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md`.
 
 ## [0.1.2] - 2026-07-28
 
