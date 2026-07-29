@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Discard a still-queued "taking longer than expected" timeout notice before
+  speaking a late search result that arrives for the same work item, so the
+  stale notice no longer plays after the real answer is ready. A notice that
+  has already started speaking is left to finish rather than interrupted
+  mid-utterance.
+
 ## [0.1.2] - 2026-07-28
 
 ### Added
