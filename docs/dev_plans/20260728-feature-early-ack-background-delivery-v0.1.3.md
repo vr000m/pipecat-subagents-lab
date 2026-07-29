@@ -18,6 +18,8 @@ v0.1.1 shipped the core background-delivery mechanism: late results are retained
 
 v0.1.2 (`feature/latency-observability-v0.1.2`, currently an **unmerged worktree** at `/Users/vr000m/Code/pipecat-ai/pipecat-subagents-lab-latency-observability`) is adding a performance-log contract and Pipecat observers (`server/perf_metrics.py`) to measure where turn time actually goes — routing vs. search vs. delivery. This plan is the next release and depends on that data and on the merge landing first, because it touches the same files (`server/pipeline.py` most heavily) and current line numbers will shift once 0.1.2 lands. The worktree commit is intentionally not pinned here; Phase 0 verifies the live ref before implementation.
 
+Transport-aware speech ownership is specified separately in `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md`. That release-neutral precursor must be reviewed and its scheduler/transport invariant implemented before this plan's Phase 2 relies on queued timeout-notice supersession; queue-only discard is not sufficient once synthesized audio has entered the output transport.
+
 This plan operationalizes four prior recommendations, in priority order: early acknowledgement (P0), background-delivery policy tuning (P1), progressive RTVI status (P1/P2), and query-context narrowing as a measured experiment (P2), gated on 0.1.2's data rather than assumed.
 
 ## Requirements
@@ -88,6 +90,7 @@ The early acknowledgement is a logical delegation-confirmed operation shared by 
 **Goal:** Confirm 0.1.2 has merged to `main` before any 0.1.3 code changes begin; re-verify all Files-to-Modify line numbers below against post-merge `main`.
 
 - Confirm `feature/latency-observability-v0.1.2` is merged (or explicitly re-scope this plan to branch from the worktree if the user wants to proceed in parallel).
+- Confirm `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md` has passed `/review-plan` and its transport-aware lease invariant is implemented and validated before Phase 2 begins. It may land independently without a version bump or release.
 - Re-run `rg -n "foreground_search_timeout_seconds|retain_late_task|history\[-4:\]" server/` against post-merge `main` and update line refs in this plan's Technical Specifications.
 - Capture a dated post-merge `PERF_METRIC` sample covering direct, delegated-complete, retained-late, cancellation, reconnect, and same-epoch newer-turn scenarios. Record the sample and command in `docs/benchmarks/`; do not treat the historical pre-0.1.2 benchmark as policy evidence.
 - Verify whether 0.1.2 emits safe `query_chars`, `context_chars`, and provider/model dimensions. If not, Phase 4 remains blocked until its instrumentation and data-collection subphase lands.
@@ -112,7 +115,7 @@ The early acknowledgement is a logical delegation-confirmed operation shared by 
 
 - Add an immutable delivery context carrying semantic turn, work item, origin epoch, acknowledgement timestamp/sequence, and the latest accepted same-epoch turn sequence. The policy evaluator runs after idempotent commit and before speech scheduling.
 - Apply the accepted deterministic policy: commit every valid late result exactly once; autoplay only when the originating epoch is active, no newer semantic turn has been accepted, the work is not cancelled, and the user has not explicitly paused or stopped output. Otherwise commit the result display-only. Do not introduce an arbitrary elapsed-time threshold in v0.1.3.
-- Supersede a timeout notice when its retained final result becomes ready while the notice is still queued behind other speech. Do not interrupt a notice that has already started, and do not discard any other work item's queued speech.
+- Consume the reviewed transport-aware invariant from `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md`: supersede a timeout notice when its retained final result becomes ready while the notice is still scheduler-queued behind transport-active speech. Do not interrupt a notice that has transport-started, and do not discard any other work item's queued speech.
 - Verify cancellation, reconnect (`interrupted_by_reconnect` in `shared/protocol.md`), and newer-turn arrival correctly suppress or supersede pending late-result delivery — extend existing epoch checks (`server/pipeline.py:1077,1086,1100-1101`) rather than introducing a parallel fencing mechanism.
 - Keep commit ownership in `SessionHost`/`SessionState`; the coordinator only owns task retention/cancellation and callback delivery. Assert exactly-once commit separately from autoplay/display-only disposition.
 
@@ -157,6 +160,7 @@ The early acknowledgement is a logical delegation-confirmed operation shared by 
 - The shared delegation-confirmed operation is called by direct, pending-dialogue, and multi-intent paths. It creates one ephemeral ack per semantic turn and hands it to `SpeechScheduler`; it does not call canonical-result commit.
 - The ack and status paths share the semantic turn/work-item identity but have separate state machines: ack speech is ephemeral delivery, while status is server-authored runtime projection.
 - Late-result delivery policy runs after idempotent `SessionHost`/`SessionState` commit and before speech scheduling. It consumes immutable delivery context and existing epoch fencing; it does not make the coordinator the commit owner.
+- Phase 2 depends on the transport-aware scheduler precursor: synthesis end does not release the active lease, transport stop does, and final-result readiness can therefore replace a same-work-item timeout notice that remains scheduler-queued behind active speech.
 - The accepted late-result policy is a delivery disposition only: use `commit_and_autoplay` when all active-epoch/newer-turn/cancellation/pause predicates hold; otherwise use `commit_display_only`. Both paths commit a valid result exactly once.
 - Status emission uses `SessionState._emit()` → `RuntimeObserver` → RTVI frame construction. The chosen payload/message kind must be updated in Python, JSON Schema, browser validation, reducer, snapshot, and tests as one contract change.
 - Phase 0 live samples precede any Phase 4 narrowing decision; the accepted Phase 2 policy has no elapsed-time threshold. Phase 4 may be marked "not promoted — data did not support it" with its analysis artifact.
