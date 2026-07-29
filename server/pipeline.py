@@ -51,7 +51,7 @@ from .speech_lifecycle import (
     SpeechGenerationMarkerFrame,
     SpeechLifecycleCoordinator,
 )
-from .speech_scheduler import SpeechScheduler
+from .speech_scheduler import ROLE_RESULT, ROLE_TIMEOUT_NOTICE, SpeechRole, SpeechScheduler
 from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
@@ -1011,7 +1011,10 @@ class SessionHost:
                 child_outcome_label = "failed"
             was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
             commit_started = time.perf_counter()
-            committed = await self._commit_and_speak(result, origin)
+            speech_role: SpeechRole = (
+                ROLE_TIMEOUT_NOTICE if child_outcome_label == "retained" else ROLE_RESULT
+            )
+            committed = await self._commit_and_speak(result, origin, role=speech_role)
             commit_ms = (time.perf_counter() - commit_started) * 1000
             child.finalize(
                 outcome=child_outcome_label,
@@ -1113,6 +1116,7 @@ class SessionHost:
                 work_item_ids=[work_item_id],
                 on_late_terminal=on_late_terminal,
             )
+            speech_role: SpeechRole = ROLE_RESULT
             if submitted.results:
                 result = submitted.results[0]
                 child.finalize(
@@ -1125,6 +1129,7 @@ class SessionHost:
                     text="That is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
+                speech_role = ROLE_TIMEOUT_NOTICE
                 child.finalize(outcome="retained", app_worker_id=worker_id)
                 self._register_retained_recorder_if_open(work_item_id, retained_recorder)
             else:
@@ -1140,7 +1145,7 @@ class SessionHost:
                     origin_epoch=origin.epoch,
                 )
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
-            committed = await self._commit_and_speak(result, origin)
+            committed = await self._commit_and_speak(result, origin, role=speech_role)
             turn_recorder.finalize()
             return committed
         except asyncio.CancelledError:
@@ -1636,16 +1641,18 @@ class SessionHost:
                     result_id = result.result_id
                     if speakable is not None:
                         try:
-                            # A retained result supersedes its timeout notice
-                            # only while that notice is still queued. Never
-                            # interrupt an utterance that has already started.
-                            speakable.scheduler.discard_queued(late.work_item_id)
+                            # A retained result supersedes only its own
+                            # queued timeout notice, not other same-work
+                            # queued speech, and never an utterance that has
+                            # already been admitted to the transport slot.
+                            speakable.scheduler.discard_queued_notice(late.work_item_id)
                             speakable.scheduler.enqueue(
                                 result_id=result.result_id,
                                 work_item_id=late.work_item_id,
                                 run_id=f"run-{result.turn_id}",
                                 text=result.spoken_text,
                                 origin_epoch=origin_epoch,
+                                role=ROLE_RESULT,
                             )
                         except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
                             speech_outcome = "enqueue_failed"
@@ -1688,7 +1695,11 @@ class SessionHost:
             )
 
     async def _commit_and_speak(
-        self, result: GroundedResult, origin: ConnectionPipeline
+        self,
+        result: GroundedResult,
+        origin: ConnectionPipeline,
+        *,
+        role: SpeechRole = ROLE_RESULT,
     ) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""
         origin_epoch = result.origin_epoch
@@ -1713,6 +1724,7 @@ class SessionHost:
             run_id=f"run-{result.turn_id}",
             text=result.spoken_text,
             origin_epoch=origin_epoch,
+            role=role,
         )
         await origin.scheduler.start_next(work_item_id)
         return result

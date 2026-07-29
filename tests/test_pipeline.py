@@ -28,6 +28,7 @@ from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
 from server.services.tts import CorrelatedTTSSpeakFrame
+from server.speech_scheduler import ROLE_RESULT, ROLE_TIMEOUT_NOTICE
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.work_item_coordinator import LateResult, WorkItemCoordinator
 from server.workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
@@ -691,8 +692,9 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
             spoken_text="That is taking longer than expected; I will continue in the background.",
             origin_epoch=1,
         )
-        await host._commit_and_speak(timeout, connection)
+        await host._commit_and_speak(timeout, connection, role=ROLE_TIMEOUT_NOTICE)
         stale = connection.scheduler._queues["work-turn-sf"][0]
+        assert stale.role == ROLE_TIMEOUT_NOTICE
 
         final = GroundedResult(
             result_id="result-final",
@@ -732,6 +734,140 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
             "Helsinki weather",
             final.spoken_text,
         ]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_interrupting_a() -> (
+    None
+):
+    """The reported two-query race: A already occupies the proven transport
+    slot (admitted through the real lifecycle coordinator, matching the
+    admission path exercised in Phase 1). B has a mixed same-work queue with
+    non-supersedable speech on both sides of its timeout notice, and B's
+    final result arrives before A stops. Only B's notice may terminate, B's
+    other same-work items must keep their order, another work item's queue
+    must be untouched, the notice-discard and final-enqueue must happen with
+    no ``start_next()`` landing between them, and A must not be interrupted.
+    """
+
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        scheduler = connection.scheduler
+
+        a_item = scheduler.enqueue(
+            result_id="result-a",
+            work_item_id="work-a",
+            run_id="run-a",
+            text="Helsinki weather",
+            origin_epoch=1,
+        )
+        await scheduler.start_next()
+        assert scheduler.active is not None and scheduler.active.item == a_item
+        assert scheduler.lifecycle is not None and scheduler.lifecycle.occupied is True
+
+        before_notice = scheduler.enqueue(
+            result_id="result-b-before",
+            work_item_id="work-b",
+            run_id="run-b-before",
+            text="Still checking on that.",
+            origin_epoch=1,
+            role=ROLE_RESULT,
+        )
+        notice = scheduler.enqueue(
+            result_id="result-b-notice",
+            work_item_id="work-b",
+            run_id="run-b-notice",
+            text="That is taking longer than expected; I will continue in the background.",
+            origin_epoch=1,
+            role=ROLE_TIMEOUT_NOTICE,
+        )
+        after_notice = scheduler.enqueue(
+            result_id="result-b-after",
+            work_item_id="work-b",
+            run_id="run-b-after",
+            text="One more update.",
+            origin_epoch=1,
+            role=ROLE_RESULT,
+        )
+        other_item = scheduler.enqueue(
+            result_id="result-other",
+            work_item_id="work-other",
+            run_id="run-other",
+            text="Unrelated speech.",
+            origin_epoch=1,
+        )
+        other_queue_before = list(scheduler._queues["work-other"])
+
+        call_order: list[str] = []
+        real_discard_queued_notice = scheduler.discard_queued_notice
+        real_enqueue = scheduler.enqueue
+        real_start_next = scheduler.start_next
+
+        def tracked_discard_queued_notice(work_item_id: str) -> tuple[object, ...]:
+            call_order.append("discard_queued_notice")
+            return real_discard_queued_notice(work_item_id)
+
+        def tracked_enqueue(**kwargs: object) -> object:
+            call_order.append("enqueue")
+            return real_enqueue(**kwargs)
+
+        async def tracked_start_next(work_item_id: str | None = None) -> object:
+            call_order.append("start_next")
+            return await real_start_next(work_item_id)
+
+        scheduler.discard_queued_notice = tracked_discard_queued_notice  # type: ignore[method-assign]
+        scheduler.enqueue = tracked_enqueue  # type: ignore[method-assign]
+        scheduler.start_next = tracked_start_next  # type: ignore[method-assign]
+
+        final = GroundedResult(
+            result_id="result-b-final",
+            worker_id="worker-search",
+            turn_id="turn-b",
+            text="The current temperature in San Francisco is 69 degrees Fahrenheit.",
+            spoken_text="The current temperature in San Francisco is 69 degrees Fahrenheit.",
+            origin_epoch=1,
+        )
+        await host._commit_late_result(
+            LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
+            1,
+        )
+
+        # No start_next() lands between the notice discard and the final
+        # result's enqueue: the discard and enqueue are adjacent in the call
+        # log, and the only start_next() is the one issued after both.
+        discard_at = call_order.index("discard_queued_notice")
+        enqueue_at = call_order.index("enqueue")
+        assert enqueue_at == discard_at + 1
+        assert "start_next" not in call_order[discard_at:enqueue_at]
+
+        # Only B's notice terminates, and it terminates exactly once.
+        assert host.state.speech[notice.utterance_id].state.value == "interrupted"
+        notice_history = host.state.speech_history(notice.utterance_id)
+        assert sum(progress.state.value == "interrupted" for progress in notice_history) == 1
+
+        # B's remaining same-work items retain order, with the final result
+        # appended after them.
+        remaining = scheduler._queues["work-b"]
+        assert [item.result_id for item in remaining] == [
+            before_notice.result_id,
+            after_notice.result_id,
+            final.result_id,
+        ]
+
+        # Another work item's queue is untouched.
+        assert scheduler._queues["work-other"] == other_queue_before
+        assert other_item.result_id == "result-other"
+
+        # A is not interrupted and still owns the transport slot.
+        assert scheduler.active is not None
+        assert scheduler.active.item == a_item
+        assert host.state.speech[a_item.utterance_id].state.value != "interrupted"
+
         await host.shutdown()
 
     asyncio.run(run())

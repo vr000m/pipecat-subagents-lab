@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from .contracts import DeliveryState
 from .session_state import SessionState
 from .speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
+
+SpeechRole = Literal["result", "timeout_notice"]
+ROLE_RESULT: SpeechRole = "result"
+ROLE_TIMEOUT_NOTICE: SpeechRole = "timeout_notice"
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,7 @@ class SpeechItem:
     text: str
     utterance_id: str
     origin_epoch: int | None = None
+    role: SpeechRole = ROLE_RESULT
 
 
 @dataclass(frozen=True)
@@ -100,6 +105,7 @@ class SpeechScheduler:
         text: str,
         origin_epoch: int | None = None,
         utterance_id: str | None = None,
+        role: SpeechRole = ROLE_RESULT,
     ) -> SpeechItem:
         item = SpeechItem(
             result_id,
@@ -108,6 +114,7 @@ class SpeechScheduler:
             text,
             utterance_id or f"utt-{uuid4().hex}",
             origin_epoch,
+            role,
         )
         self._queues.setdefault(work_item_id, []).append(item)
         self.state.speech_progress(**self._progress(item), state=DeliveryState.DISPLAYED)
@@ -260,6 +267,7 @@ class SpeechScheduler:
             run_id=item.run_id,
             text=item.text,
             origin_epoch=item.origin_epoch,
+            role=item.role,
         )
         self.state.speech_progress(**self._progress(replay), state=DeliveryState.RESUMED)
         return replay
@@ -296,6 +304,29 @@ class SpeechScheduler:
     def discard_queued(self, work_item_id: str) -> tuple[SpeechItem, ...]:
         """Discard speech for one work item only if it has not started."""
         discarded = tuple(self._queues.pop(work_item_id, ()))
+        for item in discarded:
+            self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+        return discarded
+
+    def discard_queued_notice(self, work_item_id: str) -> tuple[SpeechItem, ...]:
+        """Discard only a still-queued timeout notice for one work item.
+
+        A notice is supersedable while it remains in its own per-work queue.
+        Other queued items in the same work-item queue (non-supersedable
+        speech, or a notice already admitted to the transport slot) are left
+        untouched and keep their relative order.
+        """
+        queue = self._queues.get(work_item_id)
+        if not queue:
+            return ()
+        remaining = [item for item in queue if item.role != ROLE_TIMEOUT_NOTICE]
+        discarded = tuple(item for item in queue if item.role == ROLE_TIMEOUT_NOTICE)
+        if not discarded:
+            return ()
+        if remaining:
+            self._queues[work_item_id] = remaining
+        else:
+            self._queues.pop(work_item_id, None)
         for item in discarded:
             self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
         return discarded
