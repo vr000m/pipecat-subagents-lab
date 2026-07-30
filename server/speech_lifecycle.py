@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -192,6 +193,7 @@ class SpeechLifecycleCoordinator:
         on_terminal: TerminalCallback | None = None,
         dispatch_cleanup: CleanupCallback | None = None,
         dispatch_teardown: TeardownCallback | None = None,
+        context_tombstone_limit: int = 256,
     ) -> None:
         self._clock = clock or MonotonicClock()
         self._timers = timers or EventLoopTimerScheduler()
@@ -200,11 +202,14 @@ class SpeechLifecycleCoordinator:
         self._on_terminal = on_terminal
         self._dispatch_cleanup = dispatch_cleanup
         self._dispatch_teardown = dispatch_teardown
+        self._context_tombstone_limit = max(context_tombstone_limit, 0)
 
         self._generations: dict[str, SpeechGeneration] = {}
         self._slot_token: str | None = None
         self._context_tokens: dict[str, str] = {}
+        self._context_tombstones: OrderedDict[str, None] = OrderedDict()
         self._timer_handles: dict[str, TimerHandle] = {}
+        self._connection_closed = False
         self.connection_epoch = 0
 
     @property
@@ -226,7 +231,7 @@ class SpeechLifecycleCoordinator:
     def try_admit(self, identity: GenerationIdentity) -> SpeechGeneration | None:
         """Admit one generation to the sole global transport slot, or
         refuse when it is already occupied."""
-        if self._slot_token is not None:
+        if self._connection_closed or self._slot_token is not None:
             return None
         token = uuid4().hex
         generation = SpeechGeneration(token=token, identity=identity)
@@ -241,26 +246,45 @@ class SpeechLifecycleCoordinator:
         generation.phase = GenerationPhase.HANDED_TO_TTS
         self._arm(token, self._clock.now() + self._start_timeout, self._on_start_timeout)
 
-    def bind_context(self, token: str, context_id: str) -> None:
-        """Bind the first generated TTS `context_id` after a marker to the
-        marker's token. Never inferred from a fieldless bot frame."""
+    def bind_context(self, token: str, context_id: str) -> bool:
+        """Bind a generated TTS context only to its expected marker token.
+
+        The connection-local TTS adapters use the scheduler utterance ID as
+        their Pipecat context ID. A stale start therefore cannot consume a
+        replacement marker, and a context already owned (or tombstoned) by
+        another generation cannot be rebound.
+        """
         generation = self._live(token)
-        if generation is None or generation.context_id is not None:
-            return
+        if generation is None or generation.tombstoned:
+            return False
+        if context_id != generation.identity.utterance_id:
+            return False
+        if generation.context_id is not None:
+            return (
+                generation.context_id == context_id
+                and self._context_tokens.get(context_id) == token
+            )
+        owner = self._context_tokens.get(context_id)
+        if owner is not None and owner != token:
+            return False
+        if context_id in self._context_tombstones:
+            return False
         generation.context_id = context_id
         self._context_tokens[context_id] = token
+        return True
 
     # -- provider synthesis lifecycle --
 
-    def on_tts_started(self, context_id: str) -> None:
+    def on_tts_started(self, context_id: str) -> bool:
         token = self._context_tokens.get(context_id)
         if token is None:
-            return
+            return False
         generation = self._live(token)
-        if generation is None:
-            return
+        if generation is None or generation.tombstoned:
+            return False
         self._cancel_timer(token)
         generation.phase = GenerationPhase.SYNTHESIZING
+        return True
 
     def on_tts_audio(
         self, context_id: str, *, audio: bytes, sample_rate: int, num_channels: int
@@ -389,21 +413,29 @@ class SpeechLifecycleCoordinator:
         """True when a context-correlated frame belongs to a tombstoned or
         already-terminalized generation and must be dropped before output.
 
-        A context_id with no binding at all is NOT treated as stale: a
-        straggling `TTSStartedFrame` from a prior generation can mis-bind a
-        later marker's `_pending_token` before that later generation's own
-        `TTSStartedFrame` arrives (`bind_context` does not verify identity),
-        leaving the later generation's context genuinely unbound though
-        still live. Failing closed here would silently drop that
-        generation's real audio. Only a *reaped* context (bound once, then
-        popped by `_terminalize_state` once its generation terminalized --
-        `_context_tokens` itself is intentionally never popped, so this
-        distinction survives the reap) is unambiguously stale."""
+        Unbound contexts are not classified as stale here because this
+        method is also a coordinator query. The post-TTS processor still
+        fails closed by forwarding audio/stopped frames only when their
+        token-bound transition method positively accepts them.
+        """
+        if context_id in self._context_tombstones:
+            return True
         token = self._context_tokens.get(context_id)
         if token is None:
             return False
         generation = self._generations.get(token)
         return generation is None or generation.terminalized or generation.tombstoned
+
+    def connection_closed(self) -> None:
+        """Discard connection-scoped state after its worker/lane is closed."""
+        for handle in self._timer_handles.values():
+            handle.cancel()
+        self._timer_handles.clear()
+        self._context_tokens.clear()
+        self._context_tombstones.clear()
+        self._generations.clear()
+        self._slot_token = None
+        self._connection_closed = True
 
     # -- internal --
 
@@ -532,17 +564,14 @@ class SpeechLifecycleCoordinator:
         # found" -- popping here cannot turn one of those lookups into a
         # KeyError.
         #
-        # `_context_tokens` is deliberately NOT popped: it is the only
-        # record distinguishing "this context was bound, then reaped"
-        # (unambiguously stale -- `drop_stale_frame` finds the token but no
-        # generation) from "this context was never bound at all" (may still
-        # be a live generation whose `TTSStartedFrame` mis-bound onto a
-        # stale `_pending_token`, per `drop_stale_frame`'s docstring -- must
-        # NOT be treated as stale). Collapsing that distinction by popping
-        # both dicts together would fail closed on the second case and
-        # silently drop real audio. The leaked context_id->token string pair
-        # is bounded by connection lifetime and is far smaller than the
-        # `SpeechGeneration` it used to keep alive.
+        if generation.context_id is not None:
+            if self._context_tokens.get(generation.context_id) == token:
+                self._context_tokens.pop(generation.context_id, None)
+            if self._context_tombstone_limit:
+                self._context_tombstones[generation.context_id] = None
+                self._context_tombstones.move_to_end(generation.context_id)
+                while len(self._context_tombstones) > self._context_tombstone_limit:
+                    self._context_tombstones.popitem(last=False)
         self._generations.pop(token, None)
         return generation
 
@@ -592,26 +621,25 @@ class TransportSpeechLifecycleProcessor(FrameProcessor):
             return  # the marker never reaches transport.output()
 
         if direction == FrameDirection.DOWNSTREAM:
-            if isinstance(frame, TTSStartedFrame) and frame.context_id:
+            if isinstance(frame, TTSStartedFrame):
+                if not frame.context_id:
+                    return
                 if self._pending_token is not None:
-                    self._coordinator.bind_context(self._pending_token, frame.context_id)
-                    self._pending_token = None
-                if self._coordinator.drop_stale_frame(frame.context_id):
+                    if self._coordinator.bind_context(self._pending_token, frame.context_id):
+                        self._pending_token = None
+                if not self._coordinator.on_tts_started(frame.context_id):
                     return
-                self._coordinator.on_tts_started(frame.context_id)
-            elif isinstance(frame, TTSAudioRawFrame) and frame.context_id:
-                if self._coordinator.drop_stale_frame(frame.context_id):
-                    return
-                self._coordinator.on_tts_audio(
+            elif isinstance(frame, TTSAudioRawFrame):
+                if not frame.context_id or not self._coordinator.on_tts_audio(
                     frame.context_id,
                     audio=frame.audio,
                     sample_rate=frame.sample_rate,
                     num_channels=frame.num_channels,
-                )
-            elif isinstance(frame, TTSStoppedFrame) and frame.context_id:
-                if self._coordinator.drop_stale_frame(frame.context_id):
+                ):
                     return
-                self._coordinator.on_tts_stopped(frame.context_id)
+            elif isinstance(frame, TTSStoppedFrame):
+                if not frame.context_id or not self._coordinator.on_tts_stopped(frame.context_id):
+                    return
 
         if isinstance(frame, BotStartedSpeakingFrame):
             self._coordinator.on_transport_bot_started()

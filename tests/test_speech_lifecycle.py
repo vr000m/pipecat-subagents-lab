@@ -108,11 +108,11 @@ def test_bound_context_progresses_to_synthesizing_then_synthesis_ended() -> None
     coordinator, _ = make_coordinator()
     generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
 
-    coordinator.bind_context(generation.token, "ctx-1")
-    coordinator.on_tts_started("ctx-1")
+    coordinator.bind_context(generation.token, "utt-1")
+    coordinator.on_tts_started("utt-1")
     assert coordinator.generation_for_token(generation.token).phase == GenerationPhase.SYNTHESIZING
 
-    assert coordinator.on_tts_stopped("ctx-1") is True
+    assert coordinator.on_tts_stopped("utt-1") is True
     assert (
         coordinator.generation_for_token(generation.token).phase == GenerationPhase.SYNTHESIS_ENDED
     )
@@ -150,10 +150,10 @@ def test_only_one_generation_may_occupy_the_global_slot() -> None:
 def test_synthesis_end_does_not_clear_the_slot_or_admit_next() -> None:
     coordinator, _ = make_coordinator()
     generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-    coordinator.bind_context(generation.token, "ctx-1")
-    coordinator.on_tts_started("ctx-1")
+    coordinator.bind_context(generation.token, "utt-1")
+    coordinator.on_tts_started("utt-1")
 
-    coordinator.on_tts_stopped("ctx-1")
+    coordinator.on_tts_stopped("utt-1")
 
     assert coordinator.occupied is True
     assert coordinator.slot_token == generation.token
@@ -169,12 +169,12 @@ def test_raw_drain_timer_expiry_does_not_clear_an_output_active_slot_without_tea
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
         coordinator.on_tts_audio(
-            "ctx-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+            "utt-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
         )
-        coordinator.on_tts_stopped("ctx-1")
+        coordinator.on_tts_stopped("utt-1")
 
         # Drain deadline = synthesis_end + audio_duration(0.1s) + grace(1.0s).
         await tick(clock, 1.1 + 1e-6)
@@ -193,12 +193,12 @@ def test_teardown_complete_releases_the_slot_after_output_submitted_expiry() -> 
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
         coordinator.on_tts_audio(
-            "ctx-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+            "utt-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
         )
-        coordinator.on_tts_stopped("ctx-1")
+        coordinator.on_tts_stopped("utt-1")
         await tick(clock, 1.1 + 1e-6)
         assert coordinator.occupied is True
 
@@ -219,11 +219,11 @@ def test_teardown_complete_releases_the_slot_after_output_submitted_expiry() -> 
 
 def test_fieldless_transport_stopped_is_the_normal_slot_release() -> None:
     async def body() -> None:
-        coordinator, _ = make_coordinator()
+        coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
-        coordinator.on_tts_stopped("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
+        coordinator.on_tts_stopped("utt-1")
 
         await coordinator.on_transport_bot_stopped()
 
@@ -246,7 +246,7 @@ def test_fieldless_transport_stopped_is_the_normal_slot_release() -> None:
 def test_fieldless_transport_started_applies_to_the_sole_occupied_slot() -> None:
     coordinator, _ = make_coordinator()
     generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-    coordinator.bind_context(generation.token, "ctx-1")
+    coordinator.bind_context(generation.token, "utt-1")
 
     coordinator.on_transport_bot_started()
 
@@ -280,12 +280,12 @@ def test_late_fieldless_a_stop_after_teardown_cannot_release_b() -> None:
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
-        coordinator.bind_context(generation_a.token, "ctx-a")
-        coordinator.on_tts_started("ctx-a")
+        coordinator.bind_context(generation_a.token, "utt-a")
+        coordinator.on_tts_started("utt-a")
         coordinator.on_tts_audio(
-            "ctx-a", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+            "utt-a", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
         )
-        coordinator.on_tts_stopped("ctx-a")
+        coordinator.on_tts_stopped("utt-a")
         await tick(clock, 1.1 + 1e-6)  # drain deadline expiry with output-submitted audio
 
         blocked = coordinator.try_admit(identity("work-2", "utt-b"))
@@ -294,7 +294,7 @@ def test_late_fieldless_a_stop_after_teardown_cannot_release_b() -> None:
         await coordinator.teardown_complete(generation_a.token)
         generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
         assert generation_b is not None
-        coordinator.bind_context(generation_b.token, "ctx-b")
+        coordinator.bind_context(generation_b.token, "utt-b")
         coordinator.on_transport_bot_started()
 
         # A very late fieldless stop, arriving after B has already started.
@@ -322,37 +322,37 @@ def test_late_fieldless_a_stop_after_teardown_cannot_release_b() -> None:
 def test_stale_frame_fence_drops_late_a_frames_after_interruption_or_pause(pause: bool) -> None:
     coordinator, _ = make_coordinator()
     generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
-    coordinator.bind_context(generation_a.token, "ctx-a")
-    coordinator.on_tts_started("ctx-a")
+    coordinator.bind_context(generation_a.token, "utt-a")
+    coordinator.on_tts_started("utt-a")
 
     coordinator.record_interruption(generation_a.token, pause=pause)
 
-    assert coordinator.drop_stale_frame("ctx-a") is True
+    assert coordinator.drop_stale_frame("utt-a") is True
     # A late TTS-stopped frame for A must be dropped before it can touch
     # anything, per TransportSpeechLifecycleProcessor's own drop_stale_frame
     # gate around on_tts_stopped/on_tts_audio.
-    assert coordinator.on_tts_stopped("ctx-a") is False
+    assert coordinator.on_tts_stopped("utt-a") is False
 
 
 def test_drop_stale_frame_is_false_for_a_live_untombstoned_context() -> None:
     coordinator, _ = make_coordinator()
     generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-    coordinator.bind_context(generation.token, "ctx-1")
+    coordinator.bind_context(generation.token, "utt-1")
 
-    assert coordinator.drop_stale_frame("ctx-1") is False
+    assert coordinator.drop_stale_frame("utt-1") is False
 
 
 def test_drop_stale_frame_is_true_once_terminalized() -> None:
     async def body() -> None:
         coordinator, _ = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
-        coordinator.on_tts_stopped("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
+        coordinator.on_tts_stopped("utt-1")
 
         await coordinator.on_transport_bot_stopped()  # terminalizes
 
-        assert coordinator.drop_stale_frame("ctx-1") is True
+        assert coordinator.drop_stale_frame("utt-1") is True
 
     run(body)
 
@@ -385,8 +385,8 @@ def test_start_timeout_is_cancelled_by_the_first_correlated_tts_started_event() 
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
 
         await tick(clock, 10.0 + 1e-6)
 
@@ -400,12 +400,12 @@ def test_drain_deadline_uses_synthesis_end_plus_accumulated_audio_plus_grace() -
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
         coordinator.on_tts_audio(
-            "ctx-1", audio=synth_audio(seconds=0.5), sample_rate=16000, num_channels=1
+            "utt-1", audio=synth_audio(seconds=0.5), sample_rate=16000, num_channels=1
         )
-        coordinator.on_tts_stopped("ctx-1")
+        coordinator.on_tts_stopped("utt-1")
 
         await tick(clock, 0.5 + 1.0 - 1e-3)  # just under the deadline
         assert coordinator.generation_for_token(generation.token).disposition is None
@@ -422,9 +422,9 @@ def test_zero_audio_synthesis_uses_only_the_grace_deadline() -> None:
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
-        coordinator.on_tts_stopped("ctx-1")  # no audio ever arrived
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
+        coordinator.on_tts_stopped("utt-1")  # no audio ever arrived
 
         await tick(clock, 1.0 - 1e-3)
         assert coordinator.generation_for_token(generation.token).disposition is None
@@ -444,8 +444,8 @@ def test_interruption_cleanup_deadline_is_forwarded_at_plus_grace() -> None:
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
 
         coordinator.record_interruption(generation.token)
         await tick(clock, 1.0 - 1e-3)
@@ -464,9 +464,9 @@ def test_stop_versus_expiry_race_resolves_deterministically_in_both_orders(
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
-        coordinator.on_tts_stopped("ctx-1")  # zero-audio: grace-only deadline
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
+        coordinator.on_tts_stopped("utt-1")  # zero-audio: grace-only deadline
 
         if stop_first:
             await coordinator.on_transport_bot_stopped()
@@ -516,10 +516,10 @@ def test_local_context_bearing_error_resolves_its_context_to_the_bound_token_fir
     async def body() -> None:
         coordinator, _ = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
 
-        token = coordinator.token_for_context("ctx-1")
+        token = coordinator.token_for_context("utt-1")
         assert token == generation.token
         await coordinator.provider_error(token)
 
@@ -533,12 +533,12 @@ def test_local_context_bearing_error_resolves_its_context_to_the_bound_token_fir
 
 def test_error_for_a_stale_captured_token_does_not_corrupt_the_next_generation() -> None:
     async def body() -> None:
-        coordinator, _ = make_coordinator()
+        coordinator, clock = make_coordinator()
         generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
         coordinator.record_interruption(generation_a.token)
         # Interruption alone does not free the slot until its own cleanup
         # deadline resolves or the old lane acknowledges.
-        await coordinator.acknowledge_tts_lane_flush(generation_a.token)
+        await tick(clock, 1.0 + 1e-6)
         generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
         assert generation_b is not None
 
@@ -564,12 +564,12 @@ def test_record_interruption_tombstones_and_sets_disposition_synchronously() -> 
     InterruptionFrame satisfies the ordering."""
     coordinator, _ = make_coordinator()
     generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-    coordinator.bind_context(generation.token, "ctx-1")
-    coordinator.on_tts_started("ctx-1")
+    coordinator.bind_context(generation.token, "utt-1")
+    coordinator.on_tts_started("utt-1")
 
     coordinator.record_interruption(generation.token, pause=False)
 
-    assert coordinator.drop_stale_frame("ctx-1") is True
+    assert coordinator.drop_stale_frame("utt-1") is True
     assert coordinator.generation_for_token(generation.token).disposition == (
         DeliveryDisposition.INTERRUPTED
     )
@@ -578,8 +578,8 @@ def test_record_interruption_tombstones_and_sets_disposition_synchronously() -> 
 def test_barge_in_never_automatically_admits_the_next_generation() -> None:
     coordinator, _ = make_coordinator()
     generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
-    coordinator.bind_context(generation_a.token, "ctx-a")
-    coordinator.on_tts_started("ctx-a")
+    coordinator.bind_context(generation_a.token, "utt-a")
+    coordinator.on_tts_started("utt-a")
 
     coordinator.record_interruption(generation_a.token, pause=False)
 
@@ -595,8 +595,8 @@ def test_pause_records_paused_disposition_and_retains_the_barrier() -> None:
     async def body() -> None:
         coordinator, clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
 
         coordinator.record_interruption(generation.token, pause=True)
 
@@ -647,27 +647,51 @@ def test_terminalized_generation_is_reaped_from_internal_dicts() -> None:
     KeyError, and a stale frame for the reaped context must still be
     dropped, not mistaken for live.
 
-    `_context_tokens` is deliberately NOT reaped -- see `drop_stale_frame`'s
-    docstring -- so `token_for_context` keeps resolving the reaped context
-    to its (now-gone) token; that token's absence from `_generations` is
-    what makes `drop_stale_frame` correctly report it as stale."""
+    The active context binding is reaped into the bounded tombstone cache,
+    which preserves recent stale-frame detection without unbounded growth."""
 
     async def body() -> None:
         coordinator, _ = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
-        coordinator.on_tts_stopped("ctx-1")  # zero audio: self-acknowledges on terminalize
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
+        coordinator.on_tts_stopped("utt-1")  # zero audio: self-acknowledges on terminalize
 
         await coordinator.on_transport_bot_stopped()
 
         assert generation.terminalized is True
         assert generation.token not in coordinator._generations
-        assert "ctx-1" in coordinator._context_tokens
+        assert "utt-1" not in coordinator._context_tokens
+        assert "utt-1" in coordinator._context_tombstones
         assert coordinator.generation_for_token(generation.token) is None
-        assert coordinator.token_for_context("ctx-1") == generation.token
-        assert coordinator.drop_stale_frame("ctx-1") is True
+        assert coordinator.token_for_context("utt-1") is None
+        assert coordinator.drop_stale_frame("utt-1") is True
         assert coordinator.drop_stale_frame("never-bound-ctx") is False
+
+    run(body)
+
+
+def test_context_tombstones_are_bounded_and_connection_shutdown_clears_them() -> None:
+    async def body() -> None:
+        coordinator, _ = make_coordinator(context_tombstone_limit=2)
+
+        for index in range(4):
+            utterance_id = f"utt-{index}"
+            generation = admit_and_hand_to_tts(coordinator, "work-1", utterance_id)
+            assert coordinator.bind_context(generation.token, utterance_id) is True
+            assert coordinator.on_tts_started(utterance_id) is True
+            assert coordinator.on_tts_stopped(utterance_id) is True
+            await coordinator.on_transport_bot_stopped()
+
+        assert list(coordinator._context_tombstones) == ["utt-2", "utt-3"]
+        assert len(coordinator._context_tokens) == 0
+        assert coordinator.drop_stale_frame("utt-3") is True
+
+        coordinator.connection_closed()
+
+        assert coordinator._context_tombstones == {}
+        assert coordinator._context_tokens == {}
+        assert coordinator.try_admit(identity("work-2", "utt-after-close")) is None
 
     run(body)
 
@@ -682,12 +706,12 @@ def test_dispatch_cleanup_and_teardown_hooks_receive_the_captured_token_and_iden
             dispatch_teardown=lambda token, ident: teardown_calls.append((token, ident)),
         )
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
         coordinator.on_tts_audio(
-            "ctx-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+            "utt-1", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
         )
-        coordinator.on_tts_stopped("ctx-1")
+        coordinator.on_tts_stopped("utt-1")
 
         await tick(clock, 1.1 + 1e-6)
 
@@ -791,8 +815,8 @@ def test_ordered_event_log_for_interruption_or_pause_records_before_cleanup_with
 
         coordinator, clock = make_coordinator(dispatch_cleanup=dispatch_cleanup)
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
 
         coordinator.record_interruption(generation.token, pause=pause)
         events.append("recorded")
@@ -857,7 +881,7 @@ async def _terminalize_generation_a(
     elif reason == "start_timeout":
         await tick(clock, 10.0 + 1e-6)
     elif reason in ("drain_fallback", "reconnect", "shutdown"):
-        coordinator.on_tts_stopped("ctx-a")
+        coordinator.on_tts_stopped("utt-a")
         await tick(clock, generation.audio_duration_seconds + 1.0 + 1e-6)
     elif reason in ("generic_error", "local_error"):
         await coordinator.provider_error(generation.token)
@@ -908,11 +932,11 @@ def test_terminal_matrix_drops_late_a_frames_leaves_b_unchanged_and_progresses_o
         coordinator, clock = make_coordinator(on_terminal=on_terminal)
         generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
         if reason != "start_timeout":
-            coordinator.bind_context(generation_a.token, "ctx-a")
-            coordinator.on_tts_started("ctx-a")
+            coordinator.bind_context(generation_a.token, "utt-a")
+            coordinator.on_tts_started("utt-a")
             if audio_submitted:
                 coordinator.on_tts_audio(
-                    "ctx-a", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
+                    "utt-a", audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1
                 )
 
         await _terminalize_generation_a(
@@ -928,20 +952,20 @@ def test_terminal_matrix_drops_late_a_frames_leaves_b_unchanged_and_progresses_o
         if reason != "start_timeout":
             # Late context-bearing A frames are dropped before they could
             # reach output.
-            assert coordinator.drop_stale_frame("ctx-a") is True
+            assert coordinator.drop_stale_frame("utt-a") is True
             assert (
                 coordinator.on_tts_audio(
-                    "ctx-a", audio=synth_audio(seconds=0.05), sample_rate=16000, num_channels=1
+                    "utt-a", audio=synth_audio(seconds=0.05), sample_rate=16000, num_channels=1
                 )
                 is False
             )
-            assert coordinator.on_tts_stopped("ctx-a") is False
+            assert coordinator.on_tts_stopped("utt-a") is False
 
         # B is admitted only once A's lane is fully retired, and B's own
         # state is untouched by anything A did.
         generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
         assert generation_b is not None, "B must be admitted once A's lane is retired"
-        coordinator.bind_context(generation_b.token, "ctx-b")
+        coordinator.bind_context(generation_b.token, "utt-b")
         coordinator.on_transport_bot_started()
         assert (
             coordinator.generation_for_token(generation_b.token).phase
@@ -982,14 +1006,14 @@ def test_output_lane_wrapper_gates_transport_stopped_on_the_real_final_audio_fut
     async def body() -> None:
         coordinator, _ = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
-        coordinator.on_tts_started("ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
+        coordinator.on_tts_started("utt-1")
 
         track = RawAudioTrack(sample_rate=16000, auto_silence=False)
         chunk = bytes(16000 * 10 // 1000 * 2)
         final_audio_future = track.add_audio_bytes(chunk)
-        coordinator.on_tts_audio("ctx-1", audio=chunk, sample_rate=16000, num_channels=1)
-        coordinator.on_tts_stopped("ctx-1")
+        coordinator.on_tts_audio("utt-1", audio=chunk, sample_rate=16000, num_channels=1)
+        coordinator.on_tts_stopped("utt-1")
 
         assert not final_audio_future.done()
         await coordinator.on_transport_bot_stopped()
@@ -1013,7 +1037,7 @@ def test_transport_processor_drops_a_tts_started_frame_for_a_tombstoned_generati
     async def body() -> None:
         coordinator, _ = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
-        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.bind_context(generation.token, "utt-1")
         coordinator.record_interruption(generation.token, pause=False)
         assert coordinator.generation_for_token(generation.token).tombstoned is True
 
@@ -1026,10 +1050,87 @@ def test_transport_processor_drops_a_tts_started_frame_for_a_tombstoned_generati
         processor.push_frame = push  # type: ignore[method-assign]
 
         await processor.process_frame(
-            TTSStartedFrame(context_id="ctx-1"), FrameDirection.DOWNSTREAM
+            TTSStartedFrame(context_id="utt-1"), FrameDirection.DOWNSTREAM
         )
 
         assert forwarded == []
+
+    run(body)
+
+
+def test_transport_processor_keeps_marker_b_across_stale_start_and_audio_a() -> None:
+    """marker-B, stale start/audio/stop-A, start/audio-B must bind only B."""
+    from pipecat.frames.frames import TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from server.speech_lifecycle import (
+        SpeechGenerationMarkerFrame,
+        TransportSpeechLifecycleProcessor,
+    )
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation_a = admit_and_hand_to_tts(coordinator, "work-a", "utt-a")
+        assert coordinator.bind_context(generation_a.token, "utt-a") is True
+        assert coordinator.on_tts_started("utt-a") is True
+        assert coordinator.on_tts_stopped("utt-a") is True
+        await coordinator.on_transport_bot_stopped()
+
+        generation_b = admit_and_hand_to_tts(coordinator, "work-b", "utt-b")
+        processor = TransportSpeechLifecycleProcessor(coordinator)
+        forwarded: list[object] = []
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        processor.push_frame = push  # type: ignore[method-assign]
+        stale_audio = TTSAudioRawFrame(
+            audio=synth_audio(seconds=0.05),
+            sample_rate=16000,
+            num_channels=1,
+            context_id="utt-a",
+        )
+        unbound_audio = TTSAudioRawFrame(
+            audio=synth_audio(seconds=0.05),
+            sample_rate=16000,
+            num_channels=1,
+            context_id="never-bound",
+        )
+        audio_b = TTSAudioRawFrame(
+            audio=synth_audio(seconds=0.05),
+            sample_rate=16000,
+            num_channels=1,
+            context_id="utt-b",
+        )
+
+        await processor.process_frame(
+            SpeechGenerationMarkerFrame(
+                token=generation_b.token,
+                utterance_id="utt-b",
+                work_item_id="work-b",
+            ),
+            FrameDirection.DOWNSTREAM,
+        )
+        await processor.process_frame(
+            TTSStartedFrame(context_id="utt-a"), FrameDirection.DOWNSTREAM
+        )
+        await processor.process_frame(stale_audio, FrameDirection.DOWNSTREAM)
+        await processor.process_frame(
+            TTSStoppedFrame(context_id="utt-a"), FrameDirection.DOWNSTREAM
+        )
+        await processor.process_frame(unbound_audio, FrameDirection.DOWNSTREAM)
+        await processor.process_frame(
+            TTSStoppedFrame(context_id="never-bound"), FrameDirection.DOWNSTREAM
+        )
+        start_b = TTSStartedFrame(context_id="utt-b")
+        await processor.process_frame(start_b, FrameDirection.DOWNSTREAM)
+        await processor.process_frame(audio_b, FrameDirection.DOWNSTREAM)
+
+        assert forwarded == [start_b, audio_b]
+        assert coordinator.token_for_context("utt-a") is None
+        assert coordinator.token_for_context("utt-b") == generation_b.token
+        assert generation_b.context_id == "utt-b"
+        assert generation_b.audio_submitted is True
 
     run(body)
 
@@ -1069,10 +1170,10 @@ def test_transport_processor_binds_local_tts_audio_frames_carrying_context_id() 
             FrameDirection.DOWNSTREAM,
         )
         await processor.process_frame(
-            TTSStartedFrame(context_id="ctx-1"), FrameDirection.DOWNSTREAM
+            TTSStartedFrame(context_id="utt-1"), FrameDirection.DOWNSTREAM
         )
         audio_frame = TTSAudioRawFrame(
-            audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1, context_id="ctx-1"
+            audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1, context_id="utt-1"
         )
         await processor.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
 
@@ -1083,10 +1184,10 @@ def test_transport_processor_binds_local_tts_audio_frames_carrying_context_id() 
         # dropped rather than forwarded to transport.output().
         coordinator.record_interruption(generation.token, pause=False)
         stale_audio_frame = TTSAudioRawFrame(
-            audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1, context_id="ctx-1"
+            audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1, context_id="utt-1"
         )
         forwarded.clear()
-        assert coordinator.drop_stale_frame("ctx-1") is True
+        assert coordinator.drop_stale_frame("utt-1") is True
         await processor.process_frame(stale_audio_frame, FrameDirection.DOWNSTREAM)
 
         assert stale_audio_frame not in forwarded
