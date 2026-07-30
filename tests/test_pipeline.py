@@ -392,6 +392,55 @@ def test_output_teardown_must_finish_before_lifecycle_slot_is_released() -> None
     asyncio.run(run())
 
 
+def test_shutdown_still_forces_scheduler_cleanup_after_teardown_exception() -> None:
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        connection = await host.connect(connection_handshake(host, 1))
+        worker = QueueingPipelineWorker()
+        connection.worker = worker
+
+        async def failing_teardown() -> None:
+            raise RuntimeError("output teardown boom")
+
+        connection.output_teardown = failing_teardown
+        active = connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        assert connection.scheduler.active is not None
+        token = connection.scheduler.active.token
+        lifecycle = connection.lifecycle
+        assert lifecycle is not None
+        lifecycle.bind_context(token, active.utterance_id)
+        lifecycle.on_tts_started(active.utterance_id)
+        assert lifecycle.on_tts_audio(
+            active.utterance_id,
+            audio=b"\0\0",
+            sample_rate=16000,
+            num_channels=1,
+        )
+
+        # Drive the terminal path directly: the failing teardown sets
+        # connection.active = False before raising, without ever releasing
+        # the scheduler's lease.
+        await lifecycle.provider_error(token)
+
+        assert connection.active is False
+        assert connection.scheduler.active is not None, (
+            "sanity: the failing teardown should not itself release the lease"
+        )
+
+        await connection.shutdown(reason="session shutdown")
+
+        assert connection.scheduler.active is None
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("action", ["pause", "cancel"])
 def test_interruption_terminal_cleanup_does_not_automatically_start_queued_speech(
     action: str,
@@ -1221,6 +1270,59 @@ def test_pause_control_stops_active_speech_before_confirmation() -> None:
         )
         speak_index = len(connection.worker.frames) - 1
         assert interruption_index < speak_index
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pause_targeting_a_queued_item_does_not_tombstone_the_active_speech() -> None:
+    async def run() -> None:
+        class ControlCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": ("work-queued",),
+                        "control_action": "pause",
+                    },
+                )()
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=ControlCoordinator(),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        active = connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        active_token = connection.scheduler.active.token
+        connection.scheduler.enqueue(
+            result_id="result-queued",
+            work_item_id="work-queued",
+            run_id="run-queued",
+            text="Queued answer",
+            origin_epoch=1,
+        )
+
+        await host._handle_transcript("pause work-queued")
+
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item.work_item_id == "work-active"
+        assert connection.scheduler.active.item.utterance_id == active.utterance_id
+        assert connection.lifecycle is not None
+        generation = connection.lifecycle.generation_for_token(active_token)
+        assert generation is not None
+        assert generation.tombstoned is False
         await host.shutdown()
 
     asyncio.run(run())

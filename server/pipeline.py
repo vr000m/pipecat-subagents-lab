@@ -271,9 +271,13 @@ class ConnectionPipeline:
         self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect)
 
     async def shutdown(self, *, reason: str = "connection replaced") -> None:
-        """Fence this connection and stop its Pipecat worker, if attached."""
-        if self.active:
-            self.deactivate(reconnect=reason == "connection replaced")
+        """Fence this connection and stop its Pipecat worker, if attached.
+
+        Always forces scheduler cleanup, even if something upstream (e.g. a
+        failed output teardown) already set ``active = False`` directly
+        without releasing the scheduler's active lease.
+        """
+        self.deactivate(reconnect=reason == "connection replaced")
         if self.worker is not None:
             cancel = getattr(self.worker, "cancel", None)
             if cancel is not None:
@@ -821,7 +825,11 @@ class SessionHost:
                             else origin.scheduler.active.item.work_item_id
                         )
                         active_lease = origin.scheduler.active
-                        if origin.lifecycle is not None and active_lease is not None:
+                        if (
+                            origin.lifecycle is not None
+                            and active_lease is not None
+                            and active_lease.item.work_item_id == target
+                        ):
                             origin.lifecycle.record_interruption(active_lease.token, pause=True)
                         origin.scheduler.pause(target)
                         await origin.scheduler.wait_for_stops()

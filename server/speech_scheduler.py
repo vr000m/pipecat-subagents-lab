@@ -209,9 +209,12 @@ class SpeechScheduler:
     def interrupt(self, *, epoch: int | None = None, reconnect: bool = False) -> SpeechItem | None:
         state = DeliveryState.INTERRUPTED_BY_RECONNECT if reconnect else DeliveryState.INTERRUPTED
         active_item = self._active.item if self._active is not None else None
+        active_token = self._active.token if self._active is not None else None
         if active_item is None and not reconnect:
             return None
         if active_item is not None:
+            if self.lifecycle is not None and active_token is not None:
+                self.lifecycle.record_interruption(active_token, pause=False)
             self._signal_stop(active_item)
             self.state.speech_progress(
                 result_id=active_item.result_id,
@@ -222,6 +225,8 @@ class SpeechScheduler:
                 origin_epoch=epoch if epoch is not None else active_item.origin_epoch,
                 allow_stale_reconnect=reconnect,
             )
+            if self.lifecycle is not None and active_token is not None:
+                self.lifecycle.release_flushed_lane(active_token)
             self._release(active_item.utterance_id)
         if reconnect:
             for queue in self._queues.values():
