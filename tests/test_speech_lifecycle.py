@@ -990,6 +990,66 @@ def test_transport_processor_drops_a_tts_started_frame_for_a_tombstoned_generati
     run(body)
 
 
+def test_transport_processor_binds_local_tts_audio_frames_carrying_context_id() -> None:
+    """LocalTTS.run_tts() yields TTSAudioRawFrame(context_id=...) (fixed
+    alongside TTSStartedFrame/TTSStoppedFrame in server/services/tts.py).
+    TransportSpeechLifecycleProcessor must accumulate its duration via
+    on_tts_audio() -- setting audio_submitted True -- and, for a tombstoned
+    generation, must drop it before it reaches transport.output(), the same
+    way the local TTSStartedFrame/TTSStoppedFrame paths already are covered
+    above."""
+    from pipecat.frames.frames import TTSAudioRawFrame, TTSStartedFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from server.speech_lifecycle import (
+        SpeechGenerationMarkerFrame,
+        TransportSpeechLifecycleProcessor,
+    )
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        processor = TransportSpeechLifecycleProcessor(coordinator)
+        forwarded: list[object] = []
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        processor.push_frame = push  # type: ignore[method-assign]
+
+        await processor.process_frame(
+            SpeechGenerationMarkerFrame(
+                token=generation.token, utterance_id="utt-1", work_item_id="work-1"
+            ),
+            FrameDirection.DOWNSTREAM,
+        )
+        await processor.process_frame(
+            TTSStartedFrame(context_id="ctx-1"), FrameDirection.DOWNSTREAM
+        )
+        audio_frame = TTSAudioRawFrame(
+            audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1, context_id="ctx-1"
+        )
+        await processor.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
+
+        assert coordinator.generation_for_token(generation.token).audio_submitted is True
+        assert audio_frame in forwarded
+
+        # A second, tombstoned generation's local-TTS audio frame must be
+        # dropped rather than forwarded to transport.output().
+        coordinator.record_interruption(generation.token, pause=False)
+        stale_audio_frame = TTSAudioRawFrame(
+            audio=synth_audio(seconds=0.1), sample_rate=16000, num_channels=1, context_id="ctx-1"
+        )
+        forwarded.clear()
+        assert coordinator.drop_stale_frame("ctx-1") is True
+        await processor.process_frame(stale_audio_frame, FrameDirection.DOWNSTREAM)
+
+        assert stale_audio_frame not in forwarded
+
+    run(body)
+
+
 def test_timeout_driven_cleanup_tombstones_before_dispatch_races_a_late_start_frame() -> None:
     """_begin_delivery_unknown (start-timeout/drain-timeout path) must
     tombstone the generation before its first await in cleanup dispatch, the

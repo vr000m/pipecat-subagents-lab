@@ -123,6 +123,39 @@ def test_local_tts_adopts_server_rate_before_emitting_audio() -> None:
     asyncio.run(run())
 
 
+def test_run_tts_stamps_context_id_on_audio_frames_matching_started_and_stopped() -> None:
+    """TTSAudioRawFrame must carry context_id like its sibling
+    TTSStartedFrame/TTSStoppedFrame calls in the same generator, so
+    TransportSpeechLifecycleProcessor's `frame.context_id` guard (in
+    server/speech_lifecycle.py) actually fires for local-TTS audio chunks --
+    otherwise on_tts_audio() is never called (audio_submitted stays False)
+    and drop_stale_frame() is never checked for stale/tombstoned local-TTS
+    audio, letting it reach transport output after interruption."""
+
+    class Client:
+        async def append(self, _text: str) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+        async def events(self):
+            yield {"type": "response.audio.delta", "audio": "AA=="}
+            yield {"type": "response.audio.done"}
+
+    async def run() -> None:
+        service = LocalTTS(
+            TTSEndpoint("tcp", "127.0.0.1:9001"), client_factory=lambda _endpoint: Client()
+        )
+        await service.start()
+        frames = [frame async for frame in service.run_tts("hello", "ctx-1")]
+
+        audio = next(frame for frame in frames if isinstance(frame, TTSAudioRawFrame))
+        assert audio.context_id == "ctx-1"
+
+    asyncio.run(run())
+
+
 def test_local_tts_preserves_configured_voice_for_connection_client() -> None:
     captured: list[str | None] = []
 
