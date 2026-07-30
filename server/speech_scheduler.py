@@ -306,13 +306,6 @@ class SpeechScheduler:
                 cancelled.append(item)
         return tuple(cancelled)
 
-    def discard_queued(self, work_item_id: str) -> tuple[SpeechItem, ...]:
-        """Discard speech for one work item only if it has not started."""
-        discarded = tuple(self._queues.pop(work_item_id, ()))
-        for item in discarded:
-            self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
-        return discarded
-
     def discard_queued_notice(self, work_item_id: str) -> tuple[SpeechItem, ...]:
         """Discard only a still-queued timeout notice for one work item.
 
