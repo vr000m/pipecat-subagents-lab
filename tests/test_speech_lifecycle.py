@@ -955,3 +955,54 @@ def test_output_lane_wrapper_gates_transport_stopped_on_the_real_final_audio_fut
         assert final_audio_future.done()
 
     run(body)
+
+
+def test_transport_processor_drops_a_tts_started_frame_for_a_tombstoned_generation() -> None:
+    """A straggling TTSStartedFrame for an already-tombstoned generation
+    (e.g. after record_interruption) must never reach transport.output(), the
+    same way TTSAudioRawFrame/TTSStoppedFrame are already dropped."""
+    from pipecat.frames.frames import TTSStartedFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from server.speech_lifecycle import TransportSpeechLifecycleProcessor
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.record_interruption(generation.token, pause=False)
+        assert coordinator.generation_for_token(generation.token).tombstoned is True
+
+        processor = TransportSpeechLifecycleProcessor(coordinator)
+        forwarded: list[object] = []
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        processor.push_frame = push  # type: ignore[method-assign]
+
+        await processor.process_frame(
+            TTSStartedFrame(context_id="ctx-1"), FrameDirection.DOWNSTREAM
+        )
+
+        assert forwarded == []
+
+    run(body)
+
+
+def test_timeout_driven_cleanup_tombstones_before_dispatch_races_a_late_start_frame() -> None:
+    """_begin_delivery_unknown (start-timeout/drain-timeout path) must
+    tombstone the generation before its first await in cleanup dispatch, the
+    same way record_interruption does -- otherwise a straggling TTS
+    start/audio frame that arrives while cleanup is in flight would not be
+    recognised as stale and would reach output."""
+
+    async def body() -> None:
+        coordinator, clock = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        await tick(clock, 10.0)  # fires the start-timeout -> _begin_delivery_unknown
+
+        assert coordinator.generation_for_token(generation.token).tombstoned is True
+
+    run(body)

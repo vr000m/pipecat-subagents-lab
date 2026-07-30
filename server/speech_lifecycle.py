@@ -446,6 +446,10 @@ class SpeechLifecycleCoordinator:
         if generation is None or generation.terminalized:
             return
         generation.disposition = generation.disposition or DeliveryDisposition.DELIVERY_UNKNOWN
+        # Tombstone before the first await in cleanup dispatch, mirroring
+        # record_interruption: otherwise a straggling TTS start/audio frame
+        # for this context can race the cleanup dispatch and reach output.
+        generation.tombstoned = True
         await self._begin_cleanup(generation)
 
     async def _begin_cleanup(self, generation: SpeechGeneration) -> None:
@@ -558,6 +562,8 @@ class TransportSpeechLifecycleProcessor(FrameProcessor):
                 if self._pending_token is not None:
                     self._coordinator.bind_context(self._pending_token, frame.context_id)
                     self._pending_token = None
+                if self._coordinator.drop_stale_frame(frame.context_id):
+                    return
                 self._coordinator.on_tts_started(frame.context_id)
             elif isinstance(frame, TTSAudioRawFrame) and frame.context_id:
                 if self._coordinator.drop_stale_frame(frame.context_id):
