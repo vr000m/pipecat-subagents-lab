@@ -235,6 +235,12 @@ class LabPipeline:
         return True
 
 
+def _speech_role_for_child_outcome(outcome_label: str) -> SpeechRole:
+    """A retained/still-pending outcome must be spoken as a timeout notice so
+    it stays supersedable; every other outcome speaks as a normal result."""
+    return ROLE_TIMEOUT_NOTICE if outcome_label == "retained" else ROLE_RESULT
+
+
 def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
     """Compose the connection-local bridge, canonical adapter, and speech seams."""
     bus = _ProbeBus() if _ProbeBus is not None else None
@@ -1048,9 +1054,7 @@ class SessionHost:
                 child_outcome_label = "failed"
             was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
             commit_started = time.perf_counter()
-            speech_role: SpeechRole = (
-                ROLE_TIMEOUT_NOTICE if child_outcome_label == "retained" else ROLE_RESULT
-            )
+            speech_role = _speech_role_for_child_outcome(child_outcome_label)
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             commit_ms = (time.perf_counter() - commit_started) * 1000
             child.finalize(
@@ -1153,9 +1157,9 @@ class SessionHost:
                 work_item_ids=[work_item_id],
                 on_late_terminal=on_late_terminal,
             )
-            speech_role: SpeechRole = ROLE_RESULT
             if submitted.results:
                 result = submitted.results[0]
+                child_outcome_label = outcome_label
                 child.finalize(
                     outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
                 )
@@ -1166,7 +1170,7 @@ class SessionHost:
                     text="That is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
-                speech_role = ROLE_TIMEOUT_NOTICE
+                child_outcome_label = "retained"
                 child.finalize(outcome="retained", app_worker_id=worker_id)
                 self._register_retained_recorder_if_open(work_item_id, retained_recorder)
             else:
@@ -1181,7 +1185,9 @@ class SessionHost:
                     text="The pending web request could not be completed.",
                     origin_epoch=origin.epoch,
                 )
+                child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
+            speech_role = _speech_role_for_child_outcome(child_outcome_label)
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             turn_recorder.finalize()
             return committed
