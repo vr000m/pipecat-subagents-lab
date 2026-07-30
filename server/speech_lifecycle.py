@@ -383,7 +383,18 @@ class SpeechLifecycleCoordinator:
 
     def drop_stale_frame(self, context_id: str) -> bool:
         """True when a context-correlated frame belongs to a tombstoned or
-        already-terminalized generation and must be dropped before output."""
+        already-terminalized generation and must be dropped before output.
+
+        A context_id with no binding at all is NOT treated as stale: a
+        straggling `TTSStartedFrame` from a prior generation can mis-bind a
+        later marker's `_pending_token` before that later generation's own
+        `TTSStartedFrame` arrives (`bind_context` does not verify identity),
+        leaving the later generation's context genuinely unbound though
+        still live. Failing closed here would silently drop that
+        generation's real audio. Only a *reaped* context (bound once, then
+        popped by `_terminalize_state` once its generation terminalized --
+        `_context_tokens` itself is intentionally never popped, so this
+        distinction survives the reap) is unambiguously stale."""
         token = self._context_tokens.get(context_id)
         if token is None:
             return False
@@ -510,6 +521,25 @@ class SpeechLifecycleCoordinator:
         self._cancel_timer(token)
         if self._slot_token == token:
             self._slot_token = None
+        # Reap the terminal generation itself so a long-lived connection's
+        # per-utterance state does not grow without bound. Every other
+        # accessor (`_live`, `generation_for_token`, `drop_stale_frame`)
+        # already reads via `.get()` and treats a missing token as "not
+        # found" -- popping here cannot turn one of those lookups into a
+        # KeyError.
+        #
+        # `_context_tokens` is deliberately NOT popped: it is the only
+        # record distinguishing "this context was bound, then reaped"
+        # (unambiguously stale -- `drop_stale_frame` finds the token but no
+        # generation) from "this context was never bound at all" (may still
+        # be a live generation whose `TTSStartedFrame` mis-bound onto a
+        # stale `_pending_token`, per `drop_stale_frame`'s docstring -- must
+        # NOT be treated as stale). Collapsing that distinction by popping
+        # both dicts together would fail closed on the second case and
+        # silently drop real audio. The leaked context_id->token string pair
+        # is bounded by connection lifetime and is far smaller than the
+        # `SpeechGeneration` it used to keep alive.
+        self._generations.pop(token, None)
         return generation
 
     @staticmethod

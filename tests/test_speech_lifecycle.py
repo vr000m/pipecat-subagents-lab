@@ -205,7 +205,12 @@ def test_teardown_complete_releases_the_slot_after_output_submitted_expiry() -> 
         await coordinator.teardown_complete(generation.token)
 
         assert coordinator.occupied is False
-        assert coordinator.generation_for_token(generation.token).terminalized is True
+        # The terminalized generation is reaped from the coordinator's
+        # internal dicts (see test_terminalized_generation_is_reaped_from_
+        # internal_dicts below); the object this test already holds was
+        # mutated in place before the reap, so it still reflects final state.
+        assert generation.terminalized is True
+        assert coordinator.generation_for_token(generation.token) is None
         next_generation = coordinator.try_admit(identity("work-2", "utt-2"))
         assert next_generation is not None
 
@@ -223,10 +228,10 @@ def test_fieldless_transport_stopped_is_the_normal_slot_release() -> None:
         await coordinator.on_transport_bot_stopped()
 
         assert coordinator.occupied is False
-        assert (
-            coordinator.generation_for_token(generation.token).phase
-            == GenerationPhase.TRANSPORT_STOPPED
-        )
+        # Reaped from the coordinator on terminalization; the held object
+        # was mutated in place first, so it still reflects the final phase.
+        assert generation.phase == GenerationPhase.TRANSPORT_STOPPED
+        assert coordinator.generation_for_token(generation.token) is None
         next_generation = coordinator.try_admit(identity("work-2", "utt-2"))
         assert next_generation is not None
 
@@ -296,15 +301,11 @@ def test_late_fieldless_a_stop_after_teardown_cannot_release_b() -> None:
         await coordinator.on_transport_bot_stopped()
 
         assert coordinator.occupied is False
-        assert (
-            coordinator.generation_for_token(generation_b.token).phase
-            == GenerationPhase.TRANSPORT_STOPPED
-        )
+        # B is also reaped once terminalized; the held object was mutated in
+        # place first, so it still reflects the final phase.
+        assert generation_b.phase == GenerationPhase.TRANSPORT_STOPPED
         # A's own generation must not be mutated a second time by the late stop.
-        assert (
-            coordinator.generation_for_token(generation_a.token).phase
-            == GenerationPhase.SYNTHESIS_ENDED
-        )
+        assert generation_a.phase == GenerationPhase.SYNTHESIS_ENDED
 
     run(body)
 
@@ -368,11 +369,13 @@ def test_start_timeout_fires_delivery_unknown_after_ten_seconds_with_no_correlat
 
         await tick(clock, 10.0 + 1e-6)
 
-        generation_state = coordinator.generation_for_token(generation.token)
-        assert generation_state.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        # Terminalized and reaped from the coordinator; the held object was
+        # mutated in place first, so it still reflects final state.
+        assert generation.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
         # No audio was ever submitted, so the coordinator's own no-audio
         # flush acknowledgement retires the slot without an external ack.
-        assert generation_state.terminalized is True
+        assert generation.terminalized is True
+        assert coordinator.generation_for_token(generation.token) is None
         assert coordinator.occupied is False
 
     run(body)
@@ -427,9 +430,10 @@ def test_zero_audio_synthesis_uses_only_the_grace_deadline() -> None:
         assert coordinator.generation_for_token(generation.token).disposition is None
 
         await tick(clock, 2e-3)
-        assert coordinator.generation_for_token(generation.token).disposition == (
-            DeliveryDisposition.DELIVERY_UNKNOWN
-        )
+        # Terminalized and reaped; the held object was mutated in place
+        # first, so it still reflects final state.
+        assert generation.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        assert coordinator.generation_for_token(generation.token) is None
         # Zero-audio cleanup self-acknowledges, so the slot is retired too.
         assert coordinator.occupied is False
 
@@ -472,10 +476,12 @@ def test_stop_versus_expiry_race_resolves_deterministically_in_both_orders(
             await coordinator.on_transport_bot_stopped()  # a stale/late stop must be a no-op
 
         assert coordinator.occupied is False
-        # Exactly one terminal disposition/slot-release, regardless of order.
-        generation_state = coordinator.generation_for_token(generation.token)
-        assert generation_state.terminalized is True
-        assert generation_state.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        # Exactly one terminal disposition/slot-release, regardless of
+        # order. Terminalized and reaped; the held object was mutated in
+        # place first, so it still reflects final state.
+        assert generation.terminalized is True
+        assert generation.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        assert coordinator.generation_for_token(generation.token) is None
 
     run(body)
 
@@ -497,9 +503,11 @@ def test_provider_error_transitions_the_captured_token_to_delivery_unknown() -> 
 
         await coordinator.provider_error(generation.token)
 
-        generation_state = coordinator.generation_for_token(generation.token)
-        assert generation_state.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
-        assert generation_state.terminalized is True  # no audio was ever submitted
+        # Terminalized and reaped; the held object was mutated in place
+        # first, so it still reflects final state.
+        assert generation.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        assert generation.terminalized is True  # no audio was ever submitted
+        assert coordinator.generation_for_token(generation.token) is None
 
     run(body)
 
@@ -515,9 +523,10 @@ def test_local_context_bearing_error_resolves_its_context_to_the_bound_token_fir
         assert token == generation.token
         await coordinator.provider_error(token)
 
-        assert coordinator.generation_for_token(generation.token).disposition == (
-            DeliveryDisposition.DELIVERY_UNKNOWN
-        )
+        # Terminalized and reaped; the held object was mutated in place
+        # first, so it still reflects final state.
+        assert generation.disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+        assert coordinator.generation_for_token(generation.token) is None
 
     run(body)
 
@@ -625,6 +634,40 @@ def test_on_terminal_callback_fires_exactly_once_per_generation() -> None:
         await tick(clock, 10.0)  # nothing left pending; must not fire again
 
         assert terminal_calls == [(generation.token, DeliveryDisposition.DELIVERY_UNKNOWN)]
+
+    run(body)
+
+
+def test_terminalized_generation_is_reaped_from_internal_dicts() -> None:
+    """`_generations` must not grow without bound over a long-lived
+    connection: once a generation reaches terminal state, its entry is
+    popped (whitebox check, matching this module's existing test style of
+    reaching into coordinator internals). `generation_for_token` must
+    correctly report "not found" (None) for the reaped token rather than
+    KeyError, and a stale frame for the reaped context must still be
+    dropped, not mistaken for live.
+
+    `_context_tokens` is deliberately NOT reaped -- see `drop_stale_frame`'s
+    docstring -- so `token_for_context` keeps resolving the reaped context
+    to its (now-gone) token; that token's absence from `_generations` is
+    what makes `drop_stale_frame` correctly report it as stale."""
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        coordinator.bind_context(generation.token, "ctx-1")
+        coordinator.on_tts_started("ctx-1")
+        coordinator.on_tts_stopped("ctx-1")  # zero audio: self-acknowledges on terminalize
+
+        await coordinator.on_transport_bot_stopped()
+
+        assert generation.terminalized is True
+        assert generation.token not in coordinator._generations
+        assert "ctx-1" in coordinator._context_tokens
+        assert coordinator.generation_for_token(generation.token) is None
+        assert coordinator.token_for_context("ctx-1") == generation.token
+        assert coordinator.drop_stale_frame("ctx-1") is True
+        assert coordinator.drop_stale_frame("never-bound-ctx") is False
 
     run(body)
 
@@ -876,9 +919,11 @@ def test_terminal_matrix_drops_late_a_frames_leaves_b_unchanged_and_progresses_o
             coordinator, clock, generation_a, reason=reason, audio_submitted=audio_submitted
         )
 
-        generation_a_state = coordinator.generation_for_token(generation_a.token)
-        assert generation_a_state.terminalized is True
-        assert terminal_calls == [(generation_a.token, generation_a_state.disposition)]
+        # Terminalized and reaped from the coordinator; the held object was
+        # mutated in place first, so it still reflects final state.
+        assert generation_a.terminalized is True
+        assert terminal_calls == [(generation_a.token, generation_a.disposition)]
+        assert coordinator.generation_for_token(generation_a.token) is None
 
         if reason != "start_timeout":
             # Late context-bearing A frames are dropped before they could
@@ -911,12 +956,11 @@ def test_terminal_matrix_drops_late_a_frames_leaves_b_unchanged_and_progresses_o
         await coordinator.on_transport_bot_stopped()
 
         assert coordinator.occupied is False
-        assert (
-            coordinator.generation_for_token(generation_b.token).phase
-            == GenerationPhase.TRANSPORT_STOPPED
-        )
+        # B is also reaped once terminalized; the held object was mutated in
+        # place first, so it still reflects the final phase.
+        assert generation_b.phase == GenerationPhase.TRANSPORT_STOPPED
         assert terminal_calls == [
-            (generation_a.token, generation_a_state.disposition),
+            (generation_a.token, generation_a.disposition),
             (generation_b.token, DeliveryDisposition.DELIVERY_UNKNOWN),
         ], "A must not be terminalized a second time by a late stop meant for it"
 
@@ -1063,6 +1107,10 @@ def test_timeout_driven_cleanup_tombstones_before_dispatch_races_a_late_start_fr
 
         await tick(clock, 10.0)  # fires the start-timeout -> _begin_delivery_unknown
 
-        assert coordinator.generation_for_token(generation.token).tombstoned is True
+        # By the time the tick's timer-fired coroutine chain finishes, a
+        # zero-audio generation has already run all the way through
+        # terminalization and been reaped; the held object was mutated in
+        # place first, so it still reflects the tombstoned state.
+        assert generation.tombstoned is True
 
     run(body)
