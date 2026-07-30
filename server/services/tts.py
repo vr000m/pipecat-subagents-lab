@@ -192,6 +192,7 @@ class LocalTTS(TTSService):
                         audio=audio,
                         sample_rate=self.sample_rate,
                         num_channels=1,
+                        context_id=context_id,
                     )
                 elif kind.endswith(("audio.done", "cancelled")):
                     completed = True

@@ -15,6 +15,7 @@ from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
+from .config import Config
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     GroundedResult,
@@ -42,7 +43,22 @@ from .results import canonical_result
 from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
-from .speech_scheduler import SpeechScheduler
+from .speech_lifecycle import (
+    DeliveryDisposition,
+    EventLoopTimerScheduler,
+    GenerationIdentity,
+    MonotonicClock,
+    SpeechGenerationFlushAckFrame,
+    SpeechGenerationMarkerFrame,
+    SpeechLifecycleCoordinator,
+)
+from .speech_scheduler import (
+    ROLE_RESULT,
+    ROLE_TIMEOUT_NOTICE,
+    SpeechRole,
+    SpeechScheduler,
+    UtteranceLease,
+)
 from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
@@ -226,6 +242,12 @@ class LabPipeline:
         return True
 
 
+def _speech_role_for_child_outcome(outcome_label: str) -> SpeechRole:
+    """A retained/still-pending outcome must be spoken as a timeout notice so
+    it stays supersedable; every other outcome speaks as a normal result."""
+    return ROLE_TIMEOUT_NOTICE if outcome_label == "retained" else ROLE_RESULT
+
+
 def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
     """Compose the connection-local bridge, canonical adapter, and speech seams."""
     bus = _ProbeBus() if _ProbeBus is not None else None
@@ -247,11 +269,13 @@ class ConnectionPipeline:
     epoch: int
     observer: RuntimeObserver
     scheduler: SpeechScheduler
+    lifecycle: SpeechLifecycleCoordinator | None = None
     stt: Any | None = None
     tts: Any | None = None
     transport: Any | None = None
     worker: Any | None = None
     worker_task: asyncio.Task[Any] | None = None
+    output_teardown: Callable[[], Any] | None = None
     on_transcript: Callable[[str], Any] | None = None
     active: bool = True
 
@@ -260,7 +284,12 @@ class ConnectionPipeline:
         self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect)
 
     async def shutdown(self, *, reason: str = "connection replaced") -> None:
-        """Fence this connection and stop its Pipecat worker, if attached."""
+        """Fence this connection and stop its Pipecat worker, if attached.
+
+        Always forces scheduler cleanup, even if something upstream (e.g. a
+        failed output teardown) already set ``active = False`` directly
+        without releasing the scheduler's active lease.
+        """
         self.deactivate(reconnect=reason == "connection replaced")
         if self.worker is not None:
             cancel = getattr(self.worker, "cancel", None)
@@ -291,6 +320,8 @@ class ConnectionPipeline:
                     await result
             except Exception:  # noqa: BLE001  # intentional catch-all: a single service's cleanup failure must not block teardown of the other services
                 logger.debug(f"{service} cleanup raised during shutdown")
+        if self.lifecycle is not None:
+            self.lifecycle.connection_closed()
 
 
 SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "retention_rejected"]
@@ -455,6 +486,16 @@ class SessionHost:
                 raise RuntimeError("speech target is not the active TTS connection")
             if pipeline.worker is None:
                 raise RuntimeError("active connection has no Pipecat worker for TTS")
+            lease = pipeline.scheduler.active
+            if pipeline.lifecycle is not None and lease is not None:
+                await pipeline.worker.queue_frame(
+                    SpeechGenerationMarkerFrame(
+                        token=lease.token,
+                        utterance_id=item.utterance_id,
+                        work_item_id=item.work_item_id,
+                        origin_epoch=item.origin_epoch,
+                    )
+                )
             frame_factory = getattr(connection_tts, "correlated_speak_frame", None)
             frame = (
                 frame_factory(
@@ -468,10 +509,84 @@ class SessionHost:
             await pipeline.worker.queue_frame(frame)
 
         async def stop_speech(item: Any) -> None:
-            del item
             if connection_tts is None or self.connection is not pipeline or pipeline.worker is None:
                 return
+            token = pipeline.lifecycle.slot_token if pipeline.lifecycle is not None else None
+            generation = (
+                pipeline.lifecycle.generation_for_token(token)
+                if pipeline.lifecycle is not None and token is not None
+                else None
+            )
+            if item is not None and (
+                generation is None or generation.identity.utterance_id != item.utterance_id
+            ):
+                token = None
             await pipeline.worker.queue_frame(InterruptionFrame())
+            if token is not None:
+                await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
+
+        def schedule_pipeline_shutdown(reason: str) -> None:
+            task = asyncio.create_task(pipeline.shutdown(reason=reason))
+            self._background_shutdowns.add(task)
+            task.add_done_callback(self._background_shutdowns.discard)
+
+        async def on_lifecycle_terminal(
+            token: str, identity: GenerationIdentity, disposition: DeliveryDisposition
+        ) -> None:
+            del token
+            if self.connection is not pipeline:
+                return
+            if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
+                pipeline.scheduler.delivery_unknown(identity.utterance_id)
+            if pipeline.active and pipeline.scheduler.active is None:
+                await pipeline.scheduler.start_next()
+
+        async def dispatch_lifecycle_cleanup(token: str, identity: GenerationIdentity) -> None:
+            del token, identity
+            await stop_speech(None)
+
+        async def dispatch_lifecycle_teardown(token: str, identity: GenerationIdentity) -> None:
+            del identity
+            # Fence this connection before any await or fallback. If the
+            # physical output barrier is unavailable/fails, shutdown still
+            # prevents another generation from entering this lane.
+            pipeline.active = False
+            teardown = pipeline.output_teardown
+            if teardown is None:
+                logger.error("speech output teardown unavailable; shutting down the speech lane")
+                schedule_pipeline_shutdown("speech output teardown failed")
+                return
+
+            # SmallWebRTCConnection.disconnect() does not return until its
+            # tracks and peer connection have been closed, so no fieldless
+            # stop from this lane can arrive after teardown_complete().
+            try:
+                result = teardown()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001  # fail closed: never acknowledge an unconfirmed output teardown
+                logger.exception("speech output teardown failed; retaining the lifecycle barrier")
+                schedule_pipeline_shutdown("speech output teardown failed")
+                return
+
+            if pipeline.lifecycle is not None:
+                await pipeline.lifecycle.teardown_complete(token)
+            schedule_pipeline_shutdown("speech output teardown")
+
+        connection_config = getattr(self.registry, "config", None) or Config()
+        lifecycle = (
+            SpeechLifecycleCoordinator(
+                clock=MonotonicClock(),
+                timers=EventLoopTimerScheduler(),
+                speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
+                speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
+                on_terminal=on_lifecycle_terminal,
+                dispatch_cleanup=dispatch_lifecycle_cleanup,
+                dispatch_teardown=dispatch_lifecycle_teardown,
+            )
+            if connection_tts is not None
+            else None
+        )
 
         pipeline = ConnectionPipeline(
             connection.epoch,
@@ -480,7 +595,9 @@ class SessionHost:
                 self.state,
                 speak=queue_speech if connection_tts is not None else None,
                 stop=stop_speech if connection_tts is not None else None,
+                lifecycle=lifecycle,
             ),
+            lifecycle=lifecycle,
             stt=connection_stt,
             tts=connection_tts,
         )
@@ -501,21 +618,36 @@ class SessionHost:
                     if inspect.isawaitable(callback_result):
                         callback_result = await callback_result
                 current = self.connection is pipeline and pipeline.active
+                has_lifecycle = pipeline.lifecycle is not None
                 if event == "synthesis_started":
                     pipeline.scheduler.provider_started(context_id)
                 elif event == "synthesis_ended" and current:
-                    matched = pipeline.scheduler.provider_synthesis_ended(context_id)
-                    # The pinned local service exposes synthesis completion, not
-                    # browser playout completion. Release conservatively as
-                    # unknown so later utterances cannot be starved.
-                    if matched:
+                    pipeline.scheduler.provider_synthesis_ended(context_id)
+                    # Non-terminal: the real TTSStoppedFrame observed by
+                    # TransportSpeechLifecycleProcessor arms the coordinator's
+                    # drain deadline. Without a coordinator, fall back to the
+                    # old conservative immediate release so later utterances
+                    # cannot be starved.
+                    if not has_lifecycle:
                         pipeline.scheduler.provider_delivery_unknown(context_id)
                 elif event == "delivery_completed" and current:
-                    pipeline.scheduler.provider_delivery_completed(context_id)
+                    # Same has_lifecycle gate as synthesis_ended above: with a
+                    # coordinator installed, only its own token-bearing
+                    # transport/tombstone barriers may release the slot.
+                    if not has_lifecycle:
+                        pipeline.scheduler.provider_delivery_completed(context_id)
                 elif event == "delivery_unknown" and current:
-                    pipeline.scheduler.provider_delivery_unknown(context_id)
+                    lifecycle = pipeline.lifecycle
+                    token = (
+                        lifecycle.token_for_context(context_id) if lifecycle is not None else None
+                    )
+                    if lifecycle is not None and token is not None:
+                        await lifecycle.provider_error(token)
+                    else:
+                        pipeline.scheduler.provider_delivery_unknown(context_id)
                 if (
-                    event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
+                    not has_lifecycle
+                    and event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
                     and self.connection is pipeline
                     and pipeline.active
                     and pipeline.scheduler.active is None
@@ -722,6 +854,13 @@ class SessionHost:
                             if outcome.work_items
                             else origin.scheduler.active.item.work_item_id
                         )
+                        active_lease: UtteranceLease | None = origin.scheduler.active
+                        if (
+                            origin.lifecycle is not None
+                            and active_lease is not None
+                            and active_lease.item.work_item_id == target
+                        ):
+                            origin.lifecycle.record_interruption(active_lease.token, pause=True)
                         origin.scheduler.pause(target)
                         await origin.scheduler.wait_for_stops()
                         control_outcome = "applied"
@@ -737,6 +876,13 @@ class SessionHost:
                             target,
                             exclude_work_item_id=work_item_id,
                         )
+                        active_lease = origin.scheduler.active
+                        if (
+                            origin.lifecycle is not None
+                            and active_lease is not None
+                            and (target is None or active_lease.item.work_item_id == target)
+                        ):
+                            origin.lifecycle.record_interruption(active_lease.token, pause=False)
                         cancelled_speech = origin.scheduler.cancel(target)
                         await origin.scheduler.wait_for_stops()
                         if not cancelled_work and not cancelled_speech:
@@ -928,7 +1074,8 @@ class SessionHost:
                 child_outcome_label = "failed"
             was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
             commit_started = time.perf_counter()
-            committed = await self._commit_and_speak(result, origin)
+            speech_role = _speech_role_for_child_outcome(child_outcome_label)
+            committed = await self._commit_and_speak(result, origin, role=speech_role)
             commit_ms = (time.perf_counter() - commit_started) * 1000
             child.finalize(
                 outcome=child_outcome_label,
@@ -1032,6 +1179,7 @@ class SessionHost:
             )
             if submitted.results:
                 result = submitted.results[0]
+                child_outcome_label = outcome_label
                 child.finalize(
                     outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
                 )
@@ -1042,6 +1190,7 @@ class SessionHost:
                     text="That is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
+                child_outcome_label = "retained"
                 child.finalize(outcome="retained", app_worker_id=worker_id)
                 self._register_retained_recorder_if_open(work_item_id, retained_recorder)
             else:
@@ -1056,8 +1205,10 @@ class SessionHost:
                     text="The pending web request could not be completed.",
                     origin_epoch=origin.epoch,
                 )
+                child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
-            committed = await self._commit_and_speak(result, origin)
+            speech_role = _speech_role_for_child_outcome(child_outcome_label)
+            committed = await self._commit_and_speak(result, origin, role=speech_role)
             turn_recorder.finalize()
             return committed
         except asyncio.CancelledError:
@@ -1249,6 +1400,7 @@ class SessionHost:
             index_for_work_item_id = {
                 f"work-{turn_id}-{index}": index for index in runnable_indexes
             }
+            speech_roles: dict[int, SpeechRole] = {}
             # Two passes: settle last-wins content first, then attribute each
             # matched item exactly once from the result that actually commits.
             # Finalizing on first sight would name a discarded result_id in the
@@ -1293,6 +1445,7 @@ class SessionHost:
                     text="That item is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
+                speech_roles[item_index] = ROLE_TIMEOUT_NOTICE
                 child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
                 recorder = retained_recorders.get(work_item_id)
                 if recorder is not None:
@@ -1318,7 +1471,11 @@ class SessionHost:
                 )
             committed = []
             for index in sorted(results):
-                committed.append(await self._commit_and_speak(results[index], origin))
+                committed.append(
+                    await self._commit_and_speak(
+                        results[index], origin, role=speech_roles.get(index, ROLE_RESULT)
+                    )
+                )
             turn_recorder.finalize()
             return tuple(committed)
         except asyncio.CancelledError:
@@ -1553,12 +1710,18 @@ class SessionHost:
                     result_id = result.result_id
                     if speakable is not None:
                         try:
+                            # A retained result supersedes only its own
+                            # queued timeout notice, not other same-work
+                            # queued speech, and never an utterance that has
+                            # already been admitted to the transport slot.
+                            speakable.scheduler.discard_queued_notice(late.work_item_id)
                             speakable.scheduler.enqueue(
                                 result_id=result.result_id,
                                 work_item_id=late.work_item_id,
                                 run_id=f"run-{result.turn_id}",
                                 text=result.spoken_text,
                                 origin_epoch=origin_epoch,
+                                role=ROLE_RESULT,
                             )
                         except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
                             speech_outcome = "enqueue_failed"
@@ -1601,7 +1764,11 @@ class SessionHost:
             )
 
     async def _commit_and_speak(
-        self, result: GroundedResult, origin: ConnectionPipeline
+        self,
+        result: GroundedResult,
+        origin: ConnectionPipeline,
+        *,
+        role: SpeechRole = ROLE_RESULT,
     ) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active."""
         origin_epoch = result.origin_epoch
@@ -1626,6 +1793,7 @@ class SessionHost:
             run_id=f"run-{result.turn_id}",
             text=result.spoken_text,
             origin_epoch=origin_epoch,
+            role=role,
         )
         await origin.scheduler.start_next(work_item_id)
         return result

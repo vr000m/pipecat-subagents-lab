@@ -4,7 +4,8 @@ import asyncio
 
 from server.contracts import DeliveryState
 from server.session_state import SessionState
-from server.speech_scheduler import SpeechScheduler
+from server.speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
+from server.speech_scheduler import ROLE_RESULT, ROLE_TIMEOUT_NOTICE, SpeechScheduler
 
 
 def enqueue(scheduler: SpeechScheduler, work_item_id: str, text: str):
@@ -71,6 +72,93 @@ def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
     asyncio.run(run())
 
 
+def test_discard_queued_notice_removes_only_timeout_notice_role_and_preserves_order() -> None:
+    scheduler = SpeechScheduler(SessionState())
+    before = scheduler.enqueue(
+        work_item_id="work-b",
+        run_id="run-before",
+        result_id="result-before",
+        text="Still checking on that.",
+        role=ROLE_RESULT,
+    )
+    notice = scheduler.enqueue(
+        work_item_id="work-b",
+        run_id="run-notice",
+        result_id="result-notice",
+        text="That is taking longer than expected.",
+        role=ROLE_TIMEOUT_NOTICE,
+    )
+    after = scheduler.enqueue(
+        work_item_id="work-b",
+        run_id="run-after",
+        result_id="result-after",
+        text="One more update.",
+        role=ROLE_RESULT,
+    )
+
+    discarded = scheduler.discard_queued_notice("work-b")
+
+    assert discarded == (notice,)
+    assert scheduler._queues["work-b"] == [before, after]
+    assert scheduler.state.speech[notice.utterance_id].state == DeliveryState.INTERRUPTED
+    assert scheduler.state.speech[before.utterance_id].state != DeliveryState.INTERRUPTED
+    assert scheduler.state.speech[after.utterance_id].state != DeliveryState.INTERRUPTED
+
+
+def test_discard_queued_notice_is_a_noop_when_no_notice_is_queued() -> None:
+    scheduler = SpeechScheduler(SessionState())
+    item = enqueue(scheduler, "work-b", "just a result")
+
+    discarded = scheduler.discard_queued_notice("work-b")
+
+    assert discarded == ()
+    assert scheduler._queues["work-b"] == [item]
+
+
+def test_discard_queued_notice_is_a_noop_for_an_unknown_work_item() -> None:
+    scheduler = SpeechScheduler(SessionState())
+
+    assert scheduler.discard_queued_notice("no-such-work-item") == ()
+
+
+def test_discard_queued_notice_does_not_touch_other_work_item_queues() -> None:
+    scheduler = SpeechScheduler(SessionState())
+    notice = scheduler.enqueue(
+        work_item_id="work-b",
+        run_id="run-notice",
+        result_id="result-notice",
+        text="That is taking longer than expected.",
+        role=ROLE_TIMEOUT_NOTICE,
+    )
+    other = enqueue(scheduler, "work-other", "unrelated")
+
+    discarded = scheduler.discard_queued_notice("work-b")
+
+    assert discarded == (notice,)
+    assert scheduler._queues["work-other"] == [other]
+
+
+def test_discard_queued_notice_cannot_remove_a_notice_already_admitted_to_the_transport_slot() -> (
+    None
+):
+    scheduler = SpeechScheduler(SessionState())
+    scheduler.enqueue(
+        work_item_id="work-b",
+        run_id="run-notice",
+        result_id="result-notice",
+        text="That is taking longer than expected.",
+        role=ROLE_TIMEOUT_NOTICE,
+    )
+    admitted = asyncio.run(scheduler.start_next())
+    assert admitted is not None and admitted.role == ROLE_TIMEOUT_NOTICE
+
+    discarded = scheduler.discard_queued_notice("work-b")
+
+    assert discarded == ()
+    assert scheduler.active is not None
+    assert scheduler.active.item == admitted
+
+
 def test_interrupt_signals_provider_stop_before_releasing_active_lease() -> None:
     stopped: list[str] = []
     scheduler = SpeechScheduler(
@@ -125,6 +213,43 @@ def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:
     assert asyncio.run(scheduler.start_next()).utterance_id == second.utterance_id
 
 
+def test_speech_submission_and_cleanup_failure_release_only_after_teardown() -> None:
+    async def run() -> None:
+        teardown_calls: list[str] = []
+
+        async def cleanup_failed(*_args) -> None:
+            raise RuntimeError("cleanup unavailable")
+
+        async def teardown(token, _identity) -> None:
+            teardown_calls.append(token)
+            await lifecycle.teardown_complete(token)
+
+        lifecycle = SpeechLifecycleCoordinator(
+            dispatch_cleanup=cleanup_failed,
+            dispatch_teardown=teardown,
+        )
+
+        async def speak(_item):
+            raise RuntimeError("provider unavailable")
+
+        scheduler = SpeechScheduler(SessionState(), speak=speak, lifecycle=lifecycle)
+        item = enqueue(scheduler, "work-1", "first")
+
+        try:
+            await scheduler.start_next()
+        except RuntimeError as exc:
+            assert str(exc) == "provider unavailable"
+        else:
+            raise AssertionError("speech provider failure was swallowed")
+
+        assert scheduler.active is None
+        assert lifecycle.occupied is False
+        assert len(teardown_calls) == 1
+        assert scheduler.state.speech[item.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+
+    asyncio.run(run())
+
+
 def test_reconnect_terminally_cancels_active_and_queued_old_epoch_items() -> None:
     scheduler = SpeechScheduler(SessionState())
     first = enqueue(scheduler, "work-1", "one")
@@ -170,6 +295,38 @@ def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:
     assert scheduler.active.item.utterance_id == new_item.utterance_id
     assert scheduler.state.events == events_before_callbacks
     assert scheduler.state.speech[new_item.utterance_id].state == DeliveryState.STARTED
+
+
+def test_start_next_defers_admission_to_an_injected_lifecycle_coordinator() -> None:
+    """Phase 1 makes SpeechLifecycleCoordinator the sole admission authority:
+    the scheduler owns queue selection but must ask the coordinator before
+    starting speech, and must not start when the coordinator's global slot
+    is occupied (matches the plan's Integration Seams entry "Work queues ->
+    global slot" -> ``SpeechLifecycleCoordinator.try_admit()``)."""
+    coordinator = SpeechLifecycleCoordinator()
+    scheduler = SpeechScheduler(SessionState(), lifecycle=coordinator)
+    item = enqueue(scheduler, "work-1", "one")
+
+    result = asyncio.run(scheduler.start_next())
+
+    assert result is not None
+    assert coordinator.occupied is True
+    assert coordinator.generation_for_token(scheduler.active.token) is not None
+    assert coordinator.generation_for_token(scheduler.active.token).identity.utterance_id == (
+        item.utterance_id
+    )
+
+
+def test_start_next_does_not_start_when_the_coordinator_slot_is_already_occupied() -> None:
+    coordinator = SpeechLifecycleCoordinator()
+    coordinator.try_admit(GenerationIdentity("occupied-by-someone-else", "work-other"))
+    scheduler = SpeechScheduler(SessionState(), lifecycle=coordinator)
+    enqueue(scheduler, "work-1", "one")
+
+    result = asyncio.run(scheduler.start_next())
+
+    assert result is None
+    assert scheduler.active is None
 
 
 def test_dropped_prestart_context_cannot_claim_replacement_utterance() -> None:

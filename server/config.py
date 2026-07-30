@@ -58,6 +58,8 @@ class Config:
     stt_endpoint: tuple[str, str] | None = None
     smart_turn_timeout_seconds: float = 5.0
     smart_turn_complete_grace_seconds: float = 1.5
+    speech_start_timeout_seconds: float = 10.0
+    speech_transport_grace_seconds: float = 1.0
     tts_endpoint: tuple[str, str] | None = None
     tts_provider: str = "local"
     tts_model: str = "sonic-3.5"
@@ -76,6 +78,8 @@ class Config:
             "router_timeout_seconds",
             "provider_timeout_seconds",
             "shutdown_grace_seconds",
+            "speech_start_timeout_seconds",
+            "speech_transport_grace_seconds",
         ):
             value = getattr(self, name)
             if not isfinite(value) or value <= 0:
@@ -234,6 +238,16 @@ def load_config(
             raise ConfigError(
                 "WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS must be a number"
             ) from exc
+    if (raw := values.get("WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS")) is not None:
+        try:
+            kwargs["speech_start_timeout_seconds"] = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS must be a number") from exc
+    if (raw := values.get("WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS")) is not None:
+        try:
+            kwargs["speech_transport_grace_seconds"] = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS must be a number") from exc
     if raw := values.get("WEBSEARCH_TTS_VOICE_ID"):
         kwargs["tts_voice_id"] = str(raw)
     if raw := values.get("WEBSEARCH_TTS_PROVIDER"):
@@ -308,6 +322,10 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         values["WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS"] = turn[
             "smart_turn_complete_grace_seconds"
         ]
+    if "speech_start_timeout_seconds" in turn:
+        values["WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS"] = turn["speech_start_timeout_seconds"]
+    if "speech_transport_grace_seconds" in turn:
+        values["WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS"] = turn["speech_transport_grace_seconds"]
     if "pending_dialogue_timeout_seconds" in turn:
         values["WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"] = turn[
             "pending_dialogue_timeout_seconds"
