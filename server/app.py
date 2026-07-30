@@ -262,6 +262,7 @@ async def _attach_connection(
         )
         runtime.transport = transport
         runtime.worker = worker
+        runtime.output_teardown = getattr(connection, "disconnect", None)
         if not host.accepts(runtime.epoch):
             await runtime.shutdown(reason="connection replaced during setup")
             return

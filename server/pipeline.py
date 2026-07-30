@@ -262,6 +262,7 @@ class ConnectionPipeline:
     transport: Any | None = None
     worker: Any | None = None
     worker_task: asyncio.Task[Any] | None = None
+    output_teardown: Callable[[], Any] | None = None
     on_transcript: Callable[[str], Any] | None = None
     active: bool = True
 
@@ -271,7 +272,8 @@ class ConnectionPipeline:
 
     async def shutdown(self, *, reason: str = "connection replaced") -> None:
         """Fence this connection and stop its Pipecat worker, if attached."""
-        self.deactivate(reconnect=reason == "connection replaced")
+        if self.active:
+            self.deactivate(reconnect=reason == "connection replaced")
         if self.worker is not None:
             cancel = getattr(self.worker, "cancel", None)
             if cancel is not None:
@@ -493,15 +495,24 @@ class SessionHost:
                 return
             await pipeline.worker.queue_frame(InterruptionFrame())
 
+        def schedule_pipeline_shutdown(reason: str) -> None:
+            task = asyncio.create_task(pipeline.shutdown(reason=reason))
+            self._background_shutdowns.add(task)
+            task.add_done_callback(self._background_shutdowns.discard)
+
         async def on_lifecycle_terminal(
             token: str, identity: GenerationIdentity, disposition: DeliveryDisposition
         ) -> None:
             del token
-            if self.connection is not pipeline or not pipeline.active:
+            if self.connection is not pipeline:
                 return
             if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
                 pipeline.scheduler.delivery_unknown(identity.utterance_id)
-            if pipeline.scheduler.active is None:
+            if (
+                pipeline.active
+                and disposition == DeliveryDisposition.DELIVERY_UNKNOWN
+                and pipeline.scheduler.active is None
+            ):
                 await pipeline.scheduler.start_next()
 
         async def dispatch_lifecycle_cleanup(token: str, identity: GenerationIdentity) -> None:
@@ -509,15 +520,29 @@ class SessionHost:
             await stop_speech(None)
 
         async def dispatch_lifecycle_teardown(token: str, identity: GenerationIdentity) -> None:
-            # Deviation: the coordinator's teardown seam expects a caller to
-            # await connection-scoped SmallWebRTC output cancellation and
-            # only then call `teardown_complete`. This host does not yet
-            # expose that per-lane completion signal, so it acknowledges
-            # immediately after cleanup dispatch rather than blocking queued
-            # speech admission indefinitely.
             del identity
+            teardown = pipeline.output_teardown
+            if teardown is None:
+                logger.error("speech output teardown unavailable; retaining the lifecycle barrier")
+                return
+
+            # Fence admission before awaiting the physical output barrier.
+            # SmallWebRTCConnection.disconnect() does not return until its
+            # tracks and peer connection have been closed, so no fieldless
+            # stop from this lane can arrive after teardown_complete().
+            pipeline.active = False
+            try:
+                result = teardown()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001  # fail closed: never acknowledge an unconfirmed output teardown
+                logger.exception("speech output teardown failed; retaining the lifecycle barrier")
+                schedule_pipeline_shutdown("speech output teardown failed")
+                return
+
             if pipeline.lifecycle is not None:
                 await pipeline.lifecycle.teardown_complete(token)
+            schedule_pipeline_shutdown("speech output teardown")
 
         connection_config = getattr(self.registry, "config", None) or Config()
         lifecycle = (

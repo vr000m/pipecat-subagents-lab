@@ -422,6 +422,11 @@ class FakeTransportForApp:
         return "output"
 
 
+class FakeSmallWebRTCConnection:
+    async def disconnect(self) -> None:
+        pass
+
+
 async def _attach_fake_connection(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -460,7 +465,7 @@ async def _attach_fake_connection(
     await host.start()
     await app_module._attach_connection(
         host,
-        object(),
+        FakeSmallWebRTCConnection(),
         app_module.SnapshotHandshake(
             session_id=host.state.session_id,
             resume_token=host.state.resume_token,
@@ -492,6 +497,8 @@ def test_attach_connection_constructs_one_startup_and_one_latency_observer_per_c
         assert len(CapturingPipelineWorker.constructed) == 1
         worker = CapturingPipelineWorker.constructed[0]
         assert worker.observers == [startup_observers[0], latency_observers[0]]
+        assert host.connection is not None
+        assert host.connection.output_teardown is not None
 
     asyncio.run(run())
 

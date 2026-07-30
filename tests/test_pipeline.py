@@ -223,7 +223,12 @@ class QueueingPipelineWorker:
         self.frames.append(frame)
 
     async def cancel(self, *, reason: str) -> None:
-        assert reason in {"connection replaced", "session shutdown"}
+        assert reason in {
+            "connection replaced",
+            "session shutdown",
+            "speech output teardown",
+            "speech output teardown failed",
+        }
 
 
 class LifecycleRunner:
@@ -319,6 +324,128 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         assert len(speak_frames) == 2
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.result_id == "result-next"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_output_teardown_must_finish_before_lifecycle_slot_is_released() -> None:
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        connection = await host.connect(connection_handshake(host, 1))
+        worker = QueueingPipelineWorker()
+        connection.worker = worker
+        teardown_started = asyncio.Event()
+        allow_teardown = asyncio.Event()
+
+        async def teardown_output() -> None:
+            teardown_started.set()
+            await allow_teardown.wait()
+
+        connection.output_teardown = teardown_output
+        active = connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        connection.scheduler.enqueue(
+            result_id="result-queued",
+            work_item_id="work-queued",
+            run_id="run-queued",
+            text="Queued answer",
+            origin_epoch=1,
+        )
+        assert connection.scheduler.active is not None
+        token = connection.scheduler.active.token
+        lifecycle = connection.lifecycle
+        assert lifecycle is not None
+        lifecycle.bind_context(token, active.utterance_id)
+        lifecycle.on_tts_started(active.utterance_id)
+        assert lifecycle.on_tts_audio(
+            active.utterance_id,
+            audio=b"\0\0",
+            sample_rate=16000,
+            num_channels=1,
+        )
+
+        cleanup = asyncio.create_task(lifecycle.provider_error(token))
+        await teardown_started.wait()
+
+        assert lifecycle.occupied is True
+        assert connection.scheduler.active is not None
+        assert connection.active is False
+        assert await connection.scheduler.start_next() is None
+
+        allow_teardown.set()
+        await cleanup
+
+        assert lifecycle.occupied is False
+        assert connection.scheduler.active is None
+        assert [frame.text for frame in worker.frames if isinstance(frame, TTSSpeakFrame)] == [
+            "Active answer"
+        ]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("action", ["pause", "cancel"])
+def test_interruption_terminal_cleanup_does_not_automatically_start_queued_speech(
+    action: str,
+) -> None:
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        connection = await host.connect(connection_handshake(host, 1))
+        worker = QueueingPipelineWorker()
+        connection.worker = worker
+        active = connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        connection.scheduler.enqueue(
+            result_id="result-queued",
+            work_item_id="work-queued",
+            run_id="run-queued",
+            text="Queued answer",
+            origin_epoch=1,
+        )
+        assert connection.scheduler.active is not None
+        token = connection.scheduler.active.token
+        lifecycle = connection.lifecycle
+        assert lifecycle is not None
+        lifecycle.bind_context(token, active.utterance_id)
+        lifecycle.on_tts_started(active.utterance_id)
+        assert lifecycle.on_tts_audio(
+            active.utterance_id,
+            audio=b"\0\0",
+            sample_rate=16000,
+            num_channels=1,
+        )
+
+        if action == "pause":
+            connection.scheduler.pause("work-active")
+        else:
+            connection.scheduler.cancel("work-active")
+        await connection.scheduler.wait_for_stops()
+        assert connection.scheduler.active is None
+        assert lifecycle.occupied is True
+
+        terminal = lifecycle.on_transport_bot_stopped()
+        assert terminal is not None
+        await terminal
+
+        assert lifecycle.occupied is False
+        assert connection.scheduler.active is None
+        assert [frame.text for frame in worker.frames if isinstance(frame, TTSSpeakFrame)] == [
+            "Active answer"
+        ]
         await host.shutdown()
 
     asyncio.run(run())

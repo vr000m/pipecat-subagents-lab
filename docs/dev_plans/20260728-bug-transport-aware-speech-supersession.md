@@ -596,6 +596,9 @@ sequenceDiagram
   failures as test-contract mismatches (tests asserting behavior the plan
   explicitly forbids) rather than implementation bugs; the test-writer then
   aligned those 3 assertions with the already-tested Phase 1 contract.
+- Post-conduct review found two host-integration gaps: the SmallWebRTC teardown
+  callback acknowledged completion without awaiting physical disconnect, and the
+  terminal callback could advance queued speech after pause/interruption cleanup.
 
 ## Issues & Solutions
 
@@ -609,10 +612,18 @@ sequenceDiagram
   `TTSSpeakFrame` including control acks). The implementer flagged
   `test_contract_mismatch: true`; the test-writer fixed the 3 assertions to
   match the established, already-tested contract instead.
+- Post-conduct host fix: `_attach_connection` now exposes
+  `SmallWebRTCConnection.disconnect` as the connection-scoped output barrier.
+  Teardown fences admission, awaits that barrier, and only then acknowledges
+  `teardown_complete`; absent or failed barriers retain the lifecycle slot.
+  Lifecycle terminal handling advances only active `delivery_unknown` paths, so
+  pause/interruption cleanup cannot start previously queued speech. Host-level
+  regressions cover both orderings.
 
 ## Final Results
 
-All 3 phases implemented via `/skein:conduct --autonomous`. Final state: 578/578
+All 3 phases implemented via `/skein:conduct --autonomous`. Final state after the
+post-conduct host fix: 581/581
 tests pass, `ruff format --check` and `ruff check` clean. Commits:
 `6124040` (phase 1), `13d1044` (phase 2), `df0d5e0` (phase 3), plus progress
 bookkeeping commits `9ff8f70` and `3a5f6c9`.
