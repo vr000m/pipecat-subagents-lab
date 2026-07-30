@@ -51,7 +51,13 @@ from .speech_lifecycle import (
     SpeechGenerationMarkerFrame,
     SpeechLifecycleCoordinator,
 )
-from .speech_scheduler import ROLE_RESULT, ROLE_TIMEOUT_NOTICE, SpeechRole, SpeechScheduler
+from .speech_scheduler import (
+    ROLE_RESULT,
+    ROLE_TIMEOUT_NOTICE,
+    SpeechRole,
+    SpeechScheduler,
+    UtteranceLease,
+)
 from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
@@ -618,11 +624,12 @@ class SessionHost:
                     if not has_lifecycle:
                         pipeline.scheduler.provider_delivery_completed(context_id)
                 elif event == "delivery_unknown" and current:
+                    lifecycle = pipeline.lifecycle
                     token = (
-                        pipeline.lifecycle.token_for_context(context_id) if has_lifecycle else None
+                        lifecycle.token_for_context(context_id) if lifecycle is not None else None
                     )
-                    if token is not None:
-                        await pipeline.lifecycle.provider_error(token)
+                    if lifecycle is not None and token is not None:
+                        await lifecycle.provider_error(token)
                     else:
                         pipeline.scheduler.provider_delivery_unknown(context_id)
                 if (
@@ -834,7 +841,7 @@ class SessionHost:
                             if outcome.work_items
                             else origin.scheduler.active.item.work_item_id
                         )
-                        active_lease = origin.scheduler.active
+                        active_lease: UtteranceLease | None = origin.scheduler.active
                         if (
                             origin.lifecycle is not None
                             and active_lease is not None

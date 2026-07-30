@@ -254,7 +254,9 @@ class SpeechLifecycleCoordinator:
 
     def on_tts_started(self, context_id: str) -> None:
         token = self._context_tokens.get(context_id)
-        generation = self._live(token) if token else None
+        if token is None:
+            return
+        generation = self._live(token)
         if generation is None:
             return
         self._cancel_timer(token)
@@ -282,7 +284,9 @@ class SpeechLifecycleCoordinator:
         """Record synthesis end. Non-terminal: does not clear the slot or
         admit the next generation. Returns False for a stale context."""
         token = self._context_tokens.get(context_id)
-        generation = self._generations.get(token) if token else None
+        if token is None:
+            return False
+        generation = self._generations.get(token)
         if generation is None or generation.terminalized or generation.tombstoned:
             return False
         generation.phase = GenerationPhase.SYNTHESIS_ENDED
@@ -612,7 +616,9 @@ class TransportSpeechLifecycleProcessor(FrameProcessor):
         if isinstance(frame, BotStartedSpeakingFrame):
             self._coordinator.on_transport_bot_started()
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            await self._coordinator.on_transport_bot_stopped()
+            stopped_future = self._coordinator.on_transport_bot_stopped()
+            if stopped_future is not None:
+                await stopped_future
 
         await self.push_frame(frame, direction)
 
