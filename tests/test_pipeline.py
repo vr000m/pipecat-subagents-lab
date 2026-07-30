@@ -5204,3 +5204,49 @@ def test_multi_intent_malformed_pending_and_failure_ids_warn_instead_of_raising(
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(
+                results=(_fan_in_result("turn-role-0", "first answer"),),
+                pending_work_item_ids=("work-turn-role-1",),
+            ),
+            sink,
+        )
+        host.tts = FakeTTS()
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+
+        committed = await host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "",
+            origin,
+            "turn-role",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-role"),
+        )
+
+        assert [result.text for result in committed] == [
+            "first answer",
+            "That item is taking longer than expected; I will continue in the background.",
+        ]
+        queued_notice = origin.scheduler._queues["work-turn-role-1"][0]
+        assert queued_notice.role == ROLE_TIMEOUT_NOTICE
+
+        await host._commit_late_result(
+            LateResult(
+                work_item_id="work-turn-role-1",
+                worker_id="worker-search",
+                result=_fan_in_result("turn-role-1", "late answer"),
+            ),
+            origin.epoch,
+        )
+
+        queued = origin.scheduler._queues["work-turn-role-1"]
+        assert [item.text for item in queued] == ["late answer"]
+        assert queued[0].role == ROLE_RESULT
+        await host.shutdown()
+
+    asyncio.run(run())

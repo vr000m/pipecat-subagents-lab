@@ -1380,6 +1380,7 @@ class SessionHost:
             index_for_work_item_id = {
                 f"work-{turn_id}-{index}": index for index in runnable_indexes
             }
+            speech_roles: dict[int, SpeechRole] = {}
             # Two passes: settle last-wins content first, then attribute each
             # matched item exactly once from the result that actually commits.
             # Finalizing on first sight would name a discarded result_id in the
@@ -1424,6 +1425,7 @@ class SessionHost:
                     text="That item is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
+                speech_roles[item_index] = ROLE_TIMEOUT_NOTICE
                 child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
                 recorder = retained_recorders.get(work_item_id)
                 if recorder is not None:
@@ -1449,7 +1451,11 @@ class SessionHost:
                 )
             committed = []
             for index in sorted(results):
-                committed.append(await self._commit_and_speak(results[index], origin))
+                committed.append(
+                    await self._commit_and_speak(
+                        results[index], origin, role=speech_roles.get(index, ROLE_RESULT)
+                    )
+                )
             turn_recorder.finalize()
             return tuple(committed)
         except asyncio.CancelledError:

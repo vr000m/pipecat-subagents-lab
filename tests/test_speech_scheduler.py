@@ -213,6 +213,33 @@ def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:
     assert asyncio.run(scheduler.start_next()).utterance_id == second.utterance_id
 
 
+def test_speech_submission_failure_releases_lifecycle_generation() -> None:
+    async def run() -> None:
+        async def cleanup_failed(*_args) -> None:
+            raise RuntimeError("cleanup unavailable")
+
+        lifecycle = SpeechLifecycleCoordinator(dispatch_cleanup=cleanup_failed)
+
+        async def speak(_item):
+            raise RuntimeError("provider unavailable")
+
+        scheduler = SpeechScheduler(SessionState(), speak=speak, lifecycle=lifecycle)
+        item = enqueue(scheduler, "work-1", "first")
+
+        try:
+            await scheduler.start_next()
+        except RuntimeError as exc:
+            assert str(exc) == "provider unavailable"
+        else:
+            raise AssertionError("speech provider failure was swallowed")
+
+        assert scheduler.active is None
+        assert lifecycle.occupied is False
+        assert scheduler.state.speech[item.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+
+    asyncio.run(run())
+
+
 def test_reconnect_terminally_cancels_active_and_queued_old_epoch_items() -> None:
     scheduler = SpeechScheduler(SessionState())
     first = enqueue(scheduler, "work-1", "one")

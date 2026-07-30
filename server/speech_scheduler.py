@@ -149,6 +149,21 @@ class SpeechScheduler:
                     await outcome
         except BaseException:
             self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_UNKNOWN)
+            if self.lifecycle is not None and generation is not None:
+                try:
+                    await self.lifecycle.provider_error(generation.token)
+                except BaseException:
+                    # Preserve the original submission failure, then use the
+                    # no-audio acknowledgement as a local fallback if cleanup
+                    # dispatch itself failed. It is a no-op once audio crossed
+                    # into output, where the connection teardown barrier must
+                    # remain authoritative.
+                    pass
+                if self.lifecycle.occupied:
+                    try:
+                        await self.lifecycle.acknowledge_tts_lane_flush(generation.token)
+                    except BaseException:
+                        pass
             self._release(item.utterance_id)
             raise
         return item
