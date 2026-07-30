@@ -1,6 +1,6 @@
 # Task: Transport-Aware Speech Supersession
 
-**Status**: In Progress
+**Status**: Complete
 **Component**: Pipecat subagents
 **Assigned to**: Unassigned
 **Priority**: High
@@ -599,6 +599,17 @@ sequenceDiagram
 - Post-conduct review found two host-integration gaps: the SmallWebRTC teardown
   callback acknowledged completion without awaiting physical disconnect, and the
   terminal callback could advance queued speech after pause/interruption cleanup.
+- A subsequent xhigh-effort `/code-review --fix` pass over the full branch diff
+  found 10 further confirmed findings (7 correctness, 3 cleanup): a pause
+  command could tombstone unrelated active speech when its target was only
+  queued; `shutdown()` could skip scheduler cleanup after a failed output
+  teardown; browser reconnect never routed through the lifecycle coordinator,
+  leaking the old connection; `TTSStartedFrame` and the timeout-cleanup path
+  each had their own stale-frame race that could let audio reach output for an
+  abandoned generation; a walrus-operator override check silently dropped a
+  legitimate `0.0` TOML value instead of erroring; the `delivery_completed`
+  event bypassed the lifecycle coordinator gate; plus a dead scheduler method
+  and a duplicated business-rule mapping.
 
 ## Issues & Solutions
 
@@ -619,11 +630,26 @@ sequenceDiagram
   Lifecycle terminal handling advances only active `delivery_unknown` paths, so
   pause/interruption cleanup cannot start previously queued speech. Host-level
   regressions cover both orderings.
+- Code-review fix pass (6 commits, one per finding cluster, each with its own
+  regression test): `1af69cb` guards `pause()`'s tombstone call and
+  `shutdown()`'s scheduler cleanup on target/state mismatches, and routes
+  `SpeechScheduler.interrupt()` (reconnect) through the lifecycle coordinator
+  like `pause()`/`cancel()` already do. `ea59dde` adds the missing
+  `drop_stale_frame()` guard on `TTSStartedFrame` and tombstones the
+  timeout-driven cleanup path before its first await. `3775560` fixes the
+  config walrus-truthy bug for `0.0` overrides and folds the two new timeout
+  fields into the existing validation loop. `59c2032` gates `delivery_completed`
+  on `has_lifecycle` like its sibling branches. `c322af2` removes the dead
+  `discard_queued()` method. `e7b417d` extracts
+  `_speech_role_for_child_outcome()` so the retained-as-timeout-notice mapping
+  has one definition instead of two.
 
 ## Final Results
 
-All 3 phases implemented via `/skein:conduct --autonomous`. Final state after the
-post-conduct host fix: 581/581
-tests pass, `ruff format --check` and `ruff check` clean. Commits:
-`6124040` (phase 1), `13d1044` (phase 2), `df0d5e0` (phase 3), plus progress
-bookkeeping commits `9ff8f70` and `3a5f6c9`.
+All 3 phases implemented via `/skein:conduct --autonomous`, followed by a
+post-conduct host-integration fix and an xhigh-effort `/code-review --fix`
+pass (10 further findings fixed across 6 commits). Final state: 587/587 tests
+pass, `ruff format --check` and `ruff check` clean. Commits:
+`6124040` (phase 1), `13d1044` (phase 2), `df0d5e0` (phase 3), progress
+bookkeeping commits `9ff8f70` and `3a5f6c9`, and the code-review fix commits
+`1af69cb`, `ea59dde`, `3775560`, `59c2032`, `c322af2`, `e7b417d`.

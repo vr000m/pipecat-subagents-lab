@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backed by an injectable clock and timer scheduler. No package version
   change; ships as a release-neutral precursor to
   `docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md`.
+- A pause control command no longer tombstones an unrelated active utterance
+  when its target work item is only queued, not yet playing.
+- `shutdown()` now always forces scheduler lease cleanup, even after a failed
+  output teardown already set the connection inactive directly.
+- A browser reconnect mid-speech now routes through the lifecycle coordinator
+  (matching pause/cancel), so the old connection's peer connection and audio
+  tracks are torn down instead of leaking.
+- `TTSStartedFrame` and the start/drain-timeout cleanup path each close a race
+  that could let a stale generation's audio reach the output transport.
+- A `0.0` TOML/env override for `speech_start_timeout_seconds` or
+  `speech_transport_grace_seconds` now raises a config error instead of being
+  silently dropped in favor of the default.
+- The `delivery_completed` TTS callback event no longer bypasses the lifecycle
+  coordinator's transport-slot ownership when one is installed.
 
 ## [0.1.2] - 2026-07-28
 
