@@ -78,6 +78,8 @@ class Config:
             "router_timeout_seconds",
             "provider_timeout_seconds",
             "shutdown_grace_seconds",
+            "speech_start_timeout_seconds",
+            "speech_transport_grace_seconds",
         ):
             value = getattr(self, name)
             if not isfinite(value) or value <= 0:
@@ -122,16 +124,6 @@ class Config:
             raise ConfigError("smart_turn_timeout_seconds must be between 0 and 60")
         if not 0 < self.smart_turn_complete_grace_seconds <= 10:
             raise ConfigError("smart_turn_complete_grace_seconds must be between 0 and 10")
-        if (
-            not isfinite(self.speech_start_timeout_seconds)
-            or self.speech_start_timeout_seconds <= 0
-        ):
-            raise ConfigError("speech_start_timeout_seconds must be finite and positive")
-        if (
-            not isfinite(self.speech_transport_grace_seconds)
-            or self.speech_transport_grace_seconds <= 0
-        ):
-            raise ConfigError("speech_transport_grace_seconds must be finite and positive")
         if self.tts_provider not in {"local", "cartesia"}:
             raise ConfigError("tts_provider must be local or cartesia")
         if not self.tts_model.strip():
@@ -246,12 +238,12 @@ def load_config(
             raise ConfigError(
                 "WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS must be a number"
             ) from exc
-    if raw := values.get("WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS"):
+    if (raw := values.get("WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS")) is not None:
         try:
             kwargs["speech_start_timeout_seconds"] = float(raw)
         except (TypeError, ValueError) as exc:
             raise ConfigError("WEBSEARCH_SPEECH_START_TIMEOUT_SECONDS must be a number") from exc
-    if raw := values.get("WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS"):
+    if (raw := values.get("WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS")) is not None:
         try:
             kwargs["speech_transport_grace_seconds"] = float(raw)
         except (TypeError, ValueError) as exc:

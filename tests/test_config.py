@@ -407,6 +407,26 @@ def test_invalid_speech_transport_grace_environment_value_has_config_error_bound
         load_config(env={"WEBSEARCH_SPEECH_TRANSPORT_GRACE_SECONDS": "not-a-number"})
 
 
+def test_zero_speech_liveness_timeout_from_toml_is_not_silently_ignored(tmp_path) -> None:
+    """A legitimate-looking ``0.0`` in TOML must not be treated the same as
+    "absent" -- it is truthy-falsy in Python but a real override attempt, and
+    must surface as a validation error rather than silently falling back to
+    the default with no error at all."""
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[turn]\nspeech_start_timeout_seconds = 0.0\n")
+
+    with pytest.raises(ConfigError, match="speech_start_timeout_seconds"):
+        load_config(config_file=config_file, env={})
+
+
+def test_zero_speech_transport_grace_from_toml_is_not_silently_ignored(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[turn]\nspeech_transport_grace_seconds = 0.0\n")
+
+    with pytest.raises(ConfigError, match="speech_transport_grace_seconds"):
+        load_config(config_file=config_file, env={})
+
+
 def test_repository_config_declares_speech_liveness_timeouts() -> None:
     config = load_config(config_file=Path(__file__).parents[1] / "config.toml", env={})
 
