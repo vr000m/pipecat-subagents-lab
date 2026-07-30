@@ -606,7 +606,11 @@ class SessionHost:
                     if not has_lifecycle:
                         pipeline.scheduler.provider_delivery_unknown(context_id)
                 elif event == "delivery_completed" and current:
-                    pipeline.scheduler.provider_delivery_completed(context_id)
+                    # Same has_lifecycle gate as synthesis_ended above: with a
+                    # coordinator installed, only its own token-bearing
+                    # transport/tombstone barriers may release the slot.
+                    if not has_lifecycle:
+                        pipeline.scheduler.provider_delivery_completed(context_id)
                 elif event == "delivery_unknown" and current:
                     token = (
                         pipeline.lifecycle.token_for_context(context_id) if has_lifecycle else None

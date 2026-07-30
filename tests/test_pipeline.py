@@ -329,6 +329,46 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
     asyncio.run(run())
 
 
+def test_delivery_completed_event_does_not_bypass_the_lifecycle_coordinator() -> None:
+    """With a coordinator installed, an on_event-based "delivery_completed"
+    callback must not release the scheduler's active lease directly -- only
+    the coordinator's own token-bearing transport/tombstone barriers may."""
+
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        assert connection.lifecycle is not None
+
+        await host._handle_transcript("Riga weather")
+
+        assert connection.scheduler.active is not None
+        utterance_id = connection.scheduler.active.item.utterance_id
+        connection.scheduler.enqueue(
+            result_id="result-next",
+            work_item_id="work-next",
+            run_id="run-next",
+            text="Next answer",
+            origin_epoch=1,
+        )
+
+        await tts.on_event("synthesis_started", utterance_id)
+        await tts.on_event("delivery_completed", utterance_id)
+
+        assert connection.scheduler.active is not None, (
+            "a lifecycle-bypassing delivery_completed callback must not release the slot"
+        )
+        assert connection.scheduler.active.item.utterance_id == utterance_id
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_output_teardown_must_finish_before_lifecycle_slot_is_released() -> None:
     async def run() -> None:
         host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
