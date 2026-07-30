@@ -213,12 +213,21 @@ def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:
     assert asyncio.run(scheduler.start_next()).utterance_id == second.utterance_id
 
 
-def test_speech_submission_failure_releases_lifecycle_generation() -> None:
+def test_speech_submission_and_cleanup_failure_release_only_after_teardown() -> None:
     async def run() -> None:
+        teardown_calls: list[str] = []
+
         async def cleanup_failed(*_args) -> None:
             raise RuntimeError("cleanup unavailable")
 
-        lifecycle = SpeechLifecycleCoordinator(dispatch_cleanup=cleanup_failed)
+        async def teardown(token, _identity) -> None:
+            teardown_calls.append(token)
+            await lifecycle.teardown_complete(token)
+
+        lifecycle = SpeechLifecycleCoordinator(
+            dispatch_cleanup=cleanup_failed,
+            dispatch_teardown=teardown,
+        )
 
         async def speak(_item):
             raise RuntimeError("provider unavailable")
@@ -235,6 +244,7 @@ def test_speech_submission_failure_releases_lifecycle_generation() -> None:
 
         assert scheduler.active is None
         assert lifecycle.occupied is False
+        assert len(teardown_calls) == 1
         assert scheduler.state.speech[item.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
 
     asyncio.run(run())

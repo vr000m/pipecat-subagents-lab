@@ -268,6 +268,14 @@ async def release_lifecycle_slot(connection: object, token: str, context_id: str
     await asyncio.sleep(0)  # let on_terminal's fire-and-forget task run
 
 
+async def acknowledge_lifecycle_flush(connection: object, token: str) -> None:
+    """Model the private token-bearing frame reaching the post-TTS bridge."""
+    await connection.scheduler.wait_for_stops()
+    lifecycle = connection.lifecycle
+    assert lifecycle is not None
+    await lifecycle.acknowledge_tts_lane_flush(token)
+
+
 def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
     async def run() -> None:
         tts = FakeTTS()
@@ -482,7 +490,7 @@ def test_shutdown_still_forces_scheduler_cleanup_after_teardown_exception() -> N
 
 
 @pytest.mark.parametrize("action", ["pause", "cancel"])
-def test_interruption_terminal_cleanup_does_not_automatically_start_queued_speech(
+def test_interruption_terminal_barrier_starts_queued_speech_only_after_release(
     action: str,
 ) -> None:
     async def run() -> None:
@@ -530,10 +538,12 @@ def test_interruption_terminal_cleanup_does_not_automatically_start_queued_speec
         assert terminal is not None
         await terminal
 
-        assert lifecycle.occupied is False
-        assert connection.scheduler.active is None
+        assert lifecycle.occupied is True
+        assert connection.scheduler.active is not None
+        assert connection.scheduler.active.item.work_item_id == "work-queued"
         assert [frame.text for frame in worker.frames if isinstance(frame, TTSSpeakFrame)] == [
-            "Active answer"
+            "Active answer",
+            "Queued answer",
         ]
         await host.shutdown()
 
@@ -1245,8 +1255,11 @@ def test_cancel_control_interrupts_active_speech() -> None:
             origin_epoch=1,
         )
         await connection.scheduler.start_next()
+        assert connection.scheduler.active is not None
+        interrupted_token = connection.scheduler.active.token
 
         await host._handle_transcript("cancel")
+        await acknowledge_lifecycle_flush(connection, interrupted_token)
 
         assert host.state.speech[item.utterance_id].state.value == "interrupted"
         assert connection.scheduler.active is not None
@@ -1297,8 +1310,11 @@ def test_pause_control_stops_active_speech_before_confirmation() -> None:
             origin_epoch=1,
         )
         await connection.scheduler.start_next()
+        assert connection.scheduler.active is not None
+        paused_token = connection.scheduler.active.token
 
         await host._handle_transcript("pause")
+        await acknowledge_lifecycle_flush(connection, paused_token)
 
         assert isinstance(connection.worker.frames[-1], TTSSpeakFrame)
         assert connection.worker.frames[-1].text == "Pausing the active response."
@@ -1387,6 +1403,8 @@ def test_late_tts_callback_cannot_complete_replacement_utterance() -> None:
         )
         await connection.scheduler.start_next()
         await tts.on_event("synthesis_started", "context-old")
+        assert connection.scheduler.active is not None
+        old_token = connection.scheduler.active.token
         connection.scheduler.pause("work-old")
 
         replacement = connection.scheduler.enqueue(
@@ -1397,6 +1415,7 @@ def test_late_tts_callback_cannot_complete_replacement_utterance() -> None:
             origin_epoch=1,
         )
         await connection.scheduler.start_next()
+        await acknowledge_lifecycle_flush(connection, old_token)
         await tts.on_event("synthesis_started", "context-new")
         events_before_stale_callback = host.state.events
 
@@ -1426,6 +1445,8 @@ def test_late_tts_start_before_pause_does_not_bind_replacement_utterance() -> No
             origin_epoch=1,
         )
         await connection.scheduler.start_next()
+        assert connection.scheduler.active is not None
+        old_token = connection.scheduler.active.token
         connection.scheduler.pause("work-old")
         replacement = connection.scheduler.enqueue(
             result_id="result-new",
@@ -1435,6 +1456,7 @@ def test_late_tts_start_before_pause_does_not_bind_replacement_utterance() -> No
             origin_epoch=1,
         )
         await connection.scheduler.start_next()
+        await acknowledge_lifecycle_flush(connection, old_token)
 
         await tts.on_event("synthesis_started", "context-old")
         await tts.on_event("synthesis_ended", "context-old")
@@ -1478,9 +1500,12 @@ def test_resume_control_requeues_and_starts_targeted_paused_item() -> None:
             origin_epoch=1,
         )
         await connection.scheduler.start_next()
+        assert connection.scheduler.active is not None
+        paused_token = connection.scheduler.active.token
         connection.scheduler.pause("work-active")
 
         await host._handle_transcript("resume work-active")
+        await acknowledge_lifecycle_flush(connection, paused_token)
 
         assert connection.scheduler.paused("work-active") is None
         assert connection.scheduler.active is not None

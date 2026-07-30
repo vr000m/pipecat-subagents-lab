@@ -48,6 +48,7 @@ from .speech_lifecycle import (
     EventLoopTimerScheduler,
     GenerationIdentity,
     MonotonicClock,
+    SpeechGenerationFlushAckFrame,
     SpeechGenerationMarkerFrame,
     SpeechLifecycleCoordinator,
 )
@@ -319,6 +320,8 @@ class ConnectionPipeline:
                     await result
             except Exception:  # noqa: BLE001  # intentional catch-all: a single service's cleanup failure must not block teardown of the other services
                 logger.debug(f"{service} cleanup raised during shutdown")
+        if self.lifecycle is not None:
+            self.lifecycle.connection_closed()
 
 
 SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "retention_rejected"]
@@ -506,10 +509,21 @@ class SessionHost:
             await pipeline.worker.queue_frame(frame)
 
         async def stop_speech(item: Any) -> None:
-            del item
             if connection_tts is None or self.connection is not pipeline or pipeline.worker is None:
                 return
+            token = pipeline.lifecycle.slot_token if pipeline.lifecycle is not None else None
+            generation = (
+                pipeline.lifecycle.generation_for_token(token)
+                if pipeline.lifecycle is not None and token is not None
+                else None
+            )
+            if item is not None and (
+                generation is None or generation.identity.utterance_id != item.utterance_id
+            ):
+                token = None
             await pipeline.worker.queue_frame(InterruptionFrame())
+            if token is not None:
+                await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
 
         def schedule_pipeline_shutdown(reason: str) -> None:
             task = asyncio.create_task(pipeline.shutdown(reason=reason))
@@ -524,11 +538,7 @@ class SessionHost:
                 return
             if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
                 pipeline.scheduler.delivery_unknown(identity.utterance_id)
-            if (
-                pipeline.active
-                and disposition == DeliveryDisposition.DELIVERY_UNKNOWN
-                and pipeline.scheduler.active is None
-            ):
+            if pipeline.active and pipeline.scheduler.active is None:
                 await pipeline.scheduler.start_next()
 
         async def dispatch_lifecycle_cleanup(token: str, identity: GenerationIdentity) -> None:
@@ -537,16 +547,19 @@ class SessionHost:
 
         async def dispatch_lifecycle_teardown(token: str, identity: GenerationIdentity) -> None:
             del identity
+            # Fence this connection before any await or fallback. If the
+            # physical output barrier is unavailable/fails, shutdown still
+            # prevents another generation from entering this lane.
+            pipeline.active = False
             teardown = pipeline.output_teardown
             if teardown is None:
-                logger.error("speech output teardown unavailable; retaining the lifecycle barrier")
+                logger.error("speech output teardown unavailable; shutting down the speech lane")
+                schedule_pipeline_shutdown("speech output teardown failed")
                 return
 
-            # Fence admission before awaiting the physical output barrier.
             # SmallWebRTCConnection.disconnect() does not return until its
             # tracks and peer connection have been closed, so no fieldless
             # stop from this lane can arrive after teardown_complete().
-            pipeline.active = False
             try:
                 result = teardown()
                 if inspect.isawaitable(result):

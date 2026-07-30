@@ -81,6 +81,7 @@ class SpeechGeneration:
     audio_submitted: bool = False
     synthesis_ended_at: float | None = None
     cleanup_pending: bool = False
+    teardown_pending: bool = False
     tombstoned: bool = False
     terminalized: bool = False
 
@@ -97,6 +98,18 @@ class SpeechGenerationMarkerFrame(SystemFrame):
     utterance_id: str = ""
     work_item_id: str = ""
     origin_epoch: int | None = None
+
+
+@dataclass
+class SpeechGenerationFlushAckFrame(SystemFrame):
+    """Token-bearing barrier sent through TTS after an interruption.
+
+    Reaching the post-TTS lifecycle processor proves that TTS finished
+    handling the preceding interruption before the generation's slot is
+    released. The frame is private and never reaches transport output.
+    """
+
+    token: str = ""
 
 
 class Clock(Protocol):
@@ -373,35 +386,13 @@ class SpeechLifecycleCoordinator:
         forwarded_at = self._clock.now()
         self._arm(token, forwarded_at + self._grace, self._on_interruption_timeout)
 
-    def release_flushed_lane(self, token: str) -> bool:
-        """Synchronous fast-path for a caller that has itself already
-        dispatched an immediate flush of the TTS lane (`SpeechScheduler`'s
-        own `pause()`/`cancel()`, which are synchronous and cannot await
-        `acknowledge_tts_lane_flush`) and knows no audio reached output.
-        Frees the slot immediately rather than waiting out the
-        interruption-cleanup grace deadline; the terminal callback still
-        fires, just dispatched fire-and-forget rather than awaited here.
-        A no-op once audio has been submitted -- that case must still wait
-        for the real drain/teardown path."""
-        generation = self._generations.get(token)
-        if generation is None or generation.audio_submitted:
-            return False
-        result = self._terminalize_state(
-            token, generation.disposition or DeliveryDisposition.DELIVERY_UNKNOWN
-        )
-        if result is None:
-            return False
-        self._schedule(self._call(self._on_terminal, token, result.identity, result.disposition))
-        return True
-
     async def provider_error(self, token: str) -> None:
         """Both the generic upstream-`ErrorFrame` and local context-bearing
         error adapters converge on this transition."""
         await self._begin_delivery_unknown(token)
 
     async def acknowledge_tts_lane_flush(self, token: str) -> None:
-        """The old TTS lane confirms cancel/flush completed with no audio
-        submitted to output; the slot may now clear."""
+        """A token-bearing post-TTS barrier confirms context cancellation."""
         await self._acknowledge_tts_lane_flush(token)
 
     async def teardown_complete(self, token: str) -> None:
@@ -504,28 +495,57 @@ class SpeechLifecycleCoordinator:
         dispatches cancellation/flush, then records the disposition once
         cleanup resolves.
 
-        With no audio submitted to output, an acknowledged TTS-lane flush
-        may release the slot. Once audio has crossed into output, expiry
-        invalidates the connection and awaits `teardown_complete()`; queued
-        speech is not admitted on the old lane.
+        With no audio submitted to output, only a token-bearing barrier that
+        traversed TTS after the interruption may release the slot. If that
+        acknowledgement does not arrive within the grace window, or cleanup
+        dispatch itself fails, the connection lane is torn down instead.
+        Once audio has crossed into output, cleanup always tears down.
         """
         if generation.cleanup_pending:
             return
         generation.cleanup_pending = True
         token = generation.token
-        await self._call(self._dispatch_cleanup, token, generation.identity)
-        if generation.audio_submitted:
-            await self._call(self._dispatch_teardown, token, generation.identity)
-        else:
-            await self._acknowledge_tts_lane_flush(token)
+        try:
+            await self._call(self._dispatch_cleanup, token, generation.identity)
+        except Exception:
+            await self._request_teardown(token)
+            return
+        current = self._generations.get(token)
+        if current is None or current.terminalized:
+            return
+        if current.audio_submitted:
+            await self._request_teardown(token)
+            return
+        self._arm(token, self._clock.now() + self._grace, self._on_flush_ack_timeout)
 
     async def _acknowledge_tts_lane_flush(self, token: str) -> None:
         generation = self._generations.get(token)
-        if generation is None or generation.audio_submitted:
+        if (
+            generation is None
+            or not (generation.cleanup_pending or generation.tombstoned)
+            or generation.audio_submitted
+            or generation.teardown_pending
+        ):
             return
         await self._terminalize(
             token, generation.disposition or DeliveryDisposition.DELIVERY_UNKNOWN
         )
+
+    async def _on_flush_ack_timeout(self, token: str) -> None:
+        await self._request_teardown(token)
+
+    async def _request_teardown(self, token: str) -> None:
+        generation = self._generations.get(token)
+        if generation is None or generation.terminalized or generation.teardown_pending:
+            return
+        generation.teardown_pending = True
+        self._cancel_timer(token)
+        try:
+            await self._call(self._dispatch_teardown, token, generation.identity)
+        except Exception:
+            # Fail closed. The slot remains occupied unless the connection
+            # owner later reports teardown_complete().
+            return
 
     async def _teardown_complete(self, token: str) -> None:
         generation = self._generations.get(token)
@@ -546,9 +566,8 @@ class SpeechLifecycleCoordinator:
         self, token: str, disposition: DeliveryDisposition
     ) -> SpeechGeneration | None:
         """The synchronous half of terminalization: marks the generation
-        terminal and frees the slot if it is the occupant. Split out so a
-        caller that cannot await (`release_flushed_lane` below) can still
-        free the slot immediately and defer only the terminal callback."""
+        terminal, reaps it, and frees the slot if it is the occupant before
+        the asynchronous terminal callback runs."""
         generation = self._generations.get(token)
         if generation is None or generation.terminalized:
             return None
@@ -619,6 +638,10 @@ class TransportSpeechLifecycleProcessor(FrameProcessor):
         if isinstance(frame, SpeechGenerationMarkerFrame):
             self._pending_token = frame.token
             return  # the marker never reaches transport.output()
+
+        if isinstance(frame, SpeechGenerationFlushAckFrame):
+            await self._coordinator.acknowledge_tts_lane_flush(frame.token)
+            return  # the private acknowledgement never reaches transport.output()
 
         if direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, TTSStartedFrame):

@@ -33,15 +33,30 @@ from server.speech_lifecycle import (
 
 def make_coordinator(
     clock: ManualTimerScheduler | None = None,
+    *,
+    auto_ack_cleanup: bool = True,
     **overrides: object,
 ) -> tuple[SpeechLifecycleCoordinator, ManualTimerScheduler]:
     clock = clock or ManualTimerScheduler()
+    requested_cleanup = overrides.pop("dispatch_cleanup", None)
     kwargs: dict[str, object] = {
         "speech_start_timeout_seconds": 10.0,
         "speech_transport_grace_seconds": 1.0,
     }
     kwargs.update(overrides)
     coordinator = SpeechLifecycleCoordinator(clock=clock, timers=clock, **kwargs)
+    if auto_ack_cleanup:
+
+        async def dispatch_cleanup(token: str, identity_: GenerationIdentity) -> None:
+            if callable(requested_cleanup):
+                result = requested_cleanup(token, identity_)
+                if asyncio.iscoroutine(result):
+                    await result
+            await coordinator.acknowledge_tts_lane_flush(token)
+
+        coordinator._dispatch_cleanup = dispatch_cleanup
+    elif callable(requested_cleanup):
+        coordinator._dispatch_cleanup = requested_cleanup
     return coordinator, clock
 
 
@@ -376,6 +391,89 @@ def test_start_timeout_fires_delivery_unknown_after_ten_seconds_with_no_correlat
         # flush acknowledgement retires the slot without an external ack.
         assert generation.terminalized is True
         assert coordinator.generation_for_token(generation.token) is None
+        assert coordinator.occupied is False
+
+    run(body)
+
+
+def test_no_audio_cleanup_retains_slot_until_token_bearing_post_tts_ack() -> None:
+    async def body() -> None:
+        cleanup_calls: list[str] = []
+        coordinator, clock = make_coordinator(
+            auto_ack_cleanup=False,
+            dispatch_cleanup=lambda token, _identity: cleanup_calls.append(token),
+        )
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        await tick(clock, 10.0 + 1e-6)
+
+        assert cleanup_calls == [generation.token]
+        assert generation.cleanup_pending is True
+        assert generation.terminalized is False
+        assert coordinator.occupied is True
+        assert coordinator.try_admit(identity("work-2", "utt-2")) is None
+
+        await coordinator.acknowledge_tts_lane_flush(generation.token)
+
+        assert generation.terminalized is True
+        assert coordinator.occupied is False
+        assert coordinator.try_admit(identity("work-2", "utt-2")) is not None
+
+    run(body)
+
+
+def test_missing_post_tts_ack_escalates_to_verified_connection_teardown() -> None:
+    async def body() -> None:
+        teardown_calls: list[str] = []
+
+        async def teardown(token: str, _identity: GenerationIdentity) -> None:
+            teardown_calls.append(token)
+            await coordinator.teardown_complete(token)
+
+        coordinator, clock = make_coordinator(
+            auto_ack_cleanup=False,
+            dispatch_cleanup=lambda _token, _identity: None,
+            dispatch_teardown=teardown,
+        )
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        await tick(clock, 10.0 + 1e-6)
+        assert coordinator.occupied is True
+
+        await tick(clock, 1.0 + 1e-6)
+
+        assert teardown_calls == [generation.token]
+        assert generation.terminalized is True
+        assert coordinator.occupied is False
+        assert coordinator.connection_epoch == 1
+
+    run(body)
+
+
+def test_cleanup_dispatch_failure_escalates_to_verified_connection_teardown() -> None:
+    async def body() -> None:
+        teardown_calls: list[str] = []
+
+        async def cleanup_failed(_token: str, _identity: GenerationIdentity) -> None:
+            raise RuntimeError("queueing interruption failed")
+
+        async def teardown(token: str, _identity: GenerationIdentity) -> None:
+            teardown_calls.append(token)
+            await coordinator.teardown_complete(token)
+
+        coordinator, _ = make_coordinator(
+            auto_ack_cleanup=False,
+            dispatch_cleanup=cleanup_failed,
+            dispatch_teardown=teardown,
+        )
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        await coordinator.provider_error(generation.token)
+
+        assert teardown_calls == [generation.token]
+        assert generation.cleanup_pending is True
+        assert generation.teardown_pending is True
+        assert generation.terminalized is True
         assert coordinator.occupied is False
 
     run(body)
@@ -1131,6 +1229,39 @@ def test_transport_processor_keeps_marker_b_across_stale_start_and_audio_a() -> 
         assert coordinator.token_for_context("utt-b") == generation_b.token
         assert generation_b.context_id == "utt-b"
         assert generation_b.audio_submitted is True
+
+    run(body)
+
+
+def test_transport_processor_consumes_token_bearing_flush_ack_after_cleanup() -> None:
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from server.speech_lifecycle import (
+        SpeechGenerationFlushAckFrame,
+        TransportSpeechLifecycleProcessor,
+    )
+
+    async def body() -> None:
+        coordinator, clock = make_coordinator(auto_ack_cleanup=False)
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+        await tick(clock, 10.0 + 1e-6)
+        assert coordinator.occupied is True
+
+        processor = TransportSpeechLifecycleProcessor(coordinator)
+        forwarded: list[object] = []
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        processor.push_frame = push  # type: ignore[method-assign]
+        await processor.process_frame(
+            SpeechGenerationFlushAckFrame(token=generation.token),
+            FrameDirection.DOWNSTREAM,
+        )
+
+        assert forwarded == []
+        assert generation.terminalized is True
+        assert coordinator.occupied is False
 
     run(body)
 

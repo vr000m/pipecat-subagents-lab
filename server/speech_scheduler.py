@@ -153,17 +153,10 @@ class SpeechScheduler:
                 try:
                     await self.lifecycle.provider_error(generation.token)
                 except BaseException:
-                    # Preserve the original submission failure, then use the
-                    # no-audio acknowledgement as a local fallback if cleanup
-                    # dispatch itself failed. It is a no-op once audio crossed
-                    # into output, where the connection teardown barrier must
-                    # remain authoritative.
+                    # Preserve the original submission failure. The lifecycle
+                    # retains admission until its correlated flush barrier or
+                    # connection teardown completes.
                     pass
-                if self.lifecycle.occupied:
-                    try:
-                        await self.lifecycle.acknowledge_tts_lane_flush(generation.token)
-                    except BaseException:
-                        pass
             self._release(item.utterance_id)
             raise
         return item
@@ -240,8 +233,6 @@ class SpeechScheduler:
                 origin_epoch=epoch if epoch is not None else active_item.origin_epoch,
                 allow_stale_reconnect=reconnect,
             )
-            if self.lifecycle is not None and active_token is not None:
-                self.lifecycle.release_flushed_lane(active_token)
             self._release(active_item.utterance_id)
         if reconnect:
             for queue in self._queues.values():
@@ -267,8 +258,6 @@ class SpeechScheduler:
             self._paused[work_item_id] = item
             self._signal_stop(item)
             self.state.speech_progress(**self._progress(item), state=DeliveryState.PAUSED)
-            if self.lifecycle is not None:
-                self.lifecycle.release_flushed_lane(token)
             # Pausing releases the lease without recording a terminal
             # interruption; resume must be able to represent the next state.
             self._release(item.utterance_id)
@@ -304,8 +293,6 @@ class SpeechScheduler:
                 self.lifecycle.record_interruption(token, pause=False)
             self._signal_stop(item)
             self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
-            if self.lifecycle is not None:
-                self.lifecycle.release_flushed_lane(token)
             self._release(item.utterance_id)
             cancelled.append(item)
         keys = [work_item_id] if work_item_id is not None else list(self._queues)
