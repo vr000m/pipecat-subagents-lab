@@ -41,6 +41,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently dropped in favor of the default.
 - The `delivery_completed` TTS callback event no longer bypasses the lifecycle
   coordinator's transport-slot ownership when one is installed.
+- A multi-intent turn's "taking longer than expected" timeout notice is now
+  correctly tagged as a timeout notice rather than a regular result, so it is
+  still discardable if the real result for that item arrives late.
+- Local TTS audio frames (`LocalTTS.run_tts()`) now carry the same
+  `context_id` as their sibling start/stop frames, so they participate in the
+  lifecycle coordinator's stale-frame guard: audio from an
+  interrupted/tombstoned generation can no longer reach the output transport
+  after barge-in.
+- The speech lifecycle coordinator now reaps a generation's internal state
+  once it terminalizes, and bounds its reaped-context tombstone cache with an
+  LRU eviction limit, so a long-lived connection's memory no longer grows
+  without bound.
+- A TTS-provider frame is now rejected unless it belongs to the generation
+  its own marker most recently admitted; a stale start from a superseded
+  generation can no longer mis-bind a replacement generation's context or
+  have its late audio/stop frames forwarded to the output transport.
+- The transport slot backing an interrupted, paused, or cancelled generation
+  is now released only once a token-bearing acknowledgement confirms TTS
+  actually processed the interruption (or the connection lane tears down),
+  closing a window where a still-live old generation could be admitted
+  alongside its replacement. A cleanup-dispatch failure now also escalates
+  to connection teardown immediately, instead of permanently blocking all
+  further speech admission on that connection.
 
 ## [0.1.2] - 2026-07-28
 

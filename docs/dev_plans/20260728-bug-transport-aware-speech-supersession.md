@@ -492,47 +492,47 @@ sequenceDiagram
 
 ### Test Approach
 
-- [ ] Unit-test scheduler lease/token transitions independently of Pipecat.
-- [ ] Test the internal state machine, marker ordering, tombstone fence, and both TTS
+- [x] Unit-test scheduler lease/token transitions independently of Pipecat.
+- [x] Test the internal state machine, marker ordering, tombstone fence, and both TTS
       integration paths.
-- [ ] Test the generic upstream error observer/provider hook with a real-shape
+- [x] Test the generic upstream error observer/provider hook with a real-shape
       context-free `ErrorFrame`, separately from the local context-bearing callback.
-- [ ] Exercise pinned SmallWebRTC output with a controlled real audio-track future.
-- [ ] Reproduce the two-query ordering with deterministic events rather than wall
+- [x] Exercise pinned SmallWebRTC output with a controlled real audio-track future.
+- [x] Reproduce the two-query ordering with deterministic events rather than wall
       clock sleeps.
-- [ ] Drive monotonic reads and timer wakeups with one manual scheduler; do not use
+- [x] Drive monotonic reads and timer wakeups with one manual scheduler; do not use
       wall-clock sleeps for deadline boundaries.
-- [ ] Use an ordered event-log spy for interruption, pause, flush, teardown, slot
+- [x] Use an ordered event-log spy for interruption, pause, flush, teardown, slot
       retirement, and next-admission precedence.
-- [ ] Run the full credential-free Python suite, formatter, and linter.
+- [x] Run the full credential-free Python suite, formatter, and linter.
 
 ### Test Results
 
-- [ ] Targeted lifecycle tests pass.
-- [ ] Deterministic two-query regression passes.
-- [ ] Full test suite passes.
-- [ ] `ruff format --check` and `ruff check` pass.
+- [x] Targeted lifecycle tests pass.
+- [x] Deterministic two-query regression passes.
+- [x] Full test suite passes.
+- [x] `ruff format --check` and `ruff check` pass.
 
 ### Edge Cases Tested
 
-- [ ] Final result arrives before its timeout notice starts.
-- [ ] Final result arrives after its timeout notice starts.
-- [ ] Duplicate or stale transport start/stop event.
-- [ ] A interrupted before start, B pending, then late A start/audio/stop.
-- [ ] A paused before start, explicit resume requested before and after barrier
+- [x] Final result arrives before its timeout notice starts.
+- [x] Final result arrives after its timeout notice starts.
+- [x] Duplicate or stale transport start/stop event.
+- [x] A interrupted before start, B pending, then late A start/audio/stop.
+- [x] A paused before start, explicit resume requested before and after barrier
       resolution, then late A start/audio/stop.
-- [ ] Interruption, pause, cancellation, shutdown, or reconnect before transport
+- [x] Interruption, pause, cancellation, shutdown, or reconnect before transport
       stop.
-- [ ] Generic upstream provider error, local context-bearing error, or no start/end
+- [x] Generic upstream provider error, local context-bearing error, or no start/end
       lifecycle.
-- [ ] Start, drain, and interruption-cleanup deadline boundaries; zero audio; and
+- [x] Start, drain, and interruption-cleanup deadline boundaries; zero audio; and
       stop-versus-expiry in both deterministic orders.
-- [ ] Output-submitted expiry rejects B until old-lane teardown completes; a late
+- [x] Output-submitted expiry rejects B until old-lane teardown completes; a late
       fieldless A stop can never be observed on B's fresh lane.
-- [ ] Missing TTS and inactive/stale connection.
-- [ ] Mixed same-work queue removes only the timeout-notice role and preserves all
+- [x] Missing TTS and inactive/stale connection.
+- [x] Mixed same-work queue removes only the timeout-notice role and preserves all
       other item order.
-- [ ] Another work item's queued speech is unaffected.
+- [x] Another work item's queued speech is unaffected.
 
 ## Acceptance Criteria
 
@@ -610,6 +610,31 @@ sequenceDiagram
   legitimate `0.0` TOML value instead of erroring; the `delivery_completed`
   event bypassed the lifecycle coordinator gate; plus a dead scheduler method
   and a duplicated business-rule mapping.
+- A follow-on gap sweep found a multi-intent work item's timeout notice being
+  misattributed to `ROLE_RESULT`, and a speech-submission failure not
+  releasing the lifecycle slot on the failure path.
+- A subsequent adversarial Codex review pass found `LocalTTS.run_tts()`
+  yielding `TTSAudioRawFrame` without a `context_id`, unlike its sibling
+  `TTSStartedFrame`/`TTSStoppedFrame` calls; every local-TTS audio chunk
+  skipped both `audio_submitted` tracking and the stale-frame drop gate,
+  letting audio from an interrupted/tombstoned generation reach output after
+  barge-in.
+- A deep-review security lens pass found `SpeechLifecycleCoordinator._generations`
+  grew without bound on a long-lived connection, since no path ever popped a
+  terminalized generation.
+- A second adversarial Codex review pass, run against the branch diff after
+  the above fixes, found two further high-severity gaps: `bind_context()`
+  bound the first `TTSStartedFrame` after a marker without verifying it
+  belonged to that marker's own generation (a stale start from a superseded
+  generation could mis-bind a replacement's context, and unbound/stale
+  audio-or-stop frames were still forwarded to output unchecked), and
+  `release_flushed_lane()` released the global transport slot as soon as
+  cleanup was dispatched without confirming TTS had actually processed the
+  interruption -- letting a still-live old generation's late audio corrupt a
+  newly admitted one. It also found a `dispatch_cleanup` failure could leave
+  `cleanup_pending` stuck true forever, wedging all future speech admission
+  on that connection, and that reaped context tombstones (the fix for the
+  unbounded-growth finding above) had no eviction bound.
 
 ## Issues & Solutions
 
@@ -643,13 +668,52 @@ sequenceDiagram
   `discard_queued()` method. `e7b417d` extracts
   `_speech_role_for_child_outcome()` so the retained-as-timeout-notice mapping
   has one definition instead of two.
+- Gap-sweep fix `1bcb283`: multi-intent's second pass now records each
+  timeout-notice item's role before committing, so `_commit_and_speak` tags
+  it `ROLE_TIMEOUT_NOTICE` instead of the `ROLE_RESULT` default; a speech
+  submission failure now routes through `lifecycle.provider_error()` (with a
+  local `acknowledge_tts_lane_flush()` fallback if that dispatch itself
+  fails) before releasing the scheduler lease.
+- Adversarial-review fix `16dfa58`: `LocalTTS.run_tts()` now stamps
+  `context_id` on its `TTSAudioRawFrame` yields, matching its sibling
+  started/stopped frames, so local-TTS audio participates in both
+  `audio_submitted` tracking and the stale-frame drop gate.
+- Deep-review fix `239e88d`: `_terminalize_state` now pops a generation from
+  `_generations` once terminal. `_context_tokens` is deliberately left
+  unpopped at this point -- `drop_stale_frame()` needs to distinguish "bound
+  once, now reaped" (unambiguously stale) from "never bound at all" (still
+  possibly live, since `bind_context()` did not yet verify identity).
+- `a1e6ddb` fixes 6 mypy errors surfaced by CI (Optional-narrowing gaps
+  across ternaries and one variable whose declared type mypy inferred too
+  narrowly); type-only, no behavior change.
+- Second adversarial-review fix pass, split into two commits so each stays
+  independently green: `dfb159e` makes `bind_context()` require the frame's
+  `context_id` to match its marker's own `utterance_id` (rejecting contexts
+  already owned or tombstoned by another generation), makes
+  `on_tts_started()` report acceptance, and has
+  `TransportSpeechLifecycleProcessor` drop any TTS started/audio/stopped
+  frame the coordinator does not positively accept; reaped generations now
+  move their context into a bounded LRU tombstone cache (`connection_closed()`
+  clears it) instead of leaking the mapping forever. `433406f` removes
+  `release_flushed_lane()`'s premature-release fast path -- interruption,
+  pause, and cancel now queue a token-bearing `SpeechGenerationFlushAckFrame`
+  through the TTS lane, and only that frame reaching
+  `TransportSpeechLifecycleProcessor` (or full connection teardown) may
+  release the slot, with a grace-window timer escalating to verified
+  teardown if the ack never arrives; a `dispatch_cleanup` failure now also
+  escalates to teardown immediately instead of leaving `cleanup_pending`
+  stuck.
 
 ## Final Results
 
 All 3 phases implemented via `/skein:conduct --autonomous`, followed by a
-post-conduct host-integration fix and an xhigh-effort `/code-review --fix`
-pass (10 further findings fixed across 6 commits). Final state: 587/587 tests
-pass, `ruff format --check` and `ruff check` clean. Commits:
-`6124040` (phase 1), `13d1044` (phase 2), `df0d5e0` (phase 3), progress
-bookkeeping commits `9ff8f70` and `3a5f6c9`, and the code-review fix commits
-`1af69cb`, `ea59dde`, `3775560`, `59c2032`, `c322af2`, `e7b417d`.
+post-conduct host-integration fix, an xhigh-effort `/code-review --fix`
+pass (10 further findings fixed across 6 commits), a follow-on gap sweep,
+two further adversarial-review/deep-review fix passes, and a CI mypy fix.
+Final state: 598/598 tests pass, `mypy`, `ruff format --check`, and
+`ruff check` all clean. Commits: `6124040` (phase 1), `13d1044` (phase 2),
+`df0d5e0` (phase 3), progress bookkeeping commits `9ff8f70` and `3a5f6c9`,
+the code-review fix commits `1af69cb`, `ea59dde`, `3775560`, `59c2032`,
+`c322af2`, `e7b417d`, the gap-sweep commit `1bcb283`, the adversarial-review
+fix `16dfa58`, the deep-review fix `239e88d`, the mypy fix `a1e6ddb`, and
+the second adversarial-review fix pass `dfb159e` + `433406f`.
