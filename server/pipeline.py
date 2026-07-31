@@ -116,7 +116,21 @@ def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
     if getattr(BusBridgeProcessor, "framework_fallback", False):
         return _FallbackBridge()
     excluded = kwargs.pop("exclude_frames", ())
-    kwargs["exclude_frames"] = tuple(dict.fromkeys((TTSSpeakFrame, *excluded)))
+    # SpeechGenerationMarkerFrame/SpeechGenerationFlushAckFrame are private,
+    # connection-local lifecycle bookkeeping consumed by
+    # TransportSpeechLifecycleProcessor further down this same pipeline; the
+    # bus bridge must not divert them to other workers or the marker never
+    # reaches its consumer, leaving every TTS audio frame unbound and dropped.
+    kwargs["exclude_frames"] = tuple(
+        dict.fromkeys(
+            (
+                TTSSpeakFrame,
+                SpeechGenerationMarkerFrame,
+                SpeechGenerationFlushAckFrame,
+                *excluded,
+            )
+        )
+    )
     return BusBridgeProcessor(bus=bus, worker_name=worker_name, **kwargs)
 
 

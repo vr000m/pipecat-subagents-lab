@@ -22,6 +22,35 @@ serialize accepted work through their own mailboxes. Validated router decisions
 are dispatched directly by `WorkItemCoordinator`; the connection
 `BusBridgeProcessor` remains the Pipecat worker-bus boundary for frames.
 
+### Bus bridge frame exclusions
+
+`framework_bridge()` (`server/pipeline.py`) excludes frame types that must
+stay on the local connection pipeline instead of crossing `WorkerBus`.
+`BusBridgeProcessor.process_frame` (Pipecat) forwards a frame downstream
+locally only if it is a lifecycle frame
+(`StartFrame`/`EndFrame`/`CancelFrame`/`StopFrame`), an
+`OutputTransportMessageUrgentFrame`, or explicitly listed in
+`exclude_frames`; every other frame type is diverted to the bus and never
+reaches the rest of the connection pipeline unless another worker echoes it
+back. Any new connection-local frame type introduced downstream of the
+bridge — not just `TTSSpeakFrame` — must be added to this list, or it is
+silently dropped from the local pipeline with no error.
+
+This was missed once in practice: `SpeechGenerationMarkerFrame` and
+`SpeechGenerationFlushAckFrame` (introduced 2026-07-30, `6124040`) were never
+added to `exclude_frames` after `TTSSpeakFrame` had been excluded there a
+week earlier (2026-07-23, `82941e8`). The marker frame that
+`TransportSpeechLifecycleProcessor` needs to bind a TTS context to its
+coordinator token was silently diverted to the bus on every turn instead of
+reaching that processor. With no bound context, every real
+`TTSStartedFrame`/`TTSAudioRawFrame`/`TTSStoppedFrame` was treated as
+belonging to an unbound generation and dropped by the coordinator's
+fail-closed path (see Design boundaries): TTS synthesized correctly and the
+WebRTC audio track stayed live throughout, so nothing in transport state,
+logs, or the browser signalled failure — the assistant was simply never
+audible. Fixed 2026-07-31 by adding both marker frame types to
+`exclude_frames`.
+
 ## Voice turn and result flow
 
 ```mermaid
