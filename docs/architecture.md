@@ -56,6 +56,18 @@ logs, or the browser signalled failure — the assistant was simply never
 audible. Fixed 2026-07-31 by adding both marker frame types to
 `exclude_frames`.
 
+**Open question — `InterruptionFrame`:** `stop_speech` (`server/pipeline.py`)
+queues an `InterruptionFrame` onto the connection worker, but it is not
+listed in `CONNECTION_LOCAL_FRAMES`, so per the rule above `BusBridgeProcessor`
+diverts it to `WorkerBus` instead of forwarding it locally. It is not yet
+confirmed whether this is a live instance of the same class of bug (an
+interruption signal not reaching whatever locally listens for it) or
+benign (e.g. because Pipecat delivers interruption handling to the
+connection pipeline through some other, non-`exclude_frames` path). Needs
+verification before either adding it to `CONNECTION_LOCAL_FRAMES` or
+closing this out — adding it without confirming the need would be an
+unreviewed behavior change to interruption routing, not a refactor.
+
 ## Voice turn and result flow
 
 ```mermaid
