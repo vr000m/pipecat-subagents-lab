@@ -4,8 +4,8 @@ body { margin: 0; }
 .app-shell { max-width: 1180px; margin: auto; }
 .topbar { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; padding: .9rem; border-bottom: 1px solid #303641; }
 .topbar h1 { font-size: 1.05rem; margin: 0 auto 0 0; }
-button { border: 1px solid #46505d; border-radius: 5px; padding: .45rem .8rem; background: #222831; color: inherit; cursor: pointer; }
-button:disabled { opacity: .45; cursor: not-allowed; }
+button, select { border: 1px solid #46505d; border-radius: 5px; padding: .45rem .8rem; background: #222831; color: inherit; cursor: pointer; }
+button:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
 .local-diagnostics { margin: .7rem .9rem; padding: .5rem .7rem; border: 1px dashed #8a6d2e; color: #d8c9a0; font-size: .8rem; }
 .live-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(260px, 1fr); gap: 1rem; padding: .9rem; }
 .panel, .worker, .result-card { background: #20242b; border: 1px solid #303641; border-radius: 6px; padding: .7rem; }

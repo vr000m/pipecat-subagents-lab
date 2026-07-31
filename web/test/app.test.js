@@ -9,9 +9,17 @@ class Element {
   play() { return Promise.resolve(); }
 }
 
-function fakeDocument() {
+function fakeDocument({ audioSupportsSinkId = false } = {}) {
   const body = new Element();
-  return { body, createElement: () => new Element(), querySelector: () => new Element() };
+  return {
+    body,
+    createElement: (tag) => {
+      const node = new Element();
+      if (tag === "audio" && audioSupportsSinkId) node.setSinkId = async (id) => { node.sinkId = id; };
+      return node;
+    },
+    querySelector: () => new Element(),
+  };
 }
 
 test("connection readiness sends RTVI ready before requesting a snapshot", async () => {
@@ -47,6 +55,76 @@ test("connection readiness sends RTVI ready before requesting a snapshot", async
   expect(connectButton.disabled).toBe(true);
   expect(messages).toEqual([{ type: "client-ready" }, "snapshot-request"]);
   expect(transportOptions).toEqual({ webrtcRequestParams: { endpoint: "/api/rtc" } });
+});
+
+test("device selects populate on connect and route selection through the client and audio sink", async () => {
+  const documentRef = fakeDocument({ audioSupportsSinkId: true });
+  const root = new Element();
+  const mics = [{ deviceId: "mic-1", label: "Built-in Mic" }, { deviceId: "mic-2", label: "USB Mic" }];
+  const speakers = [{ deviceId: "spk-1", label: "Speakers" }, { deviceId: "spk-2", label: "Headphones" }];
+  const updateMicCalls = [];
+  const updateSpeakerCalls = [];
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: () => ({
+      connect: async () => {},
+      disconnect: async () => {},
+      enableMic: () => {},
+      isMicEnabled: true,
+      getAllMics: async () => mics,
+      getAllSpeakers: async () => speakers,
+      selectedMic: mics[0],
+      selectedSpeaker: speakers[0],
+      updateMic: (id) => updateMicCalls.push(id),
+      updateSpeaker: (id) => updateSpeakerCalls.push(id),
+    }),
+  });
+
+  const header = root.children[0];
+  const connectButton = header.children[1];
+  const micSelect = header.children[4];
+  const speakerSelect = header.children[5];
+
+  expect(micSelect.disabled).toBe(true);
+  await connectButton.onclick();
+
+  expect(micSelect.children.map((option) => option.value)).toEqual(["mic-1", "mic-2"]);
+  expect(speakerSelect.children.map((option) => option.value)).toEqual(["spk-1", "spk-2"]);
+  expect(micSelect.value).toBe("mic-1");
+  expect(micSelect.disabled).toBe(false);
+  expect(speakerSelect.disabled).toBe(false);
+
+  micSelect.value = "mic-2";
+  micSelect.onchange();
+  expect(updateMicCalls).toEqual(["mic-2"]);
+
+  speakerSelect.value = "spk-2";
+  await speakerSelect.onchange();
+  expect(updateSpeakerCalls).toEqual(["spk-2"]);
+  expect(app.audio.sinkId).toBe("spk-2");
+});
+
+test("speaker select is hidden when the browser cannot switch audio output devices", async () => {
+  const documentRef = fakeDocument({ audioSupportsSinkId: false });
+  const root = new Element();
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: () => ({
+      connect: async () => {},
+      disconnect: async () => {},
+      enableMic: () => {},
+      getAllMics: async () => [],
+      getAllSpeakers: async () => [{ deviceId: "spk-1", label: "Speakers" }],
+    }),
+  });
+  void app;
+
+  const speakerSelect = root.children[0].children[5];
+  expect(speakerSelect.hidden).toBe(true);
 });
 
 test("onServerMessage rejects unsupported contracts before applying state", () => {
