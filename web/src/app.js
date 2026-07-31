@@ -4,6 +4,26 @@ import { validateServerMessage } from "./protocol.js";
 import { applyServerMessage, createInitialState } from "./state.js";
 import { render } from "./render.js";
 
+const ICONS = {
+  connect: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2v4"/><path d="M15 2v4"/><path d="M8 8h8l-1 6a3 3 0 0 1-3 3h0a3 3 0 0 1-3-3z"/><path d="M12 17v5"/></svg>`,
+  disconnect: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2v4"/><path d="M15 2v4"/><path d="M8 8h8l-1 6a3 3 0 0 1-3 3h0a3 3 0 0 1-3-3z"/><path d="M12 17v5"/><path d="M3 3l18 18"/></svg>`,
+  micOn: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5"/><path d="M8 22h8"/></svg>`,
+  micOff: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5"/><path d="M8 22h8"/><path d="M3 3l18 18"/></svg>`,
+  play: `<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg>`,
+};
+
+function iconButton(documentRef, iconSvg, text) {
+  const node = documentRef.createElement("button");
+  node.innerHTML = `<span class="btn-icon">${iconSvg}</span><span class="btn-text">${text}</span>`;
+  return node;
+}
+
+function logDiag(component, message, data) {
+  const timestamp = new Date().toISOString().slice(11, 23);
+  if (data === undefined) console.info(`[${timestamp}][${component}] ${message}`);
+  else console.info(`[${timestamp}][${component}] ${message}`, data);
+}
+
 export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", sessionUrl = "/api/session", fetchImpl = globalThis.fetch, clientFactory, transportFactory } = {}) {
   root ??= documentRef?.querySelector?.("#app");
   let state = createInitialState();
@@ -20,7 +40,10 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
 
   const content = documentRef.createElement("div");
   const update = (next) => { state = next; render(state, content); };
-  const report = (message) => update({ ...state, localDiagnostics: { ...state.localDiagnostics, message } });
+  const report = (message) => {
+    logDiag("diagnostics", message);
+    update({ ...state, localDiagnostics: { ...state.localDiagnostics, message } });
+  };
 
   const callbacksFor = (callbackGeneration) => {
     const current = () => callbackGeneration === activeGeneration;
@@ -29,21 +52,29 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     };
     const attachTrack = (track, participant) => {
       if (!current() || participant?.local || track?.kind !== "audio") return;
+      logDiag("track", "attaching remote audio track", { id: track.id, readyState: track.readyState, muted: track.muted, enabled: track.enabled });
+      track.addEventListener("mute", () => logDiag("track", "remote audio track muted (no data arriving)", { id: track.id }));
+      track.addEventListener("unmute", () => logDiag("track", "remote audio track unmuted (data arriving)", { id: track.id }));
       audio.srcObject = new MediaStream([track]);
-      audio.play().catch(() => report("Assistant audio is ready, but playback was blocked. Click the page or Play audio to allow it."));
+      audio.play()
+        .then(() => logDiag("track", "audio.play() resolved"))
+        .catch(() => report("Assistant audio is ready, but playback was blocked. Click the page or Play audio to allow it."));
     };
     const detachTrack = (track) => {
       if (!current() || !audio.srcObject) return;
       const tracks = audio.srcObject.getTracks();
-      if (!track || tracks.includes(track)) audio.srcObject = null;
+      if (!track || tracks.includes(track)) {
+        logDiag("track", "detaching remote audio track", { id: track?.id });
+        audio.srcObject = null;
+      }
     };
     return {
-      onConnected: () => { if (current()) update({ ...state, connection: "connected" }); },
+      onConnected: () => { logDiag("connection", "onConnected"); if (current()) update({ ...state, connection: "connected" }); },
       // PipecatClient.connect() sends the standard RTVI client-ready message
       // before resolving onBotReady. Request the server-authoritative snapshot
       // only after that media/RTVI readiness boundary.
-      onBotReady: () => requestSnapshot(),
-      onDisconnected: () => { if (current()) update({ ...state, connection: "disconnected" }); },
+      onBotReady: () => { logDiag("connection", "onBotReady"); requestSnapshot(); },
+      onDisconnected: () => { logDiag("connection", "onDisconnected"); if (current()) update({ ...state, connection: "disconnected" }); },
       onError: (message) => { if (current()) report(message?.data?.message || "The RTVI connection reported an error."); },
       onServerMessage: (message) => {
         if (!current()) return;
@@ -63,6 +94,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
 
   const connect = async () => {
     if (connectPromise) return connectPromise;
+    logDiag("connection", "connect() starting");
     connectPromise = (async () => {
     const callbackGeneration = ++generation;
     activeGeneration = callbackGeneration;
@@ -96,6 +128,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       // client connection promise pending.
       if (typeof client.initDevices === "function") await client.initDevices();
       await client.connect();
+      logDiag("connection", "connect() succeeded");
       update({ ...state, connection: "connected" });
       setMicButton(Boolean(client.isMicEnabled));
       // Connect is a user gesture, so a previously-created audio element may play here.
@@ -110,6 +143,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     try { return await connectPromise; } finally { connectPromise = null; }
   };
   const disconnect = async () => {
+    logDiag("connection", "disconnect() starting");
     micSelect.disabled = true;
     speakerSelect.disabled = true;
     populateSelect(documentRef, micSelect, [], null);
@@ -121,9 +155,10 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     setMicButton(false);
     update({ ...state, connection: "disconnected" });
   };
-  const selectMic = (deviceId) => { if (deviceId) client?.updateMic(deviceId); };
+  const selectMic = (deviceId) => { if (deviceId) { logDiag("mic", "switching mic device", { deviceId }); client?.updateMic(deviceId); } };
   const selectSpeaker = async (deviceId) => {
     if (!deviceId) return;
+    logDiag("speaker", "switching speaker device", { deviceId });
     client?.updateSpeaker(deviceId);
     // The client's own speaker routing does not know about the <audio>
     // element this app manages by hand (see attachTrack); the sink must be
@@ -131,6 +166,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     if (supportsSinkId) {
       try {
         await audio.setSinkId(deviceId);
+        logDiag("speaker", "setSinkId succeeded", { deviceId });
       } catch (error) {
         report(`Failed to switch speaker: ${error?.message || error}`);
       }
@@ -139,6 +175,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   const toggleMic = () => {
     if (!client) return;
     const enabled = !client.isMicEnabled;
+    logDiag("mic", `toggling mic ${enabled ? "on" : "off"}`);
     client.enableMic(enabled);
     setMicButton(enabled);
     update({ ...state, localDiagnostics: { ...state.localDiagnostics, message: enabled ? "Microphone enabled." : "Microphone disabled." } });
@@ -148,35 +185,47 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   const header = documentRef.createElement("header");
   header.className = "topbar";
   header.append(el(documentRef, "h1", "Pipecat Subagents Lab"));
-  const connectButton = el(documentRef, "button", "Connect");
-  const disconnectButton = el(documentRef, "button", "Disconnect");
-  const micButton = el(documentRef, "button", "Mic: off");
-  const playButton = el(documentRef, "button", "Play audio");
+  const connectToggleButton = iconButton(documentRef, ICONS.connect, "Connect");
+  const micButton = iconButton(documentRef, ICONS.micOff, "Mic: off");
+  const playButton = iconButton(documentRef, ICONS.play, "Play audio");
   const micSelect = documentRef.createElement("select");
   micSelect.setAttribute("aria-label", "Microphone");
+  micSelect.className = "icon-select icon-select-mic";
   const speakerSelect = documentRef.createElement("select");
   speakerSelect.setAttribute("aria-label", "Speaker");
-  const setMicButton = (enabled) => { micButton.textContent = `Mic: ${enabled ? "on" : "off"}`; };
-  disconnectButton.disabled = true; micButton.disabled = true; playButton.hidden = true;
+  speakerSelect.className = "icon-select icon-select-speaker";
+  const setMicButton = (enabled) => {
+    micButton.innerHTML = `<span class="btn-icon">${enabled ? ICONS.micOn : ICONS.micOff}</span><span class="btn-text">Mic: ${enabled ? "on" : "off"}</span>`;
+  };
+  let isConnected = false;
+  const setConnectToggleButton = (connectedState) => {
+    connectToggleButton.innerHTML = `<span class="btn-icon">${connectedState ? ICONS.disconnect : ICONS.connect}</span><span class="btn-text">${connectedState ? "Disconnect" : "Connect"}</span>`;
+  };
+  micButton.disabled = true; playButton.hidden = true;
   micSelect.disabled = true; speakerSelect.disabled = true;
   if (!supportsSinkId) {
     speakerSelect.hidden = true;
     speakerSelect.title = "This browser does not support switching audio output devices.";
   }
-  connectButton.onclick = async () => {
+  connectToggleButton.onclick = async () => {
+    if (isConnected) {
+      await disconnect();
+      isConnected = false;
+      micButton.disabled = true; playButton.hidden = true;
+      setConnectToggleButton(false);
+      return;
+    }
     if (!await connect()) return;
-    connectButton.disabled = true; disconnectButton.disabled = false; micButton.disabled = false; playButton.hidden = false;
+    isConnected = true;
+    micButton.disabled = false; playButton.hidden = false;
     micSelect.disabled = false; speakerSelect.disabled = false;
-  };
-  disconnectButton.onclick = async () => {
-    await disconnect();
-    connectButton.disabled = false; disconnectButton.disabled = true; micButton.disabled = true;
+    setConnectToggleButton(true);
   };
   micButton.onclick = toggleMic;
   playButton.onclick = () => audio.play().catch(() => report("Playback is still blocked; check browser site permissions."));
   micSelect.onchange = () => selectMic(micSelect.value);
   speakerSelect.onchange = () => selectSpeaker(speakerSelect.value);
-  header.append(connectButton, disconnectButton, micButton, micSelect, speakerSelect, playButton);
+  header.append(micSelect, speakerSelect, micButton, connectToggleButton, playButton);
   root.append(header, content);
   render(state, content);
   return { connect, disconnect, toggleMic, getState: () => state, getClient: () => client, audio };

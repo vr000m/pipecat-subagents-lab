@@ -45,14 +45,14 @@ test("connection readiness sends RTVI ready before requesting a snapshot", async
     enableMic: () => {},
   }) });
 
-  const connectButton = root.children[0].children[1];
-  await connectButton.onclick();
-  expect(connectButton.disabled).toBe(false);
+  const connectToggleButton = root.children[0].children[4];
+  await connectToggleButton.onclick();
+  expect(connectToggleButton.innerHTML).toContain("Connect");
   expect(messages).toEqual([]);
 
   shouldFail = false;
-  await connectButton.onclick();
-  expect(connectButton.disabled).toBe(true);
+  await connectToggleButton.onclick();
+  expect(connectToggleButton.innerHTML).toContain("Disconnect");
   expect(messages).toEqual([{ type: "client-ready" }, "snapshot-request"]);
   expect(transportOptions).toEqual({ webrtcRequestParams: { endpoint: "/api/rtc" } });
 });
@@ -85,12 +85,12 @@ test("device selects populate from onAvailableMicsUpdated/onAvailableSpeakersUpd
   });
 
   const header = root.children[0];
-  const connectButton = header.children[1];
-  const micSelect = header.children[4];
-  const speakerSelect = header.children[5];
+  const connectToggleButton = header.children[4];
+  const micSelect = header.children[1];
+  const speakerSelect = header.children[2];
 
   expect(micSelect.disabled).toBe(true);
-  await connectButton.onclick();
+  await connectToggleButton.onclick();
 
   // Simulate what client.initDevices()/connect() trigger internally.
   callbacks.onAvailableMicsUpdated(mics);
@@ -126,7 +126,7 @@ test("speaker select is hidden and never populated when the browser cannot switc
     },
   });
 
-  const speakerSelect = root.children[0].children[5];
+  const speakerSelect = root.children[0].children[2];
   expect(speakerSelect.hidden).toBe(true);
 
   await app.connect();
@@ -150,7 +150,7 @@ test("populateSelect does not force-select a device id that is not in the provid
   });
   void app;
 
-  const micSelect = root.children[0].children[4];
+  const micSelect = root.children[0].children[1];
   await app.connect();
   callbacks.onAvailableMicsUpdated(mics);
 
@@ -172,8 +172,8 @@ test("disconnect() itself disables and clears the mic/speaker selects", async ()
     },
   });
 
-  const micSelect = root.children[0].children[4];
-  const speakerSelect = root.children[0].children[5];
+  const micSelect = root.children[0].children[1];
+  const speakerSelect = root.children[0].children[2];
   await app.connect();
   callbacks.onAvailableMicsUpdated(mics);
   micSelect.disabled = false;
@@ -203,7 +203,7 @@ test("once disconnect() has run, the selects are disabled so a real <select> can
     }),
   });
 
-  const micSelect = root.children[0].children[4];
+  const micSelect = root.children[0].children[1];
   await app.connect();
   await app.disconnect();
 
