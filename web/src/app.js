@@ -31,6 +31,8 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   let connectPromise = null;
   let generation = 0;
   let activeGeneration = 0;
+  let connectionActive = false;
+  let lastConfirmedSinkId = null;
   let audio = documentRef.createElement("audio");
   audio.autoplay = true;
   audio.playsInline = true;
@@ -74,7 +76,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       // before resolving onBotReady. Request the server-authoritative snapshot
       // only after that media/RTVI readiness boundary.
       onBotReady: () => { logDiag("connection", "onBotReady"); requestSnapshot(); },
-      onDisconnected: () => { logDiag("connection", "onDisconnected"); if (current()) update({ ...state, connection: "disconnected" }); },
+      onDisconnected: () => { logDiag("connection", "onDisconnected"); cleanupConnection(callbackGeneration); },
       onError: (message) => { if (current()) report(message?.data?.message || "The RTVI connection reported an error."); },
       onServerMessage: (message) => {
         if (!current()) return;
@@ -88,7 +90,11 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       onTrackStarted: attachTrack,
       onTrackStopped: detachTrack,
       onAvailableMicsUpdated: (mics) => { if (current()) populateSelect(documentRef, micSelect, mics, client?.selectedMic?.deviceId); },
-      onAvailableSpeakersUpdated: (speakers) => { if (current() && supportsSinkId) populateSelect(documentRef, speakerSelect, speakers, client?.selectedSpeaker?.deviceId); },
+      onAvailableSpeakersUpdated: (speakers) => {
+        if (!current() || !supportsSinkId) return;
+        lastConfirmedSinkId ??= client?.selectedSpeaker?.deviceId || null;
+        populateSelect(documentRef, speakerSelect, speakers, lastConfirmedSinkId);
+      },
     };
   };
 
@@ -98,6 +104,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     connectPromise = (async () => {
     const callbackGeneration = ++generation;
     activeGeneration = callbackGeneration;
+    connectionActive = true;
     let connectionUrl = webrtcUrl;
     if (!transportFactory && fetchImpl) {
       try {
@@ -112,6 +119,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
         connectionUrl = url.toString();
       } catch (error) {
         report(`Session discovery failed: ${error?.message || error}`);
+        connectionActive = false;
         update({ ...state, connection: "disconnected" });
         return false;
       }
@@ -128,6 +136,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       // client connection promise pending.
       if (typeof client.initDevices === "function") await client.initDevices();
       await client.connect();
+      if (callbackGeneration !== activeGeneration) return false;
       logDiag("connection", "connect() succeeded");
       update({ ...state, connection: "connected" });
       setMicButton(Boolean(client.isMicEnabled));
@@ -136,38 +145,52 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       return true;
     } catch (error) {
       report(`Connection failed: ${error?.message || error}`);
+      connectionActive = false;
       update({ ...state, connection: "disconnected" });
       return false;
     }
     })();
     try { return await connectPromise; } finally { connectPromise = null; }
   };
-  const disconnect = async () => {
-    logDiag("connection", "disconnect() starting");
+  const cleanupConnection = (callbackGeneration = activeGeneration) => {
+    if (!connectionActive || callbackGeneration !== activeGeneration) return;
+    activeGeneration = ++generation;
+    connectionActive = false;
+    isConnected = false;
     micSelect.disabled = true;
     speakerSelect.disabled = true;
     populateSelect(documentRef, micSelect, [], null);
     populateSelect(documentRef, speakerSelect, [], null);
-    activeGeneration = ++generation;
+    lastConfirmedSinkId = null;
     client?.enableMic(false);
-    await client?.disconnect();
     audio.srcObject = null;
     setMicButton(false);
+    micButton.disabled = true;
+    playButton.hidden = true;
+    setConnectToggleButton(false);
     update({ ...state, connection: "disconnected" });
+  };
+  const disconnect = async () => {
+    logDiag("connection", "disconnect() starting");
+    cleanupConnection(activeGeneration);
+    await client?.disconnect();
   };
   const selectMic = (deviceId) => { if (deviceId) { logDiag("mic", "switching mic device", { deviceId }); client?.updateMic(deviceId); } };
   const selectSpeaker = async (deviceId) => {
     if (!deviceId) return;
     logDiag("speaker", "switching speaker device", { deviceId });
-    client?.updateSpeaker(deviceId);
     // The client's own speaker routing does not know about the <audio>
     // element this app manages by hand (see attachTrack); the sink must be
     // set explicitly for switching to actually change what plays.
     if (supportsSinkId) {
       try {
         await audio.setSinkId(deviceId);
+        lastConfirmedSinkId = deviceId;
+        speakerSelect.value = deviceId;
+        client?.updateSpeaker(deviceId);
         logDiag("speaker", "setSinkId succeeded", { deviceId });
       } catch (error) {
+        speakerSelect.value = lastConfirmedSinkId || "";
         report(`Failed to switch speaker: ${error?.message || error}`);
       }
     }
@@ -210,9 +233,6 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   connectToggleButton.onclick = async () => {
     if (isConnected) {
       await disconnect();
-      isConnected = false;
-      micButton.disabled = true; playButton.hidden = true;
-      setConnectToggleButton(false);
       return;
     }
     if (!await connect()) return;

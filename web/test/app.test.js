@@ -112,6 +112,40 @@ test("device selects populate from onAvailableMicsUpdated/onAvailableSpeakersUpd
   expect(app.audio.sinkId).toBe("spk-2");
 });
 
+test("failed speaker sink switch restores the last confirmed speaker selection", async () => {
+  const documentRef = fakeDocument({ audioSupportsSinkId: true });
+  const root = new Element();
+  const speakers = [{ deviceId: "spk-1", label: "Speakers" }, { deviceId: "spk-2", label: "Headphones" }];
+  let activeSpeaker = "spk-1";
+  let callbacks;
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: (_transport, nextCallbacks) => {
+      callbacks = nextCallbacks;
+      return {
+        connect: async () => {},
+        disconnect: async () => {},
+        enableMic: () => {},
+        selectedSpeaker: speakers[0],
+        updateSpeaker: (id) => { activeSpeaker = id; },
+      };
+    },
+  });
+
+  const speakerSelect = root.children[0].children[2];
+  await app.connect();
+  callbacks.onAvailableSpeakersUpdated(speakers);
+  app.audio.setSinkId = async () => { throw new Error("device removed"); };
+
+  speakerSelect.value = "spk-2";
+  await speakerSelect.onchange();
+
+  expect(speakerSelect.value).toBe("spk-1");
+  expect(activeSpeaker).toBe("spk-1");
+});
+
 test("speaker select is hidden and never populated when the browser cannot switch audio output devices", async () => {
   const documentRef = fakeDocument({ audioSupportsSinkId: false });
   const root = new Element();
@@ -185,6 +219,52 @@ test("disconnect() itself disables and clears the mic/speaker selects", async ()
   expect(speakerSelect.disabled).toBe(true);
   expect(micSelect.children).toEqual([]);
   expect(speakerSelect.children).toEqual([]);
+});
+
+test("transport onDisconnected performs full cleanup and invalidates its callback generation", async () => {
+  const documentRef = fakeDocument({ audioSupportsSinkId: true });
+  const root = new Element();
+  const mics = [{ deviceId: "mic-1", label: "Built-in Mic" }];
+  const speakers = [{ deviceId: "spk-1", label: "Speakers" }];
+  let callbacks;
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: (_transport, nextCallbacks) => {
+      callbacks = nextCallbacks;
+      return {
+        connect: async () => {},
+        disconnect: async () => {},
+        enableMic: () => {},
+        isMicEnabled: true,
+        selectedMic: mics[0],
+        selectedSpeaker: speakers[0],
+      };
+    },
+  });
+
+  const header = root.children[0];
+  const micSelect = header.children[1];
+  const speakerSelect = header.children[2];
+  const connectToggleButton = header.children[4];
+  await connectToggleButton.onclick();
+  callbacks.onAvailableMicsUpdated(mics);
+  callbacks.onAvailableSpeakersUpdated(speakers);
+  app.audio.srcObject = { getTracks: () => [] };
+
+  callbacks.onDisconnected();
+
+  expect(connectToggleButton.innerHTML).toContain("Connect");
+  expect(micSelect.disabled).toBe(true);
+  expect(speakerSelect.disabled).toBe(true);
+  expect(micSelect.children).toEqual([]);
+  expect(speakerSelect.children).toEqual([]);
+  expect(app.audio.srcObject).toBe(null);
+  expect(app.getState().connection).toBe("disconnected");
+
+  callbacks.onConnected();
+  expect(app.getState().connection).toBe("disconnected");
 });
 
 test("once disconnect() has run, the selects are disabled so a real <select> cannot fire onchange again", async () => {
