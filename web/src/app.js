@@ -1,30 +1,60 @@
 import { PipecatClient } from "@pipecat-ai/client-js";
 import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { validateServerMessage } from "./protocol.js";
-import { applyServerMessage, createInitialState } from "./state.js";
+import {
+  applyServerMessage,
+  createInitialState,
+  disconnectedState,
+  withConnection,
+  withDeviceList,
+  withMicEnabled,
+  withSelectedDevice,
+} from "./state.js";
 import { render } from "./render.js";
+import { createControls } from "./controls.js";
 
-const ICONS = {
-  connect: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2v4"/><path d="M15 2v4"/><path d="M8 8h8l-1 6a3 3 0 0 1-3 3h0a3 3 0 0 1-3-3z"/><path d="M12 17v5"/></svg>`,
-  disconnect: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2v4"/><path d="M15 2v4"/><path d="M8 8h8l-1 6a3 3 0 0 1-3 3h0a3 3 0 0 1-3-3z"/><path d="M12 17v5"/><path d="M3 3l18 18"/></svg>`,
-  micOn: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5"/><path d="M8 22h8"/></svg>`,
-  micOff: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5"/><path d="M8 22h8"/><path d="M3 3l18 18"/></svg>`,
-  play: `<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg>`,
-};
-
-function iconButton(documentRef, iconSvg, text) {
-  const node = documentRef.createElement("button");
-  node.innerHTML = `<span class="btn-icon">${iconSvg}</span><span class="btn-text">${text}</span>`;
-  return node;
-}
-
-function logDiag(component, message, data) {
+function defaultLogger(component, message, data) {
   const timestamp = new Date().toISOString().slice(11, 23);
   if (data === undefined) console.info(`[${timestamp}][${component}] ${message}`);
   else console.info(`[${timestamp}][${component}] ${message}`, data);
 }
 
-export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", sessionUrl = "/api/session", fetchImpl = globalThis.fetch, clientFactory, transportFactory } = {}) {
+// Sole owner of the actual audio-output routing for the assistant's
+// remote audio element. `client.updateSpeaker(...)` (in app.js) is only an
+// advisory notification to the RTVI client after a switch here succeeds;
+// this adapter is what actually moves audio to the selected device.
+export function createAudioSink(audioElement) {
+  let confirmedSinkId = null;
+  return {
+    element: audioElement,
+    get supportsSinkId() {
+      return typeof audioElement.setSinkId === "function";
+    },
+    getSinkId: () => confirmedSinkId,
+    setSink: async (deviceId) => {
+      // Property lookup at call time, never a captured reference: callers
+      // (including tests) may replace audioElement.setSinkId after this
+      // adapter is constructed.
+      if (typeof audioElement.setSinkId !== "function") return false;
+      try {
+        await audioElement.setSinkId(deviceId);
+        confirmedSinkId = deviceId;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    reset: async () => {
+      const hadConfirmedSink = confirmedSinkId !== null;
+      confirmedSinkId = null;
+      if (hadConfirmedSink && typeof audioElement.setSinkId === "function") {
+        try { await audioElement.setSinkId(""); } catch { /* best effort */ }
+      }
+    },
+  };
+}
+
+export function createApp({ root, documentRef = globalThis.document, webrtcUrl = "/api/rtc", sessionUrl = "/api/session", fetchImpl = globalThis.fetch, clientFactory, transportFactory, logger = defaultLogger } = {}) {
   root ??= documentRef?.querySelector?.("#app");
   let state = createInitialState();
   let client;
@@ -32,20 +62,36 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   let generation = 0;
   let activeGeneration = 0;
   let connectionActive = false;
-  let lastConfirmedSinkId = null;
-  let audio = documentRef.createElement("audio");
+  const tornDownClients = new WeakSet();
+  const logDiag = logger;
+
+  const audio = documentRef.createElement("audio");
   audio.autoplay = true;
   audio.playsInline = true;
   audio.setAttribute("aria-label", "Assistant audio");
   documentRef.body.append(audio);
-  const supportsSinkId = typeof audio.setSinkId === "function";
+
+  const audioSink = createAudioSink(audio);
+  // Capability, probed once at startup; controls.render reads only state.
+  state = { ...state, devices: { ...state.devices, speakerSupported: audioSink.supportsSinkId } };
 
   const content = documentRef.createElement("div");
-  const update = (next) => { state = next; render(state, content); };
+  const update = (next) => { state = next; render(state, content); controls.render(state); };
   const report = (message) => {
     logDiag("diagnostics", message);
     update({ ...state, localDiagnostics: { ...state.localDiagnostics, message } });
   };
+
+  const controls = createControls({
+    documentRef,
+    handlers: {
+      onToggleConnection: () => (state.connection === "connected" ? disconnect() : connect()),
+      onToggleMic: () => toggleMic(),
+      onPlayAudio: () => audio.play().catch(() => report("Playback is still blocked; check browser site permissions.")),
+      onSelectMic: (deviceId) => selectMic(deviceId),
+      onSelectSpeaker: (deviceId) => applySpeaker(deviceId, { notifyClient: true }),
+    },
+  });
 
   const callbacksFor = (callbackGeneration) => {
     const current = () => callbackGeneration === activeGeneration;
@@ -71,7 +117,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       }
     };
     return {
-      onConnected: () => { logDiag("connection", "onConnected"); if (current()) update({ ...state, connection: "connected" }); },
+      onConnected: () => { logDiag("connection", "onConnected"); if (current()) update(withConnection(state, "connected")); },
       // PipecatClient.connect() sends the standard RTVI client-ready message
       // before resolving onBotReady. Request the server-authoritative snapshot
       // only after that media/RTVI readiness boundary.
@@ -89,189 +135,149 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       },
       onTrackStarted: attachTrack,
       onTrackStopped: detachTrack,
-      onAvailableMicsUpdated: (mics) => { if (current()) populateSelect(documentRef, micSelect, mics, client?.selectedMic?.deviceId); },
+      onAvailableMicsUpdated: (mics) => {
+        if (!current()) return;
+        update(withDeviceList(state, "mic", mics, client?.selectedMic?.deviceId));
+      },
       onAvailableSpeakersUpdated: (speakers) => {
-        if (!current() || !supportsSinkId) return;
-        lastConfirmedSinkId ??= client?.selectedSpeaker?.deviceId || null;
-        populateSelect(documentRef, speakerSelect, speakers, lastConfirmedSinkId);
+        if (!current()) return;
+        const preferred = audioSink.getSinkId() ?? client?.selectedSpeaker?.deviceId ?? null;
+        const next = withDeviceList(state, "speaker", speakers, preferred);
+        update(next);
+        const resolved = next.devices.selectedSpeakerId;
+        if (resolved && resolved !== audioSink.getSinkId()) void applySpeaker(resolved, { notifyClient: false });
+        else if (!resolved && audioSink.getSinkId()) void audioSink.reset();
       },
     };
+  };
+
+  const teardownClient = async (target) => {
+    if (!target || tornDownClients.has(target)) return;
+    tornDownClients.add(target);
+    try { target.enableMic(false); } catch (error) { logDiag("connection", "enableMic(false) failed during teardown", { error: error?.message || String(error) }); }
+    try { await target.disconnect(); } catch (error) { logDiag("connection", "disconnect() failed during teardown", { error: error?.message || String(error) }); }
   };
 
   const connect = async () => {
     if (connectPromise) return connectPromise;
     logDiag("connection", "connect() starting");
     connectPromise = (async () => {
-    const callbackGeneration = ++generation;
-    activeGeneration = callbackGeneration;
-    connectionActive = true;
-    let connectionUrl = webrtcUrl;
-    if (!transportFactory && fetchImpl) {
-      try {
-        const response = await fetchImpl(sessionUrl);
-        if (!response.ok) throw new Error(`session discovery returned HTTP ${response.status}`);
-        const handshake = await response.json();
-        const base = documentRef?.baseURI || globalThis.location?.href || "http://localhost/";
-        const url = new URL(webrtcUrl, base);
-        for (const key of ["contract_version", "session_id", "resume_token", "proposed_epoch", "snapshot_sequence"]) {
-          if (handshake[key] !== undefined) url.searchParams.set(key, String(handshake[key]));
+      // A second connect() while connected tears the old client down
+      // instead of orphaning its RTCPeerConnection and mic capture.
+      if (connectionActive) await disconnect();
+      const callbackGeneration = ++generation;
+      activeGeneration = callbackGeneration;
+      connectionActive = true;
+      let connectionUrl = webrtcUrl;
+      if (!transportFactory && fetchImpl) {
+        try {
+          const response = await fetchImpl(sessionUrl);
+          if (!response.ok) throw new Error(`session discovery returned HTTP ${response.status}`);
+          const handshake = await response.json();
+          const base = documentRef?.baseURI || globalThis.location?.href || "http://localhost/";
+          const url = new URL(webrtcUrl, base);
+          for (const key of ["contract_version", "session_id", "resume_token", "proposed_epoch", "snapshot_sequence"]) {
+            if (handshake[key] !== undefined) url.searchParams.set(key, String(handshake[key]));
+          }
+          connectionUrl = url.toString();
+        } catch (error) {
+          report(`Session discovery failed: ${error?.message || error}`);
+          connectionActive = false;
+          update(disconnectedState(state));
+          return false;
         }
-        connectionUrl = url.toString();
+      }
+      const transportOptions = { webrtcRequestParams: { endpoint: connectionUrl } };
+      const transport = transportFactory
+        ? transportFactory(transportOptions)
+        : new SmallWebRTCTransport(transportOptions);
+      const callbacks = callbacksFor(callbackGeneration);
+      const nextClient = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: true });
+      client = nextClient;
+      try {
+        // Initialize devices inside this catch boundary so microphone permission
+        // failures are surfaced in the local diagnostics instead of leaving the
+        // client connection promise pending.
+        if (typeof client.initDevices === "function") await client.initDevices();
+        await client.connect();
+        if (callbackGeneration !== activeGeneration) {
+          // disconnect() landed mid-connect; the WeakSet makes this safe
+          // even when disconnect() already tore this same client down.
+          await teardownClient(nextClient);
+          if (client === nextClient) client = undefined;
+          return false;
+        }
+        logDiag("connection", "connect() succeeded");
+        update(withMicEnabled(withConnection(state, "connected"), Boolean(client.isMicEnabled)));
+        // Connect is a user gesture, so a previously-created audio element may play here.
+        audio.play().catch(() => report("Connected, but browser audio is blocked. Click Play audio to continue."));
+        return true;
       } catch (error) {
-        report(`Session discovery failed: ${error?.message || error}`);
+        report(`Connection failed: ${error?.message || error}`);
+        await teardownClient(nextClient);
+        if (client === nextClient) client = undefined;
         connectionActive = false;
-        update({ ...state, connection: "disconnected" });
+        update(disconnectedState(state));
         return false;
       }
-    }
-    const transportOptions = { webrtcRequestParams: { endpoint: connectionUrl } };
-    const transport = transportFactory
-      ? transportFactory(transportOptions)
-      : new SmallWebRTCTransport(transportOptions);
-    const callbacks = callbacksFor(callbackGeneration);
-    client = clientFactory ? clientFactory(transport, callbacks) : new PipecatClient({ transport, callbacks, enableMic: true });
-    try {
-      // Initialize devices inside this catch boundary so microphone permission
-      // failures are surfaced in the local diagnostics instead of leaving the
-      // client connection promise pending.
-      if (typeof client.initDevices === "function") await client.initDevices();
-      await client.connect();
-      if (callbackGeneration !== activeGeneration) return false;
-      logDiag("connection", "connect() succeeded");
-      update({ ...state, connection: "connected" });
-      setMicButton(Boolean(client.isMicEnabled));
-      // Connect is a user gesture, so a previously-created audio element may play here.
-      audio.play().catch(() => report("Connected, but browser audio is blocked. Click Play audio to continue."));
-      return true;
-    } catch (error) {
-      report(`Connection failed: ${error?.message || error}`);
-      connectionActive = false;
-      update({ ...state, connection: "disconnected" });
-      return false;
-    }
     })();
     try { return await connectPromise; } finally { connectPromise = null; }
   };
+
   const cleanupConnection = (callbackGeneration = activeGeneration) => {
     if (!connectionActive || callbackGeneration !== activeGeneration) return;
     activeGeneration = ++generation;
     connectionActive = false;
-    isConnected = false;
-    micSelect.disabled = true;
-    speakerSelect.disabled = true;
-    populateSelect(documentRef, micSelect, [], null);
-    populateSelect(documentRef, speakerSelect, [], null);
-    lastConfirmedSinkId = null;
-    client?.enableMic(false);
+    try { client?.enableMic(false); }
+    catch (error) { logDiag("connection", "enableMic(false) failed during cleanup", { error: error?.message || String(error) }); }
     audio.srcObject = null;
-    setMicButton(false);
-    micButton.disabled = true;
-    playButton.hidden = true;
-    setConnectToggleButton(false);
-    update({ ...state, connection: "disconnected" });
+    audioSink.reset().catch(() => {});
+    update(disconnectedState(state));
   };
+
   const disconnect = async () => {
     logDiag("connection", "disconnect() starting");
     cleanupConnection(activeGeneration);
-    await client?.disconnect();
+    await teardownClient(client);
   };
-  const selectMic = (deviceId) => { if (deviceId) { logDiag("mic", "switching mic device", { deviceId }); client?.updateMic(deviceId); } };
-  const selectSpeaker = async (deviceId) => {
+
+  const applySpeaker = async (deviceId, { notifyClient }) => {
     if (!deviceId) return;
     logDiag("speaker", "switching speaker device", { deviceId });
-    // The client's own speaker routing does not know about the <audio>
-    // element this app manages by hand (see attachTrack); the sink must be
-    // set explicitly for switching to actually change what plays.
-    if (supportsSinkId) {
-      try {
-        await audio.setSinkId(deviceId);
-        lastConfirmedSinkId = deviceId;
-        speakerSelect.value = deviceId;
-        client?.updateSpeaker(deviceId);
-        logDiag("speaker", "setSinkId succeeded", { deviceId });
-      } catch (error) {
-        speakerSelect.value = lastConfirmedSinkId || "";
-        report(`Failed to switch speaker: ${error?.message || error}`);
+    if (!audioSink.supportsSinkId) return;
+    const ok = await audioSink.setSink(deviceId);
+    if (ok) {
+      if (notifyClient) {
+        try { client?.updateSpeaker(deviceId); }
+        catch (error) { logDiag("speaker", "client.updateSpeaker threw", { error: error?.message || String(error) }); }
       }
+      update(withSelectedDevice(state, "speaker", deviceId));
+      logDiag("speaker", "setSinkId succeeded", { deviceId });
+    } else {
+      report(`Failed to switch speaker: device removed`);
     }
   };
+
+  const selectMic = (deviceId) => {
+    if (!deviceId) return;
+    logDiag("mic", "switching mic device", { deviceId });
+    client?.updateMic(deviceId);
+    update(withSelectedDevice(state, "mic", deviceId));
+  };
+
   const toggleMic = () => {
     if (!client) return;
     const enabled = !client.isMicEnabled;
     logDiag("mic", `toggling mic ${enabled ? "on" : "off"}`);
     client.enableMic(enabled);
-    setMicButton(enabled);
-    update({ ...state, localDiagnostics: { ...state.localDiagnostics, message: enabled ? "Microphone enabled." : "Microphone disabled." } });
+    const next = withMicEnabled(state, enabled);
+    update({ ...next, localDiagnostics: { ...next.localDiagnostics, message: enabled ? "Microphone enabled." : "Microphone disabled." } });
   };
 
   root.replaceChildren();
-  const header = documentRef.createElement("header");
-  header.className = "topbar";
-  header.append(el(documentRef, "h1", "Pipecat Subagents Lab"));
-  const connectToggleButton = iconButton(documentRef, ICONS.connect, "Connect");
-  const micButton = iconButton(documentRef, ICONS.micOff, "Mic: off");
-  const playButton = iconButton(documentRef, ICONS.play, "Play audio");
-  const micSelect = documentRef.createElement("select");
-  micSelect.setAttribute("aria-label", "Microphone");
-  micSelect.className = "icon-select icon-select-mic";
-  const speakerSelect = documentRef.createElement("select");
-  speakerSelect.setAttribute("aria-label", "Speaker");
-  speakerSelect.className = "icon-select icon-select-speaker";
-  const setMicButton = (enabled) => {
-    micButton.innerHTML = `<span class="btn-icon">${enabled ? ICONS.micOn : ICONS.micOff}</span><span class="btn-text">Mic: ${enabled ? "on" : "off"}</span>`;
-  };
-  let isConnected = false;
-  const setConnectToggleButton = (connectedState) => {
-    connectToggleButton.innerHTML = `<span class="btn-icon">${connectedState ? ICONS.disconnect : ICONS.connect}</span><span class="btn-text">${connectedState ? "Disconnect" : "Connect"}</span>`;
-  };
-  micButton.disabled = true; playButton.hidden = true;
-  micSelect.disabled = true; speakerSelect.disabled = true;
-  if (!supportsSinkId) {
-    speakerSelect.hidden = true;
-    speakerSelect.title = "This browser does not support switching audio output devices.";
-  }
-  connectToggleButton.onclick = async () => {
-    if (isConnected) {
-      await disconnect();
-      return;
-    }
-    if (!await connect()) return;
-    isConnected = true;
-    micButton.disabled = false; playButton.hidden = false;
-    micSelect.disabled = false; speakerSelect.disabled = false;
-    setConnectToggleButton(true);
-  };
-  micButton.onclick = toggleMic;
-  playButton.onclick = () => audio.play().catch(() => report("Playback is still blocked; check browser site permissions."));
-  micSelect.onchange = () => selectMic(micSelect.value);
-  speakerSelect.onchange = () => selectSpeaker(speakerSelect.value);
-  header.append(micSelect, speakerSelect, micButton, connectToggleButton, playButton);
-  root.append(header, content);
-  render(state, content);
+  root.append(controls.element, content);
+  update(state);
   return { connect, disconnect, toggleMic, getState: () => state, getClient: () => client, audio };
-}
-
-function el(documentRef, tag, text, className) {
-  const node = documentRef.createElement(tag);
-  node.textContent = text;
-  if (className) node.className = className;
-  return node;
-}
-
-function populateSelect(documentRef, select, devices, selectedDeviceId) {
-  if (!select) return;
-  const deviceList = devices || [];
-  select.replaceChildren(
-    ...deviceList.map((device, index) => {
-      const option = documentRef.createElement("option");
-      option.value = device.deviceId;
-      option.textContent = device.label || `Device ${index + 1}`;
-      return option;
-    }),
-  );
-  if (selectedDeviceId && deviceList.some((device) => device.deviceId === selectedDeviceId)) {
-    select.value = selectedDeviceId;
-  }
 }
 
 if (typeof document !== "undefined") createApp();

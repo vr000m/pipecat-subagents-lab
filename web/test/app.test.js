@@ -47,12 +47,12 @@ test("connection readiness sends RTVI ready before requesting a snapshot", async
 
   const connectToggleButton = root.children[0].children[4];
   await connectToggleButton.onclick();
-  expect(connectToggleButton.innerHTML).toContain("Connect");
+  expect(connectToggleButton.children[1].textContent).toBe("Connect");
   expect(messages).toEqual([]);
 
   shouldFail = false;
   await connectToggleButton.onclick();
-  expect(connectToggleButton.innerHTML).toContain("Disconnect");
+  expect(connectToggleButton.children[1].textContent).toBe("Disconnect");
   expect(messages).toEqual([{ type: "client-ready" }, "snapshot-request"]);
   expect(transportOptions).toEqual({ webrtcRequestParams: { endpoint: "/api/rtc" } });
 });
@@ -255,7 +255,7 @@ test("transport onDisconnected performs full cleanup and invalidates its callbac
 
   callbacks.onDisconnected();
 
-  expect(connectToggleButton.innerHTML).toContain("Connect");
+  expect(connectToggleButton.children[1].textContent).toBe("Connect");
   expect(micSelect.disabled).toBe(true);
   expect(speakerSelect.disabled).toBe(true);
   expect(micSelect.children).toEqual([]);

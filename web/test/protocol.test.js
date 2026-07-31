@@ -31,7 +31,7 @@ test("browser entrypoint requests microphone capture on explicit connect", () =>
   expect(appSource).not.toContain("createMicrophoneManager");
   expect(appSource).toContain("if (typeof client.initDevices === \"function\") await client.initDevices();");
   expect(appSource).toContain("client?.enableMic(false)");
-  expect(appSource).toContain("await client?.disconnect()");
+  expect(appSource).toContain("await target.disconnect()");
 });
 
 test("browser entrypoint owns remote audio and handles track lifecycle", () => {
@@ -46,7 +46,7 @@ test("browser entrypoint owns remote audio and handles track lifecycle", () => {
 test("entrypoint requests a snapshot only after Pipecat reports bot readiness", () => {
   expect(appSource).toContain('onConnected: () => { logDiag("connection", "onConnected"); if (current()) update');
   expect(appSource).toContain('onBotReady: () => { logDiag("connection", "onBotReady"); requestSnapshot(); }');
-  expect(appSource).toContain("if (!await connect()) return;");
+  expect(appSource).toContain('state.connection === "connected" ? disconnect() : connect()');
 });
 
 test("browser transcript is projected only from server-authored runtime messages", () => {

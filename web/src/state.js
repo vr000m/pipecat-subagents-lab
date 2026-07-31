@@ -23,6 +23,73 @@ export function createInitialState() {
     lastAppliedSequence: 0,
     serverState: false,
     connectionEpoch: null,
+    // Device/toolbar UI state. `devices.speakerSupported` is a capability
+    // flag the app seeds once at startup from the audio sink; everything
+    // else here is driven by the withDeviceList/withSelectedDevice reducers.
+    devices: {
+      mics: [],
+      speakers: [],
+      selectedMicId: null,
+      selectedSpeakerId: null,
+      speakerSupported: true,
+    },
+    micEnabled: false,
+  };
+}
+
+// `connectionActive` and `generation`/`activeGeneration` (owned by app.js)
+// are deliberately NOT part of this state shape: they are internal,
+// synchronous session-lifecycle guards that decide which client callbacks
+// are still live, not render-facing truth. `state.connection` is the only
+// connection value the UI renders from.
+const DEVICE_SLOTS = {
+  mic: { list: "mics", selected: "selectedMicId" },
+  speaker: { list: "speakers", selected: "selectedSpeakerId" },
+};
+
+export function withConnection(state, connection) {
+  return { ...state, connection };
+}
+
+export function withMicEnabled(state, enabled) {
+  return { ...state, micEnabled: Boolean(enabled) };
+}
+
+export function withDeviceList(state, slot, devices, preferredId = null) {
+  const { list, selected } = DEVICE_SLOTS[slot];
+  const normalized = (Array.isArray(devices) ? devices : [])
+    .filter((device) => device && device.deviceId)
+    .map((device) => ({ deviceId: device.deviceId, label: device.label || "" }));
+  const currentSelected = state.devices[selected];
+  let resolvedId = null;
+  if (preferredId && normalized.some((device) => device.deviceId === preferredId)) {
+    resolvedId = preferredId;
+  } else if (currentSelected && normalized.some((device) => device.deviceId === currentSelected)) {
+    resolvedId = currentSelected;
+  }
+  return {
+    ...state,
+    devices: { ...state.devices, [list]: normalized, [selected]: resolvedId },
+  };
+}
+
+export function withSelectedDevice(state, slot, deviceId) {
+  const { selected } = DEVICE_SLOTS[slot];
+  return { ...state, devices: { ...state.devices, [selected]: deviceId ?? null } };
+}
+
+export function disconnectedState(state) {
+  return {
+    ...state,
+    connection: "disconnected",
+    micEnabled: false,
+    devices: {
+      ...state.devices,
+      mics: [],
+      speakers: [],
+      selectedMicId: null,
+      selectedSpeakerId: null,
+    },
   };
 }
 
@@ -165,6 +232,8 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
       state = {
         ...createInitialState(),
         connection: state.connection,
+        devices: state.devices,
+        micEnabled: state.micEnabled,
         localDiagnostics: {
           ...EMPTY_DIAGNOSTICS,
           gaps: state.localDiagnostics.gaps,
