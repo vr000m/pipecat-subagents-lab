@@ -264,9 +264,13 @@ cd web && bun run build && cd ..
 uv run python -m server.app
 ```
 
-Open <http://127.0.0.1:7860/> and use Connect. The browser requests microphone
-permission as part of that explicit user action; the Mic button then mutes or
-unmutes the active track. The browser obtains its session identity from
+Open <http://127.0.0.1:7860/> and use the toolbar's connect/disconnect toggle
+button. The browser requests microphone permission as part of that explicit
+user action; the Mic button then mutes or unmutes the active track. Once
+connected, the microphone and speaker dropdowns populate with the available
+devices and can be used to switch input/output routing mid-session; the
+speaker dropdown is hidden entirely in browsers that don't support
+`HTMLMediaElement.setSinkId()`. The browser obtains its session identity from
 `/api/session` and posts Small WebRTC offers to `/api/rtc`. Daily transport is
 not part of this
 local path; if the lab is deployed to a cloud runtime later, add Daily as a
@@ -284,12 +288,19 @@ does not call paid APIs or require live STT/TTS services.
 
 Start the application host and the browser client using the local
 Pipecat/Small WebRTC server configuration for the checkout. Connect only after
-the page is open; the Connect action is the microphone permission boundary. When
-separately configured
+the page is open; the connect toggle is the microphone permission boundary.
+The mic/speaker selectors and Mic button stay disabled until connected, and
+disconnecting (explicitly, or via a transport-driven drop) must disable and
+clear them again. When separately configured
 STT/TTS services are running, confirm a final transcript, local TTS synthesis,
 and audible browser output. Disconnecting must disable capture. If autoplay is
 blocked, use the page's audio action and record that diagnostic as local browser
-state.
+state. To verify device switching, pick a different entry from the mic or
+speaker dropdown mid-session and confirm the browser's console log shows a
+`[speaker] setSinkId succeeded` or `[mic] switching mic device` diagnostic; a
+rejected speaker switch (e.g. the device was removed) logs `Failed to switch
+speaker` and the dropdown reverts to the last device that was actually
+routed.
 
 For live STT, `Track audio received` proves only WebRTC negotiation. A complete
 utterance should also produce `VADProcessor: User started speaking`,
@@ -328,6 +339,13 @@ Pipecat logs are the authoritative diagnostic record. Browser state is a
 versioned product/debug projection and intentionally excludes raw logs, full
 prompts, and private worker context. Source links are normalized to absolute
 HTTP(S) URLs and open with `target="_blank" rel="noopener noreferrer"`.
+
+The browser client also writes structured diagnostics to the browser console,
+one line per connection/track/device event:
+`[HH:MM:SS.mmm][component] message [data]`, e.g.
+`[14:02:11.483][speaker] setSinkId succeeded { deviceId: "..." }`. This is a
+local, ephemeral debug aid only — Pipecat server logs remain the record of
+truth for anything that needs to be reported.
 
 The paid OpenAI web-search smoke test and the local STT/TTS/Small WebRTC media
 acceptance are environment-dependent. Report them separately from the
