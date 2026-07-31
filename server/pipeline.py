@@ -44,6 +44,7 @@ from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
 from .speech_lifecycle import (
+    CONNECTION_LOCAL_FRAMES,
     DeliveryDisposition,
     EventLoopTimerScheduler,
     GenerationIdentity,
@@ -116,21 +117,10 @@ def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
     if getattr(BusBridgeProcessor, "framework_fallback", False):
         return _FallbackBridge()
     excluded = kwargs.pop("exclude_frames", ())
-    # SpeechGenerationMarkerFrame/SpeechGenerationFlushAckFrame are private,
-    # connection-local lifecycle bookkeeping consumed by
-    # TransportSpeechLifecycleProcessor further down this same pipeline; the
-    # bus bridge must not divert them to other workers or the marker never
-    # reaches its consumer, leaving every TTS audio frame unbound and dropped.
-    kwargs["exclude_frames"] = tuple(
-        dict.fromkeys(
-            (
-                TTSSpeakFrame,
-                SpeechGenerationMarkerFrame,
-                SpeechGenerationFlushAckFrame,
-                *excluded,
-            )
-        )
-    )
+    # The authoritative set of connection-local frame types lives in
+    # CONNECTION_LOCAL_FRAMES (server/speech_lifecycle.py); extend it there,
+    # not here.
+    kwargs["exclude_frames"] = tuple(dict.fromkeys((*CONNECTION_LOCAL_FRAMES, *excluded)))
     return BusBridgeProcessor(bus=bus, worker_name=worker_name, **kwargs)
 
 

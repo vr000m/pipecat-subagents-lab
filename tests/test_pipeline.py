@@ -9,6 +9,7 @@ from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnal
 from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
 from pipecat.frames.frames import (
     InterruptionFrame,
+    SystemFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
@@ -22,12 +23,18 @@ from pipecat.turns.user_turn_processor import UserTurnProcessor
 
 import server.app as app_module
 import server.pipeline as pipeline_module
+import server.speech_lifecycle
 from server.config import Config
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
 from server.registry import UnsupportedWorkerType
 from server.services.tts import CorrelatedTTSSpeakFrame
+from server.speech_lifecycle import (
+    CONNECTION_LOCAL_FRAMES,
+    SpeechGenerationFlushAckFrame,
+    SpeechGenerationMarkerFrame,
+)
 from server.speech_scheduler import ROLE_RESULT, ROLE_TIMEOUT_NOTICE
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.work_item_coordinator import LateResult, WorkItemCoordinator
@@ -558,7 +565,6 @@ def test_speak_request_emits_a_generation_marker_immediately_before_the_tts_spea
     if server/pipeline.py names the marker frame differently, reconcile the
     import/name here rather than dropping the ordering assertion.
     """
-    from server.speech_lifecycle import SpeechGenerationMarkerFrame
 
     async def run() -> None:
         tts = FakeTTS()
@@ -1225,7 +1231,6 @@ def test_router_provider_failure_becomes_a_safe_canonical_result() -> None:
 
 
 def test_cancel_control_interrupts_active_speech() -> None:
-    from server.speech_lifecycle import SpeechGenerationMarkerFrame
 
     async def run() -> None:
         class ControlCoordinator:
@@ -1279,7 +1284,6 @@ def test_cancel_control_interrupts_active_speech() -> None:
 
 
 def test_pause_control_stops_active_speech_before_confirmation() -> None:
-    from server.speech_lifecycle import SpeechGenerationMarkerFrame
 
     async def run() -> None:
         class ControlCoordinator:
@@ -2270,6 +2274,13 @@ def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
 
 
 def test_framework_bridge_keeps_speech_on_connection_pipeline() -> None:
+    factories = {
+        TTSSpeakFrame: lambda: TTSSpeakFrame(text="hello", append_to_context=False),
+        SpeechGenerationMarkerFrame: lambda: SpeechGenerationMarkerFrame(token="t"),
+        SpeechGenerationFlushAckFrame: lambda: SpeechGenerationFlushAckFrame(token="t"),
+    }
+    assert set(CONNECTION_LOCAL_FRAMES) == set(factories)
+
     class RecordingBus:
         def __init__(self) -> None:
             self.messages: list[object] = []
@@ -2286,14 +2297,26 @@ def test_framework_bridge_keeps_speech_on_connection_pipeline() -> None:
             forwarded.append(frame)
 
         bridge.push_frame = push  # type: ignore[method-assign]
-        tts_frame = TTSSpeakFrame(text="hello", append_to_context=False)
 
-        await bridge.process_frame(tts_frame, FrameDirection.DOWNSTREAM)
+        constructed = [factories[frame_type]() for frame_type in CONNECTION_LOCAL_FRAMES]
+        for frame in constructed:
+            await bridge.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-        assert forwarded == [tts_frame]
+        assert forwarded == constructed
         assert bus.messages == []
 
     asyncio.run(run())
+
+
+def test_connection_local_frames_covers_every_private_speech_frame() -> None:
+    private_speech_frames = {
+        obj
+        for obj in vars(server.speech_lifecycle).values()
+        if isinstance(obj, type)
+        and issubclass(obj, SystemFrame)
+        and obj.__module__ == "server.speech_lifecycle"
+    }
+    assert private_speech_frames <= set(CONNECTION_LOCAL_FRAMES)
 
 
 def test_final_turn_transcript_waits_for_smart_turn_stop() -> None:

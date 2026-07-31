@@ -29,7 +29,7 @@ from enum import Enum
 from typing import Any, Protocol
 from uuid import uuid4
 
-from pipecat.frames.frames import SystemFrame
+from pipecat.frames.frames import Frame, SystemFrame, TTSSpeakFrame
 
 
 class GenerationPhase(str, Enum):
@@ -110,6 +110,26 @@ class SpeechGenerationFlushAckFrame(SystemFrame):
     """
 
     token: str = ""
+
+
+CONNECTION_LOCAL_FRAMES: tuple[type[Frame], ...] = (
+    TTSSpeakFrame,
+    SpeechGenerationMarkerFrame,
+    SpeechGenerationFlushAckFrame,
+)
+"""Frame types that must never cross WorkerBus.
+
+BusBridgeProcessor forwards a frame downstream locally only if it is a
+lifecycle frame, an OutputTransportMessageUrgentFrame, or explicitly listed
+in exclude_frames; every other frame type is diverted to the bus and never
+reaches the rest of the connection pipeline. A connection-local frame
+omitted from this tuple is silently dropped from the local pipeline with no
+error or log (see docs/architecture.md, "Bus bridge frame exclusions").
+
+Any new frame type consumed by TransportSpeechLifecycleProcessor or
+GenericProviderErrorObserver (both defined below) must be added here at the
+moment it is defined.
+"""
 
 
 class Clock(Protocol):

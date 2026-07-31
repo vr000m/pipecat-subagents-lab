@@ -24,17 +24,22 @@ are dispatched directly by `WorkItemCoordinator`; the connection
 
 ### Bus bridge frame exclusions
 
-`framework_bridge()` (`server/pipeline.py`) excludes frame types that must
-stay on the local connection pipeline instead of crossing `WorkerBus`.
-`BusBridgeProcessor.process_frame` (Pipecat) forwards a frame downstream
-locally only if it is a lifecycle frame
+`CONNECTION_LOCAL_FRAMES` (`server/speech_lifecycle.py`) is the single
+declaration site for frame types that must stay on the local connection
+pipeline instead of crossing `WorkerBus`; `framework_bridge()`
+(`server/pipeline.py`) is its sole consumer, feeding it into
+`exclude_frames`. `BusBridgeProcessor.process_frame` (Pipecat) forwards a
+frame downstream locally only if it is a lifecycle frame
 (`StartFrame`/`EndFrame`/`CancelFrame`/`StopFrame`), an
 `OutputTransportMessageUrgentFrame`, or explicitly listed in
 `exclude_frames`; every other frame type is diverted to the bus and never
 reaches the rest of the connection pipeline unless another worker echoes it
 back. Any new connection-local frame type introduced downstream of the
-bridge — not just `TTSSpeakFrame` — must be added to this list, or it is
-silently dropped from the local pipeline with no error.
+bridge — not just `TTSSpeakFrame` — must be added to `CONNECTION_LOCAL_FRAMES`
+at its definition site, or it is silently dropped from the local pipeline
+with no error. `test_framework_bridge_keeps_speech_on_connection_pipeline`
+and `test_connection_local_frames_covers_every_private_speech_frame`
+(`tests/test_pipeline.py`) enforce this.
 
 This was missed once in practice: `SpeechGenerationMarkerFrame` and
 `SpeechGenerationFlushAckFrame` (introduced 2026-07-30, `6124040`) were never
