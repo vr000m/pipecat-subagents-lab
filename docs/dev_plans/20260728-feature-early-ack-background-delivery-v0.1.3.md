@@ -4,7 +4,7 @@
 **Component**: Pipecat subagents
 **Assigned to**: Unassigned
 **Priority**: High
-**Branch**: feature/early-ack-background-delivery-v0.1.3 (create after `feature/latency-observability-v0.1.2` merges to `main`)
+**Branch**: feature/early-ack-background-delivery-v0.1.3 (create after PR #3 and PR #4 merge to `main`)
 **Created**: 2026-07-28
 **Review Gates**: full
 
@@ -16,9 +16,9 @@ Ship a deterministic, sub-timeout acknowledgement the moment routing confirms a 
 
 v0.1.1 shipped the core background-delivery mechanism: late results are retained, committed exactly once, and queued for same-epoch speech (`CHANGELOG.md:23-25`). It did not change when the user first hears anything — the current acknowledgement is still gated on the 15-second `foreground_search_timeout_seconds` in `server/pipeline.py:678-691`, so a user gets silence until either the search finishes or the foreground timeout fires a fixed "taking longer than expected" utterance (`server/pipeline.py:695-699`).
 
-v0.1.2 (`feature/latency-observability-v0.1.2`, currently an **unmerged worktree** at `/Users/vr000m/Code/pipecat-ai/pipecat-subagents-lab-latency-observability`) is adding a performance-log contract and Pipecat observers (`server/perf_metrics.py`) to measure where turn time actually goes — routing vs. search vs. delivery. This plan is the next release and depends on that data and on the merge landing first, because it touches the same files (`server/pipeline.py` most heavily) and current line numbers will shift once 0.1.2 lands. The worktree commit is intentionally not pinned here; Phase 0 verifies the live ref before implementation.
+v0.1.2 is merged to `main` at PR #3 (`2951dd3`) and provides the performance-log contract and Pipecat observers (`server/perf_metrics.py`) needed to measure routing vs. search vs. delivery. PR #4 (`2dfe06c`, merged through `2a73a71`) adds the transport-aware speech lifecycle that now governs scheduler admission, timeout-notice supersession, and connection teardown. This plan depends on both release boundaries because it touches the same files (`server/pipeline.py` and `server/speech_scheduler.py` most heavily); Phase 0 verifies their live ancestry and re-reads all line references before implementation.
 
-Transport-aware speech ownership is specified separately in `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md`. That release-neutral precursor must be reviewed and its scheduler/transport invariant implemented before this plan's Phase 2 relies on queued timeout-notice supersession; queue-only discard is not sufficient once synthesized audio has entered the output transport.
+Transport-aware speech ownership is specified separately in `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md`. That release-neutral precursor is now reviewed and merged; v0.1.3 must preserve its scheduler/transport invariant from Phase 1 onward. Queue-only discard is not sufficient once synthesized audio has entered the output transport.
 
 This plan operationalizes four prior recommendations, in priority order: early acknowledgement (P0), background-delivery policy tuning (P1), progressive RTVI status (P1/P2), and query-context narrowing as a measured experiment (P2), gated on 0.1.2's data rather than assumed.
 
@@ -28,11 +28,11 @@ This plan operationalizes four prior recommendations, in priority order: early a
 - Background-delivery policy changes must preserve the existing invariants from 0.1.1: `SessionHost`/`SessionState` own idempotent late-result commit, epoch gating remains authoritative (`server/pipeline.py:1077,1086,1100-1101`), and the coordinator remains responsible for task ownership/cancellation (`server/work_item_coordinator.py:251,624`).
 - New RTVI status states must be truthful (reflect actual pipeline state, not simulated progress), have an explicit wire contract and legal transition rules, survive or deliberately reset across reconnect snapshots, and must not introduce word-level progress — `shared/protocol.md:79` explicitly reserves that for a future Phase-3 extension.
 - Query-context narrowing (`server/workers/web_search.py:332-341`, `history[-4:]`) is not to be implemented speculatively — it requires a dated data-collection artifact with query/context dimensions, provider/model controls, and a defined latency/quality comparison. No change is a valid result.
-- This plan does not start implementation until `feature/latency-observability-v0.1.2` has merged to `main`; Files-to-Modify line numbers below must be re-verified against post-merge `main` before Phase 1 begins.
+- This plan does not start implementation until PR #3 (`2951dd3`) and the PR #4 merge (`2a73a71`) are ancestors of `main`; Files-to-Modify line numbers below must be re-verified against that merged state before Phase 1 begins.
 
 ## Architecture & Call Flow
 
-This plan touches 3 independently-executing components: the browser RTVI client, the server pipeline (router + turn orchestration), and the web-search worker (coordinated via `work_item_coordinator`).
+This plan touches 4 independently-executing components: the browser RTVI client, the server pipeline (router + turn orchestration), the web-search worker (coordinated via `WorkItemCoordinator`), and the connection-scoped speech/transport lifecycle.
 
 ```mermaid
 graph LR
@@ -41,6 +41,9 @@ graph LR
     Pipeline -->|dispatch search| Worker["Web Search Worker\n(web_search.py)"]
     Worker -->|retain_late_task on timeout| Coordinator["Work Item Coordinator"]
     Coordinator -->|on_complete callback| Pipeline
+    Pipeline -->|enqueue speech| Speech["SpeechScheduler"]
+    Speech -->|admit one generation| Lifecycle["SpeechLifecycleCoordinator"]
+    Lifecycle -->|markers + lifecycle frames| Transport["TTS + output transport"]
     Pipeline -->|status + result frames| Browser
 ```
 
@@ -52,6 +55,9 @@ sequenceDiagram
     participant R as Router
     participant W as Web Search Worker
     participant C as Work Item Coordinator
+    participant S as SpeechScheduler
+    participant L as SpeechLifecycleCoordinator
+    participant O as TTS/output transport
 
     U->>B: utterance
     B->>P: audio/transcript
@@ -64,9 +70,12 @@ sequenceDiagram
         P->>B: result_ready + spoken result
     else foreground timeout exceeded
         P->>C: retain_late_task(work_item_id, origin_epoch)
-        P->>B: status "background" (existing 0.1.1 utterance)
+        P->>B: status "background" (no second spoken timeout notice)
         W-->>C: late result on_complete
         C->>P: commit_late_result (epoch-gated, exactly once)
+        P->>S: enqueue final result / replace queued same-work timeout notice
+        S->>L: admit only if connection-scoped transport slot is free
+        L->>O: marker, TTS, and transport lifecycle
         P->>B: result_ready (autoplay or display-only per tuned policy)
     end
 ```
@@ -79,20 +88,20 @@ sequenceDiagram
 | Commit late result | Worker completes after timeout | late result payload | delivered exactly once, then cleared | may land in a later turn; epoch-gated |
 | Progressive status frames | Each state transition (routing/searching/background/result_ready) | RTVI status kind | ephemeral, replaces prior status | same turn per frame |
 
-The early acknowledgement is a logical delegation-confirmed operation shared by all delegated paths. It schedules an ephemeral item through the connection's `SpeechScheduler`; it never enters canonical result state. Status messages are server-authored and flow through the existing session-state/observer boundary as the strict `work_status` contract described below.
+The early acknowledgement is a logical delegation-confirmed operation shared by all delegated paths. It schedules an ephemeral item through the connection's `SpeechScheduler`; it never enters canonical result state. Status messages are server-authored and flow through the existing session-state/observer boundary as the strict `work_status` contract described below. Speech admission and transport completion remain owned by the merged connection-scoped `SpeechLifecycleCoordinator`; v0.1.3 must reuse that boundary rather than create parallel lifecycle state.
 
 ## Implementation Checklist
 
 ### Phase 0: Prerequisite — merge gate and re-verification
 **Impl files:** none (verification only)
-**Test files:** none
-**Test command:** `git -C /Users/vr000m/Code/pipecat-ai/pipecat-subagents-lab merge-base --is-ancestor feature/latency-observability-v0.1.2 main`
-**Goal:** Confirm 0.1.2 has merged to `main` before any 0.1.3 code changes begin; re-verify all Files-to-Modify line numbers below against post-merge `main`.
+**Test files:** `tests/test_speech_lifecycle.py`, `tests/test_pipeline.py`, `tests/test_speech_scheduler.py`, `tests/test_app.py`, `tests/test_config.py`
+**Test command:** `git merge-base --is-ancestor 2951dd3 main && git merge-base --is-ancestor 2a73a71 main && uv run pytest tests/test_speech_lifecycle.py tests/test_pipeline.py tests/test_speech_scheduler.py tests/test_app.py tests/test_config.py -v`
+**Goal:** Confirm both merged release boundaries and the transport-aware lifecycle contract before any 0.1.3 code changes begin; re-verify all Files-to-Modify line numbers against post-merge `main`.
 
-- Confirm `feature/latency-observability-v0.1.2` is merged (or explicitly re-scope this plan to branch from the worktree if the user wants to proceed in parallel).
-- Confirm `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md` has passed `/review-plan` and its transport-aware lease invariant is implemented and validated before Phase 2 begins. It may land independently without a version bump or release.
+- Confirm PR #3 (`2951dd3`) and the PR #4 merge (`2a73a71`, containing the transport lifecycle fixes through `2dfe06c`) are ancestors of `main`; do not begin Phase 1 against a branch that lacks either boundary.
+- Re-run the transport precursor's focused lifecycle, app-wiring, configuration, pipeline, and scheduler tests. The gate must cover marker-before-TTS ordering, synthesis-end non-terminal behavior, stale-frame suppression, provider-error attribution, queued-vs-admitted notice behavior, and teardown completion before next admission.
 - Re-run `rg -n "foreground_search_timeout_seconds|retain_late_task|history\[-4:\]" server/` against post-merge `main` and update line refs in this plan's Technical Specifications.
-- Capture a dated post-merge `PERF_METRIC` sample covering direct, delegated-complete, retained-late, cancellation, reconnect, and same-epoch newer-turn scenarios. Record the sample and command in `docs/benchmarks/`; do not treat the historical pre-0.1.2 benchmark as policy evidence.
+- Capture a dated post-merge, post-transport-precursor `PERF_METRIC` sample covering direct, delegated-complete, retained-late, cancellation, reconnect, and same-epoch newer-turn scenarios. Record the sample and command in `docs/benchmarks/`; preserve any pre-precursor sample only as a baseline, not policy evidence.
 - Verify whether 0.1.2 emits safe `query_chars`, `context_chars`, and provider/model dimensions. If not, Phase 4 remains blocked until its instrumentation and data-collection subphase lands.
 
 ### Phase 1: Early acknowledgement (P0)
@@ -104,18 +113,21 @@ The early acknowledgement is a logical delegation-confirmed operation shared by 
 - Add a shared delegation-confirmed operation with semantic-turn/work-item identity and invoke it from direct, pending-dialogue, and multi-intent delegated paths (the latter currently branch at `_handle_pending`/`_handle_multi_intent`). Define one ephemeral ack per semantic turn, including mixed multi-intent turns.
 - Schedule the ack through `SpeechScheduler` with a distinct ephemeral correlation ID. It must be interruptible, must not create canonical result/transcript/history state, and must be dropped if the real result is ready before the ack starts.
 - Add a test matrix for exactly-once delegated acknowledgement, no acknowledgement for direct/unsupported/clarification/rejected routes, no false result claim, interruption, cancellation, reconnect, and result-ready-before-ack.
+- Preserve the merged control-ack lifecycle: pause/cancel/stop disposition is recorded before interruption, control acknowledgements cannot reuse the interrupted transport generation, and resume/next speech waits for the stop or teardown barrier. Cover applied and unknown-target control requests.
 - If 0.1.2 data (from Phase 0) shows routing itself is a significant latency contributor, add a cheap pre-routing "working" state or fast classification path — scope this sub-task only if the data supports it.
-- Define whether the existing timeout-fired "taking longer than expected" utterance (`server/pipeline.py:695-699`) remains a second spoken update or becomes status-only after an early ack; test the chosen no-duplicate behavior.
+- After a delegated early acknowledgement, make the foreground timeout status-only: retain the work item and emit `background`, but do not create or speak a second canonical timeout result or transcript/history entry. Test the no-duplicate behavior when the early ack is queued, active, or already complete. The merged PR's queued timeout-notice supersession remains required for legacy/pre-ack notice paths and must not interrupt an already-admitted notice.
 
 ### Phase 2: Background-delivery policy tuning (P1)
-**Impl files:** `server/pipeline.py`, `server/work_item_coordinator.py` (only if immutable late-delivery metadata must cross its callback boundary)
-**Test files:** `tests/test_pipeline.py`, `tests/test_work_item_coordinator.py`, `tests/test_speech_scheduler.py`
-**Test command:** `uv run pytest tests/test_pipeline.py tests/test_work_item_coordinator.py -v`
+**Impl files:** `server/pipeline.py`, `server/speech_scheduler.py`, `server/speech_lifecycle.py`, `server/app.py`, `server/config.py`, `server/work_item_coordinator.py` (only if immutable late-delivery metadata must cross its callback boundary; do not change its task-ownership contract)
+**Test files:** `tests/test_pipeline.py`, `tests/test_work_item_coordinator.py`, `tests/test_speech_scheduler.py`, `tests/test_speech_lifecycle.py`, `tests/test_app.py`, `tests/test_config.py`
+**Test command:** `uv run pytest tests/test_pipeline.py tests/test_work_item_coordinator.py tests/test_speech_scheduler.py tests/test_speech_lifecycle.py tests/test_app.py tests/test_config.py -v`
 **Goal:** Tune autoplay-vs-display-only policy for late results using 0.1.2 benchmark data, without breaking the existing exactly-once/epoch-gated commit invariant.
 
 - Add an immutable delivery context carrying semantic turn, work item, origin epoch, acknowledgement timestamp/sequence, and the latest accepted same-epoch turn sequence. The policy evaluator runs after idempotent commit and before speech scheduling.
+- Reuse the merged ownership boundary: `SpeechLifecycleCoordinator` owns admitted generations, one transport slot per connection-scoped output lane, timers, tombstones, teardown barriers, and exactly-once speech terminalization; `SpeechScheduler` owns only per-work queues/selection; `WorkItemCoordinator` owns retained-task cancellation/completion callbacks; `SessionHost`/`SessionState` own canonical result commit and autoplay/display-only policy.
+- Preserve the transport invariants: synthesis/TTS end is non-terminal; only normal transport stop or completed output teardown releases the lane; stale marker/context frames cannot bind to a replacement generation; reconnect creates a fresh lane and old-lane speech cannot be admitted.
 - Apply the accepted deterministic policy: commit every valid late result exactly once; autoplay only when the originating epoch is active, no newer semantic turn has been accepted, the work is not cancelled, and the user has not explicitly paused or stopped output. Otherwise commit the result display-only. Do not introduce an arbitrary elapsed-time threshold in v0.1.3.
-- Consume the reviewed transport-aware invariant from `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md`: supersede a timeout notice when its retained final result becomes ready while the notice is still work-queued behind a transport-active generation. Do not interrupt a notice that occupies the global transport slot, and do not discard any other work item's queued speech.
+- Consume the reviewed transport-aware invariant from `docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md`: supersede a timeout notice when its retained final result becomes ready while the notice is still work-queued behind a transport-active generation. Do not interrupt a notice that occupies the connection-scoped transport slot, and do not discard any other work item's queued speech.
 - Verify cancellation, reconnect (`interrupted_by_reconnect` in `shared/protocol.md`), and newer-turn arrival correctly suppress or supersede pending late-result delivery — extend existing epoch checks (`server/pipeline.py:1077,1086,1100-1101`) rather than introducing a parallel fencing mechanism.
 - Keep commit ownership in `SessionHost`/`SessionState`; the coordinator only owns task retention/cancellation and callback delivery. Assert exactly-once commit separately from autoplay/display-only disposition.
 
@@ -147,6 +159,8 @@ The early acknowledgement is a logical delegation-confirmed operation shared by 
 ### Files to Modify
 - `server/pipeline.py` — shared delegation-confirmed ack, late-result policy, delivery metadata, and status emission points. All current line references are pre-0.1.2 and **must be re-verified post-merge (Phase 0).**
 - `server/speech_scheduler.py` — ephemeral acknowledgement scheduling, interruption, drop-if-result-ready, and non-canonical delivery identity.
+- `server/speech_lifecycle.py` — merged prerequisite owning speech-generation admission, transport slot, timers, tombstones, teardown barriers, and terminalization; preserve this ownership in Phase 1/2.
+- `server/app.py`, `server/config.py` — merged lifecycle wiring and `speech_start_timeout_seconds`/`speech_transport_grace_seconds` configuration; compatibility surfaces, not parallel policy owners.
 - `server/work_item_coordinator.py` — only if immutable late-delivery metadata must cross its callback boundary; task ownership/cancellation remains its responsibility, not commit ownership.
 - `server/session_state.py`, `server/observers.py` — authoritative status projection and existing incremental RTVI emission boundary (Phase 3).
 - `server/contracts.py`, `server/rtvi_messages.py`, `shared/schemas/rtvi-message.json`, `shared/schemas/work-status.json`, `shared/schemas/runtime-snapshot.json` — strict `work_status` contract and snapshot projection (Phase 3).
@@ -160,7 +174,8 @@ The early acknowledgement is a logical delegation-confirmed operation shared by 
 - The shared delegation-confirmed operation is called by direct, pending-dialogue, and multi-intent paths. It creates one ephemeral ack per semantic turn and hands it to `SpeechScheduler`; it does not call canonical-result commit.
 - The ack and status paths share the semantic turn/work-item identity but have separate state machines: ack speech is ephemeral delivery, while status is server-authored runtime projection.
 - Late-result delivery policy runs after idempotent `SessionHost`/`SessionState` commit and before speech scheduling. It consumes immutable delivery context and existing epoch fencing; it does not make the coordinator the commit owner.
-- Phase 2 depends on the transport-aware scheduler precursor: per-work queues feed one global transport slot, synthesis end does not clear that slot, and final-result readiness can therefore replace a same-work-item timeout notice that remains work-queued behind the transport-active generation.
+- Phase 2 reuses the merged transport-aware boundary: per-work queues feed one `SpeechLifecycleCoordinator`-owned slot per connection-scoped output lane; synthesis end does not clear that slot; final-result readiness can replace only a same-work-item timeout notice that remains work-queued behind the transport-active generation.
+- A timeout notice already admitted to the transport is never interrupted by late-result readiness. Output teardown must complete before the old lane releases, and a fresh connection lane is the only place where replacement speech may be admitted after reconnect.
 - The accepted late-result policy is a delivery disposition only: use `commit_and_autoplay` when all active-epoch/newer-turn/cancellation/pause predicates hold; otherwise use `commit_display_only`. Both paths commit a valid result exactly once.
 - Status emission uses `SessionState._emit()` → `RuntimeObserver` → RTVI frame construction. The chosen payload/message kind must be updated in Python, JSON Schema, browser validation, reducer, snapshot, and tests as one contract change.
 - Phase 0 live samples precede any Phase 4 narrowing decision; the accepted Phase 2 policy has no elapsed-time threshold. Phase 4 may be marked "not promoted — data did not support it" with its analysis artifact.
@@ -168,6 +183,7 @@ The early acknowledgement is a logical delegation-confirmed operation shared by 
 ### Architecture Decisions
 
 - **Late-result delivery:** Always commit a valid late result exactly once. Autoplay only when the originating epoch is still active, no newer semantic turn has been accepted, the work is not cancelled, and the user has not explicitly paused or stopped output; otherwise deliver display-only.
+- **Foreground timeout after early ack:** The timeout is status-only. It retains the delegated work and emits truthful `background` status without creating or speaking a second canonical timeout result or transcript/history entry. Legacy/pre-ack timeout notices remain selectively supersedable while queued, but an admitted notice is never interrupted.
 - **Status wire contract:** Progressive state uses a strict `work_status` RTVI kind with `turn_id`, nullable `work_item_id`/`worker_id`, a state enum, per-entity `event_sequence`, and `origin_epoch`. Latest statuses appear in runtime snapshots. `result_ready` means the canonical result is committed and display-ready, not that speech has been queued, delivered, or heard.
 
 ## Testing Notes
@@ -182,6 +198,10 @@ _To be filled during implementation._
 
 - [ ] Early ack fires exactly once per delegated semantic turn across direct, pending, and multi-intent paths; it is ephemeral, interruptible, non-canonical, and tested against non-delegated routes, cancellation, reconnect, and result-ready-before-ack.
 - [ ] Background-delivery policy implements the accepted commit-and-autoplay/display-only matrix across newer turns, active speech, cancellation, reconnect, stale epoch, duplicate callback, and no-TTS; commit remains exactly once and epoch-gated.
+- [ ] Transport-aware delivery preserves ownership and lifecycle invariants: synthesis end does not release the connection-scoped slot; queued same-work timeout notices can be superseded; admitted notices are not interrupted; unrelated queues remain unchanged; and next speech waits for transport stop or completed teardown.
+- [ ] Ownership boundaries remain explicit and tested: `SessionHost`/`SessionState` commit canonical results, `WorkItemCoordinator` retains/cancels work, `SpeechScheduler` owns per-work queues, and `SpeechLifecycleCoordinator` owns generation/transport admission and terminalization.
+- [ ] After an early acknowledgement, the foreground timeout emits status-only `background` state and never creates a second spoken canonical timeout result; early-ack queued/active/completed races are covered.
+- [ ] Existing pause/cancel/stop/resume and unknown-target control acknowledgements preserve the transport lifecycle ordering: disposition precedes interruption, no old generation is reused, and replacement speech waits for stop or teardown.
 - [ ] The chosen RTVI status contract defines payload identity, producer, legal transitions, terminal meaning, snapshot/reconnect behavior, Python/JSON/browser validation, reducer behavior, and rendering tests; no word-level progress is introduced.
 - [ ] Contract/browser tests pass, with optional live local-media and paid-provider acceptance reported separately from credential-free tests.
 - [ ] Query-context narrowing is either implemented with reproducible latency and answer-quality evidence under provider/model controls, or explicitly marked "not promoted — data did not support it" with the analysis artifact.
