@@ -16,6 +16,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   audio.playsInline = true;
   audio.setAttribute("aria-label", "Assistant audio");
   documentRef.body.append(audio);
+  const supportsSinkId = typeof audio.setSinkId === "function";
 
   const content = documentRef.createElement("div");
   const update = (next) => { state = next; render(state, content); };
@@ -56,7 +57,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       onTrackStarted: attachTrack,
       onTrackStopped: detachTrack,
       onAvailableMicsUpdated: (mics) => { if (current()) populateSelect(documentRef, micSelect, mics, client?.selectedMic?.deviceId); },
-      onAvailableSpeakersUpdated: (speakers) => { if (current()) populateSelect(documentRef, speakerSelect, speakers, client?.selectedSpeaker?.deviceId); },
+      onAvailableSpeakersUpdated: (speakers) => { if (current() && supportsSinkId) populateSelect(documentRef, speakerSelect, speakers, client?.selectedSpeaker?.deviceId); },
     };
   };
 
@@ -97,7 +98,6 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
       await client.connect();
       update({ ...state, connection: "connected" });
       setMicButton(Boolean(client.isMicEnabled));
-      await refreshDeviceLists();
       // Connect is a user gesture, so a previously-created audio element may play here.
       audio.play().catch(() => report("Connected, but browser audio is blocked. Click Play audio to continue."));
       return true;
@@ -110,23 +110,16 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     try { return await connectPromise; } finally { connectPromise = null; }
   };
   const disconnect = async () => {
+    micSelect.disabled = true;
+    speakerSelect.disabled = true;
+    populateSelect(documentRef, micSelect, [], null);
+    populateSelect(documentRef, speakerSelect, [], null);
     activeGeneration = ++generation;
     client?.enableMic(false);
     await client?.disconnect();
     audio.srcObject = null;
     setMicButton(false);
-    populateSelect(documentRef, micSelect, [], null);
-    populateSelect(documentRef, speakerSelect, [], null);
     update({ ...state, connection: "disconnected" });
-  };
-  const refreshDeviceLists = async () => {
-    if (!client) return;
-    if (typeof client.getAllMics === "function") {
-      populateSelect(documentRef, micSelect, await client.getAllMics(), client.selectedMic?.deviceId);
-    }
-    if (typeof client.getAllSpeakers === "function" && typeof audio.setSinkId === "function") {
-      populateSelect(documentRef, speakerSelect, await client.getAllSpeakers(), client.selectedSpeaker?.deviceId);
-    }
   };
   const selectMic = (deviceId) => { if (deviceId) client?.updateMic(deviceId); };
   const selectSpeaker = async (deviceId) => {
@@ -135,7 +128,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
     // The client's own speaker routing does not know about the <audio>
     // element this app manages by hand (see attachTrack); the sink must be
     // set explicitly for switching to actually change what plays.
-    if (typeof audio.setSinkId === "function") {
+    if (supportsSinkId) {
       try {
         await audio.setSinkId(deviceId);
       } catch (error) {
@@ -166,7 +159,7 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   const setMicButton = (enabled) => { micButton.textContent = `Mic: ${enabled ? "on" : "off"}`; };
   disconnectButton.disabled = true; micButton.disabled = true; playButton.hidden = true;
   micSelect.disabled = true; speakerSelect.disabled = true;
-  if (typeof audio.setSinkId !== "function") {
+  if (!supportsSinkId) {
     speakerSelect.hidden = true;
     speakerSelect.title = "This browser does not support switching audio output devices.";
   }
@@ -178,7 +171,6 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
   disconnectButton.onclick = async () => {
     await disconnect();
     connectButton.disabled = false; disconnectButton.disabled = true; micButton.disabled = true;
-    micSelect.disabled = true; speakerSelect.disabled = true;
   };
   micButton.onclick = toggleMic;
   playButton.onclick = () => audio.play().catch(() => report("Playback is still blocked; check browser site permissions."));
@@ -199,15 +191,18 @@ function el(documentRef, tag, text, className) {
 
 function populateSelect(documentRef, select, devices, selectedDeviceId) {
   if (!select) return;
+  const deviceList = devices || [];
   select.replaceChildren(
-    ...(devices || []).map((device, index) => {
+    ...deviceList.map((device, index) => {
       const option = documentRef.createElement("option");
       option.value = device.deviceId;
       option.textContent = device.label || `Device ${index + 1}`;
       return option;
     }),
   );
-  if (selectedDeviceId) select.value = selectedDeviceId;
+  if (selectedDeviceId && deviceList.some((device) => device.deviceId === selectedDeviceId)) {
+    select.value = selectedDeviceId;
+  }
 }
 
 if (typeof document !== "undefined") createApp();

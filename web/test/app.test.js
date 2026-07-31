@@ -57,29 +57,31 @@ test("connection readiness sends RTVI ready before requesting a snapshot", async
   expect(transportOptions).toEqual({ webrtcRequestParams: { endpoint: "/api/rtc" } });
 });
 
-test("device selects populate on connect and route selection through the client and audio sink", async () => {
+test("device selects populate from onAvailableMicsUpdated/onAvailableSpeakersUpdated and route selection through the client and audio sink", async () => {
   const documentRef = fakeDocument({ audioSupportsSinkId: true });
   const root = new Element();
   const mics = [{ deviceId: "mic-1", label: "Built-in Mic" }, { deviceId: "mic-2", label: "USB Mic" }];
   const speakers = [{ deviceId: "spk-1", label: "Speakers" }, { deviceId: "spk-2", label: "Headphones" }];
   const updateMicCalls = [];
   const updateSpeakerCalls = [];
+  let callbacks;
   const app = createApp({
     root,
     documentRef,
     transportFactory: () => ({}),
-    clientFactory: () => ({
-      connect: async () => {},
-      disconnect: async () => {},
-      enableMic: () => {},
-      isMicEnabled: true,
-      getAllMics: async () => mics,
-      getAllSpeakers: async () => speakers,
-      selectedMic: mics[0],
-      selectedSpeaker: speakers[0],
-      updateMic: (id) => updateMicCalls.push(id),
-      updateSpeaker: (id) => updateSpeakerCalls.push(id),
-    }),
+    clientFactory: (_transport, nextCallbacks) => {
+      callbacks = nextCallbacks;
+      return {
+        connect: async () => {},
+        disconnect: async () => {},
+        enableMic: () => {},
+        isMicEnabled: true,
+        selectedMic: mics[0],
+        selectedSpeaker: speakers[0],
+        updateMic: (id) => updateMicCalls.push(id),
+        updateSpeaker: (id) => updateSpeakerCalls.push(id),
+      };
+    },
   });
 
   const header = root.children[0];
@@ -89,6 +91,10 @@ test("device selects populate on connect and route selection through the client 
 
   expect(micSelect.disabled).toBe(true);
   await connectButton.onclick();
+
+  // Simulate what client.initDevices()/connect() trigger internally.
+  callbacks.onAvailableMicsUpdated(mics);
+  callbacks.onAvailableSpeakersUpdated(speakers);
 
   expect(micSelect.children.map((option) => option.value)).toEqual(["mic-1", "mic-2"]);
   expect(speakerSelect.children.map((option) => option.value)).toEqual(["spk-1", "spk-2"]);
@@ -106,9 +112,85 @@ test("device selects populate on connect and route selection through the client 
   expect(app.audio.sinkId).toBe("spk-2");
 });
 
-test("speaker select is hidden when the browser cannot switch audio output devices", async () => {
+test("speaker select is hidden and never populated when the browser cannot switch audio output devices", async () => {
   const documentRef = fakeDocument({ audioSupportsSinkId: false });
   const root = new Element();
+  let callbacks;
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: (_transport, nextCallbacks) => {
+      callbacks = nextCallbacks;
+      return { connect: async () => {}, disconnect: async () => {}, enableMic: () => {} };
+    },
+  });
+
+  const speakerSelect = root.children[0].children[5];
+  expect(speakerSelect.hidden).toBe(true);
+
+  await app.connect();
+  callbacks.onAvailableSpeakersUpdated([{ deviceId: "spk-1", label: "Speakers" }]);
+  expect(speakerSelect.children).toEqual([]);
+});
+
+test("populateSelect does not force-select a device id that is not in the provided device list", async () => {
+  const documentRef = fakeDocument({ audioSupportsSinkId: true });
+  const root = new Element();
+  const mics = [{ deviceId: "mic-1", label: "Built-in Mic" }, { deviceId: "mic-2", label: "USB Mic" }];
+  let callbacks;
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: (_transport, nextCallbacks) => {
+      callbacks = nextCallbacks;
+      return { connect: async () => {}, disconnect: async () => {}, enableMic: () => {}, selectedMic: { deviceId: "stale-mic" } };
+    },
+  });
+  void app;
+
+  const micSelect = root.children[0].children[4];
+  await app.connect();
+  callbacks.onAvailableMicsUpdated(mics);
+
+  expect(micSelect.value).not.toBe("stale-mic");
+});
+
+test("disconnect() itself disables and clears the mic/speaker selects", async () => {
+  const documentRef = fakeDocument({ audioSupportsSinkId: true });
+  const root = new Element();
+  const mics = [{ deviceId: "mic-1", label: "Built-in Mic" }];
+  let callbacks;
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: (_transport, nextCallbacks) => {
+      callbacks = nextCallbacks;
+      return { connect: async () => {}, disconnect: async () => {}, enableMic: () => {}, selectedMic: mics[0] };
+    },
+  });
+
+  const micSelect = root.children[0].children[4];
+  const speakerSelect = root.children[0].children[5];
+  await app.connect();
+  callbacks.onAvailableMicsUpdated(mics);
+  micSelect.disabled = false;
+  speakerSelect.disabled = false;
+
+  await app.disconnect();
+
+  expect(micSelect.disabled).toBe(true);
+  expect(speakerSelect.disabled).toBe(true);
+  expect(micSelect.children).toEqual([]);
+  expect(speakerSelect.children).toEqual([]);
+});
+
+test("once disconnect() has run, the selects are disabled so a real <select> cannot fire onchange again", async () => {
+  const documentRef = fakeDocument({ audioSupportsSinkId: true });
+  const root = new Element();
+  const updateMicCalls = [];
   const app = createApp({
     root,
     documentRef,
@@ -117,14 +199,18 @@ test("speaker select is hidden when the browser cannot switch audio output devic
       connect: async () => {},
       disconnect: async () => {},
       enableMic: () => {},
-      getAllMics: async () => [],
-      getAllSpeakers: async () => [{ deviceId: "spk-1", label: "Speakers" }],
+      updateMic: (id) => updateMicCalls.push(id),
     }),
   });
-  void app;
 
-  const speakerSelect = root.children[0].children[5];
-  expect(speakerSelect.hidden).toBe(true);
+  const micSelect = root.children[0].children[4];
+  await app.connect();
+  await app.disconnect();
+
+  expect(micSelect.disabled).toBe(true);
+  // A disabled real <select> cannot dispatch a change event; this fake
+  // Element doesn't enforce that, so we assert on the disabled state
+  // itself rather than invoking onchange() post-disconnect.
 });
 
 test("onServerMessage rejects unsupported contracts before applying state", () => {
