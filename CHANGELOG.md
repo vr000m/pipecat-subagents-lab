@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Microphone and speaker device selectors in the browser client, letting
+  input/output devices be switched mid-session; the speaker selector is
+  hidden in browsers without `HTMLMediaElement.setSinkId()` support.
+- Icon toolbar with a merged connect/disconnect toggle button, replacing the
+  previous separate Connect/Disconnect buttons.
+- Structured browser-console diagnostics (`[HH:MM:SS.mmm][component]
+  message`) for connection, track, mic, and speaker events.
+
 ### Fixed
 
 - Discard a still-queued "taking longer than expected" timeout notice before
