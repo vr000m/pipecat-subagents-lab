@@ -17,7 +17,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured browser-console diagnostics (`[HH:MM:SS.mmm][component]
   message`) for connection, track, mic, and speaker events.
 
+### Changed
+
+- `CONNECTION_LOCAL_FRAMES` (`server/speech_lifecycle.py`) is now the single
+  declaration site for frame types that must stay off `WorkerBus`, replacing
+  a hand-maintained tuple that previously lived separately in
+  `server/pipeline.py`'s `framework_bridge()`. A new test asserts every
+  private speech frame defined in `speech_lifecycle.py` is covered by the
+  tuple, so a future frame added there without updating the exclusion list
+  now fails at test time instead of silently breaking TTS audio.
+- The browser toolbar (mic/speaker selects, connect/disconnect toggle, mic
+  button) now renders from `state` through a new `web/src/controls.js`
+  module instead of being mutated imperatively from connection callbacks,
+  matching the existing `state` → `render` pattern already used for the
+  runtime panel. `web/src/state.js` gained device-list/selection/mic-enabled
+  reducers to support this.
+
 ### Fixed
+
+- `SpeechGenerationMarkerFrame` and `SpeechGenerationFlushAckFrame` were
+  never added to the bus-bridge's frame exclusion list after being
+  introduced, so they were silently diverted to `WorkerBus` instead of
+  reaching `TransportSpeechLifecycleProcessor`. With no bound context, every
+  TTS audio frame was treated as belonging to an unbound generation and
+  dropped: synthesis and the WebRTC track worked correctly throughout, so
+  nothing in transport state, logs, or the browser signalled a problem — the
+  assistant was simply never audible. See `docs/architecture.md`'s "Bus
+  bridge frame exclusions" section for the full incident writeup.
+- An unexpected transport disconnect left the toolbar's connect/disconnect
+  toggle and device selectors claiming an active connection against a dead
+  client, and a rejected `HTMLMediaElement.setSinkId()` call left the
+  speaker selector displaying a device that was never actually routed to.
+  Connection teardown is now a single idempotent path invoked from both a
+  transport-driven disconnect and an explicit one, and `setSinkId()` success
+  is now the commit boundary for what the speaker selector displays.
+- A latent XSS sink in the toolbar's button-label rendering (unescaped
+  `innerHTML` interpolation, not reachable by any current caller) was closed
+  by routing all button labels through `textContent`.
 
 - Discard a still-queued "taking longer than expected" timeout notice before
   speaking a late search result that arrives for the same work item, so the

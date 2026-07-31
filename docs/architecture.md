@@ -39,7 +39,11 @@ bridge — not just `TTSSpeakFrame` — must be added to `CONNECTION_LOCAL_FRAME
 at its definition site, or it is silently dropped from the local pipeline
 with no error. `test_framework_bridge_keeps_speech_on_connection_pipeline`
 and `test_connection_local_frames_covers_every_private_speech_frame`
-(`tests/test_pipeline.py`) enforce this.
+(`tests/test_pipeline.py`) enforce this. `CONNECTION_LOCAL_FRAMES` was
+originally a hand-maintained tuple built inline in `framework_bridge()`
+itself; it was moved to `server/speech_lifecycle.py` — next to the frame
+classes it governs — specifically because that separation is what let the
+2026-07-30/07-31 incident below happen undetected.
 
 This was missed once in practice: `SpeechGenerationMarkerFrame` and
 `SpeechGenerationFlushAckFrame` (introduced 2026-07-30, `6124040`) were never
