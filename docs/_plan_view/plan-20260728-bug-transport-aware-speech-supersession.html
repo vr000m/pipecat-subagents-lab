@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="plan-view-source-sha256" content="0da622a44363a3fb307ed322534595518d226151f29bde5ff72aaa3a2cc32852">
+<meta name="plan-view-source-path" content="~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md">
+<meta name="plan-view-git-head" content="80864a16253bc92c49682b340b6a0a6e3a163ee2">
+<meta name="plan-view-generated-at" content="2026-08-02T06:31:00Z">
+<title>Task: Transport-Aware Speech Supersession — Plan View</title>
+<style>
+:root {
+  --bg: #0f1115; --bg-elev: #161a22; --bg-card: #1c2230;
+  --fg: #e6e9ef; --fg-dim: #9aa3b2; --fg-muted: #6b7280;
+  --border: #2a313d; --accent: #7c9eff;
+  --green: #4ade80; --amber: #fbbf24; --blue: #60a5fa;
+  --red: #f87171; --grey: #9ca3af; --purple: #c084fc;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa; --bg-elev: #ffffff; --bg-card: #ffffff;
+    --fg: #111827; --fg-dim: #4b5563; --fg-muted: #9ca3af;
+    --border: #e5e7eb; --accent: #2563eb;
+    --green: #16a34a; --amber: #d97706; --blue: #2563eb;
+    --red: #dc2626; --grey: #6b7280; --purple: #9333ea;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px; line-height: 1.55; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header {
+  padding: 24px 32px; border-bottom: 1px solid var(--border);
+  background: var(--bg-elev); position: sticky; top: 0; z-index: 10;
+  backdrop-filter: blur(10px);
+}
+header .breadcrumb { font-size: 12px; color: var(--fg-dim); margin-bottom: 4px;
+  display: flex; justify-content: space-between; gap: 12px; }
+header .breadcrumb .rich-link { color: var(--fg-dim); }
+header h1 { margin: 0 0 8px; font-size: 20px; font-weight: 600; }
+header .meta { color: var(--fg-dim); font-size: 12px; display: flex; flex-wrap: wrap; gap: 12px; }
+header .meta code { background: var(--bg-card); padding: 1px 6px; border-radius: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 500;
+  border: 1px solid transparent;
+}
+.chip.green { background: rgba(74, 222, 128, 0.12); color: var(--green); border-color: rgba(74, 222, 128, 0.3); }
+.chip.amber { background: rgba(251, 191, 36, 0.12); color: var(--amber); border-color: rgba(251, 191, 36, 0.3); }
+.chip.blue  { background: rgba(96, 165, 250, 0.12); color: var(--blue);  border-color: rgba(96, 165, 250, 0.3); }
+.chip.red   { background: rgba(248, 113, 113, 0.12); color: var(--red);   border-color: rgba(248, 113, 113, 0.3); }
+.chip.grey  { background: rgba(156, 163, 175, 0.12); color: var(--grey);  border-color: rgba(156, 163, 175, 0.3); }
+nav.toc {
+  padding: 12px 32px; background: var(--bg-elev); border-bottom: 1px solid var(--border);
+  font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; position: sticky;
+  top: 90px; z-index: 9;
+}
+nav.toc a { color: var(--fg-dim); }
+nav.toc a:hover { color: var(--accent); }
+main { padding: 32px; max-width: 980px; margin: 0 auto; }
+section { margin-bottom: 32px; scroll-margin-top: 140px; }
+section h2 { font-size: 16px; font-weight: 600; margin: 0 0 12px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.timeline-strip { display: block; margin: 8px 0 16px; }
+.timeline-strip rect { fill: var(--accent); opacity: 0.6; }
+.timeline-strip rect:hover { opacity: 1; }
+.timeline-strip line { stroke: var(--border); }
+.timeline-strip text { fill: var(--fg-muted); font-size: 10px; }
+.commit-list { list-style: none; padding: 0; margin: 0; max-height: 400px;
+  overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+.commit-list li { padding: 8px 12px; border-bottom: 1px solid var(--border);
+  font-size: 12.5px; display: flex; gap: 12px; align-items: baseline; }
+.commit-list li:last-child { border-bottom: none; }
+.commit-list .sha { font-family: ui-monospace, monospace; color: var(--accent); font-size: 11px; }
+.commit-list .date { color: var(--fg-muted); font-size: 11px; min-width: 90px; }
+.commit-list .subject { color: var(--fg); flex: 1; }
+.edges-section ul { list-style: none; padding: 0; margin: 0; display: flex;
+  flex-direction: column; gap: 6px; }
+.edges-section li {
+  padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 4px; font-size: 12.5px; display: flex; align-items: center; gap: 10px;
+}
+.edges-section .label {
+  padding: 2px 7px; border-radius: 3px; font-size: 10.5px;
+  font-family: ui-monospace, monospace; font-weight: 500;
+}
+.edges-section .label.supersedes      { background: rgba(192, 132, 252, 0.15); color: var(--purple); }
+.edges-section .label.tracked-in      { background: rgba(96, 165, 250, 0.15); color: var(--blue); }
+.edges-section .label.structural-fix-of { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+.edges-section .label.follows         { background: rgba(251, 191, 36, 0.15); color: var(--amber); }
+.edges-section .label.references      { background: rgba(156, 163, 175, 0.12); color: var(--grey); }
+.markdown { background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px 24px; }
+.markdown h1, .markdown h2, .markdown h3 { margin-top: 24px; }
+.markdown h1:first-child, .markdown h2:first-child { margin-top: 0; }
+.markdown code { background: var(--bg-card); padding: 1px 5px; border-radius: 3px;
+  font-family: ui-monospace, monospace; font-size: 12.5px; }
+.markdown pre { background: var(--bg-card); padding: 12px; border-radius: 6px;
+  overflow-x: auto; font-size: 12.5px; }
+.markdown pre code { background: none; padding: 0; }
+.markdown blockquote { border-left: 3px solid var(--accent); padding-left: 12px;
+  color: var(--fg-dim); margin: 12px 0; }
+.markdown table { border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+.markdown th, .markdown td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.markdown th { background: var(--bg-card); }
+details.raw-source > summary { cursor: pointer; padding: 8px 12px;
+  background: var(--bg-card); border-radius: 4px; margin-bottom: 8px; font-size: 12px;
+  color: var(--fg-dim); }
+footer { padding: 24px 32px; color: var(--fg-muted); font-size: 11px;
+  border-top: 1px solid var(--border); margin-top: 32px; text-align: center; }
+footer code { font-family: ui-monospace, monospace; background: var(--bg-card); padding: 1px 6px; border-radius: 3px; }
+</style>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, securityLevel: 'strict' });
+</script>
+</head>
+<body>
+<header>
+  <div class="breadcrumb"><span><a href="index.html">← Plan View</a> · <code>pipecat subagents</code></span><a class="rich-link" href="plan-20260728-bug-transport-aware-speech-supersession.rich.html" title="rich view (generate with --rich)">rich view →</a></div>
+  <h1>Task: Transport-Aware Speech Supersession</h1>
+  <div class="meta">
+    <span><span class="chip green">Shipped</span></span>
+    <span>Created <code>2026-07-28</code></span>
+    <span>Last touched <code>2026-07-31</code></span>
+    
+    <span>Branch <code>fix/drop-stale-timeout-speech</code></span>
+  </div>
+</header>
+<nav class="toc">
+  <a href="#status">Status</a>
+  <a href="#edges">Cross-references</a>
+  <a href="#commits">Commit history</a>
+  <a href="#content">Plan content</a>
+</nav>
+<main>
+  <section id="status">
+    <h2>Status</h2>
+    <p>Complete</p>
+    <p style="color:var(--fg-dim);">Progress: <strong>3/3</strong> (100%) checkboxes complete.</p>
+  </section>
+  <section id="edges" class="edges-section">
+    <h2>Cross-references</h2>
+    <p style="color:var(--fg-muted);">No cross-references.</p>
+  </section>
+  <section id="commits">
+    <h2>Commit history</h2>
+    <svg class="timeline-strip" viewBox="0 0 720 32" width="100%" height="32"><line x1="4" y1="16.0" x2="716" y2="16.0" /><rect x="714.0" y="4" width="4" height="24"><title>a38337e · 2026-07-31 · docs: sync dev plan and changelog with the post-review fix commits</title></rect>
+<rect x="525.0" y="4" width="4" height="24"><title>ff06380 · 2026-07-30 · docs: sync plan and changelog with the code-review fix pass</title></rect>
+<rect x="501.5" y="4" width="4" height="24"><title>2dfe06c · 2026-07-30 · fix: await transport teardown before speech advance</title></rect>
+<rect x="285.4" y="4" width="4" height="24"><title>a7a9690 · 2026-07-30 · conduct: mark phase 3 complete, record final results</title></rect>
+<rect x="283.0" y="4" width="4" height="24"><title>3a5f6c9 · 2026-07-30 · conduct: mark phase 2 complete in plan progress</title></rect>
+<rect x="279.4" y="4" width="4" height="24"><title>9ff8f70 · 2026-07-30 · conduct: mark phase 1 complete in plan progress</title></rect>
+<rect x="237.3" y="4" width="4" height="24"><title>9d4870d · 2026-07-30 · docs: harden transport speech lifecycle plan</title></rect>
+<rect x="227.4" y="4" width="4" height="24"><title>29f7dbd · 2026-07-29 · docs: resolve speech supersession plan review</title></rect>
+<rect x="2.0" y="4" width="4" height="24"><title>4caa43b · 2026-07-29 · docs: plan transport-aware speech supersession</title></rect></svg>
+    <ul class="commit-list"><li><span class="date">2026-07-31</span><span class="sha">a38337e</span><span class="subject">docs: sync dev plan and changelog with the post-review fix commits</span></li>
+<li><span class="date">2026-07-30</span><span class="sha">ff06380</span><span class="subject">docs: sync plan and changelog with the code-review fix pass</span></li>
+<li><span class="date">2026-07-30</span><span class="sha">2dfe06c</span><span class="subject">fix: await transport teardown before speech advance</span></li>
+<li><span class="date">2026-07-30</span><span class="sha">a7a9690</span><span class="subject">conduct: mark phase 3 complete, record final results</span></li>
+<li><span class="date">2026-07-30</span><span class="sha">3a5f6c9</span><span class="subject">conduct: mark phase 2 complete in plan progress</span></li>
+<li><span class="date">2026-07-30</span><span class="sha">9ff8f70</span><span class="subject">conduct: mark phase 1 complete in plan progress</span></li>
+<li><span class="date">2026-07-30</span><span class="sha">9d4870d</span><span class="subject">docs: harden transport speech lifecycle plan</span></li>
+<li><span class="date">2026-07-29</span><span class="sha">29f7dbd</span><span class="subject">docs: resolve speech supersession plan review</span></li>
+<li><span class="date">2026-07-29</span><span class="sha">4caa43b</span><span class="subject">docs: plan transport-aware speech supersession</span></li></ul>
+  </section>
+  <section id="content">
+    <h2>Plan content</h2>
+    <div class="markdown"><h1>Task: Transport-Aware Speech Supersession</h1>
+<p><strong>Status</strong>: Complete <strong>Component</strong>: Pipecat subagents <strong>Assigned to</strong>: Unassigned <strong>Priority</strong>: High <strong>Branch</strong>: fix/drop-stale-timeout-speech <strong>Created</strong>: 2026-07-28 <strong>Updated</strong>: 2026-07-30 <strong>Review Gates</strong>: full</p>
+<h2>Objective</h2>
+<p>Keep speech scheduling ownership until the output transport reports that the active utterance has stopped or its connection-scoped output lane has completed teardown, so a final result can remove its still-queued timeout notice while unrelated speech is playing. Deliver this as a release-neutral precursor to <code>docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md</code>, not as a 0.1.3 release or version bump.</p>
+<h2>Context</h2>
+<p>The reported two-query trace exposes a lifecycle mismatch rather than primarily a bad timeout value. The Helsinki result was still playing when the San Francisco timeout notice was emitted. By the time the San Francisco final result was ready, the notice had already crossed the scheduler boundary and was buffered behind earlier audio, so queue-only supersession could no longer remove it.</p>
+<p>The current pipeline records <code>synthesis_ended</code> and immediately converts it to <code>delivery_unknown</code>, releasing the scheduler lease and starting the next queued utterance (<code>server/pipeline.py:495-523</code>). The generic TTS completion processor does the same before forwarding <code>TTSStoppedFrame</code> to <code>transport.output()</code> (<code>server/app.py:60-96,187-204</code>). This conflicts with the repository's documented contract: synthesis completion is not transport completion, and no server state proves browser decode, playout, or audibility (<code>shared/protocol.md:69-80</code>).</p>
+<p>Commit <code>73d1a7c</code> adds a valid but incomplete primitive: <code>SpeechScheduler.discard_queued(work_item_id)</code> and a late-result call site. It can remove a timeout notice only while the scheduler still owns that notice. This plan retains that primitive but fixes the upstream lifecycle so later speech remains queued until the output transport has drained the active utterance.</p>
+<p>Pipecat 1.6.0 provides current, non-deprecated <code>BotStartedSpeakingFrame</code> and <code>BotStoppedSpeakingFrame</code> types. <code>BaseOutputTransport</code> emits the stop frame upstream and downstream when transport-managed bot speech stops, but both bot frames are fieldless and cannot identify an utterance. Pipecat-generated <code>TTSStartedFrame</code>, <code>TTSAudioRawFrame</code>, and <code>TTSStoppedFrame</code> carry <code>context_id</code>; the pinned TTS service also serializes non-system downstream frames relative to the generated TTS sequence. The implementation therefore needs an internal generation marker before TTS plus a single in-flight transport slot; it must not bind a fieldless bot event by consulting whichever scheduler lease is active when that event happens to arrive.</p>
+<p>Shortening <code>foreground_search_timeout_seconds</code> is out of scope. A shorter timer can make duplicate notices occur closer together but cannot retract speech that has already left scheduler ownership.</p>
+<h2>Requirements</h2>
+<ul><li>Model every admitted utterance as one private <code>SpeechGeneration</code> with a stable</li></ul>
+<p>scheduler token. Queue residency remains a <code>SpeechItem</code> concern; generation phases begin at <code>admitted</code>, then <code>handed_to_tts</code>, <code>synthesizing</code>, <code>synthesis_ended</code>, <code>transport_started</code>, and <code>transport_stopped</code>, with delivery dispositions <code>paused</code>, <code>interrupted</code>, <code>cancelled</code>, and <code>delivery_unknown</code>. Transitions are token-fenced and idempotent; the public <code>DeliveryState</code> wire/state contract remains unchanged.</p>
+<ul><li>Make one <code>SpeechLifecycleCoordinator</code> the sole owner of the admitted generation,</li></ul>
+<p>TTS-lane lease, global transport slot, tombstones, timers, and exactly-once terminalization. <code>SpeechScheduler</code> owns only per-work queues and selection; lifecycle processors and provider callbacks are stateless adapters into token-bearing coordinator methods.</p>
+<ul><li>Preserve the hybrid scheduler: FIFO within each work-item queue, existing</li></ul>
+<p>work-item selection/targeted-start policy between queues, and exactly one global transport slot. Do not claim or introduce global FIFO ordering.</p>
+<ul><li>Hold the global transport slot from scheduler admission until correlated</li></ul>
+<p>transport stop or completed cleanup of the old output lane. <code>TTSStoppedFrame</code> and provider <code>synthesis_ended</code> record synthesis state only; neither admits another generation to TTS/output. A timer expiry may initiate cleanup but may not by itself clear a slot that has submitted audio to output.</p>
+<ul><li>Insert a private, token-bearing generation marker immediately before each</li></ul>
+<p><code>TTSSpeakFrame</code>. The post-TTS lifecycle bridge consumes that marker and binds the next generated TTS <code>context_id</code> to the token. Fieldless bot start/stop frames apply only to the sole occupied transport slot and never sample the scheduler's current active lease.</p>
+<ul><li>Retain tombstones for paused, interrupted, cancelled, reconnected, and</li></ul>
+<p>fallback-terminal generations until their TTS and transport barriers resolve. Drop later context-correlated audio or TTS stop frames before <code>transport.output()</code>. Tombstones do not purport to identify fieldless bot frames: after any audio has entered output, the next generation is not admitted until the old lane emits its normal stop or the connection-scoped output transport has been fully cancelled/torn down and can emit no later bot event.</p>
+<ul><li>A timeout notice is supersedable only while it remains in its own work-item</li></ul>
+<p>queue. Once its generation occupies the transport slot, final-result readiness does not interrupt it. Never reorder, delete, or interrupt another work item's speech.</p>
+<ul><li>Use token-fenced liveness deadlines backed by an injected monotonic clock and</li></ul>
+<p>injected cancellable timer scheduler: <code>speech_start_timeout_seconds = 10.0</code>, armed when a generation is handed to TTS and cancelled by its first correlated start/audio/provider-error event; and <code>speech_transport_grace_seconds = 1.0</code>, used after synthesis end at <code>synthesis_end + accumulated_audio_duration + grace</code>. Zero-audio synthesis uses only the grace. Barge-in and explicit pause arm an interruption-cleanup deadline at <code>interruption_forwarded_at + speech_transport_grace_seconds</code>.</p>
+<ul><li>Deadline expiry atomically marks the captured token <code>cleanup_pending</code>, dispatches</li></ul>
+<p>cancellation/flush, then records <code>delivery_unknown</code> once. If no audio has crossed into output, the coordinator may release only after the old TTS lane acknowledges that cleanup. If any audio has crossed into output, expiry invalidates and tears down that connection's output lane; queued speech is not admitted on it, and reconnect creates a fresh connection-scoped lane. A raw timer callback never makes a late fieldless A stop observable as B's stop.</p>
+<ul><li>Treat generic and local provider errors as separate ingress paths. A generic</li></ul>
+<p>Pipecat <code>ErrorFrame</code> is upstream and has no <code>context_id</code>; a pre-TTS error observer or provider <code>on_error</code> hook attributes it to the captured TTS-lane token and processor identity. The local-TTS callback retains its context-bearing mapping. Both converge on the same token-fenced delivery-unknown cleanup path.</p>
+<ul><li>On user barge-in, record <code>interrupted</code> and create the tombstone before forwarding</li></ul>
+<p>the interruption, cancel the start/drain timers, arm the interruption-cleanup deadline, and retain the transport barrier until the old generation stops or its output lane has been torn down. Do not automatically <code>start_next()</code> after barge-in; the new accepted turn or explicit resume owns the next scheduling decision.</p>
+<ul><li>On explicit pause, record public <code>paused</code> disposition before forwarding the same</li></ul>
+<p>interruption cleanup, retain the old barrier through stop/teardown, and keep the paused item outside the runnable queues. Explicit resume may enqueue a new generation only after that barrier resolves; the pause-control path, not the old stop callback, owns any confirmation or subsequent scheduling decision.</p>
+<ul><li>Keep canonical result commit, epoch fencing, and work-item cancellation ownership</li></ul>
+<p>unchanged. This plan changes speech disposition and lifecycle only.</p>
+<ul><li>Defer browser playout acknowledgement, selective transport-buffer retraction,</li></ul>
+<p>multiple in-flight transport generations, and adaptive timeout tuning to later plans as the transport integration matures.</p>
+<ul><li>Do not add a package version bump, tag, or release step. The reviewed invariant</li></ul>
+<p>becomes a prerequisite consumed by the v0.1.3 delivery-policy phase.</p>
+<h2>Review Focus</h2>
+<ul><li>Verify the internal generation marker survives the pinned local and generic TTS</li></ul>
+<p>paths in serialization order and binds generated <code>context_id</code> without relying on fieldless bot-frame identity.</p>
+<ul><li>Verify the single global transport slot plus tombstones prevents late A</li></ul>
+<p>start/audio/stop frames from binding to or releasing B after interruption, reconnect, cancellation, or fallback.</p>
+<ul><li>Verify a fallback after output submission cannot admit B on A's lane: it must</li></ul>
+<p>await normal stop or complete connection-scoped output teardown. Exercise A-fallback → attempted B admission → late fieldless A stop.</p>
+<ul><li>Verify the exact two-query race: B's timeout notice stays in its work-item queue</li></ul>
+<p>behind A's occupied transport slot, B's final result removes only that notice, and B's final speech starts after A stops.</p>
+<ul><li>Verify both watchdog equations, the interruption-cleanup equation, zero-audio</li></ul>
+<p>behavior, both provider-error ingress paths, and stop-versus-expiry races with a manual clock that controls both monotonic reads and timer wakeups.</p>
+<ul><li>Verify the real pinned SmallWebRTC output path holds the slot until its controlled</li></ul>
+<p>final-audio future resolves and emits the upstream stop.</p>
+<ul><li>Verify barge-in terminalizes delivery before transport cleanup and never</li></ul>
+<p>automatically advances old queued speech.</p>
+<ul><li>Verify pause retains the old barrier, resume cannot requeue early, and only the</li></ul>
+<p>explicit control path resumes scheduling.</p>
+<h2>Implementation Checklist</h2>
+<p>The phases below are the immutable implementation contract. Runtime progress and durable findings belong below the review marker.</p>
+<h3>Phase 1: Add the correlated generation state machine and transport slot</h3>
+<p><strong>Impl files:</strong> <code>server/app.py, server/config.py, config.toml, README.md, server/pipeline.py, server/speech_lifecycle.py, server/speech_scheduler.py, server/services/tts.py</code> <strong>Test files:</strong> <code>tests/test_app.py, tests/test_config.py, tests/test_pipeline.py, tests/test_speech_lifecycle.py, tests/test_speech_scheduler.py</code> <strong>Test command:</strong> <code>uv run pytest tests/test_app.py tests/test_config.py tests/test_pipeline.py tests/test_speech_lifecycle.py tests/test_speech_scheduler.py -k 'speech or tts or transport or delivery or config' -v</code> <strong>Goal:</strong> Per-work queues feed one coordinator-owned transport slot; generation identity is established before TTS, and the real pinned output lane proves that synthesis completion, cleanup deadlines, and late frames cannot release the wrong generation.</p>
+<ul><li>Add the private <code>SpeechGeneration</code> state machine,</li></ul>
+<p><code>SpeechLifecycleCoordinator</code>, cancellable timer-scheduler protocol, and <code>SpeechGenerationMarkerFrame</code> in <code>server/speech_lifecycle.py</code>. The coordinator is the only owner of the TTS-lane lease, admitted generation, global transport slot, timers, tombstones, and terminal release. The marker carries the scheduler token and utterance identity, is inserted immediately before the matching <code>TTSSpeakFrame</code>, and is consumed after TTS rather than forwarded to the output transport.</p>
+<ul><li>Add one shared <code>TransportSpeechLifecycleProcessor</code> after either TTS integration</li></ul>
+<p>path and immediately before <code>transport.output()</code>. It is a stateless adapter that observes the serialized marker, generated <code>TTSStartedFrame</code>/<code>TTSAudioRawFrame</code>/<code>TTSStoppedFrame</code>, downstream interruption, and upstream bot start/stop, then calls token-bearing coordinator methods.</p>
+<ul><li>Add a separate generic-TTS error adapter before TTS or register the pinned</li></ul>
+<p>service's <code>on_error</code> hook. Capture the TTS-lane token when the request is admitted and attribute upstream <code>ErrorFrame</code> by that captured token plus <code>ErrorFrame.processor</code>; never infer identity from an <code>ErrorFrame.context_id</code> because none exists. Keep the local provider's context-bearing error callback as a distinct adapter into the same coordinator transition.</p>
+<ul><li>Bind the first generated TTS <code>context_id</code> after a marker to that marker's token.</li></ul>
+<p>The coordinator maintains one occupied global transport slot plus terminal tombstones; neither lifecycle adapter owns parallel slot state. Never bind a fieldless bot frame by looking up a scheduler lease.</p>
+<ul><li>Preserve per-work-item FIFO and existing work-item selection/targeted-start</li></ul>
+<p>semantics. <code>SpeechScheduler</code> owns only queues/selection and may ask the coordinator to admit a selected item only when the global slot is empty.</p>
+<ul><li>Keep <code>provider_synthesis_ended()</code> non-terminal. Release/admit next only after</li></ul>
+<p>transport stop or completed old-lane cleanup.</p>
+<ul><li>Add and document validated config fields</li></ul>
+<p><code>speech_start_timeout_seconds = 10.0</code> and <code>speech_transport_grace_seconds = 1.0</code>.</p>
+<ul><li>For matching downstream PCM audio, accumulate duration from byte length, sample</li></ul>
+<p>rate, channel count, and sample width. Arm the drain fallback at <code>synthesis_end + total_audio_duration + grace</code>; zero audio uses only grace.</p>
+<ul><li>Inject both monotonic time and a cancellable <code>call_at</code>/<code>sleep_until</code> scheduler</li></ul>
+<p>into the coordinator. Production uses the event loop; tests use one manual clock that advances reads and wakes due timers deterministically.</p>
+<ul><li>Route both provider-error adapters and start-timeout through</li></ul>
+<p><code>delivery_unknown</code>. If no audio reached output, cancel/flush the old TTS lane and require its acknowledgement before clearing the slot. If audio reached output or either lane cannot acknowledge cleanup, invalidate the connection epoch, cancel/tear down its output transport, and do not admit queued speech until a fresh connection-scoped lane exists.</p>
+<ul><li>On barge-in or explicit pause, record the disposition and tombstone before</li></ul>
+<p>forwarding interruption, cancel normal timers, and arm <code>forwarded_at + speech_transport_grace_seconds</code>. The normal bot stop resolves the barrier; expiry tears down the connection-scoped output lane rather than clearing it for reuse. Neither the interruption nor its later stop calls <code>start_next()</code>.</p>
+<ul><li>Move the lifecycle proof into this phase. Add marker-order tests for both pinned</li></ul>
+<p>TTS paths; a credential-free real <code>SmallWebRTCOutputTransport</code> test with a fake peer/audio track and controlled final <code>RawAudioTrack.add_audio_bytes()</code> future; manual-clock start/drain/interruption deadline tests; and parameterized late-A start/audio/stop/error traces for interruption, pause, reconnect, cancellation, shutdown, start-timeout, and drain fallback. Assert slot mutation occurs only through the coordinator and exactly once.</p>
+<h3>Phase 2: Make queued timeout supersession explicit and work-scoped</h3>
+<p><strong>Impl files:</strong> <code>server/pipeline.py, server/speech_scheduler.py</code> <strong>Test files:</strong> <code>tests/test_pipeline.py, tests/test_speech_scheduler.py</code> <strong>Test command:</strong> <code>uv run pytest tests/test_pipeline.py tests/test_speech_scheduler.py -k 'timeout or supersed or queued or late_result' -v</code> <strong>Goal:</strong> A retained final result atomically replaces only its own queued timeout notice before that notice can occupy the global transport slot.</p>
+<ul><li>Give speech items an internal role (<code>result</code>, <code>timeout_notice</code>, or other existing</li></ul>
+<p>non-supersedable role) rather than relying on broad work-item queue deletion.</p>
+<ul><li>Replace the current generic <code>discard_queued(work_item_id)</code> call with a</li></ul>
+<p>work-scoped, notice-specific operation that returns the exact discarded items and records their terminal delivery state once.</p>
+<ul><li>Perform notice removal and final-result enqueue without an <code>await</code> boundary that</li></ul>
+<p>could let <code>start_next()</code> select the notice between the two operations.</p>
+<ul><li>Define the boundary explicitly: a notice is supersedable while it remains in its</li></ul>
+<p>per-work queue; a notice admitted to the global slot is not interrupted; final-result commit remains independent of either speech disposition.</p>
+<ul><li>Preserve within-work FIFO, existing cross-work selection, targeted-start policy,</li></ul>
+<p>paused items, duplicate late callbacks, missing TTS, stale epochs, cancellation, and reconnect semantics.</p>
+<ul><li>Add the deterministic reported-race test in this phase: A occupies the proven</li></ul>
+<p>transport slot, B has a mixed same-work queue containing non-supersedable speech around its timeout notice, and B's final result arrives before A stops. Assert only B's notice terminates once, B's remaining same-work items retain order, another work queue is unchanged, the final enqueue is atomic, and A is not interrupted.</p>
+<h3>Phase 3: Document the boundary and run cross-phase validation</h3>
+<p><strong>Impl files:</strong> <code>shared/protocol.md, CHANGELOG.md, docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md</code> <strong>Test files:</strong> <code>tests/test_app.py, tests/test_pipeline.py, tests/test_speech_lifecycle.py, tests/test_speech_scheduler.py</code> <strong>Test command:</strong> <code>uv run pytest tests/test_app.py tests/test_pipeline.py tests/test_speech_lifecycle.py tests/test_speech_scheduler.py -v</code> <strong>Validation cmd:</strong> <code>uv run ruff format --check . &amp;&amp; uv run ruff check . &amp;&amp; uv run pytest -q</code> <strong>Goal:</strong> Documentation distinguishes synthesis, transport drain, teardown, and browser audibility, while the full suite re-runs the Phase 1 lifecycle and Phase 2 supersession invariants together.</p>
+<ul><li>Re-run, without duplicating ownership, the Phase 1 real-transport/manual-clock</li></ul>
+<p>contract matrix and the Phase 2 deterministic A/B mixed-queue regression as a cross-phase validation gate.</p>
+<ul><li>Add an ordered event-log assertion for start-timeout cleanup:</li></ul>
+<p><code>fence A cleanup-pending → dispatch cancel/flush A → record delivery_unknown → acknowledge or tear down A's lane → clear or invalidate slot → optionally admit B</code>. For barge-in and pause assert <code>record disposition/tombstone → forward InterruptionFrame → stop or teardown</code>, with no <code>start_next()</code> from the interruption or stale stop.</p>
+<ul><li>Assert the full terminal matrix—interruption, pause, reconnect, cancellation,</li></ul>
+<p>shutdown, start-timeout, drain fallback, generic error, and local error—drops late context-bearing A frames before output, prevents any late fieldless A stop from being observed on B's lane, leaves B unchanged, and progresses exactly once.</p>
+<ul><li>Update <code>shared/protocol.md</code> with the transport-aware lease boundary and its</li></ul>
+<p>limitation: transport stop is stronger than synthesis end but still does not prove browser audibility.</p>
+<ul><li>Record the fix under the unreleased changelog section without changing the package</li></ul>
+<p>version, and retain the explicit precursor link in the v0.1.3 plan.</p>
+<h2>Technical Specifications</h2>
+<h3>Files to Modify</h3>
+<ul><li><code>server/app.py</code> — install one shared transport lifecycle processor immediately</li></ul>
+<p>before <code>transport.output()</code> for both local event-capable and generic TTS paths; install the distinct generic upstream error observer/provider hook; and expose connection-scoped output cancellation/teardown completion to the coordinator.</p>
+<ul><li><code>server/config.py</code>, <code>config.toml</code>, <code>README.md</code> — define, validate, load, and</li></ul>
+<p>document the two speech-liveness timeout fields.</p>
+<ul><li><code>server/pipeline.py</code> — stop releasing on provider synthesis end, connect transport</li></ul>
+<p>lifecycle events to the coordinator, emit the internal marker with each speak request, make pause/barge-in ordering explicit, and invoke notice-specific replacement before enqueueing final speech.</p>
+<ul><li><code>server/speech_scheduler.py</code> — preserve and select per-work queues, delegate</li></ul>
+<p>admission to the lifecycle coordinator, retain paused items outside runnable queues, and expose notice-specific queued replacement. It does not own a second active transport lease.</p>
+<ul><li><code>server/services/tts.py</code> — verify or adapt the local provider so the marker and</li></ul>
+<p>context-correlated lifecycle/error callbacks traverse the shared coordinator adapters exactly once.</p>
+<ul><li><code>shared/protocol.md</code> — define provider, transport, and audibility boundaries.</li><li><code>CHANGELOG.md</code> — record the unreleased bug fix without a version bump.</li><li><code>docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md</code> —</li></ul>
+<p>declare this reviewed precursor as a prerequisite for Phase 2.</p>
+<ul><li><code>tests/test_app.py</code>, <code>tests/test_config.py</code>, <code>tests/test_pipeline.py</code>,</li></ul>
+<p><code>tests/test_speech_scheduler.py</code> — assembly, configuration, queue selection, supersession, and reported-race coverage.</p>
+<h3>New Files to Create</h3>
+<ul><li><code>server/speech_lifecycle.py</code> — authoritative private generation coordinator,</li></ul>
+<p>marker frame, stateless lifecycle/error adapters, tombstones, injectable timer scheduler, and output-lane cleanup coordination.</p>
+<ul><li><code>tests/test_speech_lifecycle.py</code> — state-transition, stale-frame, manual</li></ul>
+<p>clock/timer, provider-error, teardown, and pinned SmallWebRTC drain-boundary contract tests.</p>
+<h3>Architecture Decisions</h3>
+<ul><li>Decision (grilled): use a private token-bearing marker through the pinned TTS</li></ul>
+<p>serialization boundary plus one global transport slot. Fieldless bot events never establish identity from the currently active scheduler lease.</p>
+<ul><li>Decision (reviewed): <code>SpeechLifecycleCoordinator</code> is the only owner of the</li></ul>
+<p>admitted generation, TTS-lane lease, global transport slot, timers, tombstones, and exactly-once terminalization. <code>SpeechScheduler</code> owns queues/selection and lifecycle processors are stateless frame adapters.</p>
+<ul><li>Decision (grilled): retain terminal generation tombstones until TTS and transport</li></ul>
+<p>cleanup complete; discard later context-correlated frames for stale contexts before output.</p>
+<ul><li>Decision (grilled): formalize a small internal <code>SpeechGeneration</code> state machine</li></ul>
+<p>now while leaving public <code>DeliveryState</code> unchanged. Defer browser acknowledgement, selective buffered-audio retraction, multiple in-flight generations, and adaptive timeout policy.</p>
+<ul><li>Decision (grilled): retain the hybrid scheduler. Per-work queues keep FIFO and</li></ul>
+<p>existing selection/targeted-start flexibility; one global slot serializes actual transport work. This plan does not introduce global FIFO.</p>
+<ul><li>Decision (grilled): use a 10-second start watchdog and a one-second transport</li></ul>
+<p>grace. The drain deadline is synthesis end plus accumulated PCM duration plus grace; interruption/pause cleanup is forwarded-at plus the same grace. Both monotonic time and timer wakeups are injected; all callbacks are token-fenced.</p>
+<ul><li>Decision (reviewed): a deadline never reuses an output lane that may still emit</li></ul>
+<p>a fieldless event. With no submitted output audio, acknowledged TTS flush permits release. After output submission, expiry invalidates the connection and awaits output cancellation/teardown; queued speech waits for a fresh lane.</p>
+<ul><li>Decision (reviewed): generic upstream <code>ErrorFrame</code> and local context-bearing</li></ul>
+<p>errors enter through different adapters. Both capture the old TTS-lane token and converge on <code>delivery_unknown</code>; neither samples a later active generation.</p>
+<ul><li>Decision (grilled): barge-in records interruption before output cleanup, holds the</li></ul>
+<p>old transport barrier until normal stop or completed teardown, and never auto-advances queued speech.</p>
+<ul><li>Decision (reviewed): explicit pause follows the same barrier cleanup but records</li></ul>
+<p><code>paused</code>; resume creates a new generation only after the old barrier resolves, and the explicit control path owns subsequent scheduling.</p>
+<ul><li><code>BotStoppedSpeakingFrame</code> is the normal server-side transport-drain signal, but</li></ul>
+<p>it is fieldless and valid only while the same connection-scoped lane has not been retired by completed teardown. Transport drain and browser audibility remain separate claims.</p>
+<ul><li>Supersession is role- and work-item-specific. A final result removes only its</li></ul>
+<p>queued timeout notice and cannot retract an item already occupying the global slot.</p>
+<ul><li>The existing <code>73d1a7c</code> queue-discard primitive is partial implementation evidence,</li></ul>
+<p>not proof of acceptance. Phase 2 narrows or replaces it with notice-specific replacement.</p>
+<h3>Dependencies</h3>
+<ul><li>Python remains <code>&gt;=3.12</code> and <code>pipecat-ai[cartesia,deepgram,openai,webrtc,runner]</code></li></ul>
+<p>remains pinned at <code>1.6.0</code> in <code>pyproject.toml</code>.</p>
+<ul><li><code>BotStartedSpeakingFrame</code> and <code>BotStoppedSpeakingFrame</code> are current,</li></ul>
+<p>non-deprecated but fieldless Pipecat 1.6.0 frame types; they cannot fence a late old-lane event after timer-only reuse.</p>
+<ul><li><code>TTSStartedFrame</code>, <code>TTSAudioRawFrame</code>, and <code>TTSStoppedFrame</code> carry generated</li></ul>
+<p><code>context_id</code>; <code>TTSSpeakFrame</code> does not accept a caller-supplied context ID.</p>
+<ul><li>Pipecat 1.6.0 TTS processing serializes non-system downstream frames relative to</li></ul>
+<p>generated audio contexts; Phase 1 contract tests this marker seam for both pinned TTS paths rather than relying on documentation alone.</p>
+<ul><li>Pipecat 1.6.0 generic TTS errors are upstream <code>ErrorFrame</code> instances without</li></ul>
+<p><code>context_id</code>; Phase 1 verifies the provider hook/upstream observer rather than routing them through the downstream lifecycle processor.</p>
+<ul><li>No new Python or browser dependency is required.</li><li>Explore facts above the review marker are point-in-time contract facts. A later</li></ul>
+<p>path, pattern, or dependency correction invalidates the review marker and requires <code>/review-plan</code> to run again.</p>
+<h3>Integration Seams</h3>
+<table><thead><tr><th>Seam</th><th>Writer</th><th>Caller</th><th>Contract</th></tr></thead><tbody><tr><td>Work queues → global slot</td><td><code>SpeechScheduler</code> queue selector</td><td><code>SpeechLifecycleCoordinator.try_admit()</code></td><td>Preserve within-work FIFO/current selection; coordinator admits exactly one generation</td></tr><tr><td>Generation marker → TTS context</td><td>Pipeline marker before <code>TTSSpeakFrame</code></td><td>Post-TTS lifecycle adapter</td><td>Serialized marker token binds the next generated <code>context_id</code>; marker never reaches output</td></tr><tr><td>Provider synthesis lifecycle</td><td>Local callback or generic downstream TTS frames</td><td>Coordinator</td><td>Matching start/audio/end transitions the captured token; synthesis end does not clear the slot</td></tr><tr><td>Generic provider error</td><td>TTS <code>on_error</code> hook or pre-TTS upstream observer</td><td>Coordinator TTS-lane lease</td><td>Attribute upstream fieldless-with-respect-to-context error by captured token and processor identity</td></tr><tr><td>Output transport lifecycle</td><td>SmallWebRTC <code>BaseOutputTransport</code></td><td>Coordinator through lifecycle adapter</td><td>Normal fieldless stop clears only the still-occupied same lane; a timed-out lane is torn down, never reused</td></tr><tr><td>Stale-frame fence</td><td>Tombstoned generation/context</td><td>Lifecycle adapter</td><td>Drop late context-bearing audio/TTS stop before output; never claim tombstones identify fieldless bot events</td></tr><tr><td>Watchdogs</td><td>Injected monotonic clock plus timer scheduler</td><td>Coordinator</td><td>Start, duration-plus-grace drain, and forwarded-at-plus-grace interruption deadlines compare captured token</td></tr><tr><td>Cleanup fallback</td><td>Coordinator</td><td>Connection-scoped TTS/output lane</td><td>Acknowledged no-audio TTS flush may release; submitted-output expiry tears down the lane before any fresh admission</td></tr><tr><td>Late-result supersession</td><td><code>SessionHost</code> late-result callback</td><td>Per-work speech queue</td><td>Atomically replace only the same work item's queued timeout notice</td></tr><tr><td>Barge-in/pause</td><td>Control/interruption path</td><td>Coordinator</td><td>Record disposition first, forward interruption, retain barrier through stop/teardown, do not auto-start</td></tr><tr><td>Reconnect/shutdown</td><td>Connection lifecycle</td><td>Coordinator</td><td>Invalidate epoch and await connection-scoped output teardown before a fresh lane can admit speech</td></tr><tr><td>v0.1.3 delivery policy</td><td>This precursor's tested invariant</td><td>v0.1.3 Phase 2</td><td>Phase 2 may assume notices remain per-work queued while another generation occupies transport</td></tr></tbody></table>
+<h2>Architecture &amp; Call Flow</h2>
+<pre class="mermaid">graph LR
+    Host["SessionHost / result lifecycle"] --&gt; WorkQueues["Per-work speech queues"]
+    WorkQueues --&gt; Coordinator["Speech lifecycle coordinator"]
+    Coordinator --&gt; Slot["Single global transport slot"]
+    Slot --&gt; Marker["Token-bearing generation marker"]
+    Marker --&gt; TTS["TTS provider serialization"]
+    TTS --&gt; Bridge["Transport speech lifecycle processor"]
+    TTS --&gt;|"upstream ErrorFrame / provider hook"| ErrorAdapter["Generic error adapter"]
+    ErrorAdapter --&gt; Coordinator
+    Bridge --&gt; Output["SmallWebRTC output transport"]
+    Output --&gt; Browser["Browser playback"]
+    Output --&gt;|"fieldless upstream bot start / stop"| Bridge
+    Bridge --&gt; Coordinator
+    Host --&gt;|"replace same-work queued notice"| WorkQueues</pre>
+<pre class="mermaid">sequenceDiagram
+    participant H as SessionHost
+    participant Q as Work queues
+    participant S as Lifecycle coordinator / slot
+    participant T as TTS
+    participant L as Lifecycle bridge
+    participant O as Output transport
+    participant B as Browser
+
+    H-&gt;&gt;Q: enqueue Helsinki result
+    Q-&gt;&gt;S: admit Helsinki generation
+    S-&gt;&gt;T: marker(token A), then TTSSpeakFrame
+    T-&gt;&gt;L: marker, TTSStarted(context A), audio, TTSStopped
+    L-&gt;&gt;O: correlated audio and TTSStopped
+    Note over S,L: Synthesis ended; keep global slot occupied
+    O-&gt;&gt;B: play Helsinki audio
+    H-&gt;&gt;Q: enqueue SF timeout notice
+    Note over Q,S: Notice remains per-work queued; slot is occupied
+    H-&gt;&gt;Q: SF final result replaces queued notice
+    O--&gt;&gt;L: fieldless BotStoppedSpeakingFrame
+    L-&gt;&gt;S: stop sole generation A; clear slot
+    Q-&gt;&gt;S: admit SF final generation
+    S-&gt;&gt;T: marker(token B), then TTSSpeakFrame
+    T-&gt;&gt;L: correlated SF result audio
+    L-&gt;&gt;O: SF result audio
+    O-&gt;&gt;B: play SF result</pre>
+<p>Fallback sequence after output submission:</p>
+<pre class="mermaid">sequenceDiagram
+    participant S as Lifecycle coordinator
+    participant O as Old output lane
+    participant Q as Work queues
+    participant N as Fresh connection lane
+
+    S-&gt;&gt;O: A drain/interruption deadline expires
+    S-&gt;&gt;S: fence A cleanup-pending; retain A slot
+    S-&gt;&gt;O: dispatch cancel/flush
+    S-&gt;&gt;S: record delivery_unknown once
+    S-&gt;&gt;O: await connection-scoped teardown
+    Q--&gt;&gt;S: B remains queued; admission rejected
+    O--&gt;&gt;S: teardown complete; old lane cannot emit later bot events
+    S-&gt;&gt;S: retire A slot and old connection epoch
+    N--&gt;&gt;S: fresh connection lane ready
+    S-&gt;&gt;N: admit selected B generation</pre>
+<table><thead><tr><th>Step</th><th>Trigger</th><th>Enters context</th><th>Cleared/persisted</th><th>Turn boundary</th></tr></thead><tbody><tr><td>Speech queued</td><td>Result or timeout notice enters a work queue</td><td>Utterance ID, work-item ID, role, origin epoch</td><td>Persists in that work queue</td><td>May cross turns</td></tr><tr><td>Generation admitted</td><td>Queue selector finds the global slot empty</td><td>Stable token, utterance, start watchdog</td><td>Persists in the sole global slot</td><td>No</td></tr><tr><td>Marker crosses TTS</td><td>Serialized marker precedes generated TTS context</td><td>Token bound to generated <code>context_id</code></td><td>Persists in generation ledger</td><td>No</td></tr><tr><td>Synthesis progresses</td><td>Matching start/audio/end or captured provider error</td><td>Internal phase and accumulated PCM duration</td><td>End/error updates state; end keeps slot occupied</td><td>No</td></tr><tr><td>Final replaces notice</td><td>Retained result completes while notice is work-queued</td><td>Same work-item identity and timeout-notice role</td><td>Notice terminates once; final occupies its queue position</td><td>May cross turns</td></tr><tr><td>Transport stops</td><td>Output emits fieldless stop for sole occupied slot</td><td>Transport terminal event</td><td>Clears slot once; normal selector may run</td><td>No</td></tr><tr><td>Barge-in/pause</td><td>Downstream interruption precedes output cleanup</td><td>Interrupted/paused disposition plus transport tombstone</td><td>Slot stays fenced through stop/teardown; no automatic next start</td><td>May begin newer turn</td></tr><tr><td>Delivery unknown before output</td><td>Start watchdog or captured provider error</td><td>Captured token and stale-context fence</td><td>Acknowledged TTS flush may clear slot once</td><td>May cross turns</td></tr><tr><td>Delivery unknown after output</td><td>Drain/interruption deadline or captured provider error</td><td>Captured token, tombstone, invalid connection epoch</td><td>Tears down old output lane before retiring slot; no same-lane reuse</td><td>May cross turns</td></tr></tbody></table>
+<h2>Testing Notes</h2>
+<h3>Test Approach</h3>
+<ul><li>[x] Unit-test scheduler lease/token transitions independently of Pipecat.</li><li>[x] Test the internal state machine, marker ordering, tombstone fence, and both TTS</li></ul>
+<p>integration paths.</p>
+<ul><li>[x] Test the generic upstream error observer/provider hook with a real-shape</li></ul>
+<p>context-free <code>ErrorFrame</code>, separately from the local context-bearing callback.</p>
+<ul><li>[x] Exercise pinned SmallWebRTC output with a controlled real audio-track future.</li><li>[x] Reproduce the two-query ordering with deterministic events rather than wall</li></ul>
+<p>clock sleeps.</p>
+<ul><li>[x] Drive monotonic reads and timer wakeups with one manual scheduler; do not use</li></ul>
+<p>wall-clock sleeps for deadline boundaries.</p>
+<ul><li>[x] Use an ordered event-log spy for interruption, pause, flush, teardown, slot</li></ul>
+<p>retirement, and next-admission precedence.</p>
+<ul><li>[x] Run the full credential-free Python suite, formatter, and linter.</li></ul>
+<h3>Test Results</h3>
+<ul><li>[x] Targeted lifecycle tests pass.</li><li>[x] Deterministic two-query regression passes.</li><li>[x] Full test suite passes.</li><li>[x] <code>ruff format --check</code> and <code>ruff check</code> pass.</li></ul>
+<h3>Edge Cases Tested</h3>
+<ul><li>[x] Final result arrives before its timeout notice starts.</li><li>[x] Final result arrives after its timeout notice starts.</li><li>[x] Duplicate or stale transport start/stop event.</li><li>[x] A interrupted before start, B pending, then late A start/audio/stop.</li><li>[x] A paused before start, explicit resume requested before and after barrier</li></ul>
+<p>resolution, then late A start/audio/stop.</p>
+<ul><li>[x] Interruption, pause, cancellation, shutdown, or reconnect before transport</li></ul>
+<p>stop.</p>
+<ul><li>[x] Generic upstream provider error, local context-bearing error, or no start/end</li></ul>
+<p>lifecycle.</p>
+<ul><li>[x] Start, drain, and interruption-cleanup deadline boundaries; zero audio; and</li></ul>
+<p>stop-versus-expiry in both deterministic orders.</p>
+<ul><li>[x] Output-submitted expiry rejects B until old-lane teardown completes; a late</li></ul>
+<p>fieldless A stop can never be observed on B's fresh lane.</p>
+<ul><li>[x] Missing TTS and inactive/stale connection.</li><li>[x] Mixed same-work queue removes only the timeout-notice role and preserves all</li></ul>
+<p>other item order.</p>
+<ul><li>[x] Another work item's queued speech is unaffected.</li></ul>
+<h2>Acceptance Criteria</h2>
+<ul><li>Per-work queues retain within-work FIFO and current cross-work selection behavior;</li></ul>
+<p>exactly one generation may occupy the global transport slot.</p>
+<ul><li><code>SpeechLifecycleCoordinator</code> is the sole slot/ledger mutation authority;</li></ul>
+<p><code>SpeechScheduler</code> owns queues/selection and all adapters call token-bearing coordinator APIs.</p>
+<ul><li>The marker/context ledger never obtains identity from a fieldless bot event, and</li></ul>
+<p>late frames for A cannot bind to or release B.</p>
+<ul><li>Synthesis end and raw timer expiry do not clear an output-active slot. Normal</li></ul>
+<p>transport stop clears it once; otherwise acknowledged no-audio TTS flush or completed connection-scoped output teardown retires it exactly once before any fresh admission.</p>
+<ul><li>In the reported A/B interleaving, B's timeout notice remains queued, is removed</li></ul>
+<p>when B's final result becomes ready, never reaches TTS/output, and B's final result plays after A without interrupting A.</p>
+<ul><li>Once a timeout notice has transport-started, final-result arrival does not</li></ul>
+<p>interrupt it; the final result still commits and is delivered according to the existing active-epoch policy.</p>
+<ul><li>Barge-in records interruption before transport cleanup and never automatically</li></ul>
+<p>advances previously queued speech.</p>
+<ul><li>Pause records <code>paused</code> before cleanup, retains the barrier, and permits explicit</li></ul>
+<p>resume to enqueue a fresh generation only after that barrier resolves.</p>
+<ul><li>Manual-clock/timer tests prove the 10-second start watchdog,</li></ul>
+<p>duration-plus-one-second drain deadline, forwarded-at-plus-one-second interruption deadline, zero-audio path, both provider-error paths, and stop-versus-expiry races.</p>
+<ul><li>A pinned SmallWebRTC contract test proves slot release waits for the controlled</li></ul>
+<p>final-audio future and upstream stop.</p>
+<ul><li>The A/B regression uses a mixed same-work queue and proves only the exact timeout</li></ul>
+<p>notice is removed, other same-work and cross-work ordering is preserved, and the final result is enqueued atomically.</p>
+<ul><li>Parameterized tests prove queue isolation, one-slot safety, marker ordering,</li></ul>
+<p>generic/local error attribution, every terminal-path stale-context fence, fail-closed fallback liveness, cleanup ordering, and both TTS integration paths.</p>
+<ul><li>Protocol and changelog documentation are current, with no package version bump,</li></ul>
+<p>tag, or release created by this plan.</p>
+<ul><li>The v0.1.3 plan names this reviewed precursor as a Phase 2 prerequisite.</li><li><code>uv run ruff format --check .</code>, <code>uv run ruff check .</code>, and <code>uv run pytest -q</code></li></ul>
+<p>pass before merge.</p>
+<p>&lt;!-- reviewed: 2026-07-30 @ 3e4e2ed71916d02a4ff6049fa3240ba7761f5dda --&gt;</p>
+<h2>Progress</h2>
+<ul><li>[x] Phase 1: Add the correlated generation state machine and transport slot</li><li>[x] Phase 2: Make queued timeout supersession explicit and work-scoped</li><li>[x] Phase 3: Document the boundary and run cross-phase validation</li></ul>
+<h2>Findings</h2>
+<ul><li>The 2026-07-28 trace demonstrates that scheduler-queue state and actual output</li></ul>
+<p>playback state diverge after synthesis completion.</p>
+<ul><li>Commit <code>73d1a7c</code> implements queue-only work-item discard but cannot remove a notice</li></ul>
+<p>already submitted to the output transport.</p>
+<ul><li>Phase 1 fix loop surfaced a genuine wiring bug (missing <code>await</code> on</li></ul>
+<p><code>SpeechLifecycleCoordinator.on_transport_bot_stopped</code>) and a missing <code>start_next()</code>/marker-consumption gap on the interruption/pause path; both were fixed within the fix loop. Iteration 2 correctly identified 3 remaining test failures as test-contract mismatches (tests asserting behavior the plan explicitly forbids) rather than implementation bugs; the test-writer then aligned those 3 assertions with the already-tested Phase 1 contract.</p>
+<ul><li>Post-conduct review found two host-integration gaps: the SmallWebRTC teardown</li></ul>
+<p>callback acknowledged completion without awaiting physical disconnect, and the terminal callback could advance queued speech after pause/interruption cleanup.</p>
+<ul><li>A subsequent xhigh-effort <code>/code-review --fix</code> pass over the full branch diff</li></ul>
+<p>found 10 further confirmed findings (7 correctness, 3 cleanup): a pause command could tombstone unrelated active speech when its target was only queued; <code>shutdown()</code> could skip scheduler cleanup after a failed output teardown; browser reconnect never routed through the lifecycle coordinator, leaking the old connection; <code>TTSStartedFrame</code> and the timeout-cleanup path each had their own stale-frame race that could let audio reach output for an abandoned generation; a walrus-operator override check silently dropped a legitimate <code>0.0</code> TOML value instead of erroring; the <code>delivery_completed</code> event bypassed the lifecycle coordinator gate; plus a dead scheduler method and a duplicated business-rule mapping.</p>
+<ul><li>A follow-on gap sweep found a multi-intent work item's timeout notice being</li></ul>
+<p>misattributed to <code>ROLE_RESULT</code>, and a speech-submission failure not releasing the lifecycle slot on the failure path.</p>
+<ul><li>A subsequent adversarial Codex review pass found <code>LocalTTS.run_tts()</code></li></ul>
+<p>yielding <code>TTSAudioRawFrame</code> without a <code>context_id</code>, unlike its sibling <code>TTSStartedFrame</code>/<code>TTSStoppedFrame</code> calls; every local-TTS audio chunk skipped both <code>audio_submitted</code> tracking and the stale-frame drop gate, letting audio from an interrupted/tombstoned generation reach output after barge-in.</p>
+<ul><li>A deep-review security lens pass found <code>SpeechLifecycleCoordinator._generations</code></li></ul>
+<p>grew without bound on a long-lived connection, since no path ever popped a terminalized generation.</p>
+<ul><li>A second adversarial Codex review pass, run against the branch diff after</li></ul>
+<p>the above fixes, found two further high-severity gaps: <code>bind_context()</code> bound the first <code>TTSStartedFrame</code> after a marker without verifying it belonged to that marker's own generation (a stale start from a superseded generation could mis-bind a replacement's context, and unbound/stale audio-or-stop frames were still forwarded to output unchecked), and <code>release_flushed_lane()</code> released the global transport slot as soon as cleanup was dispatched without confirming TTS had actually processed the interruption -- letting a still-live old generation's late audio corrupt a newly admitted one. It also found a <code>dispatch_cleanup</code> failure could leave <code>cleanup_pending</code> stuck true forever, wedging all future speech admission on that connection, and that reaped context tombstones (the fix for the unbounded-growth finding above) had no eviction bound.</p>
+<h2>Issues &amp; Solutions</h2>
+<ul><li>Phase 1, iterations 0-1: <code>SpeechLifecycleCoordinator.on_transport_bot_stopped</code></li></ul>
+<p>was called without <code>await</code> in <code>server/pipeline.py</code>, and the coordinator did not call <code>start_next()</code> after synthesis completion + transport release in all paths. Fixed by the implementer across two fix-loop iterations.</p>
+<ul><li>Phase 1, iteration 2: 3 tests in <code>tests/test_pipeline.py</code> asserted behavior</li></ul>
+<p>contradicting explicit Phase 1 requirements (synthesis-end-alone must not release the transport slot; a <code>SpeechGenerationMarkerFrame</code> must precede every <code>TTSSpeakFrame</code> including control acks). The implementer flagged <code>test_contract_mismatch: true</code>; the test-writer fixed the 3 assertions to match the established, already-tested contract instead.</p>
+<ul><li>Post-conduct host fix: <code>_attach_connection</code> now exposes</li></ul>
+<p><code>SmallWebRTCConnection.disconnect</code> as the connection-scoped output barrier. Teardown fences admission, awaits that barrier, and only then acknowledges <code>teardown_complete</code>; absent or failed barriers retain the lifecycle slot. Lifecycle terminal handling advances only active <code>delivery_unknown</code> paths, so pause/interruption cleanup cannot start previously queued speech. Host-level regressions cover both orderings.</p>
+<ul><li>Code-review fix pass (6 commits, one per finding cluster, each with its own</li></ul>
+<p>regression test): <code>1af69cb</code> guards <code>pause()</code>'s tombstone call and <code>shutdown()</code>'s scheduler cleanup on target/state mismatches, and routes <code>SpeechScheduler.interrupt()</code> (reconnect) through the lifecycle coordinator like <code>pause()</code>/<code>cancel()</code> already do. <code>ea59dde</code> adds the missing <code>drop_stale_frame()</code> guard on <code>TTSStartedFrame</code> and tombstones the timeout-driven cleanup path before its first await. <code>3775560</code> fixes the config walrus-truthy bug for <code>0.0</code> overrides and folds the two new timeout fields into the existing validation loop. <code>59c2032</code> gates <code>delivery_completed</code> on <code>has_lifecycle</code> like its sibling branches. <code>c322af2</code> removes the dead <code>discard_queued()</code> method. <code>e7b417d</code> extracts <code>_speech_role_for_child_outcome()</code> so the retained-as-timeout-notice mapping has one definition instead of two.</p>
+<ul><li>Gap-sweep fix <code>1bcb283</code>: multi-intent's second pass now records each</li></ul>
+<p>timeout-notice item's role before committing, so <code>_commit_and_speak</code> tags it <code>ROLE_TIMEOUT_NOTICE</code> instead of the <code>ROLE_RESULT</code> default; a speech submission failure now routes through <code>lifecycle.provider_error()</code> (with a local <code>acknowledge_tts_lane_flush()</code> fallback if that dispatch itself fails) before releasing the scheduler lease.</p>
+<ul><li>Adversarial-review fix <code>16dfa58</code>: <code>LocalTTS.run_tts()</code> now stamps</li></ul>
+<p><code>context_id</code> on its <code>TTSAudioRawFrame</code> yields, matching its sibling started/stopped frames, so local-TTS audio participates in both <code>audio_submitted</code> tracking and the stale-frame drop gate.</p>
+<ul><li>Deep-review fix <code>239e88d</code>: <code>_terminalize_state</code> now pops a generation from</li></ul>
+<p><code>_generations</code> once terminal. <code>_context_tokens</code> is deliberately left unpopped at this point -- <code>drop_stale_frame()</code> needs to distinguish "bound once, now reaped" (unambiguously stale) from "never bound at all" (still possibly live, since <code>bind_context()</code> did not yet verify identity).</p>
+<ul><li><code>a1e6ddb</code> fixes 6 mypy errors surfaced by CI (Optional-narrowing gaps</li></ul>
+<p>across ternaries and one variable whose declared type mypy inferred too narrowly); type-only, no behavior change.</p>
+<ul><li>Second adversarial-review fix pass, split into two commits so each stays</li></ul>
+<p>independently green: <code>dfb159e</code> makes <code>bind_context()</code> require the frame's <code>context_id</code> to match its marker's own <code>utterance_id</code> (rejecting contexts already owned or tombstoned by another generation), makes <code>on_tts_started()</code> report acceptance, and has <code>TransportSpeechLifecycleProcessor</code> drop any TTS started/audio/stopped frame the coordinator does not positively accept; reaped generations now move their context into a bounded LRU tombstone cache (<code>connection_closed()</code> clears it) instead of leaking the mapping forever. <code>433406f</code> removes <code>release_flushed_lane()</code>'s premature-release fast path -- interruption, pause, and cancel now queue a token-bearing <code>SpeechGenerationFlushAckFrame</code> through the TTS lane, and only that frame reaching <code>TransportSpeechLifecycleProcessor</code> (or full connection teardown) may release the slot, with a grace-window timer escalating to verified teardown if the ack never arrives; a <code>dispatch_cleanup</code> failure now also escalates to teardown immediately instead of leaving <code>cleanup_pending</code> stuck.</p>
+<h2>Final Results</h2>
+<p>All 3 phases implemented via <code>/skein:conduct --autonomous</code>, followed by a post-conduct host-integration fix, an xhigh-effort <code>/code-review --fix</code> pass (10 further findings fixed across 6 commits), a follow-on gap sweep, two further adversarial-review/deep-review fix passes, and a CI mypy fix. Final state: 598/598 tests pass, <code>mypy</code>, <code>ruff format --check</code>, and <code>ruff check</code> all clean. Commits: <code>6124040</code> (phase 1), <code>13d1044</code> (phase 2), <code>df0d5e0</code> (phase 3), progress bookkeeping commits <code>9ff8f70</code> and <code>3a5f6c9</code>, the code-review fix commits <code>1af69cb</code>, <code>ea59dde</code>, <code>3775560</code>, <code>59c2032</code>, <code>c322af2</code>, <code>e7b417d</code>, the gap-sweep commit <code>1bcb283</code>, the adversarial-review fix <code>16dfa58</code>, the deep-review fix <code>239e88d</code>, the mypy fix <code>a1e6ddb</code>, and the second adversarial-review fix pass <code>dfb159e</code> + <code>433406f</code>.</p></div>
+  </section>
+</main>
+<footer>
+  Source: <code>~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans/20260728-bug-transport-aware-speech-supersession.md</code> · sha256 <code>0da622a44363</code> ·
+  rendered at <code>2026-08-02 06:31 UTC</code> ·
+  do not hand-edit — regenerate with <code>python3 /Users/vr000m/.claude/plugins/cache/skein/skein/0.5.4/skills/plan-view/generate.py ~/Code/pipecat-ai/pipecat-subagents-lab/docs/dev_plans</code>
+</footer>
+</body>
+</html>

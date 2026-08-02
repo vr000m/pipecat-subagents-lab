@@ -1,0 +1,1245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="plan-view-rich-source-sha256" content="5320db8a362a9cfbdb4b6fc2f96767e6aa04539059237fe361cb59977d4f816b">
+<meta name="plan-view-rich-strategy" content="sections">
+<meta name="plan-view-rich-section-count" content="14">
+<title>Task: Add Pipecat-native latency observability — rich view</title>
+<link rel="preconnect" href="https://rsms.me/">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+<style>
+/* base.css — shared variables, typography, layout, and chip/tab scaffolding.
+ * Loaded once per page. Widget files assume these variables and primitive
+ * classes exist; they should NOT redeclare them.
+ *
+ * Conventions:
+ *   --bg, --bg-elev, --bg-card, --bg-deep   surfaces (deepest → flattest)
+ *   --fg, --fg-dim, --fg-muted              text (strong → faint)
+ *   --border, --border-hi                   hairlines
+ *   --accent + named hues                   semantic colour
+ *
+ * Light + dark are colour-scheme driven; consumers do not need a theme toggle.
+ */
+
+:root {
+  --bg: #0f1115; --bg-elev: #161a22; --bg-card: #1c2230; --bg-deep: #0a0c11;
+  --fg: #e6e9ef; --fg-dim: #9aa3b2; --fg-muted: #6b7280;
+  --border: #2a313d; --border-hi: #3a4250;
+  --accent: #7c9eff;
+  --green: #4ade80; --amber: #fbbf24; --blue: #60a5fa;
+  --red: #f87171; --grey: #9ca3af; --purple: #c084fc;
+  --teal: #5eead4; --pink: #f472b6;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa; --bg-elev: #ffffff; --bg-card: #ffffff; --bg-deep: #f3f4f6;
+    --fg: #111827; --fg-dim: #4b5563; --fg-muted: #9ca3af;
+    --border: #e5e7eb; --border-hi: #d1d5db;
+    --accent: #2563eb;
+    --green: #16a34a; --amber: #d97706; --blue: #2563eb;
+    --red: #dc2626; --grey: #6b7280; --purple: #9333ea;
+    --teal: #0d9488; --pink: #db2777;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px; line-height: 1.6;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em;
+  background: var(--bg-card); padding: 1px 5px; border-radius: 3px;
+}
+
+/* ────────────── Layout primitives ────────────── */
+
+main.page { max-width: 1200px; margin: 0 auto; padding: 32px 40px; }
+
+.banner {
+  background: linear-gradient(135deg, rgba(124,158,255,0.10), rgba(94,234,212,0.06));
+  border-bottom: 1px solid var(--border); padding: 32px 40px;
+}
+.banner .crumb { font-size: 12px; color: var(--fg-dim); margin-bottom: 8px; }
+.banner h1 { margin: 0 0 8px; font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
+.banner .tagline { color: var(--fg-dim); font-size: 14px; max-width: 800px; }
+
+.card {
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px;
+}
+.card.deep { background: var(--bg-deep); }
+
+.section { margin: 24px 0; }
+.section h2 {
+  font-size: 18px; font-weight: 600; margin: 0 0 16px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+.section h3 { font-size: 15px; font-weight: 600; margin: 24px 0 12px; }
+.section h4 {
+  font-size: 13px; font-weight: 600; margin: 18px 0 8px;
+  color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em;
+}
+
+/* ────────────── Chips / pills ────────────── */
+
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500;
+  border: 1px solid transparent;
+}
+.chip.green { background: rgba(74,222,128,0.12); color: var(--green); border-color: rgba(74,222,128,0.30); }
+.chip.amber { background: rgba(251,191,36,0.12); color: var(--amber); border-color: rgba(251,191,36,0.30); }
+.chip.blue  { background: rgba(96,165,250,0.12); color: var(--blue);  border-color: rgba(96,165,250,0.30); }
+.chip.red   { background: rgba(248,113,113,0.12); color: var(--red);   border-color: rgba(248,113,113,0.30); }
+.chip.purple{ background: rgba(192,132,252,0.12); color: var(--purple);border-color: rgba(192,132,252,0.30); }
+.chip.teal  { background: rgba(94,234,212,0.12); color: var(--teal);  border-color: rgba(94,234,212,0.30); }
+.chip.pink  { background: rgba(244,114,182,0.12); color: var(--pink);  border-color: rgba(244,114,182,0.30); }
+.chip.grey  { background: rgba(156,163,175,0.10); color: var(--grey);  border-color: rgba(156,163,175,0.25); }
+
+/* ────────────── Sticky-nav scaffold ────────────── */
+
+nav.sticky-nav {
+  background: var(--bg-elev); border-bottom: 1px solid var(--border);
+  padding: 0 32px; position: sticky; top: 0; z-index: 10;
+  display: flex; gap: 4px; overflow-x: auto;
+  backdrop-filter: blur(10px);
+}
+
+/* ────────────── Tab scaffold (radio + :checked, no JS) ──────────────
+ *
+ * Markup contract (see tabs.html):
+ *   <div class="tabs">
+ *     <input type="radio" name="tabs-{id}" id="tab-{id}-{slot}" class="tab-radio" [checked]>
+ *     <label for="tab-{id}-{slot}" class="tab-label">Label</label>
+ *     ...repeat radio + label for each tab...
+ *     <div class="tab-panel" data-slot="{slot}">…content…</div>
+ *     ...repeat panel...
+ *   </div>
+ *
+ * Panels are hidden by default; the sibling `:checked` radio drives the
+ * matching panel visible via attribute selector + general-sibling combinator.
+ */
+
+.tabs { display: block; }
+.tabs .tab-radio { position: absolute; opacity: 0; pointer-events: none; }
+.tabs .tab-label {
+  display: inline-block; padding: 12px 16px; font-size: 13.5px; font-weight: 500;
+  color: var(--fg-dim); cursor: pointer; border-bottom: 2px solid transparent;
+  transition: color 0.1s, border-color 0.1s; white-space: nowrap;
+}
+.tabs .tab-label:hover { color: var(--fg); }
+.tabs .tab-bar {
+  display: flex; gap: 4px; overflow-x: auto;
+  border-bottom: 1px solid var(--border); margin-bottom: 16px;
+}
+.tabs .tab-panel { display: none; }
+
+/* Each radio activates its sibling label and matching panel. The pattern
+ * relies on consumers giving radio id="tab-{id}-{slot}" and panel
+ * data-slot="{slot}". See tabs.html for the full template. */
+.tabs .tab-radio:checked + .tab-label {
+  color: var(--accent); border-bottom-color: var(--accent);
+}
+
+/* Progress / meta */
+.progress-bar {
+  flex: 1; max-width: 320px; height: 8px; background: var(--bg-card);
+  border-radius: 4px; overflow: hidden; border: 1px solid var(--border);
+}
+.progress-bar .fill { height: 100%; background: var(--green); transition: width 0.3s; }
+
+footer.page-footer {
+  text-align: center; padding: 32px 40px; color: var(--fg-muted);
+  font-size: 11px; border-top: 1px solid var(--border); margin-top: 48px;
+}
+
+body { max-width: 1200px; margin: 0 auto; padding: 32px 24px 80px; }
+header.plan-hero { padding: 24px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+header.plan-hero h1 { margin: 8px 0 12px; }
+header.plan-hero .meta { color: var(--fg-muted); font-size: 14px; }
+.tab-bar { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--fg-muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<!-- plan-view-rich-backlink -->
+<div class="rich-backlink" style="font-size:13px;margin:0 0 16px;"><a href="index.html">← Plan View</a> · <a href="plan-20260727-feature-latency-observability.html">deterministic view</a></div>
+<header class="plan-hero">
+  <div class="meta">plan-view · rich · 20260727-feature-latency-observability</div>
+  <h1>Task: Add Pipecat-native latency observability</h1>
+  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>5320db8a362a</code> · 14 sections (assembled from fragments)</div>
+</header>
+
+<div class="tabs" data-tabs-id="plan-20260727-feature-latency-observability">
+  <style>
+    /* Scoped tab visibility via :has() — works regardless of the radio's
+       depth in the DOM (radios may live inside a .tab-bar wrapper while
+       panels live outside it; sibling `~` selectors don't work across
+       that boundary, but `:has()` does). Requires :has() support
+       (Chrome/Safari/Firefox 2023+). */
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"] .tab-panel { display: none; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-preamble:checked) .tab-panel[data-slot="preamble"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-objective:checked) .tab-panel[data-slot="objective"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-context:checked) .tab-panel[data-slot="context"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-requirements:checked) .tab-panel[data-slot="requirements"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-review-focus:checked) .tab-panel[data-slot="review-focus"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-implementation-checklist:checked) .tab-panel[data-slot="implementation-checklist"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-technical-specifications:checked) .tab-panel[data-slot="technical-specifications"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-architecture-call-flow:checked) .tab-panel[data-slot="architecture-call-flow"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-testing-notes:checked) .tab-panel[data-slot="testing-notes"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-acceptance-criteria:checked) .tab-panel[data-slot="acceptance-criteria"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-progress:checked) .tab-panel[data-slot="progress"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-findings:checked) .tab-panel[data-slot="findings"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-issues-solutions:checked) .tab-panel[data-slot="issues-solutions"] { display: block; }
+    .tabs[data-tabs-id="plan-20260727-feature-latency-observability"]:has(#tab-plan-20260727-feature-latency-observability-final-results:checked) .tab-panel[data-slot="final-results"] { display: block; }
+    /* Each rule is generated as (<id>/<slot> filled per tab):
+       .tabs[data-tabs-id="<id>"]:has(#tab-<id>-<slot>:checked) .tab-panel[data-slot="<slot>"] { display: block; }
+    */
+  </style>
+
+  <div class="tab-bar">
+    <input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-preamble" class="tab-radio" checked>
+<label for="tab-plan-20260727-feature-latency-observability-preamble" class="tab-label">(preamble)</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-objective" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-objective" class="tab-label">Objective</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-context" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-context" class="tab-label">Context</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-requirements" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-requirements" class="tab-label">Requirements</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-review-focus" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-review-focus" class="tab-label">Review Focus</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-implementation-checklist" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-implementation-checklist" class="tab-label">Implementation Checklist</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-technical-specifications" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-technical-specifications" class="tab-label">Technical Specifications</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-architecture-call-flow" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-architecture-call-flow" class="tab-label">Architecture &amp; Call Flow</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-testing-notes" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-testing-notes" class="tab-label">Testing Notes</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-acceptance-criteria" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-acceptance-criteria" class="tab-label">Acceptance Criteria</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-progress" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-progress" class="tab-label">Progress</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-findings" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-findings" class="tab-label">Findings</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-issues-solutions" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-issues-solutions" class="tab-label">Issues &amp; Solutions</label>
+<input type="radio" name="tabs-plan-20260727-feature-latency-observability" id="tab-plan-20260727-feature-latency-observability-final-results" class="tab-radio">
+<label for="tab-plan-20260727-feature-latency-observability-final-results" class="tab-label">Final Results</label>
+  </div>
+
+  <div class="tab-panel" data-slot="preamble">
+<!-- plan-view-rich-section-sha256: 4f1acfc1a318824cc8f3edb0c053e22e93673b1b91ee262fc4eab791cc9a5077 -->
+<header class="section">
+  <h1>Task: Add Pipecat-native latency observability</h1>
+  <p class="chip chip-status-complete">Status: Complete (deep-review round 2 + mypy adoption landed, PR #3 open)</p>
+  <dl class="meta-grid">
+    <div><dt>Component</dt><dd>Pipecat subagents</dd></div>
+    <div><dt>Assigned to</dt><dd>Codex</dd></div>
+    <div><dt>Priority</dt><dd>Medium</dd></div>
+    <div><dt>Branch</dt><dd><code>feature/latency-observability-v0.1.2</code></dd></div>
+    <div><dt>Created</dt><dd>2026-07-27</dd></div>
+    <div><dt>Review Gates</dt><dd>full</dd></div>
+  </dl>
+</header>
+
+</div>
+<div class="tab-panel" data-slot="objective">
+<!-- plan-view-rich-section-sha256: 75eaae97217117847de4e1f212048e9856272438def3542555feaf5b5231e3ea -->
+<section class="section">
+  <h2>Objective</h2>
+  <p>
+    Add grep-friendly, console-only performance telemetry for pipeline startup,
+    conversation turns, user-to-bot speech latency, application routing,
+    delegated search, and retained background completion. Use Pipecat 1.6.0
+    observers for framework-owned timing and retain explicit application
+    timers for work that executes outside Pipecat service processors.
+  </p>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="context">
+<!-- plan-view-rich-section-sha256: 391b1c104121be234e5d473710603b4e3edd82d3c7afa81fe58b64c1607985f7 -->
+<section class="section">
+  <p>
+    The v0.1.1 runtime logs <code>routing_ms</code>, <code>search_ms</code>, and
+    <code>total_ms</code> only after the normal delegated-search path. Direct
+    responses, clarification, failures, cancellation, and retained background
+    completion can return through other paths without an equivalent terminal
+    measurement. The latest delegated measurement is also held in one mutable
+    <code>SessionHost.last_turn_metrics</code> dictionary, primarily for the paid
+    smoke harness.
+  </p>
+
+  <p>Pipecat 1.6.0 provides three relevant observer capabilities:</p>
+
+  <ul>
+    <li>
+      <code>TurnTrackingObserver</code> tracks Pipecat conversation-turn start,
+      end, duration, and interruption. <code>PipelineWorker</code> enables it by
+      default.
+    </li>
+    <li>
+      <code>UserBotLatencyObserver</code> measures user-to-bot speech latency
+      and can consume Pipecat <code>MetricsFrame</code> data for service-level
+      breakdowns.
+    </li>
+    <li>
+      <code>StartupTimingObserver</code> measures processor startup and
+      transport readiness. Small WebRTC reports client connection timing but no
+      SFU-only bot connection timing.
+    </li>
+  </ul>
+
+  <p>
+    These observers see pipeline frames, but the router, persistent-worker
+    selection, hosted web search, foreground timeout, and retained background
+    completion are application operations. Framework and application
+    measurements therefore need separate producers with a shared console
+    format. This release does not project performance telemetry through RTVI
+    or add it to browser state.
+  </p>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="requirements">
+<!-- plan-view-rich-section-sha256: 5606ccd349d864849ea70a536fdef2b1d34703c21963a4cea463928bbfc8a327 -->
+<section class="section" id="requirements">
+  <h2>Requirements</h2>
+
+  <div class="card">
+    <h3>Log format &amp; contract</h3>
+    <ul>
+      <li>Prefix every performance line with the exact literal <code>PERF_METRIC</code>.</li>
+      <li>Emit one single-line, grep-friendly <code>key=value</code> record per event, with <code>event=&lt;stable_name&gt;</code> immediately after the prefix and <code>schema=1</code> immediately after the event.</li>
+      <li>Treat the event registry, field names, units, value grammar, outcome enums, cardinality, and unknown-field rejection rules as a versioned operator-facing contract.</li>
+      <li>Report durations in milliseconds with consistent field names and no transcript, prompt, response, citation URL, provider payload, credential, or exception detail.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Correlation &amp; identity</h3>
+    <ul>
+      <li>Include the available correlation fields: <code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, Pipecat turn number, application <code>turn_id</code>, <code>work_item_id</code>, <code>result_id</code>, and <code>app_worker_id</code>.</li>
+      <li>Keep connection-worker and application-worker identity distinct. Do not guess an application turn ID for a framework event when the mapping is ambiguous.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Observers &amp; pipeline wiring</h3>
+    <ul>
+      <li>Add one <code>StartupTimingObserver</code> and one <code>UserBotLatencyObserver</code> to each browser connection's <code>PipelineWorker</code>.</li>
+      <li>Use the default <code>PipelineWorker.turn_tracking_observer</code>; do not create a duplicate <code>TurnTrackingObserver</code>.</li>
+      <li>Enable Pipecat processor metrics so <code>UserBotLatencyObserver</code> can emit the breakdown supported by processors that actually produce <code>MetricsFrame</code> data.</li>
+      <li>Keep the Pipecat turn-end timeout independent from Smart Turn's user-input completion timeout. Do not change either timeout as part of observability.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Turn &amp; work-item event modeling</h3>
+    <ul>
+      <li>Emit application foreground timing exactly once for every accepted semantic turn, including direct, unsupported, clarification, worker completion, retained acknowledgement, decline, timeout, user control, cancellation, and safe-error outcomes.</li>
+      <li>Model a multi-intent semantic turn as one parent <code>app_turn_foreground</code> event plus one <code>work_item_foreground</code> event per child. The parent records fan-out and exhaustive fan-in counters and a truthful aggregate outcome; child events retain worker-specific timing and outcomes. Every application metric uses the parent semantic <code>turn_id</code>; <code>work_item_id</code> and <code>result_id</code> identify children.</li>
+      <li>Emit a separate correlated terminal event for retained background work, including completed, failed, cancelled, stale-epoch, invalid-result, and duplicate-suppression outcomes.</li>
+      <li>Report retained work, commit, and speech as independent outcome axes so a successful search whose result is suppressed or cannot be spoken is not mislabeled as a failed search.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Sink &amp; ownership</h3>
+    <ul>
+      <li>Route all measurements through an injectable sink. Production uses only a console sink; tests and the smoke harness may inject an in-memory collector keyed by <code>turn_id</code> and <code>work_item_id</code>. The production host must not retain a latest-value measurement cache.</li>
+      <li><code>SessionHost</code> owns the one sink instance for its process-lifetime session. The application composition root defaults it to the console sink and passes the same instance to connection observers and application recorders; tests and smoke construct the host with a collecting sink.</li>
+      <li>Observer handlers must capture an immutable connection context containing only <code>session_id</code>, <code>origin_epoch</code>, and <code>connection_worker</code>, plus the sink and logger. They must not retain or mutate the host, runtime, pipeline worker, publisher, or session state.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Verification &amp; constraints</h3>
+    <ul>
+      <li>Before implementation, verify observer import paths, constructor signatures, callback events and payloads, default turn-tracker behavior, metrics enablement, and Small WebRTC timing fields against the exact locked Pipecat 1.6.0 artifact rather than relying only on the Context Hub's newer source commit.</li>
+      <li>Preserve the paid smoke harness's deterministic latency-budget checks while migrating it away from depending on a stale previous turn's mutable metrics.</li>
+      <li>Keep telemetry in the server console. Do not change <code>shared/</code> schemas, <code>server/rtvi_messages.py</code>, browser reducers, browser rendering, or the v1.0 protocol.</li>
+      <li>Add no new runtime dependency and preserve Pipecat 1.6.0 compatibility.</li>
+      <li>Prepare the coordinated v0.1.2 release metadata in <code>CHANGELOG.md</code>, <code>pyproject.toml</code>, <code>uv.lock</code>, and <code>web/package.json</code> without changing the dependency set.</li>
+    </ul>
+  </div>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="review-focus">
+<!-- plan-view-rich-section-sha256: d6754f48c13f138aa7839f77f434d917a811f3502d2c424c644fae05e3783f63 -->
+<section class="section" id="review-focus">
+  <h2>Review Focus</h2>
+  <ul>
+    <li>Prove that each accepted semantic turn emits exactly one foreground terminal event across every return and exception path in <code>_handle_transcript_impl</code>, <code>_handle_pending</code>, and <code>_handle_multi_intent</code> — all three are terminal-path owners for accepted semantic turns.</li>
+    <li>Prove that every registered retained work item emits exactly one background terminal event, while callbacks after finalization emit none, and that stale, cancelled, invalid, duplicate, disconnected, and TTS-less outcomes are accurately labelled without changing existing lifecycle behavior.</li>
+    <li>Prove that multi-intent fan-out emits one parent and one child event per work item, including mixed, retained, and partially failed fan-in results.</li>
+    <li>Verify that observer callbacks cannot keep a replaced connection alive or mutate authoritative session state.</li>
+    <li>Verify that the default turn tracker is used once, and that observer turn numbers are not falsely presented as application <code>turn_id</code> values.</li>
+    <li>Confirm <code>enable_metrics=True</code> does not change media behavior and that missing processor metrics produce a partial breakdown rather than an error.</li>
+    <li>Treat <code>PERF_METRIC</code> field names and event names as an operator-facing logging contract; formatter tests reject unknown, multiline, malformed, non-finite, or structurally invalid fields, while producer tests prove sensitive/content inputs never enter allowed identity fields.</li>
+    <li>Confirm the scope remains console-only and causes no RTVI protocol or browser state drift. <code>enable_metrics=True</code> alone is not sufficient for this: it feeds <code>MetricsFrame</code>s to the RTVI observer, whose <code>RTVIObserverParams.metrics_enabled</code> defaults to <code>True</code> and forwards them to the client. <code>server/app.py</code> therefore passes <code>rtvi_observer_params=RTVIObserverParams(metrics_enabled=False)</code> to <code>PipelineWorker</code>, and only that field is overridden so future framework defaults are not frozen.</li>
+  </ul>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="implementation-checklist">
+<!-- plan-view-rich-section-sha256: f47bf2df81b88ed9e67af0c31203853fc3678f0f2449fd39f4df0b4d45f2b60a -->
+<section class="section">
+<h2>Implementation Checklist</h2>
+<p>All three phases land as sequential commits on <code>feature/latency-observability-v0.1.2</code> per AGENTS.md's feature-branch workflow; the branch merges to <code>main</code> only after Phase 3's validation gate passes, not phase-by-phase.</p>
+
+<div class="tabs" data-tabs-id="impl-checklist">
+  <style>
+    .tabs[data-tabs-id="impl-checklist"] .tab-panel { display: none; }
+    .tabs[data-tabs-id="impl-checklist"]:has(#tab-impl-checklist-phase1:checked) .tab-panel[data-slot="phase1"] { display: block; }
+    .tabs[data-tabs-id="impl-checklist"]:has(#tab-impl-checklist-phase2:checked) .tab-panel[data-slot="phase2"] { display: block; }
+    .tabs[data-tabs-id="impl-checklist"]:has(#tab-impl-checklist-phase3:checked) .tab-panel[data-slot="phase3"] { display: block; }
+  </style>
+
+  <div class="tab-bar">
+    <input type="radio" name="tabs-impl-checklist" id="tab-impl-checklist-phase1" class="tab-radio" checked>
+    <label for="tab-impl-checklist-phase1" class="tab-label">Phase 1 <span class="chip grey" style="margin-left:6px;">18</span></label>
+    <input type="radio" name="tabs-impl-checklist" id="tab-impl-checklist-phase2" class="tab-radio">
+    <label for="tab-impl-checklist-phase2" class="tab-label">Phase 2 <span class="chip grey" style="margin-left:6px;">15</span></label>
+    <input type="radio" name="tabs-impl-checklist" id="tab-impl-checklist-phase3" class="tab-radio">
+    <label for="tab-impl-checklist-phase3" class="tab-label">Phase 3 <span class="chip grey" style="margin-left:6px;">5</span></label>
+  </div>
+
+  <div class="tab-panel" data-slot="phase1">
+    <h3>Phase 1: Performance log contract and Pipecat observers</h3>
+    <div class="card" style="margin-bottom:16px;">
+      <div style="margin-bottom:8px;"><strong>Impl files:</strong> <code>server/perf_metrics.py</code>, <code>server/app.py</code>, <code>server/pipeline.py</code>, <code>README.md</code>, <code>docs/architecture.md</code></div>
+      <div style="margin-bottom:8px;"><strong>Test files:</strong> <code>tests/test_perf_metrics.py</code>, <code>tests/test_app.py</code>, <code>tests/test_pipeline.py</code></div>
+      <div style="margin-bottom:8px;"><strong>Test command:</strong> <code>uv run pytest tests/test_perf_metrics.py tests/test_app.py tests/test_pipeline.py -q</code></div>
+      <div><strong>Goal:</strong> Framework-owned timings must be emitted through one safe, stable console contract without duplicating Pipecat's default turn tracker.</div>
+    </div>
+    <ul>
+      <li>Verify the selected observer imports, constructors, callback event names and payloads, default tracker property and timeout, <code>enable_metrics</code> behavior, and Small WebRTC timing fields against the exact installed/locked Pipecat 1.6.0 artifact. Capture this as focused import/signature tests and an observer runtime smoke; if it disagrees with Context Hub results, update the plan and re-run review before coding around the mismatch. This verification step lands as its own first commit within Phase 1, gating every subsequent observer-wiring commit behind it &mdash; a failed verification here invalidates the review marker per Verified Starting Facts.</li>
+      <li>Add a small performance logging module that implements the normative registry below, rejects unknown events and fields, accepts only allowlisted scalar values, formats milliseconds consistently, and emits one <code>PERF_METRIC event=... schema=1 ...</code> line through an injectable sink.</li>
+      <li>Add both <code>ConsoleMeasurementSink</code> and <code>CollectingMeasurementSink</code> in this phase, in <code>server/perf_metrics.py</code>. Both are Phase 1 deliverables: <code>ConsoleMeasurementSink</code> is the production default, and <code>CollectingMeasurementSink</code> is required by this phase's own collector-identity-injection tests, not deferred to Phase 2.</li>
+      <li>Add a keyword-only <code>measurement_sink: MeasurementSink | None = None</code> parameter to <code>_default_session_host</code> (server/app.py:285), forwarded into the <code>SessionHost(...)</code> constructor call &mdash; consistent with that function's existing pattern of optional keyword params (<code>router</code>, <code>router_responses_factory</code>). This is the seam Phase 2's smoke migration depends on.</li>
+      <li>Add immutable <code>PerfConnectionContext</code> and callback factories that capture only that value object, the sink, and logger.</li>
+      <li>Add the <code>SessionHost</code> sink constructor/storage seam in this phase, default it with an optional keyword-only <code>measurement_sink=None</code> parameter. Resolve <code>None</code> exactly once inside <code>SessionHost</code> to <code>ConsoleMeasurementSink</code>, keep <code>_default_session_host</code> explicit, preserve all existing direct constructor calls, and pass the same instance into connection observer factories. A preconstructed host supplied to <code>create_app(host=...)</code> or <code>serve(host=...)</code> retains its own sink. Defer application-turn recorders and <code>last_turn_metrics</code> removal to Phase 2.</li>
+      <li>Add per-connection <code>StartupTimingObserver</code> and <code>UserBotLatencyObserver</code> instances and register event handlers before the worker starts.</li>
+      <li>Pass the observers through <code>PipelineWorker(observers=[...])</code> and set <code>PipelineParams(enable_metrics=True)</code>.</li>
+      <li>Register handlers on <code>worker.turn_tracking_observer</code> after worker construction; fail clearly in tests if Pipecat's enabled-by-default contract changes.</li>
+      <li>Log pipeline startup, transport readiness, Pipecat turn start/end, interruption, first-bot-speech latency, user-to-bot latency, and available service breakdowns with session/connection identity.</li>
+      <li>Update the <code>FakePipelineWorker</code> in <code>tests/test_pipeline.py</code> to expose the default <code>turn_tracking_observer</code> seam expected by application construction.</li>
+      <li>Test <code>enable_metrics=False</code> versus <code>True</code> and no, partial, and full <code>MetricsFrame</code> breakdowns. Omit unavailable values without zero-filling or errors, while proving processor order, sample rates, transcript flow, TTS, and media behavior are unchanged.</li>
+      <li>Test that <code>transport_ready</code> omits <code>bot_connected_ms</code> under the Small WebRTC transport this app uses (SFU-only field) and includes it only when the transport actually supplies it; never zero-fill it.</li>
+      <li>Run paired synthetic pipelines through the real locked <code>PipelineWorker</code>, once with processor metrics disabled and once enabled. Assert identical processor order, sample rates, transcript/TTS calls, and downstream media-frame traces after excluding expected metrics-observation frames.</li>
+      <li>Test that only <code>pipecat_turn</code> identifies framework turns, observer callbacks publish no RTVI messages, and replacement leaves old-epoch handlers console-only and collectible by weak-reference/GC checks.</li>
+      <li>Document the framework event contract, exact grep filters, partial metrics, identity semantics, and console-only boundary in this phase.</li>
+    </ul>
+  </div>
+
+  <div class="tab-panel" data-slot="phase2">
+    <h3>Phase 2: Complete application-turn and retained-work timing</h3>
+    <div class="card" style="margin-bottom:16px;">
+      <div style="margin-bottom:8px;"><strong>Impl files:</strong> <code>server/pipeline.py</code>, <code>server/perf_metrics.py</code>, <code>server/work_item_coordinator.py</code>, <code>scripts/smoke_conversation.py</code>, <code>README.md</code>, <code>docs/architecture.md</code></div>
+      <div style="margin-bottom:8px;"><strong>Test files:</strong> <code>tests/test_pipeline.py</code>, <code>tests/test_perf_metrics.py</code>, <code>tests/test_work_item_coordinator.py</code>, <code>tests/test_smoke_conversation.py</code>, <code>tests/test_session_host.py</code></div>
+      <div style="margin-bottom:8px;"><strong>Test command:</strong> <code>uv run pytest tests/test_pipeline.py tests/test_perf_metrics.py tests/test_work_item_coordinator.py tests/test_smoke_conversation.py tests/test_session_host.py -q</code></div>
+      <div><strong>Goal:</strong> Every accepted application turn and retained work item must reach one unambiguous terminal metric without altering routing, search, speech, or reconnect behavior. This covers all three terminal-path owners: <code>_handle_transcript_impl</code>, <code>_handle_pending</code>, and <code>_handle_multi_intent</code>.</div>
+    </div>
+    <ul>
+      <li>Replace the delegated-path-only timing assignment with a parent turn recorder and child work-item recorders that use <code>time.perf_counter()</code> and finalize once.</li>
+      <li>Cover all three accepted-turn terminal-path owners, not only <code>_handle_transcript_impl</code>: <code>_handle_pending</code> and <code>_handle_multi_intent</code> are separate functions with their own early-exit returns and must carry the parent recorder too. Map each verified early-exit branch to its outcome: <code>_handle_transcript_impl</code>'s <code>if worker is None: return outcome</code> (pipeline.py:669) is parent <code>failed</code> / child <code>missing_worker</code>; its <code>if search is None: return outcome</code> (pipeline.py:673) is parent <code>failed</code> / child <code>missing_search</code>; <code>_handle_pending</code>'s <code>if search is None: return outcome</code> (pipeline.py:765) is parent <code>failed</code> / child <code>missing_search</code> for the continued pending work item. <code>_handle_multi_intent</code>'s per-item early returns (routing exception, direct/unsupported/clarify, dispatch exception at pipeline.py:848/866/877/886) already assign explicit per-item result text inline; each already corresponds one-to-one with a child outcome/counter, and the child telemetry recorder must be created and finalized at those exact per-item branch points.</li>
+      <li>Record routing, delegated search, commit/enqueue, foreground acknowledgement, and foreground-total durations when those stages exist; omit unavailable stages instead of writing misleading zeroes.</li>
+      <li>Label direct, unsupported, clarification, completed, mixed, retained, capacity/retention rejection, declined, cancelled, and safe-error outcomes explicitly. For multi-intent turns, emit child counters and one child record per fan-out item.</li>
+      <li>Extend internal <code>LateResult</code> first with a backward-compatible structured <code>terminal_kind</code> (<code>completed</code>, <code>failed</code>, or <code>cancelled</code>) so application telemetry does not infer cancellation from an error string. Preserve existing sanitized error/result fields and coordinator callback-suppression behavior; land its focused tests before consumers depend on it. This is its own commit within Phase 2: <code>terminal_kind</code> and its tests must merge before the <code>on_late_terminal</code> hook or registry (below) share its enum values, so no within-phase commit leaves <code>on_late_terminal</code> depending on an untested vocabulary. <code>on_late_terminal</code> does not read <code>LateResult.terminal_kind</code> directly &mdash; it fires before <code>LateResult</code> is constructed (see below) and derives the same three-value classification independently from the task object; <code>LateResult.terminal_kind</code> is what the normal (non-shutdown-guarded) callback path and other consumers use once <code>LateResult</code> exists.</li>
+      <li>Add an optional synchronous coordinator <code>on_late_terminal(work_item_id, terminal_kind)</code> hook that claims the recorder whenever retained work becomes terminal, before the existing shutdown guard can suppress <code>on_late_complete</code>. The hook performs no application mutation and does not change existing completion-callback suppression. Concretely: in <code>retain_late_task</code>'s <code>completed()</code> done-callback closure (work_item_coordinator.py:269-306), the <code>if self._shutdown: return</code> guard (line 275) exits before the try/except terminal-kind classification block (277-296) runs, so <code>on_late_terminal</code> must be invoked as the very first statement inside <code>completed()</code>, before that guard, classifying terminal_kind directly from the task object (<code>completed_task.cancelled()</code> &rarr; <code>cancelled</code>; <code>completed_task.exception() is not None</code> &rarr; <code>failed</code>; else &rarr; <code>completed</code>) rather than from the <code>LateResult</code> built later &mdash; this is the only way the hook fires under both the normal path and the shutdown-guard-suppressed path.</li>
+      <li>Add the host-owned retained-recorder registry and an atomic recorder state machine: <code>pending</code>, <code>claimed</code>, <code>commit_recorded</code>, <code>speech_recorded</code>, <code>finalized</code>. Each transition is idempotent and stores its explicit outcome before the next await. The existing <code>_known_work_items</code> and <code>_cancelled_work_items</code> sets (pipeline.py:302-303) remain the sole behavioral authority for cancellation/dedup logic; the new registry is telemetry-only. Recorder outcome classification in <code>_commit_late_result</code> must derive from the same branch conditions that already mutate those two sets, never from an independent re-derivation, so the two bookkeeping structures cannot diverge.</li>
+      <li>Create each provisional retained recorder before registering its coordinator callback. For single work, the callback captures the recorder directly. For multi-intent submission, build an immutable recorder map keyed by the deterministic <code>work_item_id</code> before coordinator callback registration; the shared callback resolves only through that captured map, never the host registry. After submit accepts retained ownership, register each recorder with <code>SessionHost</code> only if it has not already finalized. This two-phase, idempotent handoff must handle completion racing the acceptance return without losing or duplicating a metric.</li>
+      <li>Carry the retained-work start time and identifiers to the late-result handler, then emit one background terminal metric with separate <code>work_outcome</code>, <code>commit_outcome</code>, and <code>speech_outcome</code> fields for every completion or suppression path.</li>
+      <li>During <code>SessionHost.shutdown</code>, let <code>coordinator.shutdown()</code> cancel/settle retained work and its callback tasks first. <code>_commit_late_result</code> catches callback cancellation and records the actual commit/speech stage reached. After coordinator shutdown returns, finalize only recorders still open: unclaimed work is shutdown-cancelled, while claimed work uses its recorded terminal kind and reached stage. Connection replacement does not finalize the process-lifetime registry.</li>
+      <li>Keep exact <code>turn_id</code>, <code>work_item_id</code>, worker, result, session, and epoch identifiers where the application owns that mapping.</li>
+      <li>Inject a collector into tests and smoke runs instead of preserving <code>last_turn_metrics</code>; never let a direct turn inherit measurements from the preceding delegated turn. <code>scripts/smoke_conversation.py</code> calls <code>_default_session_host(measurement_sink=CollectingMeasurementSink())</code> (using the Phase 1 keyword-only seam) instead of the current bare <code>_default_session_host()</code> (scripts/smoke_conversation.py:39).</li>
+      <li>Migrate the smoke harness and its deterministic stale-turn tests in the same phase/commit that removes <code>last_turn_metrics</code>, preserving routing/total budgets and the <code>SMOKE_RESULT=</code> summary contract.</li>
+      <li>Build branch/fault tables for every return, helper exception, and <code>CancelledError</code> path in <code>_handle_transcript_impl</code>, and for every branch and completion/cancellation race in <code>_commit_late_result</code>. Prove exactly-once metrics without changing existing return, exception, result, or speech behavior.</li>
+      <li>In <code>_commit_late_result</code>, classify work, attempt or suppress authoritative commit, attempt or suppress TTS enqueue/start, and only then finalize the recorder from explicit stage outcomes.</li>
+      <li>Document parent/child fan-out, retained lifecycle ownership, timing boundaries, and the orthogonal background outcome axes in this phase.</li>
+    </ul>
+  </div>
+
+  <div class="tab-panel" data-slot="phase3">
+    <h3>Phase 3: Release validation and benchmark evidence</h3>
+    <div class="card" style="margin-bottom:16px;">
+      <div style="margin-bottom:8px;"><strong>Impl files:</strong> <code>docs/benchmarks/20260724-speech-latency.md</code>, <code>CHANGELOG.md</code>, <code>pyproject.toml</code>, <code>uv.lock</code>, <code>web/package.json</code></div>
+      <div style="margin-bottom:8px;"><strong>Test files:</strong> None</div>
+      <div style="margin-bottom:8px;"><strong>Test command:</strong> <code>uv run pytest -q</code></div>
+      <div style="margin-bottom:8px;"><strong>Validation cmd:</strong> <code>uv lock --check && uv run ruff format --check . && uv run ruff check . && uv run pytest -q && (cd web && bun run build && bun test && bun run lint) && uv run python scripts/smoke_server.py && gitleaks git --no-banner --redact</code></div>
+      <div><strong>Goal:</strong> Operators must be able to isolate complete performance records with <code>rg</code>, while existing paid latency budgets and the v0.1.1 benchmark baseline remain reproducible.</div>
+    </div>
+    <ul>
+      <li>Preserve the dated benchmark as historical evidence and document how future live runs should append measurements rather than rewriting the baseline.</li>
+      <li>Add the v0.1.2 changelog entry and synchronize the Python lock/project and Bun package versions. Allow no dependency additions or lock-content drift beyond the version change.</li>
+      <li>Run the credential-safe full suite and static checks. Record local-media and paid hosted-search smoke results separately when the required services and credentials are available.</li>
+      <li>Run the deterministic credential-free real-process server smoke after the browser build to verify startup, HTTP/session boundaries, assets, and clean shutdown.</li>
+      <li>Prove the base diff contains no changes under <code>shared/</code>, <code>server/rtvi_messages.py</code>, or <code>web/src/</code>, and that dependency manifests differ only in the approved v0.1.1-to-v0.1.2 version fields. Run this as documented shell commands, not a checked-in script: <code>git diff --stat</code>/<code>git diff --name-only</code> against the merge-base, plus a <code>jq</code>/manual parse of <code>pyproject.toml</code>, <code>uv.lock</code>, and <code>web/package.json</code> version fields, executed immediately before the <code>Validation cmd</code> line.</li>
+    </ul>
+  </div>
+</div>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="technical-specifications">
+<!-- plan-view-rich-section-sha256: 223b82030e0a019b93c2fa090dfe6ed5b93a77d38b3d36f17f77a1da7efcb485 -->
+<section class="section">
+<h2>Technical Specifications</h2>
+
+<h3>Verified Starting Facts</h3>
+<ul>
+<li>The working branch <code>feature/latency-observability-v0.1.2</code> and the annotated <code>v0.1.1</code> tag both resolve to commit <code>d83657c381bdca8619a364f1c8dd82f1dd6ae41c</code> as of plan creation.</li>
+<li><code>pipecat-ai[cartesia,deepgram,openai,webrtc,runner]==1.6.0</code> is pinned in <code>pyproject.toml:9</code>; the Pipecat Context Hub indexed against 1.6.0 reports the three selected observer import paths as current and non-deprecated. The Hub's indexed source commit is newer than the 1.6.0 release artifact, so Phase 1 must verify the exact locked artifact before treating callback details as stable.</li>
+<li>The browser connection constructs one <code>PipelineWorker</code> in <code>server/app.py:193-202</code>, currently without explicit observers and without <code>enable_metrics=True</code>.</li>
+<li><code>SessionHost.last_turn_metrics</code> is one mutable dictionary at <code>server/pipeline.py:305</code>.</li>
+<li>The only current assignment and <code>Turn latency</code> log are after delegated search at <code>server/pipeline.py:734-746</code> (the cancelled-work check and <code>_commit_and_speak</code> call are at 734-735; the <code>last_turn_metrics</code> assignment and log itself start at line 737); earlier routing and direct-result returns do not pass through that block.</li>
+<li>Retained background results have multiple terminal and suppression paths in <code>server/pipeline.py:1060-1111</code> and currently emit no correlated duration.</li>
+<li>The paid smoke reads an unqualified copy of <code>host.last_turn_metrics</code> at <code>scripts/smoke_conversation.py:90</code> and <code>scripts/smoke_conversation.py:147</code>.</li>
+<li>Browser protocol kinds are closed in <code>server/rtvi_messages.py:19-46</code>, while browser state and rendering have no latency field. This plan deliberately leaves those contracts unchanged.</li>
+<li>Existing architecture documentation identifies the browser-connection <code>PipelineWorker.run()</code> task as the owner of transport, VAD, Smart Turn, STT, TTS, and RTVI processing at <code>docs/architecture.md:14-16</code>.</li>
+<li>These verified paths, patterns, dependency versions, and git refs are point-in-time plan facts. Correcting a path, pattern, or dependency after review invalidates the review marker and requires re-review; normal git-ref movement after creation does not.</li>
+</ul>
+
+<h3>Performance Event Registry</h3>
+<p>Every record has the prefix <code>PERF_METRIC</code>, followed by <code>event=&lt;name&gt;</code> and <code>schema=1</code>. Required fields must be present; optional fields must be omitted when unknown. No producer may invent zeroes, empty identifiers, or cross-domain IDs to satisfy the schema.</p>
+<p>Every Pipecat 1.6.0 observer payload consumed by this plan is expressed in <strong>seconds</strong> (<code>TransportTimingReport.client_connected_secs</code>/<code>bot_connected_secs</code>, <code>UserBotLatencyObserver</code> latency floats, <code>LatencyBreakdown.*.duration_secs</code>, <code>TurnTrackingObserver</code> <code>duration_secs</code>), while every <code>PERF_METRIC</code> field is <code>_ms</code>. Framework-event producers must multiply by 1000 before formatting; a raw seconds-to-<code>_ms</code> pass-through is wrong by 1000x and would still pass formatter validation (finite, non-negative). Phase 1 adds a test asserting the conversion: feed a known <code>duration_secs</code> value through the real observer callback and assert the emitted <code>_ms</code> field equals <code>duration_secs * 1000</code>, not a raw pass-through.</p>
+
+<div style="overflow-x:auto">
+<table>
+<thead>
+<tr><th>Event</th><th>Cardinality</th><th>Required fields</th><th>Optional fields</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pipeline_startup</code></td><td>Once per pipeline start report</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, <code>total_ms</code></td><td><code>processor_count</code></td></tr>
+<tr><td><code>transport_ready</code></td><td>Once per transport timing report</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, <code>client_connected_ms</code></td><td><code>bot_connected_ms</code></td></tr>
+<tr><td><code>pipecat_turn_start</code></td><td>Once per Pipecat turn start</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, <code>pipecat_turn</code></td><td>None</td></tr>
+<tr><td><code>pipecat_turn_end</code></td><td>Once per Pipecat turn end</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, <code>pipecat_turn</code>, <code>duration_ms</code>, <code>interrupted</code></td><td>None</td></tr>
+<tr><td><code>first_bot_speech_latency</code></td><td>At most once per observer cycle</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, <code>latency_ms</code></td><td>None</td></tr>
+<tr><td><code>user_bot_latency</code></td><td>At most once per completed observer cycle</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, <code>latency_ms</code></td><td>None</td></tr>
+<tr><td><code>service_latency</code></td><td>Once per Pipecat breakdown datum</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>connection_worker</code>, <code>metric_kind</code>, <code>value_ms</code></td><td><code>processor</code> (required for <code>ttfb</code>/<code>text_aggregation</code> kinds, absent for <code>function_calls</code>/<code>user_turn_secs</code>); <code>pipecat_turn</code> only when supplied unambiguously by Pipecat</td></tr>
+<tr><td><code>app_turn_foreground</code></td><td>Exactly once per accepted semantic turn</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>turn_id</code>, <code>outcome</code>, <code>total_ms</code>, <code>child_count</code>, <code>direct_count</code>, <code>unsupported_count</code>, <code>completed_count</code>, <code>retained_count</code>, <code>clarification_count</code>, <code>declined_count</code>, <code>failed_count</code>, <code>cancelled_count</code></td><td><code>control_action</code>, <code>control_outcome</code>, <code>routing_ms</code>, <code>commit_ms</code></td></tr>
+<tr><td><code>work_item_foreground</code></td><td>Exactly once per delegated single-intent child or decomposed multi-intent child</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>turn_id</code>, <code>work_item_id</code>, <code>outcome</code>, <code>total_ms</code></td><td><code>app_worker_id</code>, <code>result_id</code>, <code>search_ms</code>, <code>commit_ms</code></td></tr>
+<tr><td><code>work_item_background</code></td><td>Exactly once per registered retained child work item</td><td><code>session_id</code>, <code>origin_epoch</code>, <code>turn_id</code>, <code>work_item_id</code>, <code>app_worker_id</code>, <code>background_ms</code>, <code>work_outcome</code>, <code>commit_outcome</code>, <code>speech_outcome</code></td><td><code>result_id</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>For a single-intent direct/unsupported turn, the parent event has <code>child_count=0</code>, every child counter is zero, and no child event is emitted. Clarification, decline, or user control before dispatch also uses zero children. User control uses parent <code>outcome=control</code> plus the requested <code>control_action</code> and resulting <code>control_outcome</code>. A delegated single-intent turn emits one child. A decomposed multi-intent turn emits one child record for every decomposed item, including direct, unsupported, clarify, or pre-dispatch failure items. It allocates deterministic <code>work-{parent_turn_id}-{index}</code> telemetry identity before branch selection; this does not create coordinator work for non-runnable items. Every child belongs to exactly one counter:</p>
+<p><code>child_count = direct_count + unsupported_count + completed_count + retained_count + clarification_count + declined_count + failed_count + cancelled_count</code>.</p>
+<p><code>missing_worker</code>, <code>missing_search</code>, <code>capacity_rejected</code>, and <code>retention_rejected</code> child outcomes increment <code>failed_count</code>; <code>clarify</code> increments <code>clarification_count</code>; all other child outcomes increment the same-named counter. A parent outcome is the corresponding child category when exactly one counter is non-zero and is <code>mixed</code> when more than one child counter is non-zero. Background completion never rewrites the foreground parent.</p>
+<p>On every application event, <code>turn_id</code> is the parent semantic-turn ID allocated by <code>_handle_transcript_impl</code>. Child identity is carried only by <code>work_item_id</code> and optional <code>result_id</code>; a child <code>GroundedResult.turn_id</code> is not logged in schema 1.</p>
+
+<p>Allowed outcomes are closed enums:</p>
+<ul>
+<li><code>app_turn_foreground.outcome</code>: <code>direct</code>, <code>unsupported</code>, <code>control</code>, <code>clarify</code>, <code>completed</code>, <code>mixed</code>, <code>retained</code>, <code>declined</code>, <code>failed</code>, <code>cancelled</code>.</li>
+<li><code>control_action</code>: <code>pause</code>, <code>resume</code>, <code>cancel</code>, <code>stop</code>, <code>consent</code>.</li>
+<li><code>control_outcome</code>: <code>applied</code>, <code>unknown_target</code>, <code>no_active</code>, <code>no_pending</code>.</li>
+<li><code>work_item_foreground.outcome</code>: <code>direct</code>, <code>unsupported</code>, <code>completed</code>, <code>retained</code>, <code>clarify</code>, <code>declined</code>, <code>failed</code>, <code>cancelled</code>, <code>missing_worker</code>, <code>missing_search</code>, <code>capacity_rejected</code>, <code>retention_rejected</code>.</li>
+<li><code>work_outcome</code>: <code>completed</code>, <code>failed</code>, <code>cancelled</code>, <code>invalid_result</code>.</li>
+<li><code>commit_outcome</code>: <code>committed</code>, <code>not_applicable</code>, <code>suppressed_cancelled</code>, <code>suppressed_stale</code>, <code>suppressed_duplicate</code>, <code>suppressed_shutdown</code>, <code>failed</code>.</li>
+<li><code>speech_outcome</code>: <code>queued</code>, <code>no_tts</code>, <code>disconnected</code>, <code>stale_connection</code>, <code>cancelled</code>, <code>not_applicable</code>, <code>enqueue_failed</code>, <code>start_failed</code>.</li>
+</ul>
+
+<p><code>metric_kind</code> is limited to the exact Pipecat metric kinds verified in Phase 1; do not pass arbitrary provider labels through. The required/optional field set is fixed per <code>metric_kind</code> during that same Phase 1 verification: against the installed pipecat-ai 1.6.0 <code>LatencyBreakdown</code> shape, <code>processor</code> is present only for <code>ttfb</code> and <code>text_aggregation</code> kinds — <code>function_calls</code> entries carry <code>function_name</code> instead and <code>user_turn_secs</code> is a bare scalar with neither. <code>service_latency.processor</code> is required only for <code>ttfb</code>/<code>text_aggregation</code> datums. Event and field names match <code>[a-z][a-z0-9_]*</code>. Integers and booleans are canonical decimal and lowercase <code>true</code>/<code>false</code>; durations are finite non-negative decimals rounded to one millisecond decimal place. Identifiers and processor names are encoded as JSON-string scalar values so spaces, <code>=</code>, quotes, CR/LF, and control characters cannot split or inject fields. Unknown events, unknown fields, non-finite numbers, nested values, and fields outside the event allowlist are rejected. Required field order follows the registry table; optional fields follow in registry order, making exact-line fixtures deterministic.</p>
+
+<p><code>schema</code> is the exact integer <code>1</code>. <code>origin_epoch</code>, <code>processor_count</code>, <code>child_count</code>, and every category counter are integers greater than or equal to zero; <code>pipecat_turn</code> is an integer greater than or equal to one. Booleans are never accepted as integers, and integer fields reject fractional or string representations. <code>app_turn_foreground</code> validation enforces the normative child-counter sum before emission.</p>
+
+<h3>Timing Boundaries</h3>
+<p>Every duration field's start/stop instant is grounded in the Context Lifecycle table (see Architecture &amp; Call Flow, rows 4-8):</p>
+<ul>
+<li><code>total_ms</code> (<code>app_turn_foreground</code>): starts at semantic-turn acceptance / parent <code>turn_id</code> allocation (row 4), ends at parent terminal-event emission.</li>
+<li><code>routing_ms</code>: starts when routing is requested, ends when the routing decision is received — a sub-span within <code>total_ms</code>.</li>
+<li><code>search_ms</code> / <code>commit_ms</code> (<code>work_item_foreground</code>, child): start at work dispatch (row 5), end at child terminal-event emission.</li>
+<li><code>background_ms</code> (<code>work_item_background</code>): starts at work dispatch / provisional-recorder creation — the same instant as row 5, since the provisional retained recorder is created before callback registration, at dispatch time, not at foreground-timeout/retention-acceptance — and ends at background terminal-event emission (row 8).</li>
+</ul>
+<p>The deterministic-clock tests in Testing Notes assert exact values against these boundaries.</p>
+
+<h3>Measurement Sink Contract</h3>
+<p><code>server/perf_metrics.py</code> defines a narrow <code>MeasurementSink.emit(record)</code> protocol:</p>
+<ul>
+<li><code>SessionHost</code> stores one sink dependency for its lifetime. Its optional keyword-only <code>measurement_sink=None</code> constructor parameter resolves exactly once to <code>ConsoleMeasurementSink</code>; <code>_default_session_host</code> supplies that default explicitly, and <code>_attach_connection</code> obtains that same sink from the host for observer callback factories. Existing direct constructors remain compatible, and <code>create_app(host=...)</code>/<code>serve(host=...)</code> preserve the supplied host's sink. Tests and smoke pass <code>CollectingMeasurementSink</code> into the host constructor. Holding the sink dependency is allowed; holding mutable latest-turn measurement state is not.</li>
+<li><code>ConsoleMeasurementSink</code> is the production default and writes the validated line with Loguru raw-message mode plus exactly one trailing newline so the physical output begins <code>PERF_METRIC event=</code> without logger metadata.</li>
+<li><code>CollectingMeasurementSink</code> is injected only by tests and the paid smoke harness. It indexes immutable records by event, <code>turn_id</code>, and <code>work_item_id</code>; it is not attached to browser state or RTVI publishing.</li>
+<li>Recorders receive a sink explicitly. <code>SessionHost</code> must not expose <code>last_turn_metrics</code> or another latest-value compatibility cache after Phase 2.</li>
+<li>Sink failures are contained and logged outside the <code>PERF_METRIC</code> namespace; telemetry failure must not change routing, result commit, speech, cancellation, or shutdown behavior. Exactly-once means one terminal sink attempt: the recorder finalizes and leaves its registry after that attempt even if the sink raises. There is no retry and no fallback <code>PERF_METRIC</code> output, so a duplicate callback cannot cause a second attempt.</li>
+</ul>
+<p><code>PerfConnectionContext</code> is an immutable value object with <code>session_id</code>, <code>origin_epoch</code>, and <code>connection_worker</code>. Observer callback closures may capture only this object, the sink, and logger. They may not close over <code>SessionHost</code>, <code>ConnectionRuntime</code>, <code>PipelineWorker</code>, RTVI publisher, or mutable session state.</p>
+
+<h3>Files to Modify</h3>
+<ul>
+<li><code>server/app.py</code> — construct observers, register connection-scoped handlers, enable processor metrics, and attach handlers to the default turn tracker. <code>server/observers.py</code> (existing <code>RuntimeObserver</code>, RTVI event projection) is untouched by this plan; all new Pipecat timing-observer wiring lives in <code>server/perf_metrics.py</code> and <code>server/app.py</code>.</li>
+<li><code>server/pipeline.py</code> — measure every accepted application turn and every retained background terminal outcome; own the retained-recorder registry and finalize open recorders after coordinator work/callback tasks settle.</li>
+<li><code>server/work_item_coordinator.py</code> — preserve structured completed/failed/cancelled terminal kind in the internal <code>LateResult</code> callback payload and synchronous telemetry-only terminal hook without changing completion-callback suppression or public routing behavior.</li>
+<li><code>scripts/smoke_conversation.py</code> — consume the current turn's correlated application measurement without stale-value fallback.</li>
+<li><code>tests/test_app.py</code> — verify observer construction, worker wiring, metrics enablement, and connection scope.</li>
+<li><code>tests/test_pipeline.py</code> — verify all application foreground and retained background timing outcomes and exactly-once finalization; update the fake pipeline worker to model the default turn tracker.</li>
+<li><code>tests/test_work_item_coordinator.py</code> — verify structured late terminal kinds, shared multi-intent callback identity, and unchanged shutdown suppression.</li>
+<li><code>tests/test_session_host.py</code> — verify the new <code>measurement_sink</code> constructor parameter and the post-<code>coordinator.shutdown()</code> recorder-finalization step (<code>server/pipeline.py:1290</code>) without changing existing shutdown-ordering assertions.</li>
+<li><code>README.md</code> — document console filters, event meanings, and smoke usage.</li>
+<li><code>docs/architecture.md</code> — document framework-observer versus application-timer ownership and the console-only observability boundary.</li>
+<li><code>docs/benchmarks/20260724-speech-latency.md</code> — preserve the baseline and state how later <code>PERF_METRIC</code> samples should be recorded.</li>
+<li><code>CHANGELOG.md</code> — add the v0.1.2 latency-observability release entry.</li>
+<li><code>pyproject.toml</code> — set the Python package version to 0.1.2 only.</li>
+<li><code>uv.lock</code> — synchronize the root package version without dependency drift.</li>
+<li><code>web/package.json</code> — set the browser package version to 0.1.2 only.</li>
+</ul>
+
+<h3>New Files to Create</h3>
+<ul>
+<li><code>server/perf_metrics.py</code> — stable event names, safe one-line formatting, turn-scoped recorder, and observer callback wiring helpers, plus <code>ConsoleMeasurementSink</code> and <code>CollectingMeasurementSink</code> (both Phase 1 deliverables).</li>
+<li><code>tests/test_perf_metrics.py</code> — formatter, safety, callback, event-name, and exactly-once recorder tests.</li>
+<li><code>tests/test_smoke_conversation.py</code> — deterministic smoke metric-selection and stale-turn regression tests.</li>
+</ul>
+
+<h3>Architecture Decisions</h3>
+<ul>
+<li><strong>Pipecat owns media timing:</strong> use <code>StartupTimingObserver</code>, <code>UserBotLatencyObserver</code>, and the worker's default <code>TurnTrackingObserver</code> rather than recreating frame timing in application code.</li>
+<li><strong>The application owns semantic timing:</strong> use explicit monotonic timers around routing, worker execution, acknowledgement, commit, and retained completion because these do not all execute as metric-emitting Pipecat service processors.</li>
+<li><strong>One textual contract:</strong> all producers call the same formatter and emit <code>PERF_METRIC event=&lt;name&gt; schema=1 ...</code> with milliseconds and safe identifiers.</li>
+<li><strong>Parent and child semantic timing:</strong> a parent application turn records routing and fan-in, while child work-item records own worker/search/commit details. This represents single- and multi-intent dispatch without assigning one worker identity to a fan-out turn. Every child record carries the parent semantic <code>turn_id</code>.</li>
+<li><strong>No false correlation:</strong> Pipecat turn numbers and application turn IDs remain separately named. A framework event omits <code>turn_id</code> when the mapping cannot be proved under overlap, interruption, or late background speech.</li>
+<li><strong>Exactly-once terminal events:</strong> foreground and retained-background recorders are idempotent. Suppression is an outcome, not a missing metric.</li>
+<li><strong>Host owns retained finalization:</strong> a host-owned recorder registry is process-lifetime session state and survives connection replacement. A provisional recorder is created before callback registration, captured by that callback, and registered only if still open after retained acceptance. A synchronous telemetry-only terminal hook claims it before completion callback suppression. <code>WorkItemCoordinator.shutdown()</code> settles work and callback tasks, then the host finalizes any still-open recorder from its claimed terminal kind and reached commit/speech stages. Existing application completion-callback semantics remain unchanged. The existing <code>_known_work_items</code>/<code>_cancelled_work_items</code> sets remain the sole behavioral authority for cancellation and duplicate detection; the recorder registry is telemetry-only and classifies from the same branch conditions, never a parallel re-derivation.</li>
+<li><strong>Orthogonal retained outcomes:</strong> work execution, authoritative commit, and speech delivery are reported independently.</li>
+<li><strong>Partial breakdown is valid:</strong> processor-level fields appear only when Pipecat emitted the corresponding metric. Their absence is not converted to zero and does not fail a turn.</li>
+<li><strong>Console-only in v0.1.2:</strong> no state retention, persistence, RTVI schema, or UI projection is added in production. Test/smoke collection is injected and process-local. The application adds no log persistence; retention depends on deployment-specific stdout/stderr capture, which operators verify in their target environment.</li>
+<li><strong>No timing-policy changes:</strong> Smart Turn and Pipecat turn-end timeouts retain their existing semantics and defaults.</li>
+</ul>
+
+<h3>Dependencies</h3>
+<ul>
+<li>Existing <code>pipecat-ai==1.6.0</code> supplies all three observer classes.</li>
+<li>Existing Loguru usage supplies console logging.</li>
+<li>No Python, browser, schema, or infrastructure dependency is added.</li>
+</ul>
+
+<h3>Integration Seams</h3>
+<div style="overflow-x:auto">
+<table>
+<thead>
+<tr><th>Seam</th><th>Writer (task)</th><th>Caller (task)</th><th>Contract</th></tr>
+</thead>
+<tbody>
+<tr><td>Performance record formatting</td><td>Phase 1 <code>server/perf_metrics.py</code></td><td>Observer callbacks and Phase 2 application timers</td><td>One line beginning <code>PERF_METRIC event=</code>, safe stable keys, milliseconds, no content</td></tr>
+<tr><td>Measurement delivery</td><td>Phase 1 sink protocol</td><td><code>SessionHost</code> composition root, then observers and application recorders</td><td>One host-owned sink instance; console in production, collector in tests/smoke; never latest-value state</td></tr>
+<tr><td>Pipecat frame observations</td><td>Phase 1 observer instances</td><td>Connection-scoped <code>PipelineWorker</code></td><td>Handlers capture immutable connection context, attach before run, release with the worker, and never mutate session state</td></tr>
+<tr><td>Default turn tracking</td><td><code>PipelineWorker</code></td><td>Phase 1 turn handlers</td><td>Use <code>worker.turn_tracking_observer</code> once; preserve Pipecat turn-number semantics</td></tr>
+<tr><td>Application foreground timing</td><td>Phase 2 parent and child recorders</td><td><code>_handle_transcript_impl</code>, <code>_handle_pending</code>, <code>_handle_multi_intent</code>, and Phase 2 smoke</td><td>One parent per accepted <code>turn_id</code>, one child per dispatched <code>work_item_id</code>; absent stages are omitted</td></tr>
+<tr><td>Retained background timing</td><td>Phase 2 provisional recorder map and host registry</td><td>Synchronous coordinator terminal hook, structured completion callback, <code>_commit_late_result</code>, and <code>SessionHost.shutdown</code></td><td>Terminal hook claims before suppression; stage machine records before awaits; coordinator settles callbacks before host finalization; registry survives reconnect</td></tr>
+<tr><td>Smoke budget selection</td><td>Phase 2 collecting sink</td><td>Phase 2 smoke harness</td><td>Select the requested <code>turn_id</code> and expected child; stale prior measurements are invalid</td></tr>
+<tr><td>Operator evidence</td><td>Runtime console</td><td>README and benchmark procedure</td><td>Grep-friendly records are ephemeral unless the operator captures stdout/stderr</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="architecture-call-flow">
+<!-- plan-view-rich-section-sha256: eac31857640a437485a0d4e003c6e1de5866f1dbaf6c17b928c2009f42f20933 -->
+<section class="section">
+  <h2>Architecture &amp; Call Flow</h2>
+
+  <p>Component graph — which component triggers which:</p>
+
+  <pre class="mermaid">graph LR
+    Browser["Browser microphone and audio"] --&gt; Pipeline["Pipecat connection PipelineWorker"]
+    Pipeline --&gt; FrameworkObservers["Pipecat timing observers"]
+    Pipeline --&gt; Transcript["Completed semantic transcript"]
+    Transcript --&gt; Parent["Parent application-turn recorder"]
+    Parent --&gt; Application["SessionHost router and worker dispatch"]
+    Application --&gt; Children["Child work-item recorders"]
+    Children --&gt; SearchA["Persistent worker A and hosted search"]
+    Children --&gt; SearchB["Persistent worker B and hosted search"]
+    Application --&gt; TTS["TTS enqueue"]
+    SearchA --&gt; FanIn["Foreground fan-in"]
+    SearchB --&gt; FanIn
+    FanIn --&gt; Application
+    Children --&gt; Provisional["Provisional retained recorders"]
+    Provisional --&gt; Retained["SessionHost retained-recorder registry"]
+    TTS --&gt; Pipeline
+    FrameworkObservers --&gt; Sink["Validated measurement sink"]
+    Parent --&gt; Sink
+    Children --&gt; Sink
+    Retained --&gt; Sink
+    Sink --&gt; PerfLogger["PERF_METRIC console output"]</pre>
+
+  <p>Trigger order — the sequence of calls across a single run:</p>
+
+  <pre class="mermaid">sequenceDiagram
+    participant B as Browser
+    participant P as Pipecat pipeline
+    participant O as Framework observers
+    participant A as Application coordinator
+    participant W1 as Work item 1
+    participant W2 as Work item 2
+    participant R as Retained registry
+    participant L as PERF_METRIC logger
+
+    B-&gt;&gt;P: User audio
+    P-&gt;&gt;O: VAD user start and stop frames
+    P-&gt;&gt;A: Completed semantic transcript
+    A-&gt;&gt;A: Route and select outcome
+    par Optional fan-out
+        A-&gt;&gt;R: Create provisional recorder before callback registration
+        A-&gt;&gt;W1: Dispatch child work
+    and
+        A-&gt;&gt;R: Create provisional recorder before callback registration
+        A-&gt;&gt;W2: Dispatch child work
+    end
+    W1--&gt;&gt;A: Child result, failure, or foreground timeout
+    W2--&gt;&gt;A: Child result, failure, or foreground timeout
+    A-&gt;&gt;A: Fan-in child classifications
+    alt Foreground completion
+        A-&gt;&gt;P: Enqueue spoken result
+        P-&gt;&gt;O: Bot starts and stops speaking
+        O-&gt;&gt;L: User-bot and turn metrics
+        A-&gt;&gt;L: Child foreground metrics
+        A-&gt;&gt;L: Parent foreground metric
+    else Foreground timeout with retained work
+        A-&gt;&gt;P: Enqueue acknowledgement
+        A-&gt;&gt;R: Register accepted recorder if still open
+        A-&gt;&gt;L: Child retained metrics
+        A-&gt;&gt;L: Parent foreground metric
+        W1--&gt;&gt;R: Late result or failure
+        R-&gt;&gt;A: Work outcome
+        A-&gt;&gt;A: Commit or suppress authoritative result
+        A-&gt;&gt;P: Attempt or suppress late speech
+        A-&gt;&gt;R: Explicit commit and speech outcomes
+        R-&gt;&gt;L: Final background event
+    end
+    opt Connection replacement
+        A-&gt;&gt;A: Replace ConnectionPipeline; retain registry
+    end
+    opt SessionHost shutdown
+        A-&gt;&gt;A: coordinator.shutdown() settles work and callbacks
+        A-&gt;&gt;R: Finalize recorders still open from claimed/reached stages
+    end</pre>
+
+  <p>Context lifecycle — what enters context at each step, and whether it clears or
+  persists:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Step</th>
+          <th scope="col">Trigger</th>
+          <th scope="col">Enters context</th>
+          <th scope="col">Cleared/persisted</th>
+          <th scope="col">Turn boundary</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Browser connection accepted</td>
+          <td>Immutable session ID, origin epoch, connection worker name, observer instances</td>
+          <td>Handlers capture only immutable context and sink; observer references release with the worker</td>
+          <td>Connection boundary</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Pipeline starts</td>
+          <td>Processor names and startup timestamps</td>
+          <td>Startup observer reports once and retains connection-scoped timing state until observer release</td>
+          <td>Pipeline-ready boundary</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>User speech frames flow</td>
+          <td>VAD timestamps and Pipecat turn number</td>
+          <td>Observer state persists until bot speech or turn end</td>
+          <td>Pipecat conversation-turn boundary</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Semantic transcript accepted</td>
+          <td>Parent application turn ID, monotonic start, routing outcome</td>
+          <td>Parent recorder persists through fan-in to exactly one terminal outcome</td>
+          <td>Application semantic-turn boundary</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td>Work dispatches</td>
+          <td>One child recorder and provisional retained recorder per work-item ID and application worker, created before callback registration</td>
+          <td>Callback captures the provisional recorder; child foreground recorder finalizes once at fan-in</td>
+          <td>Work-item boundary</td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td>Work exceeds foreground timeout</td>
+          <td>Accepted retained ownership and provisional recorder</td>
+          <td>Register only if still open; registry survives connection replacement until late completion, suppression, or SessionHost shutdown</td>
+          <td>Foreground acknowledgement boundary</td>
+        </tr>
+        <tr>
+          <td>7</td>
+          <td>Result reaches TTS and bot starts</td>
+          <td>Framework latency and available service metrics</td>
+          <td>Emitted to console; per-cycle observer accumulators reset</td>
+          <td>First bot-speech boundary</td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td>Late work terminates</td>
+          <td>Work, commit, and speech outcomes plus elapsed duration</td>
+          <td>Emitted once and removed from registry</td>
+          <td>Background-work boundary</td>
+        </tr>
+        <tr>
+          <td>9</td>
+          <td>Connection is replaced</td>
+          <td>Old connection observers and origin epoch</td>
+          <td>Release connection objects; process-lifetime retained registry remains and later reports stale commit/speech eligibility</td>
+          <td>Connection boundary</td>
+        </tr>
+        <tr>
+          <td>10</td>
+          <td>SessionHost shuts down</td>
+          <td>Claimed terminal kinds, reached commit/speech stages, and unresolved recorders</td>
+          <td>Coordinator settles work/callbacks first; host then finalizes still-open recorders from recorded state and releases all references</td>
+          <td>Process-session boundary</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="testing-notes">
+<!-- plan-view-rich-section-sha256: 7d59eaaee36b9348fc9ffd67be6584eb1207a0b6077cc95e1130fd85192d33fe -->
+<section class="section" id="testing-notes">
+<h2>Testing Notes</h2>
+
+<h3>Test Approach</h3>
+<ul>
+<li>Unit-test every registered event with its required and optional fields, deterministic ordering — including one fixture asserting <code>app_turn_foreground</code> renders <code>routing_ms</code> before <code>commit_ms</code> (registry table order) whenever both are present — one-decimal millisecond formatting, enum validation, identifier escaping, zero-duration acceptance, and rejection of empty required or supplied optional identifiers, negative durations, unknown keys, nested values, non-finite numbers, CR/LF, control characters, bool-as-int, fractional/string/negative integer fields, invalid turn/epoch ranges, and child-counter sum mismatches. Inject unique transcript, prompt, response, citation, provider-payload, credential, and exception sentinels at each producer boundary and assert none appears in collected records or captured console output.</li>
+<li>Verify exact Pipecat 1.6.0 imports, signatures, callback payloads, the default turn tracker/property and timeout, metrics enablement, and Small WebRTC timing fields before implementing callback adapters.</li>
+<li>Unit-test observer creation and callback registration without live media. Compare <code>enable_metrics=False</code> and <code>True</code>, and exercise no <code>MetricsFrame</code>, TTFB-only, text-aggregation-only, and complete breakdowns. Missing values remain absent; processor order, sample rates, transcript flow, TTS, and media output remain unchanged.</li>
+<li>Run the paired enabled/disabled synthetic trace through the real locked <code>PipelineWorker</code>; compare processor topology, sample rates, transcript/TTS calls, and downstream media frames after filtering only expected metric observations.</li>
+<li>Assert framework identity under overlapping turns, interruption, and two connection epochs: framework records use only <code>pipecat_turn</code>; startup and user-bot records omit IDs Pipecat did not supply. Extend this identity test to <code>service_latency</code>: a <code>MetricsFrame</code> breakdown datum under overlapping/ambiguous turn attribution emits <code>service_latency</code> without <code>pipecat_turn</code>; an unambiguous one includes it.</li>
+<li>Define "observer cycle" for <code>first_bot_speech_latency</code>/<code>user_bot_latency</code> cardinality as one Pipecat conversation turn tracked by the default <code>TurnTrackingObserver</code> (turn start to turn end/interruption). Add a test case: an interrupted turn with no bot speech emits zero <code>first_bot_speech_latency</code>/<code>user_bot_latency</code> events for that turn.</li>
+<li>Inspect each registered observer callback's closure/default state and assert its reachable captures are limited to <code>PerfConnectionContext</code>, the shared sink, and logger. Weak-reference the old RTVI publisher as well as runtime, worker, and observers, and prove all connection-owned objects release after replacement.</li>
+<li>Inject one collector at the application composition root and assert by object identity that the host, observer factories, parent/child recorders, and retained recorders all receive it. Emit framework and application records across connection replacement and prove no second sink is constructed. Also construct <code>SessionHost</code> without the optional argument and through <code>create_app(host=...)</code>/<code>serve(host=...)</code> to prove backward compatibility and preservation of the host-owned sink.</li>
+<li>Test the existing Smart Turn timeout and Pipecat default turn-end timeout behavior under controlled time advancement. Observability must not construct a custom turn tracker or override either timeout.</li>
+<li>Parameterize the foreground branch/fault matrix below. Assert one parent metric per accepted semantic turn, one child metric per dispatched work item, exact parent counters, no inherited stage values, and unchanged return or exception behavior.</li>
+<li>Inject a deterministic monotonic clock and assert exact <code>routing_ms</code>, <code>search_ms</code>, <code>commit_ms</code>, <code>total_ms</code>, and <code>background_ms</code> for representative foreground success, retained completion, and failure paths, against the start and terminal boundaries defined in Technical Specifications &gt; Timing Boundaries.</li>
+<li>Parameterize the retained branch/race matrix below. Assert exactly one background event per accepted retained item and no event after finalization, truthful work/commit/speech axes, registry removal, and unchanged canonical-result and speech behavior.</li>
+<li>Force retained completion before coordinator acceptance returns and immediately after accepted registration. Prove the provisional-recorder handoff emits once and never leaves a finalized recorder in the host registry.</li>
+<li>Verify coordinator callbacks preserve structured <code>completed</code>, <code>failed</code>, and <code>cancelled</code> terminal kinds for single and shared-callback multi-intent submissions without exposing exception text to metrics. Assert the synchronous terminal hook claims every retained task before completion callback suppression.</li>
+<li>Force work completion before completion-callback dispatch and shutdown during commit, TTS enqueue, and TTS start. Assert the recorder state machine stores each reached stage before awaits, coordinator shutdown settles callbacks, and final axes describe the actual work/commit/speech progress.</li>
+<li>Test smoke selection against alternating direct and delegated turns so a preceding turn cannot supply the current turn's budget values.</li>
+<li>Assert <code>SessionHost</code> no longer exposes <code>last_turn_metrics</code> after Phase 2 and run a scoped repository search over <code>server/</code>, <code>scripts/</code>, and <code>tests/</code> that fails on any legacy reference or equivalent latest-value compatibility cache.</li>
+<li>Replace a connection while retaining old handler references; invoke old callbacks and prove they only reach the console sink, publish no RTVI message, and mutate no host/session state. Drop references and use weak references plus <code>gc.collect()</code> to prove the old runtime, worker, and observers are collectible. Separately prove retained recorders survive connection replacement and are finalized only by late completion or process-session shutdown. Extend the same stale-callback assertion to a callback firing after <code>SessionHost.shutdown()</code> completes, not only after connection replacement — console-only output, no state mutation.</li>
+<li>Inject a sink that raises and prove routing, result commit, TTS enqueue, cancellation, and shutdown behavior remain unchanged. Assert one terminal sink attempt, finalized/removed recorder state, no retry or fallback metric, and no second attempt from a duplicate callback. Parameterize this over every framework observer callback and every parent, child, and retained terminal class, comparing unchanged pipeline/application traces.</li>
+<li>Capture <code>ConsoleMeasurementSink</code> through the production Loguru configuration and assert the physical bytes are exactly one line beginning <code>PERF_METRIC event=</code>; run the documented <code>rg</code> filters against that capture.</li>
+<li>Compare the base diff and reject any change under <code>shared/</code>, <code>server/rtvi_messages.py</code>, or <code>web/src/</code>. Parse the dependency manifests and permit only the root version changes to 0.1.2, with no dependency-set or resolved-package drift.</li>
+<li>Run the complete Python and browser suites, Ruff format/check, Bun build, ESLint, and the repository secret scan before push.</li>
+<li>Run local-media and paid hosted-search smoke commands when their machine-owned services and credentials are available; report environmental skips explicitly.</li>
+</ul>
+
+<h3>Foreground Branch and Fault Matrix</h3>
+<p>Each row must preserve the existing application result/exception behavior and emit exactly one <code>app_turn_foreground</code> event. Rows with dispatched work also emit exactly one <code>work_item_foreground</code> event per child.</p>
+
+<section class="searchable-table" data-table-id="fg-matrix">
+  <style>
+    .searchable-table .search-bar { display: flex; gap: 10px; margin: 16px 0; align-items: center; flex-wrap: wrap; }
+    .searchable-table .search-bar input { flex: 1; min-width: 200px; padding: 8px 12px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font-family: inherit; font-size: 13px; }
+    .searchable-table .search-bar input:focus { outline: none; border-color: var(--accent); }
+    .searchable-table table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .searchable-table table.data th, .searchable-table table.data td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .searchable-table table.data th { color: var(--fg-dim); font-weight: 600; font-size: 11.5px; background: var(--bg-deep); text-transform: uppercase; letter-spacing: 0.04em; }
+    .searchable-table table.data tr:last-child td { border-bottom: none; }
+    .searchable-table table.data tr.hidden { display: none; }
+    .searchable-table table.data code { background: var(--bg-card); }
+  </style>
+  <div class="search-bar">
+    <input type="search" class="st-search" placeholder="Search rows...">
+  </div>
+  <table class="data">
+    <thead><tr><th>Path or injected fault</th><th>Parent outcome</th><th>Child expectation</th></tr></thead>
+    <tbody>
+      <tr><td>Empty/non-semantic input rejected before acceptance</td><td>No event</td><td>No child</td></tr>
+      <tr><td>Missing coordinator/origin connection context</td><td>No event</td><td>No transcript/state mutation</td></tr>
+      <tr><td>Stale origin, inactive connection, or rejected epoch guard</td><td>No event</td><td>Preserve guard return and state</td></tr>
+      <tr><td>Direct response</td><td><code>direct</code></td><td>No child</td></tr>
+      <tr><td>Unsupported capability</td><td><code>unsupported</code></td><td>No child</td></tr>
+      <tr><td>Pause/resume/cancel/stop user control</td><td><code>control</code> with exact action and <code>applied</code> outcome</td><td>No child; every counter zero</td></tr>
+      <tr><td>Unknown control target or no active target</td><td><code>control</code> with requested action and exact <code>control_outcome</code></td><td>No child; every counter zero</td></tr>
+      <tr><td>Consent with pending dialogue</td><td>Outcome from <code>continue_pending</code> work</td><td>Child/counters follow resumed pending work; no standalone control metric</td></tr>
+      <tr><td>Consent without pending dialogue</td><td><code>control</code> with <code>consent</code> / <code>no_pending</code></td><td>No child; every counter zero</td></tr>
+      <tr><td>Router clarification</td><td><code>clarify</code></td><td>No child</td></tr>
+      <tr><td>Worker clarification</td><td><code>clarify</code></td><td>One <code>clarify</code> child if dispatch occurred</td></tr>
+      <tr><td>Worker decline</td><td><code>declined</code></td><td>One <code>declined</code> child</td></tr>
+      <tr><td>Missing catalogue worker</td><td><code>failed</code></td><td>One <code>missing_worker</code> child</td></tr>
+      <tr><td>Missing search capability</td><td><code>failed</code></td><td>One <code>missing_search</code> child</td></tr>
+      <tr><td>Delegated foreground success</td><td><code>completed</code></td><td>One <code>completed</code> child</td></tr>
+      <tr><td>Delegated foreground timeout retained</td><td><code>retained</code></td><td>One <code>retained</code> child</td></tr>
+      <tr><td>Single-intent capacity exhausted before task start</td><td><code>failed</code></td><td>One <code>capacity_rejected</code> child; no background recorder</td></tr>
+      <tr><td>Single-intent timeout followed by retention rejection</td><td><code>failed</code></td><td>One <code>retention_rejected</code> child; no background recorder</td></tr>
+      <tr><td>Multi-intent all completed</td><td><code>completed</code></td><td>One completed child per item</td></tr>
+      <tr><td>Multi-intent all retained</td><td><code>retained</code></td><td>One retained child per item</td></tr>
+      <tr><td>Multi-intent direct plus delegated</td><td><code>mixed</code></td><td>Deterministic child ID for each item; absent <code>app_worker_id</code> on direct child</td></tr>
+      <tr><td>Multi-intent containing an unsupported item</td><td>Matching category or <code>mixed</code></td><td>One <code>unsupported</code> child, <code>unsupported_count</code> incremented</td></tr>
+      <tr><td>Multi-intent clarification or decline</td><td>Matching category or <code>mixed</code></td><td>One child per decomposed item and exhaustive counters</td></tr>
+      <tr><td>Multi-intent missing worker/search or per-child routing failure</td><td><code>failed</code> or <code>mixed</code></td><td>One failed-class child per affected item</td></tr>
+      <tr><td>Multi-intent capacity exhausted before start</td><td><code>failed</code> or <code>mixed</code></td><td>One <code>capacity_rejected</code> child per affected item; no recorder</td></tr>
+      <tr><td>Multi-intent timeout followed by retention rejection</td><td><code>failed</code> or <code>mixed</code></td><td>One <code>retention_rejected</code> child per affected item; no recorder</td></tr>
+      <tr><td>Multi-intent mixed complete/retained/failed</td><td><code>mixed</code></td><td>Exact per-item outcomes and exhaustive counters</td></tr>
+      <tr><td>Multi-intent out-of-order completion</td><td>Outcome from categories, not completion order</td><td>Child identity and counters follow original item order</td></tr>
+      <tr><td>Router, dispatch, search, commit, or enqueue helper raises <code>Exception</code></td><td><code>failed</code></td><td>Child only when dispatch occurred</td></tr>
+      <tr><td>Caller cancellation raises <code>CancelledError</code> at routing, dispatch, wait, commit, or enqueue</td><td><code>cancelled</code></td><td>Child only when dispatch occurred</td></tr>
+    </tbody>
+  </table>
+  <script>
+  (function() {
+    var root = document.querySelector('.searchable-table[data-table-id="fg-matrix"]');
+    if (!root) return;
+    var search = root.querySelector('.st-search');
+    var rows = root.querySelectorAll('tbody tr');
+    search.addEventListener('input', function(e) {
+      var q = e.target.value.toLowerCase();
+      rows.forEach(function(row) {
+        row.classList.toggle('hidden', q && row.textContent.toLowerCase().indexOf(q) === -1);
+      });
+    });
+  })();
+  </script>
+</section>
+
+<p>Tests must enumerate every concrete <code>return</code> in <code>_handle_transcript_impl</code> and every awaited/helper call that can raise, then map each to this table. New branches added during implementation must extend the matrix before merge.</p>
+
+<h3>Retained Branch and Race Matrix</h3>
+<p>Each registered retained child must emit exactly one <code>work_item_background</code> event and be removed from the registry. A duplicate result detected by the first terminal callback is represented by <code>suppressed_duplicate</code>; callbacks arriving after recorder finalization emit no second event.</p>
+
+<section class="searchable-table" data-table-id="retained-matrix">
+  <style>
+    .searchable-table .search-bar { display: flex; gap: 10px; margin: 16px 0; align-items: center; flex-wrap: wrap; }
+    .searchable-table .search-bar input { flex: 1; min-width: 200px; padding: 8px 12px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font-family: inherit; font-size: 13px; }
+    .searchable-table .search-bar input:focus { outline: none; border-color: var(--accent); }
+    .searchable-table table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .searchable-table table.data th, .searchable-table table.data td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .searchable-table table.data th { color: var(--fg-dim); font-weight: 600; font-size: 11.5px; background: var(--bg-deep); text-transform: uppercase; letter-spacing: 0.04em; }
+    .searchable-table table.data tr:last-child td { border-bottom: none; }
+    .searchable-table table.data tr.hidden { display: none; }
+    .searchable-table table.data code { background: var(--bg-card); }
+  </style>
+  <div class="search-bar">
+    <input type="search" class="st-search" placeholder="Search rows...">
+  </div>
+  <table class="data">
+    <thead><tr><th><code>_commit_late_result</code> or shutdown path</th><th>Required axes</th></tr></thead>
+    <tbody>
+      <tr><td>Valid completion, commit, and speech queued</td><td><code>completed</code> / <code>committed</code> / <code>queued</code></td></tr>
+      <tr><td>Worker exception</td><td><code>failed</code> / <code>not_applicable</code> / <code>not_applicable</code></td></tr>
+      <tr><td>Worker cancellation</td><td><code>cancelled</code> / <code>suppressed_cancelled</code> / <code>cancelled</code></td></tr>
+      <tr><td>Host shutdown cancels unclaimed work</td><td><code>cancelled</code> / <code>suppressed_shutdown</code> / <code>cancelled</code></td></tr>
+      <tr><td>Completed work awaiting completion-callback dispatch during shutdown</td><td>Use claimed <code>terminal_kind</code> and exact reached commit/speech stages</td></tr>
+      <tr><td>Shutdown during late commit or TTS</td><td>Preserve recorded prior stages; current awaited stage becomes <code>failed</code> or <code>cancelled</code> per live behavior</td></tr>
+      <tr><td>Valid result whose captured origin epoch was replaced</td><td><code>completed</code> / <code>committed</code> / <code>stale_connection</code></td></tr>
+      <tr><td>Callback whose origin does not match its captured submission epoch</td><td><code>completed</code> / <code>suppressed_stale</code> / <code>not_applicable</code></td></tr>
+      <tr><td>Invalid result</td><td><code>invalid_result</code> / <code>not_applicable</code> / <code>not_applicable</code></td></tr>
+      <tr><td>Duplicate result detected by first terminal callback</td><td><code>completed</code> / <code>suppressed_duplicate</code> / <code>not_applicable</code></td></tr>
+      <tr><td>Callback after recorder already finalized</td><td>No additional event</td></tr>
+      <tr><td>Authoritative state-commit failure</td><td><code>completed</code> / <code>failed</code> / <code>not_applicable</code>; preserve exception and partial-state behavior, remove recorder, no speech attempt</td></tr>
+      <tr><td>No active connection</td><td><code>completed</code> / <code>committed</code> / <code>disconnected</code></td></tr>
+      <tr><td>Inactive or replaced connection</td><td><code>completed</code> / <code>committed</code> / <code>stale_connection</code></td></tr>
+      <tr><td>No TTS service</td><td><code>completed</code> / <code>committed</code> / <code>no_tts</code></td></tr>
+      <tr><td>TTS enqueue failure</td><td><code>completed</code> / <code>committed</code> / <code>enqueue_failed</code></td></tr>
+      <tr><td>TTS start failure</td><td><code>completed</code> / <code>committed</code> / <code>start_failed</code></td></tr>
+      <tr><td>Cancellation wins completion race</td><td>One cancellation-class event; no later event</td></tr>
+      <tr><td>Completion wins cancellation race</td><td>One completion-class event; no later event</td></tr>
+      <tr><td>Callback completes before coordinator acceptance returns</td><td>One event; finalized provisional recorder is not inserted</td></tr>
+      <tr><td>Callback completes immediately after accepted registration</td><td>One event; registry entry is removed</td></tr>
+    </tbody>
+  </table>
+  <script>
+  (function() {
+    var root = document.querySelector('.searchable-table[data-table-id="retained-matrix"]');
+    if (!root) return;
+    var search = root.querySelector('.st-search');
+    var rows = root.querySelectorAll('tbody tr');
+    search.addEventListener('input', function(e) {
+      var q = e.target.value.toLowerCase();
+      rows.forEach(function(row) {
+        row.classList.toggle('hidden', q && row.textContent.toLowerCase().indexOf(q) === -1);
+      });
+    });
+  })();
+  </script>
+</section>
+
+<p>The implementation must first inventory live <code>_commit_late_result</code> behavior and preserve it. If a table axis cannot describe an existing branch truthfully, add an enum value and re-review the plan rather than collapsing two lifecycle facts.</p>
+
+<h3>Expected Log Examples</h3>
+<pre><code>PERF_METRIC event=pipeline_startup schema=1 session_id="session-..." origin_epoch=1 connection_worker="browser-1" total_ms=284.1
+PERF_METRIC event=work_item_foreground schema=1 session_id="session-..." origin_epoch=1 turn_id="turn-7" work_item_id="work-turn-7" app_worker_id="worker-3" outcome=completed total_ms=1084.2 result_id="result-7" search_ms=1080.4
+PERF_METRIC event=app_turn_foreground schema=1 session_id="session-..." origin_epoch=1 turn_id="turn-7" outcome=completed total_ms=1402.7 child_count=1 direct_count=0 unsupported_count=0 completed_count=1 retained_count=0 clarification_count=0 declined_count=0 failed_count=0 cancelled_count=0 routing_ms=310.2
+PERF_METRIC event=user_bot_latency schema=1 session_id="session-..." origin_epoch=1 connection_worker="browser-1" latency_ms=1423.6
+PERF_METRIC event=pipecat_turn_end schema=1 session_id="session-..." origin_epoch=1 connection_worker="browser-1" pipecat_turn=3 duration_ms=5620.3 interrupted=false</code></pre>
+
+<h3>Edge Cases</h3>
+<ul>
+<li>Pipeline without STT, TTS, or provider-emitted <code>MetricsFrame</code> values.</li>
+<li>A direct turn immediately following a slow delegated turn.</li>
+<li>Routing exception before a worker or search timer exists.</li>
+<li>Foreground timeout followed by late success after reconnect.</li>
+<li>Cancellation racing late completion.</li>
+<li>A duplicate late callback after the result is already committed.</li>
+<li>TTS-less and disconnected sessions where no user-to-bot speech metric can exist but the application terminal metric must still be present.</li>
+<li>Multiple connections over one process-lifetime session without cross-epoch observer attribution.</li>
+<li>Multi-intent fan-out with completion order different from dispatch order.</li>
+<li>Observer callback after connection replacement and after shutdown.</li>
+<li>Telemetry sink failure during every terminal lifecycle path.</li>
+</ul>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="acceptance-criteria">
+<!-- plan-view-rich-section-sha256: bafb3542b308debf21cc38b490f045ce79cea20d9ff5f9a532d6b08797124fbe -->
+<section class="section">
+  <h2>Acceptance Criteria</h2>
+  <ul>
+    <li>Every performance log line starts with <code>PERF_METRIC event=</code> and remains one physical line under production Loguru configuration, includes <code>schema=1</code>, and conforms to the closed event registry.</li>
+    <li><code>rg 'PERF_METRIC'</code> selects all performance records, while <code>rg 'PERF_METRIC event=user_bot_latency'</code> and a <code>turn_id</code> filter isolate the intended subset.</li>
+    <li>No performance record contains transcript, prompt, response, citation URL, provider payload, credential, or raw exception data.</li>
+    <li>Unknown events, fields, enum values, empty identifiers, negative or non-finite durations, nested values, control characters, and multiline values are rejected; zero durations are accepted where structurally valid.</li>
+    <li>Integer fields enforce their documented ranges and reject booleans, fractions, strings, and negative counts; application child counters must sum exactly to <code>child_count</code>.</li>
+    <li>Each connection has one startup observer, exactly one <strong>application-registered</strong> <code>UserBotLatencyObserver</code>, and exactly one active default turn tracker. <code>PipelineWorker</code> itself constructs an internal <code>UserBotLatencyObserver</code> when <code>enable_tracing</code> is on and tracing is available (verified in the installed pipecat-ai 1.6.0 source, <code>pipeline/worker.py</code> around line 360-365); this plan's connection setup does not enable tracing, so no double-instance exists today, but the criterion does not assume that stays true.</li>
+    <li>Pipeline startup, Small WebRTC client readiness, Pipecat turn lifecycle, first-bot-speech latency, user-to-bot latency, and available processor breakdowns are logged from Pipecat-native observers.</li>
+    <li>Every accepted application turn emits exactly one foreground terminal metric with exhaustive fan-out counters whose sum equals <code>child_count</code> and no invented zero-duration stage. Every dispatched child emits exactly one foreground work-item metric using the parent semantic <code>turn_id</code>.</li>
+    <li>Accepted pause/resume/cancel/stop and invalid-target control turns emit one zero-child parent metric with exact <code>control_action</code> and <code>control_outcome</code>.</li>
+    <li>Consent with pending dialogue is measured as resumed pending work; consent without pending dialogue emits one zero-child <code>consent</code>/<code>no_pending</code> control metric.</li>
+    <li>Every decomposed multi-intent item, including direct and non-runnable items, emits one child metric with deterministic identity and contributes to one exhaustive parent counter.</li>
+    <li>Every registered retained work item emits exactly one background terminal metric with independent work, commit, and speech outcomes. Later duplicate callbacks emit no additional event.</li>
+    <li>Shutdown settles retained work and completion callbacks, then finalizes every still-open recorder from its synchronously claimed terminal kind and recorded commit/speech stages, leaving no recorder behind.</li>
+    <li>Retained-recorder handoff is race-safe when completion occurs before or during acceptance, and connection replacement does not finalize process-lifetime retained work.</li>
+    <li>Replaced-epoch valid results retain the existing authoritative display/history commit and report only speech as <code>stale_connection</code>; only a true callback origin mismatch reports <code>suppressed_stale</code>.</li>
+    <li>Direct and delegated turns cannot reuse or overwrite one another's metric identity in smoke-budget checks.</li>
+    <li><code>SessionHost.last_turn_metrics</code> and all equivalent unqualified latest-value caches and consumers are absent after Phase 2.</li>
+    <li>The existing paid smoke keeps its routing and total budgets and <code>SMOKE_RESULT=</code> output.</li>
+    <li>Smart Turn and Pipecat turn-end timeout behavior is unchanged.</li>
+    <li>Exact locked Pipecat 1.6.0 import, callback, default-tracker, <code>enable_metrics</code>, and Small WebRTC timing contracts are verified by focused tests before observer integration.</li>
+    <li>Missing or partial Pipecat service metrics are omitted without errors or zero-filling, and enabling metrics does not change processor order, sample rates, transcript, TTS, or media behavior.</li>
+    <li>Observer callbacks retain no replaced host/runtime/worker/publisher state; old connection objects are collectible and stale callbacks only reach the console sink.</li>
+    <li>The composition root supplies exactly one sink object to framework observers and every application recorder across connection replacement.</li>
+    <li>Telemetry sink failures do not change application return, exception, commit, speech, cancellation, or shutdown behavior. They produce one terminal sink attempt, finalize/remove the recorder, and are never retried.</li>
+    <li>Browser protocol v1.0, shared schemas, browser state, and UI output are unchanged.</li>
+    <li>The base diff contains no changes under <code>shared/</code>, <code>server/rtvi_messages.py</code>, or <code>web/src/</code>.</li>
+    <li>Python and Bun package versions and the changelog are synchronized at 0.1.2; no dependency is added, lock resolution does not drift, and Pipecat remains pinned to 1.6.0.</li>
+    <li>Targeted tests, full Python tests, Ruff format/check, Bun build/tests/lint, credential-free real-process server smoke, secret scan, documentation review, code review, and security review pass before push.</li>
+    <li>When the environment is available, local-media and paid routing/search smoke results are recorded separately from deterministic test evidence.</li>
+  </ul>
+  <p class="chip">reviewed: 2026-07-27 @ 6db80b75eecb9f9a1179046f3a8d443df4202149</p>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="progress">
+<!-- plan-view-rich-section-sha256: 53b061987ce41d6862124991b64444b9d7ddc094d76e8db208607648b6efc045 -->
+
+<section class="section">
+  <h2>Progress</h2>
+  <ul class="progress-list">
+    <li class="chip chip-done">Phase 1: Performance log contract and Pipecat observers</li>
+    <li class="chip chip-done">Phase 2: Complete application-turn and retained-work timing</li>
+    <li class="chip chip-done">Phase 3: Release validation and benchmark evidence</li>
+  </ul>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="findings">
+<!-- plan-view-rich-section-sha256: bb5f946a947bba985f0feaec70cc77dd268a53b8ea6cb29b7d0c3a9a6def9a8f -->
+<section class="section" id="findings">
+  <h2>Findings</h2>
+  <ul>
+    <li>Pipecat Context Hub 0.3.1 was refreshed on 2026-07-26 and indexed Pipecat 1.6.0. It reports the selected observer modules as current and non-deprecated.</li>
+    <li><code>TurnTrackingObserver.turn_end_timeout_secs</code> closes a turn after bot speech; it is not the Smart Turn analyzer's incomplete-user-speech timeout.</li>
+    <li><code>UserBotLatencyObserver</code> provides the end-to-end speech measurement, while router/search attribution still requires explicit application timers.</li>
+  </ul>
+
+  <div class="card">
+    <h3>Review Waivers</h3>
+    <p>
+      <code>/review-plan</code> codebase-claims finding (Verified Starting Facts branch/tag
+      citation, originally flagged Critical): <span class="chip">waived</span>, no plan change needed.
+    </p>
+    <p>
+      Verified directly: the annotated <code>v0.1.1</code> tag's target commit is exactly
+      <code>d83657c381bdca8619a364f1c8dd82f1dd6ae41c</code> as the plan claims
+      (<code>git tag -l v0.1.1 --format='%(objectname) %(*objectname)'</code>). The branch HEAD
+      has since moved forward, which is precisely the "normal git-ref movement after creation
+      does not [invalidate review]" case the plan's own Verified Starting Facts section already
+      documents. Confirmed correct, not a defect.
+    </p>
+  </div>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="issues-solutions">
+<!-- plan-view-rich-section-sha256: 8d6ac9ece1d2c8b4ba17491229ca44629cdc7462bde57091dcdb12e69dbe7fc3 -->
+<section class="section" id="issues-solutions">
+  <h2>Issues &amp; Solutions</h2>
+  <div class="card">
+    <p>
+      <span class="chip">code-review -xhigh</span> on the landed Phase 1-3 diff found three
+      exactly-once telemetry gaps: <code>_handle_pending</code>/<code>_handle_multi_intent</code>
+      could exit via exception without finalizing <code>app_turn_foreground</code>;
+      <code>on_late_terminal</code> was unguarded inside the coordinator's task
+      done-callback, so a raising hook could drop <code>on_complete</code> delivery
+      entirely; and <code>_commit_late_result</code>'s on-the-spot fallback recorder
+      construction made <code>background_ms</code> report near-zero. Fixed in
+      <code>9f9f234</code> with regression tests (444/444 passing). The remaining five
+      lower-severity findings (an empty-<code>app_worker_id</code> validation gap, and
+      four efficiency/duplication findings in <code>_handle_multi_intent</code>/
+      <code>_commit_late_result</code>/<code>perf_metrics.py</code>) were fixed in
+      <code>a76e664</code> (no behavior change; verified branch-by-branch and via the
+      full suite). Codex adversarial review was skipped (out of Codex tokens); the
+      review-gauntlet's remaining gates (deep-review, security-review) run in its
+      place.
+    </p>
+  </div>
+  <div class="card">
+    <p>
+      <span class="chip">deep-review --verbose</span> (logic, security, architecture, docs
+      lenses) found 4 Important and 7 Minor findings, the most serious being a
+      dual-recorder-ownership bug independently confirmed by both the logic and
+      architecture lenses: <code>_handle_pending</code>/<code>_handle_multi_intent</code>
+      each constructed a second <code>AppTurnRecorder</code> for the same
+      <code>turn_id</code> instead of using the parent's, causing a duplicate
+      <code>app_turn_foreground</code> emission on cancellation and silently
+      dropping <code>routing_ms</code>/understating <code>total_ms</code> for
+      delegated turns. Also found: <code>record_zero_child_outcome</code> broke
+      the plan's own <code>child_count</code> sum invariant with no waiver
+      recorded (resolved by dropping the zero-child counter increment, option (a)
+      &mdash; matches the plan as written); and a reproduced security bug where
+      Loguru's default <code>diagnose=True</code> leaked raw transcripts and API
+      keys into console tracebacks via this feature's new exception handlers.
+      All 11 findings fixed in <code>c10a54b</code> (467/467 tests passing, 23
+      new regression tests).
+    </p>
+  </div>
+  <div class="card">
+    <p>
+      A second <span class="chip">deep-review</span> round (5 lenses: logic,
+      security, spec, architecture, documentation; opus/high except haiku/low
+      docs) against <code>d83657c..fcc5394</code> found 8 Important and 13
+      Minor findings. Three Important findings were independently corroborated
+      by 2-3 lenses at once, the strongest signal in either review round:
+      <code>error_type</code> pattern-matching instead of the structured
+      <code>failure_kind</code> field (logic + architecture + spec), silent
+      zero-emission on an empty multi-intent fan-out, and an unguarded
+      <code>KeyError</code> in the multi-intent fan-in that could drop an
+      entire turn's commit/speech, not just its telemetry. All 8 Important and
+      all 13 Minor findings were architected, implemented, and independently
+      re-verified by fresh-context subagents (architect, then implement, then
+      verify) across 10 commits (<code>0beed9b..1ce51ca</code>):
+    </p>
+    <ul>
+      <li>Reverted the <code>SessionHost</code> default-<code>WorkItemCoordinator</code> scope creep.</li>
+      <li>Suppressed RTVI metrics forwarding (<code>RTVIObserverParams(metrics_enabled=False)</code>) to close a live console-only-scope violation.</li>
+      <li>Made <code>AppTurnRecorder.finalize</code> total (no path can silently skip emission).</li>
+      <li>Gave the parent recorder ownership of its children with a sweep on finalize (closes the cancellation/commit-exception orphaning gap).</li>
+      <li>Hardened the multi-intent fan-in against mismatched worker-echoed <code>turn_id</code>/<code>work_item_id</code> values with a user-approved graceful-degrade behavior change (partial results still commit and speak; only the unattributable item drops, with a warning, instead of the whole turn going silent).</li>
+      <li>Adopted <code>Literal</code>-derived outcome vocabularies with a real <code>mypy</code> CI gate.</li>
+    </ul>
+    <p>
+      Two decisions were explicitly signed off by the user before implementation:
+      adopting a type checker at all (the repo had none), and the fan-in
+      behavior change. 502/502 tests passing after the findings-fix round.
+    </p>
+  </div>
+  <div class="card">
+    <p>
+      The mypy adoption above initially gated only <code>server.perf_metrics</code>
+      (the module owning the vocabularies) because <code>server.pipeline</code>
+      and <code>server.work_item_coordinator</code> carried 34 and 2
+      pre-existing, unrelated type errors respectively (mostly
+      <code>Any | None</code> narrowing gaps predating this feature). The user
+      chose to close that gap rather than accept it as a permanent exception: a
+      follow-up architect/implement/verify round fixed all 36 errors (mostly
+      type-narrowing annotations; one deliberate, signed-off behavior change
+      adding a <code>_require_coordinator()</code> accessor that raises
+      <code>RuntimeError</code> instead of a bare <code>AttributeError</code>
+      on an already-unreachable None-coordinator path) and extended the CI gate
+      to all three modules, across 5 more commits
+      (<code>a9ad400..7de43ca</code>). 502/502 tests still passing;
+      <code>mypy</code> clean across all 28 checked source files.
+    </p>
+  </div>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="final-results">
+<!-- plan-view-rich-section-sha256: 57823b466aaa6802173664c11d88d62b220615b5a09b5fb2d5c62441dd06e6fa -->
+<section class="section" id="final-results">
+<h2>Final Results</h2>
+
+<div class="card">
+<h3>Summary</h3>
+<p>Implemented across Phases 1&ndash;3 (commits <code>fb8f88a</code>, <code>4cbfcfa</code>, <code>fdf5820</code>): a console-only <code>PERF_METRIC</code> telemetry contract, Pipecat 1.6.0 observer wiring (<code>StartupTimingObserver</code>, <code>UserBotLatencyObserver</code>, default <code>TurnTrackingObserver</code>), and application-turn/retained-work timing recorders across all three accepted-turn terminal-path owners.</p>
+
+<p>Review-gauntlet (plan's <code>Review Gates: full</code>) complete: <code>/code-review -xhigh</code> (8 findings fixed, <code>9f9f234</code>/<code>a76e664</code>), Codex adversarial review skipped (Codex out of tokens), <code>skein:deep-review --verbose</code> (11 findings fixed, <code>c10a54b</code>), <code>/security-review</code> (zero HIGH/MEDIUM findings; independently verified the Loguru diagnose fix is correctly applied and regression-tested). 467/467 tests passing, ruff clean. No full-corpus confirming re-review pass was run after the deep-review fix round (would normally restart gate 1 given the fixes' structural scope) &mdash; the fixes were verified via targeted regression tests plus a full-suite run and the final security-review pass, not a fresh multi-lens sweep.</p>
+
+<p>A second, independent <code>/deep-review</code> pass found 8 more Important and 13 Minor findings (see Issues &amp; Solutions), all fixed and independently re-verified across 10 commits (<code>0beed9b..1ce51ca</code>), followed by a type-checker adoption round that closed the resulting <code>server.pipeline</code>/<code>server.work_item_coordinator</code> mypy coverage gap across 5 more commits (<code>a9ad400..7de43ca</code>). 502/502 tests passing; <code>ruff</code> and <code>mypy</code> both clean across the full <code>server/</code> tree. PR #3 opened (<a href="https://github.com/vr000m/pipecat-subagents-lab/pull/3">github.com/vr000m/pipecat-subagents-lab/pull/3</a>).</p>
+
+<p><code>/skein:deep-review --continue</code> (incremental mode, <code>fcc5394..29fbd71</code>, 5 lenses) reviewed the mypy-adoption fix round itself and found 12 more findings (3 Important, 9 Minor) &mdash; architect/implement/verify subagents grouped by file into 3 clusters (<code>server/perf_metrics.py</code>, <code>server/pipeline.py</code>, <code>pyproject.toml</code>) fixed all 12 across 3 commits (<code>e58113e</code>, <code>2121274</code>, <code>035e0c4</code>). Independent verification of the first pass found 2 of the 3 clusters' fixes real but a third partially wrong (see Learnings); a second architect/implement/verify round on just that cluster closed the residual gaps, re-verified with hand-traced and executed counter-examples. 513/513 tests passing; <code>ruff</code> and <code>mypy</code> clean.</p>
+
+<p>
+<span class="chip green">467/467 &rarr; 502/502 &rarr; 513/513 tests</span>
+<span class="chip blue">ruff clean</span>
+<span class="chip blue">mypy clean</span>
+<span class="chip purple">PR #3</span>
+</p>
+</div>
+
+<div class="card">
+<h3>Outcomes</h3>
+<ul>
+<li>One console <code>PERF_METRIC</code> contract covers both Pipecat-native framework timing and application-owned semantic-turn/retained-work timing, with a single injectable sink (<code>ConsoleMeasurementSink</code> production, <code>CollectingMeasurementSink</code> tests/smoke) and no latest-value compatibility cache.</li>
+<li>Every accepted semantic turn across all three terminal-path owners (<code>_handle_transcript_impl</code>, <code>_handle_pending</code>, <code>_handle_multi_intent</code>) now shares one recorder instance, closing a duplicate-emission bug that review surfaced but the original phased implementation missed.</li>
+<li><code>WorkItemFailure</code> and <code>LateResult</code> both now carry structured classification fields (<code>failure_kind</code>, <code>terminal_kind</code>) instead of string-matching on exception class names or free-text error strings.</li>
+<li><code>AppTurnRecorder</code> now owns its children: a parent finalize sweeps any <code>WorkItemRecorder</code> left open (e.g. by cancellation or a raising commit/speak step) instead of silently under-reporting <code>child_count</code>, and <code>finalize</code> itself is total &mdash; no argument combination can latch <code>_finalized=True</code> and skip emission.</li>
+<li>RTVI metrics forwarding is explicitly suppressed (<code>RTVIObserverParams(metrics_enabled=False)</code>); <code>enable_metrics=True</code> now provably stays console-only, closing a gap between the feature's stated scope and its actual wire behavior.</li>
+<li>The outcome vocabularies (<code>WORK_ITEM_OUTCOMES</code>, <code>APP_TURN_OUTCOMES</code>, etc.) are <code>Literal</code>-alias-derived rather than hand-duplicated frozensets, and <code>mypy</code> is a real CI gate across <code>server/perf_metrics.py</code>, <code>server/pipeline.py</code>, and <code>server/work_item_coordinator.py</code> &mdash; a typo in an outcome literal now fails CI instead of silently dropping a metric in production.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Learnings</h3>
+<ul>
+<li>The phased <code>/conduct</code> implementation (parallel implementer/test-writer per phase) shipped a feature that passed its own phase-boundary tests cleanly, but multi-lens review (code-review, then deep-review's logic + architecture lenses independently) caught a real duplicate-metric bug that no single phase's test suite exercised: cancellation of a <em>delegated</em> turn specifically. Parallel implementer/test-writer pairs working from the same plan text can still both miss a cross-function invariant (one recorder per turn_id) that isn't stated as an explicit test case in the plan's own branch/fault matrix.</li>
+<li>Running 4 fix agents in parallel on overlapping files (<code>server/pipeline.py</code>, <code>server/perf_metrics.py</code> touched by 3&ndash;4 agents each) worked, but only because each agent was scoped to explicit non-overlapping functions/classes and instructed to report scope conflicts rather than guess. Two agents independently caught and flagged live clobbering from concurrent <code>git add</code>/edits mid-round; verifying every claimed change was actually present in the final staged diff (not just trusting each agent's self-report) was necessary before committing.</li>
+<li>A second independent <code>/deep-review</code> pass, run after the first round's fixes had already landed and the branch was believed review-clean, still found 8 more Important findings &mdash; three of them the exact same underlying defect (<code>failure_kind</code> vs <code>error_type</code>), independently rediscovered by three different lenses in the same run. Review convergence is not guaranteed by one clean pass; a second pass on the same diff range is not redundant, especially for an invariant (&ldquo;exactly one terminal event&rdquo;) that spans multiple call sites and exception paths.</li>
+<li>Two decisions surfaced during the fix round that were genuinely the user's to make, not the implementer's: whether to change the multi-intent fan-in's user-facing behavior (silent whole-turn failure vs. graceful partial degrade) and whether to adopt a project-wide type checker the repo had never had. Both were raised explicitly before any code was written, rather than decided unilaterally and reported after the fact.</li>
+<li>Scoping mypy's initial CI gate to just the module owning the vocabularies (<code>server.perf_metrics</code>), rather than blocking on fixing ~119 repo-wide pre-existing errors, let the fix land without also taking on an unrelated nullability refactor &mdash; but the gap was real (the file the original finding pointed at, <code>server/pipeline.py</code>, was not actually covered) and the user chose to close it in a follow-up round rather than let it linger as a permanent exception.</li>
+<li>A &ldquo;fix for the fix&rdquo; needs its own skeptical verify pass, not just re-running tests. The first implementation round for the 12-finding continuation review passed its own new tests and the full suite, but independent re-verification with hand-traced counter-examples found two of the five <code>perf_metrics.py</code> fixes were real regressions disguised as fixes: an &ldquo;unrecognized outcome&rdquo; fix that counted a child that was never actually emitted (a phantom child &mdash; <code>_safe_emit</code> had already dropped the raw unrecognized value before the counting fix ran), and a &ldquo;duplicate work_item_id&rdquo; registration guard that protected the wrong end of the problem, so a real caller finalizing both the tracked and untracked child could still get an emitted record with no matching counter increment (a phantom omission, the mirror-image bug). Both traced to the same root cause: the fix patched the counting side without validating the emission side first. The corrected fix moved outcome validation into <code>WorkItemRecorder.finalize</code> itself (validate-then-emit, symmetric with the parent's existing pattern) and decoupled counting from sweep-tracking, since a <code>WorkItemRecorder</code> can only invoke its attribution callback once by construction. Passing tests is necessary, not sufficient, evidence a review finding is closed &mdash; the verify subagent constructing the original finding's exact counter-example against the fixed code, not just re-running the suite, is what caught both regressions.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Follow-up Work</h3>
+<ul>
+<li>Consider UI projection or OpenTelemetry export only after console telemetry demonstrates that the event names, timing boundaries, and correlation fields answer operational questions without exposing content.</li>
+</ul>
+</div>
+</section>
+
+</div>
+</div>
+
+
+<footer class="plan-foot">
+  Rich view · assembled from 14 section fragments · source sha <code>5320db8a362a</code>.
+  Source of truth: <code>20260727-feature-latency-observability.md</code>.
+</footer>
+</body>
+</html>

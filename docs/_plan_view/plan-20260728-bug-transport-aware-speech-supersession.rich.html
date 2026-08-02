@@ -1,0 +1,1063 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="plan-view-rich-source-sha256" content="e7258f9ab74cddfbffe5836ebaf20b587b19860d921cda8c61d6a29bb227e355">
+<meta name="plan-view-rich-strategy" content="sections">
+<meta name="plan-view-rich-section-count" content="14">
+<title>Task: Transport-Aware Speech Supersession — rich view</title>
+<link rel="preconnect" href="https://rsms.me/">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+<style>
+/* base.css — shared variables, typography, layout, and chip/tab scaffolding.
+ * Loaded once per page. Widget files assume these variables and primitive
+ * classes exist; they should NOT redeclare them.
+ *
+ * Conventions:
+ *   --bg, --bg-elev, --bg-card, --bg-deep   surfaces (deepest → flattest)
+ *   --fg, --fg-dim, --fg-muted              text (strong → faint)
+ *   --border, --border-hi                   hairlines
+ *   --accent + named hues                   semantic colour
+ *
+ * Light + dark are colour-scheme driven; consumers do not need a theme toggle.
+ */
+
+:root {
+  --bg: #0f1115; --bg-elev: #161a22; --bg-card: #1c2230; --bg-deep: #0a0c11;
+  --fg: #e6e9ef; --fg-dim: #9aa3b2; --fg-muted: #6b7280;
+  --border: #2a313d; --border-hi: #3a4250;
+  --accent: #7c9eff;
+  --green: #4ade80; --amber: #fbbf24; --blue: #60a5fa;
+  --red: #f87171; --grey: #9ca3af; --purple: #c084fc;
+  --teal: #5eead4; --pink: #f472b6;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa; --bg-elev: #ffffff; --bg-card: #ffffff; --bg-deep: #f3f4f6;
+    --fg: #111827; --fg-dim: #4b5563; --fg-muted: #9ca3af;
+    --border: #e5e7eb; --border-hi: #d1d5db;
+    --accent: #2563eb;
+    --green: #16a34a; --amber: #d97706; --blue: #2563eb;
+    --red: #dc2626; --grey: #6b7280; --purple: #9333ea;
+    --teal: #0d9488; --pink: #db2777;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px; line-height: 1.6;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em;
+  background: var(--bg-card); padding: 1px 5px; border-radius: 3px;
+}
+
+/* ────────────── Layout primitives ────────────── */
+
+main.page { max-width: 1200px; margin: 0 auto; padding: 32px 40px; }
+
+.banner {
+  background: linear-gradient(135deg, rgba(124,158,255,0.10), rgba(94,234,212,0.06));
+  border-bottom: 1px solid var(--border); padding: 32px 40px;
+}
+.banner .crumb { font-size: 12px; color: var(--fg-dim); margin-bottom: 8px; }
+.banner h1 { margin: 0 0 8px; font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
+.banner .tagline { color: var(--fg-dim); font-size: 14px; max-width: 800px; }
+
+.card {
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px;
+}
+.card.deep { background: var(--bg-deep); }
+
+.section { margin: 24px 0; }
+.section h2 {
+  font-size: 18px; font-weight: 600; margin: 0 0 16px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+.section h3 { font-size: 15px; font-weight: 600; margin: 24px 0 12px; }
+.section h4 {
+  font-size: 13px; font-weight: 600; margin: 18px 0 8px;
+  color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em;
+}
+
+/* ────────────── Chips / pills ────────────── */
+
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500;
+  border: 1px solid transparent;
+}
+.chip.green { background: rgba(74,222,128,0.12); color: var(--green); border-color: rgba(74,222,128,0.30); }
+.chip.amber { background: rgba(251,191,36,0.12); color: var(--amber); border-color: rgba(251,191,36,0.30); }
+.chip.blue  { background: rgba(96,165,250,0.12); color: var(--blue);  border-color: rgba(96,165,250,0.30); }
+.chip.red   { background: rgba(248,113,113,0.12); color: var(--red);   border-color: rgba(248,113,113,0.30); }
+.chip.purple{ background: rgba(192,132,252,0.12); color: var(--purple);border-color: rgba(192,132,252,0.30); }
+.chip.teal  { background: rgba(94,234,212,0.12); color: var(--teal);  border-color: rgba(94,234,212,0.30); }
+.chip.pink  { background: rgba(244,114,182,0.12); color: var(--pink);  border-color: rgba(244,114,182,0.30); }
+.chip.grey  { background: rgba(156,163,175,0.10); color: var(--grey);  border-color: rgba(156,163,175,0.25); }
+
+/* ────────────── Sticky-nav scaffold ────────────── */
+
+nav.sticky-nav {
+  background: var(--bg-elev); border-bottom: 1px solid var(--border);
+  padding: 0 32px; position: sticky; top: 0; z-index: 10;
+  display: flex; gap: 4px; overflow-x: auto;
+  backdrop-filter: blur(10px);
+}
+
+/* ────────────── Tab scaffold (radio + :checked, no JS) ──────────────
+ *
+ * Markup contract (see tabs.html):
+ *   <div class="tabs">
+ *     <input type="radio" name="tabs-{id}" id="tab-{id}-{slot}" class="tab-radio" [checked]>
+ *     <label for="tab-{id}-{slot}" class="tab-label">Label</label>
+ *     ...repeat radio + label for each tab...
+ *     <div class="tab-panel" data-slot="{slot}">…content…</div>
+ *     ...repeat panel...
+ *   </div>
+ *
+ * Panels are hidden by default; the sibling `:checked` radio drives the
+ * matching panel visible via attribute selector + general-sibling combinator.
+ */
+
+.tabs { display: block; }
+.tabs .tab-radio { position: absolute; opacity: 0; pointer-events: none; }
+.tabs .tab-label {
+  display: inline-block; padding: 12px 16px; font-size: 13.5px; font-weight: 500;
+  color: var(--fg-dim); cursor: pointer; border-bottom: 2px solid transparent;
+  transition: color 0.1s, border-color 0.1s; white-space: nowrap;
+}
+.tabs .tab-label:hover { color: var(--fg); }
+.tabs .tab-bar {
+  display: flex; gap: 4px; overflow-x: auto;
+  border-bottom: 1px solid var(--border); margin-bottom: 16px;
+}
+.tabs .tab-panel { display: none; }
+
+/* Each radio activates its sibling label and matching panel. The pattern
+ * relies on consumers giving radio id="tab-{id}-{slot}" and panel
+ * data-slot="{slot}". See tabs.html for the full template. */
+.tabs .tab-radio:checked + .tab-label {
+  color: var(--accent); border-bottom-color: var(--accent);
+}
+
+/* Progress / meta */
+.progress-bar {
+  flex: 1; max-width: 320px; height: 8px; background: var(--bg-card);
+  border-radius: 4px; overflow: hidden; border: 1px solid var(--border);
+}
+.progress-bar .fill { height: 100%; background: var(--green); transition: width 0.3s; }
+
+footer.page-footer {
+  text-align: center; padding: 32px 40px; color: var(--fg-muted);
+  font-size: 11px; border-top: 1px solid var(--border); margin-top: 48px;
+}
+
+body { max-width: 1200px; margin: 0 auto; padding: 32px 24px 80px; }
+header.plan-hero { padding: 24px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+header.plan-hero h1 { margin: 8px 0 12px; }
+header.plan-hero .meta { color: var(--fg-muted); font-size: 14px; }
+.tab-bar { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+footer.plan-foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--fg-muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<!-- plan-view-rich-backlink -->
+<div class="rich-backlink" style="font-size:13px;margin:0 0 16px;"><a href="index.html">← Plan View</a> · <a href="plan-20260728-bug-transport-aware-speech-supersession.html">deterministic view</a></div>
+<header class="plan-hero">
+  <div class="meta">plan-view · rich · 20260728-bug-transport-aware-speech-supersession</div>
+  <h1>Task: Transport-Aware Speech Supersession</h1>
+  <div class="meta"><span class="chip green">Shipped</span> · Source sha <code>e7258f9ab74c</code> · 14 sections (assembled from fragments)</div>
+</header>
+
+<div class="tabs" data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession">
+  <style>
+    /* Scoped tab visibility via :has() — works regardless of the radio's
+       depth in the DOM (radios may live inside a .tab-bar wrapper while
+       panels live outside it; sibling `~` selectors don't work across
+       that boundary, but `:has()` does). Requires :has() support
+       (Chrome/Safari/Firefox 2023+). */
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"] .tab-panel { display: none; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-preamble:checked) .tab-panel[data-slot="preamble"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-objective:checked) .tab-panel[data-slot="objective"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-context:checked) .tab-panel[data-slot="context"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-requirements:checked) .tab-panel[data-slot="requirements"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-review-focus:checked) .tab-panel[data-slot="review-focus"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-implementation-checklist:checked) .tab-panel[data-slot="implementation-checklist"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-technical-specifications:checked) .tab-panel[data-slot="technical-specifications"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-architecture-call-flow:checked) .tab-panel[data-slot="architecture-call-flow"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-testing-notes:checked) .tab-panel[data-slot="testing-notes"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-acceptance-criteria:checked) .tab-panel[data-slot="acceptance-criteria"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-progress:checked) .tab-panel[data-slot="progress"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-findings:checked) .tab-panel[data-slot="findings"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-issues-solutions:checked) .tab-panel[data-slot="issues-solutions"] { display: block; }
+    .tabs[data-tabs-id="plan-20260728-bug-transport-aware-speech-supersession"]:has(#tab-plan-20260728-bug-transport-aware-speech-supersession-final-results:checked) .tab-panel[data-slot="final-results"] { display: block; }
+    /* Each rule is generated as (<id>/<slot> filled per tab):
+       .tabs[data-tabs-id="<id>"]:has(#tab-<id>-<slot>:checked) .tab-panel[data-slot="<slot>"] { display: block; }
+    */
+  </style>
+
+  <div class="tab-bar">
+    <input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-preamble" class="tab-radio" checked>
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-preamble" class="tab-label">(preamble)</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-objective" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-objective" class="tab-label">Objective</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-context" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-context" class="tab-label">Context</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-requirements" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-requirements" class="tab-label">Requirements</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-review-focus" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-review-focus" class="tab-label">Review Focus</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-implementation-checklist" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-implementation-checklist" class="tab-label">Implementation Checklist</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-technical-specifications" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-technical-specifications" class="tab-label">Technical Specifications</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-architecture-call-flow" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-architecture-call-flow" class="tab-label">Architecture &amp; Call Flow</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-testing-notes" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-testing-notes" class="tab-label">Testing Notes</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-acceptance-criteria" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-acceptance-criteria" class="tab-label">Acceptance Criteria</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-progress" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-progress" class="tab-label">Progress</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-findings" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-findings" class="tab-label">Findings</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-issues-solutions" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-issues-solutions" class="tab-label">Issues &amp; Solutions</label>
+<input type="radio" name="tabs-plan-20260728-bug-transport-aware-speech-supersession" id="tab-plan-20260728-bug-transport-aware-speech-supersession-final-results" class="tab-radio">
+<label for="tab-plan-20260728-bug-transport-aware-speech-supersession-final-results" class="tab-label">Final Results</label>
+  </div>
+
+  <div class="tab-panel" data-slot="preamble">
+<!-- plan-view-rich-section-sha256: 0b415f8bddfc4ae82950d4aca30d76bcbdf444c72d875cb39072266f7b3caa1c -->
+<div class="card">
+  <h1>Transport-Aware Speech Supersession</h1>
+  <p class="chip">Complete</p>
+  <table>
+    <tbody>
+      <tr><th scope="row">Component</th><td>Pipecat subagents</td></tr>
+      <tr><th scope="row">Assigned to</th><td>Unassigned</td></tr>
+      <tr><th scope="row">Priority</th><td>High</td></tr>
+      <tr><th scope="row">Branch</th><td><code>fix/drop-stale-timeout-speech</code></td></tr>
+      <tr><th scope="row">Created</th><td>2026-07-28</td></tr>
+      <tr><th scope="row">Updated</th><td>2026-07-30</td></tr>
+      <tr><th scope="row">Review Gates</th><td>full</td></tr>
+    </tbody>
+  </table>
+</div>
+
+</div>
+<div class="tab-panel" data-slot="objective">
+<!-- plan-view-rich-section-sha256: e8b315fcc1eb11074e6c037d76e6c860bf8fa776652c827473ae7ed8bbbd06d1 -->
+<section class="section">
+  <h2>Objective</h2>
+  <p>
+    Keep speech scheduling ownership until the output transport reports that the
+    active utterance has stopped or its connection-scoped output lane has
+    completed teardown, so a final result can remove its still-queued timeout
+    notice while unrelated speech is playing.
+  </p>
+  <p>
+    Deliver this as a release-neutral precursor to
+    <code>docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md</code>,
+    not as a 0.1.3 release or version bump.
+  </p>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="context">
+<!-- plan-view-rich-section-sha256: b06bcdc923aa5812c1ab9ea2570b406d0d2d0305678cab8970bcf526335f79c5 -->
+<section class="section">
+  <h2>Context</h2>
+
+  <p>The reported two-query trace exposes a lifecycle mismatch rather than primarily a
+  bad timeout value. The Helsinki result was still playing when the San Francisco
+  timeout notice was emitted. By the time the San Francisco final result was ready,
+  the notice had already crossed the scheduler boundary and was buffered behind
+  earlier audio, so queue-only supersession could no longer remove it.</p>
+
+  <p>The current pipeline records <code>synthesis_ended</code> and immediately converts it to
+  <code>delivery_unknown</code>, releasing the scheduler lease and starting the next queued
+  utterance (<code>server/pipeline.py:495-523</code>). The generic TTS completion processor does
+  the same before forwarding <code>TTSStoppedFrame</code> to <code>transport.output()</code>
+  (<code>server/app.py:60-96,187-204</code>). This conflicts with the repository's documented
+  contract: synthesis completion is not transport completion, and no server state
+  proves browser decode, playout, or audibility (<code>shared/protocol.md:69-80</code>).</p>
+
+  <p>Commit <code>73d1a7c</code> adds a valid but incomplete primitive:
+  <code>SpeechScheduler.discard_queued(work_item_id)</code> and a late-result call site. It can
+  remove a timeout notice only while the scheduler still owns that notice. This plan
+  retains that primitive but fixes the upstream lifecycle so later speech remains
+  queued until the output transport has drained the active utterance.</p>
+
+  <p>Pipecat 1.6.0 provides current, non-deprecated <code>BotStartedSpeakingFrame</code> and
+  <code>BotStoppedSpeakingFrame</code> types. <code>BaseOutputTransport</code> emits the stop frame
+  upstream and downstream when transport-managed bot speech stops, but both bot
+  frames are fieldless and cannot identify an utterance. Pipecat-generated
+  <code>TTSStartedFrame</code>, <code>TTSAudioRawFrame</code>, and <code>TTSStoppedFrame</code> carry <code>context_id</code>;
+  the pinned TTS service also serializes non-system downstream frames relative to
+  the generated TTS sequence. The implementation therefore needs an internal
+  generation marker before TTS plus a single in-flight transport slot; it must not
+  bind a fieldless bot event by consulting whichever scheduler lease is active when
+  that event happens to arrive.</p>
+
+  <p>Shortening <code>foreground_search_timeout_seconds</code> is out of scope. A shorter timer can
+  make duplicate notices occur closer together but cannot retract speech that has
+  already left scheduler ownership.</p>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="requirements">
+<!-- plan-view-rich-section-sha256: ce58f6280b1c5f5dad369f8c60b1ffa88cca2fe212dd9e53bd11ce2c7278db9d -->
+<section class="section">
+  <h2>Requirements</h2>
+  <ul>
+    <li>Model every admitted utterance as one private <code>SpeechGeneration</code> with a stable
+      scheduler token. Queue residency remains a <code>SpeechItem</code> concern; generation
+      phases begin at <code>admitted</code>, then <code>handed_to_tts</code>,
+      <code>synthesizing</code>, <code>synthesis_ended</code>, <code>transport_started</code>, and
+      <code>transport_stopped</code>, with delivery dispositions <code>paused</code>, <code>interrupted</code>,
+      <code>cancelled</code>, and <code>delivery_unknown</code>. Transitions are token-fenced and
+      idempotent; the public <code>DeliveryState</code> wire/state contract remains unchanged.</li>
+    <li>Make one <code>SpeechLifecycleCoordinator</code> the sole owner of the admitted generation,
+      TTS-lane lease, global transport slot, tombstones, timers, and exactly-once
+      terminalization. <code>SpeechScheduler</code> owns only per-work queues and selection;
+      lifecycle processors and provider callbacks are stateless adapters into
+      token-bearing coordinator methods.</li>
+    <li>Preserve the hybrid scheduler: FIFO within each work-item queue, existing
+      work-item selection/targeted-start policy between queues, and exactly one global
+      transport slot. Do not claim or introduce global FIFO ordering.</li>
+    <li>Hold the global transport slot from scheduler admission until correlated
+      transport stop or completed cleanup of the old output lane.
+      <code>TTSStoppedFrame</code> and provider <code>synthesis_ended</code> record synthesis state only;
+      neither admits another generation to TTS/output. A timer expiry may initiate
+      cleanup but may not by itself clear a slot that has submitted audio to output.</li>
+    <li>Insert a private, token-bearing generation marker immediately before each
+      <code>TTSSpeakFrame</code>. The post-TTS lifecycle bridge consumes that marker and binds the
+      next generated TTS <code>context_id</code> to the token. Fieldless bot start/stop frames
+      apply only to the sole occupied transport slot and never sample the scheduler's
+      current active lease.</li>
+    <li>Retain tombstones for paused, interrupted, cancelled, reconnected, and
+      fallback-terminal generations until their TTS and transport barriers resolve.
+      Drop later context-correlated audio or TTS stop frames before
+      <code>transport.output()</code>. Tombstones do not purport to identify fieldless bot
+      frames: after any audio has entered output, the next generation is not admitted
+      until the old lane emits its normal stop or the connection-scoped output
+      transport has been fully cancelled/torn down and can emit no later bot event.</li>
+    <li>A timeout notice is supersedable only while it remains in its own work-item
+      queue. Once its generation occupies the transport slot, final-result readiness
+      does not interrupt it. Never reorder, delete, or interrupt another work item's
+      speech.</li>
+    <li>Use token-fenced liveness deadlines backed by an injected monotonic clock and
+      injected cancellable timer scheduler:
+      <code>speech_start_timeout_seconds = 10.0</code>, armed when a generation is handed to TTS
+      and cancelled by its first correlated start/audio/provider-error event; and
+      <code>speech_transport_grace_seconds = 1.0</code>, used after synthesis end at
+      <code>synthesis_end + accumulated_audio_duration + grace</code>. Zero-audio synthesis uses
+      only the grace. Barge-in and explicit pause arm an interruption-cleanup deadline
+      at <code>interruption_forwarded_at + speech_transport_grace_seconds</code>.</li>
+    <li>Deadline expiry atomically marks the captured token <code>cleanup_pending</code>, dispatches
+      cancellation/flush, then records <code>delivery_unknown</code> once. If no audio has
+      crossed into output, the coordinator may release only after the old TTS lane
+      acknowledges that cleanup. If any audio has crossed into output, expiry
+      invalidates and tears down that connection's output lane; queued speech is not
+      admitted on it, and reconnect creates a fresh connection-scoped lane. A raw
+      timer callback never makes a late fieldless A stop observable as B's stop.</li>
+    <li>Treat generic and local provider errors as separate ingress paths. A generic
+      Pipecat <code>ErrorFrame</code> is upstream and has no <code>context_id</code>; a pre-TTS error
+      observer or provider <code>on_error</code> hook attributes it to the captured TTS-lane
+      token and processor identity. The local-TTS callback retains its context-bearing
+      mapping. Both converge on the same token-fenced delivery-unknown cleanup path.</li>
+    <li>On user barge-in, record <code>interrupted</code> and create the tombstone before forwarding
+      the interruption, cancel the start/drain timers, arm the interruption-cleanup
+      deadline, and retain the transport barrier until the old generation stops or
+      its output lane has been torn down. Do not automatically <code>start_next()</code> after
+      barge-in; the new accepted turn or explicit resume owns the next scheduling
+      decision.</li>
+    <li>On explicit pause, record public <code>paused</code> disposition before forwarding the same
+      interruption cleanup, retain the old barrier through stop/teardown, and keep the
+      paused item outside the runnable queues. Explicit resume may enqueue a new
+      generation only after that barrier resolves; the pause-control path, not the old
+      stop callback, owns any confirmation or subsequent scheduling decision.</li>
+    <li>Keep canonical result commit, epoch fencing, and work-item cancellation ownership
+      unchanged. This plan changes speech disposition and lifecycle only.</li>
+    <li>Defer browser playout acknowledgement, selective transport-buffer retraction,
+      multiple in-flight transport generations, and adaptive timeout tuning to later
+      plans as the transport integration matures.</li>
+    <li>Do not add a package version bump, tag, or release step. The reviewed invariant
+      becomes a prerequisite consumed by the v0.1.3 delivery-policy phase.</li>
+  </ul>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="review-focus">
+<!-- plan-view-rich-section-sha256: 9bce96fe6f7836342e6b11a8c364e9550227a278a3f331666552c6f9beb7df1e -->
+<section class="section">
+  <h2>Review Focus</h2>
+  <ul>
+    <li>Verify the internal generation marker survives the pinned local and generic TTS paths in serialization order and binds generated <code>context_id</code> without relying on fieldless bot-frame identity.</li>
+    <li>Verify the single global transport slot plus tombstones prevents late A start/audio/stop frames from binding to or releasing B after interruption, reconnect, cancellation, or fallback.</li>
+    <li>Verify a fallback after output submission cannot admit B on A's lane: it must await normal stop or complete connection-scoped output teardown. Exercise A-fallback &rarr; attempted B admission &rarr; late fieldless A stop.</li>
+    <li>Verify the exact two-query race: B's timeout notice stays in its work-item queue behind A's occupied transport slot, B's final result removes only that notice, and B's final speech starts after A stops.</li>
+    <li>Verify both watchdog equations, the interruption-cleanup equation, zero-audio behavior, both provider-error ingress paths, and stop-versus-expiry races with a manual clock that controls both monotonic reads and timer wakeups.</li>
+    <li>Verify the real pinned SmallWebRTC output path holds the slot until its controlled final-audio future resolves and emits the upstream stop.</li>
+    <li>Verify barge-in terminalizes delivery before transport cleanup and never automatically advances old queued speech.</li>
+    <li>Verify pause retains the old barrier, resume cannot requeue early, and only the explicit control path resumes scheduling.</li>
+  </ul>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="implementation-checklist">
+<!-- plan-view-rich-section-sha256: 4cc3663a5e254a25cbbb125d7544e25ebae784952965881acb4d9532e24ae340 -->
+<section class="section">
+<p>The phases below are the immutable implementation contract. Runtime progress and durable findings belong below the review marker.</p>
+
+<div class="card">
+<h3>Phase 1: Add the correlated generation state machine and transport slot</h3>
+<p><span class="chip">Impl: server/app.py</span> <span class="chip">server/config.py</span> <span class="chip">config.toml</span> <span class="chip">README.md</span> <span class="chip">server/pipeline.py</span> <span class="chip">server/speech_lifecycle.py</span> <span class="chip">server/speech_scheduler.py</span> <span class="chip">server/services/tts.py</span></p>
+<p><span class="chip">Test: tests/test_app.py</span> <span class="chip">tests/test_config.py</span> <span class="chip">tests/test_pipeline.py</span> <span class="chip">tests/test_speech_lifecycle.py</span> <span class="chip">tests/test_speech_scheduler.py</span></p>
+<p><code>uv run pytest tests/test_app.py tests/test_config.py tests/test_pipeline.py tests/test_speech_lifecycle.py tests/test_speech_scheduler.py -k 'speech or tts or transport or delivery or config' -v</code></p>
+<p><strong>Goal:</strong> Per-work queues feed one coordinator-owned transport slot; generation identity is established before TTS, and the real pinned output lane proves that synthesis completion, cleanup deadlines, and late frames cannot release the wrong generation.</p>
+<ul>
+<li>Add the private <code>SpeechGeneration</code> state machine, <code>SpeechLifecycleCoordinator</code>, cancellable timer-scheduler protocol, and <code>SpeechGenerationMarkerFrame</code> in <code>server/speech_lifecycle.py</code>. The coordinator is the only owner of the TTS-lane lease, admitted generation, global transport slot, timers, tombstones, and terminal release. The marker carries the scheduler token and utterance identity, is inserted immediately before the matching <code>TTSSpeakFrame</code>, and is consumed after TTS rather than forwarded to the output transport.</li>
+<li>Add one shared <code>TransportSpeechLifecycleProcessor</code> after either TTS integration path and immediately before <code>transport.output()</code>. It is a stateless adapter that observes the serialized marker, generated <code>TTSStartedFrame</code>/<code>TTSAudioRawFrame</code>/<code>TTSStoppedFrame</code>, downstream interruption, and upstream bot start/stop, then calls token-bearing coordinator methods.</li>
+<li>Add a separate generic-TTS error adapter before TTS or register the pinned service's <code>on_error</code> hook. Capture the TTS-lane token when the request is admitted and attribute upstream <code>ErrorFrame</code> by that captured token plus <code>ErrorFrame.processor</code>; never infer identity from an <code>ErrorFrame.context_id</code> because none exists. Keep the local provider's context-bearing error callback as a distinct adapter into the same coordinator transition.</li>
+<li>Bind the first generated TTS <code>context_id</code> after a marker to that marker's token. The coordinator maintains one occupied global transport slot plus terminal tombstones; neither lifecycle adapter owns parallel slot state. Never bind a fieldless bot frame by looking up a scheduler lease.</li>
+<li>Preserve per-work-item FIFO and existing work-item selection/targeted-start semantics. <code>SpeechScheduler</code> owns only queues/selection and may ask the coordinator to admit a selected item only when the global slot is empty.</li>
+<li>Keep <code>provider_synthesis_ended()</code> non-terminal. Release/admit next only after transport stop or completed old-lane cleanup.</li>
+<li>Add and document validated config fields <code>speech_start_timeout_seconds = 10.0</code> and <code>speech_transport_grace_seconds = 1.0</code>.</li>
+<li>For matching downstream PCM audio, accumulate duration from byte length, sample rate, channel count, and sample width. Arm the drain fallback at <code>synthesis_end + total_audio_duration + grace</code>; zero audio uses only grace.</li>
+<li>Inject both monotonic time and a cancellable <code>call_at</code>/<code>sleep_until</code> scheduler into the coordinator. Production uses the event loop; tests use one manual clock that advances reads and wakes due timers deterministically.</li>
+<li>Route both provider-error adapters and start-timeout through <code>delivery_unknown</code>. If no audio reached output, cancel/flush the old TTS lane and require its acknowledgement before clearing the slot. If audio reached output or either lane cannot acknowledge cleanup, invalidate the connection epoch, cancel/tear down its output transport, and do not admit queued speech until a fresh connection-scoped lane exists.</li>
+<li>On barge-in or explicit pause, record the disposition and tombstone before forwarding interruption, cancel normal timers, and arm <code>forwarded_at + speech_transport_grace_seconds</code>. The normal bot stop resolves the barrier; expiry tears down the connection-scoped output lane rather than clearing it for reuse. Neither the interruption nor its later stop calls <code>start_next()</code>.</li>
+<li>Move the lifecycle proof into this phase. Add marker-order tests for both pinned TTS paths; a credential-free real <code>SmallWebRTCOutputTransport</code> test with a fake peer/audio track and controlled final <code>RawAudioTrack.add_audio_bytes()</code> future; manual-clock start/drain/interruption deadline tests; and parameterized late-A start/audio/stop/error traces for interruption, pause, reconnect, cancellation, shutdown, start-timeout, and drain fallback. Assert slot mutation occurs only through the coordinator and exactly once.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Phase 2: Make queued timeout supersession explicit and work-scoped</h3>
+<p><span class="chip">Impl: server/pipeline.py</span> <span class="chip">server/speech_scheduler.py</span></p>
+<p><span class="chip">Test: tests/test_pipeline.py</span> <span class="chip">tests/test_speech_scheduler.py</span></p>
+<p><code>uv run pytest tests/test_pipeline.py tests/test_speech_scheduler.py -k 'timeout or supersed or queued or late_result' -v</code></p>
+<p><strong>Goal:</strong> A retained final result atomically replaces only its own queued timeout notice before that notice can occupy the global transport slot.</p>
+<ul>
+<li>Give speech items an internal role (<code>result</code>, <code>timeout_notice</code>, or other existing non-supersedable role) rather than relying on broad work-item queue deletion.</li>
+<li>Replace the current generic <code>discard_queued(work_item_id)</code> call with a work-scoped, notice-specific operation that returns the exact discarded items and records their terminal delivery state once.</li>
+<li>Perform notice removal and final-result enqueue without an <code>await</code> boundary that could let <code>start_next()</code> select the notice between the two operations.</li>
+<li>Define the boundary explicitly: a notice is supersedable while it remains in its per-work queue; a notice admitted to the global slot is not interrupted; final-result commit remains independent of either speech disposition.</li>
+<li>Preserve within-work FIFO, existing cross-work selection, targeted-start policy, paused items, duplicate late callbacks, missing TTS, stale epochs, cancellation, and reconnect semantics.</li>
+<li>Add the deterministic reported-race test in this phase: A occupies the proven transport slot, B has a mixed same-work queue containing non-supersedable speech around its timeout notice, and B's final result arrives before A stops. Assert only B's notice terminates once, B's remaining same-work items retain order, another work queue is unchanged, the final enqueue is atomic, and A is not interrupted.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Phase 3: Document the boundary and run cross-phase validation</h3>
+<p><span class="chip">Impl: shared/protocol.md</span> <span class="chip">CHANGELOG.md</span> <span class="chip">docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md</span></p>
+<p><span class="chip">Test: tests/test_app.py</span> <span class="chip">tests/test_pipeline.py</span> <span class="chip">tests/test_speech_lifecycle.py</span> <span class="chip">tests/test_speech_scheduler.py</span></p>
+<p><code>uv run pytest tests/test_app.py tests/test_pipeline.py tests/test_speech_lifecycle.py tests/test_speech_scheduler.py -v</code></p>
+<p><span class="chip">Validation: uv run ruff format --check . && uv run ruff check . && uv run pytest -q</span></p>
+<p><strong>Goal:</strong> Documentation distinguishes synthesis, transport drain, teardown, and browser audibility, while the full suite re-runs the Phase 1 lifecycle and Phase 2 supersession invariants together.</p>
+<ul>
+<li>Re-run, without duplicating ownership, the Phase 1 real-transport/manual-clock contract matrix and the Phase 2 deterministic A/B mixed-queue regression as a cross-phase validation gate.</li>
+<li>Add an ordered event-log assertion for start-timeout cleanup: <code>fence A cleanup-pending → dispatch cancel/flush A → record delivery_unknown → acknowledge or tear down A's lane → clear or invalidate slot → optionally admit B</code>. For barge-in and pause assert <code>record disposition/tombstone → forward InterruptionFrame → stop or teardown</code>, with no <code>start_next()</code> from the interruption or stale stop.</li>
+<li>Assert the full terminal matrix—interruption, pause, reconnect, cancellation, shutdown, start-timeout, drain fallback, generic error, and local error—drops late context-bearing A frames before output, prevents any late fieldless A stop from being observed on B's lane, leaves B unchanged, and progresses exactly once.</li>
+<li>Update <code>shared/protocol.md</code> with the transport-aware lease boundary and its limitation: transport stop is stronger than synthesis end but still does not prove browser audibility.</li>
+<li>Record the fix under the unreleased changelog section without changing the package version, and retain the explicit precursor link in the v0.1.3 plan.</li>
+</ul>
+</div>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="technical-specifications">
+<!-- plan-view-rich-section-sha256: a8152dab9dd148e2252613d648b2ddddab974d27de759f08ddbf8465eeba950d -->
+<section class="section">
+  <h2>Technical Specifications</h2>
+
+  <h3>Files to Modify</h3>
+  <ul>
+    <li><code>server/app.py</code> — install one shared transport lifecycle processor immediately before <code>transport.output()</code> for both local event-capable and generic TTS paths; install the distinct generic upstream error observer/provider hook; and expose connection-scoped output cancellation/teardown completion to the coordinator.</li>
+    <li><code>server/config.py</code>, <code>config.toml</code>, <code>README.md</code> — define, validate, load, and document the two speech-liveness timeout fields.</li>
+    <li><code>server/pipeline.py</code> — stop releasing on provider synthesis end, connect transport lifecycle events to the coordinator, emit the internal marker with each speak request, make pause/barge-in ordering explicit, and invoke notice-specific replacement before enqueueing final speech.</li>
+    <li><code>server/speech_scheduler.py</code> — preserve and select per-work queues, delegate admission to the lifecycle coordinator, retain paused items outside runnable queues, and expose notice-specific queued replacement. It does not own a second active transport lease.</li>
+    <li><code>server/services/tts.py</code> — verify or adapt the local provider so the marker and context-correlated lifecycle/error callbacks traverse the shared coordinator adapters exactly once.</li>
+    <li><code>shared/protocol.md</code> — define provider, transport, and audibility boundaries.</li>
+    <li><code>CHANGELOG.md</code> — record the unreleased bug fix without a version bump.</li>
+    <li><code>docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md</code> — declare this reviewed precursor as a prerequisite for Phase 2.</li>
+    <li><code>tests/test_app.py</code>, <code>tests/test_config.py</code>, <code>tests/test_pipeline.py</code>, <code>tests/test_speech_scheduler.py</code> — assembly, configuration, queue selection, supersession, and reported-race coverage.</li>
+  </ul>
+
+  <h3>New Files to Create</h3>
+  <ul>
+    <li><code>server/speech_lifecycle.py</code> — authoritative private generation coordinator, marker frame, stateless lifecycle/error adapters, tombstones, injectable timer scheduler, and output-lane cleanup coordination.</li>
+    <li><code>tests/test_speech_lifecycle.py</code> — state-transition, stale-frame, manual clock/timer, provider-error, teardown, and pinned SmallWebRTC drain-boundary contract tests.</li>
+  </ul>
+
+  <h3>Architecture Decisions</h3>
+  <ul>
+    <li><span class="chip">grilled</span> Use a private token-bearing marker through the pinned TTS serialization boundary plus one global transport slot. Fieldless bot events never establish identity from the currently active scheduler lease.</li>
+    <li><span class="chip">reviewed</span> <code>SpeechLifecycleCoordinator</code> is the only owner of the admitted generation, TTS-lane lease, global transport slot, timers, tombstones, and exactly-once terminalization. <code>SpeechScheduler</code> owns queues/selection and lifecycle processors are stateless frame adapters.</li>
+    <li><span class="chip">grilled</span> Retain terminal generation tombstones until TTS and transport cleanup complete; discard later context-correlated frames for stale contexts before output.</li>
+    <li><span class="chip">grilled</span> Formalize a small internal <code>SpeechGeneration</code> state machine now while leaving public <code>DeliveryState</code> unchanged. Defer browser acknowledgement, selective buffered-audio retraction, multiple in-flight generations, and adaptive timeout policy.</li>
+    <li><span class="chip">grilled</span> Retain the hybrid scheduler. Per-work queues keep FIFO and existing selection/targeted-start flexibility; one global slot serializes actual transport work. This plan does not introduce global FIFO.</li>
+    <li><span class="chip">grilled</span> Use a 10-second start watchdog and a one-second transport grace. The drain deadline is synthesis end plus accumulated PCM duration plus grace; interruption/pause cleanup is forwarded-at plus the same grace. Both monotonic time and timer wakeups are injected; all callbacks are token-fenced.</li>
+    <li><span class="chip">reviewed</span> A deadline never reuses an output lane that may still emit a fieldless event. With no submitted output audio, acknowledged TTS flush permits release. After output submission, expiry invalidates the connection and awaits output cancellation/teardown; queued speech waits for a fresh lane.</li>
+    <li><span class="chip">reviewed</span> Generic upstream <code>ErrorFrame</code> and local context-bearing errors enter through different adapters. Both capture the old TTS-lane token and converge on <code>delivery_unknown</code>; neither samples a later active generation.</li>
+    <li><span class="chip">grilled</span> Barge-in records interruption before output cleanup, holds the old transport barrier until normal stop or completed teardown, and never auto-advances queued speech.</li>
+    <li><span class="chip">reviewed</span> Explicit pause follows the same barrier cleanup but records <code>paused</code>; resume creates a new generation only after the old barrier resolves, and the explicit control path owns subsequent scheduling.</li>
+    <li><code>BotStoppedSpeakingFrame</code> is the normal server-side transport-drain signal, but it is fieldless and valid only while the same connection-scoped lane has not been retired by completed teardown. Transport drain and browser audibility remain separate claims.</li>
+    <li>Supersession is role- and work-item-specific. A final result removes only its queued timeout notice and cannot retract an item already occupying the global slot.</li>
+    <li>The existing <code>73d1a7c</code> queue-discard primitive is partial implementation evidence, not proof of acceptance. Phase 2 narrows or replaces it with notice-specific replacement.</li>
+  </ul>
+
+  <h3>Dependencies</h3>
+  <ul>
+    <li>Python remains <code>&gt;=3.12</code> and <code>pipecat-ai[cartesia,deepgram,openai,webrtc,runner]</code> remains pinned at <code>1.6.0</code> in <code>pyproject.toml</code>.</li>
+    <li><code>BotStartedSpeakingFrame</code> and <code>BotStoppedSpeakingFrame</code> are current, non-deprecated but fieldless Pipecat 1.6.0 frame types; they cannot fence a late old-lane event after timer-only reuse.</li>
+    <li><code>TTSStartedFrame</code>, <code>TTSAudioRawFrame</code>, and <code>TTSStoppedFrame</code> carry generated <code>context_id</code>; <code>TTSSpeakFrame</code> does not accept a caller-supplied context ID.</li>
+    <li>Pipecat 1.6.0 TTS processing serializes non-system downstream frames relative to generated audio contexts; Phase 1 contract tests this marker seam for both pinned TTS paths rather than relying on documentation alone.</li>
+    <li>Pipecat 1.6.0 generic TTS errors are upstream <code>ErrorFrame</code> instances without <code>context_id</code>; Phase 1 verifies the provider hook/upstream observer rather than routing them through the downstream lifecycle processor.</li>
+    <li>No new Python or browser dependency is required.</li>
+    <li>Explore facts above the review marker are point-in-time contract facts. A later path, pattern, or dependency correction invalidates the review marker and requires <code>/review-plan</code> to run again.</li>
+  </ul>
+
+  <h3>Integration Seams</h3>
+  <section class="searchable-table" data-table-id="integration-seams">
+    <style>
+      .searchable-table .search-bar {
+        display: flex; gap: 10px; margin: 16px 0; align-items: center; flex-wrap: wrap;
+      }
+      .searchable-table .search-bar input {
+        flex: 1; min-width: 200px; padding: 8px 12px; background: var(--bg-elev);
+        border: 1px solid var(--border); border-radius: 6px; color: var(--fg);
+        font-family: inherit; font-size: 13px;
+      }
+      .searchable-table .search-bar input:focus { outline: none; border-color: var(--accent); }
+      .searchable-table table.data {
+        width: 100%; border-collapse: collapse; font-size: 12.5px;
+        background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+        overflow: hidden;
+      }
+      .searchable-table table.data th,
+      .searchable-table table.data td {
+        text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border);
+      }
+      .searchable-table table.data th {
+        color: var(--fg-dim); font-weight: 600; font-size: 11.5px;
+        background: var(--bg-deep); text-transform: uppercase; letter-spacing: 0.04em;
+      }
+      .searchable-table table.data tr:last-child td { border-bottom: none; }
+      .searchable-table table.data tr.hidden { display: none; }
+      .searchable-table table.data code { background: var(--bg-card); }
+    </style>
+
+    <div class="search-bar">
+      <input type="search" class="st-search" placeholder="Search seams...">
+    </div>
+
+    <table class="data">
+      <thead>
+        <tr><th>Seam</th><th>Writer</th><th>Caller</th><th>Contract</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Work queues → global slot</td><td><code>SpeechScheduler</code> queue selector</td><td><code>SpeechLifecycleCoordinator.try_admit()</code></td><td>Preserve within-work FIFO/current selection; coordinator admits exactly one generation</td></tr>
+        <tr><td>Generation marker → TTS context</td><td>Pipeline marker before <code>TTSSpeakFrame</code></td><td>Post-TTS lifecycle adapter</td><td>Serialized marker token binds the next generated <code>context_id</code>; marker never reaches output</td></tr>
+        <tr><td>Provider synthesis lifecycle</td><td>Local callback or generic downstream TTS frames</td><td>Coordinator</td><td>Matching start/audio/end transitions the captured token; synthesis end does not clear the slot</td></tr>
+        <tr><td>Generic provider error</td><td>TTS <code>on_error</code> hook or pre-TTS upstream observer</td><td>Coordinator TTS-lane lease</td><td>Attribute upstream fieldless-with-respect-to-context error by captured token and processor identity</td></tr>
+        <tr><td>Output transport lifecycle</td><td>SmallWebRTC <code>BaseOutputTransport</code></td><td>Coordinator through lifecycle adapter</td><td>Normal fieldless stop clears only the still-occupied same lane; a timed-out lane is torn down, never reused</td></tr>
+        <tr><td>Stale-frame fence</td><td>Tombstoned generation/context</td><td>Lifecycle adapter</td><td>Drop late context-bearing audio/TTS stop before output; never claim tombstones identify fieldless bot events</td></tr>
+        <tr><td>Watchdogs</td><td>Injected monotonic clock plus timer scheduler</td><td>Coordinator</td><td>Start, duration-plus-grace drain, and forwarded-at-plus-grace interruption deadlines compare captured token</td></tr>
+        <tr><td>Cleanup fallback</td><td>Coordinator</td><td>Connection-scoped TTS/output lane</td><td>Acknowledged no-audio TTS flush may release; submitted-output expiry tears down the lane before any fresh admission</td></tr>
+        <tr><td>Late-result supersession</td><td><code>SessionHost</code> late-result callback</td><td>Per-work speech queue</td><td>Atomically replace only the same work item's queued timeout notice</td></tr>
+        <tr><td>Barge-in/pause</td><td>Control/interruption path</td><td>Coordinator</td><td>Record disposition first, forward interruption, retain barrier through stop/teardown, do not auto-start</td></tr>
+        <tr><td>Reconnect/shutdown</td><td>Connection lifecycle</td><td>Coordinator</td><td>Invalidate epoch and await connection-scoped output teardown before a fresh lane can admit speech</td></tr>
+        <tr><td>v0.1.3 delivery policy</td><td>This precursor's tested invariant</td><td>v0.1.3 Phase 2</td><td>Phase 2 may assume notices remain per-work queued while another generation occupies transport</td></tr>
+      </tbody>
+    </table>
+
+    <script>
+    (function() {
+      var root = document.querySelector('.searchable-table[data-table-id="integration-seams"]');
+      if (!root) return;
+      var search = root.querySelector('.st-search');
+      var rows = root.querySelectorAll('tbody tr');
+      search.addEventListener('input', function(e) {
+        var q = e.target.value.toLowerCase();
+        rows.forEach(function(row) {
+          var text = row.textContent.toLowerCase();
+          row.classList.toggle('hidden', q && text.indexOf(q) === -1);
+        });
+      });
+    })();
+    </script>
+  </section>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="architecture-call-flow">
+<!-- plan-view-rich-section-sha256: 88891dab250b3fe747e6afc81dbee05e66610616c5d1dea15745e946f9d5fcb3 -->
+<section class="section">
+<h2>Architecture &amp; Call Flow</h2>
+
+<div class="card">
+<h3>Component flow</h3>
+<pre class="mermaid">graph LR
+    Host["SessionHost / result lifecycle"] --> WorkQueues["Per-work speech queues"]
+    WorkQueues --> Coordinator["Speech lifecycle coordinator"]
+    Coordinator --> Slot["Single global transport slot"]
+    Slot --> Marker["Token-bearing generation marker"]
+    Marker --> TTS["TTS provider serialization"]
+    TTS --> Bridge["Transport speech lifecycle processor"]
+    TTS -->|"upstream ErrorFrame / provider hook"| ErrorAdapter["Generic error adapter"]
+    ErrorAdapter --> Coordinator
+    Bridge --> Output["SmallWebRTC output transport"]
+    Output --> Browser["Browser playback"]
+    Output -->|"fieldless upstream bot start / stop"| Bridge
+    Bridge --> Coordinator
+    Host -->|"replace same-work queued notice"| WorkQueues</pre>
+</div>
+
+<div class="card">
+<h3>Baseline sequence: queued notice superseded by final result</h3>
+<pre class="mermaid">sequenceDiagram
+    participant H as SessionHost
+    participant Q as Work queues
+    participant S as Lifecycle coordinator / slot
+    participant T as TTS
+    participant L as Lifecycle bridge
+    participant O as Output transport
+    participant B as Browser
+
+    H->>Q: enqueue Helsinki result
+    Q->>S: admit Helsinki generation
+    S->>T: marker(token A), then TTSSpeakFrame
+    T->>L: marker, TTSStarted(context A), audio, TTSStopped
+    L->>O: correlated audio and TTSStopped
+    Note over S,L: Synthesis ended; keep global slot occupied
+    O->>B: play Helsinki audio
+    H->>Q: enqueue SF timeout notice
+    Note over Q,S: Notice remains per-work queued; slot is occupied
+    H->>Q: SF final result replaces queued notice
+    O-->>L: fieldless BotStoppedSpeakingFrame
+    L->>S: stop sole generation A; clear slot
+    Q->>S: admit SF final generation
+    S->>T: marker(token B), then TTSSpeakFrame
+    T->>L: correlated SF result audio
+    L->>O: SF result audio
+    O->>B: play SF result</pre>
+</div>
+
+<div class="card">
+<h3>Fallback sequence after output submission</h3>
+<pre class="mermaid">sequenceDiagram
+    participant S as Lifecycle coordinator
+    participant O as Old output lane
+    participant Q as Work queues
+    participant N as Fresh connection lane
+
+    S->>O: A drain/interruption deadline expires
+    S->>S: fence A cleanup-pending; retain A slot
+    S->>O: dispatch cancel/flush
+    S->>S: record delivery_unknown once
+    S->>O: await connection-scoped teardown
+    Q-->>S: B remains queued; admission rejected
+    O-->>S: teardown complete; old lane cannot emit later bot events
+    S->>S: retire A slot and old connection epoch
+    N-->>S: fresh connection lane ready
+    S->>N: admit selected B generation</pre>
+</div>
+
+<div class="card">
+<h3>State reference: context lifecycle by step</h3>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Trigger</th>
+<th>Enters context</th>
+<th>Cleared/persisted</th>
+<th>Turn boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Speech queued</td>
+<td>Result or timeout notice enters a work queue</td>
+<td>Utterance ID, work-item ID, role, origin epoch</td>
+<td>Persists in that work queue</td>
+<td>May cross turns</td>
+</tr>
+<tr>
+<td>Generation admitted</td>
+<td>Queue selector finds the global slot empty</td>
+<td>Stable token, utterance, start watchdog</td>
+<td>Persists in the sole global slot</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Marker crosses TTS</td>
+<td>Serialized marker precedes generated TTS context</td>
+<td>Token bound to generated <code>context_id</code></td>
+<td>Persists in generation ledger</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Synthesis progresses</td>
+<td>Matching start/audio/end or captured provider error</td>
+<td>Internal phase and accumulated PCM duration</td>
+<td>End/error updates state; end keeps slot occupied</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Final replaces notice</td>
+<td>Retained result completes while notice is work-queued</td>
+<td>Same work-item identity and timeout-notice role</td>
+<td>Notice terminates once; final occupies its queue position</td>
+<td>May cross turns</td>
+</tr>
+<tr>
+<td>Transport stops</td>
+<td>Output emits fieldless stop for sole occupied slot</td>
+<td>Transport terminal event</td>
+<td>Clears slot once; normal selector may run</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Barge-in/pause</td>
+<td>Downstream interruption precedes output cleanup</td>
+<td>Interrupted/paused disposition plus transport tombstone</td>
+<td>Slot stays fenced through stop/teardown; no automatic next start</td>
+<td>May begin newer turn</td>
+</tr>
+<tr>
+<td>Delivery unknown before output</td>
+<td>Start watchdog or captured provider error</td>
+<td>Captured token and stale-context fence</td>
+<td>Acknowledged TTS flush may clear slot once</td>
+<td>May cross turns</td>
+</tr>
+<tr>
+<td>Delivery unknown after output</td>
+<td>Drain/interruption deadline or captured provider error</td>
+<td>Captured token, tombstone, invalid connection epoch</td>
+<td>Tears down old output lane before retiring slot; no same-lane reuse</td>
+<td>May cross turns</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+</section>
+
+</div>
+<div class="tab-panel" data-slot="testing-notes">
+<!-- plan-view-rich-section-sha256: 85e718080aaaa37d090b0d9c3d851dce5320dfa0e6eb06bd316acc3bb1e8b184 -->
+<section class="section">
+  <h2>Testing Notes</h2>
+
+  <h3>Test Approach</h3>
+  <ul class="checklist">
+    <li>Unit-test scheduler lease/token transitions independently of Pipecat.</li>
+    <li>Test the internal state machine, marker ordering, tombstone fence, and both TTS integration paths.</li>
+    <li>Test the generic upstream error observer/provider hook with a real-shape context-free <code>ErrorFrame</code>, separately from the local context-bearing callback.</li>
+    <li>Exercise pinned SmallWebRTC output with a controlled real audio-track future.</li>
+    <li>Reproduce the two-query ordering with deterministic events rather than wall clock sleeps.</li>
+    <li>Drive monotonic reads and timer wakeups with one manual scheduler; do not use wall-clock sleeps for deadline boundaries.</li>
+    <li>Use an ordered event-log spy for interruption, pause, flush, teardown, slot retirement, and next-admission precedence.</li>
+    <li>Run the full credential-free Python suite, formatter, and linter.</li>
+  </ul>
+
+  <h3>Test Results</h3>
+  <ul class="checklist">
+    <li>Targeted lifecycle tests pass.</li>
+    <li>Deterministic two-query regression passes.</li>
+    <li>Full test suite passes.</li>
+    <li><code>ruff format --check</code> and <code>ruff check</code> pass.</li>
+  </ul>
+
+  <h3>Edge Cases Tested</h3>
+  <ul class="checklist">
+    <li>Final result arrives before its timeout notice starts.</li>
+    <li>Final result arrives after its timeout notice starts.</li>
+    <li>Duplicate or stale transport start/stop event.</li>
+    <li>A interrupted before start, B pending, then late A start/audio/stop.</li>
+    <li>A paused before start, explicit resume requested before and after barrier resolution, then late A start/audio/stop.</li>
+    <li>Interruption, pause, cancellation, shutdown, or reconnect before transport stop.</li>
+    <li>Generic upstream provider error, local context-bearing error, or no start/end lifecycle.</li>
+    <li>Start, drain, and interruption-cleanup deadline boundaries; zero audio; and stop-versus-expiry in both deterministic orders.</li>
+    <li>Output-submitted expiry rejects B until old-lane teardown completes; a late fieldless A stop can never be observed on B's fresh lane.</li>
+    <li>Missing TTS and inactive/stale connection.</li>
+    <li>Mixed same-work queue removes only the timeout-notice role and preserves all other item order.</li>
+    <li>Another work item's queued speech is unaffected.</li>
+  </ul>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="acceptance-criteria">
+<!-- plan-view-rich-section-sha256: de117d5da96afd6dcb3cfe978d79b373ff626ba1fce83f10bc2817623bd545ef -->
+<section class="section" id="acceptance-criteria">
+  <h2>Acceptance Criteria</h2>
+  <ul>
+    <li>Per-work queues retain within-work FIFO and current cross-work selection behavior; exactly one generation may occupy the global transport slot.</li>
+    <li><code>SpeechLifecycleCoordinator</code> is the sole slot/ledger mutation authority; <code>SpeechScheduler</code> owns queues/selection and all adapters call token-bearing coordinator APIs.</li>
+    <li>The marker/context ledger never obtains identity from a fieldless bot event, and late frames for A cannot bind to or release B.</li>
+    <li>Synthesis end and raw timer expiry do not clear an output-active slot. Normal transport stop clears it once; otherwise acknowledged no-audio TTS flush or completed connection-scoped output teardown retires it exactly once before any fresh admission.</li>
+    <li>In the reported A/B interleaving, B's timeout notice remains queued, is removed when B's final result becomes ready, never reaches TTS/output, and B's final result plays after A without interrupting A.</li>
+    <li>Once a timeout notice has transport-started, final-result arrival does not interrupt it; the final result still commits and is delivered according to the existing active-epoch policy.</li>
+    <li>Barge-in records interruption before transport cleanup and never automatically advances previously queued speech.</li>
+    <li>Pause records <code>paused</code> before cleanup, retains the barrier, and permits explicit resume to enqueue a fresh generation only after that barrier resolves.</li>
+    <li>Manual-clock/timer tests prove the 10-second start watchdog, duration-plus-one-second drain deadline, forwarded-at-plus-one-second interruption deadline, zero-audio path, both provider-error paths, and stop-versus-expiry races.</li>
+    <li>A pinned SmallWebRTC contract test proves slot release waits for the controlled final-audio future and upstream stop.</li>
+    <li>The A/B regression uses a mixed same-work queue and proves only the exact timeout notice is removed, other same-work and cross-work ordering is preserved, and the final result is enqueued atomically.</li>
+    <li>Parameterized tests prove queue isolation, one-slot safety, marker ordering, generic/local error attribution, every terminal-path stale-context fence, fail-closed fallback liveness, cleanup ordering, and both TTS integration paths.</li>
+    <li>Protocol and changelog documentation are current, with no package version bump, tag, or release created by this plan.</li>
+    <li>The v0.1.3 plan names this reviewed precursor as a Phase 2 prerequisite.</li>
+    <li><code>uv run ruff format --check .</code>, <code>uv run ruff check .</code>, and <code>uv run pytest -q</code> pass before merge.</li>
+  </ul>
+  <p><em>Reviewed: 2026-07-30 @ 3e4e2ed71916d02a4ff6049fa3240ba7761f5dda</em></p>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="progress">
+<!-- plan-view-rich-section-sha256: bf160f655af13e792c0deb844b1c177597b5e262aba531cffe633ee22688b30d -->
+<section class="section" id="progress">
+  <h2>Progress</h2>
+  <ul class="progress-checklist">
+    <li><span class="chip chip-done">Done</span> Phase 1: Add the correlated generation state machine and transport slot</li>
+    <li><span class="chip chip-done">Done</span> Phase 2: Make queued timeout supersession explicit and work-scoped</li>
+    <li><span class="chip chip-done">Done</span> Phase 3: Document the boundary and run cross-phase validation</li>
+  </ul>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="findings">
+<!-- plan-view-rich-section-sha256: 653553ab9b8fb727ec2653392d17005be20edb7c9c81cd0a9e5063c3a4adc745 -->
+<section class="section">
+  <section class="timeline-wrapper">
+    <style>
+      .timeline { position: relative; padding-left: 32px; margin: 16px 0; }
+      .timeline::before {
+        content: ""; position: absolute; left: 11px; top: 4px; bottom: 4px;
+        width: 2px; background: var(--border);
+      }
+      .timeline .event { position: relative; margin-bottom: 20px; font-size: 13px; }
+      .timeline .event::before {
+        content: ""; position: absolute; left: -27px; top: 6px;
+        width: 12px; height: 12px; border-radius: 50%; background: var(--green);
+        border: 2px solid var(--bg);
+      }
+      .timeline .event.commit::before  { background: var(--green); }
+      .timeline .event.finding::before { background: var(--amber); }
+      .timeline .event.fixed::before   { background: var(--green); }
+      .timeline .event.phase::before   { background: var(--blue); }
+      .timeline .event.review::before  { background: var(--purple); }
+      .timeline .event.live::before    { background: var(--teal); }
+      .timeline .event.race::before    { background: var(--amber); }
+      .timeline .event.harness::before { background: var(--red); }
+      .timeline .event.neutral::before { background: var(--grey); }
+      .timeline .event .when {
+        font-size: 11px; color: var(--fg-muted); display: block; margin-bottom: 2px;
+      }
+      .timeline .event .what { color: var(--fg); }
+      .timeline .event .what strong { color: var(--fg); }
+      .timeline .event .sha {
+        font-family: ui-monospace, monospace; font-size: 11px; color: var(--accent);
+        background: var(--bg-card); padding: 1px 5px; border-radius: 3px;
+        margin-left: 4px;
+      }
+      .timeline .event .plan-link {
+        display: inline-block; margin-left: 8px; font-size: 11px;
+        padding: 1px 7px; background: var(--bg-card); border-radius: 3px;
+        font-family: ui-monospace, monospace;
+      }
+    </style>
+
+    <h3>Findings timeline</h3>
+    <div class="timeline">
+      <div class="event finding">
+        <span class="when">2026-07-28</span>
+        <span class="what">Trace demonstrates <strong>scheduler-queue state and actual output playback state diverge</strong> after synthesis completion.</span>
+      </div>
+      <div class="event commit">
+        <span class="when">Commit</span>
+        <span class="what">Queue-only work-item discard implemented<span class="sha">73d1a7c</span> — cannot remove a notice already submitted to the output transport.</span>
+      </div>
+      <div class="event phase">
+        <span class="when">Phase 1 fix loop</span>
+        <span class="what">Found and fixed a genuine wiring bug (missing <code>await</code> on <code>SpeechLifecycleCoordinator.on_transport_bot_stopped</code>) and a missing <code>start_next()</code>/marker-consumption gap on the interruption/pause path. Iteration 2 correctly identified 3 remaining test failures as test-contract mismatches (tests asserting behavior the plan explicitly forbids), not implementation bugs; the test-writer aligned those 3 assertions with the already-tested Phase 1 contract.</span>
+      </div>
+      <div class="event review">
+        <span class="when">Post-conduct review</span>
+        <span class="what">Two host-integration gaps: the SmallWebRTC teardown callback acknowledged completion without awaiting physical disconnect, and the terminal callback could advance queued speech after pause/interruption cleanup.</span>
+      </div>
+      <div class="event review">
+        <span class="when">xhigh-effort /code-review --fix (full branch diff)</span>
+        <span class="what">10 further confirmed findings (7 correctness, 3 cleanup): a pause command could tombstone unrelated active speech when its target was only queued; <code>shutdown()</code> could skip scheduler cleanup after a failed output teardown; browser reconnect never routed through the lifecycle coordinator, leaking the old connection; <code>TTSStartedFrame</code> and the timeout-cleanup path each had their own stale-frame race letting audio reach output for an abandoned generation; a walrus-operator override check silently dropped a legitimate <code>0.0</code> TOML value instead of erroring; the <code>delivery_completed</code> event bypassed the lifecycle coordinator gate; plus a dead scheduler method and a duplicated business-rule mapping.</span>
+      </div>
+      <div class="event finding">
+        <span class="when">Follow-on gap sweep</span>
+        <span class="what">A multi-intent work item's timeout notice was misattributed to <code>ROLE_RESULT</code>; a speech-submission failure did not release the lifecycle slot on the failure path.</span>
+      </div>
+      <div class="event review">
+        <span class="when">Adversarial Codex review</span>
+        <span class="what"><code>LocalTTS.run_tts()</code> yielded <code>TTSAudioRawFrame</code> without a <code>context_id</code>, unlike its sibling <code>TTSStartedFrame</code>/<code>TTSStoppedFrame</code> calls — every local-TTS audio chunk skipped both <code>audio_submitted</code> tracking and the stale-frame drop gate, letting audio from an interrupted/tombstoned generation reach output after barge-in.</span>
+      </div>
+      <div class="event review">
+        <span class="when">Deep-review security lens</span>
+        <span class="what"><code>SpeechLifecycleCoordinator._generations</code> grew without bound on a long-lived connection, since no path ever popped a terminalized generation.</span>
+      </div>
+      <div class="event review">
+        <span class="when">Second adversarial Codex review (post-fix branch diff)</span>
+        <span class="what">Two further high-severity gaps: <code>bind_context()</code> bound the first <code>TTSStartedFrame</code> after a marker without verifying it belonged to that marker's own generation (a stale start from a superseded generation could mis-bind a replacement's context; unbound/stale audio-or-stop frames were still forwarded to output unchecked), and <code>release_flushed_lane()</code> released the global transport slot as soon as cleanup was dispatched without confirming TTS had actually processed the interruption — letting a still-live old generation's late audio corrupt a newly admitted one. Also found: a <code>dispatch_cleanup</code> failure could leave <code>cleanup_pending</code> stuck true forever, wedging all future speech admission on that connection; and reaped context tombstones (the fix for the unbounded-growth finding above) had no eviction bound.</span>
+      </div>
+    </div>
+  </section>
+</section>
+
+</div>
+<div class="tab-panel" data-slot="issues-solutions">
+<!-- plan-view-rich-section-sha256: 86dffce6df9a7fb34e23397eb7ee3ec9913b62287e096e1c0c9d70f7012ade46 -->
+<div class="section">
+  <h2>Issues &amp; Solutions</h2>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip blue">Phase 1, iterations 0–1</span>
+    <p style="margin:10px 0 0;"><code>SpeechLifecycleCoordinator.on_transport_bot_stopped</code>
+    was called without <code>await</code> in <code>server/pipeline.py</code>, and the coordinator did not
+    call <code>start_next()</code> after synthesis completion + transport release in all paths. Fixed by
+    the implementer across two fix-loop iterations.</p>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip blue">Phase 1, iteration 2</span>
+    <p style="margin:10px 0 0;">3 tests in <code>tests/test_pipeline.py</code> asserted behavior contradicting
+    explicit Phase 1 requirements (synthesis-end-alone must not release the transport slot; a
+    <code>SpeechGenerationMarkerFrame</code> must precede every <code>TTSSpeakFrame</code> including control
+    acks). The implementer flagged <code>test_contract_mismatch: true</code>; the test-writer fixed the 3
+    assertions to match the established, already-tested contract instead.</p>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip amber">Post-conduct host fix</span>
+    <p style="margin:10px 0 0;"><code>_attach_connection</code> now exposes
+    <code>SmallWebRTCConnection.disconnect</code> as the connection-scoped output barrier. Teardown fences
+    admission, awaits that barrier, and only then acknowledges <code>teardown_complete</code>; absent or
+    failed barriers retain the lifecycle slot. Lifecycle terminal handling advances only active
+    <code>delivery_unknown</code> paths, so pause/interruption cleanup cannot start previously queued speech.
+    Host-level regressions cover both orderings.</p>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip purple">Code-review fix pass</span> <span class="chip grey">6 commits, one per finding cluster, each with its own regression test</span>
+    <ul style="margin:10px 0 0; padding-left:20px;">
+      <li><code>1af69cb</code> guards <code>pause()</code>'s tombstone call and <code>shutdown()</code>'s scheduler
+        cleanup on target/state mismatches, and routes <code>SpeechScheduler.interrupt()</code> (reconnect)
+        through the lifecycle coordinator like <code>pause()</code>/<code>cancel()</code> already do.</li>
+      <li><code>ea59dde</code> adds the missing <code>drop_stale_frame()</code> guard on
+        <code>TTSStartedFrame</code> and tombstones the timeout-driven cleanup path before its first await.</li>
+      <li><code>3775560</code> fixes the config walrus-truthy bug for <code>0.0</code> overrides and folds the
+        two new timeout fields into the existing validation loop.</li>
+      <li><code>59c2032</code> gates <code>delivery_completed</code> on <code>has_lifecycle</code> like its
+        sibling branches.</li>
+      <li><code>c322af2</code> removes the dead <code>discard_queued()</code> method.</li>
+      <li><code>e7b417d</code> extracts <code>_speech_role_for_child_outcome()</code> so the
+        retained-as-timeout-notice mapping has one definition instead of two.</li>
+    </ul>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip purple">Gap-sweep fix</span> <span class="chip grey"><code>1bcb283</code></span>
+    <p style="margin:10px 0 0;">Multi-intent's second pass now records each timeout-notice item's role before
+    committing, so <code>_commit_and_speak</code> tags it <code>ROLE_TIMEOUT_NOTICE</code> instead of the
+    <code>ROLE_RESULT</code> default; a speech submission failure now routes through
+    <code>lifecycle.provider_error()</code> (with a local <code>acknowledge_tts_lane_flush()</code> fallback if
+    that dispatch itself fails) before releasing the scheduler lease.</p>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip red">Adversarial-review fix</span> <span class="chip grey"><code>16dfa58</code></span>
+    <p style="margin:10px 0 0;"><code>LocalTTS.run_tts()</code> now stamps <code>context_id</code> on its
+    <code>TTSAudioRawFrame</code> yields, matching its sibling started/stopped frames, so local-TTS audio
+    participates in both <code>audio_submitted</code> tracking and the stale-frame drop gate.</p>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip teal">Deep-review fix</span> <span class="chip grey"><code>239e88d</code></span>
+    <p style="margin:10px 0 0;"><code>_terminalize_state</code> now pops a generation from
+    <code>_generations</code> once terminal. <code>_context_tokens</code> is deliberately left unpopped at this
+    point &mdash; <code>drop_stale_frame()</code> needs to distinguish "bound once, now reaped" (unambiguously
+    stale) from "never bound at all" (still possibly live, since <code>bind_context()</code> did not yet
+    verify identity).</p>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <span class="chip grey">CI fix</span> <span class="chip grey"><code>a1e6ddb</code></span>
+    <p style="margin:10px 0 0;">Fixes 6 mypy errors surfaced by CI (Optional-narrowing gaps across ternaries
+    and one variable whose declared type mypy inferred too narrowly); type-only, no behavior change.</p>
+  </div>
+
+  <div class="card">
+    <span class="chip red">Second adversarial-review fix pass</span> <span class="chip grey">split into two commits so each stays independently green</span>
+    <ul style="margin:10px 0 0; padding-left:20px;">
+      <li><code>dfb159e</code> makes <code>bind_context()</code> require the frame's <code>context_id</code> to
+        match its marker's own <code>utterance_id</code> (rejecting contexts already owned or tombstoned by
+        another generation), makes <code>on_tts_started()</code> report acceptance, and has
+        <code>TransportSpeechLifecycleProcessor</code> drop any TTS started/audio/stopped frame the
+        coordinator does not positively accept; reaped generations now move their context into a bounded
+        LRU tombstone cache (<code>connection_closed()</code> clears it) instead of leaking the mapping
+        forever.</li>
+      <li><code>433406f</code> removes <code>release_flushed_lane()</code>'s premature-release fast path &mdash;
+        interruption, pause, and cancel now queue a token-bearing <code>SpeechGenerationFlushAckFrame</code>
+        through the TTS lane, and only that frame reaching <code>TransportSpeechLifecycleProcessor</code> (or
+        full connection teardown) may release the slot, with a grace-window timer escalating to verified
+        teardown if the ack never arrives; a <code>dispatch_cleanup</code> failure now also escalates to
+        teardown immediately instead of leaving <code>cleanup_pending</code> stuck.</li>
+    </ul>
+  </div>
+</div>
+
+</div>
+<div class="tab-panel" data-slot="final-results">
+<!-- plan-view-rich-section-sha256: 925a7e62ba6313609f6440d9e4a1cc9e58a73307c50f94fbb3d834cebff8ae4f -->
+<section class="section" id="final-results">
+  <h2>Final Results</h2>
+  <div class="card">
+    <p>
+      All 3 phases implemented via <code>/skein:conduct --autonomous</code>, followed by a
+      post-conduct host-integration fix, an xhigh-effort <code>/code-review --fix</code>
+      pass (10 further findings fixed across 6 commits), a follow-on gap sweep,
+      two further adversarial-review/deep-review fix passes, and a CI mypy fix.
+    </p>
+    <p>
+      <span class="chip">598/598 tests pass</span>
+      <span class="chip">mypy clean</span>
+      <span class="chip">ruff format --check clean</span>
+      <span class="chip">ruff check clean</span>
+    </p>
+    <p>
+      Commits: <code>6124040</code> (phase 1), <code>13d1044</code> (phase 2),
+      <code>df0d5e0</code> (phase 3); progress bookkeeping <code>9ff8f70</code> and
+      <code>3a5f6c9</code>; code-review fixes <code>1af69cb</code>, <code>ea59dde</code>,
+      <code>3775560</code>, <code>59c2032</code>, <code>c322af2</code>, <code>e7b417d</code>;
+      gap-sweep <code>1bcb283</code>; adversarial-review fix <code>16dfa58</code>;
+      deep-review fix <code>239e88d</code>; mypy fix <code>a1e6ddb</code>; second
+      adversarial-review fix pass <code>dfb159e</code> + <code>433406f</code>.
+    </p>
+  </div>
+</section>
+
+</div>
+</div>
+
+
+<footer class="plan-foot">
+  Rich view · assembled from 14 section fragments · source sha <code>e7258f9ab74c</code>.
+  Source of truth: <code>20260728-bug-transport-aware-speech-supersession.md</code>.
+</footer>
+</body>
+</html>
