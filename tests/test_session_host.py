@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from server.contracts import DeliveryState, GroundedResult, WorkerState
 from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import SessionHost
@@ -456,6 +458,396 @@ def test_on_ack_terminal_is_idempotent_and_clears_the_turn_latch_exactly_once() 
         host.on_ack_terminal(identity, "no_tts")
         host.on_ack_terminal(identity, "no_tts")  # must be a no-op, not an error
 
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+# -- Phase 2: SessionHost.commit_late_result_once() ------------------------
+#
+# Plan bullets 195-205: the sole host-owned atomic API for late-result
+# callbacks. It commits every valid result exactly once and separately
+# computes the autoplay/display-only delivery disposition; cancellation,
+# staleness, and duplication continue to suppress commit entirely.
+# ``commit_late_result_once`` returns nothing (it is a coordinator-callback
+# entry point, not a query), so these tests observe the two things the plan
+# actually promises: (1) `host.state.result_history(...)` for exactly-once
+# commit, and (2) `origin.scheduler.active` for whether the committed result
+# was additionally admitted for speech (autoplay) or left uncommitted-to-
+# speech (display-only). Without a manifest, `enable_autoplay_policy=True`
+# always fails closed to display-only (`_late_result_disposition`: "manifest
+# is None or not manifest.promotion_eligible: return display_only") -- so a
+# `PromotionManifest(promotion_eligible=True)` is passed explicitly wherever
+# a test needs to reach the autoplay branch.
+
+
+class _FakeLateResultWorker:
+    def __init__(self) -> None:
+        self.frames: list[object] = []
+
+    async def queue_frame(self, frame: object) -> None:
+        self.frames.append(frame)
+
+
+def _late_delivery_context(host: SessionHost, **overrides: object):
+    try:
+        from server.pipeline import LateDeliveryContext
+    except ImportError:
+        pytest.skip("LateDeliveryContext not yet implemented (Phase 2 concurrent implementer)")
+    fields = {
+        "turn_id": "turn-late-1",
+        "work_item_id": "work-late-1",
+        "origin_epoch": 1,
+        "ack_timestamp": None,
+        "accepted_turn_sequence": host._turn_sequence,
+    }
+    fields.update(overrides)
+    return LateDeliveryContext(**fields)
+
+
+def _grounded_result(**overrides: object) -> GroundedResult:
+    fields = {
+        "result_id": "result-late-1",
+        "worker_id": "worker-weather",
+        "turn_id": "turn-late-1",
+        "text": "Late answer",
+        "spoken_text": "Late answer",
+        "origin_epoch": 1,
+    }
+    fields.update(overrides)
+    return GroundedResult(**fields)
+
+
+async def _connected_host(
+    *,
+    enable_autoplay_policy: bool = True,
+    promotion_manifest: object | None = None,
+    speakable: bool = False,
+):
+    from server.config import Config
+
+    config = Config(enable_autoplay_policy=enable_autoplay_policy)
+    host = SessionHost(
+        registry=WorkerRegistry(config=config),
+        config=config,
+        tts=object() if speakable else None,
+        promotion_manifest=promotion_manifest,
+    )
+    host.state.set_worker(
+        WorkerState(
+            worker_id="worker-weather",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+        )
+    )
+    origin = await host.connect(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+        }
+    )
+    if speakable:
+        origin.worker = _FakeLateResultWorker()
+    return host, origin
+
+
+def _has_commit_late_result_once() -> bool:
+    return hasattr(SessionHost, "commit_late_result_once")
+
+
+def test_commit_late_result_once_commits_every_valid_result_exactly_once() -> None:
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        host, _origin = await _connected_host()
+        context = _late_delivery_context(host)
+        result = _grounded_result()
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        committed = [r.result_id for r in host.state.result_history("worker-weather")]
+        assert committed.count("result-late-1") == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_cancelled_before_callback_still_commits_display_only() -> None:
+    """Plan cancellation matrix: 'before callback = commit display-only/no
+    speech.'"""
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        from server.config import PromotionManifest
+
+        host, origin = await _connected_host(
+            promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
+        )
+        # Simulate the turn's child work item having already been cancelled
+        # before this late callback arrives -- the same _cancelled_work_items
+        # membership host.cancel_turn_or_child() itself populates for a real
+        # in-flight task (see cancel_turn_or_child -> _cancel_work), driven
+        # directly here since this scenario has no real dispatched task to
+        # cancel through the coordinator.
+        host._cancelled_work_items.add("work-late-1")
+        context = _late_delivery_context(host)
+        result = _grounded_result()
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        assert any(
+            r.result_id == "result-late-1" for r in host.state.result_history("worker-weather")
+        )
+        assert origin.scheduler.active is None
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_same_epoch_newer_turn_forces_display_only() -> None:
+    """Plan bullet 211: register callback at sequence n, accept sequence
+    n+1, deliver the callback, assert exactly-once display-only commit with
+    no autoplay."""
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        from server.config import PromotionManifest
+
+        host, origin = await _connected_host(
+            promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
+        )
+        context = _late_delivery_context(host, accepted_turn_sequence=host._turn_sequence)
+        host._next_turn_id()  # advances _turn_sequence past the captured snapshot
+        result = _grounded_result()
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        assert any(
+            r.result_id == "result-late-1" for r in host.state.result_history("worker-weather")
+        )
+        assert origin.scheduler.active is None
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_stale_origin_epoch_commits_display_only_and_does_not_mutate_worker() -> (
+    None
+):
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        from server.config import PromotionManifest
+
+        host, _origin = await _connected_host(
+            promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
+        )
+        context = _late_delivery_context(host, origin_epoch=1)
+        result = _grounded_result(origin_epoch=1)
+        # Advance the active epoch so the result's origin becomes historical.
+        second = await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 2,
+                "snapshot_sequence": 0,
+            }
+        )
+        second.worker = _FakeLateResultWorker()
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        assert any(
+            r.result_id == "result-late-1" for r in host.state.result_history("worker-weather")
+        )
+        assert second.scheduler.active is None
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_malformed_result_produces_no_commit() -> None:
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        host, _origin = await _connected_host()
+        context = _late_delivery_context(host)
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(
+                work_item_id="work-late-1",
+                worker_id="worker-weather",
+                result="not-a-grounded-result",
+            ),
+        )
+
+        assert host.state.result_history("worker-weather") == ()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_duplicate_result_id_retains_the_first_commit_unchanged() -> None:
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        host, _origin = await _connected_host()
+        context = _late_delivery_context(host)
+        first = _grounded_result(text="First")
+        duplicate = _grounded_result(text="Different text, same result_id")
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=first),
+        )
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=duplicate),
+        )
+
+        history = [
+            r for r in host.state.result_history("worker-weather") if r.result_id == "result-late-1"
+        ]
+        assert len(history) == 1
+        assert history[0].text == "First"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_flag_off_preserves_pre_v013_active_origin_enqueue_start() -> None:
+    """Plan bullet 201: with enable_autoplay_policy disabled, preserve the
+    pre-v0.1.3 active-origin enqueue/start behavior -- commit once and
+    enqueue/start speech, skipping the new policy predicates (no promotion
+    manifest needed for this path)."""
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        host, origin = await _connected_host(enable_autoplay_policy=False, speakable=True)
+        context = _late_delivery_context(host)
+        result = _grounded_result()
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        assert any(
+            r.result_id == "result-late-1" for r in host.state.result_history("worker-weather")
+        )
+        assert origin.scheduler.active is not None
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_promotion_eligible_manifest_enables_autoplay() -> None:
+    """The positive counterpart: with a promotion_eligible manifest, the
+    originating epoch still active, and no newer turn/cancellation/pause,
+    the committed result is additionally admitted for speech."""
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        from server.config import PromotionManifest
+
+        host, origin = await _connected_host(
+            promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
+        )
+        context = _late_delivery_context(host)
+        result = _grounded_result()
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        assert any(
+            r.result_id == "result-late-1" for r in host.state.result_history("worker-weather")
+        )
+        assert origin.scheduler.active is not None
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_active_generation_is_never_interrupted() -> None:
+    """Plan bullet 206: hold an unrelated lifecycle-owned generation in the
+    connection-scoped slot and assert a late result never interrupts or
+    queue-jumps it. The oracle is coordinator occupancy, not scheduler or
+    connection convenience flags."""
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip(
+                "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
+            )
+        from server.config import PromotionManifest
+        from server.speech_lifecycle import GenerationIdentity
+
+        host, origin = await _connected_host(
+            promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
+        )
+        lifecycle = origin.lifecycle
+        assert lifecycle is not None
+        held = lifecycle.try_admit(GenerationIdentity("held-utt", "held-work", origin_epoch=1))
+        assert held is not None
+        assert lifecycle.occupied is True
+
+        context = _late_delivery_context(host)
+        result = _grounded_result()
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        # The unrelated held generation must still be the sole slot occupant;
+        # the late result's own speech admission attempt was queued behind
+        # it, not admitted in its place.
+        assert lifecycle.occupied is True
+        assert lifecycle.slot_token == held.token
+        assert any(
+            r.result_id == "result-late-1" for r in host.state.result_history("worker-weather")
+        )
         await host.shutdown()
 
     asyncio.run(run())

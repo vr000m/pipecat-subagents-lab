@@ -1,0 +1,26 @@
+{
+  "deployed_at_utc": "2026-08-04T21:16:18Z",
+  "feature_policy_fingerprint": "8dbecc4ab8fba4ce996ea86184112c38b65d16e2a07e4365d55785b964ee5be7",
+  "generated_at_utc": "2026-08-04T21:16:28Z",
+  "inputs": {
+    "phase0": {
+      "path": "docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl",
+      "sha256": "b977cfdbb24104cf21c3f4c54ae0dc266bb0b6c7e3bf1ab358b09f341779e759"
+    },
+    "phase1": {
+      "path": "docs/benchmarks/v0.1.3-phase1-ack-evidence.jsonl",
+      "sha256": "b69ca3451e69ea43b39bf8acb5414c118ceaeaa583a054d13c72e17ab4ade231"
+    },
+    "phase2": {
+      "path": "docs/benchmarks/v0.1.3-phase2-transport-browser-contract.json",
+      "sha256": "4a87645ae0f02816a31d89f6dae9d3895cf4c94fa661e9de08eba680df057b0e"
+    }
+  },
+  "manifest_phase": "provisional",
+  "promotion_eligible": false,
+  "reason": "real_stratum_missing",
+  "release_version": "0.1.3",
+  "schema_hash": "2d586cbb908269756a04444f0eb72308e5a1d49938b2bb18432fdb890e522f3e",
+  "source_commit": "5fc2e61bff65ee765803d56cb392fa65c276fcf4",
+  "source_tree_hash": "10acf0554a2ee707a82e71eb81b15b1e088eb175d6796e3ff516768bcfda0cdd"
+}

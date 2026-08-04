@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import tomllib
@@ -72,6 +74,11 @@ class Config:
     enable_background_status: bool = True
     enable_autoplay_policy: bool = True
     early_ack_text: str = "One moment while I look into that."
+    promotion_manifest_path: str = "docs/benchmarks/v0.1.3-promotion-manifest.json"
+    release_version: str = "0.1.3"
+    source_commit: str | None = None
+    source_tree_hash: str | None = None
+    deployed_at_utc: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_work_items_per_turn not in (2, 3, 4):
@@ -137,6 +144,10 @@ class Config:
             raise ConfigError("tts_voice_id must not be empty")
         if not self.early_ack_text.strip():
             raise ConfigError("early_ack_text must not be empty")
+        if not self.promotion_manifest_path.strip():
+            raise ConfigError("promotion_manifest_path must not be empty")
+        if not self.release_version.strip():
+            raise ConfigError("release_version must not be empty")
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
         object.__setattr__(self, "worker_model_policy", _models(self.worker_model_policy))
 
@@ -196,6 +207,143 @@ class FeaturePolicy:
         _feature_policy_cache[key] = policy
         weakref.finalize(config, _feature_policy_cache.pop, key, None)
         return policy
+
+
+def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
+    """Deterministic identity for one frozen `FeaturePolicy` snapshot.
+
+    Used to bind a promotion manifest to the exact kill-switch state it was
+    generated against; a manifest fingerprinted against a different policy
+    combination is stale and `load_promotion_manifest` rejects it.
+    """
+    canonical = json.dumps(
+        {
+            "enable_early_ack": policy.enable_early_ack,
+            "enable_background_status": policy.enable_background_status,
+            "enable_autoplay_policy": policy.enable_autoplay_policy,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class PromotionManifest:
+    """The immutable, fail-closed verdict `load_promotion_manifest` hands to `SessionHost`.
+
+    `promotion_eligible=True` is the *only* state a policy evaluator may
+    treat as data-driven-tuning-enabled. Every other combination -- missing
+    file, malformed JSON, schema mismatch, wrong/incomplete manifest phase,
+    stale identity binding, or an explicit `promotion_eligible=false` in the
+    manifest itself -- resolves to `promotion_eligible=False` with `reason`
+    set to the precise cause. This loader never raises for a missing or
+    malformed manifest; runtime boot is fail-closed, not fail-fast.
+    """
+
+    promotion_eligible: bool
+    reason: str | None = None
+    manifest_phase: str | None = None
+    source_commit: str | None = None
+    source_tree_hash: str | None = None
+    release_version: str | None = None
+    feature_policy_fingerprint: str | None = None
+    generated_at_utc: str | None = None
+
+
+_MANIFEST_REQUIRED_FIELDS = frozenset(
+    {
+        "manifest_phase",
+        "promotion_eligible",
+        "reason",
+        "schema_hash",
+        "source_commit",
+        "source_tree_hash",
+        "release_version",
+        "feature_policy_fingerprint",
+        "deployed_at_utc",
+        "generated_at_utc",
+        "inputs",
+    }
+)
+
+
+def _unavailable(reason: str) -> PromotionManifest:
+    return PromotionManifest(promotion_eligible=False, reason=reason)
+
+
+def load_promotion_manifest(config: Config) -> PromotionManifest:
+    """Load and bind-check the promotion manifest at `config.promotion_manifest_path`.
+
+    Fail-closed, not fail-fast: any problem here -- the path missing,
+    unreadable, malformed, schema-invalid, phase-incomplete, identity- or
+    fingerprint-mismatched, or stale relative to `config.deployed_at_utc` --
+    degrades to display-only rather than raising. It never prevents server
+    boot.
+    """
+    path = Path(config.promotion_manifest_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return _unavailable("manifest_missing")
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError:
+        return _unavailable("manifest_malformed")
+    if not isinstance(manifest, dict):
+        return _unavailable("manifest_malformed")
+
+    missing = _MANIFEST_REQUIRED_FIELDS - set(manifest)
+    if missing:
+        return _unavailable("manifest_schema_invalid")
+
+    manifest_phase = manifest["manifest_phase"]
+    if manifest_phase not in {"provisional", "final"}:
+        return _unavailable("manifest_schema_invalid")
+
+    identity = PromotionManifest(
+        promotion_eligible=False,
+        manifest_phase=manifest_phase,
+        source_commit=manifest.get("source_commit"),
+        source_tree_hash=manifest.get("source_tree_hash"),
+        release_version=manifest.get("release_version"),
+        feature_policy_fingerprint=manifest.get("feature_policy_fingerprint"),
+        generated_at_utc=manifest.get("generated_at_utc"),
+    )
+
+    if manifest_phase == "provisional":
+        # A provisional manifest is accepted for diagnostics only; it can
+        # never enable autoplay regardless of the evidence it embeds.
+        return replace(identity, reason="provisional_manifest")
+
+    # manifest_phase == "final": Phase 3 must have stamped its completion
+    # hash, and any declared Phase 4C hash must validate; Phase 2 does not
+    # implement that stamping, so a "final" manifest this loader can see is
+    # necessarily incomplete until Phase 3 lands.
+    if "phase3_completion_hash" not in manifest or not manifest["phase3_completion_hash"]:
+        return replace(identity, reason="incomplete_final_manifest")
+
+    policy = FeaturePolicy.from_config(config)
+    expected_fingerprint = feature_policy_fingerprint(policy)
+    if manifest.get("feature_policy_fingerprint") != expected_fingerprint:
+        return replace(identity, reason="policy_fingerprint_mismatch")
+    if config.source_commit and manifest.get("source_commit") != config.source_commit:
+        return replace(identity, reason="source_mismatch")
+    if config.source_tree_hash and manifest.get("source_tree_hash") != config.source_tree_hash:
+        return replace(identity, reason="source_mismatch")
+    if config.release_version and manifest.get("release_version") != config.release_version:
+        return replace(identity, reason="source_mismatch")
+    generated_at = manifest.get("generated_at_utc")
+    deployed_at = config.deployed_at_utc
+    if deployed_at and (not generated_at or generated_at < deployed_at):
+        return replace(identity, reason="stale")
+
+    if manifest.get("promotion_eligible") is not True:
+        return replace(identity, reason=manifest.get("reason") or "not_promotion_eligible")
+
+    return replace(identity, promotion_eligible=True, reason=None)
 
 
 def _parse_strict_bool(raw: object, *, field: str) -> bool:
@@ -331,6 +479,16 @@ def load_config(
             kwargs[field_name] = _parse_strict_bool(values[env_name], field=env_name)
     if raw := values.get("WEBSEARCH_EARLY_ACK_TEXT"):
         kwargs["early_ack_text"] = str(raw)
+    if raw := values.get("WEBSEARCH_PROMOTION_MANIFEST_PATH"):
+        kwargs["promotion_manifest_path"] = str(raw)
+    if raw := values.get("WEBSEARCH_RELEASE_VERSION"):
+        kwargs["release_version"] = str(raw)
+    if raw := values.get("PIPECAT_SOURCE_COMMIT"):
+        kwargs["source_commit"] = str(raw)
+    if raw := values.get("PIPECAT_SOURCE_TREE_HASH"):
+        kwargs["source_tree_hash"] = str(raw)
+    if raw := values.get("PIPECAT_DEPLOYED_AT_UTC"):
+        kwargs["deployed_at_utc"] = str(raw)
     if raw := values.get("WEBSEARCH_OPENAI_API_KEY_ENV"):
         kwargs["openai_api_key_env"] = raw
     if raw := values.get("WEBSEARCH_ROUTER_MODEL"):
@@ -381,6 +539,8 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
             values[f"WEBSEARCH_{key.upper()}"] = features[key]
     if "early_ack_text" in features:
         values["WEBSEARCH_EARLY_ACK_TEXT"] = features["early_ack_text"]
+    if "promotion_manifest_path" in features:
+        values["WEBSEARCH_PROMOTION_MANIFEST_PATH"] = features["promotion_manifest_path"]
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
     if "provider" in stt:

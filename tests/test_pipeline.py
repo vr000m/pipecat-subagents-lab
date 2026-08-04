@@ -24,10 +24,16 @@ from pipecat.turns.user_turn_processor import UserTurnProcessor
 import server.app as app_module
 import server.pipeline as pipeline_module
 import server.speech_lifecycle
-from server.config import Config
+from server.config import Config, PromotionManifest
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.perf_metrics import CollectingMeasurementSink
-from server.pipeline import CanonicalResultAdapter, SessionHost, build_pipeline, framework_bridge
+from server.pipeline import (
+    CanonicalResultAdapter,
+    LateDeliveryContext,
+    SessionHost,
+    build_pipeline,
+    framework_bridge,
+)
 from server.registry import UnsupportedWorkerType
 from server.services.tts import CorrelatedTTSSpeakFrame
 from server.speech_lifecycle import (
@@ -849,6 +855,7 @@ def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -
             runner_factory=LifecycleRunner,
             coordinator=coordinator,
             tts=tts,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         coordinator.add_worker_clarification(
             session_id=host.state.session_id,
@@ -903,7 +910,11 @@ def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -
 def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None:
     async def run() -> None:
         tts = FakeTTS()
-        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
+        )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
 
@@ -936,13 +947,19 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
             spoken_text="The current temperature in San Francisco is 69 degrees Fahrenheit.",
             origin_epoch=1,
         )
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            LateDeliveryContext(
+                turn_id="turn-sf",
+                work_item_id="work-turn-sf",
+                origin_epoch=1,
+                ack_timestamp=None,
+                accepted_turn_sequence=host._turn_sequence,
+            ),
             LateResult(
                 work_item_id="work-turn-sf",
                 worker_id="worker-search",
                 result=final,
             ),
-            1,
         )
 
         assert connection.scheduler.active is not None
@@ -986,7 +1003,11 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
 
     async def run() -> None:
         tts = FakeTTS()
-        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
+        )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
         scheduler = connection.scheduler
@@ -1064,9 +1085,15 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
             spoken_text="The current temperature in San Francisco is 69 degrees Fahrenheit.",
             origin_epoch=1,
         )
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            LateDeliveryContext(
+                turn_id="turn-b",
+                work_item_id="work-b",
+                origin_epoch=1,
+                ack_timestamp=None,
+                accepted_turn_sequence=host._turn_sequence,
+            ),
             LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
-            1,
         )
 
         # No start_next() lands between the notice discard and the final
@@ -1122,13 +1149,19 @@ def test_late_result_from_replaced_epoch_remains_display_only() -> None:
             spoken_text="Old spoken answer",
             origin_epoch=1,
         )
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            LateDeliveryContext(
+                turn_id="turn-old-epoch",
+                work_item_id="work-old-epoch",
+                origin_epoch=1,
+                ack_timestamp=None,
+                accepted_turn_sequence=host._turn_sequence,
+            ),
             LateResult(
                 work_item_id="work-old-epoch",
                 worker_id="worker-search",
                 result=result,
             ),
-            1,
         )
 
         assert host.state.result_history("worker-search")[-1] == result
@@ -1144,7 +1177,11 @@ def test_late_result_from_replaced_epoch_remains_display_only() -> None:
 def test_duplicate_late_result_callback_commits_and_enqueues_speech_once() -> None:
     async def run() -> None:
         tts = FakeTTS()
-        host = SessionHost(runner_factory=LifecycleRunner, tts=tts)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
+        )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
         result = GroundedResult(
@@ -1160,9 +1197,16 @@ def test_duplicate_late_result_callback_commits_and_enqueues_speech_once() -> No
             worker_id="worker-search",
             result=result,
         )
+        context = LateDeliveryContext(
+            turn_id="turn-late-once",
+            work_item_id="work-late-once",
+            origin_epoch=1,
+            ack_timestamp=None,
+            accepted_turn_sequence=host._turn_sequence,
+        )
 
-        await host._commit_late_result(late, 1)
-        await host._commit_late_result(late, 1)
+        await host.commit_late_result_once(context, late)
+        await host.commit_late_result_once(context, late)
 
         assert host.state.result_history("worker-search") == (result,)
         assert (
@@ -1992,13 +2036,19 @@ def test_late_worker_error_log_omits_untrusted_exception_text(
         monkeypatch.setattr(pipeline_module.logger, "warning", messages.append)
         host = SessionHost()
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            LateDeliveryContext(
+                turn_id="turn-1",
+                work_item_id="work-1",
+                origin_epoch=1,
+                ack_timestamp=None,
+                accepted_turn_sequence=host._turn_sequence,
+            ),
             LateResult(
                 work_item_id="work-1",
                 worker_id="worker-search",
                 error="ProviderError: secret-token\nforged log line",
             ),
-            1,
         )
 
         assert messages == ["Late worker result failed for work_item=work-1 worker=worker-search"]
@@ -3820,11 +3870,28 @@ def _register_dispatch_recorder(
     return recorder
 
 
+def _late_delivery_context(host: SessionHost, **overrides: object) -> LateDeliveryContext:
+    fields: dict[str, object] = {
+        "turn_id": "turn-retained",
+        "work_item_id": "work-retained",
+        "origin_epoch": 1,
+        "ack_timestamp": None,
+        "accepted_turn_sequence": host._turn_sequence,
+    }
+    fields.update(overrides)
+    return LateDeliveryContext(**fields)
+
+
 def test_retained_completion_with_speech_emits_completed_committed_queued() -> None:
     async def run() -> None:
         tts = FakeTTS()
         sink = CollectingMeasurementSink()
-        host = SessionHost(runner_factory=LifecycleRunner, tts=tts, measurement_sink=sink)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            measurement_sink=sink,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
+        )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
         result = GroundedResult(
@@ -3843,7 +3910,12 @@ def test_retained_completion_with_speech_emits_completed_committed_queued() -> N
             terminal_kind="completed",
         )
 
-        await host._commit_late_result(late, 1)
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host, turn_id="turn-retained-ok", work_item_id="work-retained-ok"
+            ),
+            late,
+        )
 
         records = _background_records(sink)
         assert len(records) == 1
@@ -3867,7 +3939,12 @@ def test_retained_late_result_cancelled_during_speech_start_still_emits_backgrou
     async def run() -> None:
         tts = FakeTTS()
         sink = CollectingMeasurementSink()
-        host = SessionHost(runner_factory=LifecycleRunner, tts=tts, measurement_sink=sink)
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            measurement_sink=sink,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
+        )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
 
@@ -3895,7 +3972,14 @@ def test_retained_late_result_cancelled_during_speech_start_still_emits_backgrou
         )
 
         with pytest.raises(asyncio.CancelledError):
-            await host._commit_late_result(late, 1)
+            await host.commit_late_result_once(
+                _late_delivery_context(
+                    host,
+                    turn_id="turn-cancel-during-start",
+                    work_item_id="work-cancel-during-start",
+                ),
+                late,
+            )
 
         records = _background_records(sink)
         assert len(records) == 1
@@ -3918,14 +4002,14 @@ def test_retained_worker_exception_emits_failed_not_applicable_axes() -> None:
         host = SessionHost(measurement_sink=sink)
         _register_dispatch_recorder(host, "work-failed")
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(host, work_item_id="work-failed"),
             LateResult(
                 work_item_id="work-failed",
                 worker_id="worker-search",
                 error="RuntimeError: provider exploded",
                 terminal_kind="failed",
             ),
-            1,
         )
 
         fields = _background_records(sink)[0].fields
@@ -3943,14 +4027,14 @@ def test_retained_worker_cancellation_emits_cancelled_axes() -> None:
         host = SessionHost(measurement_sink=sink)
         _register_dispatch_recorder(host, "work-cancelled")
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(host, work_item_id="work-cancelled"),
             LateResult(
                 work_item_id="work-cancelled",
                 worker_id="worker-search",
                 error="CancelledError: worker task was cancelled",
                 terminal_kind="cancelled",
             ),
-            1,
         )
 
         fields = _background_records(sink)[0].fields
@@ -3976,17 +4060,27 @@ def test_retained_user_cancelled_work_item_suppresses_commit_and_speech() -> Non
             origin_epoch=1,
         )
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host, turn_id="turn-user-cancelled", work_item_id="work-user-cancelled"
+            ),
             LateResult(
                 work_item_id="work-user-cancelled", worker_id="worker-search", result=result
             ),
-            1,
         )
 
-        assert host.state.result_history("worker-search") == ()
+        # Dev plan Phase 2 cancellation matrix (dev plan lines 200/205/353):
+        # cancellation before/while-queued/while-admitted suppresses or
+        # reclassifies *speech delivery* only -- it no longer suppresses a
+        # valid canonical commit. A cancelled work item's otherwise-valid
+        # result is still committed exactly once, display-only, speech
+        # suppressed.
+        assert host.state.result_history("worker-search") == (result,)
         fields = _background_records(sink)[0].fields
         assert fields["work_outcome"] == "cancelled"
-        assert fields["commit_outcome"] == "suppressed_cancelled"
+        assert fields["commit_outcome"] == "committed"
+        assert fields["speech_outcome"] == "cancelled"
+        assert fields["delivery_disposition"] == "display_only"
 
     asyncio.run(run())
 
@@ -3997,13 +4091,13 @@ def test_retained_invalid_result_type_emits_invalid_result_axes() -> None:
         host = SessionHost(measurement_sink=sink)
         _register_dispatch_recorder(host, "work-invalid")
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(host, work_item_id="work-invalid"),
             LateResult(
                 work_item_id="work-invalid",
                 worker_id="worker-search",
                 result="not a GroundedResult",
             ),
-            1,
         )
 
         fields = _background_records(sink)[0].fields
@@ -4038,9 +4132,9 @@ def test_retained_duplicate_result_id_suppresses_commit() -> None:
 
         _register_dispatch_recorder(host, "work-dup", turn_id="turn-dup")
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(host, turn_id="turn-dup", work_item_id="work-dup"),
             LateResult(work_item_id="work-dup", worker_id="worker-search", result=duplicate),
-            1,
         )
 
         fields = _background_records(sink)[0].fields
@@ -4072,11 +4166,13 @@ def test_retained_result_after_connection_replaced_commits_but_marks_speech_stal
 
         _register_dispatch_recorder(host, "work-replaced-epoch", turn_id="turn-replaced-epoch")
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host, turn_id="turn-replaced-epoch", work_item_id="work-replaced-epoch"
+            ),
             LateResult(
                 work_item_id="work-replaced-epoch", worker_id="worker-search", result=result
             ),
-            1,
         )
 
         assert host.state.result_history("worker-search")[-1] == result
@@ -4107,9 +4203,14 @@ def test_retained_result_from_replaced_origin_epoch_suppresses_commit_as_stale()
             host, "work-stale-origin", origin_epoch=2, turn_id="turn-stale-origin"
         )
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host,
+                turn_id="turn-stale-origin",
+                work_item_id="work-stale-origin",
+                origin_epoch=2,
+            ),
             LateResult(work_item_id="work-stale-origin", worker_id="worker-search", result=result),
-            2,
         )
 
         assert host.state.result_history("worker-search") == ()
@@ -4136,9 +4237,11 @@ def test_retained_result_without_active_connection_marks_speech_disconnected() -
 
         _register_dispatch_recorder(host, "work-disconnected", turn_id="turn-disconnected")
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host, turn_id="turn-disconnected", work_item_id="work-disconnected"
+            ),
             LateResult(work_item_id="work-disconnected", worker_id="worker-search", result=result),
-            1,
         )
 
         assert host.state.result_history("worker-search")[-1] == result
@@ -4166,9 +4269,9 @@ def test_retained_result_without_tts_service_marks_speech_no_tts() -> None:
 
         _register_dispatch_recorder(host, "work-no-tts", turn_id="turn-no-tts")
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(host, turn_id="turn-no-tts", work_item_id="work-no-tts"),
             LateResult(work_item_id="work-no-tts", worker_id="worker-search", result=result),
-            1,
         )
 
         fields = _background_records(sink)[0].fields
@@ -4293,14 +4396,14 @@ def test_retained_background_ms_spans_dispatch_to_completion_for_late_callbacks(
         assert fields["background_ms"] >= 70
 
         committed = host.state.result_history("worker-search")[-1]
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(host, work_item_id=fields["work_item_id"]),
             LateResult(
                 work_item_id=fields["work_item_id"],
                 worker_id="worker-search",
                 result=committed,
                 terminal_kind="completed",
             ),
-            1,
         )
         after_duplicate = _background_records(sink)
         assert len(after_duplicate) == 1
@@ -5069,7 +5172,12 @@ class _FanInRouter:
         return type("Envelope", (), {"decision": decision, "prose": None})()
 
 
-def _fan_in_host(submitted: object, sink: CollectingMeasurementSink) -> tuple[SessionHost, object]:
+def _fan_in_host(
+    submitted: object,
+    sink: CollectingMeasurementSink,
+    *,
+    promotion_manifest: PromotionManifest | None = None,
+) -> tuple[SessionHost, object]:
     """A host whose coordinator returns a hand-built ``submit`` outcome, so the
     multi-intent fan-in loops can be driven with mismatched echoes."""
     worker = ResultWorker()
@@ -5086,7 +5194,10 @@ def _fan_in_host(submitted: object, sink: CollectingMeasurementSink) -> tuple[Se
 
     return (
         SessionHost(
-            runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+            runner_factory=LifecycleRunner,
+            coordinator=Coordinator(),
+            measurement_sink=sink,
+            promotion_manifest=promotion_manifest,
         ),
         worker,
     )
@@ -5263,6 +5374,7 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
                 pending_work_item_ids=("work-turn-role-1",),
             ),
             sink,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         host.tts = FakeTTS()
         origin = await host.connect(connection_handshake(host, 1))
@@ -5283,13 +5395,18 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
         queued_notice = origin.scheduler._queues["work-turn-role-1"][0]
         assert queued_notice.role == ROLE_TIMEOUT_NOTICE
 
-        await host._commit_late_result(
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host,
+                turn_id="turn-role",
+                work_item_id="work-turn-role-1",
+                origin_epoch=origin.epoch,
+            ),
             LateResult(
                 work_item_id="work-turn-role-1",
                 worker_id="worker-search",
                 result=_fan_in_result("turn-role-1", "late answer"),
             ),
-            origin.epoch,
         )
 
         queued = origin.scheduler._queues["work-turn-role-1"]

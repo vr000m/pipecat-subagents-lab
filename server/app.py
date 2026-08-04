@@ -34,7 +34,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import WorkerParams
 
-from .config import Config, load_config
+from .config import Config, load_config, load_promotion_manifest
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
@@ -355,12 +355,17 @@ def _default_session_host(
     )
     stt = create_stt(config)
     tts = create_tts(config)
+    # Resolved once per host, exactly like FeaturePolicy.from_config: a
+    # missing/unreadable/ineligible manifest degrades to display-only rather
+    # than raising, so this never blocks server boot.
+    promotion_manifest = load_promotion_manifest(config)
     return SessionHost(
         registry=registry,
         stt=stt,
         tts=tts,
         coordinator=coordinator,
         measurement_sink=measurement_sink,
+        promotion_manifest=promotion_manifest,
     )
 
 

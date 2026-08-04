@@ -15,7 +15,7 @@ from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
-from .config import Config, FeaturePolicy
+from .config import Config, FeaturePolicy, PromotionManifest
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     GroundedResult,
@@ -38,6 +38,7 @@ from .perf_metrics import (
     WorkItemRecorder,
     WorkOutcome,
 )
+from .perf_metrics import DeliveryDisposition as LateDeliveryDisposition
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
@@ -341,6 +342,27 @@ class SearchExecution:
     result: GroundedResult | None = None
 
 
+@dataclass(frozen=True)
+class LateDeliveryContext:
+    """Immutable identity captured at late-task dispatch, consumed at commit.
+
+    Retained across the coordinator's ``on_complete`` closure boundary
+    (``retain_late_task``'s callback is already a caller-supplied closure --
+    see ``WorkItemCoordinator.retain_late_task``/``:_search_with_timeout`` --
+    so this rides that existing closure rather than adding a parameter to
+    the coordinator's callback contract). ``accepted_turn_sequence`` is
+    ``SessionHost._turn_sequence`` as observed at dispatch time; comparing it
+    against the live counter at commit time is how ``commit_late_result_once``
+    detects that a newer semantic turn has since been accepted.
+    """
+
+    turn_id: str
+    work_item_id: str
+    origin_epoch: int
+    ack_timestamp: float | None
+    accepted_turn_sequence: int
+
+
 class SessionHost:
     """Process-lifetime host; persistent workers outlive connection pipelines."""
 
@@ -357,6 +379,7 @@ class SessionHost:
         measurement_sink: MeasurementSink | None = None,
         config: Config | None = None,
         feature_policy: FeaturePolicy | None = None,
+        promotion_manifest: PromotionManifest | None = None,
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
@@ -371,6 +394,11 @@ class SessionHost:
             raise ValueError("SessionHost config conflicts with the registry's Config")
         self.config = config or registry_config or Config()
         self.feature_policy = feature_policy or FeaturePolicy.from_config(self.config)
+        # The immutable evidence-gate verdict handed in by _default_session_host
+        # (via server.config.load_promotion_manifest); missing/None is treated
+        # exactly like a manifest that failed to load -- fail-closed to
+        # display-only, never a boot-time error.
+        self._promotion_manifest = promotion_manifest
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
         self.coordinator = coordinator
@@ -1358,11 +1386,14 @@ class SessionHost:
                         origin_epoch=origin.epoch,
                     )
 
+            late_context = self._new_late_delivery_context(
+                turn_id=turn_id, work_item_id=work_item_id, origin_epoch=origin.epoch
+            )
             submitted = await coordinator.submit(
                 work_item_id,
                 [(worker_id, transcript)],
                 execute,
-                on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+                on_late_complete=lambda late: self.commit_late_result_once(late_context, late),
                 work_item_ids=[work_item_id],
                 on_late_terminal=on_late_terminal,
             )
@@ -1575,11 +1606,23 @@ class SessionHost:
             }
             on_late_terminal = self._make_late_terminal_handler(retained_recorders)
 
+            dispatch_turn_sequence = self._turn_sequence
+
+            def _multi_intent_late_context(late: LateResult) -> LateDeliveryContext:
+                return self._new_late_delivery_context(
+                    turn_id=turn_id,
+                    work_item_id=late.work_item_id,
+                    origin_epoch=origin.epoch,
+                    accepted_turn_sequence=dispatch_turn_sequence,
+                )
+
             submitted = await coordinator.submit(
                 f"work-{turn_id}",
                 runnable,
                 execute,
-                on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+                on_late_complete=lambda late: self.commit_late_result_once(
+                    _multi_intent_late_context(late), late
+                ),
                 work_item_ids=work_item_ids,
                 on_late_terminal=on_late_terminal,
             )
@@ -1773,6 +1816,10 @@ class SessionHost:
             return SearchExecution("capacity_rejected")
         work_item_id = work_item_id or f"work-{turn_id}"
         self._track_work_task(work_item_id, task)
+        # Captured before the foreground wait below, which may span other
+        # turns being accepted concurrently: this is the turn-sequence
+        # snapshot LateDeliveryContext needs to detect a newer-turn arrival.
+        dispatch_turn_sequence = self._turn_sequence
         # The provisional retained recorder is created here, at dispatch time,
         # before the foreground wait -- not only if it later times out -- so
         # background_ms always starts at work dispatch (Timing Boundaries).
@@ -1796,11 +1843,17 @@ class SessionHost:
         # time that callback could possibly run -- regardless of whether a
         # future refactor inserts an await between the two calls.
         self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+        late_context = self._new_late_delivery_context(
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            origin_epoch=origin_epoch,
+            accepted_turn_sequence=dispatch_turn_sequence,
+        )
         accepted = coordinator.retain_late_task(
             task,
             work_item_id=work_item_id,
             worker_id=worker_id,
-            on_complete=lambda late: self._commit_late_result(late, origin_epoch),
+            on_complete=lambda late: self.commit_late_result_once(late_context, late),
             on_late_terminal=self._make_late_terminal_handler({work_item_id: retained_recorder}),
         )
         if not accepted:
@@ -1808,8 +1861,78 @@ class SessionHost:
             return SearchExecution("retention_rejected")
         return SearchExecution("retained")
 
-    async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
-        """Commit a late result and defer speech on its still-active TTS epoch."""
+    def _new_late_delivery_context(
+        self,
+        *,
+        turn_id: str,
+        work_item_id: str,
+        origin_epoch: int,
+        accepted_turn_sequence: int | None = None,
+    ) -> LateDeliveryContext:
+        """Build the immutable context captured at late-task dispatch time.
+
+        ``accepted_turn_sequence`` defaults to the live ``_turn_sequence``
+        counter, but callers dispatching from a coroutine that may span
+        other turns being accepted concurrently pass an explicit snapshot
+        taken before any ``await``.
+        """
+        return LateDeliveryContext(
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            origin_epoch=origin_epoch,
+            ack_timestamp=time.monotonic(),
+            accepted_turn_sequence=(
+                accepted_turn_sequence
+                if accepted_turn_sequence is not None
+                else self._turn_sequence
+            ),
+        )
+
+    def _late_result_disposition(
+        self, context: LateDeliveryContext, *, origin: ConnectionPipeline
+    ) -> LateDeliveryDisposition:
+        """Autoplay-vs-display-only verdict for one still-committable late result.
+
+        ``enable_autoplay_policy=False`` is the strict rollback path: every
+        valid, non-cancelled result on its still-active connection is
+        spoken, exactly reproducing pre-v0.1.3 behavior. When the policy is
+        enabled, autoplay requires *all* of: promotion-eligible evidence
+        (schema validity alone is never sufficient -- see
+        ``server.config.load_promotion_manifest``), the originating epoch
+        still active, no newer same-epoch turn accepted since dispatch, and
+        no explicit pause in effect. Any predicate failing degrades to
+        ``"display_only"``; the result was already committed exactly once
+        by the caller regardless of this verdict.
+        """
+        if not self.feature_policy.enable_autoplay_policy:
+            return "autoplay"
+        manifest = self._promotion_manifest
+        if manifest is None or not manifest.promotion_eligible:
+            return "display_only"
+        if context.origin_epoch != origin.epoch:
+            return "display_only"
+        if self._turn_sequence != context.accepted_turn_sequence:
+            return "display_only"
+        if origin.scheduler.paused() is not None:
+            return "display_only"
+        return "autoplay"
+
+    async def commit_late_result_once(self, context: LateDeliveryContext, late: LateResult) -> None:
+        """The sole host-owned atomic API for a coordinator late-result callback.
+
+        Commits every valid result exactly once and separately computes the
+        autoplay-vs-display-only delivery disposition; cancellation,
+        staleness, and duplication continue to suppress commit entirely
+        (unchanged from pre-Phase-2 behavior), while a valid commit on an
+        otherwise-speakable connection now additionally consults
+        ``_late_result_disposition`` before enqueuing speech. Synchronous
+        and non-awaiting through the disposition decision itself, so
+        nothing can interleave between context capture and that verdict;
+        the network-facing enqueue/start_next calls below are the only
+        awaiting steps, matching the surrounding coordinator-callback
+        contract.
+        """
+        origin_epoch = context.origin_epoch
         # Popping (rather than peeking) makes a callback arriving after a
         # dispatch-registered recorder's finalization a structural no-op for
         # that recorder. Every retained work item registers its provisional
@@ -1825,6 +1948,7 @@ class SessionHost:
         work_outcome: WorkOutcome | None = None
         commit_outcome: CommitOutcome | None = None
         speech_outcome: SpeechOutcome | None = None
+        delivery_disposition: LateDeliveryDisposition | None = None
         result_id: str | None = None
         pending_exception: Exception | None = None
 
@@ -1850,22 +1974,62 @@ class SessionHost:
                 work_outcome = late.terminal_kind or "failed"
                 if late.terminal_kind == "cancelled":
                     commit_outcome, speech_outcome = "suppressed_cancelled", "cancelled"
+                    delivery_disposition = "suppressed"
                 else:
                     commit_outcome, speech_outcome = "not_applicable", "not_applicable"
+                    delivery_disposition = "not_applicable"
                 logger.warning(
                     f"Late worker result failed for work_item={late.work_item_id} "
                     f"worker={late.worker_id}"
                 )
             elif late.work_item_id in self._cancelled_work_items:
+                # Cancellation before/while-queued/while-admitted suppresses
+                # or reclassifies *speech delivery* only -- it no longer
+                # suppresses a valid canonical commit (dev plan Phase 2,
+                # cancellation matrix): a cancelled work item whose late
+                # result is otherwise valid is still committed exactly once,
+                # display-only, with no speech attempt.
                 self._cancelled_work_items.discard(late.work_item_id)
                 self._known_work_items.discard(late.work_item_id)
                 if isinstance(late.result, GroundedResult):
                     self._clarification_candidates.pop(late.result.result_id, None)
-                work_outcome, commit_outcome, speech_outcome = (
-                    "cancelled",
-                    "suppressed_cancelled",
-                    "cancelled",
-                )
+                if not isinstance(late.result, GroundedResult):
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "cancelled",
+                        "suppressed_cancelled",
+                        "cancelled",
+                    )
+                    delivery_disposition = "suppressed"
+                else:
+                    cancelled_result = late.result
+                    try:
+                        self._commit_result_state(cancelled_result)
+                    except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
+                        work_outcome, commit_outcome, speech_outcome = (
+                            "cancelled",
+                            "failed",
+                            "cancelled",
+                        )
+                        delivery_disposition = "not_applicable"
+                        pending_exception = exc
+                    else:
+                        worker = self.state.workers.get(cancelled_result.worker_id)
+                        if worker is not None and worker.origin_epoch == origin_epoch:
+                            self.state.set_worker(
+                                worker.model_copy(
+                                    update={
+                                        "status": "idle",
+                                        "latest_result_id": cancelled_result.result_id,
+                                    }
+                                )
+                            )
+                        work_outcome, commit_outcome, speech_outcome = (
+                            "cancelled",
+                            "committed",
+                            "cancelled",
+                        )
+                        delivery_disposition = "display_only"
+                        result_id = cancelled_result.result_id
             elif not isinstance(late.result, GroundedResult):
                 self._known_work_items.discard(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
@@ -1873,6 +2037,7 @@ class SessionHost:
                     "not_applicable",
                     "not_applicable",
                 )
+                delivery_disposition = "not_applicable"
             elif late.result.origin_epoch != origin_epoch:
                 self._known_work_items.discard(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
@@ -1880,6 +2045,7 @@ class SessionHost:
                     "suppressed_stale",
                     "not_applicable",
                 )
+                delivery_disposition = "not_applicable"
             elif any(
                 item.result_id == late.result.result_id for item in self.state.results.results
             ):
@@ -1889,6 +2055,7 @@ class SessionHost:
                     "suppressed_duplicate",
                     "not_applicable",
                 )
+                delivery_disposition = "not_applicable"
             else:
                 result = late.result
                 try:
@@ -1900,6 +2067,7 @@ class SessionHost:
                         "failed",
                         "not_applicable",
                     )
+                    delivery_disposition = "not_applicable"
                     pending_exception = exc
                 else:
                     self._known_work_items.discard(late.work_item_id)
@@ -1931,37 +2099,52 @@ class SessionHost:
                     work_outcome, commit_outcome = "completed", "committed"
                     result_id = result.result_id
                     if speakable is not None:
-                        try:
-                            # A retained result supersedes only its own
-                            # queued timeout notice, not other same-work
-                            # queued speech, and never an utterance that has
-                            # already been admitted to the transport slot.
-                            speakable.scheduler.discard_queued_notice(late.work_item_id)
-                            speakable.scheduler.enqueue(
-                                result_id=result.result_id,
-                                work_item_id=late.work_item_id,
-                                run_id=f"run-{result.turn_id}",
-                                text=result.spoken_text,
-                                origin_epoch=origin_epoch,
-                                role=ROLE_RESULT,
-                            )
-                        except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
-                            speech_outcome = "enqueue_failed"
-                            pending_exception = exc
+                        # Exactly-once commit is already done above; this
+                        # verdict only decides whether the committed result
+                        # is additionally spoken. A committed-but-not-spoken
+                        # result is still a fully valid, terminal outcome.
+                        policy_disposition = self._late_result_disposition(
+                            context, origin=speakable
+                        )
+                        if policy_disposition == "display_only":
+                            delivery_disposition = "display_only"
+                            speech_outcome = "not_applicable"
                         else:
+                            delivery_disposition = "autoplay"
                             try:
-                                await speakable.scheduler.start_next()
-                            except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
-                                speech_outcome = "start_failed"
+                                # A retained result supersedes only its own
+                                # queued timeout notice, not other same-work
+                                # queued speech, and never an utterance that has
+                                # already been admitted to the transport slot.
+                                speakable.scheduler.discard_queued_notice(late.work_item_id)
+                                speakable.scheduler.enqueue(
+                                    result_id=result.result_id,
+                                    work_item_id=late.work_item_id,
+                                    run_id=f"run-{result.turn_id}",
+                                    text=result.spoken_text,
+                                    origin_epoch=origin_epoch,
+                                    role=ROLE_RESULT,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
+                                speech_outcome = "enqueue_failed"
                                 pending_exception = exc
                             else:
-                                speech_outcome = "queued"
+                                try:
+                                    await speakable.scheduler.start_next()
+                                except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
+                                    speech_outcome = "start_failed"
+                                    pending_exception = exc
+                                else:
+                                    speech_outcome = "queued"
+                    else:
+                        delivery_disposition = "display_only"
         finally:
             if recorder is not None:
                 recorder.finalize(
                     work_outcome=work_outcome,
                     commit_outcome=commit_outcome,
                     speech_outcome=speech_outcome,
+                    delivery_disposition=delivery_disposition,
                     result_id=result_id,
                 )
         if pending_exception is not None:

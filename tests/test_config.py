@@ -546,3 +546,258 @@ def test_feature_policy_disabling_background_status_does_not_disable_ack_or_auto
     assert policy.enable_early_ack is True
     assert policy.enable_autoplay_policy is True
     assert policy.enable_background_status is False
+
+
+# -- Phase 2: promotion-manifest loader (server/config.py's
+# load_promotion_manifest()) -----------------------------------------------
+#
+# Plan bullets 183, 190-192: a missing, unreadable, schema-invalid, stale,
+# source-mismatched, policy-fingerprint-mismatched, wrong-phase (provisional
+# without a Phase 3 override), or promotion_eligible=false manifest at
+# whatever path is configured must fail closed to display-only rather than
+# raise or block server startup. Only a manifest_phase="final" manifest with
+# promotion_eligible=true, matching source/tree-hash/policy-fingerprint
+# identity, and a generated_at_utc at or after Config.deployed_at_utc may
+# report promotion-eligible.
+
+
+def test_config_promotion_manifest_path_defaults_under_docs_benchmarks() -> None:
+    config = Config()
+    assert str(config.promotion_manifest_path) == "docs/benchmarks/v0.1.3-promotion-manifest.json"
+
+
+def test_config_promotion_manifest_path_is_overridable_for_packaged_deployments() -> None:
+    config = Config(promotion_manifest_path="/opt/app/promotion-manifest.json")
+    assert str(config.promotion_manifest_path) == "/opt/app/promotion-manifest.json"
+
+
+def _final_manifest(*, config: Config | None = None, **overrides: object) -> dict:
+    from server.config import FeaturePolicy, feature_policy_fingerprint
+
+    resolved_config = config or Config()
+    manifest = {
+        "manifest_phase": "final",
+        "promotion_eligible": True,
+        "reason": None,
+        "schema_hash": "d" * 64,
+        "release_version": resolved_config.release_version,
+        "source_commit": "a" * 40,
+        "source_tree_hash": "b" * 64,
+        "feature_policy_fingerprint": feature_policy_fingerprint(
+            FeaturePolicy.from_config(resolved_config)
+        ),
+        "deployed_at_utc": "2026-08-04T00:00:00Z",
+        "generated_at_utc": "2026-08-04T00:05:00Z",
+        "phase3_completion_hash": "3" * 64,
+        "inputs": {
+            "phase0": {"path": "phase0.jsonl", "sha256": "0" * 64},
+            "phase1": {"path": "phase1.jsonl", "sha256": "1" * 64},
+            "phase2": {"path": "phase2.json", "sha256": "2" * 64},
+        },
+    }
+    manifest.update(overrides)
+    return manifest
+
+
+def _load_promotion_manifest():
+    try:
+        from server.config import load_promotion_manifest
+    except ImportError:
+        pytest.skip("load_promotion_manifest not yet implemented (Phase 2 concurrent implementer)")
+    return load_promotion_manifest
+
+
+def test_load_promotion_manifest_missing_file_fails_closed_to_display_only(tmp_path: Path) -> None:
+    load_promotion_manifest = _load_promotion_manifest()
+    config = Config(promotion_manifest_path=str(tmp_path / "missing.json"))
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_missing"
+
+
+def test_load_promotion_manifest_schema_invalid_json_fails_closed(tmp_path: Path) -> None:
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{not valid json", encoding="utf-8")
+    config = Config(promotion_manifest_path=str(manifest_path))
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_malformed"
+
+
+def test_load_promotion_manifest_missing_required_field_is_schema_invalid(tmp_path: Path) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    incomplete = _final_manifest()
+    del incomplete["schema_hash"]
+    manifest_path.write_text(json.dumps(incomplete), encoding="utf-8")
+    config = Config(promotion_manifest_path=str(manifest_path))
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_invalid"
+
+
+def test_load_promotion_manifest_provisional_phase_always_fails_closed(tmp_path: Path) -> None:
+    """Plan: 'A provisional manifest is accepted for diagnostics but is
+    permanently promotion_eligible=false and display-only.'"""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(_final_manifest(manifest_phase="provisional", promotion_eligible=True)),
+        encoding="utf-8",
+    )
+    config = Config(promotion_manifest_path=str(manifest_path))
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "provisional_manifest"
+
+
+def test_load_promotion_manifest_wrong_phase_final_without_phase3_completion_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    """Plan: Phase 2 does not implement Phase 3's completion stamping, so a
+    'final' manifest seen before Phase 3 lands must not silently pass."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    incomplete = _final_manifest()
+    del incomplete["phase3_completion_hash"]
+    manifest_path.write_text(json.dumps(incomplete), encoding="utf-8")
+    config = Config(promotion_manifest_path=str(manifest_path))
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "incomplete_final_manifest"
+
+
+def test_load_promotion_manifest_source_commit_mismatch_fails_closed(tmp_path: Path) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    config = Config(
+        promotion_manifest_path=str(tmp_path / "manifest.json"),
+        source_commit="f" * 40,
+        source_tree_hash="b" * 64,
+        deployed_at_utc="2026-08-01T00:00:00Z",
+    )
+    Path(config.promotion_manifest_path).write_text(
+        json.dumps(_final_manifest(config=config, source_commit="a" * 40)), encoding="utf-8"
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "source_mismatch"
+
+
+def test_load_promotion_manifest_policy_fingerprint_mismatch_fails_closed(tmp_path: Path) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    # Fingerprinted against the default (all-on) FeaturePolicy, then loaded
+    # with a Config whose FeaturePolicy differs -- a stale binding.
+    manifest_path.write_text(json.dumps(_final_manifest()), encoding="utf-8")
+    config = Config(
+        promotion_manifest_path=str(manifest_path),
+        enable_autoplay_policy=False,
+        deployed_at_utc="2026-08-01T00:00:00Z",
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "policy_fingerprint_mismatch"
+
+
+def test_load_promotion_manifest_stale_generated_before_deployed_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Plan: 'a manifest is stale when ... its generated_at_utc predates
+    Config.deployed_at_utc.'"""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    config = Config(
+        promotion_manifest_path=str(tmp_path / "manifest.json"),
+        deployed_at_utc="2026-08-04T00:00:00Z",
+    )
+    Path(config.promotion_manifest_path).write_text(
+        json.dumps(_final_manifest(config=config, generated_at_utc="2026-08-01T00:00:00Z")),
+        encoding="utf-8",
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "stale"
+
+
+def test_load_promotion_manifest_promotion_eligible_false_stays_display_only(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    config = Config(
+        promotion_manifest_path=str(tmp_path / "manifest.json"),
+        deployed_at_utc="2026-08-01T00:00:00Z",
+    )
+    Path(config.promotion_manifest_path).write_text(
+        json.dumps(
+            _final_manifest(config=config, promotion_eligible=False, reason="real_stratum_missing")
+        ),
+        encoding="utf-8",
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "real_stratum_missing"
+
+
+def test_load_promotion_manifest_valid_matching_final_manifest_is_promotion_eligible(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    config = Config(
+        promotion_manifest_path=str(tmp_path / "manifest.json"),
+        deployed_at_utc="2026-08-01T00:00:00Z",
+    )
+    Path(config.promotion_manifest_path).write_text(
+        json.dumps(_final_manifest(config=config)), encoding="utf-8"
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is True
+
+
+def test_load_promotion_manifest_missing_or_malformed_metadata_never_blocks_server_startup(
+    tmp_path: Path,
+) -> None:
+    """Plan (Architecture Decisions): 'Fail-closed, not fail-fast: missing or
+    malformed metadata never prevents server boot.' Constructing Config and
+    calling the loader with no deployment identity set must not raise."""
+    load_promotion_manifest = _load_promotion_manifest()
+    config = Config(promotion_manifest_path=str(tmp_path / "missing.json"))
+
+    verdict = load_promotion_manifest(config)  # must not raise
+
+    assert verdict.promotion_eligible is False

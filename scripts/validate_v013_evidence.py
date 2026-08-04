@@ -8,19 +8,34 @@ dependency) and then enforces phase-specific coverage minimums: one record
 per named scenario, one record per outcome exercised by that phase's fixture
 matrix, and one record per provider/model stratum (the credential-free
 stratum is ``unavailable``/``unavailable``).
+
+``--write-manifest`` mode (added in Phase 2) revalidates the Phase 0/1/2
+inputs and, only if every gate passes, writes the durable promotion manifest
+``server.config.load_promotion_manifest`` reads at runtime. A provisional
+manifest (the only kind this script can produce as of Phase 2) is always
+``promotion_eligible=false``: Phase 3 must stamp its completion hash and
+rewrite the manifest as ``final`` before autoplay can ever activate.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _evidence_common import EvidenceGateError, load_json, sha256_file
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
+TRANSPORT_SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-transport-browser-contract.json"
 
 REQUIRED_FIELDS = (
     "phase",
@@ -37,7 +52,12 @@ REQUIRED_FIELDS = (
     "sample_count",
 )
 OPTIONAL_FIELDS = ("work_item_id", "query_chars", "context_chars", "wall_clock_time")
-ALL_FIELDS = frozenset(REQUIRED_FIELDS) | frozenset(OPTIONAL_FIELDS)
+# Phase 1 extends the record shape with the ack-path fields described in the
+# dev plan's Phase 1 evidence-artifact bullet. They are optional at the
+# schema level (so phase0 records are unaffected) but required-though-nullable
+# for phase1 records specifically -- enforced in `validate_record` below.
+PHASE1_FIELDS = ("ack_id", "ack_enqueued", "ack_enqueued_ms", "ack_terminal_state")
+ALL_FIELDS = frozenset(REQUIRED_FIELDS) | frozenset(OPTIONAL_FIELDS) | frozenset(PHASE1_FIELDS)
 
 PHASES = frozenset({"phase0", "phase1", "phase2", "phase3", "phase4"})
 OUTCOMES = frozenset(
@@ -55,6 +75,16 @@ OUTCOMES = frozenset(
     }
 )
 DISPOSITIONS = frozenset({"autoplay", "display_only", "suppressed", "not_applicable"})
+ACK_TERMINAL_STATES = frozenset(
+    {"discarded", "admitted_completed", "no_tts", "unavailable_transport", "not_applicable"}
+)
+
+# Phase-specific fields required in addition to REQUIRED_FIELDS. Values may
+# be null (nullable-required); presence is what's enforced here, and the
+# per-field type/enum checks below reject a wrong-typed non-null value.
+PHASE_EXTRA_REQUIRED_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "phase1": ("work_item_id", "ack_id", "ack_enqueued", "ack_enqueued_ms", "ack_terminal_state"),
+}
 
 # Phase-specific coverage minimums. Each phase declares the scenario names,
 # outcomes, and provider/model strata its fixture matrix must exercise at
@@ -74,6 +104,25 @@ PHASE_MINIMUMS: Mapping[str, Mapping[str, frozenset[Any]]] = {
         "outcomes": frozenset({"direct", "completed", "retained", "cancelled"}),
         "provider_model_strata": frozenset({("unavailable", "unavailable")}),
     },
+    "phase1": {
+        "scenarios": frozenset(
+            {
+                "ack_enqueued_timing",
+                "exactly_once",
+                "queued_discard",
+                "admitted_completion",
+                "no_tts",
+            }
+        ),
+        "outcomes": frozenset({"completed", "cancelled"}),
+        "provider_model_strata": frozenset({("unavailable", "unavailable")}),
+    },
+}
+# "two records each for the queued-discard and admitted-completion race
+# scenarios" -- a minimum *count*, not just presence, so it is checked
+# separately from PHASE_MINIMUMS' presence-only sets.
+PHASE_SCENARIO_MIN_COUNT: Mapping[str, Mapping[str, int]] = {
+    "phase1": {"queued_discard": 2, "admitted_completion": 2},
 }
 
 
@@ -100,6 +149,14 @@ def validate_record(record: Mapping[str, Any], index: int) -> None:
 
     if record["phase"] not in PHASES:
         raise EvidenceValidationError(f"record {index}: invalid phase {record['phase']!r}")
+
+    phase_extra = PHASE_EXTRA_REQUIRED_FIELDS.get(record["phase"], ())
+    missing_extra = [name for name in phase_extra if name not in record]
+    if missing_extra:
+        raise EvidenceValidationError(
+            f"record {index}: phase={record['phase']!r} missing required field(s) {missing_extra}"
+        )
+
     for field in ("scenario", "turn_id", "provider", "model", "run_id"):
         _require_type(record[field], (str,), field, index)
         if not record[field]:
@@ -139,6 +196,25 @@ def validate_record(record: Mapping[str, Any], index: int) -> None:
     if "wall_clock_time" in record and record["wall_clock_time"] is not None:
         _require_type(record["wall_clock_time"], (str,), "wall_clock_time", index)
 
+    if "ack_id" in record and record["ack_id"] is not None:
+        _require_type(record["ack_id"], (str,), "ack_id", index)
+        if not record["ack_id"]:
+            raise EvidenceValidationError(f"record {index}: ack_id must be non-empty")
+    if "ack_enqueued" in record and record["ack_enqueued"] is not None:
+        _require_type(record["ack_enqueued"], (bool,), "ack_enqueued", index)
+    if "ack_enqueued_ms" in record and record["ack_enqueued_ms"] is not None:
+        _require_type(record["ack_enqueued_ms"], (int,), "ack_enqueued_ms", index)
+        if record["ack_enqueued_ms"] < 0:
+            raise EvidenceValidationError(f"record {index}: ack_enqueued_ms must be >= 0")
+    if (
+        "ack_terminal_state" in record
+        and record["ack_terminal_state"] is not None
+        and record["ack_terminal_state"] not in ACK_TERMINAL_STATES
+    ):
+        raise EvidenceValidationError(
+            f"record {index}: invalid ack_terminal_state {record['ack_terminal_state']!r}"
+        )
+
 
 def load_records(input_path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
@@ -157,7 +233,7 @@ def load_records(input_path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def check_phase_minimums(phase: str, records: list[Mapping[str, Any]]) -> None:
+def check_phase_minimums(phase: str, records: Sequence[Mapping[str, Any]]) -> None:
     minimums = PHASE_MINIMUMS.get(phase)
     if minimums is None:
         raise EvidenceValidationError(f"no coverage minimums declared for phase {phase!r}")
@@ -187,6 +263,14 @@ def check_phase_minimums(phase: str, records: list[Mapping[str, Any]]) -> None:
             f"phase {phase!r}: missing provider/model stratum coverage for {sorted(missing_strata)}"
         )
 
+    min_counts = PHASE_SCENARIO_MIN_COUNT.get(phase, {})
+    for scenario, minimum in min_counts.items():
+        count = sum(1 for r in phase_records if r["scenario"] == scenario)
+        if count < minimum:
+            raise EvidenceValidationError(
+                f"phase {phase!r}: scenario {scenario!r} requires >= {minimum} record(s), got {count}"
+            )
+
 
 def validate_artifact(phase: str, input_path: Path) -> list[dict[str, Any]]:
     records = load_records(input_path)
@@ -196,11 +280,195 @@ def validate_artifact(phase: str, input_path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def has_real_provider_stratum(records: list[Mapping[str, Any]]) -> bool:
+    """True if any record uses a non-credential-free provider/model stratum.
+
+    The credential-free ``unavailable``/``unavailable`` stratum can validate
+    schema/lifecycle correctness but can never make a manifest
+    promotion-eligible; this is the check that enforces that split.
+    """
+    return any(r["provider"] != "unavailable" or r["model"] != "unavailable" for r in records)
+
+
+def _validate_transport_contract(input_path: Path) -> dict[str, Any]:
+    """Revalidate the Phase 2 transport/browser contract artifact.
+
+    Delegates to `validate_phase2_transport_browser_contract.py` (loaded by
+    path, since `scripts/` is not a package) so this writer never
+    re-implements or drifts from that gate's own logic.
+    """
+    spec_path = Path(__file__).resolve().parent / "validate_phase2_transport_browser_contract.py"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "validate_phase2_transport_browser_contract", spec_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    record = load_json(input_path)
+    if not isinstance(record, dict):
+        raise EvidenceGateError("transport contract artifact must be a JSON object")
+    module.validate_artifact(record)
+    return record
+
+
+def write_manifest(
+    *,
+    manifest_phase: str,
+    phase0_input: Path,
+    phase1_input: Path,
+    phase2_input: Path,
+    phase4c_input: Path | None,
+    source_commit: str,
+    source_tree_hash: str,
+    deployed_at_utc: str,
+    feature_policy_fingerprint: str,
+    output: Path,
+) -> dict[str, Any]:
+    if manifest_phase not in {"provisional", "final"}:
+        raise EvidenceGateError(f"unsupported --manifest-phase {manifest_phase!r}")
+
+    phase0_records = validate_artifact("phase0", phase0_input)
+    phase1_records = validate_artifact("phase1", phase1_input)
+    transport_record = _validate_transport_contract(phase2_input)
+
+    inputs: dict[str, dict[str, str]] = {
+        "phase0": {"path": str(phase0_input), "sha256": sha256_file(phase0_input)},
+        "phase1": {"path": str(phase1_input), "sha256": sha256_file(phase1_input)},
+        "phase2": {"path": str(phase2_input), "sha256": sha256_file(phase2_input)},
+    }
+    if phase4c_input is not None:
+        inputs["phase4c"] = {"path": str(phase4c_input), "sha256": sha256_file(phase4c_input)}
+
+    real_stratum_present = has_real_provider_stratum([*phase0_records, *phase1_records])
+    transport_eligible = bool(transport_record.get("promotion_eligible"))
+
+    reason: str | None
+    if manifest_phase == "provisional":
+        # A provisional manifest is diagnostic-only and is permanently
+        # ineligible; Phase 3 replaces it with a "final" manifest that can
+        # actually pass `load_promotion_manifest`'s eligibility gate.
+        promotion_eligible = False
+        if not real_stratum_present:
+            reason = "real_stratum_missing"
+        elif not transport_eligible:
+            reason = "audibility_unverified"
+        else:
+            reason = "provisional_manifest"
+    else:
+        promotion_eligible = real_stratum_present and transport_eligible
+        reason = (
+            None
+            if promotion_eligible
+            else ("real_stratum_missing" if not real_stratum_present else "audibility_unverified")
+        )
+
+    schema_hash = sha256_file(SCHEMA_PATH) if SCHEMA_PATH.exists() else ""
+    manifest = {
+        "manifest_phase": manifest_phase,
+        "promotion_eligible": promotion_eligible,
+        "reason": reason,
+        "schema_hash": schema_hash,
+        "source_commit": source_commit,
+        "source_tree_hash": source_tree_hash,
+        "release_version": "0.1.3",
+        "feature_policy_fingerprint": feature_policy_fingerprint,
+        "deployed_at_utc": deployed_at_utc,
+        "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "inputs": inputs,
+    }
+
+    _atomic_write_manifest(output, manifest)
+    return manifest
+
+
+def _atomic_write_manifest(output: Path, manifest: dict[str, Any]) -> None:
+    """Durable atomic-rename write with fsync, preserving a `.previous` copy.
+
+    Writes a same-directory temp file, fsyncs it, atomically renames it over
+    the destination, then fsyncs the parent directory. A pre-existing
+    manifest is preserved as `<output>.previous` until the rename is
+    durable; on any failure before the rename completes, the previous
+    manifest (if any) is left untouched.
+    """
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    previous_path = output.with_suffix(output.suffix + ".previous")
+    if output.exists():
+        previous_path.write_bytes(output.read_bytes())
+
+    tmp_path = output.with_suffix(output.suffix + ".tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, output)
+    dir_fd = os.open(str(output.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", required=True, choices=sorted(PHASE_MINIMUMS))
-    parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument("--phase", choices=sorted(PHASE_MINIMUMS))
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--write-manifest", action="store_true")
+    parser.add_argument("--manifest-phase", default="provisional", choices=("provisional", "final"))
+    parser.add_argument("--phase0-input", type=Path)
+    parser.add_argument("--phase1-input", type=Path)
+    parser.add_argument("--phase2-input", type=Path)
+    parser.add_argument("--phase4c-input", type=Path)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--source-tree-hash")
+    parser.add_argument("--deployed-at-utc")
+    parser.add_argument("--feature-policy-fingerprint")
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
+
+    if args.write_manifest:
+        required = {
+            "--phase0-input": args.phase0_input,
+            "--phase1-input": args.phase1_input,
+            "--phase2-input": args.phase2_input,
+            "--source-commit": args.source_commit,
+            "--source-tree-hash": args.source_tree_hash,
+            "--deployed-at-utc": args.deployed_at_utc,
+            "--feature-policy-fingerprint": args.feature_policy_fingerprint,
+            "--output": args.output,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            print(f"FAIL: --write-manifest requires {missing}", file=sys.stderr)
+            return 1
+        try:
+            manifest = write_manifest(
+                manifest_phase=args.manifest_phase,
+                phase0_input=args.phase0_input,
+                phase1_input=args.phase1_input,
+                phase2_input=args.phase2_input,
+                phase4c_input=args.phase4c_input,
+                source_commit=args.source_commit,
+                source_tree_hash=args.source_tree_hash,
+                deployed_at_utc=args.deployed_at_utc,
+                feature_policy_fingerprint=args.feature_policy_fingerprint,
+                output=args.output,
+            )
+        except (EvidenceValidationError, EvidenceGateError, OSError) as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"OK: wrote {args.output} (manifest_phase={manifest['manifest_phase']}, "
+            f"promotion_eligible={manifest['promotion_eligible']})"
+        )
+        return 0
+
+    if not args.phase or not args.input:
+        parser.error("--phase and --input are required unless --write-manifest is given")
 
     try:
         records = validate_artifact(args.phase, args.input)

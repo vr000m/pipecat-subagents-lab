@@ -147,11 +147,25 @@ epoch, and the last snapshot sequence. The new epoch is fenced before the
 snapshot is sent; old callbacks may append an immutable canonical result tied
 to their originating turn but cannot mutate active state or autoplay.
 
-A retained result completing on its still-active originating epoch is committed
-before its concise `spoken_text` is enqueued exactly once. It waits behind any
-active utterance and then follows the normal speech-progress state machine.
-Cancelled work, old epochs, disconnected sessions, and connections without TTS
-remain display-only and never create a speech attempt.
+A retained result is committed exactly once regardless of its delivery
+disposition. When `enable_autoplay_policy` is disabled, every valid,
+still-active-epoch, non-cancelled result on a speakable connection is
+enqueued and spoken (the pre-v0.1.3 behavior, unconditionally). When
+`enable_autoplay_policy` is enabled (the default), `spoken_text` is enqueued
+and follows the normal speech-progress state machine only when *all* of the
+following hold: the loaded promotion manifest is schema-valid *and*
+`promotion_eligible` (schema validity alone never proves promotion-eligible
+-- see the v0.1.3 dev plan's Phase 2 evidence-gate predicate), the
+originating epoch is still active, no newer semantic turn has been accepted
+since the result's work was dispatched, and no explicit pause is in effect.
+Any predicate failing -- including cancelled work, an old epoch, a
+disconnected session, a connection without TTS, or evidence that is
+missing/blocked/unavailable-only/malformed/not promotion-eligible -- commits
+the result display-only and never creates a speech attempt. As of v0.1.3's
+initial release, autoplay promotion is expected ineligible (no shipped
+manifest carries complete real provider/model evidence plus verified browser
+audibility), so the policy defaults to display-only in practice even though
+the mechanism itself is on by default.
 
 ## Verified Pipecat 1.6.0 seam notes
 

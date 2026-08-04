@@ -1082,3 +1082,38 @@ def test_shared_multi_intent_callback_receives_distinct_late_results_per_item() 
         await coordinator.shutdown()
 
     asyncio.run(run())
+
+
+# -- Phase 2: coordinator ownership boundary --------------------------------
+#
+# Plan bullet 213 / Integration Seams: "Keep commit ownership in
+# SessionHost/SessionState; the coordinator only owns task retention/
+# cancellation and callback delivery." WorkItemCoordinator must not gain a
+# commit-marking or disposition-computing API of its own -- that stays on
+# SessionHost.commit_late_result_once.
+
+
+def test_work_item_coordinator_has_no_commit_or_disposition_api() -> None:
+    """The coordinator remains delivery-only: it retains/cancels tasks and
+    invokes on_complete, but never itself decides autoplay vs. display-only
+    or performs a canonical commit."""
+    forbidden_names = {
+        "commit_late_result_once",
+        "commit_result",
+        "compute_disposition",
+        "commit_and_autoplay",
+    }
+    coordinator_api = set(dir(WorkItemCoordinator))
+    assert not (forbidden_names & coordinator_api)
+
+
+def test_retain_late_task_on_complete_callback_receives_delivery_only_late_result() -> None:
+    """The coordinator's on_complete callback is handed a plain LateResult
+    (work_item_id/worker_id/result/error/terminal_kind) -- no disposition or
+    commit-outcome field lives on that type; the host computes disposition
+    separately from the delivery payload the coordinator hands it."""
+    from server.work_item_coordinator import LateResult
+
+    late = LateResult(work_item_id="work-1", worker_id="worker-1", result=None)
+    disposition_like_fields = {"disposition", "commit_outcome", "autoplay"}
+    assert not (disposition_like_fields & set(late.__dataclass_fields__))

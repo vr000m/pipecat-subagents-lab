@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Derive and emit the v0.1.3 deployment identity metadata.
+
+Concrete metadata ownership (see the dev plan's Phase 2 section): CI's
+release/manifest job invokes this script with ``--shell-export`` against a
+clean, checked-out release tree and captures its four ``export`` lines with
+``eval`` before invoking ``scripts/validate_v013_evidence.py --write-manifest``.
+Local dev/test never runs the release job, so ``--check-release-inputs`` (used
+by every phase's test command as a lightweight preflight) only proves the
+four values *can* be derived from the current checkout -- it does not require
+a clean tree, matching the plan's "local dev/test may leave them unset and
+remains display-only" rule.
+
+``PIPECAT_SOURCE_TREE_HASH`` is a deterministic filtered hash of the
+committed deployable runtime set: ``server/**``, ``web/src/**``,
+``shared/protocol.md``, the four runtime JSON schemas, package/build
+metadata, and lockfiles -- explicitly excluding ``docs/benchmarks/**``,
+evidence ``v013-*`` schemas, test fixtures, scripts, and generated evidence.
+`server/config.py`'s loader and this emitter must use the same allowlist so
+neither can drift the runtime identity independently.
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from datetime import UTC
+
+from _evidence_common import sha256_bytes
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The deployable runtime identity surface. Deliberately excludes
+# docs/benchmarks/**, shared/schemas/v013-*.json, tests/**, and scripts/**,
+# so evidence-collection and tooling commits never drift the runtime hash.
+RUNTIME_TREE_GLOBS = (
+    "server/**/*.py",
+    "web/src/**/*.js",
+    "shared/protocol.md",
+    "shared/schemas/rtvi-message.json",
+    "shared/schemas/snapshot-handshake.json",
+    "shared/schemas/work-status.json",
+    "shared/schemas/runtime-snapshot.json",
+    "web/package.json",
+    "web/bun.lock",
+    "pyproject.toml",
+)
+
+
+def _run_git(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def source_commit() -> str:
+    return _run_git("rev-parse", "HEAD")
+
+
+def source_tree_hash() -> str:
+    """A deterministic filtered hash over `RUNTIME_TREE_GLOBS`'s tracked files.
+
+    Reads each matched, currently-tracked file's on-disk bytes (not the git
+    blob) so an uncommitted-but-staged phase-in-progress checkout still
+    produces a value, matching `--check-release-inputs`'s no-clean-tree
+    requirement; only `--shell-export`'s dirty-tree rejection enforces that
+    the release build is exact.
+    """
+    paths: set[Path] = set()
+    for pattern in RUNTIME_TREE_GLOBS:
+        paths.update(p for p in REPO_ROOT.glob(pattern) if p.is_file())
+    digest_input = bytearray()
+    for path in sorted(paths, key=lambda p: str(p.relative_to(REPO_ROOT))):
+        rel = str(path.relative_to(REPO_ROOT)).encode("utf-8")
+        digest_input += len(rel).to_bytes(4, "big") + rel
+        data = path.read_bytes()
+        digest_input += len(data).to_bytes(8, "big") + data
+    return sha256_bytes(bytes(digest_input))
+
+
+def deployed_at_utc() -> str:
+    from datetime import datetime
+
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def feature_policy_fingerprint_value() -> str:
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from server.config import FeaturePolicy, feature_policy_fingerprint, load_config
+
+    config = load_config()
+    return feature_policy_fingerprint(FeaturePolicy.from_config(config))
+
+
+def _is_dirty() -> bool:
+    status = _run_git("status", "--porcelain")
+    return bool(status.strip())
+
+
+def check_release_inputs() -> int:
+    try:
+        commit = source_commit()
+        tree_hash = source_tree_hash()
+        deployed_at = deployed_at_utc()
+        fingerprint = feature_policy_fingerprint_value()
+    except Exception as exc:  # noqa: BLE001 - report and fail the preflight, not a boot path
+        print(f"FAIL: could not derive deployment metadata: {exc}", file=sys.stderr)
+        return 1
+    print(
+        "OK: deployment metadata derivable "
+        f"(source_commit={commit[:12]}, source_tree_hash={tree_hash[:12]}, "
+        f"deployed_at_utc={deployed_at}, feature_policy_fingerprint={fingerprint[:12]})"
+    )
+    return 0
+
+
+def shell_export() -> int:
+    if _is_dirty():
+        print(
+            "FAIL: refusing to emit release metadata from a dirty/untracked tree", file=sys.stderr
+        )
+        return 1
+    try:
+        commit = source_commit()
+        tree_hash = source_tree_hash()
+        deployed_at = deployed_at_utc()
+        fingerprint = feature_policy_fingerprint_value()
+    except Exception as exc:  # noqa: BLE001 - report and fail rather than emit partial exports
+        print(f"FAIL: could not derive deployment metadata: {exc}", file=sys.stderr)
+        return 1
+    print(f"export PIPECAT_SOURCE_COMMIT={commit}")
+    print(f"export PIPECAT_SOURCE_TREE_HASH={tree_hash}")
+    print(f"export PIPECAT_DEPLOYED_AT_UTC={deployed_at}")
+    print(f"export PIPECAT_FEATURE_POLICY_FINGERPRINT={fingerprint}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--shell-export", action="store_true")
+    mode.add_argument("--check-release-inputs", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.shell_export:
+        return shell_export()
+    return check_release_inputs()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

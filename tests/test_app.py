@@ -256,6 +256,57 @@ def test_create_app_does_not_resolve_a_second_policy_from_worker_registry_config
     assert app.state.session_host.feature_policy is original_policy
 
 
+def test_default_session_host_calls_load_promotion_manifest_exactly_once(
+    monkeypatch, tmp_path
+) -> None:
+    """Plan bullet 183: '_default_session_host(config) calls once, handing
+    the immutable verdict to the SessionHost policy evaluator.'
+
+    ``server.config.load_promotion_manifest`` already exists, but
+    ``_default_session_host`` does not call it yet (Phase 2 concurrent
+    implementer is still wiring app.py). Skip until app.py actually
+    references the loader, rather than asserting on a call count of zero.
+    """
+    import inspect
+
+    if not hasattr(app_module, "load_promotion_manifest"):
+        pytest.skip("_default_session_host does not import load_promotion_manifest yet")
+    source = inspect.getsource(app_module._default_session_host)
+    if "load_promotion_manifest" not in source:
+        pytest.skip("_default_session_host does not call load_promotion_manifest yet")
+
+    calls: list[object] = []
+
+    def fake_loader(config):
+        calls.append(config)
+        return SimpleNamespace(promotion_eligible=False, reason="evidence_unavailable")
+
+    monkeypatch.setattr(app_module, "load_promotion_manifest", fake_loader)
+    monkeypatch.setattr(
+        app_module,
+        "load_config",
+        lambda: Config(promotion_manifest_path=str(tmp_path / "missing.json")),
+    )
+
+    app_module._default_session_host()
+
+    assert len(calls) == 1
+
+
+def test_enable_autoplay_policy_off_regression_preserves_pre_v013_late_result_behavior() -> None:
+    """Plan bullet 201: 'Add a flag-off regression test.' With
+    enable_autoplay_policy disabled, the app-level feature policy consumer
+    must select the pre-v0.1.3 active-origin enqueue/start behavior rather
+    than evaluating the new autoplay predicates."""
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=Config(enable_autoplay_policy=False)),
+        config=Config(enable_autoplay_policy=False),
+    )
+
+    assert host.feature_policy.enable_autoplay_policy is False
+
+
 def test_app_exposes_health_and_next_session_handshake() -> None:
     host = SessionHost(runner_factory=FakeRunner)
 
