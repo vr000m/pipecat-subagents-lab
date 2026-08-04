@@ -330,11 +330,18 @@ class SpeechLifecycleCoordinator:
         invokes no admitted-generation callback. Returns ``None`` when the
         slot is merely occupied (retry later, not terminal). Otherwise
         admits normally and returns ``PreAdmissionAdmit``.
+
+        The no-TTS/unavailable-transport terminal gate is ack-specific: an
+        ack is optional, TTS-lane-only speech that is safe to drop before
+        admission when no transport lane exists. Result identities predate
+        this gate and must keep admitting (and later terminalizing through
+        the normal delivery path) regardless of TTS/transport availability.
         """
-        if not self._tts_available:
-            return PreAdmissionTerminal(PreAdmissionTerminalReason.NO_TTS)
-        if self._transport_acceptance is not None and not self._transport_acceptance():
-            return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
+        if identity.role == "ack":
+            if not self._tts_available:
+                return PreAdmissionTerminal(PreAdmissionTerminalReason.NO_TTS)
+            if self._transport_acceptance is not None and not self._transport_acceptance():
+                return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
         generation = self.try_admit(identity)
         if generation is None:
             return None

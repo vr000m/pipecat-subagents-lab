@@ -882,7 +882,7 @@ class SessionHost:
         async def admit() -> None:
             try:
                 await origin.scheduler.start_next(ack_work_item_id)
-            except Exception:
+            except Exception:  # noqa: BLE001 - ack submission failure must never crash the turn
                 # The ack is ephemeral and best-effort: a submission failure
                 # (e.g. the connection's Pipecat worker has not attached
                 # yet) must never crash the turn's real delegated work.
@@ -2027,7 +2027,7 @@ class SessionHost:
         )
         try:
             await origin.scheduler.start_next(work_item_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - result already committed; speech failure must not propagate
             # A no-TTS/submission-failed result may still reach
             # result_ready: that state describes canonical commit, not
             # audio. start_next's own except-path already recorded

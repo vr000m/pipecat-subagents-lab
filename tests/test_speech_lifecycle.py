@@ -1447,7 +1447,7 @@ def test_coordinator_constructed_with_no_tts_never_arms_the_start_timeout() -> N
     """Plan: 'start/grace timers must never arm for a generation that
     terminalizes via pre_admission_disposition before any timer would be
     scheduled.'"""
-    coordinator, clock = make_coordinator(tts_available=False)
+    coordinator, _clock = make_coordinator(tts_available=False)
     ack_identity = GenerationIdentity(
         "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
     )
