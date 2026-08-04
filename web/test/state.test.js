@@ -352,3 +352,61 @@ describe("server-authoritative runtime reducer", () => {
     expect(stale.lastAppliedSequence).toBe(1);
   });
 });
+
+// --- Phase 3: work_status reducer and cross-epoch snapshot preservation ---
+//
+// The reducer/rendering additions are new this phase; `state.js` does not
+// yet export a work-status projection helper, so these tests are guarded
+// via a namespace import (not a named import, which would throw at module
+// load for a not-yet-exported binding) and skipped until it lands.
+
+const hasWorkStatusField = Object.hasOwn(createInitialState(), "workStatus");
+
+if (hasWorkStatusField) {
+  describe("Phase 3 work_status reducer", () => {
+    test("an incremental work_status message updates state.workStatus keyed by work_item_id", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 2,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: {
+          turn_id: "turn-1",
+          work_item_id: "work-1",
+          state: "background",
+          event_sequence: 0,
+          origin_epoch: 1,
+        },
+      });
+
+      expect(state.workStatus?.["turn-1::work-1"]?.state).toBe("background");
+    });
+
+    test("a snapshot embeds a cross-epoch terminal work_status without adopting the envelope epoch", () => {
+      let state = createInitialState();
+      const withStatus = {
+        ...snapshot(1),
+        data: {
+          ...snapshot(1).data,
+          work_status: [
+            {
+              turn_id: "turn-1",
+              work_item_id: "work-1",
+              state: "result_ready",
+              event_sequence: 0,
+              origin_epoch: 1,
+            },
+          ],
+        },
+      };
+      state = applyServerMessage(state, withStatus);
+
+      const preserved = state.workStatus?.["turn-1::work-1"];
+      expect(preserved?.origin_epoch).toBe(1);
+    });
+  });
+} else {
+  test.skip("Phase 3 work_status reducer not implemented yet (state.js has no workStatus field)", () => {});
+}

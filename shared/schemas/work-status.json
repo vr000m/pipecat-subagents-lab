@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/work-status.json",
+  "title": "WorkStatus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["turn_id", "work_item_id", "worker_id", "state", "event_sequence", "terminal_reason", "origin_epoch"],
+  "properties": {
+    "turn_id": {"type": "string", "minLength": 1},
+    "work_item_id": {"type": ["string", "null"]},
+    "worker_id": {"type": ["string", "null"]},
+    "state": {"enum": ["routing", "searching", "background", "result_ready", "failed", "cancelled"]},
+    "event_sequence": {"type": "integer", "minimum": 0},
+    "terminal_reason": {"enum": [null, "missing_worker", "retention_rejected"]},
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"not": {"properties": {"state": {"const": "failed"}}}},
+      "then": {"properties": {"terminal_reason": {"const": null}}}
+    }
+  ]
+}

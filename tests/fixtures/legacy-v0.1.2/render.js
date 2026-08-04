@@ -75,15 +75,6 @@ function transcriptTurn(item, state) {
   return `<div class="turn ${escape(item.role)}"><div class="turn-header"><strong>${escape(item.role)}${projection}</strong><time datetime="${escape(timestamp)}" title="${escape(timestamp)}">${escape(formatTimestamp(timestamp))}</time></div><p class="${result && incomplete ? "spoken-text unspoken" : "spoken-text"}">${escape(text)}</p>${details}</div>`;
 }
 
-function workStatusLog(state) {
-  const entries = Object.values(state.workStatus || {});
-  if (entries.length === 0) return "";
-  const items = entries
-    .map((item) => `<li class="work-status ${escape(item.state)}">${escape(item.turn_id)} · ${escape(item.state)}${item.terminal_reason ? ` (${escape(item.terminal_reason)})` : ""}</li>`)
-    .join("");
-  return `<h2>Work status</h2><ul class="work-status-log">${items}</ul>`;
-}
-
 export function renderRuntime(state) {
   const transcript = (state.transcript || []).map((item) => transcriptTurn(item, state)).join("");
   const workers = (state.workers || []).map((worker) => {
@@ -92,7 +83,7 @@ export function renderRuntime(state) {
   }).join("");
   const results = (state.results || []).map((result) => `<details><summary>${escape(result.timestamp || "time unknown")} · ${escape(result.worker_id)} · ${escape(result.turn_id)} · ${(result.citations || result.sources || []).filter((item) => normalizeUrl(item?.url)).length} sources · ${escape((result.ui_text || result.text || "").split("\n")[0])}</summary>${resultCard(result, state)}</details>`).join("");
   const diagnostics = state.localDiagnostics?.message || "runtime state below is server-authored";
-  return `<main class="app-shell"><div class="local-diagnostics"><strong>LOCAL</strong> ${escape(diagnostics)}</div><div class="live-grid"><section class="panel"><h2>Transcript</h2>${transcript || `<p class="muted">${state.connection === "connected" ? "Listening for server state…" : "Press Connect to start. Microphone permission is requested when you connect."}</p>`}</section><section class="inspector"><h2>Router / runtime</h2><p class="route">${escape(state.routing ? `${state.routing.action}${state.routing.worker_id ? ` → ${state.routing.worker_id}` : ""}` : "No active routing decision.")}</p><h2>Workers (persistent)</h2>${workers || `<p class="muted">No server workers yet.</p>`}${workStatusLog(state)}</section></div><section class="result-log"><h2>Result Log</h2>${results || `<p class="muted">Finalized worker results appear here.</p>`}</section></main>`;
+  return `<main class="app-shell"><div class="local-diagnostics"><strong>LOCAL</strong> ${escape(diagnostics)}</div><div class="live-grid"><section class="panel"><h2>Transcript</h2>${transcript || `<p class="muted">${state.connection === "connected" ? "Listening for server state…" : "Press Connect to start. Microphone permission is requested when you connect."}</p>`}</section><section class="inspector"><h2>Router / runtime</h2><p class="route">${escape(state.routing ? `${state.routing.action}${state.routing.worker_id ? ` → ${state.routing.worker_id}` : ""}` : "No active routing decision.")}</p><h2>Workers (persistent)</h2>${workers || `<p class="muted">No server workers yet.</p>`}</section></div><section class="result-log"><h2>Result Log</h2>${results || `<p class="muted">Finalized worker results appear here.</p>`}</section></main>`;
 }
 
 export function render(state, root) {

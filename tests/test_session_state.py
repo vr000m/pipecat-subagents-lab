@@ -1,5 +1,7 @@
 """Session state is authoritative and retains immutable result history."""
 
+import pytest
+
 from server.contracts import (
     CONTRACT_VERSION,
     DeliveryState,
@@ -9,6 +11,11 @@ from server.contracts import (
     WorkerState,
 )
 from server.session_state import SessionState
+
+try:
+    from server.session_state import WorkStatusKey
+except ImportError:  # pragma: no cover - contract not yet implemented
+    WorkStatusKey = None  # type: ignore[assignment]
 
 
 def result(result_id: str, worker_id: str = "worker-weather") -> GroundedResult:
@@ -273,3 +280,53 @@ def test_snapshot_round_trip_rebuilds_worker_result_history_and_delivery_project
     ]
     assert restored.workers["worker-weather"].latest_result_id == "result-2"
     assert restored.speech["utt-2"].state == DeliveryState.INTERRUPTED_BY_RECONNECT
+
+
+# --- Phase 3: WorkStatusKey identity and independent sequence ownership ----
+
+
+@pytest.mark.skipif(
+    WorkStatusKey is None, reason="server.session_state.WorkStatusKey not implemented yet"
+)
+def test_work_status_key_identity_is_origin_epoch_turn_id_and_work_item_or_parent() -> None:
+    key = WorkStatusKey(origin_epoch=1, turn_id="turn-1", parent_key="work-1")
+    same = WorkStatusKey(origin_epoch=1, turn_id="turn-1", parent_key="work-1")
+    different_epoch = WorkStatusKey(origin_epoch=2, turn_id="turn-1", parent_key="work-1")
+
+    assert key == same
+    assert key != different_epoch
+
+
+@pytest.mark.skipif(
+    not hasattr(SessionState, "set_child_work_status"),
+    reason="SessionState.set_child_work_status is not implemented yet",
+)
+def test_per_work_status_key_event_sequence_is_independent_of_the_global_state_sequence() -> None:
+    """SessionState._emit()'s global sequence is the authoritative
+    runtime_snapshot.snapshot_sequence watermark; the per-WorkStatusKey
+    payload event_sequence is a separate, independently allocated field."""
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-weather",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+    global_sequence_before = state.sequence
+
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-1", state="routing", origin_epoch=1
+    )
+
+    assert state.sequence > global_sequence_before
+    ledger_entry = next(
+        item for item in state.work_status_snapshot() if item.work_item_id == "work-1"
+    )
+    # The per-key event_sequence starts at 1 on the first parent
+    # (re)aggregation -- it is not required to equal the global
+    # SessionState.sequence watermark; they are distinct counters.
+    assert ledger_entry.event_sequence == 1

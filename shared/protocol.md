@@ -20,12 +20,13 @@ The schemas in `shared/schemas/` are the wire artifacts. Python models in
 `server/contracts.py` are the validation authority for server-produced data;
 the browser must treat provider text, titles, and URLs as untrusted.
 
-The only server-to-browser RTVI state message kinds in `v1.0` are
+The server-to-browser RTVI state message kinds in `v1.0` are
 `runtime_snapshot`, `result`, `speech_progress`, `worker`, `routing`,
-`user_transcript`, and `bot_transcript`. Their envelope is defined by
-`shared/schemas/rtvi-message.json`. Each message carries its payload directly
-in `data`; aliases and wrapper objects are not part of the contract. In
-particular, `runtime_result` and `speech` are not message kinds.
+`user_transcript`, `bot_transcript`, and the capability-conditional
+`work_status`. Their envelope is defined by `shared/schemas/rtvi-message.json`.
+Each message carries its payload directly in `data`; aliases and wrapper
+objects are not part of the contract. In particular, `runtime_result` and
+`speech` are not message kinds.
 
 | Kind | `data` contract |
 | --- | --- |
@@ -36,6 +37,7 @@ particular, `runtime_result` and `speech` are not message kinds.
 | `routing` | `routing-state.json` |
 | `user_transcript` | `transcript-entry.json` with `role: "user"` |
 | `bot_transcript` | `transcript-entry.json` with `role: "assistant"` |
+| `work_status` | `work-status.json` (capability-gated; see below) |
 
 The envelope and payload carry the same non-negative `origin_epoch`. Snapshot
 envelope and payload session identifiers match, as do `sequence` and
@@ -76,8 +78,52 @@ The active browser protocol exposes delivery states `displayed`,
 nor any current state proves browser decode, playout, or audibility. Terminal
 delivery precedence is reconnect interruption, interruption, confirmed
 completion, unknown delivery, then cancellation; duplicate or late events
-cannot replace an already terminal outcome. Word-level progress is reserved
-for a future, verified Phase-3 extension.
+cannot replace an already terminal outcome. Word-level progress remains
+reserved for a future, verified extension beyond this release: the `v0.1.3`
+Phase 3 `work_status` kind below is a coarse, truthful progress contract only
+(`routing`/`searching`/`background`/`result_ready`/`failed`/`cancelled`) and
+does not satisfy or close that reservation.
+
+## Progressive work status (capability-gated, v0.1.3 Phase 3)
+
+The optional snapshot-handshake capability `work_status_v1` gates a coarse,
+truthful `work_status` RTVI kind. Absent or unknown capability names mean
+unsupported; no capability state is ever inferred from browser rendering or
+message-kind fallback. Only delegated children (`existing_worker`/
+`new_worker` routes) hold a client-visible parent work-status record; direct,
+unsupported, clarify, and declined outcomes remain internal, non-delegated
+join outcomes and never emit `work_status`.
+
+Each payload carries `turn_id`, a nullable `work_item_id` (the parent key for
+a mixed multi-intent turn), a nullable `worker_id`, the coarse `state` enum,
+a per-`(origin_epoch, turn_id, parent work item)` `event_sequence`, a
+nullable `terminal_reason` (only `missing_worker` or `retention_rejected`,
+and only alongside `failed`), and `origin_epoch`. Legal transitions are
+`routing -> searching|failed|cancelled`; `searching ->
+background|result_ready|failed|cancelled`; `background ->
+result_ready|failed|cancelled`; `result_ready|failed|cancelled` are terminal.
+Parent aggregation over delegated children is exhaustive: `routing` while any
+child is routing; `searching` while any child is searching and none is
+routing; `background` while no child is active and at least one remains
+retained; once every delegated child is terminal, `failed` wins if any child
+failed, otherwise `cancelled` applies only when every child is cancelled,
+otherwise `result_ready`. `result_ready` means the canonical result is
+committed and display-ready -- it does not mean speech was queued, delivered,
+or heard. Terminal records preserve their original `origin_epoch` and remain
+in a capable client's reconnect snapshot for a five-minute session-clock TTL,
+pruned lazily at projection time.
+
+Capability negotiation carries one URL-encoded JSON array of capability names
+in a single `capabilities` query parameter on both the `POST /api/rtc` offer
+and the `PATCH /api/rtc` ICE-candidate request. The server normalizes,
+deduplicates, and lexically sorts the declared set and binds it immutably to
+the promoted connection epoch. A `PATCH` request either omits the field
+(inheriting the `POST`-bound set) or repeats the identical normalized set; a
+present mismatch is rejected and cannot mutate observer entitlement after
+promotion. `enable_background_status` (default on) gates emission
+server-side regardless of client capability; when disabled, no `work_status`
+frame is ever produced and the legacy foreground-timeout notice applies
+universally, reproducing pre-Phase-3 behavior.
 
 ### Transport-aware lease boundary
 
@@ -134,10 +180,12 @@ boundary closes; browser SDK transcript callbacks are not authoritative state.
 
 ## Contract inventory
 
-- `rtvi-message.json` and its seven payload schemas define the active
-  server-to-browser boundary listed above.
-- `snapshot-handshake.json` defines same-origin HTTP session discovery and
-  reconnect negotiation; it is not an RTVI state message.
+- `rtvi-message.json` and its eight payload schemas (including
+  `work-status.json`) define the active server-to-browser boundary listed
+  above.
+- `snapshot-handshake.json` defines same-origin HTTP session discovery,
+  reconnect negotiation, and the optional `capabilities` carrier; it is not
+  an RTVI state message.
 - `routing-decision.json` defines the internal router-to-dispatch decision.
 - `work-item-event.json` and `interruption-event.json` reserve deferred
   lifecycle contracts and are not emitted by v1.0.

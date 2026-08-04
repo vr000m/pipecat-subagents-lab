@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -106,8 +107,78 @@ def _tts_processors(host: SessionHost, runtime: Any) -> tuple[Any, ...]:
     return (runtime.tts, _SpeechCompletionProcessor(host, runtime))
 
 
+def _validate_raw_percent_encoding(raw_query_string: bytes) -> None:
+    """App-layer defense on the raw ASGI scope bytes (before any framework
+    decoding): reject a percent sign not followed by two ASCII hex digits.
+
+    Whether a malformed percent sequence even survives uvicorn's own HTTP
+    parser to reach ``scope["query_string"]`` is unverified parser behavior
+    (see the dev plan's Phase 3 uvicorn-probe bullet); this check is this
+    app's own defense for whatever bytes do arrive there.
+    """
+    text = raw_query_string.decode("latin-1")
+    index = 0
+    length = len(text)
+    hex_digits = "0123456789abcdefABCDEF"
+    while index < length:
+        if text[index] == "%":
+            pair = text[index + 1 : index + 3]
+            if len(pair) != 2 or pair[0] not in hex_digits or pair[1] not in hex_digits:
+                raise HTTPException(
+                    status_code=400, detail="invalid Small WebRTC session handshake"
+                )
+            index += 3
+        else:
+            index += 1
+
+
+def _raw_query_pairs(request: Request) -> list[tuple[str, str]]:
+    """Parse `scope["query_string"]` directly, bypassing Starlette's
+    last-wins duplicate-key merging so a duplicate `capabilities` key can be
+    rejected rather than silently collapsed."""
+    raw = request.scope.get("query_string", b"")
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1")
+    _validate_raw_percent_encoding(raw)
+    text = raw.decode("latin-1")
+    pairs: list[tuple[str, str]] = []
+    for chunk in text.split("&"):
+        if not chunk:
+            continue
+        key, _, value = chunk.partition("=")
+        pairs.append((unquote(key), unquote(value)))
+    return pairs
+
+
+def _decode_capabilities(request: Request) -> tuple[tuple[str, ...], bool]:
+    """Decode the canonical single URL-encoded JSON-array `capabilities` field.
+
+    Absent means omission (inherit-on-PATCH / unsupported-on-POST); present
+    but malformed is a 400, matching every other handshake field. The raw
+    query parser rejects duplicate `capabilities` keys before normalization;
+    duplicate entries inside the single JSON array remain deduplicated by
+    ``SnapshotHandshake.validate_capabilities``.
+    """
+    matches = [value for key, value in _raw_query_pairs(request) if key == "capabilities"]
+    if not matches:
+        return (), False
+    if len(matches) > 1:
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    try:
+        decoded = json.loads(matches[0])
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    if not isinstance(decoded, list) or any(
+        not isinstance(item, str) or not item for item in decoded
+    ):
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    return tuple(decoded), True
+
+
 def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandshake:
     """Parse a short-lived browser handshake token carried by the URL."""
+    _validate_raw_percent_encoding(request.scope.get("query_string", b""))
+    capabilities, capabilities_present = _decode_capabilities(request)
     try:
         value = SnapshotHandshake(
             contract_version=request.query_params.get("contract_version", CONTRACT_VERSION),
@@ -115,6 +186,8 @@ def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandsh
             resume_token=request.query_params["resume_token"],
             proposed_epoch=int(request.query_params["proposed_epoch"]),
             snapshot_sequence=int(request.query_params.get("snapshot_sequence", "0")),
+            capabilities=capabilities,
+            capabilities_present=capabilities_present,
         )
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
@@ -267,9 +340,25 @@ async def _attach_connection(
             await runtime.shutdown(reason="connection replaced during setup")
             return
 
-        async def emit_frame(frame: Any) -> None:
-            if host.accepts(runtime.epoch):
-                await worker.queue_frame(frame)
+        # Seed the connection-projected sequence at the current snapshot
+        # watermark before subscribing, so the first delivered incremental
+        # is contiguous with whatever snapshot the client requests next
+        # (Phase 3 barrier ordering; see RuntimeObserver.seed).
+        runtime.observer.seed(host.state.sequence)
+
+        async def emit_frame(projected: Any) -> None:
+            if not host.accepts(runtime.epoch):
+                return
+            message = publisher.incremental(
+                projected["kind"],
+                projected["data"],
+                sequence=projected["sequence"],
+                origin_epoch=projected["origin_epoch"],
+            )
+            if message is not None:
+                await worker.queue_frame(
+                    RTVIServerMessageFrame(data=message.model_dump(mode="json"))
+                )
 
         runtime.observer.subscribe(emit_frame)
 
@@ -297,9 +386,14 @@ async def _attach_connection(
             publisher.set_snapshot(runtime.observer.snapshot())
             snapshot = publisher.snapshot()
             if snapshot is not None:
-                await worker.queue_frame(
-                    RTVIServerMessageFrame(data=snapshot.model_dump(mode="json"))
-                )
+                frame_data = snapshot.model_dump(mode="json")
+                if not runtime.supports_work_status:
+                    # Non-capable projections omit the status section
+                    # entirely (field absent, not an empty array) so the
+                    # frozen pre-Phase-3 runtime-snapshot schema still
+                    # validates this connection's snapshots (Requirements).
+                    frame_data.get("data", {}).pop("work_status", None)
+                await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
 
         # WorkerRunner has no remove-workers API in the pinned wheel. Run each
         # connection worker through its real PipelineWorker lifecycle task so
@@ -450,6 +544,12 @@ def create_app(
         handshake = _handshake_from_query(session_host, http_request)
         if not session_host.accepts(handshake.proposed_epoch):
             raise HTTPException(status_code=409, detail="stale Small WebRTC connection epoch")
+        try:
+            session_host.validate_patch_handshake(session_host.connection, handshake)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="capabilities cannot change after connection promotion"
+            )
         await webrtc_handler.handle_patch_request(request)
         return {"status": "success"}
 

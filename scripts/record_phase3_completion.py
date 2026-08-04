@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Record the exact Phase 3 command digest, source commit, and tree hash.
+
+Run only after Phase 3's own Test command (see the dev plan's closing Phase
+3 bullet) has passed against a clean checkout. The resulting artifact is a
+required input to ``scripts/validate_v013_evidence.py --write-manifest
+--manifest-phase final``: a final promotion manifest cannot be produced
+without a matching Phase 3 completion record.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _evidence_common import EvidenceGateError, require_nonempty_str
+
+
+def build_record(
+    *, source_commit: str, source_tree_hash: str, command_digest: str
+) -> dict[str, str]:
+    require_nonempty_str(source_commit, "source_commit")
+    require_nonempty_str(source_tree_hash, "source_tree_hash")
+    require_nonempty_str(command_digest, "command_digest")
+    return {
+        "source_commit": source_commit,
+        "source_tree_hash": source_tree_hash,
+        "command_digest": command_digest,
+        "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--source-tree-hash", required=True)
+    parser.add_argument("--command-digest", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+
+    try:
+        record = build_record(
+            source_commit=args.source_commit,
+            source_tree_hash=args.source_tree_hash,
+            command_digest=args.command_digest,
+        )
+    except EvidenceGateError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    import json
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"OK: wrote {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

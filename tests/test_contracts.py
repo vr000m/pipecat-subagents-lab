@@ -430,3 +430,182 @@ def test_snapshot_is_versioned_monotonic_and_excludes_raw_prompts_or_logs() -> N
         RuntimeSnapshot(**{**payload, "snapshot_sequence": 11})
     with pytest.raises(ValueError):
         RuntimeSnapshot(**{**payload, "unexpected_private_field": True})
+
+
+# --- Phase 3: progressive RTVI status -------------------------------------
+#
+# Plan bullet (shared/protocol.md, shared/schemas/rtvi-message.json,
+# shared/schemas/work-status.json): a strict `work_status` kind is added to
+# the closed v1.0 kind list; capability handshake gets a strict `capabilities`
+# field. These tests assert the CONTRACT the plan describes -- they may not
+# import successfully until server/contracts.py lands the new symbols.
+
+from server.contracts import SnapshotHandshake
+
+try:
+    from server.contracts import WORK_STATUS_STATES as _IMPL_WORK_STATUS_STATES
+    from server.contracts import WorkStatus
+except ImportError:  # pragma: no cover - contract not yet implemented
+    WorkStatus = None  # type: ignore[assignment]
+    _IMPL_WORK_STATUS_STATES = None  # type: ignore[assignment]
+
+WORK_STATUS_STATES = {"routing", "searching", "background", "result_ready", "failed", "cancelled"}
+LEGAL_TRANSITIONS = {
+    "routing": {"searching", "failed", "cancelled"},
+    "searching": {"background", "result_ready", "failed", "cancelled"},
+    "background": {"result_ready", "failed", "cancelled"},
+    "result_ready": set(),
+    "failed": set(),
+    "cancelled": set(),
+}
+
+
+def _work_status(**overrides: object) -> "WorkStatus":
+    assert WorkStatus is not None, "server.contracts.WorkStatus is not implemented yet"
+    fields = {
+        "turn_id": "turn-1",
+        "work_item_id": "work-1",
+        "state": "routing",
+        "event_sequence": 0,
+        "origin_epoch": 1,
+    }
+    fields.update(overrides)
+    return WorkStatus(**fields)
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_state_set_is_the_coarse_six_state_set() -> None:
+    assert set(_IMPL_WORK_STATUS_STATES) == WORK_STATUS_STATES
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize("state", sorted(WORK_STATUS_STATES))
+def test_work_status_accepts_every_coarse_state(state: str) -> None:
+    status = _work_status(state=state)
+    validate_contract(status)
+    assert status.state == state
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_rejects_word_level_progress_fields() -> None:
+    """shared/protocol.md:80 reserves word-level progress; this phase's
+    coarse work_status must not accept a word-level progress payload."""
+    with pytest.raises(ValueError):
+        _work_status(word_progress="the model is thinking about weather")
+    with pytest.raises(ValueError):
+        _work_status(partial_text="Austin is currently")
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_rejects_work_item_event_reserved_states_as_values() -> None:
+    """WorkItemEvent's reserved started/progress states (shared/protocol.md:
+    109-115) must not become legal work_status values -- the two state
+    machines are independent seams."""
+    with pytest.raises(ValueError):
+        _work_status(state="started")
+    with pytest.raises(ValueError):
+        _work_status(state="progress")
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(s, e) for s, targets in LEGAL_TRANSITIONS.items() for e in targets],
+)
+def test_work_status_legal_transitions_are_accepted(start: str, end: str) -> None:
+    # A transition is exercised through two sequential events sharing a key;
+    # both individual payloads must be independently contract-valid.
+    validate_contract(_work_status(state=start, event_sequence=0))
+    validate_contract(_work_status(state=end, event_sequence=1))
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize("terminal_state", ["result_ready", "failed", "cancelled"])
+def test_work_status_terminal_states_have_no_legal_successor(terminal_state: str) -> None:
+    assert LEGAL_TRANSITIONS[terminal_state] == set()
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize("terminal_reason", ["missing_worker", "retention_rejected"])
+def test_work_status_failed_carries_terminal_reason(terminal_reason: str) -> None:
+    status = _work_status(state="failed", terminal_reason=terminal_reason)
+    validate_contract(status)
+    assert status.terminal_reason == terminal_reason
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_terminal_reason_only_legal_alongside_failed() -> None:
+    with pytest.raises(ValueError):
+        _work_status(state="routing", terminal_reason="missing_worker")
+
+
+# --- Phase 3: SnapshotHandshake capabilities field -------------------------
+
+
+def test_snapshot_handshake_absent_capabilities_normalizes_to_empty_and_unpresent() -> None:
+    handshake = SnapshotHandshake(
+        session_id="session-1", resume_token="resume-1", proposed_epoch=1, snapshot_sequence=0
+    )
+    assert handshake.capabilities == ()
+    assert handshake.capabilities_present is False
+
+
+def test_snapshot_handshake_explicit_empty_array_is_present_but_empty() -> None:
+    handshake = SnapshotHandshake(
+        session_id="session-1",
+        resume_token="resume-1",
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=(),
+        capabilities_present=True,
+    )
+    assert handshake.capabilities == ()
+    assert handshake.capabilities_present is True
+
+
+def test_snapshot_handshake_unknown_capability_names_are_retained_as_unsupported() -> None:
+    """Absent/unknown means unsupported -- the strict model itself does not
+    reject a well-formed but unrecognized future capability name; rejection
+    of malformed entries only applies to non-string/empty-string entries."""
+    handshake = SnapshotHandshake(
+        session_id="session-1",
+        resume_token="resume-1",
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=("work_status_v1", "some_future_capability"),
+        capabilities_present=True,
+    )
+    assert handshake.capabilities == ("some_future_capability", "work_status_v1")
+
+
+def test_snapshot_handshake_capabilities_are_deduplicated_and_lexicographically_sorted() -> None:
+    handshake = SnapshotHandshake(
+        session_id="session-1",
+        resume_token="resume-1",
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=("work_status_v1", "work_status_v1", "alpha"),
+        capabilities_present=True,
+    )
+    assert handshake.capabilities == ("alpha", "work_status_v1")
+
+
+def test_snapshot_handshake_rejects_non_string_or_empty_capability_entries() -> None:
+    with pytest.raises(ValueError):
+        SnapshotHandshake(
+            session_id="session-1",
+            resume_token="resume-1",
+            proposed_epoch=1,
+            snapshot_sequence=0,
+            capabilities=("work_status_v1", ""),
+            capabilities_present=True,
+        )
+    with pytest.raises(ValueError):
+        SnapshotHandshake(
+            session_id="session-1",
+            resume_token="resume-1",
+            proposed_epoch=1,
+            snapshot_sequence=0,
+            capabilities=(1,),  # type: ignore[arg-type]
+            capabilities_present=True,
+        )

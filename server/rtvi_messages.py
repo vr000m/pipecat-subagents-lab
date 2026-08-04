@@ -15,6 +15,7 @@ from .contracts import (
     SpeechProgress,
     TranscriptEntry,
     WorkerState,
+    WorkStatus,
 )
 
 RTVI_MESSAGE_KINDS = (
@@ -25,6 +26,7 @@ RTVI_MESSAGE_KINDS = (
     "routing",
     "user_transcript",
     "bot_transcript",
+    "work_status",
 )
 RTVIMessageKind = Literal[
     "runtime_snapshot",
@@ -34,6 +36,7 @@ RTVIMessageKind = Literal[
     "routing",
     "user_transcript",
     "bot_transcript",
+    "work_status",
 ]
 
 _PAYLOAD_MODELS = {
@@ -44,6 +47,7 @@ _PAYLOAD_MODELS = {
     "routing": RoutingState,
     "user_transcript": TranscriptEntry,
     "bot_transcript": TranscriptEntry,
+    "work_status": WorkStatus,
 }
 
 
@@ -91,31 +95,27 @@ class RTVIMessagePublisher:
         self._ready = False
         self._snapshot: RuntimeSnapshot | None = None
 
-    def _message(
-        self, kind: RTVIMessageKind, data: dict[str, Any], origin_epoch: int
+    def incremental(
+        self, kind: RTVIMessageKind, data: dict[str, Any], *, sequence: int, origin_epoch: int
     ) -> RTVIMessage | None:
+        """Serialize an already-sequenced typed event (Phase 3 observer path).
+
+        Validates and serializes the caller-supplied envelope sequence
+        rather than allocating one; the connection-projected sequence is
+        owned exclusively by ``RuntimeObserver``. Returns ``None`` for a
+        stale (non-active-epoch) origin, matching every other publisher
+        method's epoch fence.
+        """
         if origin_epoch != self.active_epoch:
             return None
-        self._sequence = (
-            self._sequence_provider() if self._sequence_provider is not None else self._sequence + 1
-        )
+        self._sequence = max(self._sequence, sequence)
         return RTVIMessage(
             session_id=self.session_id,
-            sequence=self._sequence,
+            sequence=sequence,
             kind=kind,
             data=data,
             origin_epoch=origin_epoch,
         )
-
-    def result(self, result: GroundedResult, *, origin_epoch: int) -> RTVIMessage | None:
-        if result.origin_epoch is None:
-            result = result.model_copy(update={"origin_epoch": origin_epoch})
-        return self._message("result", result.model_dump(mode="json"), origin_epoch)
-
-    def speech_progress(self, progress: SpeechProgress, *, origin_epoch: int) -> RTVIMessage | None:
-        if progress.origin_epoch is None:
-            progress = progress.model_copy(update={"origin_epoch": origin_epoch})
-        return self._message("speech_progress", progress.model_dump(mode="json"), origin_epoch)
 
     def client_ready(self, *, epoch: int) -> None:
         if epoch != self.active_epoch:

@@ -19,7 +19,6 @@ export function createInitialState() {
     workers: [],
     results: [],
     speech: {},
-    workStatus: {},
     localDiagnostics: { ...EMPTY_DIAGNOSTICS },
     lastAppliedSequence: 0,
     serverState: false,
@@ -139,23 +138,6 @@ function projectedWorker(worker) {
   };
 }
 
-function projectedWorkStatus(status) {
-  if (!status || typeof status !== "object" || !status.turn_id) return null;
-  return {
-    turn_id: status.turn_id,
-    work_item_id: status.work_item_id,
-    worker_id: status.worker_id,
-    state: status.state,
-    event_sequence: status.event_sequence,
-    terminal_reason: status.terminal_reason,
-    origin_epoch: status.origin_epoch,
-  };
-}
-
-function workStatusKey(status) {
-  return `${status.turn_id}::${status.work_item_id ?? ""}`;
-}
-
 function projectedSpeech(progress) {
   if (!progress || typeof progress !== "object" || !progress.utterance_id) return null;
   return {
@@ -179,12 +161,6 @@ function snapshotState(state, snapshot, sequence) {
       .filter(Boolean)
       .map((item) => [item.utterance_id, item]),
   );
-  const workStatus = Object.fromEntries(
-    (Array.isArray(snapshot.work_status) ? snapshot.work_status : [])
-      .map(projectedWorkStatus)
-      .filter(Boolean)
-      .map((item) => [workStatusKey(item), item]),
-  );
   const diagnostics = {
     ...state.localDiagnostics,
     lastSequence: snapshotSequence,
@@ -199,7 +175,6 @@ function snapshotState(state, snapshot, sequence) {
     workers: Array.isArray(snapshot.workers) ? snapshot.workers.map(projectedWorker).filter(Boolean) : [],
     results,
     speech,
-    workStatus,
     routing: snapshot.routing ?? null,
     transcript: Array.isArray(snapshot.transcript) ? snapshot.transcript.map((item) => ({ ...item })) : [],
     serverState: true,
@@ -233,14 +208,6 @@ function applyIncrement(state, payload) {
     }
     case "routing":
       return { ...state, routing: payload.data };
-    case "work_status": {
-      const projected = projectedWorkStatus(payload.data);
-      if (!projected) return state;
-      const key = workStatusKey(projected);
-      const previous = state.workStatus[key];
-      if (previous && previous.event_sequence >= projected.event_sequence) return state;
-      return { ...state, workStatus: { ...state.workStatus, [key]: projected } };
-    }
     case "user_transcript":
     case "bot_transcript":
       return {

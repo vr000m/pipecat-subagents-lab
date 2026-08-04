@@ -17,6 +17,11 @@ from server.contracts import (
 )
 from server.rtvi_messages import RTVI_MESSAGE_KINDS, RTVIMessage, RTVIMessagePublisher
 
+try:
+    from server.contracts import WorkStatus
+except ImportError:  # pragma: no cover - contract not yet implemented
+    WorkStatus = None  # type: ignore[assignment]
+
 
 def test_messages_have_monotonic_sequences_and_reject_stale_epoch_emission() -> None:
     publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=4)
@@ -26,9 +31,13 @@ def test_messages_have_monotonic_sequences_and_reject_stale_epoch_emission() -> 
         turn_id="turn-1",
         text="Rain is likely.",
         spoken_text="Rain is likely.",
+        origin_epoch=4,
     )
-    first = publisher.result(result, origin_epoch=4)
-    second = publisher.speech_progress(
+    first = publisher.incremental(
+        "result", result.model_dump(mode="json"), sequence=1, origin_epoch=4
+    )
+    second = publisher.incremental(
+        "speech_progress",
         SpeechProgress(
             result_id="result-1",
             work_item_id="work-1",
@@ -36,12 +45,16 @@ def test_messages_have_monotonic_sequences_and_reject_stale_epoch_emission() -> 
             utterance_id="utt-1",
             state=DeliveryState.STARTED,
             origin_epoch=4,
-        ),
+        ).model_dump(mode="json"),
+        sequence=2,
         origin_epoch=4,
     )
 
     assert second.sequence == first.sequence + 1
-    assert publisher.result(result, origin_epoch=3) is None
+    assert (
+        publisher.incremental("result", result.model_dump(mode="json"), sequence=3, origin_epoch=3)
+        is None
+    )
     payload = first.model_dump(mode="json")
     assert "raw_logs" not in payload
     assert "prompt" not in payload
@@ -74,6 +87,7 @@ def test_first_ready_snapshot_is_schema_complete_before_authoritative_state_is_s
         "speech_progress": [],
         "routing": None,
         "transcript": [],
+        "work_status": [],
         "origin_epoch": 1,
     }
     RuntimeSnapshot.model_validate(snapshot.data)
@@ -86,7 +100,8 @@ def test_stale_epoch_cannot_advance_sequence_or_emit_after_readiness() -> None:
 
     assert first is not None
     assert (
-        publisher.speech_progress(
+        publisher.incremental(
+            "speech_progress",
             SpeechProgress(
                 result_id="result-1",
                 work_item_id="work-1",
@@ -94,7 +109,8 @@ def test_stale_epoch_cannot_advance_sequence_or_emit_after_readiness() -> None:
                 utterance_id="utt-1",
                 state=DeliveryState.STARTED,
                 origin_epoch=1,
-            ),
+            ).model_dump(mode="json"),
+            sequence=first.sequence + 1,
             origin_epoch=1,
         )
         is None
@@ -155,7 +171,8 @@ def test_high_snapshot_sequence_is_shared_with_envelope_and_following_events() -
 
     snapshot = publisher.snapshot()
     repeated_snapshot = publisher.snapshot()
-    event = publisher.speech_progress(
+    event = publisher.incremental(
+        "speech_progress",
         SpeechProgress(
             result_id="result-1",
             work_item_id="work-1",
@@ -163,7 +180,8 @@ def test_high_snapshot_sequence_is_shared_with_envelope_and_following_events() -
             utterance_id="utt-1",
             state=DeliveryState.STARTED,
             origin_epoch=1,
-        ),
+        ).model_dump(mode="json"),
+        sequence=41,
         origin_epoch=1,
     )
 
@@ -259,8 +277,18 @@ def test_every_versioned_message_kind_validates_its_direct_payload() -> None:
             role="assistant", text="Answer", turn_id="turn-1", origin_epoch=epoch
         ),
     }
+    if WorkStatus is not None:
+        payloads["work_status"] = WorkStatus(
+            turn_id="turn-1",
+            work_item_id="work-1",
+            state="routing",
+            event_sequence=0,
+            origin_epoch=epoch,
+        )
 
     for kind in RTVI_MESSAGE_KINDS:
+        if kind not in payloads:
+            continue  # contract not yet implemented for this kind
         message = RTVIMessage(
             session_id=session_id,
             sequence=7 if kind == "runtime_snapshot" else 8,
@@ -320,3 +348,77 @@ def test_envelope_rejects_payload_kind_epoch_and_snapshot_fence_mismatches() -> 
             ).model_dump(mode="json"),
             origin_epoch=2,
         )
+
+
+# --- Phase 3: work_status kind and the generic incremental(...) contract --
+
+
+def test_rtvi_message_kinds_gains_work_status_in_the_closed_v1_0_list() -> None:
+    assert "work_status" in RTVI_MESSAGE_KINDS
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_incremental_validates_and_serializes_the_supplied_sequence_without_a_second_counter() -> (
+    None
+):
+    """`incremental(...)` validates/serializes the supplied sequence rather
+    than allocating a second one -- the observer/adapter assigns the single
+    projected sequence, and the publisher is only its serializer."""
+    publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=1)
+    status = WorkStatus(
+        turn_id="turn-1", work_item_id="work-1", state="routing", event_sequence=0, origin_epoch=1
+    )
+
+    first = publisher.incremental(
+        "work_status", status.model_dump(mode="json"), sequence=7, origin_epoch=1
+    )
+    second = publisher.incremental(
+        "work_status", status.model_dump(mode="json"), sequence=8, origin_epoch=1
+    )
+
+    assert first.sequence == 7
+    assert second.sequence == 8
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_incremental_rejects_stale_epoch_like_the_other_publisher_methods() -> None:
+    publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=4)
+    status = WorkStatus(
+        turn_id="turn-1", work_item_id="work-1", state="routing", event_sequence=0, origin_epoch=3
+    )
+
+    assert (
+        publisher.incremental(
+            "work_status", status.model_dump(mode="json"), sequence=1, origin_epoch=3
+        )
+        is None
+    )
+
+
+def test_no_publisher_method_allocates_its_own_incremental_sequence_after_phase3() -> None:
+    """Plan bullet 234: after Phase 3, no RTVIMessagePublisher method may
+    allocate its own incremental sequence. `result`/`speech_progress` are
+    caller-less; this migration either removes them or routes them through
+    the supplied-sequence `incremental(...)` contract -- either disposition
+    is acceptable, but a self-incrementing `self._sequence + 1` path with no
+    sequence_provider must not remain reachable from either method."""
+    publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=1)
+    result_method = getattr(publisher, "result", None)
+    speech_progress_method = getattr(publisher, "speech_progress", None)
+    if result_method is None and speech_progress_method is None:
+        return  # removed entirely -- satisfies the invariant trivially
+    grounded = GroundedResult(
+        result_id="result-1",
+        worker_id="worker-weather",
+        turn_id="turn-1",
+        text="Rain is likely.",
+        spoken_text="Rain is likely.",
+        origin_epoch=1,
+    )
+    before = publisher._sequence
+    if result_method is not None:
+        result_method(grounded, origin_epoch=1)
+    after = publisher._sequence
+    # A caller-less method that still self-increments without a
+    # sequence_provider is exactly the forbidden disposition.
+    assert after == before or publisher._sequence_provider is not None

@@ -17,7 +17,8 @@
         "worker",
         "routing",
         "user_transcript",
-        "bot_transcript"
+        "bot_transcript",
+        "work_status"
       ]
     },
     "data": {"type": "object"},
@@ -86,6 +87,13 @@
           }
         }
       }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "work_status"}}},
+      "then": {"properties": {"data": {"allOf": [
+        {"$ref": "work-status.json"},
+        {"required": ["origin_epoch"], "properties": {"origin_epoch": {"type": "integer", "minimum": 0}}}
+      ]}}}
     }
   ]
 }

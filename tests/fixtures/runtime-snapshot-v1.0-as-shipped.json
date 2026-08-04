@@ -1,0 +1,256 @@
+{
+  "checksum_sha256": "c98e946ae3de7d0e48c83ac7d05b621a51511f80875e02f1ee0975b4ffa19d9c",
+  "schema": {
+    "$defs": {
+      "origin_epoch": {
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "routing": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "direct",
+              "unsupported",
+              "clarify",
+              "existing_worker",
+              "new_worker"
+            ]
+          },
+          "model_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin_epoch": {
+            "$ref": "#/$defs/origin_epoch"
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worker_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "turn_id",
+          "action",
+          "worker_id",
+          "worker_type",
+          "topic",
+          "model_policy",
+          "origin_epoch"
+        ],
+        "type": "object"
+      },
+      "speech_progress": {
+        "additionalProperties": false,
+        "properties": {
+          "origin_epoch": {
+            "$ref": "#/$defs/origin_epoch"
+          },
+          "result_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "run_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "displayed",
+              "queued",
+              "started",
+              "synthesis_ended",
+              "delivery_completed",
+              "delivery_unknown",
+              "interrupted",
+              "interrupted_by_reconnect",
+              "paused",
+              "resumed"
+            ]
+          },
+          "utterance_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "work_item_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "result_id",
+          "work_item_id",
+          "run_id",
+          "utterance_id",
+          "state",
+          "origin_epoch"
+        ],
+        "type": "object"
+      },
+      "transcript_entry": {
+        "additionalProperties": false,
+        "properties": {
+          "origin_epoch": {
+            "$ref": "#/$defs/origin_epoch"
+          },
+          "role": {
+            "enum": [
+              "user",
+              "assistant"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "text",
+          "turn_id",
+          "timestamp",
+          "origin_epoch"
+        ],
+        "type": "object"
+      },
+      "worker": {
+        "additionalProperties": false,
+        "properties": {
+          "latest_result_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_policy": {
+            "type": "string"
+          },
+          "origin_epoch": {
+            "$ref": "#/$defs/origin_epoch"
+          },
+          "status": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "string"
+          },
+          "worker_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker_id",
+          "topic",
+          "model_policy",
+          "status",
+          "latest_result_id",
+          "origin_epoch"
+        ],
+        "type": "object"
+      }
+    },
+    "$id": "https://pipecat-subagents-lab.local/schemas/v1/runtime-snapshot.json",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "contract_version": {
+        "const": "v1.0"
+      },
+      "origin_epoch": {
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "results": {
+        "items": {
+          "$ref": "grounded-result.json"
+        },
+        "type": "array"
+      },
+      "routing": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/routing"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "snapshot_sequence": {
+        "minimum": 0,
+        "type": "integer"
+      },
+      "speech_progress": {
+        "items": {
+          "$ref": "#/$defs/speech_progress"
+        },
+        "type": "array"
+      },
+      "transcript": {
+        "items": {
+          "$ref": "#/$defs/transcript_entry"
+        },
+        "type": "array"
+      },
+      "workers": {
+        "items": {
+          "$ref": "#/$defs/worker"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "contract_version",
+      "session_id",
+      "snapshot_sequence",
+      "workers",
+      "results",
+      "speech_progress",
+      "routing",
+      "transcript",
+      "origin_epoch"
+    ],
+    "title": "RuntimeSnapshot",
+    "type": "object"
+  },
+  "source_commit": "86abe425610201924ec9d99345d8b73958c7802b"
+}

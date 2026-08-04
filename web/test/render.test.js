@@ -256,3 +256,27 @@ test("uses conservative incomplete styling for every non-transport-complete deli
     expect(html).not.toContain("verified browser audibility");
   }
 });
+
+// --- Phase 3: rendering the coarse work_status states ---------------------
+//
+// renderRuntime does not yet render a work_status section (pre-Phase-3
+// state has no `workStatus` field); this is guarded on the field's presence
+// so it is skipped, not failed, until the rendering addition lands.
+
+const hasWorkStatusField = Object.hasOwn(state, "workStatus") ||
+  Object.hasOwn(state, "work_status");
+
+if (hasWorkStatusField) {
+  test("renders a coarse, truthful label for every work_status state, never word-level progress", () => {
+    for (const workState of ["routing", "searching", "background", "result_ready", "failed", "cancelled"]) {
+      const html = renderRuntime({
+        ...state,
+        workStatus: { "work-1": { turn_id: "turn-1", work_item_id: "work-1", state: workState } },
+      });
+
+      expect(html).toContain(workState);
+    }
+  });
+} else {
+  test.skip("Phase 3 work_status rendering not implemented yet", () => {});
+}

@@ -1,0 +1,18 @@
+{
+  "description": "Pre-Phase-3 browser protocol/reducer bundle plus the pre-Phase-3 runtime-snapshot schema, pinned before any Phase 3 (web/src/* or server) edit land. Used by the mixed-version client/server compatibility fixture and the immutable pre-Phase-3 runtime-snapshot schema tests.",
+  "source_commit": "86abe425610201924ec9d99345d8b73958c7802b",
+  "files": {
+    "protocol.js": {
+      "archived_from": "web/src/protocol.js",
+      "sha256": "57f972342bbfa89165ad80ba02bb684ed6ac01b2af304f563c59df641140cd2b"
+    },
+    "state.js": {
+      "archived_from": "web/src/state.js",
+      "sha256": "2b1494673e7cf18c89bd342272087324429e51b49684be3b7b67655f70a1a0dd"
+    },
+    "runtime-snapshot.schema.json": {
+      "archived_from": "shared/schemas/runtime-snapshot.json",
+      "sha256": "c98e946ae3de7d0e48c83ac7d05b621a51511f80875e02f1ee0975b4ffa19d9c"
+    }
+  }
+}

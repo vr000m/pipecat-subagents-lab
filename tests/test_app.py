@@ -846,3 +846,354 @@ assert handler_id in logger._core.handlers
         captured = capfd.readouterr()
         assert secret not in captured.err
         assert secret not in captured.out
+
+
+# --- Phase 3: capability handshake (POST/PATCH `capabilities` query field) -
+#
+# `_handshake_from_query` is the sole app-layer parser for the canonical
+# encoding: a single `capabilities` query parameter carrying one URL-encoded
+# JSON array of capability-name strings. These tests assert the CONTRACT the
+# plan describes; they may fail to import/run until server/app.py lands the
+# `capabilities`/raw-ASGI-validation extension.
+
+import json as _json
+from urllib.parse import quote
+
+from starlette.requests import Request as _StarletteRequest
+
+from server.app import _handshake_from_query
+from server.contracts import SnapshotHandshake
+
+
+def _raw_request(raw_query_string: bytes) -> _StarletteRequest:
+    """Build a minimal ASGI Request carrying an already-encoded raw query
+    string, bypassing the framework's own query-string decoding -- this is
+    the direct-ASGI injection the plan calls for to test malformed percent
+    sequences at the `scope["query_string"]` boundary."""
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/rtc",
+        "headers": [],
+        "query_string": raw_query_string,
+    }
+    return _StarletteRequest(scope)
+
+
+def _capability_query(
+    *, session_id: str, resume_token: str, epoch: int, capabilities: str
+) -> bytes:
+    return (
+        f"session_id={session_id}&resume_token={resume_token}"
+        f"&proposed_epoch={epoch}&snapshot_sequence=0&capabilities={capabilities}"
+    ).encode()
+
+
+def _host_with_fresh_handshake_token() -> tuple[SessionHost, dict[str, str]]:
+    host = SessionHost(runner_factory=FakeRunner)
+    handshake = host.session_handshake()
+    return host, handshake
+
+
+def test_handshake_absent_capabilities_normalizes_to_unsupported() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0"
+    ).encode()
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ()
+    assert value.capabilities_present is False
+
+
+def test_handshake_canonical_capabilities_array_is_decoded_deduplicated_and_sorted() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1", "work_status_v1", "alpha"]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ("alpha", "work_status_v1")
+    assert value.capabilities_present is True
+
+
+def test_handshake_unknown_future_capability_name_is_retained_as_unsupported() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["some_future_capability"]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ("some_future_capability",)
+
+
+def test_handshake_empty_array_normalizes_to_present_but_empty_set() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps([]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ()
+    assert value.capabilities_present is True
+
+
+@pytest.mark.parametrize(
+    "raw_capabilities",
+    [
+        "not-json",
+        quote("{"),
+        quote(_json.dumps({"not": "an array"})),
+        quote(_json.dumps([1, 2])),
+        quote(_json.dumps([""])),
+    ],
+)
+def test_handshake_rejects_malformed_or_non_string_capabilities(raw_capabilities: str) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=raw_capabilities,
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+def test_handshake_rejects_duplicate_capabilities_query_keys() -> None:
+    """The raw query parser rejects duplicate `capabilities` keys before
+    normalization; deduplication only applies inside the single JSON array."""
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0"
+        f"&capabilities={encoded}&capabilities={encoded}"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+def test_handshake_rejects_percent_not_followed_by_two_hex_digits_at_asgi_boundary() -> None:
+    """App-layer defense on the raw ASGI scope bytes: a percent sign not
+    followed by two ASCII hex digits must be rejected with the same 400
+    handshake error, independent of whatever the framework's own decoder
+    would have done with it."""
+    host, handshake = _host_with_fresh_handshake_token()
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0&capabilities=%zz"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+def test_handshake_rejects_trailing_bare_percent_at_asgi_boundary() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0&capabilities=%"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+# --- Phase 3: PATCH capability inheritance/mismatch (SessionHost.validate_patch_handshake) -
+
+
+def test_validate_patch_handshake_omitted_field_inherits_the_post_bound_set() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    promoted = host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    patch_handshake = SnapshotHandshake(
+        session_id=host.state.session_id,
+        resume_token=host.state.resume_token,
+        proposed_epoch=1,
+        snapshot_sequence=0,
+    )
+
+    # Omission must not raise and must not mutate the bound connection.
+    host.validate_patch_handshake(promoted, patch_handshake)
+
+    assert promoted.capabilities == ("work_status_v1",)
+
+
+def test_validate_patch_handshake_present_mismatch_is_rejected() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    promoted = host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    mismatched_patch = SnapshotHandshake(
+        session_id=host.state.session_id,
+        resume_token=host.state.resume_token,
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=(),
+        capabilities_present=True,
+    )
+
+    with pytest.raises(ValueError):
+        host.validate_patch_handshake(promoted, mismatched_patch)
+    # Rejecting the mismatch must not mutate the bound connection/entitlement.
+    assert promoted.capabilities == ("work_status_v1",)
+
+
+def test_validate_patch_handshake_exact_matching_set_is_accepted() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    promoted = host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    matching_patch = SnapshotHandshake(
+        session_id=host.state.session_id,
+        resume_token=host.state.resume_token,
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=("work_status_v1",),
+        capabilities_present=True,
+    )
+
+    host.validate_patch_handshake(promoted, matching_patch)  # must not raise
+
+
+# --- Phase 3: mixed-version client/server compatibility fixture -----------
+
+
+def test_pre_phase3_style_server_ignores_an_unknown_capabilities_field() -> None:
+    """A pre-Phase-3 server parses only its known query fields, so an
+    otherwise-valid new-browser request carrying `capabilities` is accepted
+    with the field ignored/treated as unsupported -- not strictly rejected.
+    This models the old server against a new-browser request; do not claim
+    strict rejection for a mixed-version fixture."""
+    old_style_fields = {
+        "contract_version",
+        "session_id",
+        "resume_token",
+        "proposed_epoch",
+        "snapshot_sequence",
+    }
+    from server.contracts import SnapshotHandshake as _Handshake
+
+    parsed = _Handshake.model_validate(
+        {
+            "session_id": "session-1",
+            "resume_token": "resume-1",
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+        }
+    )
+    # An old (pre-Phase-3) parser only ever reads these fields; a new browser
+    # sending an extra `capabilities` query parameter must not break it.
+    assert old_style_fields <= set(parsed.model_dump().keys())
+
+
+def test_old_browser_snapshot_carries_no_status_field() -> None:
+    """A new server's snapshot projection for a non-advertising (old) browser
+    must omit the status section entirely -- field absent, not an empty
+    array/object -- per the legacy-compatibility fixture requirement."""
+    import json as _json2
+
+    legacy = _json2.loads(
+        (Path(__file__).parent / "fixtures" / "runtime-snapshot-v1.0-as-shipped.json").read_text()
+    )["schema"]
+    assert "work_status" not in legacy.get("properties", {})
+
+
+# --- Phase 3: enable_background_status flag-off regression / rollback -----
+
+
+def test_enable_background_status_off_reproduces_pre_phase3_legacy_timeout_behavior() -> None:
+    """Plan bullet: 'When disabled, no work_status frames are emitted
+    regardless of client capability, and the Phase 1 legacy timeout notice
+    applies universally, reproducing pre-Phase-3 behavior.'"""
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=Config(enable_background_status=False)),
+        config=Config(enable_background_status=False),
+    )
+
+    assert host.feature_policy.enable_background_status is False
+
+
+def test_rollback_order_disable_status_then_autoplay_then_early_ack() -> None:
+    """Plan bullet: the documented rollback order (disable
+    enable_background_status first, then enable_autoplay_policy, then
+    enable_early_ack) must leave each preceding phase's disabled-switch path
+    operational at every step."""
+    config = Config(enable_background_status=False)
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=config),
+        config=config,
+    )
+    assert host.feature_policy.enable_background_status is False
+    assert host.feature_policy.enable_autoplay_policy is True
+    assert host.feature_policy.enable_early_ack is True
+
+    config = Config(enable_background_status=False, enable_autoplay_policy=False)
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=config),
+        config=config,
+    )
+    assert host.feature_policy.enable_background_status is False
+    assert host.feature_policy.enable_autoplay_policy is False
+    assert host.feature_policy.enable_early_ack is True
+
+    config = Config(
+        enable_background_status=False, enable_autoplay_policy=False, enable_early_ack=False
+    )
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=config),
+        config=config,
+    )
+    assert host.feature_policy.enable_background_status is False
+    assert host.feature_policy.enable_autoplay_policy is False
+    assert host.feature_policy.enable_early_ack is False

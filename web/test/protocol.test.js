@@ -488,3 +488,65 @@ test("requests a snapshot at each explicit readiness boundary, never during init
 
   expect(snapshots).toEqual(["snapshot", "snapshot"]);
 });
+
+// --- Phase 3: work_status kind -------------------------------------------
+//
+// shared/schemas/rtvi-message.json extends its closed v1.0 kind enum with
+// "work_status"; RTVI_MESSAGE_KINDS must track the schema exactly (existing
+// test above already asserts RTVI_MESSAGE_KINDS === schema kind enum, so
+// once the schema lands "work_status", this constant must too).
+
+const workStatus = (overrides = {}) => ({
+  turn_id: "turn-1",
+  work_item_id: "work-1",
+  worker_id: null,
+  state: "routing",
+  event_sequence: 0,
+  terminal_reason: null,
+  origin_epoch: 1,
+  ...overrides,
+});
+
+test("rtvi-message.json's closed v1.0 kind enum includes work_status", () => {
+  expect(messageSchema.properties.kind.enum).toContain("work_status");
+});
+
+test("validateServerMessage accepts a well-formed work_status envelope for each coarse state", () => {
+  for (const state of ["routing", "searching", "background", "result_ready", "failed", "cancelled"]) {
+    const message = {
+      contract_version: "v1.0",
+      session_id: "session-1",
+      sequence: 1,
+      kind: "work_status",
+      data: workStatus({ state }),
+      origin_epoch: 1,
+    };
+    expect(validateServerMessage(message)).toBe(true);
+  }
+});
+
+test("validateServerMessage rejects a work_status payload carrying word-level progress fields", () => {
+  const message = {
+    contract_version: "v1.0",
+    session_id: "session-1",
+    sequence: 1,
+    kind: "work_status",
+    data: workStatus({ word_progress: "thinking about the weather" }),
+    origin_epoch: 1,
+  };
+  expect(validateServerMessage(message)).toBe(false);
+});
+
+test("validateServerMessage rejects work_status using the WorkItemEvent-reserved started/progress states", () => {
+  for (const reserved of ["started", "progress"]) {
+    const message = {
+      contract_version: "v1.0",
+      session_id: "session-1",
+      sequence: 1,
+      kind: "work_status",
+      data: workStatus({ state: reserved }),
+      origin_epoch: 1,
+    };
+    expect(validateServerMessage(message)).toBe(false);
+  }
+});

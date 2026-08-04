@@ -179,6 +179,10 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
           for (const key of ["contract_version", "session_id", "resume_token", "proposed_epoch", "snapshot_sequence"]) {
             if (handshake[key] !== undefined) url.searchParams.set(key, String(handshake[key]));
           }
+          // Canonical capability encoding: one URL-encoded JSON array of
+          // strings in a single `capabilities` query parameter, bound
+          // immutably to the promoted connection epoch server-side.
+          url.searchParams.set("capabilities", JSON.stringify(["work_status_v1"]));
           connectionUrl = url.toString();
         } catch (error) {
           report(`Session discovery failed: ${error?.message || error}`);

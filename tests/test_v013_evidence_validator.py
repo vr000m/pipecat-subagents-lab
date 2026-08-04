@@ -391,3 +391,186 @@ def test_evidence_common_status_enum_contains_the_documented_values() -> None:
     # contain blocked/not_run so validate_phase2_transport_browser_contract.py
     # and validate_v013_evidence.py draw from the same enum.
     assert {"blocked", "not_run"} <= status_values
+
+
+# --- Phase 3: --phase3-input extension and scripts/record_phase3_completion.py -
+#
+# Plan bullet 245 (Phase 3 closing step): `scripts/record_phase3_completion.py`
+# writes a dated completion record binding source-commit/source-tree-hash and
+# a sha256 digest of this phase's own Test command; `validate_v013_evidence.py
+# --write-manifest --manifest-phase final` then requires a matching
+# `--phase3-input` and rejects any mismatch against the earlier phase0/1/2
+# artifacts, schema, source identity, or deployment/policy fingerprint.
+
+RECORD_PHASE3_PATH = REPO_ROOT / "scripts" / "record_phase3_completion.py"
+
+
+def _record_phase3_completion_script() -> Any:
+    if not RECORD_PHASE3_PATH.exists():
+        pytest.skip(
+            "scripts/record_phase3_completion.py not yet implemented "
+            "(Phase 3 concurrent implementer)"
+        )
+    return _load(RECORD_PHASE3_PATH, "record_phase3_completion")
+
+
+COMMAND_DIGEST = "e" * 64
+
+
+def _phase3_completion_argv(*, output: Path, command_digest: str = COMMAND_DIGEST) -> list[str]:
+    return [
+        "--source-commit",
+        SOURCE_COMMIT,
+        "--source-tree-hash",
+        SOURCE_TREE_HASH,
+        "--command-digest",
+        command_digest,
+        "--output",
+        str(output),
+    ]
+
+
+def test_record_phase3_completion_writes_a_source_tree_and_command_bound_record(
+    tmp_path: Path,
+) -> None:
+    module = _record_phase3_completion_script()
+    output = tmp_path / "v0.1.3-phase3-completion.json"
+
+    exit_code = module.main(_phase3_completion_argv(output=output))
+
+    assert exit_code == 0
+    record = json.loads(output.read_text())
+    assert record["source_commit"] == SOURCE_COMMIT
+    assert record["source_tree_hash"] == SOURCE_TREE_HASH
+    assert record["command_digest"] == COMMAND_DIGEST
+    assert "generated_at_utc" in record
+
+
+def test_record_phase3_completion_rejects_an_empty_command_digest(tmp_path: Path) -> None:
+    module = _record_phase3_completion_script()
+    output = tmp_path / "v0.1.3-phase3-completion.json"
+
+    exit_code = module.main(_phase3_completion_argv(output=output, command_digest=""))
+
+    assert exit_code != 0
+    assert not output.exists()
+
+
+def _write_manifest_final_argv(
+    tmp_path: Path,
+    *,
+    phase0: Path,
+    phase1: Path,
+    phase2: Path,
+    phase3: Path,
+) -> list[str]:
+    return [
+        "--write-manifest",
+        "--manifest-phase",
+        "final",
+        "--phase0-input",
+        str(phase0),
+        "--phase1-input",
+        str(phase1),
+        "--phase2-input",
+        str(phase2),
+        "--phase3-input",
+        str(phase3),
+        "--source-commit",
+        SOURCE_COMMIT,
+        "--source-tree-hash",
+        SOURCE_TREE_HASH,
+        "--deployed-at-utc",
+        "2026-08-04T00:00:00Z",
+        "--feature-policy-fingerprint",
+        FEATURE_POLICY_FINGERPRINT,
+        "--output",
+        str(tmp_path / "promotion-manifest.json"),
+    ]
+
+
+def _full_valid_inputs_with_phase3(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    phase0, phase1, phase2 = _full_valid_inputs(tmp_path)
+    completion_module = _record_phase3_completion_script()
+    phase3 = tmp_path / "v0.1.3-phase3-completion.json"
+    exit_code = completion_module.main(_phase3_completion_argv(output=phase3))
+    assert exit_code == 0
+    return phase0, phase1, phase2, phase3
+
+
+def test_final_manifest_requires_phase3_input_and_binds_its_hash(tmp_path: Path) -> None:
+    module = _validator()
+    phase0, phase1, phase2, phase3 = _full_valid_inputs_with_phase3(tmp_path)
+
+    exit_code = module.main(
+        _write_manifest_final_argv(
+            tmp_path, phase0=phase0, phase1=phase1, phase2=phase2, phase3=phase3
+        )
+    )
+
+    assert exit_code == 0
+    manifest = json.loads((tmp_path / "promotion-manifest.json").read_text())
+    assert manifest["inputs"]["phase3"]["path"] == str(phase3)
+    assert len(manifest["inputs"]["phase3"]["sha256"]) == 64
+
+
+def test_final_manifest_refuses_when_phase3_input_is_missing(tmp_path: Path) -> None:
+    module = _validator()
+    phase0, phase1, phase2 = _full_valid_inputs(tmp_path)
+    missing_phase3 = tmp_path / "missing-phase3.json"
+
+    exit_code = module.main(
+        _write_manifest_final_argv(
+            tmp_path, phase0=phase0, phase1=phase1, phase2=phase2, phase3=missing_phase3
+        )
+    )
+
+    assert exit_code != 0
+    assert not (tmp_path / "promotion-manifest.json").exists()
+
+
+def test_final_manifest_rejects_a_phase3_record_with_mismatched_source_commit(
+    tmp_path: Path,
+) -> None:
+    module = _validator()
+    phase0, phase1, phase2 = _full_valid_inputs(tmp_path)
+    completion_module = _record_phase3_completion_script()
+    phase3 = tmp_path / "v0.1.3-phase3-completion.json"
+    completion_module.main(_phase3_completion_argv(output=phase3))
+    stale_record = json.loads(phase3.read_text())
+    stale_record["source_commit"] = "f" * 40  # does not match --source-commit below
+    phase3.write_text(json.dumps(stale_record))
+
+    exit_code = module.main(
+        _write_manifest_final_argv(
+            tmp_path, phase0=phase0, phase1=phase1, phase2=phase2, phase3=phase3
+        )
+    )
+
+    assert exit_code != 0
+    assert not (tmp_path / "promotion-manifest.json").exists()
+
+
+def test_final_manifest_binds_the_phase3_command_digest_the_record_declares(tmp_path: Path) -> None:
+    """The final manifest must carry forward the exact command_digest the
+    Phase 3 completion record declares, so a later loader can compare it
+    against the pinned Test command hash rather than trusting the record
+    blindly."""
+    module = _validator()
+    phase0, phase1, phase2 = _full_valid_inputs(tmp_path)
+    completion_module = _record_phase3_completion_script()
+    phase3 = tmp_path / "v0.1.3-phase3-completion.json"
+    distinct_digest = "0" * 64
+    completion_module.main(_phase3_completion_argv(output=phase3, command_digest=distinct_digest))
+
+    exit_code = module.main(
+        _write_manifest_final_argv(
+            tmp_path, phase0=phase0, phase1=phase1, phase2=phase2, phase3=phase3
+        )
+    )
+
+    assert exit_code == 0
+    manifest = json.loads((tmp_path / "promotion-manifest.json").read_text())
+    completion_record = json.loads(phase3.read_text())
+    assert completion_record["command_digest"] == distinct_digest
+    assert manifest["inputs"]["phase3"]["sha256"] == module.sha256_file(phase3)

@@ -313,12 +313,45 @@ def _validate_transport_contract(input_path: Path) -> dict[str, Any]:
     return record
 
 
+PHASE3_COMPLETION_REQUIRED_FIELDS = (
+    "source_commit",
+    "source_tree_hash",
+    "command_digest",
+    "generated_at_utc",
+)
+
+
+def _validate_phase3_completion(
+    input_path: Path, *, source_commit: str, source_tree_hash: str
+) -> dict[str, Any]:
+    """Revalidate the Phase 3 completion artifact `record_phase3_completion.py` writes."""
+    record = load_json(input_path)
+    if not isinstance(record, dict):
+        raise EvidenceGateError("phase3 completion artifact must be a JSON object")
+    missing = [field for field in PHASE3_COMPLETION_REQUIRED_FIELDS if not record.get(field)]
+    if missing:
+        raise EvidenceGateError(f"phase3 completion artifact missing field(s) {missing}")
+    if record["source_commit"] != source_commit:
+        raise EvidenceGateError(
+            "phase3 completion artifact source_commit "
+            f"{record['source_commit']!r} does not match --source-commit {source_commit!r}"
+        )
+    if record["source_tree_hash"] != source_tree_hash:
+        raise EvidenceGateError(
+            "phase3 completion artifact source_tree_hash "
+            f"{record['source_tree_hash']!r} does not match "
+            f"--source-tree-hash {source_tree_hash!r}"
+        )
+    return record
+
+
 def write_manifest(
     *,
     manifest_phase: str,
     phase0_input: Path,
     phase1_input: Path,
     phase2_input: Path,
+    phase3_input: Path | None,
     phase4c_input: Path | None,
     source_commit: str,
     source_tree_hash: str,
@@ -328,21 +361,33 @@ def write_manifest(
 ) -> dict[str, Any]:
     if manifest_phase not in {"provisional", "final"}:
         raise EvidenceGateError(f"unsupported --manifest-phase {manifest_phase!r}")
+    if manifest_phase == "final" and phase3_input is None:
+        raise EvidenceGateError("--manifest-phase final requires --phase3-input")
 
     phase0_records = validate_artifact("phase0", phase0_input)
     phase1_records = validate_artifact("phase1", phase1_input)
     transport_record = _validate_transport_contract(phase2_input)
+    phase3_record = (
+        _validate_phase3_completion(
+            phase3_input, source_commit=source_commit, source_tree_hash=source_tree_hash
+        )
+        if phase3_input is not None
+        else None
+    )
 
     inputs: dict[str, dict[str, str]] = {
         "phase0": {"path": str(phase0_input), "sha256": sha256_file(phase0_input)},
         "phase1": {"path": str(phase1_input), "sha256": sha256_file(phase1_input)},
         "phase2": {"path": str(phase2_input), "sha256": sha256_file(phase2_input)},
     }
+    if phase3_input is not None:
+        inputs["phase3"] = {"path": str(phase3_input), "sha256": sha256_file(phase3_input)}
     if phase4c_input is not None:
         inputs["phase4c"] = {"path": str(phase4c_input), "sha256": sha256_file(phase4c_input)}
 
     real_stratum_present = has_real_provider_stratum([*phase0_records, *phase1_records])
     transport_eligible = bool(transport_record.get("promotion_eligible"))
+    phase3_complete = phase3_record is not None
 
     reason: str | None
     if manifest_phase == "provisional":
@@ -357,11 +402,17 @@ def write_manifest(
         else:
             reason = "provisional_manifest"
     else:
-        promotion_eligible = real_stratum_present and transport_eligible
+        promotion_eligible = real_stratum_present and transport_eligible and phase3_complete
         reason = (
             None
             if promotion_eligible
-            else ("real_stratum_missing" if not real_stratum_present else "audibility_unverified")
+            else (
+                "real_stratum_missing"
+                if not real_stratum_present
+                else "audibility_unverified"
+                if not transport_eligible
+                else "phase3_incomplete"
+            )
         )
 
     schema_hash = sha256_file(SCHEMA_PATH) if SCHEMA_PATH.exists() else ""
@@ -422,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--phase0-input", type=Path)
     parser.add_argument("--phase1-input", type=Path)
     parser.add_argument("--phase2-input", type=Path)
+    parser.add_argument("--phase3-input", type=Path)
     parser.add_argument("--phase4c-input", type=Path)
     parser.add_argument("--source-commit")
     parser.add_argument("--source-tree-hash")
@@ -442,6 +494,8 @@ def main(argv: list[str] | None = None) -> int:
             "--output": args.output,
         }
         missing = [name for name, value in required.items() if not value]
+        if args.manifest_phase == "final" and not args.phase3_input:
+            missing.append("--phase3-input")
         if missing:
             print(f"FAIL: --write-manifest requires {missing}", file=sys.stderr)
             return 1
@@ -451,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
                 phase0_input=args.phase0_input,
                 phase1_input=args.phase1_input,
                 phase2_input=args.phase2_input,
+                phase3_input=args.phase3_input,
                 phase4c_input=args.phase4c_input,
                 source_commit=args.source_commit,
                 source_tree_hash=args.source_tree_hash,

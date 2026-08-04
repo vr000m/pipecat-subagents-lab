@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 from .contracts import (
+    WORK_STATUS_TERMINAL,
     DeliveryState,
     GroundedResult,
     RoutingState,
@@ -16,8 +18,16 @@ from .contracts import (
     SpeechProgress,
     TranscriptEntry,
     WorkerState,
+    WorkStatus,
+    legal_work_status_transition,
 )
 from .results import ResultLog
+
+# Terminal work_status records remain in capable-client snapshots for a fixed
+# five-minute session-clock TTL (Requirements). SessionState has no timer
+# source, so pruning is lazy: a record is excluded from the projection once
+# its age is >= this TTL, never removed by a background timer.
+WORK_STATUS_TTL_SECONDS = 5 * 60.0
 
 _TERMINAL = {
     DeliveryState.DELIVERY_COMPLETED,
@@ -51,6 +61,27 @@ class StateEvent:
     payload: dict[str, Any]
 
 
+class WorkStatusKey(NamedTuple):
+    """Identity of one client-visible parent work-status record.
+
+    ``parent_key`` is the delegated-child grouping key -- the parent
+    ``work_item_id`` for a mixed multi-intent turn, or the sole
+    ``work_item_id`` for a single-delegation turn. Only delegated children
+    ever allocate a key; direct/unsupported/clarify/declined outcomes never
+    hold a delegated parent status open (Requirements).
+    """
+
+    origin_epoch: int | None
+    turn_id: str
+    parent_key: str
+
+
+@dataclass
+class _WorkStatusRecord:
+    status: WorkStatus
+    terminal_at: float | None = None
+
+
 class SessionState:
     """The single source of truth projected to each active connection."""
 
@@ -68,6 +99,14 @@ class SessionState:
         self.active_epoch: int | None = None
         self._speech_history: dict[str, list[SpeechProgress]] = {}
         self._listeners: list[Callable[[StateEvent], Any]] = []
+        # Phase 3 work-status ledger. Children are keyed per delegated work
+        # item; the parent ledger holds the one client-visible aggregate per
+        # WorkStatusKey. Both hold the per-key event_sequence independently
+        # of the global SessionState sequence (Requirements/Sequence
+        # namespaces).
+        self._work_status_children: dict[WorkStatusKey, dict[str, WorkStatus]] = {}
+        self._work_status_parents: dict[WorkStatusKey, _WorkStatusRecord] = {}
+        self._work_status_sequence: dict[WorkStatusKey, int] = {}
 
     @property
     def events(self) -> tuple[StateEvent, ...]:
@@ -233,6 +272,107 @@ class SessionState:
     def speech_history(self, utterance_id: str) -> tuple[SpeechProgress, ...]:
         return tuple(self._speech_history.get(utterance_id, ()))
 
+    # -- Phase 3: progressive work status --------------------------------
+
+    def set_child_work_status(
+        self,
+        *,
+        turn_id: str,
+        work_item_id: str,
+        parent_work_item_id: str | None = None,
+        worker_id: str | None = None,
+        state: str,
+        origin_epoch: int | None,
+        terminal_reason: str | None = None,
+    ) -> StateEvent | None:
+        """Record one delegated child's status and re-emit the parent aggregate.
+
+        Only delegated children participate in the client-visible parent
+        ledger. The parent join is exhaustive: routing while any child is
+        routing; searching while any child is searching and none routing;
+        background once no child is active but at least one remains
+        retained; and, once every child is terminal, failed wins over
+        cancelled (all-cancelled) which wins over result_ready (Requirements).
+        """
+        key = WorkStatusKey(origin_epoch, turn_id, parent_work_item_id or work_item_id)
+        children = self._work_status_children.setdefault(key, {})
+        previous_child = children.get(work_item_id)
+        if previous_child is not None and not legal_work_status_transition(
+            previous_child.state, state
+        ):
+            return None
+        children[work_item_id] = WorkStatus(
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            worker_id=worker_id,
+            state=state,
+            event_sequence=0,
+            terminal_reason=terminal_reason,
+            origin_epoch=origin_epoch,
+        )
+        return self._reaggregate_parent(key)
+
+    def _reaggregate_parent(self, key: WorkStatusKey) -> StateEvent | None:
+        children = list(self._work_status_children.get(key, {}).values())
+        if not children:
+            return None
+        parent_state, parent_reason = self._aggregate(children)
+        record = self._work_status_parents.get(key)
+        if record is not None and record.status.state == parent_state:
+            return None
+        # The parent's "state" is a pure recomputation over the current child
+        # set on every call, not a step in its own forward state machine, so
+        # legal_work_status_transition (built for one entity's sequential
+        # progression) does not apply here. The only invariant to preserve is
+        # that a terminal parent state never regresses.
+        if record is not None and record.status.state in WORK_STATUS_TERMINAL:
+            return None
+        next_sequence = self._work_status_sequence.get(key, 0) + 1
+        self._work_status_sequence[key] = next_sequence
+        status = WorkStatus(
+            turn_id=key.turn_id,
+            work_item_id=key.parent_key,
+            worker_id=None,
+            state=parent_state,
+            event_sequence=next_sequence,
+            terminal_reason=parent_reason,
+            origin_epoch=key.origin_epoch,
+        )
+        terminal_at = time.monotonic() if parent_state in WORK_STATUS_TERMINAL else None
+        self._work_status_parents[key] = _WorkStatusRecord(status=status, terminal_at=terminal_at)
+        return self._emit("work_status", status.model_dump(mode="json"))
+
+    @staticmethod
+    def _aggregate(children: list[WorkStatus]) -> tuple[str, str | None]:
+        if any(child.state == "routing" for child in children):
+            return "routing", None
+        if any(child.state == "searching" for child in children):
+            return "searching", None
+        if any(child.state not in WORK_STATUS_TERMINAL for child in children):
+            return "background", None
+        failed = [child for child in children if child.state == "failed"]
+        if failed:
+            reason = next(
+                (child.terminal_reason for child in failed if child.terminal_reason), None
+            )
+            return "failed", reason
+        if all(child.state == "cancelled" for child in children):
+            return "cancelled", None
+        return "result_ready", None
+
+    def work_status_snapshot(self) -> tuple[WorkStatus, ...]:
+        """Return live parent work-status records, pruning expired terminals."""
+        now = time.monotonic()
+        live: list[WorkStatus] = []
+        for record in self._work_status_parents.values():
+            if (
+                record.terminal_at is not None
+                and (now - record.terminal_at) >= WORK_STATUS_TTL_SECONDS
+            ):
+                continue
+            live.append(record.status)
+        return tuple(live)
+
     @classmethod
     def from_snapshot(cls, snapshot: RuntimeSnapshot) -> SessionState:
         state = cls(snapshot.session_id)
@@ -248,7 +388,9 @@ class SessionState:
         state.transcript.extend(snapshot.transcript)
         return state
 
-    def snapshot(self, origin_epoch: int | None = None) -> RuntimeSnapshot:
+    def snapshot(
+        self, origin_epoch: int | None = None, *, include_work_status: bool = False
+    ) -> RuntimeSnapshot:
         return RuntimeSnapshot(
             contract_version="v1.0",
             session_id=self.session_id,
@@ -259,4 +401,5 @@ class SessionState:
             routing=self.routing,
             transcript=list(self.transcript),
             origin_epoch=origin_epoch,
+            work_status=list(self.work_status_snapshot()) if include_work_status else [],
         )

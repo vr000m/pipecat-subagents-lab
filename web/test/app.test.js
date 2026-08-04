@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { createApp } from "../src/app.js";
+
+const appEntrySource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8");
 
 class Element {
   constructor() { this.children = []; this.innerHTML = ""; this.disabled = false; this.hidden = false; }
@@ -340,4 +343,19 @@ test("onServerMessage rejects unsupported contracts before applying state", () =
     });
     expect(app.getState().lastAppliedSequence).toBe(2);
   });
+});
+
+// --- Phase 3: capability advertisement on the connection URL --------------
+//
+// Plan bullet 223 step (4): "advertise work_status_v1 from the browser only
+// after the server carrier/storage/observer path is live." The canonical
+// encoding (bullet 224) is one URL-encoded JSON array of strings in a
+// single `capabilities` query parameter, emitted by URLSearchParams as
+// JSON.stringify([...]) -- i.e. url.searchParams.set("capabilities",
+// JSON.stringify([...])), matching the existing per-field loop at
+// web/src/app.js:179 that already builds this same connection URL.
+
+test("browser entrypoint advertises the work_status_v1 capability on the connection URL", () => {
+  expect(appEntrySource).toContain("work_status_v1");
+  expect(appEntrySource).toMatch(/searchParams\.set\(\s*["']capabilities["']/);
 });

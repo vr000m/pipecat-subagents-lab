@@ -79,3 +79,43 @@ def test_client_arbiter_fences_input_snapshot_and_callbacks_after_replacement() 
     assert not arbiter.snapshot_allowed(old.client_id, old.epoch)
     assert not arbiter.accepts_callback(old.epoch)
     assert arbiter.replacement_interruptions() == ((1, "interrupted_by_reconnect"),)
+
+
+# --- Phase 3: capabilities bound immutably to the promoted connection -----
+
+
+def test_promote_stores_normalized_capabilities_on_the_promoted_connection() -> None:
+    arbiter = ConnectionArbiter(session_id="session-1", resume_token="resume-1")
+
+    connection = arbiter.promote(
+        {**handshake(1), "capabilities": ("work_status_v1",), "capabilities_present": True}
+    )
+
+    assert connection.capabilities == ("work_status_v1",)
+
+
+def test_promote_without_capabilities_field_normalizes_to_empty_unsupported_set() -> None:
+    arbiter = ConnectionArbiter(session_id="session-1", resume_token="resume-1")
+
+    connection = arbiter.promote(handshake(1))
+
+    assert connection.capabilities == ()
+
+
+def test_same_client_epoch_capabilities_survive_promote_across_patch_style_reinvocation() -> None:
+    """server/connection_arbiter.py:promote() is the live path SessionHost.connect()
+    passes the validated SnapshotHandshake through; capabilities normalized at
+    POST time must still be readable from the same promoted Connection later
+    (e.g. when server/app.py validates a PATCH against the bound set)."""
+    arbiter = ConnectionArbiter(session_id="session-1", resume_token="resume-1")
+
+    connection = arbiter.promote(
+        {
+            **handshake(1),
+            "capabilities": ("work_status_v1", "work_status_v1"),
+            "capabilities_present": True,
+        }
+    )
+
+    assert arbiter.active is connection
+    assert arbiter.active.capabilities == ("work_status_v1",)

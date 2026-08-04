@@ -191,6 +191,10 @@ class RuntimeSnapshot(StrictModel):
     routing: RoutingState | None = None
     transcript: list[TranscriptEntry] = Field(default_factory=list)
     origin_epoch: int | None = Field(default=None, ge=0)
+    # Present only for connections that negotiated the work_status_v1
+    # capability; non-capable projections omit this field entirely rather
+    # than serializing an empty list (see server/session_state.py).
+    work_status: list[WorkStatus] = Field(default_factory=list)
     _highest_by_session: ClassVar[dict[str, int]] = {}
 
     @classmethod
@@ -237,12 +241,74 @@ class InterruptionEvent(StrictModel):
     origin_epoch: int | None = Field(default=None, ge=0)
 
 
+WORK_STATUS_STATES = (
+    "routing",
+    "searching",
+    "background",
+    "result_ready",
+    "failed",
+    "cancelled",
+)
+WorkStatusState = Literal[
+    "routing", "searching", "background", "result_ready", "failed", "cancelled"
+]
+TerminalReason = Literal["missing_worker", "retention_rejected"]
+_WORK_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
+    "routing": frozenset({"searching", "failed", "cancelled"}),
+    "searching": frozenset({"background", "result_ready", "failed", "cancelled"}),
+    "background": frozenset({"result_ready", "failed", "cancelled"}),
+    "result_ready": frozenset(),
+    "failed": frozenset(),
+    "cancelled": frozenset(),
+}
+WORK_STATUS_TERMINAL = frozenset({"result_ready", "failed", "cancelled"})
+
+
+def legal_work_status_transition(previous: str | None, state: str) -> bool:
+    """Return whether ``state`` may legally follow ``previous`` (or start cold)."""
+    if previous is None:
+        return state in {"routing", "searching", "background", "result_ready"}
+    if previous == state:
+        return False
+    return state in _WORK_STATUS_TRANSITIONS.get(previous, frozenset())
+
+
+class WorkStatus(StrictModel):
+    turn_id: str = Field(min_length=1)
+    work_item_id: str | None = None
+    worker_id: str | None = None
+    state: WorkStatusState
+    event_sequence: int = Field(ge=0)
+    terminal_reason: TerminalReason | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_terminal_reason(self) -> WorkStatus:
+        if self.terminal_reason is not None and self.state != "failed":
+            raise ValueError("terminal_reason may only be set for the failed state")
+        return self
+
+
 class SnapshotHandshake(StrictModel):
     contract_version: str = CONTRACT_VERSION
     session_id: str
     resume_token: str
     proposed_epoch: int = Field(ge=0)
     snapshot_sequence: int = Field(ge=0)
+    # Capability negotiation (Phase 3): a normalized, deduplicated, lexically
+    # sorted set of capability names the browser declares support for.
+    # ``capabilities_present`` distinguishes an explicitly-empty/all-unknown
+    # array from omission, so PATCH inheritance-vs-mismatch can be decided
+    # without conflating the two (see SessionHost.validate_patch_handshake).
+    capabilities: tuple[str, ...] = ()
+    capabilities_present: bool = False
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not isinstance(item, str) or not item for item in value):
+            raise ValueError("capabilities must be non-empty strings")
+        return tuple(sorted(set(value)))
 
 
 def validate_contract(value: Any) -> Any:

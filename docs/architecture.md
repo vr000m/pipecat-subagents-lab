@@ -124,6 +124,42 @@ speech after a newer epoch has accepted work. Reconnect rebuilds browser state
 from the process-lifetime snapshot and then resumes sequenced incremental
 messages.
 
+## Progressive work status (v0.1.3 Phase 3)
+
+Capability negotiation is carried by `SnapshotHandshake.capabilities`: one
+URL-encoded JSON array of capability names on both the `POST /api/rtc` offer
+and the `PATCH /api/rtc` ICE-candidate request, normalized (deduplicated,
+lexically sorted) and bound immutably to the promoted `Connection`/
+`ConnectionPipeline` for the life of that epoch. `SessionHost
+.validate_patch_handshake()` enforces that a PATCH either omits the field
+(inheriting the POST-bound set) or repeats it exactly; a mismatch is
+rejected without mutating entitlement.
+
+`SessionState` owns a `WorkStatusKey`-indexed ledger (`(origin_epoch,
+turn_id, parent work item)`) separate from its global emission sequence.
+Only delegated (`existing_worker`/`new_worker`) children participate;
+`SessionHost._emit_work_status()` records each child transition
+(`routing`/`searching`/`background`/`result_ready`/`failed`/`cancelled`),
+and `SessionState._reaggregate_parent()` recomputes the one client-visible
+parent record per the exhaustive aggregation rule described in
+`shared/protocol.md`. Terminal records carry their original `origin_epoch`
+and are pruned lazily (TTL check at projection time), never by a timer.
+
+`RuntimeObserver` is the sole owner of per-connection entitlement filtering
+and the projected incremental envelope sequence, seeded from the snapshot
+watermark at subscribe time; it emits typed dicts, never framework frames.
+`server/app.py`'s `emit_frame` adapter hands each typed event to
+`RTVIMessagePublisher.incremental()`, which validates and serializes the
+supplied sequence without allocating a second counter, then wraps the result
+in `RTVIServerMessageFrame`. Non-capable connections never receive
+`work_status` frames and their runtime snapshots omit the `work_status` key
+entirely (field absent, not an empty array), preserving compatibility with
+the pinned pre-Phase-3 `runtime-snapshot` schema fixture in
+`tests/fixtures/runtime-snapshot-v1.0-as-shipped.json`. The
+`enable_background_status` `FeaturePolicy` switch (default on) gates
+emission server-side regardless of client capability; when off, the legacy
+foreground-timeout notice applies universally.
+
 ## Provider boundaries
 
 - Local speech uses the configured Nemotron websocket STT service and Pocket

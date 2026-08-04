@@ -153,10 +153,27 @@ class SpeechGenerationFlushAckFrame(SystemFrame):
     token: str = ""
 
 
+@dataclass
+class SnapshotBarrierFlushFrame(SystemFrame):
+    """Serialized-writer barrier ordering the Phase 3 snapshot handoff.
+
+    Carries only a connection-generation/token and an acknowledgement
+    handle; `server/app.py` is its sole consumer, resolving the handle only
+    after every earlier queued worker frame has drained so no incremental
+    RTVI event can reach the network ahead of the installed snapshot
+    watermark. It is never an RTVI payload and must never cross a bus
+    bridge, hence its membership in `CONNECTION_LOCAL_FRAMES` below.
+    """
+
+    token: str = ""
+    acknowledge: Any = None
+
+
 CONNECTION_LOCAL_FRAMES: tuple[type[Frame], ...] = (
     TTSSpeakFrame,
     SpeechGenerationMarkerFrame,
     SpeechGenerationFlushAckFrame,
+    SnapshotBarrierFlushFrame,
 )
 """Frame types that must never cross WorkerBus.
 

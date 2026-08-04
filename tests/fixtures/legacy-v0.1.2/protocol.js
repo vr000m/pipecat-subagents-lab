@@ -12,24 +12,10 @@ export const RTVI_MESSAGE_KINDS = Object.freeze([
   "routing",
   "user_transcript",
   "bot_transcript",
-  "work_status",
 ]);
 const runtimeKinds = new Set(RTVI_MESSAGE_KINDS);
 const groundedResultKeys = Object.freeze(Object.keys(groundedResultSchema.properties));
-// "work_status" is the one optional runtime-snapshot key: non-capable
-// projections omit it entirely (field absent, not an empty array), so the
-// exact-key check below treats it separately rather than requiring it.
-const runtimeSnapshotKeys = Object.freeze(
-  Object.keys(runtimeSnapshotSchema.properties).filter((key) => key !== "work_status"),
-);
-const workStatusStates = new Set([
-  "routing",
-  "searching",
-  "background",
-  "result_ready",
-  "failed",
-  "cancelled",
-]);
+const runtimeSnapshotKeys = Object.freeze(Object.keys(runtimeSnapshotSchema.properties));
 const deliveryStates = new Set([
   "displayed",
   "queued",
@@ -138,19 +124,6 @@ function validTranscript(value) {
     Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
 }
 
-function validWorkStatus(value) {
-  const keys = ["turn_id", "work_item_id", "worker_id", "state", "event_sequence", "terminal_reason", "origin_epoch"];
-  if (!value || typeof value !== "object" || Object.keys(value).some((key) => !keys.includes(key))) return false;
-  const optionalString = (item) => item === null || typeof item === "string";
-  if (typeof value.turn_id !== "string" || value.turn_id.length === 0) return false;
-  if (!optionalString(value.work_item_id) || !optionalString(value.worker_id)) return false;
-  if (!workStatusStates.has(value.state)) return false;
-  if (!Number.isInteger(value.event_sequence) || value.event_sequence < 0) return false;
-  if (value.terminal_reason !== null && !["missing_worker", "retention_rejected"].includes(value.terminal_reason)) return false;
-  if (value.terminal_reason !== null && value.state !== "failed") return false;
-  return Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
-}
-
 export function validateServerMessage(message) {
   if (!message || typeof message !== "object" || typeof message.kind !== "string") return false;
   const envelopeKeys = ["contract_version", "session_id", "sequence", "kind", "data", "origin_epoch"];
@@ -167,22 +140,13 @@ export function validateServerMessage(message) {
   if (message.kind === "speech_progress" && !validSpeech(data)) return false;
   if (message.kind === "worker" && !validWorker(data)) return false;
   if (message.kind === "routing" && !validRouting(data)) return false;
-  if (message.kind === "work_status" && !validWorkStatus(data)) return false;
   if (["user_transcript", "bot_transcript"].includes(message.kind)) {
     if (!validTranscript(data)) return false;
     if (message.kind === "user_transcript" && data.role !== "user") return false;
     if (message.kind === "bot_transcript" && data.role !== "assistant") return false;
   }
   if (message.kind === "runtime_snapshot") {
-    const extraKeys = Object.keys(data).filter(
-      (key) => !runtimeSnapshotKeys.includes(key) && key !== "work_status",
-    );
-    if (extraKeys.length > 0 || !runtimeSnapshotKeys.every((key) => Object.hasOwn(data, key))) {
-      return false;
-    }
-    if (Object.hasOwn(data, "work_status")) {
-      if (!Array.isArray(data.work_status) || !data.work_status.every(validWorkStatus)) return false;
-    }
+    if (!hasExactKeys(data, runtimeSnapshotKeys)) return false;
     if (typeof data.session_id !== "string" || data.session_id.length === 0) return false;
     if (message.session_id !== data.session_id) return false;
     if (data.contract_version !== CONTRACT_VERSION || !validOrigin(data.origin_epoch)) return false;

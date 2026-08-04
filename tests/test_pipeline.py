@@ -38,6 +38,7 @@ from server.registry import UnsupportedWorkerType
 from server.services.tts import CorrelatedTTSSpeakFrame
 from server.speech_lifecycle import (
     CONNECTION_LOCAL_FRAMES,
+    SnapshotBarrierFlushFrame,
     SpeechGenerationFlushAckFrame,
     SpeechGenerationMarkerFrame,
 )
@@ -652,10 +653,16 @@ def test_completed_turn_projects_routing_transcript_and_real_worker_state() -> N
             "user_transcript",
             "routing",
             "worker",
+            "work_status",
+            "work_status",
+            "work_status",
             "bot_transcript",
             "result",
             "worker",
         ]
+        assert [
+            event.payload["state"] for event in host.state.events if event.kind == "work_status"
+        ] == ["routing", "searching", "result_ready"]
         await host.shutdown()
 
     asyncio.run(run())
@@ -2328,6 +2335,7 @@ def test_framework_bridge_keeps_speech_on_connection_pipeline() -> None:
         TTSSpeakFrame: lambda: TTSSpeakFrame(text="hello", append_to_context=False),
         SpeechGenerationMarkerFrame: lambda: SpeechGenerationMarkerFrame(token="t"),
         SpeechGenerationFlushAckFrame: lambda: SpeechGenerationFlushAckFrame(token="t"),
+        SnapshotBarrierFlushFrame: lambda: SnapshotBarrierFlushFrame(token="t"),
     }
     assert set(CONNECTION_LOCAL_FRAMES) == set(factories)
 

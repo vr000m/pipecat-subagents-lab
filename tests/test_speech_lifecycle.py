@@ -23,10 +23,12 @@ import asyncio
 import pytest
 
 from server.speech_lifecycle import (
+    CONNECTION_LOCAL_FRAMES,
     DeliveryDisposition,
     GenerationIdentity,
     GenerationPhase,
     ManualTimerScheduler,
+    SnapshotBarrierFlushFrame,
     SpeechLifecycleCoordinator,
 )
 
@@ -1465,3 +1467,26 @@ def test_dispatch_callbacks_are_no_ops_when_constructed_without_tts() -> None:
     coordinator, _clock = make_coordinator(tts_available=False)
 
     assert coordinator.occupied is False
+
+
+# --- Phase 3: SnapshotBarrierFlushFrame registration and shape ------------
+
+
+def test_snapshot_barrier_flush_frame_is_registered_in_connection_local_frames() -> None:
+    """It must never cross a bus bridge -- BusBridgeProcessor forwards a
+    frame locally only if its type is listed in CONNECTION_LOCAL_FRAMES."""
+    assert SnapshotBarrierFlushFrame in CONNECTION_LOCAL_FRAMES
+
+
+def test_snapshot_barrier_flush_frame_carries_only_token_and_acknowledge_handle() -> None:
+    frame = SnapshotBarrierFlushFrame(token="connection-generation-1", acknowledge=lambda: None)
+
+    assert frame.token == "connection-generation-1"
+    assert callable(frame.acknowledge)
+
+
+def test_snapshot_barrier_flush_frame_defaults_are_empty_token_and_no_handle() -> None:
+    frame = SnapshotBarrierFlushFrame()
+
+    assert frame.token == ""
+    assert frame.acknowledge is None

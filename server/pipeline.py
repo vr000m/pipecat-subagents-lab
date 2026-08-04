@@ -285,6 +285,13 @@ class ConnectionPipeline:
     output_teardown: Callable[[], Any] | None = None
     on_transcript: Callable[[str], Any] | None = None
     active: bool = True
+    # Normalized capability set bound immutably to this connection's promoted
+    # epoch (Phase 3); mirrors ConnectionArbiter's Connection.capabilities.
+    capabilities: tuple[str, ...] = ()
+
+    @property
+    def supports_work_status(self) -> bool:
+        return "work_status_v1" in self.capabilities
 
     def deactivate(self, *, reconnect: bool = True) -> None:
         self.active = False
@@ -644,7 +651,7 @@ class SessionHost:
 
         pipeline = ConnectionPipeline(
             connection.epoch,
-            RuntimeObserver(self.state, connection.epoch),
+            RuntimeObserver(self.state, connection.epoch, connection.capabilities),
             SpeechScheduler(
                 self.state,
                 speak=queue_speech if connection_tts is not None else None,
@@ -655,6 +662,7 @@ class SessionHost:
             lifecycle=lifecycle,
             stt=connection_stt,
             tts=connection_tts,
+            capabilities=connection.capabilities,
         )
         if connection_stt is not None and self.coordinator is not None:
 
@@ -818,6 +826,22 @@ class SessionHost:
             self._handshake_tokens[token] = (epoch, expires_at, True)
             return True
         return redeemed
+
+    def validate_patch_handshake(self, connection: Any, handshake: Any) -> None:
+        """Enforce immutable capability binding for a PATCH ICE-candidate request.
+
+        An omitted ``capabilities`` field inherits the POST-bound set; a
+        present field must match it exactly (post-normalization) or the
+        request is rejected. Neither branch mutates ``connection`` or its
+        already-constructed ``RuntimeObserver``: capability entitlement is
+        immutable for the life of a promoted epoch (Requirements).
+        """
+        if not getattr(handshake, "capabilities_present", False):
+            return
+        bound = frozenset(getattr(connection, "capabilities", ()))
+        presented = frozenset(getattr(handshake, "capabilities", ()))
+        if presented != bound:
+            raise ValueError("capabilities cannot change after connection promotion")
 
     def abort_connection(self, pipeline: ConnectionPipeline) -> None:
         """Fence a promoted connection whose transport setup did not complete."""
@@ -1185,6 +1209,13 @@ class SessionHost:
                 child = turn_recorder.new_child(work_item_id=work_item_id)
                 child.finalize(outcome="missing_worker")
                 turn_recorder.finalize(outcome="failed")
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    state="failed",
+                    origin_epoch=origin_epoch,
+                    terminal_reason="missing_worker",
+                )
                 return outcome
             self._project_worker(worker, origin_epoch=origin_epoch, status="running")
             search = getattr(worker, "search", None)
@@ -1193,12 +1224,33 @@ class SessionHost:
                 child = turn_recorder.new_child(work_item_id=work_item_id)
                 child.finalize(outcome="missing_search", app_worker_id=worker_id)
                 turn_recorder.finalize(outcome="failed")
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state="failed",
+                    origin_epoch=origin_epoch,
+                )
                 return outcome
             child = turn_recorder.new_child(work_item_id=work_item_id)
+            self._emit_work_status(
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                worker_id=worker_id,
+                state="routing",
+                origin_epoch=origin_epoch,
+            )
             try:
                 search_started = time.perf_counter()
                 search_task = self._dispatch_search_task(
                     search, transcript, turn_id=turn_id, origin_epoch=origin_epoch
+                )
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state="searching",
+                    origin_epoch=origin_epoch,
                 )
                 # Dispatch before the ack: a search that resolves within the
                 # same tick (no real delegation latency) never gets an ack at
@@ -1234,6 +1286,21 @@ class SessionHost:
                     result = execution.result
                     child_outcome_label = "completed"
                 elif execution.status == "retained":
+                    if origin.supports_work_status and self.feature_policy.enable_background_status:
+                        # Phase 3 capability-gated path: retain the work item
+                        # and emit the truthful `background` wire event
+                        # instead of a second canonical timeout result or
+                        # transcript/history entry (Requirements).
+                        self._emit_work_status(
+                            turn_id=turn_id,
+                            work_item_id=work_item_id,
+                            worker_id=worker_id,
+                            state="background",
+                            origin_epoch=origin_epoch,
+                        )
+                        child.finalize(outcome="retained", app_worker_id=worker_id)
+                        turn_recorder.finalize()
+                        return execution
                     result = canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
@@ -1289,6 +1356,36 @@ class SessionHost:
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
+            if child_outcome_label not in {"clarify", "declined"}:
+                if was_cancelled:
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state="cancelled",
+                        origin_epoch=origin_epoch,
+                    )
+                elif child_outcome_label == "completed":
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state="result_ready",
+                        origin_epoch=origin_epoch,
+                    )
+                else:
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state="failed",
+                        origin_epoch=origin_epoch,
+                        terminal_reason=(
+                            "retention_rejected"
+                            if child_outcome_label == "retention_rejected"
+                            else None
+                        ),
+                    )
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             commit_ms = (time.perf_counter() - commit_started) * 1000
             child.finalize(
@@ -2147,6 +2244,30 @@ class SessionHost:
                     delivery_disposition=delivery_disposition,
                     result_id=result_id,
                 )
+            if work_outcome == "completed" and commit_outcome == "committed":
+                self._emit_work_status(
+                    turn_id=context.turn_id,
+                    work_item_id=context.work_item_id,
+                    state="result_ready",
+                    origin_epoch=origin_epoch,
+                )
+            elif work_outcome == "cancelled":
+                self._emit_work_status(
+                    turn_id=context.turn_id,
+                    work_item_id=context.work_item_id,
+                    state="cancelled",
+                    origin_epoch=origin_epoch,
+                )
+            elif work_outcome is not None:
+                self._emit_work_status(
+                    turn_id=context.turn_id,
+                    work_item_id=context.work_item_id,
+                    state="failed",
+                    origin_epoch=origin_epoch,
+                    terminal_reason=(
+                        "retention_rejected" if late.terminal_kind == "retention_rejected" else None
+                    ),
+                )
         if pending_exception is not None:
             raise pending_exception
 
@@ -2344,6 +2465,36 @@ class SessionHost:
                 ),
                 origin_epoch=origin_epoch,
             )
+        )
+
+    def _emit_work_status(
+        self,
+        *,
+        turn_id: str,
+        work_item_id: str,
+        parent_work_item_id: str | None = None,
+        worker_id: str | None = None,
+        state: str,
+        origin_epoch: int,
+        terminal_reason: str | None = None,
+    ) -> None:
+        """Record one delegated child's coarse status (Phase 3).
+
+        A no-op unless ``enable_background_status`` is on; the wire
+        emission itself is further capability-gated per connection inside
+        the observer, so this call site does not need to branch on client
+        capability -- only on whether the feature is enabled at all.
+        """
+        if not self.feature_policy.enable_background_status:
+            return
+        self.state.set_child_work_status(
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            parent_work_item_id=parent_work_item_id,
+            worker_id=worker_id,
+            state=state,
+            origin_epoch=origin_epoch,
+            terminal_reason=terminal_reason,
         )
 
     def accepts(self, epoch: int | None) -> bool:
