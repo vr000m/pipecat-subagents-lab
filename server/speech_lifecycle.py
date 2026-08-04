@@ -527,7 +527,7 @@ class SpeechLifecycleCoordinator:
         token = generation.token
         try:
             await self._call(self._dispatch_cleanup, token, generation.identity)
-        except Exception:
+        except Exception:  # noqa: BLE001 - any dispatch failure falls back to teardown
             await self._request_teardown(token)
             return
         current = self._generations.get(token)
@@ -562,7 +562,7 @@ class SpeechLifecycleCoordinator:
         self._cancel_timer(token)
         try:
             await self._call(self._dispatch_teardown, token, generation.identity)
-        except Exception:
+        except Exception:  # noqa: BLE001 - fail closed regardless of dispatch failure mode
             # Fail closed. The slot remains occupied unless the connection
             # owner later reports teardown_complete().
             return
@@ -667,9 +667,10 @@ class TransportSpeechLifecycleProcessor(FrameProcessor):
             if isinstance(frame, TTSStartedFrame):
                 if not frame.context_id:
                     return
-                if self._pending_token is not None:
-                    if self._coordinator.bind_context(self._pending_token, frame.context_id):
-                        self._pending_token = None
+                if self._pending_token is not None and self._coordinator.bind_context(
+                    self._pending_token, frame.context_id
+                ):
+                    self._pending_token = None
                 if not self._coordinator.on_tts_started(frame.context_id):
                     return
             elif isinstance(frame, TTSAudioRawFrame):

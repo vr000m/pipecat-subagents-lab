@@ -721,6 +721,7 @@ assert handler_id in logger._core.handlers
             cwd=Path(__file__).resolve().parents[1],
             capture_output=True,
             text=True,
+            check=False,
         )
 
         assert result.returncode == 0, result.stderr

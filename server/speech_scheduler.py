@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import uuid4
 
+from loguru import logger
+
 from .contracts import DeliveryState
 from .session_state import SessionState
 from .speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
@@ -152,11 +154,10 @@ class SpeechScheduler:
             if self.lifecycle is not None and generation is not None:
                 try:
                     await self.lifecycle.provider_error(generation.token)
-                except BaseException:
-                    # Preserve the original submission failure. The lifecycle
-                    # retains admission until its correlated flush barrier or
-                    # connection teardown completes.
-                    pass
+                except BaseException:  # noqa: BLE001 - preserve the original submission failure below
+                    logger.opt(exception=True).debug(
+                        "lifecycle.provider_error failed while handling submission failure"
+                    )
             self._release(item.utterance_id)
             raise
         return item

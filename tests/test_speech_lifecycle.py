@@ -234,7 +234,7 @@ def test_teardown_complete_releases_the_slot_after_output_submitted_expiry() -> 
 
 def test_fieldless_transport_stopped_is_the_normal_slot_release() -> None:
     async def body() -> None:
-        coordinator, clock = make_coordinator()
+        coordinator, _clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
         coordinator.bind_context(generation.token, "utt-1")
         coordinator.on_tts_started("utt-1")
