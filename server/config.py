@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from ipaddress import ip_address
@@ -67,6 +68,10 @@ class Config:
     bind_host: str = "127.0.0.1"
     bind_port: int = 7860
     known_client_url: str = "http://127.0.0.1:7860"
+    enable_early_ack: bool = True
+    enable_background_status: bool = True
+    enable_autoplay_policy: bool = True
+    early_ack_text: str = "One moment while I look into that."
 
     def __post_init__(self) -> None:
         if self.max_work_items_per_turn not in (2, 3, 4):
@@ -130,6 +135,8 @@ class Config:
             raise ConfigError("tts_model must not be empty")
         if not self.tts_voice_id.strip():
             raise ConfigError("tts_voice_id must not be empty")
+        if not self.early_ack_text.strip():
+            raise ConfigError("early_ack_text must not be empty")
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
         object.__setattr__(self, "worker_model_policy", _models(self.worker_model_policy))
 
@@ -149,6 +156,57 @@ class Config:
         if service not in {"stt", "tts"}:
             raise ConfigError(f"unknown service: {service}")
         return replace(self, **{f"{service}_endpoint": (transport, address)})
+
+
+_feature_policy_cache: dict[int, FeaturePolicy] = {}
+
+
+@dataclass(frozen=True)
+class FeaturePolicy:
+    """Immutable v0.1.3 kill-switch snapshot, resolved once from a `Config`.
+
+    `SessionHost` owns/injects one instance per host; connection pipelines,
+    observers, and policy evaluators consume this same object rather than
+    re-reading `Config` independently.
+    """
+
+    enable_early_ack: bool = True
+    enable_background_status: bool = True
+    enable_autoplay_policy: bool = True
+
+    @classmethod
+    def from_config(cls, config: Config) -> FeaturePolicy:
+        """Resolve once per `Config` identity.
+
+        Repeated calls with the *same* `Config` object return the identical
+        cached `FeaturePolicy` instance -- callers may compare with ``is``.
+        A different `Config` instance (even with equal field values) always
+        resolves independently. The cache entry is freed automatically when
+        its `Config` is garbage collected.
+        """
+        key = id(config)
+        cached = _feature_policy_cache.get(key)
+        if cached is not None:
+            return cached
+        policy = cls(
+            enable_early_ack=config.enable_early_ack,
+            enable_background_status=config.enable_background_status,
+            enable_autoplay_policy=config.enable_autoplay_policy,
+        )
+        _feature_policy_cache[key] = policy
+        weakref.finalize(config, _feature_policy_cache.pop, key, None)
+        return policy
+
+
+def _parse_strict_bool(raw: object, *, field: str) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    raise ConfigError(f"{field} must be 'true' or 'false'")
 
 
 def load_config(
@@ -264,6 +322,15 @@ def load_config(
             raise ConfigError("WEBSEARCH_BIND_PORT must be an integer") from exc
     if "WEBSEARCH_KNOWN_CLIENT_URL" in values:
         kwargs["known_client_url"] = values["WEBSEARCH_KNOWN_CLIENT_URL"]
+    for env_name, field_name in (
+        ("WEBSEARCH_ENABLE_EARLY_ACK", "enable_early_ack"),
+        ("WEBSEARCH_ENABLE_BACKGROUND_STATUS", "enable_background_status"),
+        ("WEBSEARCH_ENABLE_AUTOPLAY_POLICY", "enable_autoplay_policy"),
+    ):
+        if env_name in values:
+            kwargs[field_name] = _parse_strict_bool(values[env_name], field=env_name)
+    if raw := values.get("WEBSEARCH_EARLY_ACK_TEXT"):
+        kwargs["early_ack_text"] = str(raw)
     if raw := values.get("WEBSEARCH_OPENAI_API_KEY_ENV"):
         kwargs["openai_api_key_env"] = raw
     if raw := values.get("WEBSEARCH_ROUTER_MODEL"):
@@ -304,8 +371,16 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
     tts = document.get("tts", {})
     turn = document.get("turn", {})
     models = document.get("models", {})
-    if not all(isinstance(section, Mapping) for section in (stt, tts, turn, models)):
-        raise ConfigError("[stt], [tts], [turn], and [models] config sections must be tables")
+    features = document.get("features", {})
+    if not all(isinstance(section, Mapping) for section in (stt, tts, turn, models, features)):
+        raise ConfigError(
+            "[stt], [tts], [turn], [models], and [features] config sections must be tables"
+        )
+    for key in ("enable_early_ack", "enable_background_status", "enable_autoplay_policy"):
+        if key in features:
+            values[f"WEBSEARCH_{key.upper()}"] = features[key]
+    if "early_ack_text" in features:
+        values["WEBSEARCH_EARLY_ACK_TEXT"] = features["early_ack_text"]
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
     if "provider" in stt:

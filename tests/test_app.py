@@ -219,6 +219,43 @@ def test_injected_session_host_is_preserved() -> None:
     assert create_app(host).state.session_host is host
 
 
+def test_default_session_host_derives_one_feature_policy_from_the_loaded_config(
+    monkeypatch,
+) -> None:
+    """Plan: 'derive one frozen FeaturePolicy' from the immutable Config
+    constructed by ``_default_session_host()``, injected into SessionHost."""
+    from server.config import FeaturePolicy
+
+    monkeypatch.setattr(app_module, "load_config", lambda: Config(enable_early_ack=False))
+
+    host = app_module._default_session_host()
+
+    assert isinstance(host.feature_policy, FeaturePolicy)
+    assert host.feature_policy.enable_early_ack is False
+    assert host.feature_policy is FeaturePolicy.from_config(host.config)
+
+
+def test_create_app_does_not_resolve_a_second_policy_from_worker_registry_config(
+    monkeypatch,
+) -> None:
+    """Plan: 'create_app() must not resolve a second policy from
+    WorkerRegistry.config.' A custom injected host is authoritative; its
+    feature_policy must be unchanged by create_app()."""
+    from server.config import FeaturePolicy
+
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=Config(enable_autoplay_policy=False)),
+        config=Config(enable_autoplay_policy=False),
+        feature_policy=FeaturePolicy.from_config(Config(enable_autoplay_policy=False)),
+    )
+    original_policy = host.feature_policy
+
+    app = create_app(host)
+
+    assert app.state.session_host.feature_policy is original_policy
+
+
 def test_app_exposes_health_and_next_session_handshake() -> None:
     host = SessionHost(runner_factory=FakeRunner)
 

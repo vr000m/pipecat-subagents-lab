@@ -26,7 +26,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from pipecat.frames.frames import Frame, SystemFrame, TTSSpeakFrame
@@ -55,13 +55,54 @@ class DeliveryDisposition(str, Enum):
     DELIVERY_UNKNOWN = "delivery_unknown"
 
 
+GenerationRole = Literal["result", "ack"]
+
+
 @dataclass(frozen=True)
 class GenerationIdentity:
-    """The minimal identity a coordinator generation is admitted for."""
+    """The minimal identity a coordinator generation is admitted for.
+
+    Result identities carry ``role="result"``; ack identities carry
+    ``role="ack"`` plus ``ack_id`` and the owning ``turn_id``, so
+    pre-admission terminal records can derive ack/turn identity from typed
+    data rather than parsing the synthetic ``work_item_id``.
+    """
 
     utterance_id: str
     work_item_id: str
     origin_epoch: int | None = None
+    role: GenerationRole = "result"
+    turn_id: str | None = None
+    ack_id: str | None = None
+
+
+class PreAdmissionTerminalReason(str, Enum):
+    """Closed enum of pre-admission terminal dispositions.
+
+    A pre-admission terminal never allocates a transport token or timer;
+    it is decided before ``try_admit`` runs.
+    """
+
+    NO_TTS = "no_tts"
+    UNAVAILABLE_TRANSPORT = "unavailable_transport"
+
+
+@dataclass(frozen=True)
+class PreAdmissionAdmit:
+    """The identity may proceed to normal admission (`try_admit`)."""
+
+    generation: SpeechGeneration
+
+    @property
+    def admitted(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True)
+class PreAdmissionTerminal:
+    """The identity is terminal before admission; no transport token issued."""
+
+    reason: PreAdmissionTerminalReason
 
 
 @dataclass
@@ -227,6 +268,8 @@ class SpeechLifecycleCoordinator:
         dispatch_cleanup: CleanupCallback | None = None,
         dispatch_teardown: TeardownCallback | None = None,
         context_tombstone_limit: int = 256,
+        tts_available: bool = True,
+        transport_acceptance: Callable[[], bool] | None = None,
     ) -> None:
         self._clock = clock or MonotonicClock()
         self._timers = timers or EventLoopTimerScheduler()
@@ -236,6 +279,8 @@ class SpeechLifecycleCoordinator:
         self._dispatch_cleanup = dispatch_cleanup
         self._dispatch_teardown = dispatch_teardown
         self._context_tombstone_limit = max(context_tombstone_limit, 0)
+        self._tts_available = tts_available
+        self._transport_acceptance = transport_acceptance
 
         self._generations: dict[str, SpeechGeneration] = {}
         self._slot_token: str | None = None
@@ -271,6 +316,29 @@ class SpeechLifecycleCoordinator:
         self._generations[token] = generation
         self._slot_token = token
         return generation
+
+    def pre_admission_disposition(
+        self, identity: GenerationIdentity
+    ) -> PreAdmissionAdmit | PreAdmissionTerminal | None:
+        """Idempotent pre-admission check, run before any queue pop or
+        ``_active`` assignment.
+
+        Returns a closed-enum terminal disposition when no transport lane
+        exists at all (``no_tts``) or the injected transport-acceptance
+        predicate rejects the connection (``unavailable_transport``); a
+        ``Terminal`` result allocates no transport token, arms no timer, and
+        invokes no admitted-generation callback. Returns ``None`` when the
+        slot is merely occupied (retry later, not terminal). Otherwise
+        admits normally and returns ``PreAdmissionAdmit``.
+        """
+        if not self._tts_available:
+            return PreAdmissionTerminal(PreAdmissionTerminalReason.NO_TTS)
+        if self._transport_acceptance is not None and not self._transport_acceptance():
+            return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
+        generation = self.try_admit(identity)
+        if generation is None:
+            return None
+        return PreAdmissionAdmit(generation)
 
     def mark_handed_to_tts(self, token: str) -> None:
         generation = self._live(token)
@@ -399,12 +467,46 @@ class SpeechLifecycleCoordinator:
         if generation is None:
             return
         self._cancel_timer(token)
-        generation.disposition = (
-            DeliveryDisposition.PAUSED if pause else DeliveryDisposition.INTERRUPTED
-        )
+        disposition = DeliveryDisposition.PAUSED if pause else DeliveryDisposition.INTERRUPTED
+        generation.disposition = disposition
         generation.tombstoned = True
+        if generation.context_id is None:
+            # No TTS context was ever bound to this generation: no cleanup
+            # dispatch has anything to cancel and no flush-ack barrier can
+            # ever traverse it, so the slot frees immediately (synchronously,
+            # so callers with no running event loop still observe it) instead
+            # of arming a timer for an acknowledgement that structurally
+            # cannot arrive. Any cleanup/terminal callbacks are still
+            # dispatched, best-effort, fire-and-forget.
+            self._schedule(self._call(self._dispatch_cleanup, token, generation.identity))
+            terminal = self._terminalize_state(token, disposition)
+            if terminal is not None:
+                self._schedule(
+                    self._call(self._on_terminal, token, terminal.identity, terminal.disposition)
+                )
+            return
         forwarded_at = self._clock.now()
         self._arm(token, forwarded_at + self._grace, self._on_interruption_timeout)
+
+    def release_generation(self, token: str, *, notify: bool = True) -> None:
+        """Free the slot for a generation the scheduler has already observed
+        reach a terminal outcome directly (a completed/unknown delivery
+        reported through the scheduler's own bookkeeping rather than a
+        provider-frame correlation). A no-op if the generation is already
+        terminal or unknown -- when a coordinator-driven frame flow already
+        terminalized it, this call simply confirms what already happened.
+
+        ``notify=False`` frees the slot without dispatching ``on_terminal``:
+        for a caller already inside its own admission attempt (a submission
+        failure raised from within ``start_next``), firing the terminal
+        callback here would re-enter admission for the same still-failing
+        item before the original caller has had a chance to react.
+        """
+        terminal = self._terminalize_state(token, DeliveryDisposition.DELIVERY_UNKNOWN)
+        if terminal is not None and notify:
+            self._schedule(
+                self._call(self._on_terminal, token, terminal.identity, terminal.disposition)
+            )
 
     async def provider_error(self, token: str) -> None:
         """Both the generic upstream-`ErrorFrame` and local context-bearing

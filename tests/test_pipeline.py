@@ -5298,3 +5298,280 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def _ack_items(scheduler: object) -> list[object]:
+    """Every item across queues plus the active lease with ``role == "ack"``.
+
+    Phase 1's ack items are wire-invisible (never call
+    ``SessionState.speech_progress()``), so they cannot be observed through
+    ``host.state.speech``; this scans the scheduler's own bookkeeping
+    instead, matching the plan's "SpeechScheduler owns the ack item, ack_id
+    index, queued discard" ownership bullet.
+    """
+    from server.speech_scheduler import ROLE_ACK
+
+    items = [
+        item for queue in scheduler._queues.values() for item in queue if item.role == ROLE_ACK
+    ]
+    active = scheduler.active
+    if active is not None and active.item.role == ROLE_ACK:
+        items.append(active.item)
+    return items
+
+
+def test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch() -> None:
+    """Phase 1 Goal: 'Replace timeout-gated silence with a deterministic ack
+    emitted the instant routing confirms delegation.' The ack must be visible
+    while the delegated search is still in flight, before any result exists
+    (plan: 'without claiming progress that hasn't happened')."""
+
+    async def run() -> None:
+        search = BlockingResultWorker()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=RoutedCoordinator(search),
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        pending = asyncio.create_task(host._handle_transcript("today's weather"))
+        await asyncio.wait_for(search.started.wait(), timeout=1)
+
+        acks = _ack_items(origin.scheduler)
+        assert len(acks) == 1
+        assert acks[0].result_id is None or acks[0].ack_id is not None
+
+        search.release.set()
+        result = await asyncio.wait_for(pending, timeout=1)
+
+        assert result.text.startswith("Answer for")
+        assert _ack_items(origin.scheduler) == []
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_no_early_ack_for_the_non_delegated_direct_route() -> None:
+    """The plan disambiguates: ``RoutingDecision.action=="direct"`` is the
+    non-delegated main-responder path and remains ack-free -- only a direct
+    *web-search delegation* (existing_worker/new_worker) is eligible."""
+
+    async def run() -> None:
+        class DirectCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                decision = type("Decision", (), {"action": "direct"})()
+                return type(
+                    "Outcome",
+                    (),
+                    {"kind": "routed", "decision": decision, "prose": "Direct answer text."},
+                )()
+
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=DirectCoordinator())
+        origin = await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("what is 2 + 2")
+
+        assert result.text == "Direct answer text."
+        assert _ack_items(origin.scheduler) == []
+        assert len(origin.scheduler.state.speech) == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("action", ["unsupported", "clarify"])
+def test_no_early_ack_for_unsupported_and_clarify_routes(action: str) -> None:
+    async def run() -> None:
+        class UnsupportedOrClarifyCoordinator:
+            def arbitrate(self, _session_id: str, transcript: str) -> object:
+                decision = type("Decision", (), {"action": action})()
+                return type("Outcome", (), {"kind": "routed", "decision": decision})()
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=UnsupportedOrClarifyCoordinator()
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("do something out of scope")
+
+        assert _ack_items(origin.scheduler) == []
+        assert len(origin.scheduler.state.speech) == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_turn_emits_exactly_one_parent_ack_for_its_sole_delegated_child() -> None:
+    """Plan: 'emit one parent ack when at least one child is delegated, never
+    one ack per child.' Uses the same mixed-route Router/Coordinator
+    scaffolding as
+    ``test_multi_intent_mixed_outcomes_emit_one_child_per_item_and_mixed_parent``,
+    but with a blocking delegated worker so the ack is observable mid-flight
+    and only one delegated child exists."""
+
+    async def run() -> None:
+        search = BlockingResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=4)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(text: str, _catalogue: object) -> object:
+                action = {
+                    "answer directly": "direct",
+                    "ask me": "clarify",
+                    "unsupported thing": "unsupported",
+                    "search it": "existing_worker",
+                }[text]
+                decision = type("Decision", (), {"action": action})()
+                prose = {
+                    "direct": "Direct answer.",
+                    "clarify": "Which one?",
+                    "unsupported": None,
+                    "existing_worker": None,
+                }[action]
+                return type("Envelope", (), {"decision": decision, "prose": prose})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+            def dispatch(self, decision: object, **_: object) -> object:
+                assert decision.action == "existing_worker"
+                return search
+
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=Coordinator())
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome",
+            (),
+            {
+                "work_items": (
+                    "answer directly",
+                    "ask me",
+                    "unsupported thing",
+                    "search it",
+                ),
+                "pending_dialogue": None,
+            },
+        )()
+
+        pending = asyncio.create_task(
+            host._handle_multi_intent(
+                outcome,
+                "",
+                origin,
+                "turn-mixed-ack",
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-mixed-ack"),
+            )
+        )
+        await asyncio.wait_for(search.started.wait(), timeout=1)
+
+        acks = _ack_items(origin.scheduler)
+        assert len(acks) == 1
+
+        search.release.set()
+        await asyncio.wait_for(pending, timeout=1)
+
+        assert _ack_items(origin.scheduler) == []
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_turn_with_only_non_delegated_children_gets_no_ack() -> None:
+    async def run() -> None:
+        class Registry:
+            config = Config(max_work_items_per_turn=4)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(text: str, _catalogue: object) -> object:
+                action = {
+                    "answer directly": "direct",
+                    "ask me": "clarify",
+                    "unsupported thing": "unsupported",
+                }[text]
+                decision = type("Decision", (), {"action": action})()
+                prose = {
+                    "direct": "Direct answer.",
+                    "clarify": "Which one?",
+                    "unsupported": None,
+                }[action]
+                return type("Envelope", (), {"decision": decision, "prose": prose})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=Coordinator())
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome",
+            (),
+            {
+                "work_items": ("answer directly", "ask me", "unsupported thing"),
+                "pending_dialogue": None,
+            },
+        )()
+
+        await host._handle_multi_intent(
+            outcome,
+            "",
+            origin,
+            "turn-no-ack",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-no-ack"),
+        )
+
+        assert _ack_items(origin.scheduler) == []
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_early_ack_is_discarded_without_being_admitted_when_the_result_is_already_ready() -> None:
+    """Plan: 'an admitted ack may finish but never blocks a result from being
+    committed' and the ack 'must be dropped atomically via an explicit
+    discard_queued_ack(ack_id) operation if the real result is ready before
+    admission.' Occupies the one global transport slot with an unrelated
+    generation first, so the ack can only ever be queued, never admitted,
+    while its result resolves underneath it."""
+
+    async def run() -> None:
+        from server.speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
+
+        search = BlockingResultWorker()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=RoutedCoordinator(search),
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        # Occupy the single connection-scoped slot with unrelated speech so
+        # the ack this turn produces can only ever be queued.
+        assert isinstance(origin.lifecycle, SpeechLifecycleCoordinator)
+        occupying = origin.lifecycle.try_admit(GenerationIdentity("occupier", "work-occupier"))
+        assert occupying is not None
+
+        pending = asyncio.create_task(host._handle_transcript("today's weather"))
+        await asyncio.wait_for(search.started.wait(), timeout=1)
+        assert len(_ack_items(origin.scheduler)) == 1
+
+        search.release.set()
+        result = await asyncio.wait_for(pending, timeout=1)
+
+        assert result.text.startswith("Answer for")
+        assert _ack_items(origin.scheduler) == []
+        await host.shutdown()
+
+    asyncio.run(run())

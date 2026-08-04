@@ -1346,3 +1346,122 @@ def test_timeout_driven_cleanup_tombstones_before_dispatch_races_a_late_start_fr
         assert generation.tombstoned is True
 
     run(body)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: GenerationIdentity role/turn_id/ack_id and pre-admission disposition
+# ---------------------------------------------------------------------------
+
+
+def test_generation_identity_carries_role_turn_id_and_nullable_ack_id() -> None:
+    """Plan: 'Extend GenerationIdentity with explicit role, turn_id, and
+    nullable ack_id fields ... result identities carry role="result"/
+    result_id, while ack identities carry role="ack"/ack_id.'"""
+    result_identity = GenerationIdentity(
+        "utt-1", "work-1", role="result", turn_id="turn-1", ack_id=None
+    )
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    assert result_identity.role == "result"
+    assert result_identity.ack_id is None
+    assert ack_identity.role == "ack"
+    assert ack_identity.ack_id == "ack-turn-1"
+    assert ack_identity.turn_id == "turn-1"
+
+
+def test_generation_identity_role_defaults_to_result_for_backward_compatibility() -> None:
+    """Every non-ack call site in this repo (and every existing test)
+    constructs ``GenerationIdentity(utterance_id, work_item_id,
+    origin_epoch)`` positionally; the new fields must not force those call
+    sites to change."""
+    plain = identity("work-1", "utt-1")
+
+    assert plain.role == "result"
+    assert plain.ack_id is None
+
+
+def test_pre_admission_terminal_reason_is_a_closed_no_tts_unavailable_transport_enum() -> None:
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    assert {member.value for member in PreAdmissionTerminalReason} == {
+        "no_tts",
+        "unavailable_transport",
+    }
+
+
+def test_pre_admission_disposition_admits_a_normal_ack_when_tts_and_transport_are_available() -> (
+    None
+):
+    coordinator, _clock = make_coordinator()
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    disposition = coordinator.pre_admission_disposition(ack_identity)
+
+    assert getattr(disposition, "admitted", None) is True or disposition == "admit"
+    assert coordinator.occupied is True
+
+
+def test_pre_admission_disposition_is_terminal_with_no_tts_and_allocates_no_transport_token() -> (
+    None
+):
+    """Plan: 'A Terminal result records the reason in the lifecycle terminal
+    ledger but does not allocate a transport token.'"""
+    coordinator, _clock = make_coordinator(tts_available=False)
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    disposition = coordinator.pre_admission_disposition(ack_identity)
+
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    reason = getattr(disposition, "reason", disposition)
+    assert reason == PreAdmissionTerminalReason.NO_TTS or reason == "no_tts"
+    assert coordinator.occupied is False
+
+
+def test_pre_admission_disposition_is_terminal_when_transport_acceptance_predicate_rejects() -> (
+    None
+):
+    coordinator, _clock = make_coordinator(transport_acceptance=lambda: False)
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    disposition = coordinator.pre_admission_disposition(ack_identity)
+
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    reason = getattr(disposition, "reason", disposition)
+    assert reason == PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT or (
+        reason == "unavailable_transport"
+    )
+    assert coordinator.occupied is False
+
+
+def test_coordinator_constructed_with_no_tts_never_arms_the_start_timeout() -> None:
+    """Plan: 'start/grace timers must never arm for a generation that
+    terminalizes via pre_admission_disposition before any timer would be
+    scheduled.'"""
+    coordinator, clock = make_coordinator(tts_available=False)
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    coordinator.pre_admission_disposition(ack_identity)
+
+    assert coordinator._timer_handles == {}
+
+
+def test_dispatch_callbacks_are_no_ops_when_constructed_without_tts() -> None:
+    """Plan: 'each becomes a no-op (or receives a null-transport adapter)
+    when no TTS/transport lane exists.' Constructing the coordinator with no
+    TTS must not itself raise, and it must not have armed any live
+    generation for a normal-path dispatch_cleanup/dispatch_teardown call."""
+    coordinator, _clock = make_coordinator(tts_available=False)
+
+    assert coordinator.occupied is False

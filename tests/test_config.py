@@ -9,7 +9,82 @@ from pathlib import Path
 
 import pytest
 
-from server.config import Config, ConfigError, load_config
+from server.config import Config, ConfigError, FeaturePolicy, load_config
+
+
+def test_feature_switch_defaults_are_true() -> None:
+    config = Config()
+
+    assert config.enable_early_ack is True
+    assert config.enable_background_status is True
+    assert config.enable_autoplay_policy is True
+
+
+def test_feature_policy_is_frozen_and_constructed_from_config() -> None:
+    config = Config(
+        enable_early_ack=False, enable_background_status=True, enable_autoplay_policy=False
+    )
+
+    policy = FeaturePolicy.from_config(config)
+
+    assert policy.enable_early_ack is False
+    assert policy.enable_background_status is True
+    assert policy.enable_autoplay_policy is False
+    with pytest.raises((AttributeError, TypeError)):
+        policy.enable_early_ack = True  # type: ignore[misc]
+
+
+def test_feature_switches_load_from_environment() -> None:
+    config = load_config(
+        env={
+            "WEBSEARCH_ENABLE_EARLY_ACK": "false",
+            "WEBSEARCH_ENABLE_BACKGROUND_STATUS": "false",
+            "WEBSEARCH_ENABLE_AUTOPLAY_POLICY": "false",
+        }
+    )
+
+    assert config.enable_early_ack is False
+    assert config.enable_background_status is False
+    assert config.enable_autoplay_policy is False
+
+
+def test_feature_switches_load_from_toml_and_environment_wins(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "[features]\n"
+        "enable_early_ack = false\n"
+        "enable_background_status = false\n"
+        "enable_autoplay_policy = false\n"
+    )
+
+    from_toml = load_config(config_file=config_file, env={})
+    from_environment = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_ENABLE_EARLY_ACK": "true"},
+    )
+
+    assert from_toml.enable_early_ack is False
+    assert from_environment.enable_early_ack is True
+    assert from_environment.enable_background_status is False
+    assert from_environment.enable_autoplay_policy is False
+
+
+def test_feature_switch_invalid_boolean_value_has_config_error_boundary() -> None:
+    with pytest.raises(ConfigError, match="WEBSEARCH_ENABLE_EARLY_ACK"):
+        load_config(env={"WEBSEARCH_ENABLE_EARLY_ACK": "not-a-boolean"})
+
+
+def test_early_ack_text_override_defaults_to_a_non_progress_claiming_fixed_wording() -> None:
+    config = Config()
+
+    assert isinstance(config.early_ack_text, str)
+    assert config.early_ack_text.strip() != ""
+    lowered = config.early_ack_text.lower()
+    for claim in ("found", "here is", "here's", "result"):
+        assert claim not in lowered
+
+    overridden = load_config(env={"WEBSEARCH_EARLY_ACK_TEXT": "One moment."})
+    assert overridden.early_ack_text == "One moment."
 
 
 def test_defaults_are_bounded_and_do_not_contain_credentials() -> None:
@@ -444,3 +519,30 @@ def test_tts_uri_precedes_socket_and_host_port(tmp_path) -> None:
     config = load_config(config_file=config_file, env={})
 
     assert config.tts_endpoint == ("wss", "tts.example.test:9443")
+
+
+def test_feature_policy_precedence_matrix_disabling_early_ack_forces_legacy_timeout_regardless_of_background_status() -> (
+    None
+):
+    """Rollout safety matrix (dev plan Integration Seams): disabling
+    ``enable_early_ack`` always forces the legacy timeout path even when
+    ``enable_background_status`` remains on."""
+    always_off_ack = FeaturePolicy.from_config(
+        Config(enable_early_ack=False, enable_background_status=True)
+    )
+    also_off_ack = FeaturePolicy.from_config(
+        Config(enable_early_ack=False, enable_background_status=False)
+    )
+
+    assert always_off_ack.enable_early_ack is False
+    assert also_off_ack.enable_early_ack is False
+
+
+def test_feature_policy_disabling_background_status_does_not_disable_ack_or_autoplay() -> None:
+    policy = FeaturePolicy.from_config(
+        Config(enable_early_ack=True, enable_background_status=False, enable_autoplay_policy=True)
+    )
+
+    assert policy.enable_early_ack is True
+    assert policy.enable_autoplay_policy is True
+    assert policy.enable_background_status is False

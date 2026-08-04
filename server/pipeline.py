@@ -15,7 +15,7 @@ from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
-from .config import Config
+from .config import Config, FeaturePolicy
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     GroundedResult,
@@ -49,11 +49,13 @@ from .speech_lifecycle import (
     EventLoopTimerScheduler,
     GenerationIdentity,
     MonotonicClock,
+    PreAdmissionTerminalReason,
     SpeechGenerationFlushAckFrame,
     SpeechGenerationMarkerFrame,
     SpeechLifecycleCoordinator,
 )
 from .speech_scheduler import (
+    ROLE_ACK,
     ROLE_RESULT,
     ROLE_TIMEOUT_NOTICE,
     SpeechRole,
@@ -353,6 +355,8 @@ class SessionHost:
         coordinator: Any | None = None,
         *,
         measurement_sink: MeasurementSink | None = None,
+        config: Config | None = None,
+        feature_policy: FeaturePolicy | None = None,
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
@@ -362,6 +366,11 @@ class SessionHost:
         self.registry = registry or WorkerRegistry()
         if coordinator_registry is not None and coordinator_registry is not self.registry:
             raise ValueError("SessionHost and coordinator must share one WorkerRegistry")
+        registry_config = getattr(self.registry, "config", None)
+        if config is not None and registry_config is not None and registry_config != config:
+            raise ValueError("SessionHost config conflicts with the registry's Config")
+        self.config = config or registry_config or Config()
+        self.feature_policy = feature_policy or FeaturePolicy.from_config(self.config)
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
         self.coordinator = coordinator
@@ -384,6 +393,14 @@ class SessionHost:
         self._measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
         self._closing = False
         self.started = False
+        # Turn-scoped acknowledgement latch (Requirements: one ephemeral ack
+        # per semantic turn, including mixed multi-intent turns). Cleared in
+        # each turn's normal completion/cancellation/failure cleanup -- never
+        # retained as an unbounded process-lifetime set.
+        self._ack_emitted_turns: set[str] = set()
+        # Keep deferred ack-admission tasks referenced so they aren't
+        # garbage-collected mid-flight; see _schedule_ack_admission.
+        self._ack_admission_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def measurement_sink(self) -> MeasurementSink:
@@ -577,19 +594,24 @@ class SessionHost:
                 await pipeline.lifecycle.teardown_complete(token)
             schedule_pipeline_shutdown("speech output teardown")
 
-        connection_config = getattr(self.registry, "config", None) or Config()
-        lifecycle = (
-            SpeechLifecycleCoordinator(
-                clock=MonotonicClock(),
-                timers=EventLoopTimerScheduler(),
-                speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
-                speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
-                on_terminal=on_lifecycle_terminal,
-                dispatch_cleanup=dispatch_lifecycle_cleanup,
-                dispatch_teardown=dispatch_lifecycle_teardown,
-            )
-            if connection_tts is not None
-            else None
+        def transport_acceptable() -> bool:
+            return self.connection is pipeline and pipeline.active
+
+        connection_config = self.config
+        # Every connection constructs one SpeechLifecycleCoordinator,
+        # including when connection_tts is None: the no-TTS/unavailable-
+        # transport cases are decided by pre_admission_disposition() rather
+        # than by never constructing a coordinator at all.
+        lifecycle = SpeechLifecycleCoordinator(
+            clock=MonotonicClock(),
+            timers=EventLoopTimerScheduler(),
+            speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
+            speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
+            on_terminal=on_lifecycle_terminal,
+            dispatch_cleanup=dispatch_lifecycle_cleanup,
+            dispatch_teardown=dispatch_lifecycle_teardown,
+            tts_available=connection_tts is not None,
+            transport_acceptance=transport_acceptable,
         )
 
         pipeline = ConnectionPipeline(
@@ -600,6 +622,7 @@ class SessionHost:
                 speak=queue_speech if connection_tts is not None else None,
                 stop=stop_speech if connection_tts is not None else None,
                 lifecycle=lifecycle,
+                on_ack_terminal=self.on_ack_terminal,
             ),
             lifecycle=lifecycle,
             stt=connection_stt,
@@ -774,6 +797,146 @@ class SessionHost:
             pipeline.deactivate()
             self.connection = None
             self.state.active_epoch = None
+
+    def _clear_ack_latch(self, turn_id: str) -> None:
+        self._ack_emitted_turns.discard(turn_id)
+
+    def on_ack_terminal(
+        self, identity: GenerationIdentity, reason: PreAdmissionTerminalReason
+    ) -> None:
+        """Idempotent sole mutator for the pre-admission-terminal ack path.
+
+        Injected into ``SpeechScheduler`` at connection setup; invoked only
+        when an ack is terminalized before admission (``no_tts`` /
+        ``unavailable_transport``), never for a normal admitted completion.
+        """
+        del reason
+        if identity.turn_id is not None:
+            self._clear_ack_latch(identity.turn_id)
+
+    async def _emit_early_ack(
+        self,
+        origin: ConnectionPipeline,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        search_task: asyncio.Task[Any] | None = None,
+    ) -> None:
+        """Enqueue this turn's one delegation-confirmed ack.
+
+        Latches immediately so later eligible multi-intent children in the
+        same turn are no-ops (Requirements: one ephemeral ack per semantic
+        turn, never one per child, never claiming progress that hasn't
+        happened). When ``search_task`` is supplied, this yields exactly one
+        scheduling tick first: a search that already resolved within that
+        tick has no real delegation latency to acknowledge, so no ack is
+        queued at all ('without claiming progress that hasn't happened').
+        """
+        if not self.feature_policy.enable_early_ack or turn_id in self._ack_emitted_turns:
+            return
+        self._ack_emitted_turns.add(turn_id)
+        if (
+            origin.tts is None
+            or self.connection is not origin
+            or not origin.active
+            or not self.accepts(origin_epoch)
+        ):
+            return
+        if search_task is not None:
+            await asyncio.sleep(0)
+            if search_task.done():
+                return
+        ack_work_item_id = f"ack-{turn_id}"
+
+        def enqueue_ack() -> None:
+            origin.scheduler.enqueue(
+                result_id=None,
+                work_item_id=ack_work_item_id,
+                run_id=f"run-{ack_work_item_id}",
+                text=self.config.early_ack_text,
+                origin_epoch=origin_epoch,
+                role=ROLE_ACK,
+                ack_id=ack_work_item_id,
+                turn_id=turn_id,
+            )
+
+        enqueue_ack()
+        self._schedule_ack_admission(origin, ack_work_item_id, enqueue_ack)
+
+    def _schedule_ack_admission(
+        self,
+        origin: ConnectionPipeline,
+        ack_work_item_id: str,
+        enqueue_ack: Callable[[], None],
+    ) -> None:
+        """Admit a just-enqueued ack on a later scheduling tick, not inline.
+
+        The caller's enqueue is synchronous and immediate -- the ack is
+        visible in the scheduler's own bookkeeping the instant delegation is
+        confirmed. Admission is deferred so a same-turn reconnect, or a
+        result that is already ready, can still discard the ack while it is
+        merely queued (``discard_queued_ack`` / ``SpeechScheduler.interrupt``)
+        before it is ever handed to the transport.
+        """
+
+        async def admit() -> None:
+            try:
+                await origin.scheduler.start_next(ack_work_item_id)
+            except Exception:
+                # The ack is ephemeral and best-effort: a submission failure
+                # (e.g. the connection's Pipecat worker has not attached
+                # yet) must never crash the turn's real delegated work.
+                # start_next's own except-path already released the
+                # coordinator slot and discarded the item from scheduler
+                # bookkeeping entirely, so re-queue a fresh ack item rather
+                # than leaving none at all.
+                logger.opt(exception=True).debug(
+                    "early ack failed to start; leaving it queued for a later retry"
+                )
+                enqueue_ack()
+
+        task = asyncio.create_task(admit())
+        self._ack_admission_tasks.add(task)
+        task.add_done_callback(self._ack_admission_tasks.discard)
+
+    async def cancel_turn_or_child(
+        self, turn_id: str, child_work_item_id: str | None = None
+    ) -> None:
+        """Host-owned atomic cancellation of a turn's ack and/or one child.
+
+        A child cancel never accidentally removes the parent ack unless it
+        was the turn's sole remaining delegated child; a whole-turn cancel
+        (``child_work_item_id is None``) removes the ack and every other
+        queued/active work item this connection is currently carrying.
+        Synchronous and non-awaiting apart from the scheduler's own stop
+        signalling, so nothing else can interleave between child removal and
+        the sole-child ack check.
+        """
+        origin = self.connection
+        ack_work_item_id = f"ack-{turn_id}"
+        if origin is None:
+            self._clear_ack_latch(turn_id)
+            return
+        scheduler = origin.scheduler
+        if child_work_item_id is None:
+            other_keys = {key for key in scheduler._queues if key != ack_work_item_id}
+            if scheduler.active is not None:
+                other_keys.add(scheduler.active.item.work_item_id)
+            other_keys.discard(ack_work_item_id)
+            for key in other_keys:
+                self._cancel_work(key)
+                scheduler.cancel(key)
+            scheduler.cancel(ack_work_item_id)
+            self._clear_ack_latch(turn_id)
+            return
+        self._cancel_work(child_work_item_id)
+        scheduler.cancel(child_work_item_id)
+        remaining = {key for key in scheduler._queues if key != ack_work_item_id}
+        if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
+            remaining.add(scheduler.active.item.work_item_id)
+        if not remaining:
+            scheduler.cancel(ack_work_item_id)
+            self._clear_ack_latch(turn_id)
 
     def _require_coordinator(self) -> Any:
         coordinator = self.coordinator
@@ -971,6 +1134,7 @@ class SessionHost:
                         origin_epoch=origin_epoch,
                     ),
                     origin,
+                    require_tts=False,
                 )
                 turn_recorder.finalize(outcome=action)
                 return result
@@ -1005,6 +1169,22 @@ class SessionHost:
             child = turn_recorder.new_child(work_item_id=work_item_id)
             try:
                 search_started = time.perf_counter()
+                search_task = self._dispatch_search_task(
+                    search, transcript, turn_id=turn_id, origin_epoch=origin_epoch
+                )
+                # Dispatch before the ack: a search that resolves within the
+                # same tick (no real delegation latency) never gets an ack at
+                # all, and one still in flight only gets an ack admitted via
+                # a deferred task -- scheduled strictly after this search
+                # task's own first step -- so a reconnect racing in on the
+                # very same turn can still fence the still-queued ack before
+                # it ever reaches the old connection's transport.
+                await self._emit_early_ack(
+                    origin,
+                    turn_id=turn_id,
+                    origin_epoch=origin_epoch,
+                    search_task=search_task,
+                )
                 execution = await self._search_with_timeout(
                     search,
                     transcript,
@@ -1018,6 +1198,7 @@ class SessionHost:
                     ),
                     worker_id=worker_id,
                     work_item_id=work_item_id,
+                    task=search_task,
                 )
                 search_ms = (time.perf_counter() - search_started) * 1000
                 child_outcome_label: WorkItemOutcome
@@ -1079,6 +1260,7 @@ class SessionHost:
             was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
+            origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             commit_ms = (time.perf_counter() - commit_started) * 1000
             child.finalize(
@@ -1105,6 +1287,8 @@ class SessionHost:
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="failed")
             raise
+        finally:
+            self._clear_ack_latch(turn_id)
 
     async def _handle_pending(
         self,
@@ -1132,6 +1316,7 @@ class SessionHost:
             await self._register_runner_worker(worker)
             worker_id = owner_id or "main"
             self._known_work_items.add(work_item_id)
+            await self._emit_early_ack(origin, turn_id=turn_id, origin_epoch=origin.epoch)
             clarification_context = self._clarification_context(pending, transcript)
             child = turn_recorder.new_child(work_item_id=work_item_id)
             retained_recorder = self._new_retained_recorder(
@@ -1212,6 +1397,7 @@ class SessionHost:
                 child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
+            origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             turn_recorder.finalize()
             return committed
@@ -1223,6 +1409,8 @@ class SessionHost:
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="failed")
             raise
+        finally:
+            self._clear_ack_latch(turn_id)
 
     async def _handle_multi_intent(
         self,
@@ -1330,6 +1518,7 @@ class SessionHost:
                     if index == 0 and pending is not None
                     else None
                 )
+                await self._emit_early_ack(origin, turn_id=turn_id, origin_epoch=origin.epoch)
 
             index_to_worker_id = dict(zip(runnable_indexes, runnable, strict=True))
 
@@ -1473,6 +1662,7 @@ class SessionHost:
                     outcome=self._failure_child_outcome(failure),
                     app_worker_id=failure.worker_id,
                 )
+            origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             committed = []
             for index in sorted(results):
                 committed.append(
@@ -1490,6 +1680,8 @@ class SessionHost:
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="failed")
             raise
+        finally:
+            self._clear_ack_latch(turn_id)
 
     def _worker_clarification_result(
         self,
@@ -1526,6 +1718,35 @@ class SessionHost:
             answer=transcript,
         )
 
+    def _dispatch_search_task(
+        self,
+        search: Callable[..., Any],
+        query: str,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        clarification_context: ClarificationContext | None = None,
+    ) -> asyncio.Task[Any] | None:
+        """Start the delegated search coroutine and return its task.
+
+        Split out of ``_search_with_timeout`` so a caller can dispatch the
+        search, give it exactly one scheduling tick, and only then decide
+        whether an early ack is still warranted (see ``_emit_early_ack``'s
+        ``search_task`` parameter).
+        """
+        kwargs: dict[str, Any] = {
+            "turn_id": turn_id,
+            "origin_epoch": origin_epoch,
+        }
+        if clarification_context is not None:
+            kwargs["clarification_context"] = clarification_context
+        starter = getattr(self.coordinator, "start_task", None)
+        return (
+            starter(search(query, **kwargs))
+            if starter is not None
+            else asyncio.create_task(search(query, **kwargs))
+        )
+
     async def _search_with_timeout(
         self,
         search: Callable[..., Any],
@@ -1537,20 +1758,17 @@ class SessionHost:
         worker_id: str,
         work_item_id: str | None = None,
         clarification_context: ClarificationContext | None = None,
+        task: asyncio.Task[Any] | None = None,
     ) -> SearchExecution:
         coordinator = self._require_coordinator()
-        kwargs: dict[str, Any] = {
-            "turn_id": turn_id,
-            "origin_epoch": origin_epoch,
-        }
-        if clarification_context is not None:
-            kwargs["clarification_context"] = clarification_context
-        starter = getattr(self.coordinator, "start_task", None)
-        task = (
-            starter(search(query, **kwargs))
-            if starter is not None
-            else asyncio.create_task(search(query, **kwargs))
-        )
+        if task is None:
+            task = self._dispatch_search_task(
+                search,
+                query,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                clarification_context=clarification_context,
+            )
         if task is None:
             return SearchExecution("capacity_rejected")
         work_item_id = work_item_id or f"work-{turn_id}"
@@ -1773,8 +1991,16 @@ class SessionHost:
         origin: ConnectionPipeline,
         *,
         role: SpeechRole = ROLE_RESULT,
+        require_tts: bool = True,
     ) -> GroundedResult:
-        """Commit a result and speak only when its originating epoch is active."""
+        """Commit a result and speak only when its originating epoch is active.
+
+        ``require_tts`` gates the no-TTS short-circuit: delegated worker
+        results stay history-only without a TTS lane (``require_tts=True``,
+        the default), while the main-responder direct/unsupported/clarify
+        replies still enqueue through the scheduler's no-TTS pre-admission
+        terminal path so their progress is recorded even with no transport.
+        """
         origin_epoch = result.origin_epoch
         work_item_id = f"work-{result.turn_id}"
         if work_item_id in self._cancelled_work_items:
@@ -1785,7 +2011,7 @@ class SessionHost:
         self._commit_result_state(result)
         self._known_work_items.discard(work_item_id)
         if (
-            origin.tts is None
+            (require_tts and origin.tts is None)
             or self.connection is not origin
             or not origin.active
             or not self.accepts(origin_epoch)
@@ -1799,7 +2025,14 @@ class SessionHost:
             origin_epoch=origin_epoch,
             role=role,
         )
-        await origin.scheduler.start_next(work_item_id)
+        try:
+            await origin.scheduler.start_next(work_item_id)
+        except Exception:
+            # A no-TTS/submission-failed result may still reach
+            # result_ready: that state describes canonical commit, not
+            # audio. start_next's own except-path already recorded
+            # DELIVERY_UNKNOWN and released the coordinator slot.
+            logger.opt(exception=True).debug("speech submission failed after commit; result stands")
         return result
 
     def session_handshake(self) -> dict[str, Any]:

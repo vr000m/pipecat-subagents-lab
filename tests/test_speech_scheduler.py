@@ -1,11 +1,37 @@
-"""Speech scheduling owns leases, queues, and frame ownership."""
+"""Speech scheduling owns leases, queues, and frame ownership.
+
+Phase 1 makes ``lifecycle`` an unconditionally required ``SpeechScheduler``
+constructor argument (the dev plan's "Normative build order" step 2): every
+construction below -- including the pre-existing no-lifecycle cases -- goes
+through ``_scheduler()``, which always injects a real, ``ManualTimerScheduler``-
+backed ``SpeechLifecycleCoordinator`` rather than relying on the removed
+``lifecycle is None`` fallback branches.
+"""
 
 import asyncio
 
 from server.contracts import DeliveryState
 from server.session_state import SessionState
-from server.speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
-from server.speech_scheduler import ROLE_RESULT, ROLE_TIMEOUT_NOTICE, SpeechScheduler
+from server.speech_lifecycle import (
+    GenerationIdentity,
+    ManualTimerScheduler,
+    SpeechLifecycleCoordinator,
+)
+from server.speech_scheduler import ROLE_ACK, ROLE_RESULT, ROLE_TIMEOUT_NOTICE, SpeechScheduler
+
+
+def _lifecycle(**kwargs) -> SpeechLifecycleCoordinator:
+    timers = ManualTimerScheduler()
+    return SpeechLifecycleCoordinator(clock=timers, timers=timers, **kwargs)
+
+
+def _scheduler(
+    state: SessionState | None = None,
+    *,
+    lifecycle: SpeechLifecycleCoordinator | None = None,
+    **kwargs,
+) -> SpeechScheduler:
+    return SpeechScheduler(state or SessionState(), lifecycle=lifecycle or _lifecycle(), **kwargs)
 
 
 def enqueue(scheduler: SpeechScheduler, work_item_id: str, text: str):
@@ -17,8 +43,36 @@ def enqueue(scheduler: SpeechScheduler, work_item_id: str, text: str):
     )
 
 
+def enqueue_ack(scheduler: SpeechScheduler, *, turn_id: str, text: str = "One moment."):
+    """Enqueue an ephemeral ack under the plan's synthetic queue key
+    (``ack-{turn_id}``): ack items require ``ack_id`` and carry no
+    ``result_id``."""
+    ack_work_item_id = f"ack-{turn_id}"
+    return scheduler.enqueue(
+        work_item_id=ack_work_item_id,
+        run_id=f"run-{ack_work_item_id}",
+        result_id=None,
+        text=text,
+        role=ROLE_ACK,
+        ack_id=ack_work_item_id,
+    )
+
+
+def test_speech_scheduler_requires_a_lifecycle_coordinator() -> None:
+    """Plan: the ``lifecycle is None`` fallback branches -- ``_release()``
+    clearing ``_active`` directly and the ``uuid4().hex`` token fallback in
+    ``start_next()`` -- are deleted entirely, and ``lifecycle`` becomes a
+    non-optional constructor argument with no default."""
+    try:
+        SpeechScheduler(SessionState())
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("SpeechScheduler no longer requires lifecycle")
+
+
 def test_one_active_utterance_lease_and_per_work_item_queue_isolation() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     first = enqueue(scheduler, "work-1", "first")
     second = enqueue(scheduler, "work-2", "second")
 
@@ -33,7 +87,7 @@ def test_one_active_utterance_lease_and_per_work_item_queue_isolation() -> None:
 
 
 def test_replay_gets_a_new_utterance_id() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     first = enqueue(scheduler, "work-1", "answer")
     assert asyncio.run(scheduler.start_next()) is not None
     scheduler.interrupt()
@@ -44,7 +98,7 @@ def test_replay_gets_a_new_utterance_id() -> None:
 
 
 def test_pause_preserves_paused_state_and_resume_records_resumed_transition() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     first = enqueue(scheduler, "work-1", "answer")
     asyncio.run(scheduler.start_next())
 
@@ -60,7 +114,7 @@ def test_pause_preserves_paused_state_and_resume_records_resumed_transition() ->
 
 def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
     async def run() -> None:
-        scheduler = SpeechScheduler(SessionState())
+        scheduler = _scheduler()
         task_one = enqueue(scheduler, "work-1", "one")
         task_two = enqueue(scheduler, "work-2", "two")
         await scheduler.start_next()
@@ -73,7 +127,7 @@ def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
 
 
 def test_discard_queued_notice_removes_only_timeout_notice_role_and_preserves_order() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     before = scheduler.enqueue(
         work_item_id="work-b",
         run_id="run-before",
@@ -106,7 +160,7 @@ def test_discard_queued_notice_removes_only_timeout_notice_role_and_preserves_or
 
 
 def test_discard_queued_notice_is_a_noop_when_no_notice_is_queued() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     item = enqueue(scheduler, "work-b", "just a result")
 
     discarded = scheduler.discard_queued_notice("work-b")
@@ -116,13 +170,13 @@ def test_discard_queued_notice_is_a_noop_when_no_notice_is_queued() -> None:
 
 
 def test_discard_queued_notice_is_a_noop_for_an_unknown_work_item() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
 
     assert scheduler.discard_queued_notice("no-such-work-item") == ()
 
 
 def test_discard_queued_notice_does_not_touch_other_work_item_queues() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     notice = scheduler.enqueue(
         work_item_id="work-b",
         run_id="run-notice",
@@ -141,7 +195,7 @@ def test_discard_queued_notice_does_not_touch_other_work_item_queues() -> None:
 def test_discard_queued_notice_cannot_remove_a_notice_already_admitted_to_the_transport_slot() -> (
     None
 ):
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     scheduler.enqueue(
         work_item_id="work-b",
         run_id="run-notice",
@@ -161,10 +215,7 @@ def test_discard_queued_notice_cannot_remove_a_notice_already_admitted_to_the_tr
 
 def test_interrupt_signals_provider_stop_before_releasing_active_lease() -> None:
     stopped: list[str] = []
-    scheduler = SpeechScheduler(
-        SessionState(),
-        stop=lambda item: stopped.append(item.utterance_id),
-    )
+    scheduler = _scheduler(stop=lambda item: stopped.append(item.utterance_id))
     item = enqueue(scheduler, "work-1", "one")
     asyncio.run(scheduler.start_next())
 
@@ -175,7 +226,7 @@ def test_interrupt_signals_provider_stop_before_releasing_active_lease() -> None
 
 
 def test_synthesis_end_is_not_completion_and_unknown_delivery_is_terminal() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     item = enqueue(scheduler, "work-1", "answer")
     asyncio.run(scheduler.start_next())
 
@@ -197,7 +248,7 @@ def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:
         if calls == 1:
             raise RuntimeError("provider unavailable")
 
-    scheduler = SpeechScheduler(SessionState(), speak=speak)
+    scheduler = _scheduler(speak=speak)
     first = enqueue(scheduler, "work-1", "first")
     second = enqueue(scheduler, "work-2", "second")
 
@@ -224,7 +275,7 @@ def test_speech_submission_and_cleanup_failure_release_only_after_teardown() -> 
             teardown_calls.append(token)
             await lifecycle.teardown_complete(token)
 
-        lifecycle = SpeechLifecycleCoordinator(
+        lifecycle = _lifecycle(
             dispatch_cleanup=cleanup_failed,
             dispatch_teardown=teardown,
         )
@@ -232,7 +283,7 @@ def test_speech_submission_and_cleanup_failure_release_only_after_teardown() -> 
         async def speak(_item):
             raise RuntimeError("provider unavailable")
 
-        scheduler = SpeechScheduler(SessionState(), speak=speak, lifecycle=lifecycle)
+        scheduler = _scheduler(speak=speak, lifecycle=lifecycle)
         item = enqueue(scheduler, "work-1", "first")
 
         try:
@@ -251,7 +302,7 @@ def test_speech_submission_and_cleanup_failure_release_only_after_teardown() -> 
 
 
 def test_reconnect_terminally_cancels_active_and_queued_old_epoch_items() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     first = enqueue(scheduler, "work-1", "one")
     second = enqueue(scheduler, "work-2", "two")
     third = enqueue(scheduler, "work-3", "three")
@@ -272,7 +323,7 @@ def test_reconnect_terminally_cancels_active_and_queued_old_epoch_items() -> Non
 
 
 def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:
-    scheduler = SpeechScheduler(SessionState())
+    scheduler = _scheduler()
     old_item = enqueue(scheduler, "work-1", "old")
     asyncio.run(scheduler.start_next())
 
@@ -303,8 +354,8 @@ def test_start_next_defers_admission_to_an_injected_lifecycle_coordinator() -> N
     starting speech, and must not start when the coordinator's global slot
     is occupied (matches the plan's Integration Seams entry "Work queues ->
     global slot" -> ``SpeechLifecycleCoordinator.try_admit()``)."""
-    coordinator = SpeechLifecycleCoordinator()
-    scheduler = SpeechScheduler(SessionState(), lifecycle=coordinator)
+    coordinator = _lifecycle()
+    scheduler = _scheduler(lifecycle=coordinator)
     item = enqueue(scheduler, "work-1", "one")
 
     result = asyncio.run(scheduler.start_next())
@@ -318,9 +369,9 @@ def test_start_next_defers_admission_to_an_injected_lifecycle_coordinator() -> N
 
 
 def test_start_next_does_not_start_when_the_coordinator_slot_is_already_occupied() -> None:
-    coordinator = SpeechLifecycleCoordinator()
+    coordinator = _lifecycle()
     coordinator.try_admit(GenerationIdentity("occupied-by-someone-else", "work-other"))
-    scheduler = SpeechScheduler(SessionState(), lifecycle=coordinator)
+    scheduler = _scheduler(lifecycle=coordinator)
     enqueue(scheduler, "work-1", "one")
 
     result = asyncio.run(scheduler.start_next())
@@ -330,7 +381,7 @@ def test_start_next_does_not_start_when_the_coordinator_slot_is_already_occupied
 
 
 def test_dropped_prestart_context_cannot_claim_replacement_utterance() -> None:
-    scheduler = SpeechScheduler(SessionState(), speak=lambda _item: None)
+    scheduler = _scheduler(speak=lambda _item: None)
     old_item = enqueue(scheduler, "work-1", "old")
     asyncio.run(scheduler.start_next())
     scheduler.interrupt()
@@ -347,3 +398,118 @@ def test_dropped_prestart_context_cannot_claim_replacement_utterance() -> None:
     assert scheduler.provider_synthesis_ended(new_item.utterance_id) is True
     assert scheduler.provider_delivery_unknown(new_item.utterance_id) is True
     assert scheduler.active is None
+
+
+# -- Phase 1: ephemeral ack items ---------------------------------------
+
+
+def test_ack_item_carries_a_non_null_ack_id_and_a_null_result_id() -> None:
+    scheduler = _scheduler()
+    ack = enqueue_ack(scheduler, turn_id="turn-1")
+
+    assert ack.role == ROLE_ACK
+    assert ack.ack_id is not None
+    assert ack.result_id is None
+
+
+def test_result_item_still_requires_a_result_id() -> None:
+    scheduler = _scheduler()
+    result = enqueue(scheduler, "work-1", "answer")
+
+    assert result.role == ROLE_RESULT
+    assert result.result_id is not None
+    assert result.ack_id is None
+
+
+def test_ack_items_never_reach_session_state_speech_progress() -> None:
+    """Plan: 'route every speech_progress-shaped emission ... through a
+    single internal _emit_progress(item, state) helper that no-ops for
+    item.role == "ack"'. Sweep enqueue, admission, interruption, cancellation,
+    pause/resume, and terminalization and assert zero SessionState events are
+    recorded for the ack item's utterance."""
+    scheduler = _scheduler(speak=lambda _item: None)
+    ack = enqueue_ack(scheduler, turn_id="turn-1")
+    assert ack.utterance_id not in scheduler.state.speech
+
+    asyncio.run(scheduler.start_next())
+    assert ack.utterance_id not in scheduler.state.speech
+
+    scheduler.synthesis_ended(ack.utterance_id)
+    assert ack.utterance_id not in scheduler.state.speech
+
+    scheduler.pause("ack-turn-1")
+    assert ack.utterance_id not in scheduler.state.speech
+
+    resumed = scheduler.resume("ack-turn-1")
+    assert resumed is not None
+    assert resumed.utterance_id not in scheduler.state.speech
+
+    scheduler.cancel("ack-turn-1")
+    assert resumed.utterance_id not in scheduler.state.speech
+
+
+def test_discard_queued_ack_removes_only_the_named_ack_and_leaves_other_queues_untouched() -> None:
+    scheduler = _scheduler()
+    ack = enqueue_ack(scheduler, turn_id="turn-1")
+    other = enqueue(scheduler, "work-other", "unrelated")
+
+    discarded = scheduler.discard_queued_ack(ack.ack_id)
+
+    assert discarded is not None
+    assert "ack-turn-1" not in scheduler._queues
+    assert scheduler._queues["work-other"] == [other]
+
+
+def test_discard_queued_ack_cannot_remove_an_admitted_ack() -> None:
+    """Plan: 'an admitted ack may finish but never blocks a result from
+    being committed' -- discard only ever affects a still-queued ack."""
+    scheduler = _scheduler()
+    ack = enqueue_ack(scheduler, turn_id="turn-1")
+    admitted = asyncio.run(scheduler.start_next())
+    assert admitted is not None and admitted.role == ROLE_ACK
+
+    discarded = scheduler.discard_queued_ack(ack.ack_id)
+
+    assert not discarded
+    assert scheduler.active is not None
+    assert scheduler.active.item.ack_id == ack.ack_id
+
+
+def test_cancel_with_the_ack_work_item_id_removes_only_the_parent_ack() -> None:
+    """Plan: 'cancel(work_item_id) therefore only ever removes the ack when
+    called with ack_work_item_id (i.e. a whole-turn cancel); cancelling a
+    single delegated child's work_item_id does not touch the parent ack.'"""
+    scheduler = _scheduler()
+    ack = enqueue_ack(scheduler, turn_id="turn-1")
+    child = enqueue(scheduler, "work-1-0", "child")
+
+    cancelled = scheduler.cancel("work-1-0")
+
+    assert [item.utterance_id for item in cancelled] == [child.utterance_id]
+    assert "ack-turn-1" in scheduler._queues
+    assert scheduler._queues["ack-turn-1"] == [ack]
+
+
+def test_ack_admission_and_completion_do_not_block_a_ready_result_from_committing() -> None:
+    """The ack is ephemeral, non-canonical delivery; its presence in the
+    scheduler must never prevent a real result's canonical commit path (that
+    commit happens above the scheduler, in SessionState/SessionHost -- this
+    asserts only that the scheduler keeps the ack and the result item fully
+    independent in its own bookkeeping)."""
+    scheduler = _scheduler()
+    enqueue_ack(scheduler, turn_id="turn-1")
+    admitted_ack = asyncio.run(scheduler.start_next())
+    assert admitted_ack is not None and admitted_ack.role == ROLE_ACK
+
+    result = scheduler.enqueue(
+        work_item_id="work-1-0",
+        run_id="run-1-0",
+        result_id="result-1-0",
+        text="the real answer",
+    )
+    assert result.utterance_id in {item.utterance_id for item in scheduler._queues["work-1-0"]}
+
+    scheduler.delivery_completed(admitted_ack.utterance_id)
+    assert scheduler.active is None
+    started = asyncio.run(scheduler.start_next("work-1-0"))
+    assert started is not None and started.utterance_id == result.utterance_id

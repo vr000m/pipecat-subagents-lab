@@ -12,22 +12,41 @@ from loguru import logger
 
 from .contracts import DeliveryState
 from .session_state import SessionState
-from .speech_lifecycle import GenerationIdentity, SpeechLifecycleCoordinator
+from .speech_lifecycle import (
+    GenerationIdentity,
+    PreAdmissionTerminal,
+    PreAdmissionTerminalReason,
+    SpeechLifecycleCoordinator,
+)
 
-SpeechRole = Literal["result", "timeout_notice"]
+SpeechRole = Literal["result", "timeout_notice", "ack"]
 ROLE_RESULT: SpeechRole = "result"
 ROLE_TIMEOUT_NOTICE: SpeechRole = "timeout_notice"
+ROLE_ACK: SpeechRole = "ack"
+
+AckTerminalCallback = Callable[[GenerationIdentity, PreAdmissionTerminalReason], Any]
 
 
 @dataclass(frozen=True)
 class SpeechItem:
-    result_id: str
+    result_id: str | None
     work_item_id: str
     run_id: str
     text: str
     utterance_id: str
     origin_epoch: int | None = None
     role: SpeechRole = ROLE_RESULT
+    ack_id: str | None = None
+    turn_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.role == ROLE_ACK:
+            if self.ack_id is None:
+                raise ValueError("an ack SpeechItem requires ack_id")
+            if self.result_id is not None:
+                raise ValueError("an ack SpeechItem must not carry result_id")
+        elif self.result_id is None:
+            raise ValueError(f"a {self.role!r} SpeechItem requires result_id")
 
 
 @dataclass(frozen=True)
@@ -44,17 +63,21 @@ class SpeechScheduler:
         state: SessionState | None = None,
         speak: Callable[[SpeechItem], Any] | None = None,
         stop: Callable[[SpeechItem], Any] | None = None,
-        lifecycle: SpeechLifecycleCoordinator | None = None,
+        *,
+        lifecycle: SpeechLifecycleCoordinator,
+        on_ack_terminal: AckTerminalCallback | None = None,
     ) -> None:
         self.state = state or SessionState()
         self.speak = speak
         self.stop = stop
         self.lifecycle = lifecycle
+        self._on_ack_terminal = on_ack_terminal
         self._queues: dict[str, list[SpeechItem]] = {}
         self._active: UtteranceLease | None = None
         self._paused: dict[str, SpeechItem] = {}
         self._provider_contexts: dict[str, str] = {}
         self._stop_tasks: set[asyncio.Future[Any]] = set()
+        self._ack_index: dict[str, str] = {}
 
     def _signal_stop(self, item: SpeechItem) -> None:
         if self.stop is None:
@@ -98,69 +121,153 @@ class SpeechScheduler:
             "origin_epoch": item.origin_epoch,
         }
 
+    def _emit_progress(self, item: SpeechItem, state: DeliveryState, **extra: Any) -> None:
+        """The sole choke point for public speech-progress emission.
+
+        Ack items are wire-invisible and server-log/observability-only,
+        keyed by ``ack_id``: this is the one place that gate is enforced, so
+        no other call site needs its own role check before calling
+        ``SessionState.speech_progress`` / (indirectly)
+        ``RTVIMessagePublisher.speech_progress``.
+        """
+        if item.role == ROLE_ACK:
+            return
+        fields = {**self._progress(item), **extra}
+        self.state.speech_progress(state=state, **fields)
+
     def enqueue(
         self,
         *,
-        result_id: str,
+        result_id: str | None = None,
         work_item_id: str,
         run_id: str,
         text: str,
         origin_epoch: int | None = None,
         utterance_id: str | None = None,
         role: SpeechRole = ROLE_RESULT,
+        ack_id: str | None = None,
+        turn_id: str | None = None,
     ) -> SpeechItem:
+        if role == ROLE_ACK and ack_id is None:
+            # The synthetic ack queue key (``ack-{turn_id}``) and the ack's
+            # identity are the same string throughout production call
+            # sites; default it here so every ack enqueue satisfies
+            # SpeechItem's ack_id requirement without every caller having
+            # to repeat work_item_id as ack_id explicitly.
+            ack_id = work_item_id
         item = SpeechItem(
-            result_id,
-            work_item_id,
-            run_id,
-            text,
-            utterance_id or f"utt-{uuid4().hex}",
-            origin_epoch,
-            role,
+            result_id=result_id,
+            work_item_id=work_item_id,
+            run_id=run_id,
+            text=text,
+            utterance_id=utterance_id or f"utt-{uuid4().hex}",
+            origin_epoch=origin_epoch,
+            role=role,
+            ack_id=ack_id,
+            turn_id=turn_id,
         )
         self._queues.setdefault(work_item_id, []).append(item)
-        self.state.speech_progress(**self._progress(item), state=DeliveryState.DISPLAYED)
-        self.state.speech_progress(**self._progress(item), state=DeliveryState.QUEUED)
+        if role == ROLE_ACK and ack_id is not None:
+            self._ack_index[ack_id] = work_item_id
+        self._emit_progress(item, DeliveryState.DISPLAYED)
+        self._emit_progress(item, DeliveryState.QUEUED)
         return item
 
+    def discard_queued_ack(self, ack_id: str) -> SpeechItem | None:
+        """Atomically drop one still-queued ack, clearing its index entry.
+
+        Only the still-queued ack for ``ack_id`` is removed; other queued
+        items for the same work-item key (there should be none, since the
+        synthetic ack queue key is disjoint from real work-item keys) and
+        every other queued/paused/active item are left untouched. An
+        already-admitted ack cannot be discarded this way.
+        """
+        work_item_id = self._ack_index.get(ack_id)
+        if work_item_id is None:
+            return None
+        queue = self._queues.get(work_item_id, [])
+        discarded = next(
+            (item for item in queue if item.role == ROLE_ACK and item.ack_id == ack_id), None
+        )
+        if discarded is None:
+            self._ack_index.pop(ack_id, None)
+            return None
+        remaining = [item for item in queue if item is not discarded]
+        if remaining:
+            self._queues[work_item_id] = remaining
+        else:
+            self._queues.pop(work_item_id, None)
+        self._ack_index.pop(ack_id, None)
+        return discarded
+
     async def start_next(self, work_item_id: str | None = None) -> SpeechItem | None:
-        if self._active is not None or (self.lifecycle is not None and self.lifecycle.occupied):
+        if self._active is not None or self.lifecycle.occupied:
             return None
         keys = [work_item_id] if work_item_id else list(self._queues)
         item = next((self._queues[key][0] for key in keys if self._queues.get(key)), None)
         if item is None:
             return None
-        generation = None
-        if self.lifecycle is not None:
-            generation = self.lifecycle.try_admit(
-                GenerationIdentity(item.utterance_id, item.work_item_id, item.origin_epoch)
-            )
-            if generation is None:
-                return None
+        identity = GenerationIdentity(
+            item.utterance_id,
+            item.work_item_id,
+            item.origin_epoch,
+            role=item.role if item.role == ROLE_ACK else "result",
+            turn_id=item.turn_id,
+            ack_id=item.ack_id,
+        )
+        disposition = self.lifecycle.pre_admission_disposition(identity)
+        if disposition is None:
+            return None
+        if isinstance(disposition, PreAdmissionTerminal):
+            self._discard_from_queue(item)
+            if item.role == ROLE_ACK:
+                if item.ack_id is not None:
+                    self._ack_index.pop(item.ack_id, None)
+                if self._on_ack_terminal is not None:
+                    self._on_ack_terminal(identity, disposition.reason)
+            else:
+                self._emit_progress(item, DeliveryState.DELIVERY_UNKNOWN)
+            return None
+        generation = disposition.generation
         self._queues[item.work_item_id].pop(0)
-        token = generation.token if generation is not None else uuid4().hex
+        token = generation.token
         lease = UtteranceLease(item, token)
         self._active = lease
-        self.state.speech_progress(**self._progress(item), state=DeliveryState.STARTED)
-        if self.lifecycle is not None:
-            self.lifecycle.mark_handed_to_tts(token)
+        self._emit_progress(item, DeliveryState.STARTED)
+        self.lifecycle.mark_handed_to_tts(token)
         try:
             if self.speak is not None:
                 outcome = self.speak(item)
                 if isinstance(outcome, Awaitable):
                     await outcome
         except BaseException:
-            self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_UNKNOWN)
-            if self.lifecycle is not None and generation is not None:
-                try:
-                    await self.lifecycle.provider_error(generation.token)
-                except BaseException:  # noqa: BLE001 - preserve the original submission failure below
-                    logger.opt(exception=True).debug(
-                        "lifecycle.provider_error failed while handling submission failure"
-                    )
+            self._emit_progress(item, DeliveryState.DELIVERY_UNKNOWN)
+            try:
+                await self.lifecycle.provider_error(generation.token)
+            except BaseException:  # noqa: BLE001 - preserve the original submission failure below
+                logger.opt(exception=True).debug(
+                    "lifecycle.provider_error failed while handling submission failure"
+                )
+            # The submission itself raised, synchronously, before anything
+            # could have reached a real TTS lane: no marker/TTSSpeakFrame
+            # traversal is in flight for provider_error's flush-ack barrier
+            # to ever wait on, so the slot frees immediately rather than
+            # waiting on an acknowledgement that structurally cannot arrive.
+            # notify=False: this call is still inside start_next's own
+            # admission attempt, so firing on_terminal here would re-enter
+            # admission for the same still-failing item before the caller
+            # that's about to receive this exception has a chance to react.
+            self.lifecycle.release_generation(token, notify=False)
             self._release(item.utterance_id)
             raise
         return item
+
+    def _discard_from_queue(self, item: SpeechItem) -> None:
+        queue = self._queues.get(item.work_item_id)
+        if queue and queue[0] is item:
+            queue.pop(0)
+            if not queue:
+                self._queues.pop(item.work_item_id, None)
 
     def provider_started(self, context_id: str) -> None:
         """Bind a correlated Pipecat TTS context to its active scheduler lease."""
@@ -199,20 +306,26 @@ class SpeechScheduler:
         item = self._active_item(utterance_id)
         if item is None:
             return
-        self.state.speech_progress(**self._progress(item), state=DeliveryState.SYNTHESIS_ENDED)
+        self._emit_progress(item, DeliveryState.SYNTHESIS_ENDED)
 
     def delivery_completed(self, utterance_id: str) -> None:
         item = self._active_item(utterance_id)
         if item is None:
             return
-        self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_COMPLETED)
+        token = self._active.token if self._active is not None else None
+        self._emit_progress(item, DeliveryState.DELIVERY_COMPLETED)
+        if token is not None:
+            self.lifecycle.release_generation(token)
         self._release(utterance_id)
 
     def delivery_unknown(self, utterance_id: str) -> None:
         item = self._active_item(utterance_id)
         if item is None:
             return
-        self.state.speech_progress(**self._progress(item), state=DeliveryState.DELIVERY_UNKNOWN)
+        token = self._active.token if self._active is not None else None
+        self._emit_progress(item, DeliveryState.DELIVERY_UNKNOWN)
+        if token is not None:
+            self.lifecycle.release_generation(token)
         self._release(utterance_id)
 
     def interrupt(self, *, epoch: int | None = None, reconnect: bool = False) -> SpeechItem | None:
@@ -222,43 +335,37 @@ class SpeechScheduler:
         if active_item is None and not reconnect:
             return None
         if active_item is not None:
-            if self.lifecycle is not None and active_token is not None:
+            if active_token is not None:
                 self.lifecycle.record_interruption(active_token, pause=False)
             self._signal_stop(active_item)
-            self.state.speech_progress(
-                result_id=active_item.result_id,
-                work_item_id=active_item.work_item_id,
-                run_id=active_item.run_id,
-                utterance_id=active_item.utterance_id,
-                state=state,
-                origin_epoch=epoch if epoch is not None else active_item.origin_epoch,
+            self._emit_progress(
+                active_item,
+                state,
                 allow_stale_reconnect=reconnect,
+                **({"origin_epoch": epoch} if epoch is not None else {}),
             )
             self._release(active_item.utterance_id)
         if reconnect:
             for queue in self._queues.values():
                 for item in queue:
-                    self.state.speech_progress(
-                        result_id=item.result_id,
-                        work_item_id=item.work_item_id,
-                        run_id=item.run_id,
-                        utterance_id=item.utterance_id,
-                        state=state,
-                        origin_epoch=epoch if epoch is not None else item.origin_epoch,
+                    self._emit_progress(
+                        item,
+                        state,
                         allow_stale_reconnect=True,
+                        **({"origin_epoch": epoch} if epoch is not None else {}),
                     )
             self._queues.clear()
+            self._ack_index.clear()
         return active_item
 
     def pause(self, work_item_id: str) -> None:
         if self._active and self._active.item.work_item_id == work_item_id:
             item = self._active.item
             token = self._active.token
-            if self.lifecycle is not None:
-                self.lifecycle.record_interruption(token, pause=True)
+            self.lifecycle.record_interruption(token, pause=True)
             self._paused[work_item_id] = item
             self._signal_stop(item)
-            self.state.speech_progress(**self._progress(item), state=DeliveryState.PAUSED)
+            self._emit_progress(item, DeliveryState.PAUSED)
             # Pausing releases the lease without recording a terminal
             # interruption; resume must be able to represent the next state.
             self._release(item.utterance_id)
@@ -278,8 +385,10 @@ class SpeechScheduler:
             text=item.text,
             origin_epoch=item.origin_epoch,
             role=item.role,
+            ack_id=item.ack_id,
+            turn_id=item.turn_id,
         )
-        self.state.speech_progress(**self._progress(replay), state=DeliveryState.RESUMED)
+        self._emit_progress(replay, DeliveryState.RESUMED)
         return replay
 
     def cancel(self, work_item_id: str | None = None) -> tuple[SpeechItem, ...]:
@@ -290,22 +399,23 @@ class SpeechScheduler:
         ):
             item = self._active.item
             token = self._active.token
-            if self.lifecycle is not None:
-                self.lifecycle.record_interruption(token, pause=False)
+            self.lifecycle.record_interruption(token, pause=False)
             self._signal_stop(item)
-            self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+            self._emit_progress(item, DeliveryState.INTERRUPTED)
             self._release(item.utterance_id)
             cancelled.append(item)
         keys = [work_item_id] if work_item_id is not None else list(self._queues)
         for key in keys:
             for item in self._queues.pop(key, []):
-                self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+                self._emit_progress(item, DeliveryState.INTERRUPTED)
+                if item.role == ROLE_ACK and item.ack_id is not None:
+                    self._ack_index.pop(item.ack_id, None)
                 cancelled.append(item)
         paused_keys = [work_item_id] if work_item_id is not None else list(self._paused)
         for key in paused_keys:
             item = self._paused.pop(key, None)
             if item is not None:
-                self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+                self._emit_progress(item, DeliveryState.INTERRUPTED)
                 cancelled.append(item)
         return tuple(cancelled)
 
@@ -329,7 +439,7 @@ class SpeechScheduler:
         else:
             self._queues.pop(work_item_id, None)
         for item in discarded:
-            self.state.speech_progress(**self._progress(item), state=DeliveryState.INTERRUPTED)
+            self._emit_progress(item, DeliveryState.INTERRUPTED)
         return discarded
 
     def _active_item(self, utterance_id: str) -> SpeechItem | None:

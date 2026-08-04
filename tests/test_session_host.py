@@ -265,3 +265,197 @@ def test_late_result_terminal_kind_field_is_backward_compatible_with_legacy_cons
     terminal_kind")."""
     late = LateResult(work_item_id="work-1", worker_id="worker-1", result=None)
     assert late.terminal_kind is None or isinstance(late.terminal_kind, str)
+
+
+def test_legacy_session_host_registry_only_construction_derives_one_feature_policy() -> None:
+    """Plan: 'A legacy SessionHost(registry) derives its canonical
+    config/policy from that registry' and 'Add a compatibility test for
+    existing SessionHost(registry) callers.'"""
+    from server.config import Config, FeaturePolicy
+
+    registry = WorkerRegistry(config=Config(enable_early_ack=False))
+    host = SessionHost(registry=registry)
+
+    assert isinstance(host.feature_policy, FeaturePolicy)
+    assert host.feature_policy.enable_early_ack is False
+
+
+def test_session_host_accepts_keyword_only_config_and_feature_policy() -> None:
+    from server.config import Config, FeaturePolicy
+
+    config = Config(enable_background_status=False)
+    policy = FeaturePolicy.from_config(config)
+
+    host = SessionHost(registry=WorkerRegistry(config=config), config=config, feature_policy=policy)
+
+    assert host.feature_policy is policy
+    assert host.config is config
+
+
+def test_session_host_rejects_a_registry_config_that_conflicts_with_the_injected_config() -> None:
+    """Plan: 'a conflicting registry Config fails fast rather than creating a
+    second policy.'"""
+    from server.config import Config
+
+    conflicting_registry = WorkerRegistry(config=Config(enable_early_ack=False))
+
+    try:
+        SessionHost(
+            registry=conflicting_registry,
+            config=Config(enable_early_ack=True),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a conflicting registry config was silently accepted")
+
+
+def test_cancel_turn_or_child_removes_only_the_named_childs_speech_and_leaves_the_parent_ack() -> (
+    None
+):
+    """Plan: 'A child cancel never accidentally removes a parent ack' --
+    cancelling one non-sole delegated child under its own work_item_id must
+    leave ``ack_work_item_id`` queued."""
+
+    async def run() -> None:
+        host = SessionHost()
+        origin = await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+        ack_work_item_id = "ack-turn-1"
+        origin.scheduler.enqueue(
+            work_item_id=ack_work_item_id,
+            run_id="run-ack",
+            result_id=None,
+            text="One moment.",
+            role="ack",
+        )
+        origin.scheduler.enqueue(
+            work_item_id="work-1-0",
+            run_id="run-1-0",
+            result_id="result-1-0",
+            text="child one",
+        )
+        origin.scheduler.enqueue(
+            work_item_id="work-1-1",
+            run_id="run-1-1",
+            result_id="result-1-1",
+            text="child two",
+        )
+
+        await host.cancel_turn_or_child("turn-1", "work-1-0")
+
+        assert ack_work_item_id in origin.scheduler._queues
+        assert "work-1-0" not in origin.scheduler._queues
+        assert "work-1-1" in origin.scheduler._queues
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_turn_or_child_whole_turn_removes_the_parent_ack_and_every_child_queue() -> None:
+    async def run() -> None:
+        host = SessionHost()
+        origin = await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+        ack_work_item_id = "ack-turn-2"
+        origin.scheduler.enqueue(
+            work_item_id=ack_work_item_id,
+            run_id="run-ack",
+            result_id=None,
+            text="One moment.",
+            role="ack",
+        )
+        origin.scheduler.enqueue(
+            work_item_id="work-2-0",
+            run_id="run-2-0",
+            result_id="result-2-0",
+            text="child",
+        )
+
+        await host.cancel_turn_or_child("turn-2", None)
+
+        assert ack_work_item_id not in origin.scheduler._queues
+        assert "work-2-0" not in origin.scheduler._queues
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_turn_or_child_sole_delegated_child_removes_both_ack_and_child_atomically() -> None:
+    """Plan: cancelling the turn's sole delegated child must cancel both the
+    child and the parent ack 'under their respective keys in the same
+    operation,' since the ack has no other delegated child left to serve."""
+
+    async def run() -> None:
+        host = SessionHost()
+        origin = await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+        ack_work_item_id = "ack-turn-3"
+        origin.scheduler.enqueue(
+            work_item_id=ack_work_item_id,
+            run_id="run-ack",
+            result_id=None,
+            text="One moment.",
+            role="ack",
+        )
+        origin.scheduler.enqueue(
+            work_item_id="work-3-0",
+            run_id="run-3-0",
+            result_id="result-3-0",
+            text="only child",
+        )
+
+        await host.cancel_turn_or_child("turn-3", "work-3-0")
+
+        assert ack_work_item_id not in origin.scheduler._queues
+        assert "work-3-0" not in origin.scheduler._queues
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_on_ack_terminal_is_idempotent_and_clears_the_turn_latch_exactly_once() -> None:
+    """Plan: 'an idempotent SessionHost.on_ack_terminal(identity, reason)
+    callback remains the sole turn-latch mutator.' A second call for the same
+    identity must not raise or double-clear."""
+
+    async def run() -> None:
+        from server.speech_lifecycle import GenerationIdentity
+
+        host = SessionHost()
+        await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+        identity = GenerationIdentity(
+            "ack-turn-4", "ack-turn-4", role="ack", turn_id="turn-4", ack_id="ack-turn-4"
+        )
+
+        host.on_ack_terminal(identity, "no_tts")
+        host.on_ack_terminal(identity, "no_tts")  # must be a no-op, not an error
+
+        await host.shutdown()
+
+    asyncio.run(run())
