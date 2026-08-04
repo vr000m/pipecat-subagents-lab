@@ -75,6 +75,7 @@ class Config:
     enable_autoplay_policy: bool = True
     early_ack_text: str = "One moment while I look into that."
     promotion_manifest_path: str = "docs/benchmarks/v0.1.3-promotion-manifest.json"
+    phase4c_artifact_path: str | None = None
     release_version: str = "0.1.3"
     source_commit: str | None = None
     source_tree_hash: str | None = None
@@ -342,6 +343,25 @@ def load_promotion_manifest(config: Config) -> PromotionManifest:
 
     if manifest.get("promotion_eligible") is not True:
         return replace(identity, reason=manifest.get("reason") or "not_promotion_eligible")
+
+    # An optional Phase 4C binding: absent, a no-change release is still a
+    # valid final manifest. Present, the declared hash must resolve to a
+    # readable file whose current bytes actually match it -- an unresolvable
+    # or mismatched artifact is treated as stale/foreign, never trusted blindly.
+    phase4c_hash = manifest.get("phase4c_artifact_sha256")
+    if phase4c_hash:
+        phase4c_artifact_path = config.phase4c_artifact_path
+        if not phase4c_artifact_path:
+            return replace(identity, reason="phase4c_unresolvable")
+        phase4c_path = Path(phase4c_artifact_path)
+        if not phase4c_path.is_absolute():
+            phase4c_path = Path(__file__).resolve().parents[1] / phase4c_path
+        try:
+            actual_hash = hashlib.sha256(phase4c_path.read_bytes()).hexdigest()
+        except OSError:
+            return replace(identity, reason="phase4c_unresolvable")
+        if actual_hash != phase4c_hash:
+            return replace(identity, reason="phase4c_mismatch")
 
     return replace(identity, promotion_eligible=True, reason=None)
 

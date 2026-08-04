@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Phase 4B analyzer: deterministic, credential-free promotion decision for
+the query-context narrowing experiment.
+
+See the "Phase 4: Query-context narrowing experiment" section of
+``docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md``.
+
+Consumes ``scripts/_evidence_common.py``'s shared
+``blocked``/``not-run``/``provider_effect_uncontrolled`` status vocabulary
+rather than re-implementing it. Always emits
+``docs/benchmarks/v0.1.3-query-context-analysis.json`` -- for a blocked,
+not-run, or not-promoted outcome ``analysis`` is ``null`` and
+``promotion_eligible`` is ``false``; promotion additionally requires every
+named assumption (a)-(d) to hold.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import statistics
+import sys
+from collections import defaultdict
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _evidence_common import EvidenceGateError, EvidenceStatus, closed_object, load_jsonl
+from run_query_context_experiment import RAW_ALLOWED, RAW_REQUIRED
+
+BOOTSTRAP_ITERATIONS = 10_000
+BOOTSTRAP_SEED = 0
+MIN_PAIRED_SAMPLES_PER_CELL = 30
+PROMOTION_MEDIAN_IMPROVEMENT = 0.10
+PROMOTION_BOOTSTRAP_LOWER_BOUND = 0.05
+QUALITY_FLOOR = 0.90
+QUALITY_DROP_BUDGET = 0.02
+BASELINE_NOISE_SD_THRESHOLD = 0.01
+EPSILON = 1e-9  # float round-off tolerance for exact-boundary threshold comparisons
+
+CONTAMINATION_FIELDS = ("attempt_count", "retry_count", "rate_limit_count")
+
+
+def _now_utc() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _terminal(
+    *,
+    status: str,
+    reason: str,
+    promotion_eligible: bool = False,
+    analysis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "reason": reason,
+        "promotion_eligible": promotion_eligible,
+        "analysis": analysis,
+        "generated_at_utc": _now_utc(),
+    }
+
+
+def _is_contaminated(record: dict[str, Any], *, retrieval_snapshot_exposed: bool) -> bool:
+    if record["attempt_count"] > 1 or record["retry_count"] > 0 or record["rate_limit_count"] > 0:
+        return True
+    if record["cache_status"] == "unknown":
+        return True
+    return retrieval_snapshot_exposed and record["retrieval_snapshot_id"] is None
+
+
+def _spearman(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman's rank correlation, average-rank tie handling, no scipy/numpy."""
+    n = len(xs)
+    if n < 2:
+        return None
+
+    def _ranks(values: list[float]) -> list[float]:
+        order = sorted(range(len(values)), key=lambda i: values[i])
+        ranks = [0.0] * len(values)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+                j += 1
+            avg_rank = (i + j) / 2.0 + 1.0
+            for k in range(i, j + 1):
+                ranks[order[k]] = avg_rank
+            i = j + 1
+        return ranks
+
+    rx = _ranks(xs)
+    ry = _ranks(ys)
+    mean_rx = sum(rx) / n
+    mean_ry = sum(ry) / n
+    cov = sum((rx[i] - mean_rx) * (ry[i] - mean_ry) for i in range(n))
+    var_x = sum((r - mean_rx) ** 2 for r in rx)
+    var_y = sum((r - mean_ry) ** 2 for r in ry)
+    denom = (var_x * var_y) ** 0.5
+    if denom == 0:
+        return None
+    return cov / denom
+
+
+def _median(values: list[float]) -> float:
+    return statistics.median(values)
+
+
+def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply the full Phase 4B promotion rubric to a clean set of raw records.
+
+    Raises ``EvidenceGateError`` for input-contract violations (missing
+    dimensions, forbidden/unknown fields, duplicate or unpaired fixture-turn
+    identities, mixed fixture versions). Returns a terminal result dict for
+    every other outcome, including halts required by named assumptions
+    (a)-(d).
+
+    Re-validates every record against the strict raw allowlist even though
+    ``collect_query_context_latency.py`` already did so: the analyzer must
+    not silently trust its input file's provenance, since nothing prevents a
+    hand-edited or externally produced JSONL from reaching this script.
+    """
+    for record in records:
+        closed_object(record, required=RAW_REQUIRED, allowed=RAW_ALLOWED)
+
+    fixture_versions = {r["fixture_version"] for r in records}
+    if len(fixture_versions) > 1:
+        raise EvidenceGateError(
+            f"mixed fixture_version values in input: {sorted(fixture_versions)}"
+        )
+    scorer_versions = {r["scorer_version"] for r in records}
+    if len(scorer_versions) > 1:
+        raise EvidenceGateError(f"mixed scorer_version values in input: {sorted(scorer_versions)}")
+
+    by_stratum: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_stratum[(record["provider"], record["model"])].append(record)
+
+    # Assumption (d): control-field contamination. A stratum is
+    # provider_effect_uncontrolled if none of its records expose a retrieval
+    # snapshot id at all (no discoverable control), otherwise samples missing
+    # it while siblings have it are excluded as contaminated.
+    clean_by_stratum: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    uncontrolled_strata: list[str] = []
+    for stratum, stratum_records in by_stratum.items():
+        exposes_snapshot = any(r["retrieval_snapshot_id"] is not None for r in stratum_records)
+        if not exposes_snapshot:
+            uncontrolled_strata.append(f"{stratum[0]}/{stratum[1]}")
+            continue
+        clean_by_stratum[stratum] = [
+            r for r in stratum_records if not _is_contaminated(r, retrieval_snapshot_exposed=True)
+        ]
+
+    if not clean_by_stratum:
+        return _terminal(
+            status=EvidenceStatus.BLOCKED.value,
+            reason="provider_effect_uncontrolled",
+            analysis={"uncontrolled_strata": uncontrolled_strata},
+        )
+
+    per_stratum_report: dict[str, Any] = {}
+    per_stratum_pair_improvements: dict[str, list[float]] = {}
+    undersized: list[str] = []
+
+    for (provider, model), stratum_records in clean_by_stratum.items():
+        stratum_key = f"{provider}/{model}"
+        baseline = [r for r in stratum_records if r["condition"] == "baseline"]
+        narrowed = [r for r in stratum_records if r["condition"] == "narrowed"]
+
+        for group, label in ((baseline, "baseline"), (narrowed, "narrowed")):
+            ids = [r["fixture_turn_id"] for r in group]
+            if len(ids) != len(set(ids)):
+                raise EvidenceGateError(
+                    f"duplicate fixture_turn_id in {stratum_key}/{label}: input is not one sample "
+                    "per fixture-turn identity"
+                )
+
+        baseline_by_id = {r["fixture_turn_id"]: r for r in baseline}
+        narrowed_by_id = {r["fixture_turn_id"]: r for r in narrowed}
+        paired_ids = sorted(set(baseline_by_id) & set(narrowed_by_id))
+
+        if len(paired_ids) < MIN_PAIRED_SAMPLES_PER_CELL:
+            undersized.append(f"{stratum_key}={len(paired_ids)}")
+            continue
+
+        # Assumption (a): baseline run-to-run noise. Repeated baseline
+        # quality scores must be stable enough that the score measures the
+        # context-window effect, not provider variance. An epsilon absorbs
+        # float round-off so an exact-SD-0.01 fixture is not misclassified
+        # as "too noisy" by a value like 0.010000000000000009.
+        baseline_quality = [baseline_by_id[i]["quality_score"] for i in paired_ids]
+        narrowed_quality = [narrowed_by_id[i]["quality_score"] for i in paired_ids]
+        baseline_quality_sd = (
+            statistics.pstdev(baseline_quality) if len(baseline_quality) > 1 else 0.0
+        )
+        baseline_too_noisy = baseline_quality_sd > BASELINE_NOISE_SD_THRESHOLD + EPSILON
+
+        baseline_quality_mean = statistics.fmean(baseline_quality)
+        narrowed_quality_mean = statistics.fmean(narrowed_quality)
+        quality_drop = baseline_quality_mean - narrowed_quality_mean
+        baseline_below_floor = baseline_quality_mean < QUALITY_FLOOR - EPSILON
+        quality_ok = (
+            narrowed_quality_mean >= QUALITY_FLOOR - EPSILON
+            and quality_drop <= QUALITY_DROP_BUDGET + EPSILON
+        )
+
+        pair_latencies_baseline = [baseline_by_id[i]["latency_ms"] for i in paired_ids]
+        pair_latencies_narrowed = [narrowed_by_id[i]["latency_ms"] for i in paired_ids]
+        rel_improvements = [
+            (b - n) / b if b else 0.0
+            for b, n in zip(pair_latencies_baseline, pair_latencies_narrowed)
+        ]
+
+        all_context = [r["context_chars"] for r in stratum_records]
+        all_latency = [r["latency_ms"] for r in stratum_records]
+        spearman = _spearman(all_context, all_latency)
+
+        per_stratum_pair_improvements[stratum_key] = rel_improvements
+        per_stratum_report[stratum_key] = {
+            "paired_sample_count": len(paired_ids),
+            "spearman_context_vs_latency": spearman,
+            "baseline_quality_mean": baseline_quality_mean,
+            "narrowed_quality_mean": narrowed_quality_mean,
+            "baseline_quality_sd": baseline_quality_sd,
+            "quality_drop": quality_drop,
+            "quality_ok": quality_ok,
+            "median_relative_improvement": _median(rel_improvements),
+        }
+
+        # Named-assumption halts (a)/(b) take priority over the ordinary
+        # promotion rubric, per stratum, in the order the plan names them.
+        if baseline_too_noisy:
+            return _terminal(
+                status="not_promoted",
+                reason="baseline_too_noisy",
+                analysis={"strata": per_stratum_report, "undersized_strata": undersized},
+            )
+        if baseline_below_floor:
+            return _terminal(
+                status="not_promoted",
+                reason="baseline_below_quality_floor",
+                analysis={"strata": per_stratum_report, "undersized_strata": undersized},
+            )
+        if not quality_ok:
+            return _terminal(
+                status="not_promoted",
+                reason="quality_drop_exceeded",
+                analysis={"strata": per_stratum_report, "undersized_strata": undersized},
+            )
+
+    if not per_stratum_pair_improvements:
+        return _terminal(
+            status=EvidenceStatus.BLOCKED.value,
+            reason="undersized_cell",
+            analysis={"undersized_strata": undersized},
+        )
+
+    strata = sorted(per_stratum_pair_improvements)
+    stratum_medians = [_median(per_stratum_pair_improvements[s]) for s in strata]
+    equal_weight_median = _median(stratum_medians)
+
+    rng = random.Random(BOOTSTRAP_SEED)
+    bootstrap_overall_medians: list[float] = []
+    for _ in range(BOOTSTRAP_ITERATIONS):
+        resample_medians = []
+        for stratum in strata:
+            pool = per_stratum_pair_improvements[stratum]
+            resample = [pool[rng.randrange(len(pool))] for _ in range(len(pool))]
+            resample_medians.append(_median(resample))
+        bootstrap_overall_medians.append(_median(resample_medians))
+    bootstrap_overall_medians.sort()
+    lower_bound_index = int(0.05 * BOOTSTRAP_ITERATIONS)
+    bootstrap_lower_bound = bootstrap_overall_medians[lower_bound_index]
+
+    # Quality gating already happened per-stratum above (halts with
+    # quality_drop_exceeded before reaching this point), so promotion here
+    # depends only on the latency thresholds.
+    promote = (
+        equal_weight_median >= PROMOTION_MEDIAN_IMPROVEMENT - EPSILON
+        and bootstrap_lower_bound >= PROMOTION_BOOTSTRAP_LOWER_BOUND - EPSILON
+    )
+
+    analysis = {
+        "strata": per_stratum_report,
+        "median_relative_latency_improvement": equal_weight_median,
+        "bootstrap_lower_bound_95": bootstrap_lower_bound,
+        "bootstrap_iterations": BOOTSTRAP_ITERATIONS,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "thresholds": {
+            "median_improvement": PROMOTION_MEDIAN_IMPROVEMENT,
+            "bootstrap_lower_bound": PROMOTION_BOOTSTRAP_LOWER_BOUND,
+            "quality_floor": QUALITY_FLOOR,
+            "quality_drop_budget": QUALITY_DROP_BUDGET,
+        },
+        "undersized_strata": undersized,
+    }
+
+    if promote:
+        return _terminal(status="promoted", reason=None, promotion_eligible=True, analysis=analysis)
+    return _terminal(
+        status="not_promoted", reason="data_did_not_support_promotion", analysis=analysis
+    )
+
+
+def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(records) == 1 and "status" in records[0] and "quality_score" not in records[0]:
+        status_record = records[0]
+        return _terminal(
+            status=status_record["status"],
+            reason=status_record.get("reason"),
+            promotion_eligible=False,
+            analysis=None,
+        )
+    if not records:
+        return _terminal(status=EvidenceStatus.NOT_RUN.value, reason="no_paid_samples")
+    return build_analysis(records)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+
+    try:
+        records = load_jsonl(args.input)
+        result = analyze(records)
+    except (EvidenceGateError, OSError) as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        f"OK: wrote status={result['status']} promotion_eligible={result['promotion_eligible']} "
+        f"to {args.output}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

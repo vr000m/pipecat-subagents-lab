@@ -1,0 +1,52 @@
+{
+  "fixture_version": "v1",
+  "description": "Versioned fact/citation/disallowed-claim fixture for the v0.1.3 Phase 4 query-context narrowing experiment. Turn IDs, fact IDs, citation IDs, and disallowed-claim IDs are stable across scorer versions; only the scorer's matching logic may change between scorer_version values.",
+  "turns": [
+    {
+      "turn_id": "qc-turn-1",
+      "query": "What is the current stable release version of Pipecat?",
+      "prior_queries": [],
+      "required_facts": [
+        {"id": "qc1-fact-release-name", "match_pattern": "pipecat"},
+        {"id": "qc1-fact-version-kind", "match_pattern": "stable release"}
+      ],
+      "expected_citations": [
+        {"id": "qc1-cite-pypi", "domain": "pypi.org", "fact_id": "qc1-fact-release-name"},
+        {"id": "qc1-cite-github", "domain": "github.com", "fact_id": "qc1-fact-version-kind"}
+      ],
+      "disallowed_claims": [
+        {"id": "qc1-disallowed-eol", "match_pattern": "end of life"},
+        {"id": "qc1-disallowed-deprecated", "match_pattern": "deprecated framework"}
+      ]
+    },
+    {
+      "turn_id": "qc-turn-2",
+      "query": "Does Pipecat support WebRTC transports out of the box?",
+      "prior_queries": ["qc-turn-1"],
+      "required_facts": [
+        {"id": "qc2-fact-webrtc-support", "match_pattern": "webrtc"},
+        {"id": "qc2-fact-transport-plural", "match_pattern": "transport"}
+      ],
+      "expected_citations": [
+        {"id": "qc2-cite-docs", "domain": "docs.pipecat.ai", "fact_id": "qc2-fact-webrtc-support"}
+      ],
+      "disallowed_claims": [
+        {"id": "qc2-disallowed-only-webrtc", "match_pattern": "only supports webrtc"}
+      ]
+    },
+    {
+      "turn_id": "qc-turn-3",
+      "query": "What licence does the Pipecat project use?",
+      "prior_queries": ["qc-turn-1", "qc-turn-2"],
+      "required_facts": [
+        {"id": "qc3-fact-licence-name", "match_pattern": "bsd"}
+      ],
+      "expected_citations": [
+        {"id": "qc3-cite-license-file", "domain": "github.com", "fact_id": "qc3-fact-licence-name"}
+      ],
+      "disallowed_claims": [
+        {"id": "qc3-disallowed-proprietary", "match_pattern": "proprietary licence"}
+      ]
+    }
+  ]
+}

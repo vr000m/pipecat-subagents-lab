@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -345,6 +346,72 @@ def _validate_phase3_completion(
     return record
 
 
+# Fields that carry a hash/digest/commit identity in the Phase 4C promoted
+# post-change artifact: validated as non-empty lowercase hex strings. This is
+# what distinguishes a well-formed binding from a corrupted/foreign one (e.g.
+# a "stale..." placeholder) without requiring a byte-for-byte recomputation
+# against the bound Phase 3 artifact, which the schema does not otherwise tie
+# together structurally.
+PHASE4C_HASH_LIKE_FIELDS = frozenset(
+    {
+        "post_change_source_commit",
+        "post_change_source_tree_hash",
+        "phase3_completion_hash",
+        "phase4b_baseline_input_hash",
+        "phase4b_normalized_input_hash",
+        "experiment_command_digest",
+        "analyzer_command_digest",
+        "scorer_hash",
+        "control_fingerprint",
+    }
+)
+PHASE4C_STRING_FIELDS = frozenset({"fixture_version", "scorer_version", "generated_at_utc"})
+PHASE4C_ALLOWED_FIELDS = (
+    frozenset({"status", "promotion_eligible"}) | PHASE4C_HASH_LIKE_FIELDS | PHASE4C_STRING_FIELDS
+)
+_HEX_RE = re.compile(r"^[0-9a-f]+$")
+
+
+def _validate_phase4c_artifact(payload: Any) -> None:
+    """Validate a Phase 4C promoted post-change analysis artifact.
+
+    Only a ``status=promoted``, ``promotion_eligible=true`` artifact with
+    every required binding field present, correctly typed, and (for
+    hash/digest/commit fields) valid lowercase hex may be bound into the
+    final manifest.
+    """
+    if not isinstance(payload, dict):
+        raise EvidenceGateError("phase4c artifact must be a JSON object")
+
+    unknown = set(payload) - PHASE4C_ALLOWED_FIELDS
+    if unknown:
+        raise EvidenceGateError(f"phase4c artifact: unknown field(s) {sorted(unknown)}")
+    missing = PHASE4C_ALLOWED_FIELDS - set(payload)
+    if missing:
+        raise EvidenceGateError(f"phase4c artifact: missing required field(s) {sorted(missing)}")
+
+    if not isinstance(payload["status"], str) or payload["status"] != "promoted":
+        raise EvidenceGateError(
+            f"phase4c artifact: status must be 'promoted', got {payload['status']!r}"
+        )
+    if (
+        not isinstance(payload["promotion_eligible"], bool)
+        or payload["promotion_eligible"] is not True
+    ):
+        raise EvidenceGateError("phase4c artifact: promotion_eligible must be true")
+
+    for name in PHASE4C_HASH_LIKE_FIELDS:
+        value = payload[name]
+        if not isinstance(value, str) or not value or not _HEX_RE.match(value):
+            raise EvidenceGateError(
+                f"phase4c artifact: {name} must be a non-empty lowercase hex string"
+            )
+    for name in PHASE4C_STRING_FIELDS:
+        value = payload[name]
+        if not isinstance(value, str) or not value:
+            raise EvidenceGateError(f"phase4c artifact: {name} must be a non-empty string")
+
+
 def write_manifest(
     *,
     manifest_phase: str,
@@ -382,8 +449,13 @@ def write_manifest(
     }
     if phase3_input is not None:
         inputs["phase3"] = {"path": str(phase3_input), "sha256": sha256_file(phase3_input)}
+
+    phase4c_artifact_sha256: str | None = None
     if phase4c_input is not None:
-        inputs["phase4c"] = {"path": str(phase4c_input), "sha256": sha256_file(phase4c_input)}
+        phase4c_payload = load_json(phase4c_input)
+        _validate_phase4c_artifact(phase4c_payload)
+        phase4c_artifact_sha256 = sha256_file(phase4c_input)
+        inputs["phase4c"] = {"path": str(phase4c_input), "sha256": phase4c_artifact_sha256}
 
     real_stratum_present = has_real_provider_stratum([*phase0_records, *phase1_records])
     transport_eligible = bool(transport_record.get("promotion_eligible"))
@@ -429,6 +501,8 @@ def write_manifest(
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "inputs": inputs,
     }
+    if phase4c_artifact_sha256 is not None:
+        manifest["phase4c_artifact_sha256"] = phase4c_artifact_sha256
 
     _atomic_write_manifest(output, manifest)
     return manifest
