@@ -39,6 +39,14 @@ class FakeRunner:
         pass
 
 
+class _FakePipecatWorker:
+    def __init__(self) -> None:
+        self.frames: list[object] = []
+
+    async def queue_frame(self, frame: object) -> None:
+        self.frames.append(frame)
+
+
 def _decision(catalogue, action: str, **overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "action": action,
@@ -148,7 +156,7 @@ def test_persistence_grounding_reconnect_and_interruption_hold_together() -> Non
             "https://weather.example/forecast"
         ]
 
-        host = SessionHost(registry=registry, runner_factory=FakeRunner)
+        host = SessionHost(registry=registry, runner_factory=FakeRunner, tts=object())
         host.state.set_worker(
             WorkerState(
                 worker_id=weather.worker_id,
@@ -165,6 +173,7 @@ def test_persistence_grounding_reconnect_and_interruption_hold_together() -> Non
                 "snapshot_sequence": 0,
             }
         )
+        first.worker = _FakePipecatWorker()
         host.state.append_result(result, origin_epoch=1)
         item = first.scheduler.enqueue(
             result_id=result.result_id,

@@ -1445,6 +1445,61 @@ def test_pre_admission_disposition_is_terminal_when_transport_acceptance_predica
     assert coordinator.occupied is False
 
 
+def test_pre_admission_disposition_is_terminal_for_a_result_when_no_tts_lane_exists() -> None:
+    """I2: with no TTS lane the scheduler's ``speak`` callable is ``None``,
+    so an admitted result can never be handed to a provider and would sit in
+    the sole transport slot until ``speech_start_timeout_seconds`` expired.
+    The no-TTS gate is therefore role-independent: a result identity is
+    terminal before admission too, allocating no token and arming no timer.
+    """
+    coordinator, _clock = make_coordinator(tts_available=False)
+
+    disposition = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    assert getattr(disposition, "reason", None) == PreAdmissionTerminalReason.NO_TTS
+    assert coordinator.occupied is False
+    assert coordinator._timer_handles == {}
+
+
+def test_pre_admission_disposition_still_admits_a_result_when_transport_is_unacceptable() -> None:
+    """The transport-acceptance gate stays ack-specific: a result identity
+    keeps admitting and terminalizes through the normal delivery path, so
+    only the structurally impossible no-TTS case is short-circuited."""
+    coordinator, _clock = make_coordinator(transport_acceptance=lambda: False)
+
+    disposition = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+
+    assert getattr(disposition, "admitted", None) is True
+    assert coordinator.occupied is True
+
+
+def test_release_generation_records_an_explicit_completed_disposition() -> None:
+    """M1: a clean delivery must not be recorded as DELIVERY_UNKNOWN in the
+    coordinator's own terminal ledger."""
+
+    async def body() -> None:
+        terminal_calls: list[DeliveryDisposition] = []
+
+        def on_terminal(token, identity_, disposition) -> None:
+            terminal_calls.append(disposition)
+
+        coordinator, _clock = make_coordinator(on_terminal=on_terminal)
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        coordinator.release_generation(
+            generation.token, disposition=DeliveryDisposition.DELIVERY_COMPLETED
+        )
+        await asyncio.sleep(0)
+
+        assert generation.disposition == DeliveryDisposition.DELIVERY_COMPLETED
+        assert terminal_calls == [DeliveryDisposition.DELIVERY_COMPLETED]
+        assert coordinator.occupied is False
+
+    run(body)
+
+
 def test_coordinator_constructed_with_no_tts_never_arms_the_start_timeout() -> None:
     """Plan: 'start/grace timers must never arm for a generation that
     terminalizes via pre_admission_disposition before any timer would be

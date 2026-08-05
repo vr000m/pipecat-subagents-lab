@@ -52,6 +52,7 @@ class DeliveryDisposition(str, Enum):
     PAUSED = "paused"
     INTERRUPTED = "interrupted"
     CANCELLED = "cancelled"
+    DELIVERY_COMPLETED = "delivery_completed"
     DELIVERY_UNKNOWN = "delivery_unknown"
 
 
@@ -348,15 +349,25 @@ class SpeechLifecycleCoordinator:
         slot is merely occupied (retry later, not terminal). Otherwise
         admits normally and returns ``PreAdmissionAdmit``.
 
-        The no-TTS/unavailable-transport terminal gate is ack-specific: an
-        ack is optional, TTS-lane-only speech that is safe to drop before
-        admission when no transport lane exists. Result identities predate
-        this gate and must keep admitting (and later terminalizing through
-        the normal delivery path) regardless of TTS/transport availability.
+        The ``no_tts`` gate is role-independent. ``tts_available`` is the
+        same connection-level fact that decides whether ``SpeechScheduler``
+        gets a ``speak`` callable at all: with no TTS lane there is nothing
+        for an admitted generation to be handed to, so admitting one would
+        arm ``speech_start_timeout_seconds`` on a generation that
+        structurally cannot start, holding the sole transport slot for the
+        whole timeout. A result reaching this gate (the main responder's
+        direct/unsupported/clarify replies, committed with
+        ``require_tts=False``) is therefore terminal before admission too;
+        the scheduler records DELIVERY_UNKNOWN progress for it.
+
+        The ``unavailable_transport`` gate stays ack-specific: an ack is
+        optional, TTS-lane-only speech that is safe to drop before admission,
+        while a result with a live TTS lane keeps admitting and terminalizes
+        through the normal delivery path.
         """
+        if not self._tts_available:
+            return PreAdmissionTerminal(PreAdmissionTerminalReason.NO_TTS)
         if identity.role == "ack":
-            if not self._tts_available:
-                return PreAdmissionTerminal(PreAdmissionTerminalReason.NO_TTS)
             if self._transport_acceptance is not None and not self._transport_acceptance():
                 return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
         generation = self.try_admit(identity)
@@ -512,7 +523,13 @@ class SpeechLifecycleCoordinator:
         forwarded_at = self._clock.now()
         self._arm(token, forwarded_at + self._grace, self._on_interruption_timeout)
 
-    def release_generation(self, token: str, *, notify: bool = True) -> None:
+    def release_generation(
+        self,
+        token: str,
+        *,
+        notify: bool = True,
+        disposition: DeliveryDisposition = DeliveryDisposition.DELIVERY_UNKNOWN,
+    ) -> None:
         """Free the slot for a generation the scheduler has already observed
         reach a terminal outcome directly (a completed/unknown delivery
         reported through the scheduler's own bookkeeping rather than a
@@ -520,13 +537,20 @@ class SpeechLifecycleCoordinator:
         terminal or unknown -- when a coordinator-driven frame flow already
         terminalized it, this call simply confirms what already happened.
 
+        ``disposition`` records what the caller actually observed; a clean
+        delivery passes ``DELIVERY_COMPLETED`` rather than letting the
+        unknown-delivery default stand in for it.
+
         ``notify=False`` frees the slot without dispatching ``on_terminal``:
         for a caller already inside its own admission attempt (a submission
-        failure raised from within ``start_next``), firing the terminal
-        callback here would re-enter admission for the same still-failing
-        item before the original caller has had a chance to react.
+        failure raised from within ``start_next``), ``on_terminal`` re-probes
+        the whole queue, including the work-item key whose submission just
+        failed and whose owner is about to re-queue a replacement item. Such
+        a caller owns the retry for its own key and must advance only the
+        *other* pending keys itself (see
+        ``SpeechScheduler._schedule_queue_advance``).
         """
-        terminal = self._terminalize_state(token, DeliveryDisposition.DELIVERY_UNKNOWN)
+        terminal = self._terminalize_state(token, disposition)
         if terminal is not None and notify:
             self._schedule(
                 self._call(self._on_terminal, token, terminal.identity, terminal.disposition)

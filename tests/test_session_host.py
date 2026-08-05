@@ -93,7 +93,11 @@ def test_session_host_adopts_or_rejects_the_coordinator_registry() -> None:
 
 def test_replacement_interrupts_only_old_connection_speech_and_keeps_result_history() -> None:
     async def run() -> None:
-        host = SessionHost()
+        # A speakable connection: with no TTS lane at all, speech now
+        # terminalizes before admission (nothing could ever hand it to a
+        # provider), so there would be no active utterance for the
+        # replacement to interrupt.
+        host = SessionHost(tts=object())
         host.state.set_worker(
             WorkerState(
                 worker_id="worker-weather",
@@ -110,6 +114,7 @@ def test_replacement_interrupts_only_old_connection_speech_and_keeps_result_hist
                 "snapshot_sequence": 0,
             }
         )
+        first.worker = _FakeLateResultWorker()
         item = first.scheduler.enqueue(
             result_id="result-1",
             work_item_id="work-1",
@@ -958,7 +963,10 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
     permanently false for any connection that ever admitted an item."""
 
     async def run() -> None:
-        host = SessionHost()
+        # Speakable: an item can only be admitted and drained on a connection
+        # that has a TTS lane; with none, admission is terminal before it
+        # starts.
+        host = SessionHost(tts=object())
         origin = await host.connect(
             {
                 "session_id": host.state.session_id,
@@ -967,11 +975,13 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
                 "snapshot_sequence": 0,
             }
         )
+        origin.worker = _FakeLateResultWorker()
         drained = origin.scheduler.enqueue(
             work_item_id="work-earlier",
             run_id="run-earlier",
             result_id="result-earlier",
             text="an earlier answer",
+            origin_epoch=1,
         )
         admitted = await origin.scheduler.start_next("work-earlier")
         assert admitted is not None and admitted.utterance_id == drained.utterance_id

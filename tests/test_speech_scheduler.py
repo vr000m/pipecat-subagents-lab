@@ -13,6 +13,7 @@ import asyncio
 from server.contracts import DeliveryState
 from server.session_state import SessionState
 from server.speech_lifecycle import (
+    DeliveryDisposition,
     GenerationIdentity,
     ManualTimerScheduler,
     SpeechLifecycleCoordinator,
@@ -240,28 +241,38 @@ def test_synthesis_end_is_not_completion_and_unknown_delivery_is_terminal() -> N
 
 
 def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:
-    calls = 0
+    async def run() -> None:
+        calls = 0
 
-    async def speak(_item):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("provider unavailable")
+        async def speak(_item):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("provider unavailable")
 
-    scheduler = _scheduler(speak=speak)
-    first = enqueue(scheduler, "work-1", "first")
-    second = enqueue(scheduler, "work-2", "second")
+        scheduler = _scheduler(speak=speak)
+        first = enqueue(scheduler, "work-1", "first")
+        second = enqueue(scheduler, "work-2", "second")
 
-    try:
-        asyncio.run(scheduler.start_next())
-    except RuntimeError as exc:
-        assert str(exc) == "provider unavailable"
-    else:
-        raise AssertionError("speech provider failure was swallowed")
+        try:
+            await scheduler.start_next("work-1")
+        except RuntimeError as exc:
+            assert str(exc) == "provider unavailable"
+        else:
+            raise AssertionError("speech provider failure was swallowed")
 
-    assert scheduler.active is None
-    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
-    assert asyncio.run(scheduler.start_next()).utterance_id == second.utterance_id
+        # The lease is released synchronously with the failure; the next
+        # item is admitted by the scheduler's own deferred re-probe.
+        assert scheduler.active is None
+        assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert scheduler.active is not None
+        assert scheduler.active.item.utterance_id == second.utterance_id
+
+    asyncio.run(run())
 
 
 def test_speech_submission_and_cleanup_failure_release_only_after_teardown() -> None:
@@ -538,3 +549,121 @@ def test_pending_work_item_ids_reports_only_non_empty_queues_and_honours_exclude
 
     assert scheduler.pending_work_item_ids() == frozenset({"ack-turn-1", "work-1-0"})
     assert scheduler.pending_work_item_ids(exclude="ack-turn-1") == frozenset({"work-1-0"})
+
+
+def test_no_tts_result_never_occupies_the_slot_waiting_for_the_start_timeout() -> None:
+    """I2: ``_commit_and_speak(..., require_tts=False)`` enqueues the
+    direct/unsupported/clarify replies on a connection with no TTS lane, so
+    ``speak`` is ``None``. Admitting such an item would arm
+    ``speech_start_timeout_seconds`` on a generation that structurally cannot
+    be handed to a provider; it must terminalize before admission instead."""
+    lifecycle = _lifecycle(tts_available=False)
+    scheduler = _scheduler(lifecycle=lifecycle, speak=None)
+    first = enqueue(scheduler, "work-1", "direct answer")
+    second = enqueue(scheduler, "work-2", "clarify")
+
+    assert asyncio.run(scheduler.start_next("work-1")) is None
+    assert lifecycle.occupied is False
+    assert scheduler.active is None
+    assert lifecycle._timer_handles == {}
+    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+    assert scheduler.pending_work_item_ids() == frozenset({"work-2"})
+
+    # The next item is handled in the same way, immediately: nothing had to
+    # wait for a start-timeout to expire before the slot could be reused.
+    assert asyncio.run(scheduler.start_next("work-2")) is None
+    assert scheduler.state.speech[second.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+    assert scheduler.pending_work_item_ids() == frozenset()
+
+
+def test_submission_failure_advances_other_pending_work_without_a_further_start_next() -> None:
+    """I10: the submission-failure path frees the coordinator slot with
+    ``notify=False``, so the coordinator's ``on_terminal`` -- the only other
+    reactive re-probe of the queue when the slot frees -- never fires. Items
+    queued under another work-item key would otherwise stall until some
+    unrelated caller happened to call ``start_next`` again."""
+
+    async def run() -> None:
+        calls = 0
+
+        async def speak(_item) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("provider unavailable")
+
+        scheduler = _scheduler(speak=speak)
+        first = enqueue(scheduler, "work-1", "first")
+        second = enqueue(scheduler, "work-2", "second")
+
+        try:
+            await scheduler.start_next("work-1")
+        except RuntimeError as exc:
+            assert str(exc) == "provider unavailable"
+        else:
+            raise AssertionError("speech provider failure was swallowed")
+
+        # No further explicit start_next: the scheduler's own deferred
+        # re-probe is the only thing that may advance the queue here.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+        assert scheduler.active is not None
+        assert scheduler.active.item.utterance_id == second.utterance_id
+
+    asyncio.run(run())
+
+
+def test_submission_failure_leaves_its_own_work_item_key_for_its_owner_to_retry() -> None:
+    """The failed item's own key is excluded from the deferred re-probe: its
+    owner catches the propagating exception and decides whether to re-queue
+    (the early-ack retry path in ``pipeline._schedule_ack_admission``), so a
+    replacement item queued under that key must still be there afterwards."""
+
+    async def run() -> None:
+        async def speak(_item) -> None:
+            raise RuntimeError("provider unavailable")
+
+        scheduler = _scheduler(speak=speak)
+        enqueue(scheduler, "work-1", "first")
+
+        try:
+            await scheduler.start_next("work-1")
+        except RuntimeError:
+            retry = enqueue(scheduler, "work-1", "retry")
+        else:
+            raise AssertionError("speech provider failure was swallowed")
+
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert scheduler.active is None
+        assert scheduler.pending_work_item_ids() == frozenset({"work-1"})
+        assert scheduler._queues["work-1"][0].utterance_id == retry.utterance_id
+
+    asyncio.run(run())
+
+
+def test_clean_delivery_reports_a_completed_terminal_disposition() -> None:
+    """M1: the coordinator-internal disposition for a completed delivery must
+    not be recorded as DELIVERY_UNKNOWN."""
+
+    async def run() -> None:
+        dispositions: list[DeliveryDisposition] = []
+
+        def on_terminal(_token, _identity, disposition) -> None:
+            dispositions.append(disposition)
+
+        lifecycle = _lifecycle(on_terminal=on_terminal)
+        scheduler = _scheduler(lifecycle=lifecycle)
+        item = enqueue(scheduler, "work-1", "answer")
+        await scheduler.start_next()
+
+        scheduler.delivery_completed(item.utterance_id)
+        await asyncio.sleep(0)
+
+        assert dispositions == [DeliveryDisposition.DELIVERY_COMPLETED]
+        assert scheduler.state.speech[item.utterance_id].state == DeliveryState.DELIVERY_COMPLETED
+
+    asyncio.run(run())

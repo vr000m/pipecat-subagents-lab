@@ -13,6 +13,7 @@ from loguru import logger
 from .contracts import DeliveryState
 from .session_state import SessionState
 from .speech_lifecycle import (
+    DeliveryDisposition,
     GenerationIdentity,
     PreAdmissionTerminal,
     PreAdmissionTerminalReason,
@@ -77,6 +78,7 @@ class SpeechScheduler:
         self._paused: dict[str, SpeechItem] = {}
         self._provider_contexts: dict[str, str] = {}
         self._stop_tasks: set[asyncio.Future[Any]] = set()
+        self._advance_tasks: set[asyncio.Future[Any]] = set()
         self._ack_index: dict[str, str] = {}
 
     def _signal_stop(self, item: SpeechItem) -> None:
@@ -269,13 +271,61 @@ class SpeechScheduler:
             # to ever wait on, so the slot frees immediately rather than
             # waiting on an acknowledgement that structurally cannot arrive.
             # notify=False: this call is still inside start_next's own
-            # admission attempt, so firing on_terminal here would re-enter
-            # admission for the same still-failing item before the caller
-            # that's about to receive this exception has a chance to react.
+            # admission attempt, and on_terminal re-probes every queue key --
+            # including this item's own key, whose owner is about to re-queue
+            # a replacement item it expects to still be queued. The freed slot
+            # must still be re-probed for the *other* pending keys, which
+            # nothing else would do until an unrelated caller happened to call
+            # start_next again; _schedule_queue_advance does exactly that,
+            # deferred, so the original exception propagates first.
             self.lifecycle.release_generation(token, notify=False)
             self._release(item.utterance_id)
+            self._schedule_queue_advance(exclude=item.work_item_id)
             raise
         return item
+
+    def _schedule_queue_advance(self, *, exclude: str) -> None:
+        """Re-probe the queue once, on a later tick, after a submission
+        failure freed the slot.
+
+        The coordinator's ``on_terminal`` callback is the only other reactive
+        re-probe when the slot frees, and the submission-failure path
+        deliberately suppresses it (see ``release_generation``). Without this,
+        every item queued under another work-item key stalls until some
+        unrelated caller happens to call ``start_next`` again.
+
+        ``exclude`` is the failed item's own key: its owner catches the
+        propagating exception and decides whether to re-queue, so this must
+        not race that decision. Admission is deferred to a task so the
+        original exception reaches that owner first, and any failure of the
+        advance itself is swallowed -- it is a best-effort re-probe, and the
+        newly admitted item's own progress bookkeeping already recorded it.
+        """
+
+        async def advance() -> None:
+            try:
+                key = next(
+                    (
+                        candidate
+                        for candidate, queue in self._queues.items()
+                        if queue and candidate != exclude
+                    ),
+                    None,
+                )
+                if key is None:
+                    return
+                await self.start_next(key)
+            except BaseException:  # noqa: BLE001 - best-effort re-probe; never surfaces to a caller
+                logger.opt(exception=True).debug(
+                    "queue advance after a speech submission failure did not start an item"
+                )
+
+        try:
+            task = asyncio.ensure_future(advance())
+        except RuntimeError:  # no running loop: nothing to advance onto
+            return
+        self._advance_tasks.add(task)
+        task.add_done_callback(self._advance_tasks.discard)
 
     def _discard_from_queue(self, item: SpeechItem) -> None:
         queue = self._queues.get(item.work_item_id)
@@ -330,7 +380,9 @@ class SpeechScheduler:
         token = self._active.token if self._active is not None else None
         self._emit_progress(item, DeliveryState.DELIVERY_COMPLETED)
         if token is not None:
-            self.lifecycle.release_generation(token)
+            self.lifecycle.release_generation(
+                token, disposition=DeliveryDisposition.DELIVERY_COMPLETED
+            )
         self._release(utterance_id)
 
     def delivery_unknown(self, utterance_id: str) -> None:
