@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -271,17 +271,20 @@ def _work_status_for_outcome(
     ``SessionHost.commit_late_result_once``'s finalization block, so the two
     can never drift apart. Precedence mirrors the commit contract:
     cancellation classifies the work item regardless of whether its result
-    additionally cleared the commit fences; otherwise only an outcome that
-    both completed *and* committed is ``result_ready``, and everything else
-    terminal is ``failed``. ``None`` means "no status to emit" (no outcome
-    was ever assigned). ``terminal_reason`` is carried only for a
-    retention-rejected terminal, the sole reason either site can name.
+    additionally cleared the commit fences; otherwise an outcome that both
+    committed and delivered a real committed result -- ``completed``, or a
+    worker-raised ``clarify``/``declined`` (both commit and speak a canonical
+    result of their own, so the work item is just as done as a completed
+    search) -- is ``result_ready``, and everything else terminal is
+    ``failed``. ``None`` means "no status to emit" (no outcome was ever
+    assigned). ``terminal_reason`` is carried only for a retention-rejected
+    terminal, the sole reason either site can name.
     """
     if cancelled:
         return "cancelled", None
     if outcome_label is None:
         return None
-    if outcome_label == "completed" and committed:
+    if outcome_label in {"completed", "clarify", "declined"} and committed:
         return "result_ready", None
     return "failed", ("retention_rejected" if terminal_kind == "retention_rejected" else None)
 
@@ -449,10 +452,20 @@ class SessionHost:
         # The coordinator is the other config holder in this object graph; a
         # divergent one is a split-brain, since the host reads every switch
         # (timeouts included) off ``self.config``. Fail fast at construction
-        # rather than letting two Configs drive one session.
+        # rather than letting two Configs drive one session. WorkItemCoordinator's
+        # own constructor is allowed to override max_work_items_per_turn and
+        # multi_intent_wait_timeout_ms onto whatever Config it was given (see
+        # its docstring/tests), so those two fields are coordinator-owned and
+        # excluded from this comparison; every other field must still match.
         coordinator_config = getattr(coordinator, "config", None)
-        if coordinator_config is not None and coordinator_config != self.config:
-            raise ValueError("SessionHost config conflicts with the coordinator's Config")
+        if coordinator_config is not None:
+            comparable_coordinator_config = replace(
+                coordinator_config,
+                max_work_items_per_turn=self.config.max_work_items_per_turn,
+                multi_intent_wait_timeout_ms=self.config.multi_intent_wait_timeout_ms,
+            )
+            if comparable_coordinator_config != self.config:
+                raise ValueError("SessionHost config conflicts with the coordinator's Config")
         self.feature_policy = feature_policy or FeaturePolicy.from_config(self.config)
         # The immutable evidence-gate verdict handed in by _default_session_host
         # (via server.config.load_promotion_manifest); missing/None is treated
@@ -1467,7 +1480,7 @@ class SessionHost:
             # it when the late result lands. Only an actual cancellation
             # settles it here.
             retained_still_open = child_outcome_label == "retained" and not was_cancelled
-            if child_outcome_label not in {"clarify", "declined"} and not retained_still_open:
+            if not retained_still_open:
                 derived = _work_status_for_outcome(
                     child_outcome_label,
                     cancelled=was_cancelled,
@@ -1656,7 +1669,7 @@ class SessionHost:
                     state="background",
                     origin_epoch=origin_epoch,
                 )
-            elif child_outcome_label not in {"clarify", "declined"}:
+            else:
                 derived = _work_status_for_outcome(
                     child_outcome_label,
                     cancelled=was_cancelled,
@@ -1944,23 +1957,22 @@ class SessionHost:
                     result_id=final_result.result_id,
                 )
                 item_work_item_id = f"work-{turn_id}-{index}"
-                if item_outcome not in {"clarify", "declined"}:
-                    derived = _work_status_for_outcome(
-                        item_outcome,
-                        cancelled=item_work_item_id in self._cancelled_work_items,
-                        terminal_kind=item_outcome,
+                derived = _work_status_for_outcome(
+                    item_outcome,
+                    cancelled=item_work_item_id in self._cancelled_work_items,
+                    terminal_kind=item_outcome,
+                )
+                if derived is not None:
+                    status_state, status_reason = derived
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=item_work_item_id,
+                        parent_work_item_id=parent_work_item_id,
+                        worker_id=worker_id,
+                        state=status_state,
+                        origin_epoch=origin_epoch,
+                        terminal_reason=status_reason,
                     )
-                    if derived is not None:
-                        status_state, status_reason = derived
-                        self._emit_work_status(
-                            turn_id=turn_id,
-                            work_item_id=item_work_item_id,
-                            parent_work_item_id=parent_work_item_id,
-                            worker_id=worker_id,
-                            state=status_state,
-                            origin_epoch=origin_epoch,
-                            terminal_reason=status_reason,
-                        )
             for work_item_id in submitted.pending_work_item_ids:
                 matched = index_for_work_item_id.get(work_item_id)
                 if matched is None:

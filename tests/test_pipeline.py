@@ -5883,7 +5883,7 @@ def _reference_delegated_child_site(
 ) -> tuple[str, str | None]:
     if was_cancelled:
         return "cancelled", None
-    if child_outcome_label == "completed":
+    if child_outcome_label in {"completed", "clarify", "declined"}:
         return "result_ready", None
     return (
         "failed",
@@ -6133,6 +6133,64 @@ def test_multi_intent_mixed_terminal_children_aggregate_to_failed_parent() -> No
     asyncio.run(run())
 
 
+def test_multi_intent_declined_child_still_terminates_the_parent_aggregate() -> None:
+    """A worker-raised WorkerDeclined still commits and speaks its own
+    canonical result (see ``WorkerDeclined`` handling in
+    ``_handle_multi_intent``), so the child's work item is done -- the parent
+    aggregate must reach ``result_ready`` rather than staying stuck at
+    ``searching`` forever."""
+
+    async def run() -> None:
+        worker = DecliningResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(_text: str, _catalogue: object) -> object:
+                decision = type("Decision", (), {"action": "existing_worker"})()
+                return type("Envelope", (), {"decision": decision, "prose": None})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome",
+            (),
+            {"work_items": ("search it",), "pending_dialogue": None},
+        )()
+
+        await host._handle_multi_intent(
+            outcome,
+            "",
+            origin,
+            "turn-declined",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-declined"),
+        )
+
+        assert _work_status_states(host) == ["routing", "searching", "result_ready"]
+        statuses = host.state.work_status_snapshot()
+        assert statuses[0].state == "result_ready"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_retained_foreground_child_records_background_even_without_capability() -> None:
     """I7: the ledger must record ``background`` for a retained child on a
     non-capable connection too. The wire filter lives in the observer, so
@@ -6317,6 +6375,83 @@ def test_cancel_status_sweep_is_idempotent_for_already_terminal_children() -> No
 
         assert _work_status_states(host) == settled
         assert host.state.work_status_snapshot()[0].state == "result_ready"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_of_retained_child_after_turn_task_returns_emits_terminal_status() -> None:
+    """Review-gauntlet round-1 follow-up: a work item retained as background
+    work (its owning multi-intent turn task has already returned) must still
+    reach a terminal work-status when cancelled through the host's
+    ``cancel_turn_or_child`` API -- the real entrypoint a "cancel work-item-X"
+    voice command uses. This path is distinct from ``_handle_multi_intent``'s
+    own ``except asyncio.CancelledError`` handler, which only covers
+    cancellation of the turn's *own* still-running task."""
+
+    async def run() -> None:
+        class SlowWorker(ResultWorker):
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                self.started.set()
+                await asyncio.Event().wait()  # only ends via cancellation
+                return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+        worker = SlowWorker()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(
+                    registry=_FanInRegistry(),
+                    router=_FanInRouter(),
+                    config=Config(multi_intent_wait_timeout_ms=1, max_work_items_per_turn=4),
+                )
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+        coordinator = Coordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        turn_id = "turn-retained-cancel"
+        parent_work_item_id = f"work-{turn_id}"
+        child_work_item_id = f"work-{turn_id}-0"
+        turn = asyncio.create_task(
+            host._handle_multi_intent(
+                _multi_intent_outcome("slow item"),
+                "",
+                origin,
+                turn_id,
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+            )
+        )
+        await asyncio.wait_for(worker.started.wait(), 1)
+        await turn  # the owning multi-intent turn task fully returns; the sole
+        # child stays retained as background work
+
+        assert child_work_item_id in host._retained_recorders
+        statuses = {s.work_item_id: s.state for s in host.state.work_status_snapshot()}
+        assert statuses[parent_work_item_id] == "background"
+
+        cancelled_work, _ = await host.cancel_turn_or_child(turn_id, child_work_item_id)
+        assert child_work_item_id in cancelled_work
+
+        for _ in range(50):
+            statuses = {s.work_item_id: s.state for s in host.state.work_status_snapshot()}
+            if statuses.get(parent_work_item_id) == "cancelled":
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail(
+                "no terminal work-status emitted for a child cancelled after its owning "
+                f"turn task returned; last observed state={statuses.get(parent_work_item_id)!r}"
+            )
+
         await host.shutdown()
 
     asyncio.run(run())

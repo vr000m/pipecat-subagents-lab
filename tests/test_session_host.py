@@ -351,6 +351,31 @@ def test_session_host_accepts_a_coordinator_whose_config_matches() -> None:
     assert host.coordinator is coordinator
 
 
+def test_session_host_accepts_a_coordinator_whose_config_only_diverges_via_its_own_overrides() -> (
+    None
+):
+    """WorkItemCoordinator's constructor is allowed to layer
+    max_work_items_per_turn/multi_intent_wait_timeout_ms overrides onto
+    whatever Config it was handed (see test_work_item_coordinator.py's
+    test_constructor_overrides_preserve_pending_dialogue_timeout). Passing
+    that same original config to SessionHost must not be treated as a
+    conflict just because those two coordinator-owned fields differ."""
+    from server.config import Config
+    from server.work_item_coordinator import WorkItemCoordinator
+
+    config = Config(pending_dialogue_timeout_seconds=45)
+    coordinator = WorkItemCoordinator(config=config, max_work_items_per_turn=3)
+
+    host = SessionHost(
+        registry=WorkerRegistry(config=config),
+        config=config,
+        coordinator=coordinator,
+    )
+
+    assert host.config == config
+    assert host.coordinator.config.max_work_items_per_turn == 3
+
+
 def test_session_host_accepts_a_coordinator_without_any_config_attribute() -> None:
     from server.config import Config
 
