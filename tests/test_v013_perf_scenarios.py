@@ -343,8 +343,13 @@ def test_phase0_fixture_produces_a_schema_valid_dated_artifact(tmp_path: Path) -
 
 def test_phase0_writes_the_committed_docs_benchmarks_artifact() -> None:
     """Produce the dated, credential-free artifact under docs/benchmarks/ and
-    validate it in place, per the Phase 0 completion gate."""
-    records = build_phase0_fixture()
+    validate it in place, per the Phase 0 completion gate.
+
+    Uses a fixed run_id (rather than build_phase0_fixture's default random
+    uuid) so re-running this test does not churn the committed artifact with
+    a no-op diff.
+    """
+    records = build_phase0_fixture(run_id="phase0-fixture-committed")
     ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
     ARTIFACT_PATH.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
