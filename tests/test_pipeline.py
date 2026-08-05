@@ -34,7 +34,7 @@ from server.pipeline import (
     build_pipeline,
     framework_bridge,
 )
-from server.registry import UnsupportedWorkerType
+from server.registry import UnsupportedWorkerType, WorkerRegistry
 from server.services.tts import CorrelatedTTSSpeakFrame
 from server.speech_lifecycle import (
     CONNECTION_LOCAL_FRAMES,
@@ -1982,6 +1982,8 @@ def test_direct_search_timeout_transfers_to_background_and_commits_late_result()
 
         coordinator = RetainingRoutedCoordinator()
         host = SessionHost(
+            registry=WorkerRegistry(config=coordinator.config),
+            config=coordinator.config,
             runner_factory=LifecycleRunner,
             coordinator=coordinator,
         )
@@ -2020,6 +2022,8 @@ def test_rejected_direct_search_does_not_claim_background_continuation() -> None
                 return False
 
         host = SessionHost(
+            registry=WorkerRegistry(config=RejectingCoordinator.config),
+            config=RejectingCoordinator.config,
             runner_factory=LifecycleRunner,
             coordinator=RejectingCoordinator(worker),
         )
@@ -3380,7 +3384,11 @@ def test_delegated_foreground_timeout_emits_retained_parent_and_child_then_backg
         sink = CollectingMeasurementSink()
         coordinator = RetainingRoutedCoordinator()
         host = SessionHost(
-            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+            registry=WorkerRegistry(config=coordinator.config),
+            config=coordinator.config,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+            measurement_sink=sink,
         )
         await host.connect(connection_handshake(host, 1))
 
@@ -4326,7 +4334,11 @@ def test_shutdown_finalizes_open_retained_recorder_after_coordinator_settles() -
 
         coordinator = RetainingRoutedCoordinator()
         host = SessionHost(
-            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+            registry=WorkerRegistry(config=coordinator.config),
+            config=coordinator.config,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+            measurement_sink=sink,
         )
         await host.connect(connection_handshake(host, 1))
 
@@ -4383,7 +4395,11 @@ def test_retained_background_ms_spans_dispatch_to_completion_for_late_callbacks(
 
         coordinator = RetainingRoutedCoordinator()
         host = SessionHost(
-            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+            registry=WorkerRegistry(config=coordinator.config),
+            config=coordinator.config,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+            measurement_sink=sink,
         )
         await host.connect(connection_handshake(host, 1))
 
@@ -6149,7 +6165,12 @@ def test_retained_foreground_child_records_background_even_without_capability() 
                 await self.owner.shutdown()
 
         coordinator = RetainingRoutedCoordinator()
-        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        host = SessionHost(
+            registry=WorkerRegistry(config=coordinator.config),
+            config=coordinator.config,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
         origin = await host.connect(connection_handshake(host, 1))
         assert not origin.supports_work_status
 
@@ -6296,6 +6317,37 @@ def test_cancel_status_sweep_is_idempotent_for_already_terminal_children() -> No
 
         assert _work_status_states(host) == settled
         assert host.state.work_status_snapshot()[0].state == "result_ready"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_foreground_search_timeout_comes_from_the_host_config_not_the_coordinator() -> None:
+    """``foreground_search_timeout_seconds`` used to be read off
+    ``coordinator.config`` first, so a coordinator without a config of its own
+    silently fell back to the hard-coded 15.0s default instead of the host's
+    canonical Config."""
+
+    async def run() -> None:
+        recorded: list[float] = []
+
+        class RecordingHost(SessionHost):
+            async def _search_with_timeout(self, *args: object, **kwargs: object) -> object:
+                recorded.append(kwargs["timeout"])  # type: ignore[arg-type]
+                return await super()._search_with_timeout(*args, **kwargs)  # type: ignore[arg-type]
+
+        config = Config(foreground_search_timeout_seconds=0.75)
+        host = RecordingHost(
+            registry=WorkerRegistry(config=config),
+            config=config,
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("what is the weather?")
+
+        assert recorded == [0.75]
         await host.shutdown()
 
     asyncio.run(run())

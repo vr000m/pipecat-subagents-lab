@@ -446,6 +446,13 @@ class SessionHost:
         if config is not None and registry_config is not None and registry_config != config:
             raise ValueError("SessionHost config conflicts with the registry's Config")
         self.config = config or registry_config or Config()
+        # The coordinator is the other config holder in this object graph; a
+        # divergent one is a split-brain, since the host reads every switch
+        # (timeouts included) off ``self.config``. Fail fast at construction
+        # rather than letting two Configs drive one session.
+        coordinator_config = getattr(coordinator, "config", None)
+        if coordinator_config is not None and coordinator_config != self.config:
+            raise ValueError("SessionHost config conflicts with the coordinator's Config")
         self.feature_policy = feature_policy or FeaturePolicy.from_config(self.config)
         # The immutable evidence-gate verdict handed in by _default_session_host
         # (via server.config.load_promotion_manifest); missing/None is treated
@@ -1367,12 +1374,7 @@ class SessionHost:
                     transcript,
                     turn_id=turn_id,
                     origin_epoch=origin_epoch,
-                    timeout=getattr(
-                        getattr(self.coordinator, "config", None)
-                        or getattr(self.registry, "config", None),
-                        "foreground_search_timeout_seconds",
-                        15.0,
-                    ),
+                    timeout=self.config.foreground_search_timeout_seconds,
                     worker_id=worker_id,
                     work_item_id=work_item_id,
                     task=search_task,
@@ -2808,11 +2810,7 @@ class SessionHost:
         if shutdowns:
             done, pending = await asyncio.wait(
                 shutdowns,
-                timeout=getattr(
-                    getattr(self.coordinator, "config", None),
-                    "shutdown_grace_seconds",
-                    2.0,
-                ),
+                timeout=self.config.shutdown_grace_seconds,
             )
             for task in pending:
                 task.cancel()

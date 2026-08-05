@@ -317,6 +317,94 @@ def test_session_host_rejects_a_registry_config_that_conflicts_with_the_injected
         raise AssertionError("a conflicting registry config was silently accepted")
 
 
+def test_session_host_rejects_a_coordinator_config_that_conflicts_with_the_host_config() -> None:
+    """The coordinator is a second config holder; a divergent one is a
+    split-brain (its ``Config`` used to drive foreground/shutdown timeouts
+    while every other switch came from ``self.config``). Construction must
+    fail fast instead."""
+    from server.config import Config
+
+    config = Config(enable_early_ack=True)
+    coordinator = type("Coordinator", (), {"config": Config(enable_early_ack=False)})()
+
+    with pytest.raises(ValueError, match="coordinator"):
+        SessionHost(
+            registry=WorkerRegistry(config=config),
+            config=config,
+            coordinator=coordinator,
+        )
+
+
+def test_session_host_accepts_a_coordinator_whose_config_matches() -> None:
+    from server.config import Config
+
+    config = Config(enable_early_ack=False)
+    coordinator = type("Coordinator", (), {"config": Config(enable_early_ack=False)})()
+
+    host = SessionHost(
+        registry=WorkerRegistry(config=config),
+        config=config,
+        coordinator=coordinator,
+    )
+
+    assert host.config == config
+    assert host.coordinator is coordinator
+
+
+def test_session_host_accepts_a_coordinator_without_any_config_attribute() -> None:
+    from server.config import Config
+
+    coordinator = type("Coordinator", (), {})()
+    config = Config(enable_early_ack=False)
+
+    host = SessionHost(
+        registry=WorkerRegistry(config=config),
+        config=config,
+        coordinator=coordinator,
+    )
+
+    assert host.config is config
+
+
+def test_shutdown_grace_period_comes_from_the_host_config_not_the_coordinator() -> None:
+    """``shutdown_grace_seconds`` used to be read off ``coordinator.config``.
+    A coordinator with no config of its own must still honour the host's
+    configured grace period rather than silently falling back to the
+    hard-coded 2.0s default."""
+
+    async def run() -> None:
+        from server.config import Config
+
+        config = Config(shutdown_grace_seconds=0.01)
+        coordinator = type("Coordinator", (), {})()
+        host = SessionHost(
+            registry=WorkerRegistry(config=config),
+            config=config,
+            coordinator=coordinator,
+        )
+
+        async def never_finishes() -> None:
+            await asyncio.Event().wait()
+
+        hanging = asyncio.create_task(never_finishes())
+        host._background_shutdowns.add(hanging)
+
+        started = asyncio.get_running_loop().time()
+        await host.shutdown()
+        elapsed = asyncio.get_running_loop().time() - started
+
+        # The 2.0s fallback would blow straight through this bound.
+        assert elapsed < 1.0
+        # Let the cancellation requested by shutdown() actually land.
+        for _ in range(5):
+            if hanging.done():
+                break
+            await asyncio.sleep(0)
+        assert hanging.cancelled()
+
+    asyncio.run(run())
+
+
 def test_cancel_turn_or_child_removes_only_the_named_childs_speech_and_leaves_the_parent_ack() -> (
     None
 ):
