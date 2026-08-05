@@ -3,8 +3,21 @@
 
 Concrete metadata ownership (see the dev plan's Phase 2 section): CI's
 release/manifest job invokes this script with ``--shell-export`` against a
-clean, checked-out release tree and captures its four ``export`` lines with
-``eval`` before invoking ``scripts/validate_v013_evidence.py --write-manifest``.
+clean, checked-out release tree and appends its four ``KEY=VALUE`` lines to
+``$GITHUB_ENV`` before invoking
+``scripts/validate_v013_evidence.py --write-manifest``.
+
+``--shell-export`` prints bare ``NAME=value`` lines with **no** ``export``
+prefix, because GitHub Actions parses ``$GITHUB_ENV`` as literal
+``KEY=VALUE`` pairs and never evaluates it as shell; an ``export `` prefix
+would be absorbed into the variable *name*. The same bare form remains
+usable locally via ``eval "$(... --shell-export)"``, where each line is an
+ordinary shell assignment (shell-local rather than exported -- prefix the
+consuming command with ``export`` or use ``set -a`` if the child process
+needs them). Every emitted line is validated against
+``SHELL_EXPORT_LINE_RE`` before printing so no value can smuggle in
+whitespace, a newline, or shell metacharacters.
+
 Local dev/test never runs the release job, so ``--check-release-inputs`` (used
 by every phase's test command as a lightweight preflight) only proves the
 four values *can* be derived from the current checkout -- it does not require
@@ -12,9 +25,10 @@ a clean tree, matching the plan's "local dev/test may leave them unset and
 remains display-only" rule.
 
 ``PIPECAT_SOURCE_TREE_HASH`` is a deterministic filtered hash of the
-committed deployable runtime set: ``server/**``, ``web/src/**``,
-``shared/protocol.md``, the four runtime JSON schemas, package/build
-metadata, and lockfiles -- explicitly excluding ``docs/benchmarks/**``,
+committed deployable runtime set: ``server/**``, ``web/src/**`` (scripts and
+stylesheets), ``web/index.html``, ``shared/protocol.md``, the four runtime
+JSON schemas, package/build metadata, and both lockfiles (``web/bun.lock``
+and ``uv.lock``) -- explicitly excluding ``docs/benchmarks/**``,
 evidence ``v013-*`` schemas, test fixtures, scripts, and generated evidence.
 `server/config.py`'s loader and this emitter must use the same allowlist so
 neither can drift the runtime identity independently.
@@ -23,6 +37,7 @@ neither can drift the runtime identity independently.
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +57,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_TREE_GLOBS = (
     "server/**/*.py",
     "web/src/**/*.js",
+    "web/src/**/*.css",
+    "web/index.html",
     "shared/protocol.md",
     "shared/schemas/rtvi-message.json",
     "shared/schemas/snapshot-handshake.json",
@@ -50,7 +67,15 @@ RUNTIME_TREE_GLOBS = (
     "web/package.json",
     "web/bun.lock",
     "pyproject.toml",
+    "uv.lock",
 )
+
+# The exact shape every ``--shell-export`` line must have. GitHub Actions
+# reads ``$GITHUB_ENV`` as literal ``KEY=VALUE`` pairs (no shell evaluation),
+# so the line must carry no ``export `` prefix, no quoting and no
+# whitespace. Values here are hex digests and an ISO-8601 UTC timestamp, so
+# this charset is a defensive assertion rather than an expected rejection.
+SHELL_EXPORT_LINE_RE = re.compile(r"^[A-Z][A-Z0-9_]*=[A-Za-z0-9:.+-]+$")
 
 
 def _run_git(*args: str) -> str:
@@ -136,10 +161,22 @@ def shell_export() -> int:
     except Exception as exc:  # noqa: BLE001 - report and fail rather than emit partial exports
         print(f"FAIL: could not derive deployment metadata: {exc}", file=sys.stderr)
         return 1
-    print(f"export PIPECAT_SOURCE_COMMIT={commit}")
-    print(f"export PIPECAT_SOURCE_TREE_HASH={tree_hash}")
-    print(f"export PIPECAT_DEPLOYED_AT_UTC={deployed_at}")
-    print(f"export PIPECAT_FEATURE_POLICY_FINGERPRINT={fingerprint}")
+    lines = [
+        f"PIPECAT_SOURCE_COMMIT={commit}",
+        f"PIPECAT_SOURCE_TREE_HASH={tree_hash}",
+        f"PIPECAT_DEPLOYED_AT_UTC={deployed_at}",
+        f"PIPECAT_FEATURE_POLICY_FINGERPRINT={fingerprint}",
+    ]
+    for line in lines:
+        if not SHELL_EXPORT_LINE_RE.fullmatch(line):
+            name = line.split("=", 1)[0]
+            print(
+                f"FAIL: refusing to emit unsafe $GITHUB_ENV line for {name}",
+                file=sys.stderr,
+            )
+            return 1
+    for line in lines:
+        print(line)
     return 0
 
 
