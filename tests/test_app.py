@@ -2,21 +2,24 @@
 
 import asyncio
 import dataclasses
+import json as _json
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
 from pipecat.processors.frameworks.rtvi import RTVIObserverParams
+from starlette.requests import Request as _StarletteRequest
 
 import server.app as app_module
-from server.app import create_app
+from server.app import _handshake_from_query, create_app
 from server.config import Config
-from server.contracts import GroundedResult
+from server.contracts import GroundedResult, SnapshotHandshake
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
 from server.router import LazyRouterProvider, Router
@@ -855,14 +858,6 @@ assert handler_id in logger._core.handlers
 # JSON array of capability-name strings. These tests assert the CONTRACT the
 # plan describes; they may fail to import/run until server/app.py lands the
 # `capabilities`/raw-ASGI-validation extension.
-
-import json as _json
-from urllib.parse import quote
-
-from starlette.requests import Request as _StarletteRequest
-
-from server.app import _handshake_from_query
-from server.contracts import SnapshotHandshake
 
 
 def _raw_request(raw_query_string: bytes) -> _StarletteRequest:

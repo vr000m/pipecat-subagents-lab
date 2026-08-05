@@ -16,9 +16,11 @@ from .contracts import (
     RoutingState,
     RuntimeSnapshot,
     SpeechProgress,
+    TerminalReason,
     TranscriptEntry,
     WorkerState,
     WorkStatus,
+    WorkStatusState,
     legal_work_status_transition,
 )
 from .results import ResultLog
@@ -281,9 +283,9 @@ class SessionState:
         work_item_id: str,
         parent_work_item_id: str | None = None,
         worker_id: str | None = None,
-        state: str,
+        state: WorkStatusState,
         origin_epoch: int | None,
-        terminal_reason: str | None = None,
+        terminal_reason: TerminalReason | None = None,
     ) -> StateEvent | None:
         """Record one delegated child's status and re-emit the parent aggregate.
 
@@ -343,7 +345,7 @@ class SessionState:
         return self._emit("work_status", status.model_dump(mode="json"))
 
     @staticmethod
-    def _aggregate(children: list[WorkStatus]) -> tuple[str, str | None]:
+    def _aggregate(children: list[WorkStatus]) -> tuple[WorkStatusState, TerminalReason | None]:
         if any(child.state == "routing" for child in children):
             return "routing", None
         if any(child.state == "searching" for child in children):

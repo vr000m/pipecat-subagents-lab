@@ -21,8 +21,10 @@ from .contracts import (
     GroundedResult,
     RoutingDecision,
     RoutingState,
+    TerminalReason,
     TranscriptEntry,
     WorkerState,
+    WorkStatusState,
 )
 from .observers import RuntimeObserver
 from .perf_metrics import (
@@ -651,7 +653,7 @@ class SessionHost:
 
         pipeline = ConnectionPipeline(
             connection.epoch,
-            RuntimeObserver(self.state, connection.epoch, connection.capabilities),
+            RuntimeObserver(self.state, connection.epoch, frozenset(connection.capabilities)),
             SpeechScheduler(
                 self.state,
                 speak=queue_speech if connection_tts is not None else None,
@@ -2474,9 +2476,9 @@ class SessionHost:
         work_item_id: str,
         parent_work_item_id: str | None = None,
         worker_id: str | None = None,
-        state: str,
+        state: WorkStatusState,
         origin_epoch: int,
-        terminal_reason: str | None = None,
+        terminal_reason: TerminalReason | None = None,
     ) -> None:
         """Record one delegated child's coarse status (Phase 3).
 

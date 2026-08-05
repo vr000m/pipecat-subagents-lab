@@ -14,13 +14,16 @@ from server.contracts import (
     RoutingDecision,
     RoutingState,
     RuntimeSnapshot,
+    SnapshotHandshake,
     SpeechProgress,
     TranscriptEntry,
     WorkerState,
     WorkItemEvent,
     WorkItemState,
+    WorkStatus,
     validate_contract,
 )
+from server.contracts import WORK_STATUS_STATES as _IMPL_WORK_STATUS_STATES
 
 GROUNDED_RESULT_SCHEMA = json.loads(
     (Path(__file__).parents[1] / "shared" / "schemas" / "grounded-result.json").read_text()
@@ -439,15 +442,6 @@ def test_snapshot_is_versioned_monotonic_and_excludes_raw_prompts_or_logs() -> N
 # the closed v1.0 kind list; capability handshake gets a strict `capabilities`
 # field. These tests assert the CONTRACT the plan describes -- they may not
 # import successfully until server/contracts.py lands the new symbols.
-
-from server.contracts import SnapshotHandshake
-
-try:
-    from server.contracts import WORK_STATUS_STATES as _IMPL_WORK_STATUS_STATES
-    from server.contracts import WorkStatus
-except ImportError:  # pragma: no cover - contract not yet implemented
-    WorkStatus = None  # type: ignore[assignment]
-    _IMPL_WORK_STATUS_STATES = None  # type: ignore[assignment]
 
 WORK_STATUS_STATES = {"routing", "searching", "background", "result_ready", "failed", "cancelled"}
 LEGAL_TRANSITIONS = {
