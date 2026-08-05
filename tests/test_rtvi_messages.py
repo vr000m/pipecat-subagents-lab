@@ -400,7 +400,7 @@ def test_no_publisher_method_allocates_its_own_incremental_sequence_after_phase3
     allocate its own incremental sequence. `result`/`speech_progress` are
     caller-less; this migration either removes them or routes them through
     the supplied-sequence `incremental(...)` contract -- either disposition
-    is acceptable, but a self-incrementing `self._sequence + 1` path with no
+    is acceptable, but a self-incrementing `self._watermark + 1` path with no
     sequence_provider must not remain reachable from either method."""
     publisher = RTVIMessagePublisher(session_id="session-1", active_epoch=1)
     result_method = getattr(publisher, "result", None)
@@ -415,10 +415,52 @@ def test_no_publisher_method_allocates_its_own_incremental_sequence_after_phase3
         spoken_text="Rain is likely.",
         origin_epoch=1,
     )
-    before = publisher._sequence
+    before = publisher._watermark
     if result_method is not None:
         result_method(grounded, origin_epoch=1)
-    after = publisher._sequence
+    after = publisher._watermark
     # A caller-less method that still self-increments without a
     # sequence_provider is exactly the forbidden disposition.
     assert after == before or publisher._sequence_provider is not None
+
+
+# --- M10: _watermark is a watermark, not an allocator ---------------------
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_incremental_never_advances_the_watermark_past_the_supplied_sequence() -> None:
+    """M10: `incremental()` never allocates. It only clamps the watermark
+    upward to the caller-supplied sequence; a lower sequence leaves the
+    watermark untouched (and is still serialized as supplied)."""
+    publisher = RTVIMessagePublisher(session_id="session-m10", active_epoch=1)
+    status = WorkStatus(
+        turn_id="turn-1", work_item_id="work-1", state="routing", event_sequence=0, origin_epoch=1
+    )
+
+    assert publisher._watermark == 0
+    publisher.incremental("work_status", status.model_dump(mode="json"), sequence=7, origin_epoch=1)
+    assert publisher._watermark == 7, "clamps upward to the supplied sequence"
+
+    lower = publisher.incremental(
+        "work_status", status.model_dump(mode="json"), sequence=3, origin_epoch=1
+    )
+    assert publisher._watermark == 7, "never advances past, and never rolls back below"
+    assert lower is not None and lower.sequence == 3, "serializes the supplied sequence verbatim"
+
+
+def test_snapshot_is_the_sole_allocator_and_reads_the_sequence_provider() -> None:
+    """M10: `snapshot()` is the only allocation point; it takes its sequence
+    from `_sequence_provider` when one is installed, overriding the
+    watermark, and re-seeds the watermark from what it stamped."""
+    provided = [42]
+    publisher = RTVIMessagePublisher(
+        session_id="session-m10", active_epoch=1, sequence_provider=lambda: provided[0]
+    )
+    publisher.client_ready(epoch=1)
+
+    message = publisher.snapshot()
+
+    assert message is not None
+    assert message.sequence == 42
+    assert message.data["snapshot_sequence"] == 42
+    assert publisher._watermark == 42

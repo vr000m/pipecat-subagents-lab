@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .contracts import (
     CONTRACT_VERSION,
@@ -59,6 +59,7 @@ class RTVIMessage(BaseModel):
     kind: RTVIMessageKind
     data: dict[str, Any]
     origin_epoch: int = Field(ge=0)
+    _payload: Any = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def validate_versioned_payload(self) -> RTVIMessage:
@@ -78,10 +79,35 @@ class RTVIMessage(BaseModel):
             if payload.snapshot_sequence != self.sequence:
                 raise ValueError("snapshot_sequence must match envelope sequence")
         self.data = payload.model_dump(mode="json")
+        self._payload = payload
         return self
+
+    def wire_payload(self, *, include_work_status: bool = True) -> dict[str, Any]:
+        """Serialize the envelope for the wire.
+
+        Payload-level field projection is delegated to the validated payload
+        model -- see :meth:`RuntimeSnapshot.wire_payload` -- so the decision
+        about which fields reach the wire lives on the typed model and never
+        as an ad-hoc key removal at the call site.
+        """
+        frame = self.model_dump(mode="json")
+        if isinstance(self._payload, RuntimeSnapshot):
+            frame["data"] = self._payload.wire_payload(include_work_status=include_work_status)
+        return frame
 
 
 class RTVIMessagePublisher:
+    """Serializes RTVI envelopes for one connection.
+
+    ``_watermark`` is a watermark, not an allocator. :meth:`incremental`
+    never allocates a sequence: it serializes the caller-supplied sequence
+    verbatim (``RuntimeObserver`` owns the connection-projected counter) and
+    only clamps the watermark upward to it. :meth:`set_snapshot` likewise
+    only clamps upward from authoritative session state. :meth:`snapshot` is
+    the sole allocation point, and it allocates from ``_sequence_provider``
+    when one is installed, falling back to the watermark otherwise.
+    """
+
     def __init__(
         self,
         session_id: str,
@@ -90,7 +116,7 @@ class RTVIMessagePublisher:
     ) -> None:
         self.session_id, self.active_epoch = session_id, active_epoch
         RuntimeSnapshot.reset_monotonicity(session_id)
-        self._sequence = 0
+        self._watermark = 0
         self._sequence_provider = sequence_provider
         self._ready = False
         self._snapshot: RuntimeSnapshot | None = None
@@ -108,7 +134,7 @@ class RTVIMessagePublisher:
         """
         if origin_epoch != self.active_epoch:
             return None
-        self._sequence = max(self._sequence, sequence)
+        self._watermark = max(self._watermark, sequence)
         return RTVIMessage(
             session_id=self.session_id,
             sequence=sequence,
@@ -128,7 +154,7 @@ class RTVIMessagePublisher:
         self._snapshot = snapshot
         # Snapshot sequence is authoritative session state, not a publisher
         # sequence. Repeated snapshots do not invent state events.
-        self._sequence = max(self._sequence, snapshot.snapshot_sequence)
+        self._watermark = max(self._watermark, snapshot.snapshot_sequence)
 
     def snapshot(self) -> RTVIMessage | None:
         if not self._ready:
@@ -148,10 +174,10 @@ class RTVIMessagePublisher:
             }
         )
         sequence = (
-            self._sequence_provider() if self._sequence_provider is not None else self._sequence
+            self._sequence_provider() if self._sequence_provider is not None else self._watermark
         )
         data["snapshot_sequence"] = sequence
-        self._sequence = sequence
+        self._watermark = sequence
         return RTVIMessage(
             session_id=self.session_id,
             sequence=sequence,

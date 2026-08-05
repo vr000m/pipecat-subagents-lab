@@ -254,9 +254,9 @@ def test_snapshot_install_reseeds_projected_sequence_to_the_global_watermark() -
     observer = RuntimeObserver(state, epoch=1, capabilities=frozenset())
     observer.seed(state.sequence)
 
-    projected: list[dict] = []
+    projected: list[object] = []
 
-    def emit(event: dict) -> None:
+    def emit(event: object) -> None:
         projected.append(event)
 
     observer.subscribe(emit)
@@ -298,4 +298,68 @@ def test_snapshot_install_reseeds_projected_sequence_to_the_global_watermark() -
             origin_epoch=1,
         )
     )
-    assert projected[-1]["sequence"] == watermark + 1
+    assert projected[-1].sequence == watermark + 1  # type: ignore[attr-defined]
+
+
+# --- I13/M9: project() returns a typed ProjectedEvent -----------------------
+
+
+@pytest.mark.skipif(RuntimeObserver is None, reason="server.observers.RuntimeObserver missing")
+def test_project_returns_a_typed_projected_event_with_all_four_attributes() -> None:
+    """I13: `project()` is documented as returning a *typed* projected event;
+    it must return a `ProjectedEvent` dataclass, not a bare dict, so consumers
+    bind by attribute rather than by string key."""
+    from server.observers import ProjectedEvent
+
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    observer = RuntimeObserver(state, epoch=1)
+    observer.seed(5)
+
+    captured: list[object] = []
+    observer.subscribe(captured.append)
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-typed",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert isinstance(event, ProjectedEvent)
+    assert event.kind == "worker"
+    assert event.sequence == 6
+    assert event.origin_epoch == 1
+    assert isinstance(event.data, dict)
+    assert event.data["worker_id"] == "worker-typed"
+
+
+@pytest.mark.skipif(RuntimeObserver is None, reason="server.observers.RuntimeObserver missing")
+def test_work_status_visibility_flips_with_the_negotiated_capability() -> None:
+    """M9: `work_status` is capability-gated, not always-visible. The gate is
+    the only admission path for the kind, and it must flip strictly with
+    `supports_work_status`."""
+    from server.observers import ProjectedEvent
+
+    def project_one_work_status(capabilities: frozenset[str]) -> object:
+        state = SessionState(session_id="session-1")
+        state.active_epoch = 1
+        observer = RuntimeObserver(state, epoch=1, capabilities=capabilities)
+        observer.seed(state.sequence)
+        captured: list[object] = []
+        observer.subscribe(captured.append)
+        state.set_child_work_status(
+            turn_id="turn-1", work_item_id="work-1", state="searching", origin_epoch=1
+        )
+        return captured
+
+    capable = project_one_work_status(frozenset({"work_status_v1"}))
+    assert len(capable) == 1
+    assert isinstance(capable[0], ProjectedEvent)
+    assert capable[0].kind == "work_status"
+
+    assert project_one_work_status(frozenset()) == []

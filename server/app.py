@@ -37,6 +37,7 @@ from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config, load_promotion_manifest
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
+from .observers import ProjectedEvent
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
@@ -346,14 +347,14 @@ async def _attach_connection(
         # (Phase 3 barrier ordering; see RuntimeObserver.seed).
         runtime.observer.seed(host.state.sequence)
 
-        async def emit_frame(projected: Any) -> None:
+        async def emit_frame(projected: ProjectedEvent) -> None:
             if not host.accepts(runtime.epoch):
                 return
             message = publisher.incremental(
-                projected["kind"],
-                projected["data"],
-                sequence=projected["sequence"],
-                origin_epoch=projected["origin_epoch"],
+                projected.kind,
+                projected.data,
+                sequence=projected.sequence,
+                origin_epoch=projected.origin_epoch,
             )
             if message is not None:
                 await worker.queue_frame(
@@ -399,13 +400,12 @@ async def _attach_connection(
                 # next incremental is snapshot_sequence + 1. No await may be
                 # introduced before this seed.
                 runtime.observer.seed(snapshot.sequence)
-                frame_data = snapshot.model_dump(mode="json")
-                if not runtime.supports_work_status:
-                    # Non-capable projections omit the status section
-                    # entirely (field absent, not an empty array) so the
-                    # frozen pre-Phase-3 runtime-snapshot schema still
-                    # validates this connection's snapshots (Requirements).
-                    frame_data.get("data", {}).pop("work_status", None)
+                # Non-capable projections omit the status section entirely
+                # (field absent, not an empty array) so the frozen
+                # pre-Phase-3 runtime-snapshot schema still validates this
+                # connection's snapshots (Requirements). The exclusion is
+                # owned by RuntimeSnapshot.wire_payload, not by this caller.
+                frame_data = snapshot.wire_payload(include_work_status=runtime.supports_work_status)
                 await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
 
         # WorkerRunner has no remove-workers API in the pinned wheel. Run each

@@ -191,11 +191,30 @@ class RuntimeSnapshot(StrictModel):
     routing: RoutingState | None = None
     transcript: list[TranscriptEntry] = Field(default_factory=list)
     origin_epoch: int | None = Field(default=None, ge=0)
-    # Present only for connections that negotiated the work_status_v1
-    # capability; non-capable projections omit this field entirely rather
-    # than serializing an empty list (see server/session_state.py).
+    # Two distinct gates govern this field, and they are not interchangeable:
+    #   * *content* -- ``SessionState.snapshot(include_work_status=...)``
+    #     decides whether the ledger is computed at all (a non-capable
+    #     projection carries an empty list on the model).
+    #   * *wire presence* -- :meth:`wire_payload` is the sole mechanism that
+    #     drops the key from the serialized frame, so a non-capable
+    #     connection's snapshot still validates against the frozen
+    #     pre-Phase-3 runtime-snapshot schema, which does not know the field.
+    # The model itself always has the attribute; never assume absence here.
     work_status: list[WorkStatus] = Field(default_factory=list)
     _highest_by_session: ClassVar[dict[str, int]] = {}
+
+    def wire_payload(self, *, include_work_status: bool) -> dict[str, Any]:
+        """Serialize for the wire, dropping ``work_status`` when not negotiated.
+
+        The single choke point for snapshot serialization. ``work_status`` is
+        excluded by name rather than via ``exclude_none``/``exclude_defaults``:
+        ``routing`` and ``origin_epoch`` are nullable but *required* by
+        shared/schemas/runtime-snapshot.json, so a blanket exclusion would
+        strip them and break schema validation.
+        """
+        return self.model_dump(
+            mode="json", exclude=None if include_work_status else {"work_status"}
+        )
 
     @classmethod
     def reset_monotonicity(cls, session_id: str) -> None:

@@ -525,6 +525,7 @@ async def _attach_fake_connection(
     startup_observers: list[RecordingFrameworkObserver],
     latency_observers: list[RecordingFrameworkObserver],
     worker_class: type = CapturingPipelineWorker,
+    capabilities: tuple[str, ...] = (),
 ) -> None:
     monkeypatch.setattr(app_module, "SmallWebRTCTransport", lambda *_args: FakeTransportForApp())
     monkeypatch.setattr(app_module, "SileroVADAnalyzer", lambda *, sample_rate: object())
@@ -562,6 +563,7 @@ async def _attach_fake_connection(
             resume_token=host.state.resume_token,
             proposed_epoch=1,
             snapshot_sequence=0,
+            capabilities=capabilities,
         ),
     )
 
@@ -1284,3 +1286,64 @@ def test_snapshot_install_reseeds_the_observer_projected_sequence() -> None:
         assert incrementals[0]["sequence"] == wire_snapshot_sequence + 1
 
     asyncio.run(run())
+
+
+# --- I12: wire_payload is the single choke point for work_status presence --
+
+
+def _snapshot_frame_data(*, capabilities: tuple[str, ...]) -> dict:
+    """Attach a fake connection, request a snapshot, return the wire frame."""
+
+    async def run() -> dict:
+        FrameCapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=FrameCapturingPipelineWorker,
+                capabilities=capabilities,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = FrameCapturingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+        await worker.rtvi.handlers["on_client_message"](
+            worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+        )
+        frame = worker.frames[-1]
+        assert frame["kind"] == "runtime_snapshot"
+        return frame
+
+    return asyncio.run(run())
+
+
+def test_non_capable_snapshot_omits_work_status_but_keeps_nullable_required_fields() -> None:
+    """I12: a non-capable connection's snapshot must omit `work_status`
+    entirely (field absent, not an empty array), while every other nullable
+    field the frozen schema marks *required* -- `routing`, `origin_epoch` --
+    stays present. This is the test that fails under a naive
+    `model_dump(exclude_none=True)` fix, which would strip `routing: None`
+    and break schema validation.
+    """
+    frame = _snapshot_frame_data(capabilities=())
+    data = frame["data"]
+
+    assert "work_status" not in data
+    assert "routing" in data and data["routing"] is None
+    assert "origin_epoch" in data
+
+
+def test_capable_snapshot_carries_the_work_status_field() -> None:
+    """I12: a connection that advertised `work_status_v1` keeps the field."""
+    frame = _snapshot_frame_data(capabilities=("work_status_v1",))
+    data = frame["data"]
+
+    assert "work_status" in data
+    assert isinstance(data["work_status"], list)

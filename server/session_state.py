@@ -393,6 +393,9 @@ class SessionState:
     def snapshot(
         self, origin_epoch: int | None = None, *, include_work_status: bool = False
     ) -> RuntimeSnapshot:
+        # ``include_work_status`` gates snapshot *content* only (whether the
+        # ledger is computed); wire *presence* of the field is decided later
+        # by ``RuntimeSnapshot.wire_payload(include_work_status=...)``.
         return RuntimeSnapshot(
             contract_version="v1.0",
             session_id=self.session_id,

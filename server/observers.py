@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from .contracts import RuntimeSnapshot
@@ -21,6 +22,28 @@ _ALWAYS_VISIBLE_KINDS = frozenset(
         "bot_transcript",
     }
 )
+# Kinds admitted only when the connection negotiated the matching capability.
+# Membership here is the *admission* half; the per-kind capability check in
+# ``RuntimeObserver._visible`` is the *gate* half. A kind must appear in
+# exactly one of these two sets.
+_CAPABILITY_GATED_KINDS = frozenset({"work_status"})
+_VISIBLE_KINDS = _ALWAYS_VISIBLE_KINDS | _CAPABILITY_GATED_KINDS
+
+
+@dataclass(frozen=True)
+class ProjectedEvent:
+    """One authoritative state event as projected onto a single connection.
+
+    ``sequence`` is the connection-local projected sequence assigned by
+    :meth:`RuntimeObserver.project`, not the global ``SessionState``
+    sequence; ``server/app.py`` hands it straight to
+    ``RTVIMessagePublisher.incremental(...)``, which serializes it verbatim.
+    """
+
+    kind: str
+    data: dict[str, Any]
+    sequence: int
+    origin_epoch: int
 
 
 class RuntimeObserver:
@@ -63,7 +86,7 @@ class RuntimeObserver:
             return False
         if event.kind == "work_status" and not self.supports_work_status:
             return False
-        return event.kind in _ALWAYS_VISIBLE_KINDS or event.kind == "work_status"
+        return event.kind in _VISIBLE_KINDS
 
     def seed(self, sequence: int) -> None:
         """Install the connection-local projected sequence at a snapshot watermark.
@@ -85,24 +108,24 @@ class RuntimeObserver:
         """
         self._projected_sequence = sequence
 
-    def project(self, event: StateEvent) -> dict[str, Any] | None:
+    def project(self, event: StateEvent) -> ProjectedEvent | None:
         """Return the typed projected event for a visible state event, or None."""
         if not self._visible(event):
             return None
         self._projected_sequence += 1
-        return {
-            "kind": event.kind,
-            "data": event.payload,
-            "origin_epoch": event.payload.get("origin_epoch", self.epoch),
-            "sequence": self._projected_sequence,
-        }
+        return ProjectedEvent(
+            kind=event.kind,
+            data=event.payload,
+            sequence=self._projected_sequence,
+            origin_epoch=event.payload.get("origin_epoch", self.epoch),
+        )
 
     def subscribe(self, emit: Callable[[Any], Any]) -> Callable[[], None]:
         """Forward future authoritative events as typed projected events.
 
-        ``emit`` receives the typed dict from :meth:`project`, not a
-        framework frame; ``server/app.py`` is responsible for handing that
-        dict to ``RTVIMessagePublisher.incremental(...)``.
+        ``emit`` receives the :class:`ProjectedEvent` from :meth:`project`,
+        not a framework frame; ``server/app.py`` is responsible for handing
+        that event to ``RTVIMessagePublisher.incremental(...)``.
         """
 
         def on_event(event: StateEvent) -> None:
