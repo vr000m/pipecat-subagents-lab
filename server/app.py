@@ -386,6 +386,19 @@ async def _attach_connection(
             publisher.set_snapshot(runtime.observer.snapshot())
             snapshot = publisher.snapshot()
             if snapshot is not None:
+                # Atomically install the snapshot watermark in both
+                # components. The observer's projected sequence only advances
+                # for events visible to *this* connection, while the snapshot
+                # is stamped from the global SessionState watermark, which
+                # also advances for invisible events (a capability-gated
+                # work_status on a connection that never advertised
+                # work_status_v1). Re-seed from the value actually stamped on
+                # the wire -- publisher.snapshot() re-reads the sequence
+                # provider -- so the client's lastAppliedSequence and the
+                # observer's counter are identical by construction and the
+                # next incremental is snapshot_sequence + 1. No await may be
+                # introduced before this seed.
+                runtime.observer.seed(snapshot.sequence)
                 frame_data = snapshot.model_dump(mode="json")
                 if not runtime.supports_work_status:
                     # Non-capable projections omit the status section

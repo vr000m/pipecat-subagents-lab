@@ -46,6 +46,18 @@ class RuntimeObserver:
     def supports_work_status(self) -> bool:
         return "work_status_v1" in self.capabilities
 
+    @property
+    def projected_sequence(self) -> int:
+        """The last connection-projected envelope sequence handed to the client.
+
+        Read-only view of the projected counter so callers and tests can
+        assert the snapshot/incremental namespace invariant -- after any
+        snapshot install this must equal the ``snapshot_sequence`` stamped on
+        the wire, and the next :meth:`project` returns that value plus one --
+        without reaching into private state.
+        """
+        return self._projected_sequence
+
     def _visible(self, event: StateEvent) -> bool:
         if event.payload.get("origin_epoch") != self.epoch:
             return False
@@ -54,7 +66,23 @@ class RuntimeObserver:
         return event.kind in _ALWAYS_VISIBLE_KINDS or event.kind == "work_status"
 
     def seed(self, sequence: int) -> None:
-        """Install the connection-local projected sequence at a snapshot watermark."""
+        """Install the connection-local projected sequence at a snapshot watermark.
+
+        Called at attach time (before :meth:`subscribe`) **and again at every
+        snapshot install**, seeded from the ``snapshot_sequence`` actually
+        stamped on the outgoing snapshot frame. The re-seed is mandatory:
+        the snapshot watermark comes from the global ``SessionState``
+        sequence, which advances for events this connection never sees (a
+        capability-gated ``work_status`` on a connection that did not
+        advertise ``work_status_v1``, or a foreign-epoch event). Without it
+        the projected counter drifts below the watermark the client installs
+        as ``lastAppliedSequence``, and every later incremental is silently
+        discarded by the browser reducer with no gap detected.
+
+        The caller must not ``await`` between reading the stamped snapshot
+        sequence and this call, so the install is atomic with respect to
+        further state events.
+        """
         self._projected_sequence = sequence
 
     def project(self, event: StateEvent) -> dict[str, Any] | None:

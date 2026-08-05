@@ -1192,3 +1192,95 @@ def test_rollback_order_disable_status_then_autoplay_then_early_ack() -> None:
     assert host.feature_policy.enable_background_status is False
     assert host.feature_policy.enable_autoplay_policy is False
     assert host.feature_policy.enable_early_ack is False
+
+
+# --- C1: snapshot/incremental sequence namespace unification --------------
+
+
+class FrameCapturingPipelineWorker(CapturingPipelineWorker):
+    """CapturingPipelineWorker that records every queued frame's payload."""
+
+    def __init__(self, pipeline: object, **kwargs: object) -> None:
+        super().__init__(pipeline, **kwargs)
+        self.frames: list[dict] = []
+
+    async def queue_frame(self, frame: object) -> None:
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_snapshot_install_reseeds_the_observer_projected_sequence() -> None:
+    """C1 regression: a connection that never advertised `work_status_v1`
+    still advances the global `SessionState` sequence for every invisible
+    `work_status` event. The snapshot is stamped from that global watermark,
+    so the observer's projected counter must be re-seeded at snapshot install
+    or the next visible incremental lands at or below the client's
+    `lastAppliedSequence` and is silently discarded forever.
+
+    Invariant: after any snapshot install,
+    ``observer.projected_sequence == wire snapshot_sequence`` and the next
+    incremental carries exactly ``snapshot_sequence + 1``.
+    """
+
+    async def run() -> None:
+        FrameCapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=FrameCapturingPipelineWorker,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        assert runtime.supports_work_status is False, (
+            "fixture must model a non-capable (no work_status_v1) connection"
+        )
+        worker = FrameCapturingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        # N invisible work_status events: they advance the global sequence
+        # (SessionState._emit) but are dropped by the observer's capability
+        # filter, so the projected counter does not move.
+        for index in range(4):
+            host.state.set_child_work_status(
+                turn_id="turn-1",
+                work_item_id=f"work-{index}",
+                state="searching",
+                origin_epoch=runtime.epoch,
+            )
+        assert worker.frames == [], "work_status must stay invisible on this connection"
+
+        await worker.rtvi.handlers["on_client_message"](
+            worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+        )
+        assert worker.frames, "a snapshot-request must produce a runtime_snapshot frame"
+        snapshot_frame = worker.frames[-1]
+        assert snapshot_frame["kind"] == "runtime_snapshot"
+        wire_snapshot_sequence = snapshot_frame["data"]["snapshot_sequence"]
+        assert snapshot_frame["sequence"] == wire_snapshot_sequence
+        assert runtime.observer.projected_sequence == wire_snapshot_sequence
+
+        host.state.append_result(
+            GroundedResult(
+                result_id="result-c1",
+                worker_id="worker-weather",
+                turn_id="turn-1",
+                text="Answer",
+                spoken_text="Answer",
+                origin_epoch=runtime.epoch,
+            ),
+            origin_epoch=runtime.epoch,
+        )
+        await asyncio.sleep(0)
+
+        incrementals = [frame for frame in worker.frames if frame["kind"] == "result"]
+        assert len(incrementals) == 1
+        assert incrementals[0]["sequence"] == wire_snapshot_sequence + 1
+
+    asyncio.run(run())

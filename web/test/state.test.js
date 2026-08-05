@@ -410,3 +410,40 @@ if (hasWorkStatusField) {
 } else {
   test.skip("Phase 3 work_status reducer not implemented yet (state.js has no workStatus field)", () => {});
 }
+
+// --- C1: snapshot/incremental sequence namespace contract ----------------
+//
+// The server stamps a snapshot at the global watermark S and re-seeds the
+// connection observer to S, so the very next incremental carries S + 1. These
+// pin the client half of that contract: S + 1 must be applied with no gap
+// reported, and an incremental at S (at or below lastAppliedSequence) stays
+// discarded.
+describe("snapshot watermark / incremental contiguity", () => {
+  test("applies the first incremental at snapshot_sequence + 1 with no gap", () => {
+    const requests = [];
+    let state = applyServerMessage(createInitialState(), snapshot(7));
+    expect(state.lastAppliedSequence).toBe(7);
+
+    state = applyServerMessage(state, increment(8, "result-after-snapshot"), () =>
+      requests.push("snapshot"),
+    );
+
+    expect(state.results.map(({ result_id }) => result_id)).toEqual(["result-after-snapshot"]);
+    expect(state.lastAppliedSequence).toBe(8);
+    expect(state.localDiagnostics.gaps).toBe(0);
+    expect(requests).toEqual([]);
+  });
+
+  test("discards an incremental at the snapshot sequence itself", () => {
+    const requests = [];
+    let state = applyServerMessage(createInitialState(), snapshot(7));
+    state = applyServerMessage(state, increment(7, "at-watermark"), () =>
+      requests.push("snapshot"),
+    );
+
+    expect(state.results).toEqual([]);
+    expect(state.lastAppliedSequence).toBe(7);
+    expect(state.localDiagnostics.gaps).toBe(0);
+    expect(requests).toEqual([]);
+  });
+});

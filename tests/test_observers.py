@@ -231,3 +231,71 @@ class TestSnapshotBarrierOrdering:
 
         assert sequences == sorted(sequences)
         assert len(sequences) == len(set(sequences))
+
+
+# --- C1: snapshot install must re-seed the projected sequence -------------
+
+
+@pytest.mark.skipif(RuntimeObserver is None, reason="server.observers.RuntimeObserver missing")
+def test_snapshot_install_reseeds_projected_sequence_to_the_global_watermark() -> None:
+    """C1 regression: the global ``SessionState`` sequence is the snapshot
+    watermark, but only *visible* events advance the observer's projected
+    sequence. After invisible events the two namespaces diverge, so a
+    snapshot install must re-seed the projected counter at the watermark it
+    puts on the wire.
+
+    Invariant: after a snapshot install ``observer.projected_sequence ==
+    snapshot watermark`` and the next visible ``project()`` returns exactly
+    ``watermark + 1``.
+    """
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    # No capabilities -> `work_status` events are invisible on this connection.
+    observer = RuntimeObserver(state, epoch=1, capabilities=frozenset())
+    observer.seed(state.sequence)
+
+    projected: list[dict] = []
+
+    def emit(event: dict) -> None:
+        projected.append(event)
+
+    observer.subscribe(emit)
+
+    for index in range(3):  # 3 visible events
+        state.set_worker(
+            WorkerState(
+                worker_id=f"worker-{index}",
+                topic="weather",
+                model_policy="deep",
+                status="idle",
+                origin_epoch=1,
+            )
+        )
+    for index in range(3):  # 3 invisible events (capability-gated work_status)
+        state.set_child_work_status(
+            turn_id="turn-1",
+            work_item_id=f"work-{index}",
+            state="searching",
+            origin_epoch=1,
+        )
+
+    assert len(projected) == 3, "only the visible events may be projected"
+    watermark = state.sequence
+    assert observer.projected_sequence < watermark, (
+        "precondition: invisible events made the two sequence namespaces diverge"
+    )
+
+    # Snapshot install at the global watermark (what app.py stamps on the wire).
+    observer.seed(watermark)
+    assert observer.projected_sequence == watermark
+
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-after-snapshot",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+    assert projected[-1]["sequence"] == watermark + 1
