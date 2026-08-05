@@ -30,6 +30,7 @@ from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import (
     CanonicalResultAdapter,
     LateDeliveryContext,
+    SearchExecution,
     SessionHost,
     build_pipeline,
     framework_bridge,
@@ -6058,6 +6059,168 @@ def test_pending_continuation_retained_child_reports_background_not_failed() -> 
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("path", ["direct_delegated", "pending_continuation", "mixed_multi_intent"])
+def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(path: str) -> None:
+    """Acceptance criterion: with ``enable_early_ack=False``, no ack
+    scheduling/metrics/latch/index/media residue occurs on any of the three
+    ack-eligible turn shapes -- direct-delegated, pending-continuation, and
+    mixed multi-intent. ``_emit_early_ack`` returns at its very first line
+    when the flag is off, so this asserts the turn-scoped latch
+    (``host._ack_emitted_turns``), the scheduler's ack queue/active lease
+    (``_ack_items``, matching the enabled-ack tests above), and the
+    scheduler's ack_id index (``origin.scheduler._ack_index``) all stay
+    empty even though every path here is otherwise ack-eligible (a real TTS
+    connection, a genuinely in-flight delegated child)."""
+
+    async def run() -> None:
+        if path == "direct_delegated":
+            search = BlockingResultWorker()
+            config = Config(enable_early_ack=False)
+            host = SessionHost(
+                registry=WorkerRegistry(config=config),
+                config=config,
+                runner_factory=LifecycleRunner,
+                tts=FakeTTS(),
+                coordinator=RoutedCoordinator(search),
+            )
+            origin = await host.connect(connection_handshake(host, 1))
+            assert host.feature_policy.enable_early_ack is False
+
+            pending = asyncio.create_task(host._handle_transcript("today's weather"))
+            await asyncio.wait_for(search.started.wait(), timeout=1)
+
+            assert _ack_items(origin.scheduler) == []
+            assert host._ack_emitted_turns == set()
+            assert origin.scheduler._ack_index == {}
+
+            search.release.set()
+            result = await asyncio.wait_for(pending, timeout=1)
+            assert result.text.startswith("Answer for")
+
+        elif path == "pending_continuation":
+            worker = ResultWorker()
+
+            class Registry:
+                config = Config(max_work_items_per_turn=2, enable_early_ack=False)
+
+                @staticmethod
+                def get(_worker_id: str) -> object:
+                    return type("Registered", (), {"worker": worker})()
+
+            class Coordinator(WorkItemCoordinator):
+                def __init__(self) -> None:
+                    super().__init__(registry=Registry(), router=object())
+
+                async def submit(self, *_args: object, **_kwargs: object) -> object:
+                    return _submitted(results=(_fan_in_result("turn-pending-noack", "answer"),))
+
+            host = SessionHost(
+                runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=Coordinator()
+            )
+            origin = await host.connect(connection_handshake(host, 1))
+            assert host.feature_policy.enable_early_ack is False
+
+            await host._handle_pending(
+                _pending_outcome(),
+                "continue please",
+                origin,
+                "turn-pending-noack",
+                host._new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending-noack"
+                ),
+            )
+
+            assert _ack_items(origin.scheduler) == []
+            assert host._ack_emitted_turns == set()
+            assert origin.scheduler._ack_index == {}
+
+        else:
+            assert path == "mixed_multi_intent"
+            search = BlockingResultWorker()
+
+            class Registry:
+                config = Config(max_work_items_per_turn=4, enable_early_ack=False)
+
+                @staticmethod
+                def catalogue() -> object:
+                    return object()
+
+            class Router:
+                @staticmethod
+                def route_envelope(text: str, _catalogue: object) -> object:
+                    action = {
+                        "answer directly": "direct",
+                        "ask me": "clarify",
+                        "unsupported thing": "unsupported",
+                        "search it": "existing_worker",
+                    }[text]
+                    decision = type("Decision", (), {"action": action})()
+                    prose = {
+                        "direct": "Direct answer.",
+                        "clarify": "Which one?",
+                        "unsupported": None,
+                        "existing_worker": None,
+                    }[action]
+                    return type("Envelope", (), {"decision": decision, "prose": prose})()
+
+            class Coordinator(WorkItemCoordinator):
+                def __init__(self) -> None:
+                    super().__init__(registry=Registry(), router=Router())
+
+                def dispatch(self, decision: object, **_: object) -> object:
+                    assert decision.action == "existing_worker"
+                    return search
+
+            host = SessionHost(
+                runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=Coordinator()
+            )
+            origin = await host.connect(connection_handshake(host, 1))
+            assert host.feature_policy.enable_early_ack is False
+            outcome = type(
+                "Outcome",
+                (),
+                {
+                    "work_items": (
+                        "answer directly",
+                        "ask me",
+                        "unsupported thing",
+                        "search it",
+                    ),
+                    "pending_dialogue": None,
+                },
+            )()
+
+            pending = asyncio.create_task(
+                host._handle_multi_intent(
+                    outcome,
+                    "",
+                    origin,
+                    "turn-mixed-noack",
+                    host._new_app_turn_recorder(
+                        origin_epoch=origin.epoch, turn_id="turn-mixed-noack"
+                    ),
+                )
+            )
+            await asyncio.wait_for(search.started.wait(), timeout=1)
+
+            assert _ack_items(origin.scheduler) == []
+            assert host._ack_emitted_turns == set()
+            assert origin.scheduler._ack_index == {}
+
+            search.release.set()
+            await asyncio.wait_for(pending, timeout=1)
+
+        # Common post-turn assertion for every path: the turn's completion
+        # (or, for the direct-delegated path, its release) must not have
+        # left any deferred ack admission task or index entry behind either.
+        assert _ack_items(origin.scheduler) == []
+        assert host._ack_emitted_turns == set()
+        assert origin.scheduler._ack_index == {}
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_multi_intent_parent_aggregate_progresses_through_its_children() -> None:
     """I6: every delegated multi-intent child must feed the turn's single
     parent aggregate, keyed off ``work-{turn_id}``."""
@@ -6239,6 +6402,72 @@ def test_retained_foreground_child_records_background_even_without_capability() 
         assert states == ["routing", "searching", "background"]
         assert "failed" not in states
         assert host.state.work_status_snapshot()[0].state == "background"
+
+        worker.release.set()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retained_foreground_child_on_capable_connection_stays_status_only() -> None:
+    """Capable clients (``work_status_v1`` + ``enable_background_status``)
+    receive the ``background`` status alone: no legacy "taking longer than
+    expected" canonical result is ever committed or spoken for the turn."""
+
+    async def run() -> None:
+        worker = BlockingResultWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "slow search", "model_policy": "deep"},
+        )()
+
+        class RetainingRoutedCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(worker)
+                self.owner = WorkItemCoordinator(
+                    config=Config(foreground_search_timeout_seconds=0.001)
+                )
+                self.config = self.owner.config
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                return self.owner.start_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **kwargs: object) -> bool:
+                return self.owner.retain_late_task(task, **kwargs)
+
+            async def shutdown(self) -> None:
+                await self.owner.shutdown()
+
+        coordinator = RetainingRoutedCoordinator()
+        host = SessionHost(
+            registry=WorkerRegistry(config=coordinator.config),
+            config=coordinator.config,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
+        handshake = connection_handshake(host, 1)
+        handshake["capabilities"] = ("work_status_v1",)
+        handshake["capabilities_present"] = True
+        origin = await host.connect(handshake)
+        assert origin.supports_work_status
+        assert host.feature_policy.enable_background_status
+
+        foreground = await host._handle_transcript("slow query")
+
+        assert isinstance(foreground, SearchExecution)
+        assert foreground.status == "retained"
+        assert foreground.result is None
+
+        states = _work_status_states(host)
+        assert states == ["routing", "searching", "background"]
+        assert "failed" not in states
+        assert host.state.work_status_snapshot()[0].state == "background"
+
+        assert len(host.state.result_history("worker-search")) == 0
+        assert all(
+            "taking longer than expected" not in entry.text for entry in host.state.transcript
+        )
 
         worker.release.set()
         await host.shutdown()
