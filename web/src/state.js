@@ -297,8 +297,6 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
     if (!state.localDiagnostics.snapshotRequestPending) requestSnapshot();
     return {
       ...state,
-      snapshotRequestPending: true,
-      snapshotRequestCount: (state.snapshotRequestCount ?? 0) + (state.localDiagnostics.snapshotRequestPending ? 0 : 1),
       localDiagnostics: {
         ...state.localDiagnostics,
         gaps: state.localDiagnostics.gaps + 1,
@@ -314,7 +312,6 @@ export function applyServerMessage(state, rawMessage, requestSnapshot = () => {}
   return {
     ...next,
     lastAppliedSequence: sequence,
-    snapshotRequestPending: false,
     localDiagnostics: { ...next.localDiagnostics, lastSequence: sequence, lastAppliedSequence: sequence, snapshotRequestPending: false },
   };
 }

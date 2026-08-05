@@ -78,6 +78,44 @@ describe("server-authoritative runtime reducer", () => {
     expect(state.localDiagnostics.gaps).toBe(1);
   });
 
+  test("keeps snapshot-request bookkeeping scoped to localDiagnostics", () => {
+    const requests = [];
+    const initial = applyServerMessage(createInitialState(), snapshot(10));
+    expect(Object.hasOwn(initial, "snapshotRequestPending")).toBe(false);
+    expect(Object.hasOwn(initial, "snapshotRequestCount")).toBe(false);
+
+    const gapped = applyServerMessage(initial, increment(12, "gap-result"), () =>
+      requests.push("snapshot"),
+    );
+
+    expect(Object.hasOwn(gapped, "snapshotRequestPending")).toBe(false);
+    expect(Object.hasOwn(gapped, "snapshotRequestCount")).toBe(false);
+    expect(gapped.localDiagnostics.snapshotRequestPending).toBe(true);
+    expect(gapped.localDiagnostics.snapshotRequestCount).toBe(1);
+    expect(gapped.localDiagnostics.gaps).toBe(1);
+    expect(gapped.localDiagnostics.lastAppliedSequence).toBe(10);
+    expect(gapped.localDiagnostics.lastSequence).toBe(10);
+    expect(gapped.localDiagnostics.message).toBe(
+      "State gap detected (11–11); requesting snapshot.",
+    );
+    expect(requests).toEqual(["snapshot"]);
+
+    // A second gapped increment while recovering must not double-count.
+    const stillGapped = applyServerMessage(gapped, increment(13, "still-unsafe"), () =>
+      requests.push("snapshot"),
+    );
+    expect(stillGapped).toBe(gapped);
+
+    // The ordered-increment path also leaves no top-level bookkeeping behind.
+    const recovered = applyServerMessage(
+      applyServerMessage(gapped, snapshot(12)),
+      increment(13, "after-recovery"),
+    );
+    expect(Object.hasOwn(recovered, "snapshotRequestPending")).toBe(false);
+    expect(Object.hasOwn(recovered, "snapshotRequestCount")).toBe(false);
+    expect(recovered.localDiagnostics.snapshotRequestPending).toBe(false);
+  });
+
   test("resumes ordered increments only after the authoritative recovery snapshot", () => {
     const requests = [];
     let state = applyServerMessage(createInitialState(), snapshot(10, [result("before-gap")]));

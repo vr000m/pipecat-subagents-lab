@@ -139,6 +139,33 @@ equivalents.
 `WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
 OpenAI model IDs without allowing model output to select an arbitrary model.
 
+The v0.1.3 delivery behaviours are gated by feature flags whose TOML
+equivalents live under `[features]`. `WEBSEARCH_ENABLE_EARLY_ACK`
+(`[features].enable_early_ack`, default `true`) controls whether a routed turn
+speaks a short acknowledgement before its first result is ready.
+`WEBSEARCH_EARLY_ACK_TEXT` (`[features].early_ack_text`, default
+`One moment while I look into that.`) is the spoken text used for that
+acknowledgement and must not be empty.
+`WEBSEARCH_ENABLE_BACKGROUND_STATUS`
+(`[features].enable_background_status`, default `true`) gates server-side
+emission of the capability-gated `work_status` updates described below;
+when disabled, no `work_status` frame is produced and the legacy
+foreground-timeout notice applies instead.
+`WEBSEARCH_ENABLE_AUTOPLAY_POLICY` (`[features].enable_autoplay_policy`,
+default `true`) enables the browser autoplay-recovery policy that surfaces the
+page's audio action when playback is blocked.
+`WEBSEARCH_PROMOTION_MANIFEST_PATH`
+(`[features].promotion_manifest_path`, default
+`docs/benchmarks/v0.1.3-promotion-manifest.json`) points at the release
+promotion manifest that the server bind-checks at startup; it must not be
+empty. `WEBSEARCH_PHASE4C_ARTIFACT_PATH`
+(`[features].phase4c_artifact_path`, default unset) points at the Phase 4C
+completion artifact whose SHA-256 the manifest's `phase4c_artifact_sha256`
+field is checked against, when present; leaving it unset makes any manifest
+declaring that field resolve to a `phase4c_unresolvable` (display-only)
+verdict. The three boolean flags are parsed strictly: only `true` or `false`
+(case-insensitive) is accepted, and any other value fails startup.
+
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
 The default host opens these websocket endpoints with the versioned local STT
 and TTS wire clients; adapter-level client factories remain injectable for
@@ -301,6 +328,21 @@ speaker dropdown mid-session and confirm the browser's console log shows a
 rejected speaker switch (e.g. the device was removed) logs `Failed to switch
 speaker` and the dropdown reverts to the last device that was actually
 routed.
+
+A browser declares optional protocol capabilities with a single `capabilities`
+query parameter — one URL-encoded JSON array of capability names — on both the
+`POST /api/rtc` offer and the `PATCH /api/rtc` ICE-candidate request. The
+server normalizes, deduplicates, and sorts the declared set and binds it
+immutably to the promoted connection epoch; a `PATCH` either omits the field or
+repeats the identical set. A client that declares `work_status_v1` receives
+coarse `work_status` updates (`routing`, `searching`, `background`,
+`result_ready`, `failed`, `cancelled`) for delegated work, including in its
+reconnect snapshot; a client that declares nothing keeps the legacy behaviour
+with no `work_status` frames. `result_ready` means the canonical result is
+committed and display-ready, not that speech was queued, delivered, or heard.
+Emission is additionally gated server-side by
+`WEBSEARCH_ENABLE_BACKGROUND_STATUS`. See `shared/protocol.md` for the wire
+contract, transition rules, and parent aggregation semantics.
 
 For live STT, `Track audio received` proves only WebRTC negotiation. A complete
 utterance should also produce `VADProcessor: User started speaking`,
