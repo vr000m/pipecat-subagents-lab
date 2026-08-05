@@ -472,8 +472,13 @@ class CapturingPipelineWorker:
         self.rtvi = FakeRTVIForApp()
         type(self).constructed.append(self)
 
-    async def queue_frame(self, _frame: object) -> None:
-        pass
+    async def queue_frame(self, frame: object) -> None:
+        # Mirror _SnapshotBarrierConsumer, the real last-processor-before-
+        # transport.output() consumer: acknowledge a barrier frame as though
+        # it drained through the pipeline, or install_baseline() hangs.
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            acknowledge()
 
 
 class FakeRTVIForApp:
@@ -1207,6 +1212,10 @@ class FrameCapturingPipelineWorker(CapturingPipelineWorker):
         self.frames: list[dict] = []
 
     async def queue_frame(self, frame: object) -> None:
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            acknowledge()
+            return
         self.frames.append(getattr(frame, "data", frame))
 
 

@@ -64,6 +64,12 @@ class RuntimeObserver:
         self.capabilities = frozenset(capabilities)
         self._unsubscribe: Callable[[], None] | None = None
         self._projected_sequence = 0
+        self._emit: Callable[[Any], Any] | None = None
+        # SnapshotBarrier pause/replay state. Buffers raw StateEvents (not yet
+        # projected) while a barrier owns the handoff between deciding to
+        # (re)install a snapshot and actually installing its watermark.
+        self._paused = False
+        self._buffer: list[StateEvent] = []
 
     @property
     def supports_work_status(self) -> bool:
@@ -120,32 +126,78 @@ class RuntimeObserver:
             origin_epoch=event.payload.get("origin_epoch", self.epoch),
         )
 
+    def _deliver(self, event: StateEvent) -> None:
+        projected = self.project(event)
+        if projected is None or self._emit is None:
+            return
+        result = self._emit(projected)
+        # A connection emitter is normally a coroutine scheduled by the
+        # transport callback. Do not make state mutation await a network send.
+        if inspect.isawaitable(result):
+            asyncio.create_task(result)
+
+    def _on_event(self, event: StateEvent) -> None:
+        if self._paused:
+            self._buffer.append(event)
+            return
+        self._deliver(event)
+
     def subscribe(self, emit: Callable[[Any], Any]) -> Callable[[], None]:
         """Forward future authoritative events as typed projected events.
 
         ``emit`` receives the :class:`ProjectedEvent` from :meth:`project`,
         not a framework frame; ``server/app.py`` is responsible for handing
         that event to ``RTVIMessagePublisher.incremental(...)``.
+
+        Idempotent with respect to the underlying ``SessionState``
+        subscription: a :class:`SnapshotBarrier` may already have attached
+        the raw listener via :meth:`pause`, in which case this only swaps
+        the emit target, so a paused observer stays paused across a
+        ``subscribe()`` call made while a barrier owns the handoff.
         """
-
-        def on_event(event: StateEvent) -> None:
-            projected = self.project(event)
-            if projected is None:
-                return
-            result = emit(projected)
-            # A connection emitter is normally a coroutine scheduled by the
-            # transport callback. Do not make state mutation await a network send.
-            if inspect.isawaitable(result):
-                asyncio.create_task(result)
-
-        self.unsubscribe()
-        self._unsubscribe = self.state.subscribe(on_event)
-        return self._unsubscribe
+        self._emit = emit
+        if self._unsubscribe is None:
+            self._unsubscribe = self.state.subscribe(self._on_event)
+        return self.unsubscribe
 
     def unsubscribe(self) -> None:
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
+        self._emit = None
+
+    def pause(self) -> None:
+        """Buffer subsequent state events instead of projecting/emitting them.
+
+        The sole caller is :class:`SnapshotBarrier`. Buffering (rather than
+        continuing to let ``_on_event`` dispatch through ``asyncio.create_task``)
+        is what actually closes the race: a task already scheduled before
+        the pause is free to land on either side of the barrier frame, but
+        no event captured *after* this call can reach the network ahead of
+        the barrier, because it never gets a chance to be scheduled at all
+        until :meth:`resume` replays it.
+        """
+        self._paused = True
+        if self._unsubscribe is None:
+            self._unsubscribe = self.state.subscribe(self._on_event)
+
+    def resume(self, watermark: int | None = None) -> None:
+        """Unpause, optionally reseeding at ``watermark`` and replaying the buffer.
+
+        Buffered events at or below ``watermark`` are dropped (already
+        represented by the snapshot); events above it are delivered exactly
+        once, in order, before any newly-arriving event is dispatched.
+        ``watermark=None`` (an aborted snapshot install) replays every
+        buffered event without dropping or reseeding anything.
+        """
+        self._paused = False
+        if watermark is not None:
+            self.seed(watermark)
+        buffered, self._buffer = self._buffer, []
+        for event in buffered:
+            if watermark is not None and event.sequence <= watermark:
+                continue
+            self._deliver(event)
 
     def snapshot(self) -> RuntimeSnapshot:
         return self.state.snapshot(
@@ -173,3 +225,47 @@ class RuntimeObserver:
             for event in self.state.events
             if event.sequence > after_sequence and self._visible(event)
         )
+
+
+class SnapshotBarrier:
+    """Owns the ordering handoff when a snapshot is (re)installed for a connection.
+
+    Pairs with ``SnapshotBarrierFlushFrame`` (`server/speech_lifecycle.py`):
+    :meth:`subscribe_paused` pauses ``observer`` synchronously so no event
+    captured after that point can be dispatched ahead of the barrier, then
+    :meth:`install_baseline` pushes the flush frame through the same
+    serialized writer incrementals use and only reseeds/replays the buffer
+    once that frame's ``acknowledge`` callback proves it actually reached
+    the network.
+    """
+
+    def __init__(self, observer: RuntimeObserver, state: SessionState) -> None:
+        self.observer = observer
+        self.state = state
+        self._generation = 0
+
+    def subscribe_paused(self) -> None:
+        self.observer.pause()
+
+    async def install_baseline(self, *, watermark: int, flush_writer: Callable[[Any], Any]) -> None:
+        """Write the barrier frame, await its delivery, then reseed and replay."""
+        from .speech_lifecycle import SnapshotBarrierFlushFrame
+
+        self._generation += 1
+        acked: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        def acknowledge() -> None:
+            if not acked.done():
+                acked.set_result(None)
+
+        frame = SnapshotBarrierFlushFrame(
+            token=f"{self.state.session_id}-{watermark}-{self._generation}",
+            acknowledge=acknowledge,
+        )
+        await flush_writer(frame)
+        await acked
+        self.observer.resume(watermark)
+
+    def cancel(self) -> None:
+        """Abort a paused install without a watermark change (e.g. snapshot not ready)."""
+        self.observer.resume(None)

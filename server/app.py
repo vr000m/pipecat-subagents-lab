@@ -37,7 +37,7 @@ from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config, load_promotion_manifest
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
-from .observers import ProjectedEvent
+from .observers import ProjectedEvent, SnapshotBarrier
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
@@ -45,7 +45,11 @@ from .registry import WorkerRegistry
 from .router import LazyRouterProvider, Router
 from .rtvi_messages import RTVIMessagePublisher
 from .services.factory import create_stt, create_tts
-from .speech_lifecycle import GenericProviderErrorObserver, TransportSpeechLifecycleProcessor
+from .speech_lifecycle import (
+    GenericProviderErrorObserver,
+    SnapshotBarrierFlushFrame,
+    TransportSpeechLifecycleProcessor,
+)
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from .work_item_coordinator import WorkItemCoordinator
 
@@ -103,6 +107,24 @@ class _SpeechCompletionProcessor(FrameProcessor):
                 # fall back to the old conservative immediate release.
                 self._runtime.scheduler.provider_delivery_unknown(frame.context_id)
                 await self._runtime.scheduler.start_next()
+        await self.push_frame(frame, direction)
+
+
+class _SnapshotBarrierConsumer(FrameProcessor):
+    """Resolves a `SnapshotBarrierFlushFrame`'s acknowledge handle.
+
+    Placed as the last processor before `transport.output()`, so a frame
+    reaching it has already passed every other connection-local processor
+    queued ahead of it -- the drain `SnapshotBarrier.install_baseline`
+    waits on. The frame is private and never reaches transport output.
+    """
+
+    async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, SnapshotBarrierFlushFrame):
+            if callable(frame.acknowledge):
+                frame.acknowledge()
+            return
         await self.push_frame(frame, direction)
 
 
@@ -276,6 +298,14 @@ async def _attach_connection(
             )
         if bridge is not None:
             processors.extend((bridge, CanonicalResultAdapter()))
+        # Placed here, not after TransportSpeechLifecycleProcessor: that
+        # processor must remain the sole processor immediately before
+        # transport.output() (Phase 1 invariant). RTVIServerMessageFrame-type
+        # frames -- both this barrier frame and every status incremental --
+        # are queued directly onto the worker and pass straight through the
+        # TTS/lifecycle processors below untouched, so this position still
+        # proves every frame queued ahead of the barrier has drained past it.
+        processors.append(_SnapshotBarrierConsumer())
         if runtime.tts is not None:
             if runtime.lifecycle is not None:
                 processors.append(GenericProviderErrorObserver(runtime.lifecycle, runtime.tts))
@@ -377,29 +407,39 @@ async def _attach_connection(
             )
             if not snapshot_requested or not host.accepts(runtime.epoch):
                 return
+            # Pause the observer before reading any state so no incremental
+            # captured from here on can be dispatched (via the emitter's
+            # asyncio.create_task scheduling) ahead of the snapshot -- the
+            # barrier owns synchronous SessionState._emit() callbacks between
+            # this point and install_baseline() below.
+            barrier = SnapshotBarrier(observer=runtime.observer, state=host.state)
+            barrier.subscribe_paused()
             publisher.set_snapshot(runtime.observer.snapshot())
             snapshot = publisher.snapshot()
-            if snapshot is not None:
-                # Atomically install the snapshot watermark in both
-                # components. The observer's projected sequence only advances
-                # for events visible to *this* connection, while the snapshot
-                # is stamped from the global SessionState watermark, which
-                # also advances for invisible events (a capability-gated
-                # work_status on a connection that never advertised
-                # work_status_v1). Re-seed from the value actually stamped on
-                # the wire -- publisher.snapshot() re-reads the sequence
-                # provider -- so the client's lastAppliedSequence and the
-                # observer's counter are identical by construction and the
-                # next incremental is snapshot_sequence + 1. No await may be
-                # introduced before this seed.
-                runtime.observer.seed(snapshot.sequence)
-                # Non-capable projections omit the status section entirely
-                # (field absent, not an empty array) so the frozen
-                # pre-Phase-3 runtime-snapshot schema still validates this
-                # connection's snapshots (Requirements). The exclusion is
-                # owned by RuntimeSnapshot.wire_payload, not by this caller.
-                frame_data = snapshot.wire_payload(include_work_status=runtime.supports_work_status)
-                await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
+            if snapshot is None:
+                barrier.cancel()
+                return
+            # install_baseline() reseeds the observer's projected sequence at
+            # snapshot.sequence only after the barrier frame is acknowledged.
+            # The observer's projected sequence only advances for events
+            # visible to *this* connection, while the snapshot is stamped
+            # from the global SessionState watermark, which also advances
+            # for invisible events (a capability-gated work_status on a
+            # connection that never advertised work_status_v1). Reseeding
+            # from the value actually stamped on the wire -- publisher.snapshot()
+            # re-reads the sequence provider -- keeps the client's
+            # lastAppliedSequence and the observer's counter identical by
+            # construction, so the next incremental is snapshot_sequence + 1.
+            await barrier.install_baseline(
+                watermark=snapshot.sequence, flush_writer=worker.queue_frame
+            )
+            # Non-capable projections omit the status section entirely
+            # (field absent, not an empty array) so the frozen
+            # pre-Phase-3 runtime-snapshot schema still validates this
+            # connection's snapshots (Requirements). The exclusion is
+            # owned by RuntimeSnapshot.wire_payload, not by this caller.
+            frame_data = snapshot.wire_payload(include_work_status=runtime.supports_work_status)
+            await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
 
         # WorkerRunner has no remove-workers API in the pinned wheel. Run each
         # connection worker through its real PipelineWorker lifecycle task so
