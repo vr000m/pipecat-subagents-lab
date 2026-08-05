@@ -10,7 +10,7 @@ from server.contracts import (
     TranscriptEntry,
     WorkerState,
 )
-from server.session_state import SessionState
+from server.session_state import WORK_STATUS_TTL_SECONDS, SessionState
 
 try:
     from server.session_state import WorkStatusKey
@@ -330,3 +330,117 @@ def test_per_work_status_key_event_sequence_is_independent_of_the_global_state_s
     # (re)aggregation -- it is not required to equal the global
     # SessionState.sequence watermark; they are distinct counters.
     assert ledger_entry.event_sequence == 1
+
+
+# --- Phase 3: the work-status ledger is bounded ---------------------------
+
+
+def _ledger_keysets(state: SessionState) -> tuple[set, set, set]:
+    return (
+        set(state._work_status_children),
+        set(state._work_status_parents),
+        set(state._work_status_sequence),
+    )
+
+
+def assert_ledger_lockstep(state: SessionState) -> None:
+    """Invariant: the three work-status dicts are keyed in lockstep.
+
+    A key retained in ``_work_status_sequence`` after being dropped from
+    ``_work_status_parents`` would let ``event_sequence`` continue from a
+    stale counter (or restart at 1 after a full drop) and be rejected by the
+    client reducer, so insertion and eviction must always touch all three.
+    """
+    children, parents, sequence = _ledger_keysets(state)
+    assert children == parents == sequence
+
+
+def test_expired_terminal_work_status_is_deleted_from_all_three_ledger_dicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-1", state="result_ready", origin_epoch=1
+    )
+    assert_ledger_lockstep(state)
+    key = next(iter(state._work_status_parents))
+
+    clock[0] = WORK_STATUS_TTL_SECONDS
+    assert state.work_status_snapshot() == ()
+
+    assert key not in state._work_status_children
+    assert key not in state._work_status_parents
+    assert key not in state._work_status_sequence
+    assert_ledger_lockstep(state)
+
+
+def test_live_terminal_work_status_is_not_deleted_before_the_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-1", state="result_ready", origin_epoch=1
+    )
+
+    clock[0] = WORK_STATUS_TTL_SECONDS - 1
+    assert len(state.work_status_snapshot()) == 1
+    assert len(state._work_status_parents) == 1
+    assert_ledger_lockstep(state)
+
+
+def test_work_status_ledger_is_capped_without_any_snapshot_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+
+    cap = SessionState._MAX_WORK_STATUS_KEYS
+    for index in range(cap + 1):
+        clock[0] = float(index)
+        state.set_child_work_status(
+            turn_id=f"turn-{index}",
+            work_item_id=f"work-{index}",
+            state="result_ready",
+            origin_epoch=1,
+        )
+
+    assert len(state._work_status_parents) == cap
+    # The oldest terminal record is the one evicted; the newest survives.
+    turn_ids = {key.turn_id for key in state._work_status_parents}
+    assert "turn-0" not in turn_ids
+    assert f"turn-{cap}" in turn_ids
+    assert_ledger_lockstep(state)
+
+
+def test_capping_never_evicts_a_still_active_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    state.set_child_work_status(
+        turn_id="turn-active", work_item_id="work-active", state="routing", origin_epoch=1
+    )
+
+    cap = SessionState._MAX_WORK_STATUS_KEYS
+    for index in range(cap + 2):
+        clock[0] = float(index + 1)
+        state.set_child_work_status(
+            turn_id=f"turn-{index}",
+            work_item_id=f"work-{index}",
+            state="result_ready",
+            origin_epoch=1,
+        )
+
+    assert len(state._work_status_parents) == cap
+    assert any(key.turn_id == "turn-active" for key in state._work_status_parents)
+    assert_ledger_lockstep(state)

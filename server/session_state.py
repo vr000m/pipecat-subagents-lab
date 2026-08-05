@@ -87,6 +87,13 @@ class _WorkStatusRecord:
 class SessionState:
     """The single source of truth projected to each active connection."""
 
+    # Hard ceiling on distinct WorkStatusKeys retained by one process-lifetime
+    # SessionState. TTL pruning alone is not a bound: a session that never
+    # requests a work-status snapshot would otherwise accumulate one ledger
+    # entry per delegated turn forever. Mirrors the handshake-token cap in
+    # pipeline.py (evict oldest-first once over the cap).
+    _MAX_WORK_STATUS_KEYS = 256
+
     def __init__(self, session_id: str | None = None, resume_token: str | None = None) -> None:
         self.session_id = session_id or f"session-{uuid4().hex}"
         RuntimeSnapshot.reset_monotonicity(self.session_id)
@@ -106,6 +113,13 @@ class SessionState:
         # WorkStatusKey. Both hold the per-key event_sequence independently
         # of the global SessionState sequence (Requirements/Sequence
         # namespaces).
+        # Ledger invariant: the three dicts are keyed in lockstep. Every
+        # insertion and every eviction must touch all three together -- a key
+        # dropped from _work_status_parents but left in
+        # _work_status_sequence would let a later record for the same key
+        # resume from a stale counter (or, after a full drop of only the
+        # parent, restart event_sequence at 1) and be rejected as stale by
+        # the client reducer. _forget_work_status() is the only eviction path.
         self._work_status_children: dict[WorkStatusKey, dict[str, WorkStatus]] = {}
         self._work_status_parents: dict[WorkStatusKey, _WorkStatusRecord] = {}
         self._work_status_sequence: dict[WorkStatusKey, int] = {}
@@ -342,7 +356,35 @@ class SessionState:
         )
         terminal_at = time.monotonic() if parent_state in WORK_STATUS_TERMINAL else None
         self._work_status_parents[key] = _WorkStatusRecord(status=status, terminal_at=terminal_at)
+        self._evict_work_status_overflow(protect=key)
         return self._emit("work_status", status.model_dump(mode="json"))
+
+    def _forget_work_status(self, key: WorkStatusKey) -> None:
+        """Drop one ledger key from all three dicts in lockstep."""
+        self._work_status_children.pop(key, None)
+        self._work_status_parents.pop(key, None)
+        self._work_status_sequence.pop(key, None)
+
+    def _evict_work_status_overflow(self, *, protect: WorkStatusKey) -> None:
+        """Bound the ledger, evicting the oldest terminal record first.
+
+        Non-terminal records (``terminal_at is None``) are still live parent
+        aggregates, so they are only evicted once no terminal record remains;
+        among equals the least recently inserted goes first. ``protect`` is
+        the key just written and is never the eviction victim.
+        """
+        while len(self._work_status_parents) > self._MAX_WORK_STATUS_KEYS:
+            candidates = [item for item in self._work_status_parents if item != protect]
+            if not candidates:
+                return
+            oldest = min(
+                candidates,
+                key=lambda item: (
+                    self._work_status_parents[item].terminal_at is None,
+                    self._work_status_parents[item].terminal_at or 0.0,
+                ),
+            )
+            self._forget_work_status(oldest)
 
     @staticmethod
     def _aggregate(children: list[WorkStatus]) -> tuple[WorkStatusState, TerminalReason | None]:
@@ -366,13 +408,22 @@ class SessionState:
         """Return live parent work-status records, pruning expired terminals."""
         now = time.monotonic()
         live: list[WorkStatus] = []
-        for record in self._work_status_parents.values():
+        expired: list[WorkStatusKey] = []
+        for key, record in self._work_status_parents.items():
             if (
                 record.terminal_at is not None
                 and (now - record.terminal_at) >= WORK_STATUS_TTL_SECONDS
             ):
+                # Expiry is inclusive at the boundary; the record is both
+                # excluded from this projection and forgotten entirely, so
+                # the ledger does not grow for the process lifetime.
+                expired.append(key)
                 continue
             live.append(record.status)
+        for key in expired:
+            # Collected first: deleting during iteration would mutate the
+            # dict being walked.
+            self._forget_work_status(key)
         return tuple(live)
 
     @classmethod
