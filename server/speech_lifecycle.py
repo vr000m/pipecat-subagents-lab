@@ -367,9 +367,12 @@ class SpeechLifecycleCoordinator:
         """
         if not self._tts_available:
             return PreAdmissionTerminal(PreAdmissionTerminalReason.NO_TTS)
-        if identity.role == "ack":
-            if self._transport_acceptance is not None and not self._transport_acceptance():
-                return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
+        if (
+            identity.role == "ack"
+            and self._transport_acceptance is not None
+            and not self._transport_acceptance()
+        ):
+            return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
         generation = self.try_admit(identity)
         if generation is None:
             return None
