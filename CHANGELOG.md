@@ -7,8 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-05
+
 ### Added
 
+- Early acknowledgement: a deterministic, non-progress-claiming spoken ack
+  ("One moment while I look into that.") is scheduled the instant routing
+  confirms delegation to a worker, replacing timeout-gated silence for
+  direct, pending-dialogue, and multi-intent delegated turns. Exactly one
+  ack per semantic turn, enforced by a turn-scoped acknowledgement latch;
+  never claims a result exists, is discarded atomically if the real result
+  is ready before admission, and never enters canonical result/transcript
+  state. Gated by `enable_early_ack` (`Config`/`FeaturePolicy`), on by
+  default; disabling it reproduces the exact pre-0.1.3 legacy-timeout
+  behavior.
+- Background-delivery autoplay policy: a late (retained) search result now
+  commits exactly once and is either autoplayed or delivered display-only
+  based on a machine-checked promotion gate — schema-valid evidence alone
+  never enables autoplay; complete real (non-credential-free) provider/model
+  evidence plus a named-browser/device `audibility_verified` transport
+  contract are both required. Gated by `enable_autoplay_policy`; v0.1.3
+  ships with promotion expected ineligible (no paid-provider evidence
+  collected), so the shipped behavior is commit-and-display-only for late
+  results.
+- Progressive RTVI status: coarse, truthful `work_status` states (`routing`,
+  `searching`, `background`, `result_ready`, `failed`, `cancelled`) for
+  delegated search work, delivered only to browsers that negotiate the new
+  `work_status_v1` capability via a versioned `capabilities` handshake field
+  on connect/reconnect. Gated by `enable_background_status`; legacy and
+  non-advertising clients keep the pre-0.1.3 timeout-notice behavior
+  unchanged. Terminal statuses are preserved across reconnects for a bounded
+  5-minute TTL.
+- Deployment promotion-manifest system: `scripts/validate_v013_evidence.py
+  --write-manifest`, an atomic fsync/rename-durable writer, and
+  `server/config.py`'s fail-closed `load_promotion_manifest()` loader bind
+  the three feature flags' autoplay-eligibility evidence to a specific
+  release/source identity. A CI `release-metadata` job derives deployment
+  identity on `main` pushes; `scripts/check_release_metadata.py` gates
+  future releases on `pyproject.toml`/`CHANGELOG.md` agreement.
+- Query-context narrowing experiment scaffolding (`scripts/
+  run_query_context_experiment.py`, `collect_query_context_latency.py`,
+  `analyze_query_context_latency.py`): a bounded, credential-free-safe
+  statistical framework (paired bootstrap resampling, versioned quality
+  scorer, Spearman correlation) to evaluate whether narrowing
+  `_contextual_input`'s `history[-4:]` window reduces search latency. No
+  paid-provider evidence was collected for this release, so the experiment
+  resolves to "no change": production `_contextual_input` behavior is
+  unmodified.
 - Microphone and speaker device selectors in the browser client, letting
   input/output devices be switched mid-session; the speaker selector is
   hidden in browsers without `HTMLMediaElement.setSinkId()` support.
