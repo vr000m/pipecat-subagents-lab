@@ -501,6 +501,8 @@ def write_manifest(
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "inputs": inputs,
     }
+    if phase3_input is not None:
+        manifest["phase3_completion_hash"] = inputs["phase3"]["sha256"]
     if phase4c_artifact_sha256 is not None:
         manifest["phase4c_artifact_sha256"] = phase4c_artifact_sha256
 
