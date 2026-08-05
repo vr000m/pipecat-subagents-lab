@@ -1,11 +1,11 @@
 {
-  "deployed_at_utc": "2026-08-05T14:31:08Z",
+  "deployed_at_utc": "2026-08-05T23:25:07Z",
   "feature_policy_fingerprint": "8dbecc4ab8fba4ce996ea86184112c38b65d16e2a07e4365d55785b964ee5be7",
-  "generated_at_utc": "2026-08-05T14:33:03Z",
+  "generated_at_utc": "2026-08-05T23:25:07Z",
   "inputs": {
     "phase0": {
       "path": "docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl",
-      "sha256": "b977cfdbb24104cf21c3f4c54ae0dc266bb0b6c7e3bf1ab358b09f341779e759"
+      "sha256": "dc3d7e8632b296eadfdb740ab85d857a89b64f2a7ae7f58800ac87ad5a7624c9"
     },
     "phase1": {
       "path": "docs/benchmarks/v0.1.3-phase1-ack-evidence.jsonl",
@@ -17,15 +17,15 @@
     },
     "phase3": {
       "path": "docs/benchmarks/v0.1.3-phase3-completion.json",
-      "sha256": "8748d539bedbcaf69c2cc3651ad0d30fcf0e95fd29ef5cba26f9d2a3adb80d7a"
+      "sha256": "1671cc67716718a4b66591b286137f380e251135f18f6d0d22b6a1e02e59af17"
     }
   },
   "manifest_phase": "final",
-  "phase3_completion_hash": "8748d539bedbcaf69c2cc3651ad0d30fcf0e95fd29ef5cba26f9d2a3adb80d7a",
+  "phase3_completion_hash": "1671cc67716718a4b66591b286137f380e251135f18f6d0d22b6a1e02e59af17",
   "promotion_eligible": false,
   "reason": "real_stratum_missing",
   "release_version": "0.1.3",
   "schema_hash": "2d586cbb908269756a04444f0eb72308e5a1d49938b2bb18432fdb890e522f3e",
-  "source_commit": "f2be8774b048d79022f5a37215159a664655ba79",
-  "source_tree_hash": "1bf2b3ef987d5373047931f60c4c9fa6593b097be68a33159dd321da37fa41b2"
+  "source_commit": "740b364b4d0c1c00d83e7117f9f0fcfce430bef8",
+  "source_tree_hash": "fa7d284664c5a8b80903b386e6b3102bf62ca871a3ce544f754f06cf53e74ccd"
 }
