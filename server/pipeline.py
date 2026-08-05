@@ -1092,6 +1092,9 @@ class SessionHost:
         turn_id = self._next_turn_id()
         work_item_id = f"work-{turn_id}"
         turn_recorder = self._new_app_turn_recorder(origin_epoch=origin_epoch, turn_id=turn_id)
+        # Delegated children that have had a work_status emitted, so a
+        # cancellation of this turn can terminalize whichever are still open.
+        delegated_children: dict[str, str | None] = {}
         try:
             turn_task = asyncio.current_task()
             if turn_task is not None:
@@ -1318,6 +1321,7 @@ class SessionHost:
                 )
                 return outcome
             child = turn_recorder.new_child(work_item_id=work_item_id)
+            delegated_children[work_item_id] = worker_id
             self._emit_work_status(
                 turn_id=turn_id,
                 work_item_id=work_item_id,
@@ -1371,18 +1375,25 @@ class SessionHost:
                     result = execution.result
                     child_outcome_label = "completed"
                 elif execution.status == "retained":
+                    # A retained work item is still working, so `background` is
+                    # its truthful status on every connection -- the observer,
+                    # not this call site, decides which connections may see it.
+                    # Deriving a status from the "retained" outcome label
+                    # instead (below) would publish `failed`, and a terminal
+                    # parent never regresses, so the late result could never
+                    # flip it to `result_ready`.
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state="background",
+                        origin_epoch=origin_epoch,
+                    )
                     if origin.supports_work_status and self.feature_policy.enable_background_status:
                         # Phase 3 capability-gated path: retain the work item
-                        # and emit the truthful `background` wire event
-                        # instead of a second canonical timeout result or
-                        # transcript/history entry (Requirements).
-                        self._emit_work_status(
-                            turn_id=turn_id,
-                            work_item_id=work_item_id,
-                            worker_id=worker_id,
-                            state="background",
-                            origin_epoch=origin_epoch,
-                        )
+                        # and let the `background` status stand alone instead
+                        # of speaking a second canonical timeout result or
+                        # writing a transcript/history entry (Requirements).
                         child.finalize(outcome="retained", app_worker_id=worker_id)
                         turn_recorder.finalize()
                         return execution
@@ -1441,7 +1452,12 @@ class SessionHost:
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
-            if child_outcome_label not in {"clarify", "declined"}:
+            # A retained child is not terminal: its truthful `background`
+            # status was already emitted above and the coordinator terminalizes
+            # it when the late result lands. Only an actual cancellation
+            # settles it here.
+            retained_still_open = child_outcome_label == "retained" and not was_cancelled
+            if child_outcome_label not in {"clarify", "declined"} and not retained_still_open:
                 derived = _work_status_for_outcome(
                     child_outcome_label,
                     cancelled=was_cancelled,
@@ -1476,6 +1492,9 @@ class SessionHost:
             )
             return committed
         except asyncio.CancelledError:
+            self._cancel_child_work_statuses(
+                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            )
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="cancelled")
             raise
@@ -1495,6 +1514,8 @@ class SessionHost:
         turn_recorder: AppTurnRecorder,
     ) -> Any:
         coordinator = self._require_coordinator()
+        origin_epoch = origin.epoch
+        delegated_children: dict[str, str | None] = {}
         try:
             pending = getattr(outcome, "pending_dialogue", None)
             owner_id = pending.owner_id if pending is not None else None
@@ -1515,6 +1536,16 @@ class SessionHost:
             await self._emit_early_ack(origin, turn_id=turn_id, origin_epoch=origin.epoch)
             clarification_context = self._clarification_context(pending, transcript)
             child = turn_recorder.new_child(work_item_id=work_item_id)
+            # A continuation turn delegates genuine worker work, so it owns a
+            # client-visible parent status exactly like a single-intent turn.
+            delegated_children[work_item_id] = worker_id
+            self._emit_work_status(
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                worker_id=worker_id,
+                state="routing",
+                origin_epoch=origin_epoch,
+            )
             retained_recorder = self._new_retained_recorder(
                 origin_epoch=origin.epoch,
                 turn_id=turn_id,
@@ -1557,6 +1588,13 @@ class SessionHost:
             late_context = self._new_late_delivery_context(
                 turn_id=turn_id, work_item_id=work_item_id, origin_epoch=origin.epoch
             )
+            self._emit_work_status(
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                worker_id=worker_id,
+                state="searching",
+                origin_epoch=origin_epoch,
+            )
             submitted = await coordinator.submit(
                 work_item_id,
                 [(worker_id, transcript)],
@@ -1597,10 +1635,40 @@ class SessionHost:
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
+            was_cancelled = work_item_id in self._cancelled_work_items
+            if child_outcome_label == "retained" and not was_cancelled:
+                # Still working, not terminal (see the same rule in
+                # ``_handle_transcript_impl``): the late result terminalizes it.
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state="background",
+                    origin_epoch=origin_epoch,
+                )
+            elif child_outcome_label not in {"clarify", "declined"}:
+                derived = _work_status_for_outcome(
+                    child_outcome_label,
+                    cancelled=was_cancelled,
+                    terminal_kind=child_outcome_label,
+                )
+                if derived is not None:
+                    status_state, status_reason = derived
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state=status_state,
+                        origin_epoch=origin_epoch,
+                        terminal_reason=status_reason,
+                    )
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             turn_recorder.finalize()
             return committed
         except asyncio.CancelledError:
+            self._cancel_child_work_statuses(
+                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            )
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="cancelled")
             raise
@@ -1622,6 +1690,12 @@ class SessionHost:
         """Execute bounded compound work in the user's stated order."""
         del transcript
         coordinator = self._require_coordinator()
+        origin_epoch = origin.epoch
+        # Every delegated child of this turn aggregates under the one parent
+        # key the turn submits under, so a compound turn shows the client a
+        # single progressive record instead of one per item.
+        parent_work_item_id = f"work-{turn_id}"
+        delegated_children: dict[str, str | None] = {}
         try:
             results: dict[int, Any] = {}
             runnable: list[tuple[str, str]] = []
@@ -1709,6 +1783,18 @@ class SessionHost:
                     )
                     continue
                 worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
+                # Only genuinely delegated items reach here: direct,
+                # unsupported, clarify, and dispatch-failure items returned
+                # above and never allocate a client-visible status.
+                delegated_children[item_work_item_id] = worker_id
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=item_work_item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=worker_id,
+                    state="routing",
+                    origin_epoch=origin_epoch,
+                )
                 runnable.append((worker_id, item_text))
                 runnable_indexes.append(index)
                 runnable_workers[index] = worker
@@ -1788,6 +1874,15 @@ class SessionHost:
                     parent_work_item_id=f"work-{turn_id}",
                 )
 
+            for item_work_item_id, item_worker_id in delegated_children.items():
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=item_work_item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=item_worker_id,
+                    state="searching",
+                    origin_epoch=origin_epoch,
+                )
             submitted = await coordinator.submit(
                 f"work-{turn_id}",
                 runnable,
@@ -1832,11 +1927,30 @@ class SessionHost:
                 final_result_for_index[matched] = result
             for index, final_result in final_result_for_index.items():
                 worker_id = index_to_worker_id[index][0]
+                item_outcome = outcome_labels.get(index, "completed")
                 child_recorders[index].finalize(
-                    outcome=outcome_labels.get(index, "completed"),
+                    outcome=item_outcome,
                     app_worker_id=worker_id,
                     result_id=final_result.result_id,
                 )
+                item_work_item_id = f"work-{turn_id}-{index}"
+                if item_outcome not in {"clarify", "declined"}:
+                    derived = _work_status_for_outcome(
+                        item_outcome,
+                        cancelled=item_work_item_id in self._cancelled_work_items,
+                        terminal_kind=item_outcome,
+                    )
+                    if derived is not None:
+                        status_state, status_reason = derived
+                        self._emit_work_status(
+                            turn_id=turn_id,
+                            work_item_id=item_work_item_id,
+                            parent_work_item_id=parent_work_item_id,
+                            worker_id=worker_id,
+                            state=status_state,
+                            origin_epoch=origin_epoch,
+                            terminal_reason=status_reason,
+                        )
             for work_item_id in submitted.pending_work_item_ids:
                 matched = index_for_work_item_id.get(work_item_id)
                 if matched is None:
@@ -1855,6 +1969,19 @@ class SessionHost:
                 )
                 speech_roles[item_index] = ROLE_TIMEOUT_NOTICE
                 child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
+                # Retained is not terminal: `background` is the truthful state
+                # until the late result lands (same rule as the single-intent
+                # path); a `failed` here could never be flipped back.
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=worker_id,
+                    state=(
+                        "cancelled" if work_item_id in self._cancelled_work_items else "background"
+                    ),
+                    origin_epoch=origin_epoch,
+                )
                 recorder = retained_recorders.get(work_item_id)
                 if recorder is not None:
                     self._register_retained_recorder_if_open(work_item_id, recorder)
@@ -1873,10 +2000,27 @@ class SessionHost:
                     text="The web search is temporarily unavailable.",
                     origin_epoch=origin.epoch,
                 )
+                failure_outcome = self._failure_child_outcome(failure)
                 child_recorders[item_index].finalize(
-                    outcome=self._failure_child_outcome(failure),
+                    outcome=failure_outcome,
                     app_worker_id=failure.worker_id,
                 )
+                derived = _work_status_for_outcome(
+                    failure_outcome,
+                    cancelled=failure.work_item_id in self._cancelled_work_items,
+                    terminal_kind=failure_outcome,
+                )
+                if derived is not None:
+                    status_state, status_reason = derived
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=failure.work_item_id,
+                        parent_work_item_id=parent_work_item_id,
+                        worker_id=failure.worker_id,
+                        state=status_state,
+                        origin_epoch=origin_epoch,
+                        terminal_reason=status_reason,
+                    )
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             committed = []
             for index in sorted(results):
@@ -1888,6 +2032,12 @@ class SessionHost:
             turn_recorder.finalize()
             return tuple(committed)
         except asyncio.CancelledError:
+            self._cancel_child_work_statuses(
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children=delegated_children,
+                parent_work_item_id=parent_work_item_id,
+            )
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="cancelled")
             raise
@@ -2590,6 +2740,36 @@ class SessionHost:
             origin_epoch=origin_epoch,
             terminal_reason=terminal_reason,
         )
+
+    def _cancel_child_work_statuses(
+        self,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        children: Mapping[str, str | None],
+        parent_work_item_id: str | None = None,
+    ) -> None:
+        """Terminalize every still-non-terminal delegated child as ``cancelled``.
+
+        A turn cancelled mid-flight would otherwise strand a capable client on
+        a non-terminal ``routing``/``searching`` record forever. ``children``
+        maps each delegated child's ``work_item_id`` to its worker id.
+
+        Idempotent by construction, so callers do not have to track which
+        children already settled: ``legal_work_status_transition`` rejects any
+        move out of a terminal child state, rejects ``cancelled`` as a
+        cold-start state (a child that never had a status is a no-op), and
+        ``_reaggregate_parent`` never regresses an already-terminal parent.
+        """
+        for work_item_id, worker_id in children.items():
+            self._emit_work_status(
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                parent_work_item_id=parent_work_item_id,
+                worker_id=worker_id,
+                state="cancelled",
+                origin_epoch=origin_epoch,
+            )
 
     def accepts(self, epoch: int | None) -> bool:
         return (

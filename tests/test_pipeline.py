@@ -5937,3 +5937,365 @@ def test_work_status_helper_matches_the_late_commit_derivation(
         committed=commit_outcome == "committed",
         terminal_kind=terminal_kind,
     ) == _reference_late_commit_site(work_outcome, commit_outcome, terminal_kind)
+
+
+# --- I6/I7/I9: work-status emission gaps -----------------------------------
+#
+# I6: ``_handle_pending`` and ``_handle_multi_intent`` emitted no work_status
+# at all -- a continuation or compound turn was invisible to a capable client.
+# I7: a retained child on a non-capable connection fell through to the generic
+# terminal block and was reported as ``failed`` -- a benign "still working"
+# state published as a failure, which the coordinator could never later flip
+# to ``result_ready`` (a terminal parent never regresses).
+# I9: a directly-cancelled turn emitted no terminal status, stranding a
+# capable client on a non-terminal ``routing``/``searching`` record.
+
+
+def _work_status_states(host: SessionHost) -> list[str]:
+    return [event.payload["state"] for event in host.state.events if event.kind == "work_status"]
+
+
+def _pending_outcome() -> object:
+    pending = type(
+        "Pending",
+        (),
+        {
+            "owner_id": "worker-search",
+            "original_query": "continue please",
+            "question": "Which one?",
+        },
+    )()
+    return type("Outcome", (), {"pending_dialogue": pending, "work_items": ()})()
+
+
+def _pending_host(submitted: object, sink: CollectingMeasurementSink) -> SessionHost:
+    """A host whose coordinator returns a hand-built ``submit`` outcome for the
+    ``continue_pending`` path."""
+    worker = ResultWorker()
+
+    class Registry:
+        config = Config(max_work_items_per_turn=2)
+
+        @staticmethod
+        def get(_worker_id: str) -> object:
+            return type("Registered", (), {"worker": worker})()
+
+    class Coordinator(WorkItemCoordinator):
+        def __init__(self) -> None:
+            super().__init__(registry=Registry(), router=object())
+
+        async def submit(self, *_args: object, **_kwargs: object) -> object:
+            return submitted
+
+    return SessionHost(
+        runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+    )
+
+
+def test_pending_continuation_turn_emits_routing_through_terminal_work_status() -> None:
+    """I6: a ``continue_pending`` turn delegates real work, so its parent
+    record must progress routing -> searching -> terminal like any other
+    delegated turn."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = _pending_host(_submitted(results=(_fan_in_result("turn-pending", "answer"),)), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_pending(
+            _pending_outcome(),
+            "continue please",
+            origin,
+            "turn-pending",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+        )
+
+        assert _work_status_states(host) == ["routing", "searching", "result_ready"]
+        statuses = host.state.work_status_snapshot()
+        assert [status.work_item_id for status in statuses] == ["work-turn-pending"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_continuation_retained_child_reports_background_not_failed() -> None:
+    """I6 + I7: a retained continuation is still working -- never ``failed``."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = _pending_host(_submitted(pending_work_item_ids=("work-turn-pending",)), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_pending(
+            _pending_outcome(),
+            "continue please",
+            origin,
+            "turn-pending",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+        )
+
+        states = _work_status_states(host)
+        assert states == ["routing", "searching", "background"]
+        assert "failed" not in states
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_parent_aggregate_progresses_through_its_children() -> None:
+    """I6: every delegated multi-intent child must feed the turn's single
+    parent aggregate, keyed off ``work-{turn_id}``."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(
+                results=(
+                    _fan_in_result("turn-multi-0", "first answer"),
+                    _fan_in_result("turn-multi-1", "second answer"),
+                )
+            ),
+            sink,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "",
+            origin,
+            "turn-multi",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-multi"),
+        )
+
+        assert _work_status_states(host) == ["routing", "searching", "result_ready"]
+        statuses = host.state.work_status_snapshot()
+        assert [status.work_item_id for status in statuses] == ["work-turn-multi"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_mixed_terminal_children_aggregate_to_failed_parent() -> None:
+    """A retained sibling holds the aggregate at ``background`` only while it
+    is the sole non-terminal child; a failed sibling still wins the terminal
+    join."""
+
+    async def run() -> None:
+        from server.work_item_coordinator import WorkItemFailure
+
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(
+                results=(_fan_in_result("turn-mix-0", "first answer"),),
+                failures=(
+                    WorkItemFailure(
+                        work_item_id="work-turn-mix-1",
+                        worker_id="worker-search",
+                        error_type="RuntimeError",
+                        error_message="boom",
+                        failure_kind="retention_rejected",
+                    ),
+                ),
+            ),
+            sink,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "",
+            origin,
+            "turn-mix",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-mix"),
+        )
+
+        assert _work_status_states(host) == ["routing", "searching", "failed"]
+        statuses = host.state.work_status_snapshot()
+        assert statuses[0].terminal_reason == "retention_rejected"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retained_foreground_child_records_background_even_without_capability() -> None:
+    """I7: the ledger must record ``background`` for a retained child on a
+    non-capable connection too. The wire filter lives in the observer, so
+    emitting ``failed`` here only ever mislabels the work -- and permanently,
+    since a terminal parent never regresses to ``result_ready``."""
+
+    async def run() -> None:
+        worker = BlockingResultWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "slow search", "model_policy": "deep"},
+        )()
+
+        class RetainingRoutedCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(worker)
+                self.owner = WorkItemCoordinator(
+                    config=Config(foreground_search_timeout_seconds=0.001)
+                )
+                self.config = self.owner.config
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                return self.owner.start_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **kwargs: object) -> bool:
+                return self.owner.retain_late_task(task, **kwargs)
+
+            async def shutdown(self) -> None:
+                await self.owner.shutdown()
+
+        coordinator = RetainingRoutedCoordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        origin = await host.connect(connection_handshake(host, 1))
+        assert not origin.supports_work_status
+
+        foreground = await host._handle_transcript("slow query")
+        assert "continue in the background" in foreground.text
+
+        states = _work_status_states(host)
+        assert states == ["routing", "searching", "background"]
+        assert "failed" not in states
+        assert host.state.work_status_snapshot()[0].state == "background"
+
+        worker.release.set()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancelled_pending_turn_terminalizes_its_non_terminal_child_status() -> None:
+    """I9: a turn cancelled mid-flight must publish a terminal ``cancelled``
+    status instead of stranding a capable client on ``searching``."""
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+                self.submitting = asyncio.Event()
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                self.submitting.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        coordinator = Coordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        turn = asyncio.create_task(
+            host._handle_pending(
+                _pending_outcome(),
+                "continue please",
+                origin,
+                "turn-cancel",
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-cancel"),
+            )
+        )
+        await asyncio.wait_for(coordinator.submitting.wait(), 1)
+        assert _work_status_states(host) == ["routing", "searching"]
+
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        assert _work_status_states(host) == ["routing", "searching", "cancelled"]
+        assert host.state.work_status_snapshot()[0].state == "cancelled"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancelled_multi_intent_turn_terminalizes_every_non_terminal_child() -> None:
+    """I9, fan-out shape: both delegated children of a cancelled compound turn
+    settle, so the parent aggregate reaches ``cancelled`` rather than holding
+    at ``searching`` forever."""
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=_FanInRegistry(), router=_FanInRouter())
+                self.submitting = asyncio.Event()
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                self.submitting.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        coordinator = Coordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        turn = asyncio.create_task(
+            host._handle_multi_intent(
+                _multi_intent_outcome("first item", "second item"),
+                "",
+                origin,
+                "turn-multi-cancel",
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-multi-cancel"),
+            )
+        )
+        await asyncio.wait_for(coordinator.submitting.wait(), 1)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        assert _work_status_states(host)[-1] == "cancelled"
+        statuses = host.state.work_status_snapshot()
+        assert [status.work_item_id for status in statuses] == ["work-turn-multi-cancel"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_status_sweep_is_idempotent_for_already_terminal_children() -> None:
+    """The I9 sweep re-emits ``cancelled`` for children that may already have
+    settled. Terminal children reject the transition and an already-terminal
+    parent never regresses, so a repeated sweep publishes nothing new."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner)
+        await host.connect(connection_handshake(host, 1))
+        host._emit_work_status(
+            turn_id="turn-idem",
+            work_item_id="work-turn-idem",
+            state="searching",
+            origin_epoch=1,
+        )
+        host._emit_work_status(
+            turn_id="turn-idem",
+            work_item_id="work-turn-idem",
+            state="result_ready",
+            origin_epoch=1,
+        )
+        settled = _work_status_states(host)
+
+        for _ in range(3):
+            host._cancel_child_work_statuses(
+                turn_id="turn-idem",
+                origin_epoch=1,
+                children={"work-turn-idem": None},
+            )
+
+        assert _work_status_states(host) == settled
+        assert host.state.work_status_snapshot()[0].state == "result_ready"
+        await host.shutdown()
+
+    asyncio.run(run())
