@@ -851,3 +851,60 @@ def test_commit_late_result_once_active_generation_is_never_interrupted() -> Non
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drained() -> None:
+    """A work item that has already been admitted and drained must not leave a
+    stale queue key behind: the sole-remaining-child ack cancellation is gated
+    on "no other pending work", and a stale empty key would make that gate
+    permanently false for any connection that ever admitted an item."""
+
+    async def run() -> None:
+        host = SessionHost()
+        origin = await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+        drained = origin.scheduler.enqueue(
+            work_item_id="work-earlier",
+            run_id="run-earlier",
+            result_id="result-earlier",
+            text="an earlier answer",
+        )
+        admitted = await origin.scheduler.start_next("work-earlier")
+        assert admitted is not None and admitted.utterance_id == drained.utterance_id
+        origin.scheduler.delivery_completed(admitted.utterance_id)
+        assert origin.scheduler.active is None
+        assert origin.scheduler.pending_work_item_ids() == frozenset()
+
+        turn_id = "turn-5"
+        ack_work_item_id = f"ack-{turn_id}"
+        host._ack_emitted_turns.add(turn_id)
+        origin.scheduler.enqueue(
+            work_item_id=ack_work_item_id,
+            run_id="run-ack",
+            result_id=None,
+            text="One moment.",
+            role="ack",
+            ack_id=ack_work_item_id,
+            turn_id=turn_id,
+        )
+        origin.scheduler.enqueue(
+            work_item_id="work-5-0",
+            run_id="run-5-0",
+            result_id="result-5-0",
+            text="only child",
+        )
+
+        await host.cancel_turn_or_child(turn_id, "work-5-0")
+
+        assert ack_work_item_id not in origin.scheduler._queues
+        assert "work-5-0" not in origin.scheduler._queues
+        assert turn_id not in host._ack_emitted_turns
+        await host.shutdown()
+
+    asyncio.run(run())

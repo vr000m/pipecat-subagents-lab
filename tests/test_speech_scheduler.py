@@ -513,3 +513,28 @@ def test_ack_admission_and_completion_do_not_block_a_ready_result_from_committin
     assert scheduler.active is None
     started = asyncio.run(scheduler.start_next("work-1-0"))
     assert started is not None and started.utterance_id == result.utterance_id
+
+
+def test_start_next_drops_the_queue_key_once_its_last_item_is_admitted() -> None:
+    """An admitted item must not leave an empty ``[]`` behind under its queue
+    key: callers that ask "is any work still pending?" by looking at the queue
+    keys would otherwise see a permanently truthy stale key."""
+    scheduler = _scheduler()
+    enqueue(scheduler, "work-1-0", "only item")
+
+    admitted = asyncio.run(scheduler.start_next())
+
+    assert admitted is not None
+    assert "work-1-0" not in scheduler._queues
+    assert scheduler.pending_work_item_ids() == frozenset()
+
+
+def test_pending_work_item_ids_reports_only_non_empty_queues_and_honours_exclude() -> None:
+    scheduler = _scheduler()
+    enqueue_ack(scheduler, turn_id="turn-1")
+    enqueue(scheduler, "work-1-0", "child")
+    # Defence in depth: even a hand-planted empty queue must not be reported.
+    scheduler._queues["work-1-1"] = []
+
+    assert scheduler.pending_work_item_ids() == frozenset({"ack-turn-1", "work-1-0"})
+    assert scheduler.pending_work_item_ids(exclude="ack-turn-1") == frozenset({"work-1-0"})

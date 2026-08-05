@@ -61,6 +61,7 @@ from .speech_scheduler import (
     ROLE_ACK,
     ROLE_RESULT,
     ROLE_TIMEOUT_NOTICE,
+    SpeechItem,
     SpeechRole,
     SpeechScheduler,
     UtteranceLease,
@@ -855,6 +856,22 @@ class SessionHost:
     def _clear_ack_latch(self, turn_id: str) -> None:
         self._ack_emitted_turns.discard(turn_id)
 
+    def _ack_turn_for_work_item(self, work_item_id: str) -> str | None:
+        """The latched semantic turn that owns ``work_item_id``, if any.
+
+        A control message ("stop that") arrives as its own semantic turn, so
+        the turn being cancelled is never the control turn: the ack that must
+        be settled belongs to the *target child's* turn. Delegated children
+        are named ``work-{turn_id}`` (single intent) or ``work-{turn_id}-{i}``
+        (multi-intent) at their two creation sites, so matching against the
+        live latch set resolves the owner without a second registry and
+        without the ambiguity of parsing a turn id back out of the string.
+        """
+        for candidate in self._ack_emitted_turns:
+            if work_item_id == f"work-{candidate}" or work_item_id.startswith(f"work-{candidate}-"):
+                return candidate
+        return None
+
     def on_ack_terminal(
         self, identity: GenerationIdentity, reason: PreAdmissionTerminalReason
     ) -> None:
@@ -878,17 +895,19 @@ class SessionHost:
     ) -> None:
         """Enqueue this turn's one delegation-confirmed ack.
 
-        Latches immediately so later eligible multi-intent children in the
-        same turn are no-ops (Requirements: one ephemeral ack per semantic
-        turn, never one per child, never claiming progress that hasn't
-        happened). When ``search_task`` is supplied, this yields exactly one
+        Latches at the moment the ack is enqueued, so later eligible
+        multi-intent children in the same turn are no-ops (Requirements: one
+        ephemeral ack per semantic turn, never one per child, never claiming
+        progress that hasn't happened). A child that bails before enqueueing
+        does not consume the turn's one ack slot -- otherwise a turn whose
+        first child had no TTS (or resolved instantly) would be permanently
+        ack-less. When ``search_task`` is supplied, this yields exactly one
         scheduling tick first: a search that already resolved within that
         tick has no real delegation latency to acknowledge, so no ack is
         queued at all ('without claiming progress that hasn't happened').
         """
         if not self.feature_policy.enable_early_ack or turn_id in self._ack_emitted_turns:
             return
-        self._ack_emitted_turns.add(turn_id)
         if (
             origin.tts is None
             or self.connection is not origin
@@ -914,6 +933,11 @@ class SessionHost:
                 turn_id=turn_id,
             )
 
+        # Latch only on the path that actually enqueues: a child that bailed
+        # above (no TTS, superseded origin, stale epoch, or a search that
+        # resolved within one tick) never spent this turn's single ack slot,
+        # so a later genuinely-slow child of the same turn can still claim it.
+        self._ack_emitted_turns.add(turn_id)
         enqueue_ack()
         self._schedule_ack_admission(origin, ack_work_item_id, enqueue_ack)
 
@@ -954,8 +978,13 @@ class SessionHost:
         task.add_done_callback(self._ack_admission_tasks.discard)
 
     async def cancel_turn_or_child(
-        self, turn_id: str, child_work_item_id: str | None = None
-    ) -> None:
+        self,
+        turn_id: str,
+        child_work_item_id: str | None = None,
+        *,
+        origin: ConnectionPipeline | None = None,
+        exclude_work_item_id: str | None = None,
+    ) -> tuple[tuple[str, ...], tuple[SpeechItem, ...]]:
         """Host-owned atomic cancellation of a turn's ack and/or one child.
 
         A child cancel never accidentally removes the parent ack unless it
@@ -965,32 +994,40 @@ class SessionHost:
         Synchronous and non-awaiting apart from the scheduler's own stop
         signalling, so nothing else can interleave between child removal and
         the sole-child ack check.
+
+        ``exclude_work_item_id`` protects the caller's own in-flight turn task
+        from the sweep. Returns the ``(cancelled_work, cancelled_speech)``
+        pair for the *requested* target only: the parent ack is ephemeral and
+        never counts towards a caller's "did this cancel hit anything?"
+        decision.
         """
-        origin = self.connection
+        origin = origin or self.connection
         ack_work_item_id = f"ack-{turn_id}"
         if origin is None:
             self._clear_ack_latch(turn_id)
-            return
+            return (), ()
         scheduler = origin.scheduler
         if child_work_item_id is None:
-            other_keys = {key for key in scheduler._queues if key != ack_work_item_id}
-            if scheduler.active is not None:
-                other_keys.add(scheduler.active.item.work_item_id)
-            other_keys.discard(ack_work_item_id)
-            for key in other_keys:
-                self._cancel_work(key)
-                scheduler.cancel(key)
-            scheduler.cancel(ack_work_item_id)
+            cancelled_work = self._cancel_work(None, exclude_work_item_id=exclude_work_item_id)
+            cancelled_speech = scheduler.cancel(None)
             self._clear_ack_latch(turn_id)
-            return
-        self._cancel_work(child_work_item_id)
-        scheduler.cancel(child_work_item_id)
-        remaining = {key for key in scheduler._queues if key != ack_work_item_id}
+            for item in cancelled_speech:
+                # A whole-turn sweep removes every live ack, including acks
+                # belonging to earlier turns; their latches go with them.
+                if item.role == ROLE_ACK and item.turn_id is not None:
+                    self._clear_ack_latch(item.turn_id)
+            return cancelled_work, cancelled_speech
+        cancelled_work = self._cancel_work(
+            child_work_item_id, exclude_work_item_id=exclude_work_item_id
+        )
+        cancelled_speech = scheduler.cancel(child_work_item_id)
+        remaining = set(scheduler.pending_work_item_ids(exclude=ack_work_item_id))
         if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
             remaining.add(scheduler.active.item.work_item_id)
         if not remaining:
             scheduler.cancel(ack_work_item_id)
             self._clear_ack_latch(turn_id)
+        return cancelled_work, cancelled_speech
 
     def _require_coordinator(self) -> Any:
         coordinator = self.coordinator
@@ -1093,10 +1130,6 @@ class SessionHost:
                             control_outcome = "applied"
                     elif action in {"cancel", "stop"}:
                         target = outcome.work_items[0] if outcome.work_items else None
-                        cancelled_work = self._cancel_work(
-                            target,
-                            exclude_work_item_id=work_item_id,
-                        )
                         active_lease = origin.scheduler.active
                         if (
                             origin.lifecycle is not None
@@ -1104,7 +1137,23 @@ class SessionHost:
                             and (target is None or active_lease.item.work_item_id == target)
                         ):
                             origin.lifecycle.record_interruption(active_lease.token, pause=False)
-                        cancelled_speech = origin.scheduler.cancel(target)
+                        # Route every explicit cancel/stop through the host's
+                        # cancellation boundary so a targeted child cancel also
+                        # settles this turn's parent ack (and its latch) when
+                        # that child was the sole remaining delegated child --
+                        # an ack must never be spoken after the user cancelled
+                        # the work it was acknowledging.
+                        cancel_turn_id = (
+                            self._ack_turn_for_work_item(target) or turn_id
+                            if target is not None
+                            else turn_id
+                        )
+                        cancelled_work, cancelled_speech = await self.cancel_turn_or_child(
+                            cancel_turn_id,
+                            target,
+                            origin=origin,
+                            exclude_work_item_id=work_item_id,
+                        )
                         await origin.scheduler.wait_for_stops()
                         if not cancelled_work and not cancelled_speech:
                             control_outcome = (

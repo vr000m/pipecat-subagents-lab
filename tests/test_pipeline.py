@@ -5700,3 +5700,154 @@ def test_early_ack_is_discarded_without_being_admitted_when_the_result_is_alread
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slot() -> None:
+    """The turn latch must be claimed only by the child that actually enqueues
+    the ack. A first eligible child of a multi-intent turn that bails (no TTS
+    on the origin, or a search that resolves within one tick) must leave the
+    turn's single ack slot available for a later, genuinely slow child of the
+    same ``turn_id``."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        turn_id = "turn-multi"
+
+        # First child: origin has no TTS, so it bails before enqueueing.
+        tts = connection.tts
+        connection.tts = None
+        await host._emit_early_ack(connection, turn_id=turn_id, origin_epoch=connection.epoch)
+        connection.tts = tts
+        assert f"ack-{turn_id}" not in connection.scheduler._queues
+
+        # Second child: a search that resolves within one tick, so it also
+        # bails before enqueueing.
+        fast: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(0))
+        await host._emit_early_ack(
+            connection,
+            turn_id=turn_id,
+            origin_epoch=connection.epoch,
+            search_task=fast,
+        )
+        await fast
+        assert f"ack-{turn_id}" not in connection.scheduler._queues
+
+        # Third child of the same turn is genuinely slow: it must still get
+        # the turn's one ack.
+        slow: asyncio.Task[None] = asyncio.create_task(asyncio.Event().wait())
+        await host._emit_early_ack(
+            connection,
+            turn_id=turn_id,
+            origin_epoch=connection.epoch,
+            search_task=slow,
+        )
+        assert f"ack-{turn_id}" in connection.scheduler._queues or any(
+            lease is not None and lease.item.work_item_id == f"ack-{turn_id}"
+            for lease in (connection.scheduler.active,)
+        )
+        assert turn_id in host._ack_emitted_turns
+
+        slow.cancel()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_the_others() -> None:
+    """An explicit ``cancel``/``stop`` control message targeting a single child
+    must go through the host's cancellation boundary: the parent ack survives
+    while another delegated child remains, and is cancelled once the targeted
+    child was the sole remaining one."""
+
+    from server.speech_scheduler import ROLE_ACK
+
+    async def run() -> None:
+        class ControlCoordinator:
+            def __init__(self) -> None:
+                self.target: str | None = None
+
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": (self.target,) if self.target else (),
+                        "control_action": "cancel",
+                    },
+                )()
+
+        coordinator = ControlCoordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=coordinator)
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        turn_id = "turn-cancel"
+        ack_work_item_id = f"ack-{turn_id}"
+        host._ack_emitted_turns.add(turn_id)
+        connection.scheduler.enqueue(
+            result_id=None,
+            work_item_id=ack_work_item_id,
+            run_id=f"run-{ack_work_item_id}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=ack_work_item_id,
+            turn_id=turn_id,
+        )
+        for index in (0, 1):
+            connection.scheduler.enqueue(
+                result_id=f"result-{index}",
+                work_item_id=f"work-{turn_id}-{index}",
+                run_id=f"run-{index}",
+                text=f"child {index}",
+                origin_epoch=1,
+            )
+
+        coordinator.target = f"work-{turn_id}-0"
+        await host._handle_transcript(f"cancel work-{turn_id}-0")
+        assert ack_work_item_id in connection.scheduler._queues
+        assert turn_id in host._ack_emitted_turns
+
+        # Let the first control confirmation finish speaking, so the second
+        # cancel really does target the turn's sole remaining delegated child.
+        active = connection.scheduler.active
+        assert active is not None
+        connection.scheduler.delivery_completed(active.item.utterance_id)
+        await acknowledge_lifecycle_flush(connection, active.token)
+
+        coordinator.target = f"work-{turn_id}-1"
+        await host._handle_transcript(f"cancel work-{turn_id}-1")
+        assert ack_work_item_id not in connection.scheduler._queues
+        assert turn_id not in host._ack_emitted_turns
+
+        # A whole-turn cancel removes an earlier turn's live ack and its latch
+        # too: nothing may speak an ack for work the user just cancelled.
+        other_turn = "turn-swept"
+        other_ack = f"ack-{other_turn}"
+        host._ack_emitted_turns.add(other_turn)
+        connection.scheduler.enqueue(
+            result_id=None,
+            work_item_id=other_ack,
+            run_id=f"run-{other_ack}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=other_ack,
+            turn_id=other_turn,
+        )
+        coordinator.target = None
+        frames_before_sweep = len(connection.worker.frames)
+        await host._handle_transcript("cancel")
+        assert other_ack not in connection.scheduler._queues
+        assert other_turn not in host._ack_emitted_turns
+        assert all(
+            not isinstance(frame, TTSSpeakFrame) or frame.text != "One moment."
+            for frame in connection.worker.frames[frames_before_sweep:]
+        )
+
+        await host.shutdown()
+
+    asyncio.run(run())

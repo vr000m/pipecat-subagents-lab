@@ -104,6 +104,16 @@ class SpeechScheduler:
     def active(self) -> UtteranceLease | None:
         return self._active
 
+    def pending_work_item_ids(self, *, exclude: str | None = None) -> frozenset[str]:
+        """Work-item keys that still have at least one queued speech item.
+
+        The public read for "is any other work still pending?": callers must
+        not inspect ``_queues`` directly, and the truthiness filter here means
+        a queue key left behind empty by a future regression cannot be
+        mistaken for pending work.
+        """
+        return frozenset(key for key, queue in self._queues.items() if queue and key != exclude)
+
     def paused(self, work_item_id: str | None = None) -> SpeechItem | None:
         if work_item_id is not None:
             return self._paused.get(work_item_id)
@@ -230,6 +240,11 @@ class SpeechScheduler:
             return None
         generation = disposition.generation
         self._queues[item.work_item_id].pop(0)
+        if not self._queues[item.work_item_id]:
+            # Drop the now-empty queue key, exactly as every other queue
+            # mutator does. A retained empty list is indistinguishable from
+            # pending work to any caller that inspects the queue keys.
+            self._queues.pop(item.work_item_id, None)
         token = generation.token
         lease = UtteranceLease(item, token)
         self._active = lease
