@@ -5851,3 +5851,89 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
         await host.shutdown()
 
     asyncio.run(run())
+
+
+# --- M12: one shared outcome -> work-status derivation ---------------------
+#
+# Both status-deriving call sites (the delegated-child finalization path and
+# ``commit_late_result_once``'s finally block) must route through
+# ``_work_status_for_outcome``. These references reimplement the two former
+# inline derivations; the parametrised tables below lock them to the shared
+# helper so the two sites can never drift apart again.
+
+
+def _reference_delegated_child_site(
+    child_outcome_label: str, was_cancelled: bool
+) -> tuple[str, str | None]:
+    if was_cancelled:
+        return "cancelled", None
+    if child_outcome_label == "completed":
+        return "result_ready", None
+    return (
+        "failed",
+        "retention_rejected" if child_outcome_label == "retention_rejected" else None,
+    )
+
+
+def _reference_late_commit_site(
+    work_outcome: str | None, commit_outcome: str | None, terminal_kind: str | None
+) -> tuple[str, str | None] | None:
+    if work_outcome == "completed" and commit_outcome == "committed":
+        return "result_ready", None
+    if work_outcome == "cancelled":
+        return "cancelled", None
+    if work_outcome is not None:
+        return (
+            "failed",
+            "retention_rejected" if terminal_kind == "retention_rejected" else None,
+        )
+    return None
+
+
+_CHILD_OUTCOME_LABELS = (
+    "completed",
+    "retained",
+    "capacity_rejected",
+    "retention_rejected",
+    "failed",
+    "clarify",
+    "declined",
+)
+
+
+@pytest.mark.parametrize("label", _CHILD_OUTCOME_LABELS)
+@pytest.mark.parametrize("was_cancelled", (False, True))
+def test_work_status_helper_matches_the_delegated_child_derivation(
+    label: str, was_cancelled: bool
+) -> None:
+    assert pipeline_module._work_status_for_outcome(
+        label, cancelled=was_cancelled, terminal_kind=label
+    ) == _reference_delegated_child_site(label, was_cancelled)
+
+
+@pytest.mark.parametrize(
+    "work_outcome",
+    (None, "completed", "cancelled", "invalid_result", "failed", "retention_rejected"),
+)
+@pytest.mark.parametrize(
+    "commit_outcome",
+    (
+        None,
+        "committed",
+        "not_applicable",
+        "suppressed_cancelled",
+        "suppressed_stale",
+        "suppressed_duplicate",
+        "failed",
+    ),
+)
+@pytest.mark.parametrize("terminal_kind", (None, "completed", "cancelled", "retention_rejected"))
+def test_work_status_helper_matches_the_late_commit_derivation(
+    work_outcome: str | None, commit_outcome: str | None, terminal_kind: str | None
+) -> None:
+    assert pipeline_module._work_status_for_outcome(
+        work_outcome,
+        cancelled=work_outcome == "cancelled",
+        committed=commit_outcome == "committed",
+        terminal_kind=terminal_kind,
+    ) == _reference_late_commit_site(work_outcome, commit_outcome, terminal_kind)

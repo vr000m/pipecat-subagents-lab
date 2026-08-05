@@ -258,6 +258,34 @@ def _speech_role_for_child_outcome(outcome_label: str) -> SpeechRole:
     return ROLE_TIMEOUT_NOTICE if outcome_label == "retained" else ROLE_RESULT
 
 
+def _work_status_for_outcome(
+    outcome_label: str | None,
+    *,
+    cancelled: bool = False,
+    committed: bool = True,
+    terminal_kind: str | None = None,
+) -> tuple[WorkStatusState, TerminalReason | None] | None:
+    """The single outcome -> coarse work-status derivation for both sites.
+
+    Used by the foreground delegated-child finalization path and by
+    ``SessionHost.commit_late_result_once``'s finalization block, so the two
+    can never drift apart. Precedence mirrors the commit contract:
+    cancellation classifies the work item regardless of whether its result
+    additionally cleared the commit fences; otherwise only an outcome that
+    both completed *and* committed is ``result_ready``, and everything else
+    terminal is ``failed``. ``None`` means "no status to emit" (no outcome
+    was ever assigned). ``terminal_reason`` is carried only for a
+    retention-rejected terminal, the sole reason either site can name.
+    """
+    if cancelled:
+        return "cancelled", None
+    if outcome_label is None:
+        return None
+    if outcome_label == "completed" and committed:
+        return "result_ready", None
+    return "failed", ("retention_rejected" if terminal_kind == "retention_rejected" else None)
+
+
 def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
     """Compose the connection-local bridge, canonical adapter, and speech seams."""
     bus = _ProbeBus() if _ProbeBus is not None else None
@@ -371,6 +399,12 @@ class LateDeliveryContext:
     origin_epoch: int
     ack_timestamp: float | None
     accepted_turn_sequence: int
+    # The turn-level parent work item for a multi-intent child, so a late
+    # child's work_status keys off the same WorkStatusKey as its siblings
+    # (SessionState.set_child_work_status falls back to work_item_id when
+    # this is None, which is correct for a single-intent turn where the
+    # dispatched work item *is* the parent).
+    parent_work_item_id: str | None = None
 
 
 class SessionHost:
@@ -1408,34 +1442,20 @@ class SessionHost:
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             if child_outcome_label not in {"clarify", "declined"}:
-                if was_cancelled:
+                derived = _work_status_for_outcome(
+                    child_outcome_label,
+                    cancelled=was_cancelled,
+                    terminal_kind=child_outcome_label,
+                )
+                if derived is not None:
+                    status_state, status_reason = derived
                     self._emit_work_status(
                         turn_id=turn_id,
                         work_item_id=work_item_id,
                         worker_id=worker_id,
-                        state="cancelled",
+                        state=status_state,
                         origin_epoch=origin_epoch,
-                    )
-                elif child_outcome_label == "completed":
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state="result_ready",
-                        origin_epoch=origin_epoch,
-                    )
-                else:
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state="failed",
-                        origin_epoch=origin_epoch,
-                        terminal_reason=(
-                            "retention_rejected"
-                            if child_outcome_label == "retention_rejected"
-                            else None
-                        ),
+                        terminal_reason=status_reason,
                     )
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             commit_ms = (time.perf_counter() - commit_started) * 1000
@@ -1762,6 +1782,10 @@ class SessionHost:
                     work_item_id=late.work_item_id,
                     origin_epoch=origin.epoch,
                     accepted_turn_sequence=dispatch_turn_sequence,
+                    # Same parent id the turn submits under, so a late
+                    # child's status aggregates with its siblings instead
+                    # of opening a second parent record.
+                    parent_work_item_id=f"work-{turn_id}",
                 )
 
             submitted = await coordinator.submit(
@@ -2016,18 +2040,22 @@ class SessionHost:
         work_item_id: str,
         origin_epoch: int,
         accepted_turn_sequence: int | None = None,
+        parent_work_item_id: str | None = None,
     ) -> LateDeliveryContext:
         """Build the immutable context captured at late-task dispatch time.
 
         ``accepted_turn_sequence`` defaults to the live ``_turn_sequence``
         counter, but callers dispatching from a coroutine that may span
         other turns being accepted concurrently pass an explicit snapshot
-        taken before any ``await``.
+        taken before any ``await``. ``parent_work_item_id`` is supplied only
+        by multi-intent dispatch, where the child work item is not itself
+        the turn's work-status parent.
         """
         return LateDeliveryContext(
             turn_id=turn_id,
             work_item_id=work_item_id,
             origin_epoch=origin_epoch,
+            parent_work_item_id=parent_work_item_id,
             ack_timestamp=time.monotonic(),
             accepted_turn_sequence=(
                 accepted_turn_sequence
@@ -2069,11 +2097,23 @@ class SessionHost:
         """The sole host-owned atomic API for a coordinator late-result callback.
 
         Commits every valid result exactly once and separately computes the
-        autoplay-vs-display-only delivery disposition; cancellation,
-        staleness, and duplication continue to suppress commit entirely
-        (unchanged from pre-Phase-2 behavior), while a valid commit on an
-        otherwise-speakable connection now additionally consults
-        ``_late_result_disposition`` before enqueuing speech. Synchronous
+        autoplay-vs-display-only delivery disposition; a valid commit on an
+        otherwise-speakable connection additionally consults
+        ``_late_result_disposition`` before enqueuing speech.
+
+        Branch precedence is: worker error, then the three structural
+        fences -- not a ``GroundedResult``, foreign ``origin_epoch``,
+        already-committed ``result_id`` -- and only then cancellation,
+        followed by the normal commit-and-speak path. Cancellation is a
+        classification input rather than a fence of its own: a cancelled
+        work item whose result clears every fence still commits exactly
+        once (display-only, no speech), while a cancelled result that is
+        stale or duplicate is suppressed like any other, keeping
+        ``work_outcome="cancelled"`` alongside the suppressing
+        ``commit_outcome``. Ordering cancellation ahead of the fences would
+        let a foreign-epoch result reach authoritative state and would make
+        ``suppressed_duplicate`` unreachable for cancelled work.
+        Synchronous
         and non-awaiting through the disposition decision itself, so
         nothing can interleave between context capture and that verdict;
         the network-facing enqueue/start_next calls below are the only
@@ -2099,6 +2139,19 @@ class SessionHost:
         delivery_disposition: LateDeliveryDisposition | None = None
         result_id: str | None = None
         pending_exception: Exception | None = None
+
+        # Cancellation is a *classification* input for every non-error branch
+        # below, never a branch of its own that could bypass the structural
+        # fences (invalid result / foreign origin_epoch / duplicate
+        # result_id). Snapshotting and clearing the marker once, here, keeps
+        # the marker's consumption independent of branch order; the error
+        # path keeps its pre-existing behavior of leaving the marker
+        # untouched.
+        was_cancelled = late.error is None and late.work_item_id in self._cancelled_work_items
+        if was_cancelled:
+            self._cancelled_work_items.discard(late.work_item_id)
+            if isinstance(late.result, GroundedResult):
+                self._clarification_candidates.pop(late.result.result_id, None)
 
         # The recorder was already popped above, so it is only reachable from
         # this stack frame from here on. A CancelledError delivered during the
@@ -2130,18 +2183,9 @@ class SessionHost:
                     f"Late worker result failed for work_item={late.work_item_id} "
                     f"worker={late.worker_id}"
                 )
-            elif late.work_item_id in self._cancelled_work_items:
-                # Cancellation before/while-queued/while-admitted suppresses
-                # or reclassifies *speech delivery* only -- it no longer
-                # suppresses a valid canonical commit (dev plan Phase 2,
-                # cancellation matrix): a cancelled work item whose late
-                # result is otherwise valid is still committed exactly once,
-                # display-only, with no speech attempt.
-                self._cancelled_work_items.discard(late.work_item_id)
+            elif not isinstance(late.result, GroundedResult):
                 self._known_work_items.discard(late.work_item_id)
-                if isinstance(late.result, GroundedResult):
-                    self._clarification_candidates.pop(late.result.result_id, None)
-                if not isinstance(late.result, GroundedResult):
+                if was_cancelled:
                     work_outcome, commit_outcome, speech_outcome = (
                         "cancelled",
                         "suppressed_cancelled",
@@ -2149,47 +2193,16 @@ class SessionHost:
                     )
                     delivery_disposition = "suppressed"
                 else:
-                    cancelled_result = late.result
-                    try:
-                        self._commit_result_state(cancelled_result)
-                    except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
-                        work_outcome, commit_outcome, speech_outcome = (
-                            "cancelled",
-                            "failed",
-                            "cancelled",
-                        )
-                        delivery_disposition = "not_applicable"
-                        pending_exception = exc
-                    else:
-                        worker = self.state.workers.get(cancelled_result.worker_id)
-                        if worker is not None and worker.origin_epoch == origin_epoch:
-                            self.state.set_worker(
-                                worker.model_copy(
-                                    update={
-                                        "status": "idle",
-                                        "latest_result_id": cancelled_result.result_id,
-                                    }
-                                )
-                            )
-                        work_outcome, commit_outcome, speech_outcome = (
-                            "cancelled",
-                            "committed",
-                            "cancelled",
-                        )
-                        delivery_disposition = "display_only"
-                        result_id = cancelled_result.result_id
-            elif not isinstance(late.result, GroundedResult):
-                self._known_work_items.discard(late.work_item_id)
-                work_outcome, commit_outcome, speech_outcome = (
-                    "invalid_result",
-                    "not_applicable",
-                    "not_applicable",
-                )
-                delivery_disposition = "not_applicable"
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "invalid_result",
+                        "not_applicable",
+                        "not_applicable",
+                    )
+                    delivery_disposition = "not_applicable"
             elif late.result.origin_epoch != origin_epoch:
                 self._known_work_items.discard(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
-                    "completed",
+                    "cancelled" if was_cancelled else "completed",
                     "suppressed_stale",
                     "not_applicable",
                 )
@@ -2199,11 +2212,49 @@ class SessionHost:
             ):
                 self._known_work_items.discard(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
-                    "completed",
+                    "cancelled" if was_cancelled else "completed",
                     "suppressed_duplicate",
                     "not_applicable",
                 )
                 delivery_disposition = "not_applicable"
+            elif was_cancelled:
+                # Cancellation before/while-queued/while-admitted suppresses
+                # or reclassifies *speech delivery* only -- it no longer
+                # suppresses a valid canonical commit (dev plan Phase 2,
+                # cancellation matrix): a cancelled work item whose late
+                # result is otherwise valid *and past every structural fence
+                # above* is still committed exactly once, display-only, with
+                # no speech attempt.
+                self._known_work_items.discard(late.work_item_id)
+                cancelled_result = late.result
+                try:
+                    self._commit_result_state(cancelled_result)
+                except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "cancelled",
+                        "failed",
+                        "cancelled",
+                    )
+                    delivery_disposition = "not_applicable"
+                    pending_exception = exc
+                else:
+                    worker = self.state.workers.get(cancelled_result.worker_id)
+                    if worker is not None and worker.origin_epoch == origin_epoch:
+                        self.state.set_worker(
+                            worker.model_copy(
+                                update={
+                                    "status": "idle",
+                                    "latest_result_id": cancelled_result.result_id,
+                                }
+                            )
+                        )
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "cancelled",
+                        "committed",
+                        "cancelled",
+                    )
+                    delivery_disposition = "display_only"
+                    result_id = cancelled_result.result_id
             else:
                 result = late.result
                 try:
@@ -2295,29 +2346,21 @@ class SessionHost:
                     delivery_disposition=delivery_disposition,
                     result_id=result_id,
                 )
-            if work_outcome == "completed" and commit_outcome == "committed":
+            derived = _work_status_for_outcome(
+                work_outcome,
+                cancelled=work_outcome == "cancelled",
+                committed=commit_outcome == "committed",
+                terminal_kind=late.terminal_kind,
+            )
+            if derived is not None:
+                status_state, status_reason = derived
                 self._emit_work_status(
                     turn_id=context.turn_id,
                     work_item_id=context.work_item_id,
-                    state="result_ready",
+                    parent_work_item_id=context.parent_work_item_id,
+                    state=status_state,
                     origin_epoch=origin_epoch,
-                )
-            elif work_outcome == "cancelled":
-                self._emit_work_status(
-                    turn_id=context.turn_id,
-                    work_item_id=context.work_item_id,
-                    state="cancelled",
-                    origin_epoch=origin_epoch,
-                )
-            elif work_outcome is not None:
-                self._emit_work_status(
-                    turn_id=context.turn_id,
-                    work_item_id=context.work_item_id,
-                    state="failed",
-                    origin_epoch=origin_epoch,
-                    terminal_reason=(
-                        "retention_rejected" if late.terminal_kind == "retention_rejected" else None
-                    ),
+                    terminal_reason=status_reason,
                 )
         if pending_exception is not None:
             raise pending_exception

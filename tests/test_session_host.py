@@ -523,6 +523,7 @@ async def _connected_host(
     enable_autoplay_policy: bool = True,
     promotion_manifest: object | None = None,
     speakable: bool = False,
+    measurement_sink: object | None = None,
 ):
     from server.config import Config
 
@@ -532,6 +533,7 @@ async def _connected_host(
         config=config,
         tts=object() if speakable else None,
         promotion_manifest=promotion_manifest,
+        measurement_sink=measurement_sink,
     )
     host.state.set_worker(
         WorkerState(
@@ -744,6 +746,102 @@ def test_commit_late_result_once_duplicate_result_id_retains_the_first_commit_un
         ]
         assert len(history) == 1
         assert history[0].text == "First"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+# -- Late-commit fence precedence over cancellation (finding I5) -----------
+#
+# The cancellation branch must never bypass the structural fences: a
+# cancelled work item whose late result carries a foreign origin_epoch, or
+# whose result_id has already been committed, must still be fenced out
+# instead of being written to authoritative state as a "committed" cancel.
+
+
+def _register_late_recorder(
+    host: SessionHost,
+    work_item_id: str = "work-late-1",
+    *,
+    turn_id: str = "turn-late-1",
+    origin_epoch: int = 1,
+    worker_id: str = "worker-weather",
+) -> object:
+    recorder = host._new_retained_recorder(
+        origin_epoch=origin_epoch,
+        turn_id=turn_id,
+        work_item_id=work_item_id,
+        app_worker_id=worker_id,
+    )
+    host._retained_recorders[work_item_id] = recorder
+    return recorder
+
+
+def _background_fields(sink: CollectingMeasurementSink) -> list[dict]:
+    return [record.fields for record in sink.records if record.event == "work_item_background"]
+
+
+def test_commit_late_result_once_cancelled_foreign_epoch_result_is_never_committed() -> None:
+    """A cancelled work item whose late result was produced under a different
+    epoch must be fenced by the origin_epoch check, not written through the
+    cancellation branch."""
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip("commit_late_result_once not yet implemented")
+        sink = CollectingMeasurementSink()
+        host, _origin = await _connected_host(measurement_sink=sink)
+        host._cancelled_work_items.add("work-late-1")
+        _register_late_recorder(host)
+        context = _late_delivery_context(host, origin_epoch=1)
+        # Foreign-epoch result: the worker produced it under epoch 7 while the
+        # context (and therefore the commit fence) is bound to epoch 1.
+        result = _grounded_result(origin_epoch=7)
+
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+        )
+
+        assert host.state.result_history("worker-weather") == ()
+        fields = _background_fields(sink)
+        assert len(fields) == 1
+        assert fields[0]["commit_outcome"] == "suppressed_stale"
+        assert fields[0]["work_outcome"] == "cancelled"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_cancelled_duplicate_is_classified_suppressed_duplicate() -> None:
+    """Redelivering the same result_id for a cancelled work item commits
+    exactly once; the second delivery is classified as a suppressed
+    duplicate rather than a second 'committed' cancel."""
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip("commit_late_result_once not yet implemented")
+        sink = CollectingMeasurementSink()
+        host, _origin = await _connected_host(measurement_sink=sink)
+        result = _grounded_result()
+
+        for _ in range(2):
+            host._cancelled_work_items.add("work-late-1")
+            _register_late_recorder(host)
+            await host.commit_late_result_once(
+                _late_delivery_context(host),
+                LateResult(work_item_id="work-late-1", worker_id="worker-weather", result=result),
+            )
+
+        history = [
+            r for r in host.state.result_history("worker-weather") if r.result_id == "result-late-1"
+        ]
+        assert len(history) == 1
+        fields = _background_fields(sink)
+        assert len(fields) == 2
+        assert fields[0]["commit_outcome"] == "committed"
+        assert fields[1]["commit_outcome"] == "suppressed_duplicate"
+        assert fields[1]["work_outcome"] == "cancelled"
         await host.shutdown()
 
     asyncio.run(run())

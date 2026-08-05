@@ -329,3 +329,64 @@ def test_snapshot_projection_embeds_work_status_only_when_requested() -> None:
     included = state.snapshot(origin_epoch=1, include_work_status=True).work_status
     assert len(included) == 1
     assert included[0].work_item_id == "work-1"
+
+
+# --- Late multi-intent child keys off the turn's parent (finding I8) -------
+
+
+def test_late_multi_intent_child_status_aggregates_under_the_parent_key() -> None:
+    """A late-completing multi-intent child must land under the turn's parent
+    ``WorkStatusKey``, aggregating with its still-running siblings, instead of
+    opening a second parent record keyed off its own work_item_id."""
+    import asyncio
+
+    from server.contracts import GroundedResult
+    from server.pipeline import LateDeliveryContext, SessionHost
+    from server.work_item_coordinator import LateResult
+
+    async def run() -> None:
+        host = SessionHost()
+        await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+        # Sibling child of the same multi-intent turn, still searching.
+        host._emit_work_status(
+            turn_id="turn-multi",
+            work_item_id="work-turn-multi-1",
+            parent_work_item_id="work-turn-multi",
+            state="searching",
+            origin_epoch=1,
+        )
+        context = LateDeliveryContext(
+            turn_id="turn-multi",
+            work_item_id="work-turn-multi-0",
+            origin_epoch=1,
+            ack_timestamp=None,
+            accepted_turn_sequence=host._turn_sequence,
+            parent_work_item_id="work-turn-multi",
+        )
+        result = GroundedResult(
+            result_id="result-multi-0",
+            worker_id="worker-weather",
+            turn_id="turn-multi-0",
+            text="Late child answer",
+            spoken_text="Late child answer",
+            origin_epoch=1,
+        )
+        await host.commit_late_result_once(
+            context,
+            LateResult(work_item_id="work-turn-multi-0", worker_id="worker-weather", result=result),
+        )
+
+        statuses = host.state.work_status_snapshot()
+        assert [status.work_item_id for status in statuses] == ["work-turn-multi"]
+        # One child result_ready, one sibling still searching -> parent searching.
+        assert statuses[0].state == "searching"
+        await host.shutdown()
+
+    asyncio.run(run())
