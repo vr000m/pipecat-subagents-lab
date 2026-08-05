@@ -4,6 +4,7 @@ import {
   createClientProtocol,
   RTVI_MESSAGE_KINDS,
   validateServerMessage,
+  WORK_STATUS_V1,
 } from "../src/protocol.js";
 
 const appSource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8");
@@ -549,4 +550,18 @@ test("validateServerMessage rejects work_status using the WorkItemEvent-reserved
     };
     expect(validateServerMessage(message)).toBe(false);
   }
+});
+
+
+// The capability name is a cross-language wire constant: nothing but this
+// assertion pair keeps the JS export and server/contracts.py's WORK_STATUS_V1
+// spelled the same way.
+test("the work_status capability constant matches the server contract constant", () => {
+  const contractsSource = readFileSync(
+    new URL("../../server/contracts.py", import.meta.url),
+    "utf8",
+  );
+  const match = contractsSource.match(/^WORK_STATUS_V1 = "([^"]+)"$/m);
+  expect(match).not.toBeNull();
+  expect(WORK_STATUS_V1).toBe(match[1]);
 });

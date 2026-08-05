@@ -1,6 +1,7 @@
 """Versioned Python contract invariants for the browser protocol."""
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 from server.contracts import (
     CONTRACT_VERSION,
+    WORK_STATUS_V1,
     DeliveryState,
     GroundedResult,
     InterruptionEvent,
@@ -603,3 +605,14 @@ def test_snapshot_handshake_rejects_non_string_or_empty_capability_entries() -> 
             capabilities=(1,),  # type: ignore[arg-type]
             capabilities_present=True,
         )
+
+
+def test_work_status_capability_constant_matches_the_browser_constant() -> None:
+    """The capability name is a cross-language wire constant: nothing but this
+    assertion pair keeps `server/contracts.py` and `web/src/protocol.js`
+    spelled the same way."""
+    source = (Path(__file__).resolve().parents[1] / "web" / "src" / "protocol.js").read_text()
+    match = re.search(r'^export const WORK_STATUS_V1 = "([^"]+)";$', source, re.MULTILINE)
+
+    assert match is not None
+    assert WORK_STATUS_V1 == match.group(1)

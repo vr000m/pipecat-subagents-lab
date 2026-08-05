@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import RuntimeSnapshot
+from .contracts import WORK_STATUS_V1, RuntimeSnapshot
 from .session_state import SessionState, StateEvent
 
 _ALWAYS_VISIBLE_KINDS = frozenset(
@@ -67,7 +67,7 @@ class RuntimeObserver:
 
     @property
     def supports_work_status(self) -> bool:
-        return "work_status_v1" in self.capabilities
+        return WORK_STATUS_V1 in self.capabilities
 
     @property
     def projected_sequence(self) -> int:

@@ -316,13 +316,22 @@ class ConnectionPipeline:
     output_teardown: Callable[[], Any] | None = None
     on_transcript: Callable[[str], Any] | None = None
     active: bool = True
-    # Normalized capability set bound immutably to this connection's promoted
-    # epoch (Phase 3); mirrors ConnectionArbiter's Connection.capabilities.
-    capabilities: tuple[str, ...] = ()
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Normalized capability set bound immutably to this connection's
+        promoted epoch (Phase 3).
+
+        Read straight off the ``RuntimeObserver`` constructed from the
+        promoted ``Connection``'s set, so entitlement lives in exactly one
+        place: a mirrored copy here could drift from the set the observer
+        actually filters with.
+        """
+        return self.observer.capabilities
 
     @property
     def supports_work_status(self) -> bool:
-        return "work_status_v1" in self.capabilities
+        return self.observer.supports_work_status
 
     def deactivate(self, *, reconnect: bool = True) -> None:
         self.active = False
@@ -699,7 +708,6 @@ class SessionHost:
             lifecycle=lifecycle,
             stt=connection_stt,
             tts=connection_tts,
-            capabilities=connection.capabilities,
         )
         if connection_stt is not None and self.coordinator is not None:
 

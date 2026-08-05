@@ -1347,3 +1347,157 @@ def test_capable_snapshot_carries_the_work_status_field() -> None:
 
     assert "work_status" in data
     assert isinstance(data["work_status"], list)
+
+
+# --- Batch 7: single-decoder handshake parsing, bounds, and 409-vs-400 -------
+#
+# I14: `capabilities` must decode through Starlette's QueryParams like every
+# other handshake field (one decoder per request, `+` == space), the raw
+# percent-encoding validator must run exactly once, and duplicate query keys
+# must still be rejected -- `QueryParams.getlist` does expose duplicates.
+
+
+def test_handshake_capabilities_decode_matches_starlette_query_params() -> None:
+    """`+` in the capabilities value decodes to a space, identically to the
+    way `request.query_params` decodes the very same bytes."""
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities="%5B%22alpha+beta%22%5D",
+    )
+    request = _raw_request(query)
+    expected = tuple(_json.loads(request.query_params["capabilities"]))
+
+    value = _handshake_from_query(host, request)
+
+    assert expected == ("alpha beta",)
+    assert value.capabilities == expected
+
+
+def test_handshake_validates_raw_percent_encoding_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+    calls: list[bytes] = []
+    original = app_module._validate_raw_percent_encoding
+
+    def counting(raw: bytes) -> None:
+        calls.append(raw)
+        original(raw)
+
+    monkeypatch.setattr(app_module, "_validate_raw_percent_encoding", counting)
+
+    _handshake_from_query(host, _raw_request(query))
+
+    assert len(calls) == 1
+
+
+def test_handshake_still_rejects_duplicate_capabilities_keys_via_getlist() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0"
+        f"&capabilities={encoded}&capabilities={encoded}"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+# M7: the capabilities decoder bounds the array length and each entry length.
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [f"cap_{index}" for index in range(17)],
+        ["a" * 65],
+    ],
+)
+def test_handshake_rejects_oversized_capabilities_payloads(payload: list[str]) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=quote(_json.dumps(payload)),
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [f"cap_{index:02d}" for index in range(16)],
+        ["a" * 64],
+    ],
+)
+def test_handshake_accepts_capabilities_payloads_at_the_bounds(payload: list[str]) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=quote(_json.dumps(payload)),
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == tuple(sorted(payload))
+
+
+# M4: a PATCH whose promoted connection is gone is a stale-epoch 409, never a
+# capability-mismatch 400 -- an absent connection binds no capability set.
+
+
+def test_patch_with_correct_capabilities_and_no_connection_is_409_not_400() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    discovery = host.session_handshake()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = (
+        f"session_id={discovery['session_id']}&resume_token={discovery['resume_token']}"
+        f"&proposed_epoch={discovery['proposed_epoch']}&snapshot_sequence=0"
+        f"&capabilities={encoded}"
+    )
+    host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": discovery["proposed_epoch"],
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    # Redeem the one-shot URL token the way a completed POST would have.
+    assert host.validate_handshake_token(
+        discovery["resume_token"], discovery["proposed_epoch"], redeem=True
+    )
+    assert host.connection is None
+
+    with TestClient(create_app(host)) as client:
+        response = client.patch(
+            f"/api/rtc?{query}",
+            json={
+                "pc_id": "pc-1",
+                "candidates": [{"candidate": "", "sdp_mid": "0", "sdp_mline_index": 0}],
+            },
+            headers={"origin": "http://127.0.0.1:7860"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "stale Small WebRTC connection epoch"

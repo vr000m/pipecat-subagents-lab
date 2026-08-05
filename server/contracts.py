@@ -260,6 +260,10 @@ class InterruptionEvent(StrictModel):
     origin_epoch: int | None = Field(default=None, ge=0)
 
 
+# The single spelling of the capability name that gates the `work_status`
+# wire kind. The browser mirrors it in `web/src/protocol.js`; the two literals
+# must agree exactly (asserted in tests/test_contracts.py).
+WORK_STATUS_V1 = "work_status_v1"
 WORK_STATUS_STATES = (
     "routing",
     "searching",

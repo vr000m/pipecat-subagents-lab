@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createApp } from "../src/app.js";
+import { WORK_STATUS_V1 } from "../src/protocol.js";
 
 const appEntrySource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8");
 
@@ -356,6 +357,10 @@ test("onServerMessage rejects unsupported contracts before applying state", () =
 // web/src/app.js:179 that already builds this same connection URL.
 
 test("browser entrypoint advertises the work_status_v1 capability on the connection URL", () => {
-  expect(appEntrySource).toContain("work_status_v1");
+  // The literal now lives in exactly one place (protocol.js); the entrypoint
+  // advertises it by importing that shared constant.
+  expect(WORK_STATUS_V1).toBe("work_status_v1");
+  expect(appEntrySource).toContain("WORK_STATUS_V1");
+  expect(appEntrySource).not.toContain('"work_status_v1"');
   expect(appEntrySource).toMatch(/searchParams\.set\(\s*["']capabilities["']/);
 });

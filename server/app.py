@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -51,6 +51,11 @@ from .work_item_coordinator import WorkItemCoordinator
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# Bounds on the URL-carried `capabilities` array: the handshake is a short
+# fixed vocabulary of capability names, so an oversized array or an
+# oversized name is malformed input, not a large-but-valid handshake.
+_MAX_CAPABILITY_ENTRIES = 16
+_MAX_CAPABILITY_NAME_LENGTH = 64
 
 
 def _configure_logging() -> None:
@@ -133,34 +138,19 @@ def _validate_raw_percent_encoding(raw_query_string: bytes) -> None:
             index += 1
 
 
-def _raw_query_pairs(request: Request) -> list[tuple[str, str]]:
-    """Parse `scope["query_string"]` directly, bypassing Starlette's
-    last-wins duplicate-key merging so a duplicate `capabilities` key can be
-    rejected rather than silently collapsed."""
-    raw = request.scope.get("query_string", b"")
-    if isinstance(raw, str):
-        raw = raw.encode("latin-1")
-    _validate_raw_percent_encoding(raw)
-    text = raw.decode("latin-1")
-    pairs: list[tuple[str, str]] = []
-    for chunk in text.split("&"):
-        if not chunk:
-            continue
-        key, _, value = chunk.partition("=")
-        pairs.append((unquote(key), unquote(value)))
-    return pairs
-
-
 def _decode_capabilities(request: Request) -> tuple[tuple[str, ...], bool]:
     """Decode the canonical single URL-encoded JSON-array `capabilities` field.
 
     Absent means omission (inherit-on-PATCH / unsupported-on-POST); present
-    but malformed is a 400, matching every other handshake field. The raw
-    query parser rejects duplicate `capabilities` keys before normalization;
-    duplicate entries inside the single JSON array remain deduplicated by
+    but malformed is a 400, matching every other handshake field. The field
+    decodes through Starlette's ``QueryParams`` exactly like every other
+    handshake field -- one decoder per request -- and ``getlist`` (unlike
+    ``get``/``[]``) preserves duplicate keys, so a duplicate `capabilities`
+    key is rejected rather than silently collapsed. Duplicate entries inside
+    the single JSON array remain deduplicated by
     ``SnapshotHandshake.validate_capabilities``.
     """
-    matches = [value for key, value in _raw_query_pairs(request) if key == "capabilities"]
+    matches = request.query_params.getlist("capabilities")
     if not matches:
         return (), False
     if len(matches) > 1:
@@ -169,8 +159,11 @@ def _decode_capabilities(request: Request) -> tuple[tuple[str, ...], bool]:
         decoded = json.loads(matches[0])
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
-    if not isinstance(decoded, list) or any(
-        not isinstance(item, str) or not item for item in decoded
+    if not isinstance(decoded, list) or len(decoded) > _MAX_CAPABILITY_ENTRIES:
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    if any(
+        not isinstance(item, str) or not item or len(item) > _MAX_CAPABILITY_NAME_LENGTH
+        for item in decoded
     ):
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
     return tuple(decoded), True

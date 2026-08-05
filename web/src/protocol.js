@@ -3,6 +3,9 @@ import groundedResultSchema from "../../shared/schemas/grounded-result.json";
 import runtimeSnapshotSchema from "../../shared/schemas/runtime-snapshot.json";
 
 export const CONTRACT_VERSION = "v1.0";
+// Capability name gating the `work_status` wire kind. Must match
+// server/contracts.py's WORK_STATUS_V1 exactly (asserted in both suites).
+export const WORK_STATUS_V1 = "work_status_v1";
 const forbidden = ["raw_logs", "prompt", "context"];
 export const RTVI_MESSAGE_KINDS = Object.freeze([
   "runtime_snapshot",
