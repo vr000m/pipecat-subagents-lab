@@ -235,7 +235,7 @@ def test_default_session_host_derives_one_feature_policy_from_the_loaded_config(
 
     assert isinstance(host.feature_policy, FeaturePolicy)
     assert host.feature_policy.enable_early_ack is False
-    assert host.feature_policy is FeaturePolicy.from_config(host.config)
+    assert host.feature_policy == FeaturePolicy.from_config(host.config)
 
 
 def test_create_app_does_not_resolve_a_second_policy_from_worker_registry_config(

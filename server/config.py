@@ -7,13 +7,34 @@ import json
 import os
 import re
 import tomllib
-import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
 from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
 from urllib.parse import urlparse
+
+_FALLBACK_RELEASE_VERSION = "0.1.3"
+
+
+def _installed_release_version() -> str:
+    """The packaged project version, or a pinned literal when unavailable.
+
+    A non-installed checkout (no distribution metadata) still has to boot, so
+    the lookup is best-effort rather than fatal. Keeping this derived from
+    package metadata avoids a second hand-maintained copy of the version that
+    can silently drift from ``pyproject.toml``.
+    """
+    try:
+        return _package_version("pipecat-subagents-lab")
+    except PackageNotFoundError:
+        return _FALLBACK_RELEASE_VERSION
+
+
+_DEFAULT_RELEASE_VERSION = _installed_release_version()
 
 
 class ConfigError(ValueError):
@@ -76,7 +97,7 @@ class Config:
     early_ack_text: str = "One moment while I look into that."
     promotion_manifest_path: str = "docs/benchmarks/v0.1.3-promotion-manifest.json"
     phase4c_artifact_path: str | None = None
-    release_version: str = "0.1.3"
+    release_version: str = _DEFAULT_RELEASE_VERSION
     source_commit: str | None = None
     source_tree_hash: str | None = None
     deployed_at_utc: str | None = None
@@ -170,9 +191,6 @@ class Config:
         return replace(self, **{f"{service}_endpoint": (transport, address)})
 
 
-_feature_policy_cache: dict[int, FeaturePolicy] = {}
-
-
 @dataclass(frozen=True)
 class FeaturePolicy:
     """Immutable v0.1.3 kill-switch snapshot, resolved once from a `Config`.
@@ -188,26 +206,18 @@ class FeaturePolicy:
 
     @classmethod
     def from_config(cls, config: Config) -> FeaturePolicy:
-        """Resolve once per `Config` identity.
+        """Project the three kill switches out of a `Config`.
 
-        Repeated calls with the *same* `Config` object return the identical
-        cached `FeaturePolicy` instance -- callers may compare with ``is``.
-        A different `Config` instance (even with equal field values) always
-        resolves independently. The cache entry is freed automatically when
-        its `Config` is garbage collected.
+        Both `Config` and `FeaturePolicy` are frozen dataclasses with
+        structural equality, so this resolves unconditionally on every call
+        and callers compare policies with ``==``, never ``is``. Two
+        field-equal `Config` objects therefore yield equal policies.
         """
-        key = id(config)
-        cached = _feature_policy_cache.get(key)
-        if cached is not None:
-            return cached
-        policy = cls(
+        return cls(
             enable_early_ack=config.enable_early_ack,
             enable_background_status=config.enable_background_status,
             enable_autoplay_policy=config.enable_autoplay_policy,
         )
-        _feature_policy_cache[key] = policy
-        weakref.finalize(config, _feature_policy_cache.pop, key, None)
-        return policy
 
 
 def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
@@ -269,19 +279,74 @@ _MANIFEST_REQUIRED_FIELDS = frozenset(
 )
 
 
+_HEX_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+
+# Manifest keys whose value must be a JSON string. `reason` is deliberately
+# excluded: it is required to be present but is null on an eligible manifest.
+_MANIFEST_STRING_FIELDS = (
+    "manifest_phase",
+    "schema_hash",
+    "source_commit",
+    "source_tree_hash",
+    "release_version",
+    "feature_policy_fingerprint",
+    "deployed_at_utc",
+    "generated_at_utc",
+)
+
+
 def _unavailable(reason: str) -> PromotionManifest:
     return PromotionManifest(promotion_eligible=False, reason=reason)
+
+
+def _is_hex_hash(value: object) -> bool:
+    return isinstance(value, str) and _HEX_HASH_PATTERN.fullmatch(value) is not None
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp into an aware UTC instant.
+
+    `datetime.fromisoformat` historically rejects a bare trailing ``Z``, and a
+    naive timestamp cannot be compared against an aware one, so both are
+    normalised here. Raises `ValueError` on anything unparseable; the caller's
+    fail-closed boundary turns that into a display-only verdict.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def load_promotion_manifest(config: Config) -> PromotionManifest:
     """Load and bind-check the promotion manifest at `config.promotion_manifest_path`.
 
     Fail-closed, not fail-fast: any problem here -- the path missing,
-    unreadable, malformed, schema-invalid, phase-incomplete, identity- or
-    fingerprint-mismatched, or stale relative to `config.deployed_at_utc` --
-    degrades to display-only rather than raising. It never prevents server
-    boot.
+    unreadable, malformed, schema-invalid, wrongly typed, phase-incomplete,
+    identity-unbound, identity- or fingerprint-mismatched, or stale relative
+    to `config.deployed_at_utc` -- degrades to display-only rather than
+    raising. It never prevents server boot: every unexpected exception raised
+    below is caught here and rendered as `manifest_malformed`, so fail-closed
+    is a structural property of this boundary rather than of each individual
+    check.
+
+    Precedence of the identity binding changed in this release. Previously a
+    `source_commit`, `source_tree_hash`, or `release_version` check was
+    *skipped* when the corresponding `Config` field was falsy, so an
+    unconfigured runtime accepted whatever identity the manifest declared.
+    Now the comparisons are unconditional: an unset `Config` field means the
+    runtime cannot prove the manifest describes this build, which resolves to
+    `identity_unbound` (display-only) rather than silently passing.
     """
+    try:
+        return _load_promotion_manifest(config)
+    except Exception:  # noqa: BLE001  # fail closed: a malformed manifest must never abort server boot
+        return _unavailable("manifest_malformed")
+
+
+def _load_promotion_manifest(config: Config) -> PromotionManifest:
     path = Path(config.promotion_manifest_path)
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
@@ -300,6 +365,17 @@ def load_promotion_manifest(config: Config) -> PromotionManifest:
     if missing:
         return _unavailable("manifest_schema_invalid")
 
+    if any(not isinstance(manifest[name], str) for name in _MANIFEST_STRING_FIELDS):
+        return _unavailable("manifest_schema_invalid")
+    if not isinstance(manifest["promotion_eligible"], bool):
+        return _unavailable("manifest_schema_invalid")
+    if manifest["reason"] is not None and not isinstance(manifest["reason"], str):
+        return _unavailable("manifest_schema_invalid")
+    if not isinstance(manifest["inputs"], Mapping):
+        return _unavailable("manifest_schema_invalid")
+    if not _is_hex_hash(manifest["schema_hash"]):
+        return _unavailable("manifest_schema_invalid")
+
     manifest_phase = manifest["manifest_phase"]
     if manifest_phase not in {"provisional", "final"}:
         return _unavailable("manifest_schema_invalid")
@@ -307,11 +383,11 @@ def load_promotion_manifest(config: Config) -> PromotionManifest:
     identity = PromotionManifest(
         promotion_eligible=False,
         manifest_phase=manifest_phase,
-        source_commit=manifest.get("source_commit"),
-        source_tree_hash=manifest.get("source_tree_hash"),
-        release_version=manifest.get("release_version"),
-        feature_policy_fingerprint=manifest.get("feature_policy_fingerprint"),
-        generated_at_utc=manifest.get("generated_at_utc"),
+        source_commit=manifest["source_commit"],
+        source_tree_hash=manifest["source_tree_hash"],
+        release_version=manifest["release_version"],
+        feature_policy_fingerprint=manifest["feature_policy_fingerprint"],
+        generated_at_utc=manifest["generated_at_utc"],
     )
 
     if manifest_phase == "provisional":
@@ -323,26 +399,32 @@ def load_promotion_manifest(config: Config) -> PromotionManifest:
     # hash, and any declared Phase 4C hash must validate; Phase 2 does not
     # implement that stamping, so a "final" manifest this loader can see is
     # necessarily incomplete until Phase 3 lands.
-    if "phase3_completion_hash" not in manifest or not manifest["phase3_completion_hash"]:
+    if not _is_hex_hash(manifest.get("phase3_completion_hash")):
         return replace(identity, reason="incomplete_final_manifest")
 
     policy = FeaturePolicy.from_config(config)
     expected_fingerprint = feature_policy_fingerprint(policy)
-    if manifest.get("feature_policy_fingerprint") != expected_fingerprint:
+    if manifest["feature_policy_fingerprint"] != expected_fingerprint:
         return replace(identity, reason="policy_fingerprint_mismatch")
-    if config.source_commit and manifest.get("source_commit") != config.source_commit:
-        return replace(identity, reason="source_mismatch")
-    if config.source_tree_hash and manifest.get("source_tree_hash") != config.source_tree_hash:
-        return replace(identity, reason="source_mismatch")
-    if config.release_version and manifest.get("release_version") != config.release_version:
-        return replace(identity, reason="source_mismatch")
-    generated_at = manifest.get("generated_at_utc")
+    # Unconditional identity binding: an unset Config field cannot prove the
+    # manifest describes this build, so it is unbound rather than waived.
+    for config_value, manifest_key in (
+        (config.source_commit, "source_commit"),
+        (config.source_tree_hash, "source_tree_hash"),
+        (config.release_version, "release_version"),
+    ):
+        if not config_value:
+            return replace(identity, reason="identity_unbound")
+        if manifest[manifest_key] != config_value:
+            return replace(identity, reason="source_mismatch")
     deployed_at = config.deployed_at_utc
-    if deployed_at and (not generated_at or generated_at < deployed_at):
+    if deployed_at and _parse_utc_timestamp(manifest["generated_at_utc"]) < _parse_utc_timestamp(
+        deployed_at
+    ):
         return replace(identity, reason="stale")
 
-    if manifest.get("promotion_eligible") is not True:
-        return replace(identity, reason=manifest.get("reason") or "not_promotion_eligible")
+    if manifest["promotion_eligible"] is not True:
+        return replace(identity, reason=manifest["reason"] or "not_promotion_eligible")
 
     # An optional Phase 4C binding: absent, a no-change release is still a
     # valid final manifest. Present, the declared hash must resolve to a
@@ -501,6 +583,8 @@ def load_config(
         kwargs["early_ack_text"] = str(raw)
     if raw := values.get("WEBSEARCH_PROMOTION_MANIFEST_PATH"):
         kwargs["promotion_manifest_path"] = str(raw)
+    if raw := values.get("WEBSEARCH_PHASE4C_ARTIFACT_PATH"):
+        kwargs["phase4c_artifact_path"] = str(raw)
     if raw := values.get("WEBSEARCH_RELEASE_VERSION"):
         kwargs["release_version"] = str(raw)
     if raw := values.get("PIPECAT_SOURCE_COMMIT"):
@@ -561,6 +645,8 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         values["WEBSEARCH_EARLY_ACK_TEXT"] = features["early_ack_text"]
     if "promotion_manifest_path" in features:
         values["WEBSEARCH_PROMOTION_MANIFEST_PATH"] = features["promotion_manifest_path"]
+    if "phase4c_artifact_path" in features:
+        values["WEBSEARCH_PHASE4C_ARTIFACT_PATH"] = features["phase4c_artifact_path"]
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
     if "provider" in stt:

@@ -734,6 +734,8 @@ def test_load_promotion_manifest_stale_generated_before_deployed_fails_closed(
     load_promotion_manifest = _load_promotion_manifest()
     config = Config(
         promotion_manifest_path=str(tmp_path / "manifest.json"),
+        source_commit="a" * 40,
+        source_tree_hash="b" * 64,
         deployed_at_utc="2026-08-04T00:00:00Z",
     )
     Path(config.promotion_manifest_path).write_text(
@@ -755,6 +757,8 @@ def test_load_promotion_manifest_promotion_eligible_false_stays_display_only(
     load_promotion_manifest = _load_promotion_manifest()
     config = Config(
         promotion_manifest_path=str(tmp_path / "manifest.json"),
+        source_commit="a" * 40,
+        source_tree_hash="b" * 64,
         deployed_at_utc="2026-08-01T00:00:00Z",
     )
     Path(config.promotion_manifest_path).write_text(
@@ -778,6 +782,8 @@ def test_load_promotion_manifest_valid_matching_final_manifest_is_promotion_elig
     load_promotion_manifest = _load_promotion_manifest()
     config = Config(
         promotion_manifest_path=str(tmp_path / "manifest.json"),
+        source_commit="a" * 40,
+        source_tree_hash="b" * 64,
         deployed_at_utc="2026-08-01T00:00:00Z",
     )
     Path(config.promotion_manifest_path).write_text(
@@ -799,5 +805,193 @@ def test_load_promotion_manifest_missing_or_malformed_metadata_never_blocks_serv
     config = Config(promotion_manifest_path=str(tmp_path / "missing.json"))
 
     verdict = load_promotion_manifest(config)  # must not raise
+    assert verdict.promotion_eligible is False
+
+
+# -- Config hardening: manifest type validation, timestamp parsing, the
+# phase4c artifact path loader, and FeaturePolicy value semantics ----------
+
+
+def _bound_config(manifest_path: Path, **overrides: object) -> Config:
+    """A Config whose deployment identity is fully bound to `_final_manifest`."""
+    kwargs: dict[str, object] = {
+        "promotion_manifest_path": str(manifest_path),
+        "source_commit": "a" * 40,
+        "source_tree_hash": "b" * 64,
+        "deployed_at_utc": "2026-08-01T00:00:00Z",
+    }
+    kwargs.update(overrides)
+    return Config(**kwargs)  # type: ignore[arg-type]
+
+
+def test_load_promotion_manifest_non_string_timestamp_fails_closed_without_raising(
+    tmp_path: Path,
+) -> None:
+    """A non-str JSON value where a timestamp is expected must degrade to a
+    display-only verdict, never raise out of the loader and abort boot."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, generated_at_utc=12345)), encoding="utf-8"
+    )
+
+    verdict = load_promotion_manifest(config)  # must not raise
 
     assert verdict.promotion_eligible is False
+    assert verdict.reason
+
+
+def test_load_promotion_manifest_rejects_non_dict_inputs(tmp_path: Path) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, inputs="not-a-mapping")), encoding="utf-8"
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_invalid"
+
+
+def test_load_promotion_manifest_rejects_a_non_hex_schema_hash(tmp_path: Path) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, schema_hash="not-a-hash")), encoding="utf-8"
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_invalid"
+
+
+def test_load_promotion_manifest_rejects_a_non_hex_phase3_completion_hash(tmp_path: Path) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, phase3_completion_hash="yes")), encoding="utf-8"
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+
+
+def test_load_promotion_manifest_unset_source_identity_is_unbound_not_skipped(
+    tmp_path: Path,
+) -> None:
+    """An unset `Config.source_commit` means the runtime cannot prove the
+    manifest describes *this* build -- that is unbound, not "skip the check"."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = Config(
+        promotion_manifest_path=str(manifest_path),
+        source_tree_hash="b" * 64,
+        deployed_at_utc="2026-08-01T00:00:00Z",
+    )
+    manifest_path.write_text(json.dumps(_final_manifest(config=config)), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "identity_unbound"
+
+
+def test_load_promotion_manifest_compares_timestamps_as_instants_not_strings(
+    tmp_path: Path,
+) -> None:
+    """`Z` and `+00:00` denote the same instant; a naive string compare does
+    not, and would mark an equal-instant manifest stale."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+
+    config = _bound_config(manifest_path, deployed_at_utc="2026-01-01T00:00:00+00:00")
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, generated_at_utc="2026-01-01T00:00:00Z")),
+        encoding="utf-8",
+    )
+    assert load_promotion_manifest(config).promotion_eligible is True
+
+    config = _bound_config(manifest_path, deployed_at_utc="2026-01-01T00:00:00Z")
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, generated_at_utc="2026-01-01T00:00:00+00:00")),
+        encoding="utf-8",
+    )
+    assert load_promotion_manifest(config).promotion_eligible is True
+
+
+def test_phase4c_artifact_path_loads_from_environment() -> None:
+    config = load_config(env={"WEBSEARCH_PHASE4C_ARTIFACT_PATH": "docs/benchmarks/phase4c.json"})
+
+    assert config.phase4c_artifact_path == "docs/benchmarks/phase4c.json"
+
+
+def test_phase4c_artifact_path_loads_from_toml_and_environment_wins(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[features]\nphase4c_artifact_path = "docs/benchmarks/from-toml.json"\n', encoding="utf-8"
+    )
+
+    from_toml = load_config(env={}, config_file=config_file)
+    assert from_toml.phase4c_artifact_path == "docs/benchmarks/from-toml.json"
+
+    from_env = load_config(
+        env={"WEBSEARCH_PHASE4C_ARTIFACT_PATH": "/opt/app/phase4c.json"}, config_file=config_file
+    )
+    assert from_env.phase4c_artifact_path == "/opt/app/phase4c.json"
+
+
+def test_load_promotion_manifest_without_a_phase4c_path_is_unresolvable(tmp_path: Path) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    assert config.phase4c_artifact_path is None
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, phase4c_artifact_sha256="f" * 64)),
+        encoding="utf-8",
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "phase4c_unresolvable"
+
+
+def test_release_version_default_matches_the_packaged_project_version() -> None:
+    import tomllib
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        declared = tomllib.load(handle)["project"]["version"]
+
+    assert Config().release_version == declared
+
+
+def test_feature_policy_from_config_compares_by_value_across_distinct_configs() -> None:
+    """`FeaturePolicy` is a frozen dataclass with structural equality; two
+    field-equal `Config` objects must resolve to equal policies."""
+    first = FeaturePolicy.from_config(Config(enable_autoplay_policy=False))
+    second = FeaturePolicy.from_config(Config(enable_autoplay_policy=False))
+
+    assert first == second
+    assert first != FeaturePolicy.from_config(Config())
