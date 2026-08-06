@@ -1,6 +1,6 @@
 # Task: Add Pipecat-native latency observability
 
-**Status**: Complete (deep-review round 2 + mypy adoption landed, PR #3 open)
+**Status**: Complete (deep-review round 2 + mypy adoption landed, PR #3 merged)
 **Component**: Pipecat subagents
 **Assigned to**: Codex
 **Priority**: Medium
@@ -1204,7 +1204,7 @@ re-verified across 10 commits (0beed9b..1ce51ca), followed by a
 type-checker adoption round that closed the resulting `server.pipeline`/
 `server.work_item_coordinator` mypy coverage gap across 5 more commits
 (a9ad400..7de43ca). 502/502 tests passing; `ruff` and `mypy` both clean
-across the full `server/` tree. PR #3 opened
+across the full `server/` tree. PR #3 merged
 (https://github.com/vr000m/pipecat-subagents-lab/pull/3).
 
 `/skein:deep-review --continue` (incremental mode, `fcc5394..29fbd71`,
