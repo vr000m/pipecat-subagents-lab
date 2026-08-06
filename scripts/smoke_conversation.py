@@ -81,6 +81,7 @@ async def _run_child(
             max_latency_seconds + 15,
         ),
     )
+    host.config = tuned
     host.coordinator.config = tuned
     host.registry.config = tuned
     # This smoke isolates the paid semantic path. Browser media and local speech
