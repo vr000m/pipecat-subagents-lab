@@ -54,6 +54,7 @@
         "checked_at_utc": { "type": "string", "format": "date-time" },
         "runner_identity": { "type": "string", "minLength": 1 },
         "checked_source_commit": { "type": "string", "minLength": 1 },
+        "checked_source_tree_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
         "route_artifact_sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
         "package_version": { "type": "string", "minLength": 1 },
         "package_integrity": { "type": "string", "minLength": 1 },

@@ -303,6 +303,27 @@ def _is_hex_hash(value: object) -> bool:
     return isinstance(value, str) and _HEX_HASH_PATTERN.fullmatch(value) is not None
 
 
+_EVIDENCE_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "shared/schemas/v013-evidence.json"
+
+
+def _schema_hash_matches(declared: str) -> bool:
+    """Recompute the evidence schema digest the manifest declares.
+
+    The writer stamps `schema_hash` from `shared/schemas/v013-evidence.json`;
+    accepting it as "some 64-hex string" let a forged manifest declare an
+    arbitrary schema binding. The evidence schemas are deliberately excluded
+    from the deployable runtime set, so a packaged install legitimately may
+    not ship this file -- when it is absent the digest is unverifiable and
+    this check abstains rather than failing a valid deployment. When the file
+    *is* present (dev, CI, repo checkout) the digest must match.
+    """
+    try:
+        data = _EVIDENCE_SCHEMA_PATH.read_bytes()
+    except OSError:
+        return True
+    return hashlib.sha256(data).hexdigest() == declared
+
+
 def _parse_utc_timestamp(value: str) -> datetime:
     """Parse an ISO-8601 timestamp into an aware UTC instant.
 
@@ -375,6 +396,20 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         return _unavailable("manifest_schema_invalid")
     if not _is_hex_hash(manifest["schema_hash"]):
         return _unavailable("manifest_schema_invalid")
+    # `inputs` was previously accepted as "any mapping". Each entry names an
+    # artifact this manifest claims to be bound to, so each must actually
+    # carry a path and a well-formed digest -- otherwise a forged manifest
+    # with a correct outer identity could declare arbitrary/empty bindings.
+    for entry in manifest["inputs"].values():
+        if not isinstance(entry, Mapping):
+            return _unavailable("manifest_schema_invalid")
+        path_value = entry.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            return _unavailable("manifest_schema_invalid")
+        if not _is_hex_hash(entry.get("sha256")):
+            return _unavailable("manifest_schema_invalid")
+    if not _schema_hash_matches(manifest["schema_hash"]):
+        return _unavailable("manifest_schema_hash_mismatch")
 
     manifest_phase = manifest["manifest_phase"]
     if manifest_phase not in {"provisional", "final"}:
@@ -401,6 +436,15 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # necessarily incomplete until Phase 3 lands.
     if not _is_hex_hash(manifest.get("phase3_completion_hash")):
         return replace(identity, reason="incomplete_final_manifest")
+    # The Phase 3 completion hash and the Phase 3 input binding are two
+    # records of the same fact; a manifest whose top-level hash disagrees with
+    # (or has no) corresponding `inputs.phase3` entry is internally
+    # inconsistent and must not activate autoplay.
+    phase3_entry = manifest["inputs"].get("phase3")
+    if not isinstance(phase3_entry, Mapping):
+        return replace(identity, reason="incomplete_final_manifest")
+    if phase3_entry.get("sha256") != manifest["phase3_completion_hash"]:
+        return replace(identity, reason="phase3_binding_mismatch")
 
     policy = FeaturePolicy.from_config(config)
     expected_fingerprint = feature_policy_fingerprint(policy)
@@ -444,6 +488,12 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
             return replace(identity, reason="phase4c_unresolvable")
         if actual_hash != phase4c_hash:
             return replace(identity, reason="phase4c_mismatch")
+        # The declared top-level hash and the `inputs.phase4c` binding are two
+        # records of the same artifact; disagreement means the manifest was
+        # assembled from mismatched parts.
+        phase4c_entry = manifest["inputs"].get("phase4c")
+        if not isinstance(phase4c_entry, Mapping) or phase4c_entry.get("sha256") != phase4c_hash:
+            return replace(identity, reason="phase4c_binding_mismatch")
 
     return replace(identity, promotion_eligible=True, reason=None)
 
@@ -579,20 +629,23 @@ def load_config(
     ):
         if env_name in values:
             kwargs[field_name] = _parse_strict_bool(values[env_name], field=env_name)
-    if raw := values.get("WEBSEARCH_EARLY_ACK_TEXT"):
-        kwargs["early_ack_text"] = str(raw)
-    if raw := values.get("WEBSEARCH_PROMOTION_MANIFEST_PATH"):
-        kwargs["promotion_manifest_path"] = str(raw)
-    if raw := values.get("WEBSEARCH_PHASE4C_ARTIFACT_PATH"):
-        kwargs["phase4c_artifact_path"] = str(raw)
-    if raw := values.get("WEBSEARCH_RELEASE_VERSION"):
-        kwargs["release_version"] = str(raw)
-    if raw := values.get("PIPECAT_SOURCE_COMMIT"):
-        kwargs["source_commit"] = str(raw)
-    if raw := values.get("PIPECAT_SOURCE_TREE_HASH"):
-        kwargs["source_tree_hash"] = str(raw)
-    if raw := values.get("PIPECAT_DEPLOYED_AT_UTC"):
-        kwargs["deployed_at_utc"] = str(raw)
+    # Membership, not truthiness: `__post_init__` rejects an empty
+    # `early_ack_text`/`promotion_manifest_path`/`release_version`, and the
+    # identity fields treat empty as unbound. A walrus-truthiness check
+    # silently swallowed an explicitly-empty operator setting and substituted
+    # the default, so the validation could never fire. This matches the
+    # membership pattern the boolean flags above already use.
+    for env_name, field_name in (
+        ("WEBSEARCH_EARLY_ACK_TEXT", "early_ack_text"),
+        ("WEBSEARCH_PROMOTION_MANIFEST_PATH", "promotion_manifest_path"),
+        ("WEBSEARCH_PHASE4C_ARTIFACT_PATH", "phase4c_artifact_path"),
+        ("WEBSEARCH_RELEASE_VERSION", "release_version"),
+        ("PIPECAT_SOURCE_COMMIT", "source_commit"),
+        ("PIPECAT_SOURCE_TREE_HASH", "source_tree_hash"),
+        ("PIPECAT_DEPLOYED_AT_UTC", "deployed_at_utc"),
+    ):
+        if env_name in values:
+            kwargs[field_name] = str(values[env_name])
     if raw := values.get("WEBSEARCH_OPENAI_API_KEY_ENV"):
         kwargs["openai_api_key_env"] = raw
     if raw := values.get("WEBSEARCH_ROUTER_MODEL"):

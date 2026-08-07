@@ -137,7 +137,7 @@ def _real_scorer_hash(**kwargs: Any) -> str:
             matched_fact_ids=kwargs.get("matched_fact_ids", ["fact-1"]),
             matched_citation_ids=kwargs.get("matched_citation_ids", ["cite-1"]),
             matched_disallowed_claim_ids=kwargs.get("matched_disallowed_claim_ids", []),
-            quality_score=kwargs.get("quality_score", 0.95),
+            quality_score=kwargs.get("quality_score", 1.0),
         )
     except (TypeError, AttributeError):
         return "0" * 64
@@ -160,7 +160,7 @@ def _valid_raw_record(**overrides: Any) -> dict[str, Any]:
         "model": "gpt-test",
         "latency_ms": 850,
         "outcome": "success",
-        "quality_score": 0.95,
+        "quality_score": 1.0,
         "matched_fact_ids": ["fact-1"],
         "matched_citation_ids": ["cite-1"],
         "matched_disallowed_claim_ids": [],
@@ -347,6 +347,51 @@ def test_runner_scorer_clamps_score_to_zero_when_disallowed_claims_exceed_matche
     assert score == 0.0  # would be negative unclamped: (0 - 2) / 1
 
 
+# --- collector fixture binding ---------------------------------------------
+#
+# The collector resolves every record's match IDs and quality_score against a
+# versioned fixture rather than trusting the record's self-reported values, so
+# these tests supply a synthetic fixture whose turns/IDs match
+# `_valid_raw_record`. One matched fact + one matched citation over a
+# two-item denominator scores exactly 1.0.
+
+COLLECTOR_FIXTURE_VERSION = "qcl-test-v1"
+
+
+def _collector_fixture(tmp_path: Path) -> Path:
+    path = tmp_path / "collector-fixture.json"
+    if not path.exists():
+        fixture = {
+            "fixture_version": COLLECTOR_FIXTURE_VERSION,
+            "turns": [
+                {
+                    "turn_id": f"turn-{i}",
+                    "query": "q",
+                    "prior_queries": [],
+                    "required_facts": [{"id": "fact-1", "match_pattern": "alpha"}],
+                    "expected_citations": [
+                        {"id": "cite-1", "domain": "example.com", "fact_id": "fact-1"}
+                    ],
+                    "disallowed_claims": [{"id": "claim-1", "match_pattern": "zeta"}],
+                }
+                for i in range(64)
+            ],
+        }
+        path.write_text(json.dumps(fixture), encoding="utf-8")
+    return path
+
+
+def _collector_argv(input_path: Path, output: Path, tmp_path: Path) -> list[str]:
+    return [
+        "--input",
+        str(input_path),
+        "--output",
+        str(output),
+        "--fixture",
+        str(_collector_fixture(tmp_path)),
+    ]
+
+
 # --- 4A: collector (raw allowlist enforcement) -----------------------------
 
 
@@ -356,7 +401,7 @@ def test_collector_rejects_raw_records_with_a_status_field(tmp_path: Path) -> No
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code != 0
 
 
@@ -371,7 +416,7 @@ def test_collector_rejects_raw_records_with_unknown_forbidden_fields(
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code != 0
 
 
@@ -381,7 +426,7 @@ def test_collector_rejects_an_invalid_condition(tmp_path: Path) -> None:
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code != 0
 
 
@@ -391,7 +436,7 @@ def test_collector_rejects_quality_score_out_of_range(tmp_path: Path) -> None:
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code != 0
 
 
@@ -410,7 +455,7 @@ def test_collector_rejects_scalar_only_quality_records(tmp_path: Path) -> None:
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code != 0
 
 
@@ -428,7 +473,7 @@ def test_collector_rejects_a_forged_matched_id_added_after_scoring(tmp_path: Pat
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code != 0
 
 
@@ -438,7 +483,7 @@ def test_collector_rejects_a_scorer_hash_that_does_not_match_its_own_record(tmp_
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code != 0
 
 
@@ -450,7 +495,7 @@ def test_collector_accepts_a_fully_valid_raw_record_and_writes_a_status_artifact
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, [record])
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code == 0
     assert output.exists()
     common = _evidence_common()
@@ -464,7 +509,7 @@ def test_collector_reports_not_run_when_raw_input_file_is_missing(tmp_path: Path
     common = _evidence_common()
     missing = tmp_path / "does-not-exist.jsonl"
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(missing), "--output", str(output)])
+    exit_code = module.main(_collector_argv(missing, output, tmp_path))
     assert exit_code == 0
     line = json.loads(output.read_text().splitlines()[0])
     assert line["status"] == common.EvidenceStatus.NOT_RUN.value
@@ -477,7 +522,7 @@ def test_collector_passes_through_a_fully_populated_cell(tmp_path: Path) -> None
     raw_input = tmp_path / "raw.jsonl"
     _write_jsonl(raw_input, records)
     output = tmp_path / "normalized.jsonl"
-    exit_code = module.main(["--input", str(raw_input), "--output", str(output)])
+    exit_code = module.main(_collector_argv(raw_input, output, tmp_path))
     assert exit_code == 0
     lines = [json.loads(line) for line in output.read_text().splitlines() if line.strip()]
     assert len(lines) == 30
@@ -1069,3 +1114,226 @@ def test_production_context_window_unchanged_regardless_of_phase4_outcome() -> N
     for entry_text in result.split("Previous answer: ")[1:]:
         truncated = entry_text.split("\n", 1)[0]
         assert len(truncated) <= 1200
+
+
+# --- Regression: Phase 4 experiment/collector/analyzer defects --------------
+
+
+def test_runner_zero_history_condition_actually_empties_the_history() -> None:
+    """Regression: `history[-0:]` returns the FULL list, so a schema-valid
+    `--value 0` "zero history" narrowed condition silently included every
+    prior query."""
+    module = _runner()
+    turn = {
+        "turn_id": "t1",
+        "query": "q",
+        "prior_queries": ["one", "two", "three", "four"],
+        "required_facts": [{"id": "f1", "match_pattern": "alpha"}],
+        "expected_citations": [],
+        "disallowed_claims": [],
+    }
+    narrowed_zero = module._context_chars_for(
+        turn, "narrowed", dimension="history_count", narrowed_value=0
+    )
+    baseline = module._context_chars_for(
+        turn, "baseline", dimension="history_count", narrowed_value=0
+    )
+    assert narrowed_zero == 0
+    assert baseline > 0
+
+
+def test_runner_rejects_a_negative_dimension_value(tmp_path: Path) -> None:
+    """Regression: only the *count* of --value was validated, so `--value -1`
+    reached artifact construction and produced negative selected_value /
+    context fields the raw schema forbids."""
+    module = _runner()
+    output = tmp_path / "dry-run.json"
+    exit_code = module.main(
+        [
+            "--dry-run",
+            "--fixture",
+            str(_fixture_path()),
+            "--output",
+            str(output),
+            "--value",
+            "-1",
+        ]
+    )
+    assert exit_code != 0
+    assert not output.exists()
+
+
+def test_runner_scorer_rejects_a_citation_whose_expected_fact_is_unmatched() -> None:
+    """Regression: citation credit was granted for a bare domain mention,
+    ignoring the fixture's citation-to-fact mapping -- so a response that
+    name-dropped "example.com" without supporting the fact still scored."""
+    module = _runner()
+    turn = {
+        "turn_id": "t1",
+        "query": "q",
+        "required_facts": [{"id": "f1", "match_pattern": "alpha"}],
+        "expected_citations": [{"id": "c1", "domain": "example.com", "fact_id": "f1"}],
+        "disallowed_claims": [],
+    }
+    score, facts, cites, _ = module.score_response(turn, "example.com says something else")
+    assert facts == []
+    assert cites == [], "a citation without its expected fact is not a valid citation"
+    assert score == 0.0
+
+
+def test_runner_scorer_requires_a_pinned_canonical_url_when_the_fixture_declares_one() -> None:
+    module = _runner()
+    turn = {
+        "turn_id": "t1",
+        "query": "q",
+        "required_facts": [{"id": "f1", "match_pattern": "alpha"}],
+        "expected_citations": [
+            {
+                "id": "c1",
+                "domain": "example.com",
+                "url": "https://example.com/facts/alpha",
+                "fact_id": "f1",
+            }
+        ],
+        "disallowed_claims": [],
+    }
+    _, _, without_url, _ = module.score_response(turn, "alpha example.com")
+    _, _, with_url, _ = module.score_response(turn, "alpha https://example.com/facts/alpha")
+    assert without_url == []
+    assert with_url == ["c1"]
+
+
+def test_runner_randomizes_condition_order_within_blocks_and_records_it(tmp_path: Path) -> None:
+    """Regression: every block ran baseline-then-narrowed, so provider/cache/
+    time drift loaded entirely onto the narrowed arm. The order must vary and
+    must be recorded for reproducibility."""
+    module = _runner()
+    output = tmp_path / "dry-run.json"
+    assert (
+        module.main(
+            ["--dry-run", "--fixture", str(_fixture_path()), "--output", str(output), "--seed", "1"]
+        )
+        == 0
+    )
+    artifact = json.loads(output.read_text())
+    orders = [tuple(entry["order"]) for entry in artifact["condition_orders"]]
+    assert orders, "the chosen per-block condition order must be recorded"
+    assert len(set(orders)) > 1, "condition order must vary across blocks, not be fixed"
+    assert all(sorted(order) == ["baseline", "narrowed"] for order in orders)
+    # The recorded order must match the order the records were actually
+    # emitted in, block by block.
+    records = artifact["records"]
+    for entry in artifact["condition_orders"]:
+        block = [r for r in records if r["run_block"] == entry["run_block"]]
+        assert [r["condition"] for r in sorted(block, key=lambda r: r["run_order"])] == entry[
+            "order"
+        ]
+
+
+def test_runner_condition_order_is_reproducible_for_a_given_seed(tmp_path: Path) -> None:
+    module = _runner()
+    first, second = tmp_path / "a.json", tmp_path / "b.json"
+    for output in (first, second):
+        assert (
+            module.main(
+                [
+                    "--dry-run",
+                    "--fixture",
+                    str(_fixture_path()),
+                    "--output",
+                    str(output),
+                    "--seed",
+                    "7",
+                ]
+            )
+            == 0
+        )
+    a = json.loads(first.read_text())
+    b = json.loads(second.read_text())
+    assert a["condition_orders"] == b["condition_orders"]
+
+
+def test_collector_rejects_a_match_id_the_fixture_does_not_declare(tmp_path: Path) -> None:
+    """Regression: the collector recomputed scorer_hash purely from fields the
+    record itself supplied, so an editor could invent a match, recompute the
+    same hash from the fabricated values, and pass validation."""
+    module = _collector()
+    record = _valid_raw_record(
+        matched_fact_ids=["fact-1", "fact-invented"],
+        matched_citation_ids=["cite-1"],
+        quality_score=1.0,
+    )
+    raw_input = tmp_path / "raw.jsonl"
+    _write_jsonl(raw_input, [record])
+    output = tmp_path / "normalized.jsonl"
+    assert module.main(_collector_argv(raw_input, output, tmp_path)) != 0
+
+
+def test_collector_rejects_duplicate_match_ids(tmp_path: Path) -> None:
+    module = _collector()
+    record = _valid_raw_record(
+        matched_fact_ids=["fact-1", "fact-1"], matched_citation_ids=["cite-1"], quality_score=1.0
+    )
+    raw_input = tmp_path / "raw.jsonl"
+    _write_jsonl(raw_input, [record])
+    output = tmp_path / "normalized.jsonl"
+    assert module.main(_collector_argv(raw_input, output, tmp_path)) != 0
+
+
+def test_collector_rejects_a_citation_claimed_without_its_expected_fact(tmp_path: Path) -> None:
+    module = _collector()
+    record = _valid_raw_record(
+        matched_fact_ids=[], matched_citation_ids=["cite-1"], quality_score=0.5
+    )
+    raw_input = tmp_path / "raw.jsonl"
+    _write_jsonl(raw_input, [record])
+    output = tmp_path / "normalized.jsonl"
+    assert module.main(_collector_argv(raw_input, output, tmp_path)) != 0
+
+
+def test_collector_rejects_a_quality_score_that_is_not_fixture_derived(tmp_path: Path) -> None:
+    """A self-consistent record (its scorer_hash matches its own fields) whose
+    quality_score is not what the fixture's denominator implies must still be
+    rejected."""
+    module = _collector()
+    record = _valid_raw_record(quality_score=0.5)
+    raw_input = tmp_path / "raw.jsonl"
+    _write_jsonl(raw_input, [record])
+    output = tmp_path / "normalized.jsonl"
+    assert module.main(_collector_argv(raw_input, output, tmp_path)) != 0
+
+
+def test_collector_rejects_an_unknown_fixture_turn_identity(tmp_path: Path) -> None:
+    module = _collector()
+    record = _valid_raw_record(fixture_turn_id="turn-not-in-the-fixture")
+    raw_input = tmp_path / "raw.jsonl"
+    _write_jsonl(raw_input, [record])
+    output = tmp_path / "normalized.jsonl"
+    assert module.main(_collector_argv(raw_input, output, tmp_path)) != 0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"latency_ms": -1},
+        {"latency_ms": "fast"},
+        {"context_chars": -5},
+        {"attempt_count": 0},
+        {"retry_count": -1},
+        {"cache_status": "warm"},
+        {"outcome": "maybe"},
+        {"selected_dimension": "not_a_dimension"},
+        {"run_block": -1},
+        {"matched_fact_ids": [""]},
+    ],
+)
+def test_analyzer_rejects_type_and_range_violations(tmp_path: Path, override: dict) -> None:
+    """Regression: the analyzer re-validated only the *key set*, so a
+    hand-edited record with wrong numeric types, negative values, or invalid
+    enums reached the statistics."""
+    module = _analyzer()
+    records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    records[0].update(override)
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    assert module.main(["--input", str(input_path), "--output", str(output)]) != 0

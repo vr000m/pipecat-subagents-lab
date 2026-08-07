@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,7 +33,13 @@ from typing import Any
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _evidence_common import EvidenceGateError, load_json, load_jsonl, sha256_file
+from _evidence_common import (
+    EvidenceGateError,
+    load_json,
+    load_jsonl,
+    require_hex64,
+    sha256_file,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
@@ -347,12 +354,27 @@ PHASE4C_HASH_LIKE_FIELDS = frozenset(
         "post_change_source_commit",
         "post_change_source_tree_hash",
         "phase3_completion_hash",
-        "phase4b_baseline_input_hash",
-        "phase4b_normalized_input_hash",
+        # These two field names must match
+        # `shared/schemas/v013-query-context-post-change-analysis.json`
+        # exactly. They previously read `..._input_hash`, so a
+        # schema-conformant artifact was rejected here and only this
+        # validator's own non-schema spellings could ever be bound into a
+        # manifest. `test_phase4c_field_set_matches_the_schema` pins them.
+        "phase4b_baseline_input_sha256",
+        "phase4b_normalized_input_sha256",
         "experiment_command_digest",
         "analyzer_command_digest",
         "scorer_hash",
         "control_fingerprint",
+    }
+)
+# The subset the schema pins to exactly 64 hex characters (SHA-256 digests),
+# as opposed to the `minLength: 1` identity fields above.
+PHASE4C_SHA256_FIELDS = frozenset(
+    {
+        "phase4b_baseline_input_sha256",
+        "phase4b_normalized_input_sha256",
+        "scorer_hash",
     }
 )
 PHASE4C_STRING_FIELDS = frozenset({"fixture_version", "scorer_version", "generated_at_utc"})
@@ -392,6 +414,12 @@ def _validate_phase4c_artifact(payload: Any) -> None:
 
     for name in PHASE4C_HASH_LIKE_FIELDS:
         value = payload[name]
+        if name in PHASE4C_SHA256_FIELDS:
+            # The schema pins these to exactly 64 hex characters; accepting any
+            # hex length here let a truncated or over-long digest bind into a
+            # manifest that the schema would have rejected.
+            require_hex64(value, f"phase4c artifact: {name}")
+            continue
         if not isinstance(value, str) or not value or not _HEX_RE.match(value):
             raise EvidenceGateError(
                 f"phase4c artifact: {name} must be a non-empty lowercase hex string"
@@ -400,6 +428,48 @@ def _validate_phase4c_artifact(payload: Any) -> None:
         value = payload[name]
         if not isinstance(value, str) or not value:
             raise EvidenceGateError(f"phase4c artifact: {name} must be a non-empty string")
+
+
+def _bind_phase4c_artifact(
+    payload: Mapping[str, Any],
+    *,
+    source_commit: str,
+    source_tree_hash: str,
+    phase3_sha256: str | None,
+) -> None:
+    """Cross-check a shape-valid Phase 4C artifact against this release.
+
+    Shape validation alone lets a well-formed artifact generated against a
+    different tree, or bound to a different Phase 3 completion record, be
+    stamped into this manifest. The Phase 4C artifact describes the *post
+    -change* runtime tree, which is exactly the tree this manifest is being
+    written for, so its source identity must equal the writer's.
+
+    The fixture/scorer/control/command bindings are deliberately not checked
+    here: the Phase 4A/4B artifacts they refer to are not inputs to this
+    writer, so verifying them would require new writer inputs rather than a
+    local cross-check.
+    """
+    if payload["post_change_source_commit"] != source_commit:
+        raise EvidenceGateError(
+            "phase4c artifact: post_change_source_commit "
+            f"{payload['post_change_source_commit']!r} does not match --source-commit "
+            f"{source_commit!r}"
+        )
+    if payload["post_change_source_tree_hash"] != source_tree_hash:
+        raise EvidenceGateError(
+            "phase4c artifact: post_change_source_tree_hash "
+            f"{payload['post_change_source_tree_hash']!r} does not match --source-tree-hash "
+            f"{source_tree_hash!r}"
+        )
+    if phase3_sha256 is None:
+        raise EvidenceGateError("phase4c artifact requires a --phase3-input to bind against")
+    if payload["phase3_completion_hash"] != phase3_sha256:
+        raise EvidenceGateError(
+            "phase4c artifact: phase3_completion_hash "
+            f"{payload['phase3_completion_hash']!r} does not match the bound Phase 3 completion "
+            f"artifact digest {phase3_sha256!r}"
+        )
 
 
 def write_manifest(
@@ -424,6 +494,22 @@ def write_manifest(
     phase0_records = validate_artifact("phase0", phase0_input)
     phase1_records = validate_artifact("phase1", phase1_input)
     transport_record = _validate_transport_contract(phase2_input)
+    # The Phase 2 gate proves the artifact is internally consistent; it says
+    # nothing about *which* build it describes. Without this check a
+    # stale-but-eligible browser check from a different tree could be stamped
+    # into a manifest for the current release identity.
+    if transport_record["source_commit"] != source_commit:
+        raise EvidenceGateError(
+            "phase2 transport artifact source_commit "
+            f"{transport_record['source_commit']!r} does not match --source-commit "
+            f"{source_commit!r}"
+        )
+    if transport_record["source_tree_hash"] != source_tree_hash:
+        raise EvidenceGateError(
+            "phase2 transport artifact source_tree_hash "
+            f"{transport_record['source_tree_hash']!r} does not match --source-tree-hash "
+            f"{source_tree_hash!r}"
+        )
     phase3_record = (
         _validate_phase3_completion(
             phase3_input, source_commit=source_commit, source_tree_hash=source_tree_hash
@@ -444,6 +530,12 @@ def write_manifest(
     if phase4c_input is not None:
         phase4c_payload = load_json(phase4c_input)
         _validate_phase4c_artifact(phase4c_payload)
+        _bind_phase4c_artifact(
+            phase4c_payload,
+            source_commit=source_commit,
+            source_tree_hash=source_tree_hash,
+            phase3_sha256=inputs["phase3"]["sha256"] if phase3_input is not None else None,
+        )
         phase4c_artifact_sha256 = sha256_file(phase4c_input)
         inputs["phase4c"] = {"path": str(phase4c_input), "sha256": phase4c_artifact_sha256}
 
@@ -493,11 +585,41 @@ def write_manifest(
     }
     if phase3_input is not None:
         manifest["phase3_completion_hash"] = inputs["phase3"]["sha256"]
+        # `_validate_phase3_completion` verifies the recorded command digest is
+        # present, then the manifest used to drop it -- so downstream release
+        # verification had no way to re-check which command produced Phase 3.
+        assert phase3_record is not None
+        manifest["phase3_command_digest"] = phase3_record["command_digest"]
     if phase4c_artifact_sha256 is not None:
         manifest["phase4c_artifact_sha256"] = phase4c_artifact_sha256
 
     _atomic_write_manifest(output, manifest)
     return manifest
+
+
+def _write_bytes_no_follow(path: Path, payload: bytes) -> None:
+    """Write `payload` to `path`, refusing to write *through* a symlink.
+
+    ``O_NOFOLLOW`` makes an attacker-planted symlink at this predictable path
+    fail with ``ELOOP`` instead of silently redirecting manifest bytes to the
+    link's target. The path may legitimately already exist as a regular file
+    (a `.previous` copy from an earlier run), so ``O_EXCL`` is not usable
+    here -- ``O_NOFOLLOW`` is the check that matters.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(directory: Path) -> None:
+    dir_fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _atomic_write_manifest(output: Path, manifest: dict[str, Any]) -> None:
@@ -508,26 +630,70 @@ def _atomic_write_manifest(output: Path, manifest: dict[str, Any]) -> None:
     manifest is preserved as `<output>.previous` until the rename is
     durable; on any failure before the rename completes, the previous
     manifest (if any) is left untouched.
+
+    Two properties this function must hold, both of which it previously did
+    not:
+
+    * **old-or-new, always.** A failure of the post-rename directory fsync
+      used to propagate with the *new* file already installed, so a caller
+      that saw the exception could still be left reading the new manifest.
+      That failure now rolls the previous manifest back (or removes the new
+      one when there was no previous) before re-raising.
+    * **no symlink follow-through.** The temp file used a predictable
+      `<output>.tmp` path opened without ``O_EXCL``/``O_NOFOLLOW``, so a
+      planted symlink there would have received the manifest bytes. The temp
+      file is now created by `tempfile.mkstemp` (random name, ``O_EXCL``) and
+      the `.previous` copy is opened ``O_NOFOLLOW``.
     """
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     previous_path = output.with_suffix(output.suffix + ".previous")
+    previous_bytes: bytes | None = None
     if output.exists():
-        previous_path.write_bytes(output.read_bytes())
+        previous_bytes = output.read_bytes()
+        _write_bytes_no_follow(previous_path, previous_bytes)
 
-    tmp_path = output.with_suffix(output.suffix + ".tmp")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(output.parent), prefix=f".{output.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
     try:
         os.write(fd, payload)
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(tmp_path, output)
-    dir_fd = os.open(str(output.parent), os.O_RDONLY)
     try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, output)
+    except BaseException:
+        # Nothing was installed: drop the temp file and leave any previous
+        # manifest exactly as it was.
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    try:
+        _fsync_directory(output.parent)
+    except BaseException:
+        _rollback_manifest(output, previous_bytes)
+        raise
+
+
+def _rollback_manifest(output: Path, previous_bytes: bytes | None) -> None:
+    """Undo an installed-but-not-durable manifest replacement.
+
+    Restores the previous manifest bytes, or removes the newly installed file
+    when there was no previous manifest, so a caller that sees the write fail
+    never finds a half-committed new manifest in place. A failure *during*
+    the restore is deliberately suppressed: the original write failure is the
+    error worth reporting, and re-raising from here would mask it.
+    """
+    try:
+        if previous_bytes is None:
+            output.unlink(missing_ok=True)
+        else:
+            _write_bytes_no_follow(output, previous_bytes)
+    except OSError:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

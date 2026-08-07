@@ -91,6 +91,94 @@ RAW_REQUIRED = frozenset(
 RAW_ALLOWED = RAW_REQUIRED
 
 
+OUTCOMES = frozenset({"success", "error", "timeout"})
+CACHE_STATUSES = frozenset({"hit", "miss", "unknown"})
+
+# (field, python types, minimum) for the numeric raw fields, mirroring
+# `shared/schemas/v013-query-context-raw.json`'s type/minimum constraints.
+_RAW_NUMERIC_FIELDS: tuple[tuple[str, tuple[type, ...], float], ...] = (
+    ("run_block", (int,), 0),
+    ("run_order", (int,), 0),
+    ("selected_value", (int,), 0),
+    ("context_chars", (int,), 0),
+    ("query_chars", (int,), 0),
+    ("latency_ms", (int, float), 0),
+    ("attempt_count", (int,), 1),
+    ("retry_count", (int,), 0),
+    ("rate_limit_count", (int,), 0),
+)
+_RAW_STRING_FIELDS = (
+    "run_id",
+    "fixture_version",
+    "fixture_turn_id",
+    "provider",
+    "model",
+    "scorer_version",
+    "recorded_at_utc",
+)
+_RAW_ID_LIST_FIELDS = (
+    "matched_fact_ids",
+    "matched_citation_ids",
+    "matched_disallowed_claim_ids",
+)
+
+
+def validate_raw_record(record: dict[str, Any], *, where: str = "record") -> None:
+    """Full type/range/enum validation of one raw record against the schema.
+
+    Both the collector and the analyzer need this: a hand-edited or
+    externally produced JSONL can reach either one, and a key-set
+    (`closed_object`) check alone lets wrong numeric types, negative values,
+    and invalid enums through to skew statistics or raise downstream. It
+    lives here because this module already owns `RAW_REQUIRED`/`RAW_ALLOWED`,
+    so the allowlist and the field contract cannot drift apart.
+    """
+    closed_object(record, required=RAW_REQUIRED, allowed=RAW_ALLOWED)
+    for field in _RAW_STRING_FIELDS:
+        value = record[field]
+        require_type(value, (str,), f"{where}: {field}")
+        if not value:
+            raise EvidenceGateError(f"{where}: {field} must be non-empty")
+    if record["condition"] not in CONDITIONS:
+        raise EvidenceGateError(f"{where}: invalid condition {record['condition']!r}")
+    if record["selected_dimension"] not in SELECTABLE_DIMENSIONS:
+        raise EvidenceGateError(
+            f"{where}: invalid selected_dimension {record['selected_dimension']!r}"
+        )
+    if record["outcome"] not in OUTCOMES:
+        raise EvidenceGateError(f"{where}: invalid outcome {record['outcome']!r}")
+    if record["cache_status"] not in CACHE_STATUSES:
+        raise EvidenceGateError(f"{where}: invalid cache_status {record['cache_status']!r}")
+
+    for field, kinds, minimum in _RAW_NUMERIC_FIELDS:
+        value = record[field]
+        require_type(value, kinds, f"{where}: {field}")
+        if value < minimum:
+            raise EvidenceGateError(f"{where}: {field} must be >= {minimum}, got {value!r}")
+
+    require_type(record["quality_score"], (int, float), f"{where}: quality_score")
+    if not (0.0 <= float(record["quality_score"]) <= 1.0):
+        raise EvidenceGateError(f"{where}: quality_score must be within [0, 1]")
+
+    for field in _RAW_ID_LIST_FIELDS:
+        value = record[field]
+        require_type(value, (list,), f"{where}: {field}")
+        for item in value:
+            if not isinstance(item, str) or not item:
+                raise EvidenceGateError(f"{where}: {field} entries must be non-empty strings")
+
+    digest = record["scorer_hash"]
+    require_type(digest, (str,), f"{where}: scorer_hash")
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise EvidenceGateError(f"{where}: scorer_hash must be a 64-character lowercase hex digest")
+
+    snapshot = record["retrieval_snapshot_id"]
+    if snapshot is not None:
+        require_type(snapshot, (str,), f"{where}: retrieval_snapshot_id")
+        if not snapshot:
+            raise EvidenceGateError(f"{where}: retrieval_snapshot_id must be non-empty or null")
+
+
 def scorer_hash(
     fixture_version: str,
     fixture_turn_id: str | None = None,
@@ -152,14 +240,30 @@ def score_response(
     A fact/citation/claim only counts as matched when its normalized ID's
     match_pattern is found in the response text -- the scorer derives IDs
     from the fixture and the response, never from caller-supplied input.
+
+    A citation is *valid*, not merely mentioned: the plan requires "its
+    canonical URL/domain and fixture-expected fact mapping match". Domain
+    presence alone credited a response that name-dropped e.g. "github.com"
+    without supporting the fact the fixture maps that citation to, so the
+    citation's `fact_id` must also be among the matched facts, and its
+    canonical `url` (when the fixture pins one) must appear in the response.
     """
     text = response_text.lower()
     matched_facts = [
         fact["id"] for fact in turn["required_facts"] if fact["match_pattern"].lower() in text
     ]
-    matched_citations = [
-        cite["id"] for cite in turn["expected_citations"] if cite["domain"].lower() in text
-    ]
+    matched_fact_ids = set(matched_facts)
+    matched_citations = []
+    for cite in turn["expected_citations"]:
+        if cite["domain"].lower() not in text:
+            continue
+        canonical_url = cite.get("url")
+        if canonical_url and canonical_url.lower() not in text:
+            continue
+        expected_fact_id = cite.get("fact_id")
+        if expected_fact_id is not None and expected_fact_id not in matched_fact_ids:
+            continue
+        matched_citations.append(cite["id"])
     matched_disallowed = [
         claim["id"] for claim in turn["disallowed_claims"] if claim["match_pattern"].lower() in text
     ]
@@ -200,7 +304,11 @@ def _context_chars_for(
             history_count = narrowed_value
         else:
             char_limit = narrowed_value
-    prior = turn.get("prior_queries", [])[-history_count:]
+    history = turn.get("prior_queries", [])
+    # `history[-0:]` is the FULL list, not an empty one -- so a schema-valid
+    # `--value 0` "zero history" condition silently included every prior
+    # query. Zero has to be handled before the slice.
+    prior = history[-history_count:] if history_count > 0 else []
     # Mirrors _contextual_input's per-entry answer-truncation budget.
     return sum(min(len(p) + 40, char_limit) for p in prior) if prior else 0
 
@@ -223,6 +331,7 @@ def build_dry_run_artifact(
     baseline_value = BASELINE_VALUE if dimension == "history_count" else DEFAULT_ANSWER_CHAR_LIMIT
 
     records: list[dict[str, Any]] = []
+    condition_orders: list[dict[str, Any]] = []
     run_order = 0
     for turn in fixture["turns"]:
         # Each repeat gets its own fixture-turn identity (turn_id#repeat_index)
@@ -231,7 +340,23 @@ def build_dry_run_artifact(
         # once is not enough samples to satisfy the per-cell minimum.
         for repeat_index in range(baseline_repeats):
             fixture_turn_id = f"{turn['turn_id']}#{repeat_index}"
-            for condition in CONDITIONS:
+            # Assumption (d): run order must not be confounded with condition.
+            # Iterating CONDITIONS in fixed baseline-then-narrowed order meant
+            # every narrowed sample ran second within its block, so any
+            # provider/cache/time drift loaded entirely onto the narrowed arm.
+            # The order is shuffled from the run seed (so it stays exactly
+            # reproducible) and recorded in the artifact.
+            order_rng = random.Random(f"{seed}:order:{turn['turn_id']}:{repeat_index}")
+            block_conditions = list(CONDITIONS)
+            order_rng.shuffle(block_conditions)
+            condition_orders.append(
+                {
+                    "run_block": run_order // len(CONDITIONS),
+                    "fixture_turn_id": fixture_turn_id,
+                    "order": block_conditions,
+                }
+            )
+            for condition in block_conditions:
                 rng = random.Random(f"{seed}:{turn['turn_id']}:{condition}:{repeat_index}")
                 response_text = _synthesize_response_text(turn, condition, rng)
                 quality_score, facts, cites, disallowed = score_response(turn, response_text)
@@ -298,6 +423,8 @@ def build_dry_run_artifact(
         "scorer_version": SCORER_VERSION,
         "record_count": len(records),
         "generated_at_utc": generated_at,
+        "seed": seed,
+        "condition_orders": condition_orders,
         "records": records,
     }
 
@@ -349,6 +476,11 @@ def main(argv: list[str] | None = None) -> int:
             raise EvidenceGateError(
                 f"exactly one --value must be selected per named condition, got {len(values)}"
             )
+        # Only the *count* of values was checked, so `--value -1` reached
+        # artifact construction and produced negative selected_value/context
+        # fields that violate the raw schema's documented minimum of zero.
+        if values[0] < 0:
+            raise EvidenceGateError(f"--value must be >= 0, got {values[0]}")
         fixture = load_fixture(args.fixture)
         require_type(args.baseline_repeats, (int,), "--baseline-repeats")
         if args.baseline_repeats < 1:

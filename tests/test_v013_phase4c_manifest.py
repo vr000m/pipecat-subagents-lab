@@ -34,6 +34,7 @@ manifest-binding scope for the concurrent implementer subagent.
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -51,8 +52,19 @@ POST_CHANGE_SCHEMA_PATH = (
 
 SOURCE_COMMIT = "a" * 40
 SOURCE_TREE_HASH = "b" * 64
-POST_CHANGE_SOURCE_TREE_HASH = "d" * 64
-PHASE3_COMPLETION_HASH = "e" * 64
+# The Phase 4C artifact describes the post-change runtime tree, which is the
+# same tree the manifest is stamped for -- so these bind to the release
+# identity the writer is given, not to independent placeholder values.
+POST_CHANGE_SOURCE_TREE_HASH = SOURCE_TREE_HASH
+PHASE3_COMPLETION_PAYLOAD = {
+    "source_commit": SOURCE_COMMIT,
+    "source_tree_hash": SOURCE_TREE_HASH,
+    "command_digest": "6" * 64,
+    "generated_at_utc": "2026-08-05T00:00:00Z",
+}
+PHASE3_COMPLETION_HASH = hashlib.sha256(
+    json.dumps(PHASE3_COMPLETION_PAYLOAD).encode("utf-8")
+).hexdigest()
 BASELINE_INPUT_HASH = "f" * 64
 NORMALIZED_INPUT_HASH = "1" * 64
 CONTROL_FINGERPRINT = "2" * 64
@@ -88,8 +100,8 @@ def _valid_phase4c_artifact(**overrides: Any) -> dict[str, Any]:
         "post_change_source_commit": SOURCE_COMMIT,
         "post_change_source_tree_hash": POST_CHANGE_SOURCE_TREE_HASH,
         "phase3_completion_hash": PHASE3_COMPLETION_HASH,
-        "phase4b_baseline_input_hash": BASELINE_INPUT_HASH,
-        "phase4b_normalized_input_hash": NORMALIZED_INPUT_HASH,
+        "phase4b_baseline_input_sha256": BASELINE_INPUT_HASH,
+        "phase4b_normalized_input_sha256": NORMALIZED_INPUT_HASH,
         "experiment_command_digest": "3" * 64,
         "analyzer_command_digest": "4" * 64,
         "fixture_version": "qcl-test-v1",
@@ -248,6 +260,7 @@ def _phase2_transport_artifact(tmp_path: Path) -> Path:
             "checked_at_utc": "2026-08-04T00:00:00Z",
             "runner_identity": "varun@varunsingh.net",
             "checked_source_commit": SOURCE_COMMIT,
+            "checked_source_tree_hash": SOURCE_TREE_HASH,
             "route_artifact_sha256": "d" * 64,
             "package_version": package_version,
             "package_integrity": package_integrity,
@@ -258,13 +271,7 @@ def _phase2_transport_artifact(tmp_path: Path) -> Path:
 
 
 def _phase3_completion_artifact(tmp_path: Path) -> Path:
-    payload = {
-        "source_commit": SOURCE_COMMIT,
-        "source_tree_hash": SOURCE_TREE_HASH,
-        "command_digest": "6" * 64,
-        "generated_at_utc": "2026-08-05T00:00:00Z",
-    }
-    return _write_json(tmp_path / "phase3-completion.json", payload)
+    return _write_json(tmp_path / "phase3-completion.json", PHASE3_COMPLETION_PAYLOAD)
 
 
 def _attempt_write_manifest(
@@ -341,8 +348,8 @@ def test_write_manifest_rejects_wrong_typed_fields_in_phase4c_artifact(tmp_path:
     [
         "post_change_source_tree_hash",
         "phase3_completion_hash",
-        "phase4b_baseline_input_hash",
-        "phase4b_normalized_input_hash",
+        "phase4b_baseline_input_sha256",
+        "phase4b_normalized_input_sha256",
         "experiment_command_digest",
         "analyzer_command_digest",
         "fixture_version",
@@ -452,7 +459,12 @@ def _base_manifest(**overrides: Any) -> dict[str, Any]:
         "manifest_phase": "final",
         "promotion_eligible": True,
         "reason": None,
-        "schema_hash": "0" * 64,
+        # The loader recomputes the evidence-schema digest and cross-checks the
+        # `inputs` bindings, so these must be the real values rather than
+        # placeholders.
+        "schema_hash": hashlib.sha256(
+            (REPO_ROOT / "shared" / "schemas" / "v013-evidence.json").read_bytes()
+        ).hexdigest(),
         "source_commit": SOURCE_COMMIT,
         "source_tree_hash": SOURCE_TREE_HASH,
         "release_version": "0.1.3",
@@ -460,7 +472,9 @@ def _base_manifest(**overrides: Any) -> dict[str, Any]:
         "deployed_at_utc": "2026-08-04T00:00:00Z",
         "generated_at_utc": "2026-08-05T00:00:00Z",
         "phase3_completion_hash": PHASE3_COMPLETION_HASH,
-        "inputs": {},
+        "inputs": {
+            "phase3": {"path": "phase3-completion.json", "sha256": PHASE3_COMPLETION_HASH},
+        },
     }
     payload.update(overrides)
     return payload
@@ -550,3 +564,87 @@ def _add_phase4c_path(config: Any, path: Path) -> Any:
         return replace(config, phase4c_artifact_path=str(path))
     except TypeError:
         return config
+
+
+# --- Regression: validator/schema field-name drift and digest strictness ----
+
+
+def _post_change_schema() -> dict[str, Any]:
+    return json.loads(POST_CHANGE_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def test_phase4c_validator_field_set_matches_the_schema_exactly() -> None:
+    """Regression: the validator named ``phase4b_baseline_input_hash`` /
+    ``phase4b_normalized_input_hash`` while the schema requires the
+    ``_sha256`` spellings, so a schema-conformant artifact was rejected and
+    only the validator's own non-schema names could reach a manifest. This
+    pins the two field sets together so they cannot drift again silently."""
+    module = _validator()
+    schema = _post_change_schema()
+    assert module.PHASE4C_ALLOWED_FIELDS == frozenset(schema["properties"])
+    assert module.PHASE4C_ALLOWED_FIELDS == frozenset(schema["required"])
+
+
+def test_phase4c_sha256_fields_are_the_schema_pinned_64_char_ones() -> None:
+    module = _validator()
+    schema = _post_change_schema()
+    pinned = {
+        name
+        for name, spec in schema["properties"].items()
+        if spec.get("minLength") == 64 and spec.get("maxLength") == 64
+    }
+    assert module.PHASE4C_SHA256_FIELDS == pinned
+
+
+def test_write_manifest_accepts_the_schema_spelled_phase4b_fields(tmp_path: Path) -> None:
+    """The positive half of the drift fix: an artifact spelled exactly as the
+    schema requires must be accepted."""
+    payload = _valid_phase4c_artifact()
+    assert "phase4b_baseline_input_sha256" in payload
+    phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
+    _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
+    assert manifest is not None
+
+
+@pytest.mark.parametrize(
+    "field", ["phase4b_baseline_input_sha256", "phase4b_normalized_input_sha256", "scorer_hash"]
+)
+@pytest.mark.parametrize("bad_value", ["abc123", "a" * 63, "a" * 65])
+def test_write_manifest_rejects_non_64_char_sha256_bindings(
+    tmp_path: Path, field: str, bad_value: str
+) -> None:
+    """Regression: these fields accepted *any* nonempty lowercase-hex string,
+    while the schema pins them to exactly 64 hex characters."""
+    payload = _valid_phase4c_artifact(**{field: bad_value})
+    phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
+    _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
+    assert manifest is None
+
+
+def test_write_manifest_rejects_a_phase4c_artifact_from_a_different_tree(tmp_path: Path) -> None:
+    """Regression: Phase 4C bindings were checked only for *shape*, so a
+    well-formed artifact generated against a different post-change tree could
+    be stamped into this release's manifest."""
+    payload = _valid_phase4c_artifact(post_change_source_tree_hash="9" * 64)
+    phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
+    _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
+    assert manifest is None
+
+
+def test_write_manifest_rejects_a_phase4c_artifact_from_a_different_commit(tmp_path: Path) -> None:
+    payload = _valid_phase4c_artifact(post_change_source_commit="9" * 40)
+    phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
+    _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
+    assert manifest is None
+
+
+def test_write_manifest_rejects_a_phase4c_bound_to_a_foreign_phase3_completion(
+    tmp_path: Path,
+) -> None:
+    """A well-formed 64-hex phase3_completion_hash that simply is not the
+    digest of the Phase 3 artifact bound into this same manifest must be
+    rejected as a cross-artifact mismatch, not accepted for being hex."""
+    payload = _valid_phase4c_artifact(phase3_completion_hash="7" * 64)
+    phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
+    _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
+    assert manifest is None

@@ -74,6 +74,7 @@ def _valid_audibility(**overrides: Any) -> dict[str, Any]:
         "checked_at_utc": "2026-08-04T00:00:00Z",
         "runner_identity": "varun@varunsingh.net",
         "checked_source_commit": SOURCE_COMMIT,
+        "checked_source_tree_hash": SOURCE_TREE_HASH,
         "route_artifact_sha256": FAKE_ROUTE_SHA256,
         "package_version": PINNED_PACKAGE_VERSION,
         "package_integrity": PINNED_PACKAGE_INTEGRITY,
@@ -200,6 +201,85 @@ def test_validator_rejects_an_invalid_fake_route_hash_shape(tmp_path: Path) -> N
     path = _write(tmp_path, payload)
     with pytest.raises(module.EvidenceGateError):
         module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_64_char_non_hex_fake_route_digest(tmp_path: Path) -> None:
+    """Regression: the digest check was a *length* check, so a 64-character
+    string that is no kind of hash (``"z" * 64``) passed it."""
+    module = _load_validator()
+    payload = _valid_artifact(fake_route_artifact_sha256="z" * 64)
+    path = _write(tmp_path, payload)
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_an_uppercase_hex_fake_route_digest(tmp_path: Path) -> None:
+    module = _load_validator()
+    payload = _valid_artifact(fake_route_artifact_sha256="C" * 64)
+    path = _write(tmp_path, payload)
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_source_anchor_that_names_a_foreign_source(tmp_path: Path) -> None:
+    """Regression: ``source_anchor`` was validated only as a non-empty string,
+    so a verified artifact could name an arbitrary source while still passing
+    the lockfile version/integrity checks."""
+    module = _load_validator()
+    path = _write(tmp_path, _valid_artifact(source_anchor="https://example.invalid/some-fork"))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_source_anchor_naming_a_different_version(tmp_path: Path) -> None:
+    module = _load_validator()
+    path = _write(
+        tmp_path,
+        _valid_artifact(
+            source_anchor="https://github.com/pipecat-ai/small-webrtc-transport/tree/v0.0.1"
+        ),
+    )
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_verified_claim_missing_the_checked_source_tree_hash(
+    tmp_path: Path,
+) -> None:
+    """Regression: ``audibility_verified`` bound only ``checked_source_commit``,
+    so a browser check run from a different working tree at the same commit
+    could be attached to this release."""
+    module = _load_validator()
+    audibility = _valid_audibility()
+    del audibility["checked_source_tree_hash"]
+    path = _write(tmp_path, _valid_artifact(audibility=audibility))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_checked_source_tree_hash_from_a_different_tree(
+    tmp_path: Path,
+) -> None:
+    module = _load_validator()
+    audibility = _valid_audibility(checked_source_tree_hash="e" * 64)
+    path = _write(tmp_path, _valid_artifact(audibility=audibility))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_main_cli_returns_nonzero_for_an_unreadable_input_file(tmp_path: Path) -> None:
+    """Regression: refactoring onto the shared ``load_json`` helper narrowed
+    the CLI's exception handling to ``EvidenceGateError`` only, so a
+    permission-denied input raised an uncaught traceback instead of the
+    validator's controlled non-zero exit."""
+    module = _load_validator()
+    path = _write(tmp_path, _valid_artifact())
+    path.chmod(0o000)
+    try:
+        exit_code = module.main(["--input", str(path)])
+    finally:
+        path.chmod(0o644)
+    assert exit_code == 1
 
 
 def test_validator_records_audibility_unverified_when_no_named_browser_device_check_exists(

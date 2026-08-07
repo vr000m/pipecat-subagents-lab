@@ -199,6 +199,7 @@ def _valid_transport_artifact(**overrides: Any) -> dict[str, Any]:
             "checked_at_utc": "2026-08-04T00:00:00Z",
             "runner_identity": "varun@varunsingh.net",
             "checked_source_commit": SOURCE_COMMIT,
+            "checked_source_tree_hash": SOURCE_TREE_HASH,
             "route_artifact_sha256": "d" * 64,
             "package_version": package_version,
             "package_integrity": package_integrity,
@@ -611,3 +612,115 @@ def test_final_manifest_binds_the_phase3_command_digest_the_record_declares(tmp_
     completion_record = json.loads(phase3.read_text())
     assert completion_record["command_digest"] == distinct_digest
     assert manifest["inputs"]["phase3"]["sha256"] == module.sha256_file(phase3)
+    # Regression: the validated command binding was computed and then dropped,
+    # leaving downstream release verification with only the file hash.
+    assert manifest["phase3_command_digest"] == distinct_digest
+
+
+# --- Regression: phase2 release-identity binding and durable-write safety ---
+
+
+def test_write_manifest_rejects_a_phase2_artifact_from_a_different_commit(
+    tmp_path: Path,
+) -> None:
+    """Regression: `write_manifest` validated that the Phase 2 evidence was
+    eligible but never bound it to the release identity, so a stale-but-valid
+    browser check from another build could be stamped into this manifest."""
+    module = _validator()
+    phase0, phase1, _ = _full_valid_inputs(tmp_path)
+    phase2 = tmp_path / "phase2-foreign-commit.json"
+    artifact = _valid_transport_artifact(source_commit="c" * 40)
+    artifact["audibility"]["checked_source_commit"] = "c" * 40
+    phase2.write_text(json.dumps(artifact))
+
+    exit_code = module.main(
+        _write_manifest_argv(tmp_path, phase0=phase0, phase1=phase1, phase2=phase2)
+    )
+
+    assert exit_code != 0
+    assert not (tmp_path / "promotion-manifest.json").exists()
+
+
+def test_write_manifest_rejects_a_phase2_artifact_from_a_different_tree(tmp_path: Path) -> None:
+    module = _validator()
+    phase0, phase1, _ = _full_valid_inputs(tmp_path)
+    phase2 = tmp_path / "phase2-foreign-tree.json"
+    artifact = _valid_transport_artifact(source_tree_hash="c" * 64)
+    artifact["audibility"]["checked_source_tree_hash"] = "c" * 64
+    phase2.write_text(json.dumps(artifact))
+
+    exit_code = module.main(
+        _write_manifest_argv(tmp_path, phase0=phase0, phase1=phase1, phase2=phase2)
+    )
+
+    assert exit_code != 0
+    assert not (tmp_path / "promotion-manifest.json").exists()
+
+
+def test_atomic_write_restores_the_previous_manifest_when_the_dir_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the parent-directory fsync runs *after* the rename, so a
+    failure there left the NEW manifest installed while the exception
+    propagated -- breaking the documented old-or-new guarantee."""
+    module = _validator()
+    output = tmp_path / "manifest.json"
+    output.write_text(json.dumps({"manifest_phase": "old"}), encoding="utf-8")
+    original = output.read_bytes()
+
+    def _boom(directory: Path) -> None:
+        raise OSError("simulated post-rename fsync failure")
+
+    monkeypatch.setattr(module, "_fsync_directory", _boom)
+    with pytest.raises(OSError):
+        module._atomic_write_manifest(output, {"manifest_phase": "new"})
+
+    assert output.read_bytes() == original, "a failed write must leave the OLD manifest in place"
+
+
+def test_atomic_write_removes_the_new_manifest_when_there_was_no_previous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _validator()
+    output = tmp_path / "manifest.json"
+
+    def _boom(directory: Path) -> None:
+        raise OSError("simulated post-rename fsync failure")
+
+    monkeypatch.setattr(module, "_fsync_directory", _boom)
+    with pytest.raises(OSError):
+        module._atomic_write_manifest(output, {"manifest_phase": "new"})
+
+    assert not output.exists(), "with no previous manifest, old-or-new means absent"
+
+
+def test_atomic_write_does_not_write_through_a_planted_previous_symlink(tmp_path: Path) -> None:
+    """Regression: the `.previous` backup was opened without O_NOFOLLOW, so a
+    symlink planted at that predictable path received the manifest bytes."""
+    module = _validator()
+    output = tmp_path / "manifest.json"
+    output.write_text(json.dumps({"manifest_phase": "old"}), encoding="utf-8")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    (tmp_path / "manifest.json.previous").symlink_to(victim)
+
+    with pytest.raises(OSError):
+        module._atomic_write_manifest(output, {"manifest_phase": "new"})
+
+    assert victim.read_text(encoding="utf-8") == "untouched"
+
+
+def test_atomic_write_ignores_a_planted_predictable_temp_file(tmp_path: Path) -> None:
+    """The temp file is now created via `tempfile.mkstemp` (random name,
+    O_EXCL), so a symlink planted at the previously-predictable
+    `<output>.tmp` path is never opened at all."""
+    module = _validator()
+    output = tmp_path / "manifest.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    (tmp_path / "manifest.json.tmp").symlink_to(victim)
+
+    module._atomic_write_manifest(output, {"manifest_phase": "new"})
+
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert json.loads(output.read_text())["manifest_phase"] == "new"

@@ -33,6 +33,7 @@ from _evidence_common import (
     EvidenceGateError,
     closed_object,
     load_json,
+    require_hex64,
     require_nonempty_str,
     require_type,
 )
@@ -71,6 +72,7 @@ AUDIBILITY_ALLOWED = frozenset(
         "checked_at_utc",
         "runner_identity",
         "checked_source_commit",
+        "checked_source_tree_hash",
         "route_artifact_sha256",
         "package_version",
         "package_integrity",
@@ -88,6 +90,7 @@ AUDIBILITY_VERIFIED_REQUIRED = frozenset(
         "checked_at_utc",
         "runner_identity",
         "checked_source_commit",
+        "checked_source_tree_hash",
         "route_artifact_sha256",
         "package_version",
         "package_integrity",
@@ -136,11 +139,11 @@ def validate_artifact(record: dict[str, Any]) -> None:
         "source_anchor",
     ):
         require_nonempty_str(record[field], field)
-    fake_route_hash = require_nonempty_str(
+    # A 64-character string is not a digest: `"z" * 64` satisfies a length
+    # check while being no kind of hash at all, so require exact lowercase hex.
+    fake_route_hash = require_hex64(
         record["fake_route_artifact_sha256"], "fake_route_artifact_sha256"
     )
-    if len(fake_route_hash) != 64:
-        raise EvidenceGateError("fake_route_artifact_sha256 must be a 64-hex-char SHA-256 digest")
 
     audibility = record["audibility"]
     require_type(audibility, (dict,), "audibility")
@@ -156,6 +159,13 @@ def validate_artifact(record: dict[str, Any]) -> None:
             raise EvidenceGateError("audibility_verified requires play_result == 'resolved'")
         if audibility["checked_source_commit"] != record["source_commit"]:
             raise EvidenceGateError("audibility.checked_source_commit must match source_commit")
+        # A commit alone does not identify the tree that was actually checked:
+        # a browser check run from a dirty or different working tree at the
+        # same commit must not be attachable to this release.
+        if audibility["checked_source_tree_hash"] != record["source_tree_hash"]:
+            raise EvidenceGateError(
+                "audibility.checked_source_tree_hash must match source_tree_hash"
+            )
         if audibility["route_artifact_sha256"] != fake_route_hash:
             raise EvidenceGateError(
                 "audibility.route_artifact_sha256 must match fake_route_artifact_sha256"
@@ -177,6 +187,22 @@ def validate_artifact(record: dict[str, Any]) -> None:
     ):
         raise EvidenceGateError(
             "package_version/package_integrity do not match web/bun.lock's pinned dependency"
+        )
+
+    # `source_anchor` names the source the check was actually run against.
+    # Validating it only as "a non-empty string" let a verified artifact claim
+    # an arbitrary anchor (a fork, a different package, an unrelated URL)
+    # while still passing the version/integrity checks above, so it must name
+    # the pinned package *and* the locked version. The exact anchor spelling
+    # is deliberately free-form (a lockfile reference or an upstream source
+    # URL are both legitimate), so this binds the two identifying substrings
+    # rather than one fixed format.
+    anchor = record["source_anchor"]
+    package_leaf = PACKAGE_NAME.rsplit("/", 1)[-1]
+    if package_leaf not in anchor or locked_version not in anchor:
+        raise EvidenceGateError(
+            f"source_anchor {anchor!r} does not name the pinned package "
+            f"{PACKAGE_NAME!r} at the locked version {locked_version!r}"
         )
 
     # The promotion predicate: schema validity alone is never sufficient.
@@ -201,7 +227,10 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(record, dict):
             raise EvidenceGateError("artifact must be a JSON object")
         validate_artifact(record)
-    except EvidenceGateError as exc:
+    except (EvidenceGateError, OSError) as exc:
+        # `load_json` now wraps read failures, but `validate_artifact` also
+        # reads `web/bun.lock` directly; an unreadable lockfile must still be
+        # a controlled non-zero exit, not a traceback.
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 

@@ -571,6 +571,19 @@ def test_config_promotion_manifest_path_is_overridable_for_packaged_deployments(
     assert str(config.promotion_manifest_path) == "/opt/app/promotion-manifest.json"
 
 
+def _evidence_schema_hash() -> str:
+    """The digest `validate_v013_evidence.py --write-manifest` stamps.
+
+    The loader now recomputes it, so a fixture manifest must carry the real
+    value rather than a placeholder.
+    """
+    import hashlib
+    from pathlib import Path as _Path
+
+    schema = _Path(__file__).resolve().parent.parent / "shared/schemas/v013-evidence.json"
+    return hashlib.sha256(schema.read_bytes()).hexdigest()
+
+
 def _final_manifest(*, config: Config | None = None, **overrides: object) -> dict:
     from server.config import FeaturePolicy, feature_policy_fingerprint
 
@@ -579,7 +592,7 @@ def _final_manifest(*, config: Config | None = None, **overrides: object) -> dic
         "manifest_phase": "final",
         "promotion_eligible": True,
         "reason": None,
-        "schema_hash": "d" * 64,
+        "schema_hash": _evidence_schema_hash(),
         "release_version": resolved_config.release_version,
         "source_commit": "a" * 40,
         "source_tree_hash": "b" * 64,
@@ -593,6 +606,10 @@ def _final_manifest(*, config: Config | None = None, **overrides: object) -> dic
             "phase0": {"path": "phase0.jsonl", "sha256": "0" * 64},
             "phase1": {"path": "phase1.jsonl", "sha256": "1" * 64},
             "phase2": {"path": "phase2.json", "sha256": "2" * 64},
+            # The Phase 3 input binding and the top-level completion hash are
+            # two records of the same fact; the loader now requires them to
+            # agree.
+            "phase3": {"path": "phase3.json", "sha256": "3" * 64},
         },
     }
     manifest.update(overrides)
@@ -995,3 +1012,113 @@ def test_feature_policy_from_config_compares_by_value_across_distinct_configs() 
 
     assert first == second
     assert first != FeaturePolicy.from_config(Config())
+
+
+# --- Regression: manifest input bindings and explicitly-empty settings ------
+
+
+def _write_manifest_for(tmp_path: Path, **overrides: object):
+    import json
+
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, **overrides)), encoding="utf-8"
+    )
+    return config
+
+
+@pytest.mark.parametrize(
+    "forged_inputs",
+    [
+        {"phase0": "not-a-mapping"},
+        {"phase0": {"sha256": "0" * 64}},
+        {"phase0": {"path": "", "sha256": "0" * 64}},
+        {"phase0": {"path": "phase0.jsonl", "sha256": "nope"}},
+        {"phase0": {"path": "phase0.jsonl"}},
+    ],
+)
+def test_load_promotion_manifest_rejects_unverifiable_input_entries(
+    tmp_path: Path, forged_inputs: dict
+) -> None:
+    """Regression: `inputs` was checked only for being *a mapping*, so a
+    forged-but-well-shaped manifest could declare arbitrary artifact
+    bindings and still be treated as eligible."""
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(tmp_path, inputs=forged_inputs)
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_invalid"
+
+
+def test_load_promotion_manifest_rejects_a_forged_schema_hash(tmp_path: Path) -> None:
+    """Regression: the schema hash was only shape-checked, never recomputed."""
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(tmp_path, schema_hash="a" * 64)
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_hash_mismatch"
+
+
+def test_load_promotion_manifest_rejects_a_phase3_hash_that_contradicts_its_input_entry(
+    tmp_path: Path,
+) -> None:
+    """Regression: `phase3_completion_hash` was never compared against
+    `inputs.phase3.sha256`, so the two could name different artifacts."""
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(
+        tmp_path,
+        inputs={
+            "phase0": {"path": "phase0.jsonl", "sha256": "0" * 64},
+            "phase3": {"path": "phase3.json", "sha256": "9" * 64},
+        },
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "phase3_binding_mismatch"
+
+
+def test_load_promotion_manifest_rejects_a_final_manifest_with_no_phase3_input_entry(
+    tmp_path: Path,
+) -> None:
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(
+        tmp_path, inputs={"phase0": {"path": "phase0.jsonl", "sha256": "0" * 64}}
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "incomplete_final_manifest"
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "WEBSEARCH_EARLY_ACK_TEXT",
+        "WEBSEARCH_PROMOTION_MANIFEST_PATH",
+        "WEBSEARCH_RELEASE_VERSION",
+    ],
+)
+def test_load_config_explicitly_empty_string_settings_reach_validation(env_name: str) -> None:
+    """Regression: these settings were read with walrus-truthiness, so an
+    operator setting them to "" silently got the default instead of reaching
+    `Config.__post_init__`'s empty-value validation."""
+    with pytest.raises(ConfigError):
+        load_config(env={env_name: ""})
+
+
+def test_load_config_explicitly_empty_identity_settings_are_not_silently_defaulted() -> None:
+    """The identity fields have no `__post_init__` rejection, but an explicit
+    empty value must still be carried through as unset-and-unbound rather
+    than dropped as if the operator had said nothing."""
+    config = load_config(env={"PIPECAT_SOURCE_COMMIT": "", "PIPECAT_SOURCE_TREE_HASH": ""})
+
+    assert config.source_commit == ""
+    assert config.source_tree_hash == ""

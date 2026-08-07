@@ -10,6 +10,7 @@ primitives live, so the three scripts cannot silently drift from each other.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
@@ -61,11 +62,21 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def load_json(path: Path) -> Any:
+    """Read one JSON document, converting *every* read failure into a gate error.
+
+    ``FileNotFoundError`` is only the most common way an evidence input can be
+    unreadable; a permission-denied file, a directory supplied where a file was
+    expected, or a dangling symlink all raise other ``OSError`` subclasses. This
+    helper exists so every caller gets one controlled failure type, so all of
+    them are wrapped here rather than only in the callers that remembered to.
+    """
     try:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
     except FileNotFoundError as exc:
         raise EvidenceGateError(f"missing evidence input: {path}") from exc
+    except OSError as exc:
+        raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise EvidenceGateError(f"malformed JSON in {path}: {exc}") from exc
 
@@ -74,7 +85,11 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         raise EvidenceGateError(f"missing evidence input: {path}")
     records: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError as exc:
+        raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
+    with handle:
         for line_no, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
             if not line:
@@ -87,6 +102,22 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise EvidenceGateError(f"{path}: line {line_no}: expected a JSON object")
             records.append(record)
     return records
+
+
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def require_hex64(value: Any, field: str) -> str:
+    """Require an exact lowercase 64-char hex SHA-256 digest.
+
+    Length alone is not a digest check: ``"z" * 64`` is 64 characters and no
+    kind of hash. Every SHA-256 binding in the evidence gates goes through
+    here so none of them re-implements a weaker version of the same check.
+    """
+    require_type(value, (str,), field)
+    if HEX64_RE.match(value) is None:
+        raise EvidenceGateError(f"{field} must be a 64-character lowercase hex SHA-256 digest")
+    return value
 
 
 def require_type(value: Any, kinds: tuple[type, ...], field: str) -> None:

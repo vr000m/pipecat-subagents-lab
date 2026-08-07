@@ -29,8 +29,8 @@ from typing import Any
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _evidence_common import EvidenceGateError, EvidenceStatus, closed_object, load_jsonl
-from run_query_context_experiment import RAW_ALLOWED, RAW_REQUIRED
+from _evidence_common import EvidenceGateError, EvidenceStatus, load_jsonl
+from run_query_context_experiment import validate_raw_record
 
 BOOTSTRAP_ITERATIONS = 10_000
 BOOTSTRAP_SEED = 0
@@ -122,10 +122,13 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
     Re-validates every record against the strict raw allowlist even though
     ``collect_query_context_latency.py`` already did so: the analyzer must
     not silently trust its input file's provenance, since nothing prevents a
-    hand-edited or externally produced JSONL from reaching this script.
+    hand-edited or externally produced JSONL from reaching this script. The
+    key-set check alone was not enough -- wrong numeric types, negative
+    values, and invalid enums passed straight through into the statistics --
+    so this runs the same full type/range validator the collector uses.
     """
-    for record in records:
-        closed_object(record, required=RAW_REQUIRED, allowed=RAW_ALLOWED)
+    for index, record in enumerate(records):
+        validate_raw_record(record, where=f"record {index}")
 
     fixture_versions = {r["fixture_version"] for r in records}
     if len(fixture_versions) > 1:
