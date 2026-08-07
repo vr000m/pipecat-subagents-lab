@@ -54,8 +54,8 @@ from server.perf_metrics import (
     COMMIT_OUTCOMES,
     CONTROL_ACTIONS,
     CONTROL_OUTCOMES,
-    DELIVERY_DISPOSITIONS,
     EVENT_REGISTRY,
+    LATE_DELIVERY_DISPOSITIONS,
     METRIC_KINDS,
     SPEECH_OUTCOMES,
     WORK_ITEM_OUTCOMES,
@@ -67,7 +67,7 @@ from server.perf_metrics import (
     ConsoleMeasurementSink,
     ControlAction,
     ControlOutcome,
-    DeliveryDisposition,
+    LateDeliveryDisposition,
     MetricKind,
     PerfConnectionContext,
     PerfMetricError,
@@ -97,7 +97,7 @@ _ALIAS_TO_FROZENSET = (
     (WorkOutcome, WORK_OUTCOMES),
     (CommitOutcome, COMMIT_OUTCOMES),
     (SpeechOutcome, SPEECH_OUTCOMES),
-    (DeliveryDisposition, DELIVERY_DISPOSITIONS),
+    (LateDeliveryDisposition, LATE_DELIVERY_DISPOSITIONS),
 )
 
 # Every ``enum`` field in the closed registry, mapped to the vocabulary it is
@@ -112,7 +112,7 @@ _ENUM_FIELD_VOCABULARY = {
     ("work_item_background", "work_outcome"): WORK_OUTCOMES,
     ("work_item_background", "commit_outcome"): COMMIT_OUTCOMES,
     ("work_item_background", "speech_outcome"): SPEECH_OUTCOMES,
-    ("work_item_background", "delivery_disposition"): DELIVERY_DISPOSITIONS,
+    ("work_item_background", "delivery_disposition"): LATE_DELIVERY_DISPOSITIONS,
 }
 
 
@@ -1353,7 +1353,7 @@ def test_work_item_finalize_degrades_unrecognized_outcome_to_failed() -> None:
 
 
 def test_delivery_disposition_frozenset_matches_its_literal_alias() -> None:
-    assert DELIVERY_DISPOSITIONS == frozenset(get_args(DeliveryDisposition))
+    assert LATE_DELIVERY_DISPOSITIONS == frozenset(get_args(LateDeliveryDisposition))
 
 
 def test_app_turn_foreground_accepts_scenario_and_acknowledgement() -> None:

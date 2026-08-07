@@ -32,7 +32,7 @@ from typing import Any
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _evidence_common import EvidenceGateError, load_json, sha256_file
+from _evidence_common import EvidenceGateError, load_json, load_jsonl, sha256_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
@@ -218,20 +218,10 @@ def validate_record(record: Mapping[str, Any], index: int) -> None:
 
 
 def load_records(input_path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with input_path.open("r", encoding="utf-8") as handle:
-        for line_no, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise EvidenceValidationError(f"line {line_no}: invalid JSON ({exc})") from exc
-            if not isinstance(record, dict):
-                raise EvidenceValidationError(f"line {line_no}: expected a JSON object")
-            records.append(record)
-    return records
+    try:
+        return load_jsonl(input_path)
+    except EvidenceGateError as exc:
+        raise EvidenceValidationError(str(exc)) from exc
 
 
 def check_phase_minimums(phase: str, records: Sequence[Mapping[str, Any]]) -> None:

@@ -941,6 +941,20 @@ def test_analyzer_computes_spearman_correlation_between_context_chars_and_latenc
     assert -1.0 <= correlation <= 1.0
 
 
+def test_spearman_treats_float_round_off_ties_as_equal() -> None:
+    """``_ranks`` must compare values within ``EPSILON`` tolerance, not with
+    exact float equality, matching the module's own tolerance used elsewhere
+    (``baseline_quality_sd``/``quality_drop``). Two latency values equal up
+    to float round-off (differing by 1e-10, well under EPSILON=1e-9) must be
+    treated as tied and receive the same averaged rank as if they were
+    exactly equal -- an exact-equality comparison would instead rank them
+    1.0/2.0, silently perturbing the Spearman correlation."""
+    module = _analyzer()
+    exact_tie = module._spearman([1.0, 2.0], [10.0, 10.0])
+    near_tie = module._spearman([1.0, 2.0], [10.0, 10.0 + 1e-10])
+    assert near_tie == exact_tie
+
+
 def test_analyzer_bootstrap_is_exactly_reproducible_with_seed_0(tmp_path: Path) -> None:
     module = _analyzer()
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=750)

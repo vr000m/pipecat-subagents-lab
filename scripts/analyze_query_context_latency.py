@@ -85,7 +85,7 @@ def _spearman(xs: list[float], ys: list[float]) -> float | None:
         i = 0
         while i < len(order):
             j = i
-            while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            while j + 1 < len(order) and abs(values[order[j + 1]] - values[order[i]]) <= EPSILON:
                 j += 1
             avg_rank = (i + j) / 2.0 + 1.0
             for k in range(i, j + 1):

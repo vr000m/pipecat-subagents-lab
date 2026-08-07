@@ -138,8 +138,8 @@ SpeechOutcome = Literal[
 ]
 SPEECH_OUTCOMES: frozenset[str] = frozenset(get_args(SpeechOutcome))
 
-DeliveryDisposition = Literal["autoplay", "display_only", "suppressed", "not_applicable"]
-DELIVERY_DISPOSITIONS: frozenset[str] = frozenset(get_args(DeliveryDisposition))
+LateDeliveryDisposition = Literal["autoplay", "display_only", "suppressed", "not_applicable"]
+LATE_DELIVERY_DISPOSITIONS: frozenset[str] = frozenset(get_args(LateDeliveryDisposition))
 
 _APP_TURN_COUNTER_FIELDS = (
     "direct_count",
@@ -351,7 +351,7 @@ EVENT_REGISTRY: Mapping[str, EventSpec] = MappingProxyType(
                 _id("result_id"),
                 _id("provider", maxlen=64),
                 _id("model", maxlen=64),
-                _enum("delivery_disposition", DELIVERY_DISPOSITIONS),
+                _enum("delivery_disposition", LATE_DELIVERY_DISPOSITIONS),
             ),
         ),
     }
@@ -1085,7 +1085,7 @@ class RetainedRecorder:
         result_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
-        delivery_disposition: DeliveryDisposition | None = None,
+        delivery_disposition: LateDeliveryDisposition | None = None,
     ) -> bool:
         """Emit the terminal ``work_item_background`` record and close the recorder.
 

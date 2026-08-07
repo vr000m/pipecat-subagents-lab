@@ -5111,6 +5111,170 @@ def test_commit_exception_after_a_completed_search_sweeps_the_child_as_failed() 
     asyncio.run(run())
 
 
+def test_start_next_exception_after_commit_sweeps_the_turn_as_failed() -> None:
+    """A genuine ``start_next`` failure (distinct from the documented
+    no-TTS/DELIVERY_UNKNOWN short-circuit, which ``start_next`` itself
+    resolves without raising) must propagate out of ``_commit_and_speak``
+    so the turn is finalized as ``failed`` rather than silently standing
+    as a successful commit."""
+
+    async def run() -> None:
+        tts = FakeTTS()
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+            tts=tts,
+            measurement_sink=sink,
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+
+        async def raising_start_next(work_item_id: str | None = None) -> object:
+            raise RuntimeError("submission exploded")
+
+        connection.scheduler.start_next = raising_start_next  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="submission exploded"):
+            await host._handle_transcript("Riga weather")
+
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "failed"
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert parents[0].fields["outcome"] == "failed"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_and_speak_no_tts_short_circuit_completes_without_raising() -> None:
+    """The legitimate no-TTS path (``require_tts and origin.tts is None``)
+    must still complete ``_commit_and_speak`` without raising -- this is the
+    documented short-circuit that removing the old broad except must not
+    break."""
+
+    async def run() -> None:
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        assert connection.tts is None
+
+        result = GroundedResult(
+            result_id="result-no-tts",
+            worker_id="worker-search",
+            turn_id="turn-no-tts",
+            text="Answer",
+            spoken_text="Spoken answer",
+            origin_epoch=1,
+        )
+        committed = await host._commit_and_speak(result, connection)
+        assert committed is result
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
+    """``_handle_pending`` must snapshot ``_turn_sequence`` before its first
+    await (``_register_runner_worker``), matching ``_search_with_timeout``/
+    ``_handle_multi_intent``. If a newer turn is accepted during that yield
+    and the snapshot were instead taken after it (the bug), the late
+    delivery context would wrongly believe its own dispatch was the latest
+    turn and later resolve to ``autoplay`` instead of ``display_only``."""
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+
+            async def submit(
+                self,
+                work_item_id: str,
+                _items: object,
+                _execute: object,
+                **_kwargs: object,
+            ) -> object:
+                # Report the work item as retained/still-pending so
+                # _handle_pending takes the late-delivery-context path.
+                return type(
+                    "Submitted",
+                    (),
+                    {"results": (), "pending_work_item_ids": (work_item_id,), "failures": ()},
+                )()
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+            measurement_sink=sink,
+            promotion_manifest=PromotionManifest(promotion_eligible=True),
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        original_register_runner_worker = host._register_runner_worker
+
+        async def register_and_accept_newer_turn(worker_arg: object) -> None:
+            # Simulate a newer semantic turn being accepted concurrently,
+            # during the exact yield _handle_pending suspends on.
+            host._turn_sequence += 1
+            await original_register_runner_worker(worker_arg)
+
+        host._register_runner_worker = register_and_accept_newer_turn  # type: ignore[method-assign]
+
+        captured_contexts: list[LateDeliveryContext] = []
+        original_new_late_delivery_context = host._new_late_delivery_context
+
+        def capturing_new_late_delivery_context(**kwargs: object) -> LateDeliveryContext:
+            context = original_new_late_delivery_context(**kwargs)
+            captured_contexts.append(context)
+            return context
+
+        host._new_late_delivery_context = capturing_new_late_delivery_context  # type: ignore[method-assign]
+
+        pending_dialogue = type(
+            "Pending",
+            (),
+            {
+                "owner_id": "worker-search",
+                "original_query": "continue please",
+                "question": "Which one?",
+            },
+        )()
+        outcome = type("Outcome", (), {"pending_dialogue": pending_dialogue, "work_items": ()})()
+
+        await host._handle_pending(
+            outcome,
+            "continue please",
+            origin,
+            "turn-pending-snapshot",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending-snapshot"),
+        )
+
+        assert len(captured_contexts) == 1
+        late_context = captured_contexts[0]
+        # The snapshot must reflect the sequence at dispatch time (0), not
+        # the post-yield value (1) that the newer turn bumped it to.
+        assert late_context.accepted_turn_sequence == 0
+        assert host._turn_sequence == 1
+        assert host._late_result_disposition(late_context, origin=origin) == "display_only"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_pending_turn_cancelled_mid_submit_sweeps_the_child_as_cancelled() -> None:
     """The ``_handle_pending`` path owns its child the same way: a turn
     cancelled while ``coordinator.submit`` is in flight still emits one
@@ -5476,6 +5640,7 @@ def test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch() -> 
             coordinator=RoutedCoordinator(search),
         )
         origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
 
         pending = asyncio.create_task(host._handle_transcript("today's weather"))
         await asyncio.wait_for(search.started.wait(), timeout=1)
@@ -5483,6 +5648,15 @@ def test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch() -> 
         acks = _ack_items(origin.scheduler)
         assert len(acks) == 1
         assert acks[0].result_id is None or acks[0].ack_id is not None
+
+        # Let the deferred ack admission run, then complete/release its TTS
+        # lease -- mirroring the real pipeline, where the ack always finishes
+        # speaking well before a genuinely slow delegated search returns --
+        # so the real result can be admitted once the search resolves.
+        while origin.scheduler.active is None:
+            await asyncio.sleep(0)
+        lease = origin.scheduler.active
+        await release_lifecycle_slot(origin, lease.token, lease.item.utterance_id)
 
         search.release.set()
         result = await asyncio.wait_for(pending, timeout=1)
@@ -5590,6 +5764,7 @@ def test_multi_intent_turn_emits_exactly_one_parent_ack_for_its_sole_delegated_c
 
         host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=Coordinator())
         origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
         outcome = type(
             "Outcome",
             (),
@@ -5617,6 +5792,15 @@ def test_multi_intent_turn_emits_exactly_one_parent_ack_for_its_sole_delegated_c
 
         acks = _ack_items(origin.scheduler)
         assert len(acks) == 1
+
+        # Let the deferred ack admission run, then complete/release its TTS
+        # lease (see test_early_ack_is_enqueued_immediately_after_delegated_
+        # search_dispatch) so the real result can be admitted once the
+        # search resolves.
+        while origin.scheduler.active is None:
+            await asyncio.sleep(0)
+        lease = origin.scheduler.active
+        await release_lifecycle_slot(origin, lease.token, lease.item.utterance_id)
 
         search.release.set()
         await asyncio.wait_for(pending, timeout=1)
@@ -6084,6 +6268,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
                 coordinator=RoutedCoordinator(search),
             )
             origin = await host.connect(connection_handshake(host, 1))
+            origin.worker = QueueingPipelineWorker()
             assert host.feature_policy.enable_early_ack is False
 
             pending = asyncio.create_task(host._handle_transcript("today's weather"))
@@ -6118,6 +6303,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
                 runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=Coordinator()
             )
             origin = await host.connect(connection_handshake(host, 1))
+            origin.worker = QueueingPipelineWorker()
             assert host.feature_policy.enable_early_ack is False
 
             await host._handle_pending(
@@ -6175,6 +6361,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
                 runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=Coordinator()
             )
             origin = await host.connect(connection_handshake(host, 1))
+            origin.worker = QueueingPipelineWorker()
             assert host.feature_policy.enable_early_ack is False
             outcome = type(
                 "Outcome",

@@ -268,6 +268,43 @@ def test_write_manifest_refuses_when_phase0_input_is_malformed(tmp_path: Path) -
     assert not (tmp_path / "promotion-manifest.json").exists()
 
 
+def test_plain_phase_input_cli_cleanly_fails_on_a_missing_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The plain ``--phase``/``--input`` CLI path (``validate_artifact`` ->
+    ``load_records``) must still print a clean ``FAIL: ...`` and exit 1 for a
+    missing input file -- not a raw traceback. ``load_records`` delegates to
+    the shared ``_evidence_common.load_jsonl``, which raises
+    ``EvidenceGateError``; that must be translated to
+    ``EvidenceValidationError`` since this CLI path's except clause only
+    catches the latter."""
+    module = _validator()
+    missing = tmp_path / "does-not-exist.jsonl"
+
+    exit_code = module.main(["--phase", "phase0", "--input", str(missing)])
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("FAIL:")
+
+
+def test_plain_phase_input_cli_cleanly_fails_on_a_malformed_json_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same CLI path, but for a malformed JSON line rather than a missing
+    file -- both must translate cleanly through ``load_records`` rather than
+    raising an uncaught ``EvidenceGateError``."""
+    module = _validator()
+    malformed = tmp_path / "phase0-malformed.jsonl"
+    malformed.write_text("{not json")
+
+    exit_code = module.main(["--phase", "phase0", "--input", str(malformed)])
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("FAIL:")
+
+
 def test_write_manifest_refuses_when_phase1_input_is_incomplete(tmp_path: Path) -> None:
     """A phase1 artifact missing the queued_discard/admitted_completion x2
     minimum counts (plan bullet 174) must not silently pass into the

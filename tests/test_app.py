@@ -1297,6 +1297,80 @@ def test_snapshot_install_reseeds_the_observer_projected_sequence() -> None:
     asyncio.run(run())
 
 
+class YieldingFrameCapturingPipelineWorker(FrameCapturingPipelineWorker):
+    """FrameCapturingPipelineWorker whose ``queue_frame`` yields to the event
+    loop before acknowledging a barrier frame, so two concurrent
+    snapshot-request handlers on the same connection can actually interleave
+    at that point instead of one running start-to-finish before the other is
+    ever scheduled."""
+
+    async def queue_frame(self, frame: object) -> None:
+        await asyncio.sleep(0)
+        await super().queue_frame(frame)
+
+
+def test_concurrent_snapshot_requests_on_one_connection_are_serialized() -> None:
+    """Two snapshot-request messages firing concurrently on the same
+    connection must not open two ``SnapshotBarrier``s at once: each barrier
+    pauses/resumes the one shared observer, so an overlap would let one
+    request's resume/reseed corrupt the other's in-flight watermark/buffer.
+    """
+
+    async def run() -> None:
+        YieldingFrameCapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=YieldingFrameCapturingPipelineWorker,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = YieldingFrameCapturingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        active_barriers = 0
+        max_concurrent_barriers = 0
+        original_pause = runtime.observer.pause
+        original_resume = runtime.observer.resume
+
+        def tracking_pause() -> None:
+            nonlocal active_barriers, max_concurrent_barriers
+            active_barriers += 1
+            max_concurrent_barriers = max(max_concurrent_barriers, active_barriers)
+            original_pause()
+
+        def tracking_resume(watermark: int | None = None) -> None:
+            nonlocal active_barriers
+            original_resume(watermark)
+            active_barriers -= 1
+
+        runtime.observer.pause = tracking_pause  # type: ignore[method-assign]
+        runtime.observer.resume = tracking_resume  # type: ignore[method-assign]
+
+        message = SimpleNamespace(type="snapshot-request", data=None)
+        await asyncio.gather(
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+        )
+
+        # The lock must ensure the second barrier never opens before the
+        # first resumes: at most one pause-without-matching-resume at a time.
+        assert max_concurrent_barriers == 1
+        assert active_barriers == 0
+        snapshot_frames = [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"]
+        assert len(snapshot_frames) == 2
+
+    asyncio.run(run())
+
+
 # --- I12: wire_payload is the single choke point for work_status presence --
 
 

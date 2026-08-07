@@ -33,6 +33,7 @@ from .perf_metrics import (
     ConsoleMeasurementSink,
     ControlAction,
     ControlOutcome,
+    LateDeliveryDisposition,
     MeasurementSink,
     RetainedRecorder,
     SpeechOutcome,
@@ -40,7 +41,6 @@ from .perf_metrics import (
     WorkItemRecorder,
     WorkOutcome,
 )
-from .perf_metrics import DeliveryDisposition as LateDeliveryDisposition
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
@@ -287,6 +287,21 @@ def _work_status_for_outcome(
     if outcome_label in {"completed", "clarify", "declined"} and committed:
         return "result_ready", None
     return "failed", ("retention_rejected" if terminal_kind == "retention_rejected" else None)
+
+
+def _child_work_status_after_dispatch(
+    outcome_label: str | None,
+    *,
+    cancelled: bool,
+    terminal_kind: str | None = None,
+) -> tuple[WorkStatusState, TerminalReason | None] | None:
+    """Retained-and-not-cancelled work is not terminal: 'background' is its
+    truthful status until the late result terminalizes it. Every other case
+    defers to ``_work_status_for_outcome``.
+    """
+    if outcome_label == "retained" and not cancelled:
+        return "background", None
+    return _work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
 
 
 def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
@@ -1539,6 +1554,10 @@ class SessionHost:
         coordinator = self._require_coordinator()
         origin_epoch = origin.epoch
         delegated_children: dict[str, str | None] = {}
+        # Captured before the first await below, which may span other turns
+        # being accepted concurrently: this is the turn-sequence snapshot
+        # LateDeliveryContext needs to detect a newer-turn arrival.
+        dispatch_turn_sequence = self._turn_sequence
         try:
             pending = getattr(outcome, "pending_dialogue", None)
             owner_id = pending.owner_id if pending is not None else None
@@ -1609,7 +1628,10 @@ class SessionHost:
                     )
 
             late_context = self._new_late_delivery_context(
-                turn_id=turn_id, work_item_id=work_item_id, origin_epoch=origin.epoch
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                origin_epoch=origin.epoch,
+                accepted_turn_sequence=dispatch_turn_sequence,
             )
             self._emit_work_status(
                 turn_id=turn_id,
@@ -1659,32 +1681,21 @@ class SessionHost:
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             was_cancelled = work_item_id in self._cancelled_work_items
-            if child_outcome_label == "retained" and not was_cancelled:
-                # Still working, not terminal (see the same rule in
-                # ``_handle_transcript_impl``): the late result terminalizes it.
+            derived = _child_work_status_after_dispatch(
+                child_outcome_label,
+                cancelled=was_cancelled,
+                terminal_kind=child_outcome_label,
+            )
+            if derived is not None:
+                status_state, status_reason = derived
                 self._emit_work_status(
                     turn_id=turn_id,
                     work_item_id=work_item_id,
                     worker_id=worker_id,
-                    state="background",
+                    state=status_state,
                     origin_epoch=origin_epoch,
+                    terminal_reason=status_reason,
                 )
-            else:
-                derived = _work_status_for_outcome(
-                    child_outcome_label,
-                    cancelled=was_cancelled,
-                    terminal_kind=child_outcome_label,
-                )
-                if derived is not None:
-                    status_state, status_reason = derived
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state=status_state,
-                        origin_epoch=origin_epoch,
-                        terminal_reason=status_reason,
-                    )
             committed = await self._commit_and_speak(result, origin, role=speech_role)
             turn_recorder.finalize()
             return committed
@@ -1994,16 +2005,21 @@ class SessionHost:
                 # Retained is not terminal: `background` is the truthful state
                 # until the late result lands (same rule as the single-intent
                 # path); a `failed` here could never be flipped back.
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=work_item_id,
-                    parent_work_item_id=parent_work_item_id,
-                    worker_id=worker_id,
-                    state=(
-                        "cancelled" if work_item_id in self._cancelled_work_items else "background"
-                    ),
-                    origin_epoch=origin_epoch,
+                derived = _child_work_status_after_dispatch(
+                    "retained",
+                    cancelled=work_item_id in self._cancelled_work_items,
                 )
+                if derived is not None:
+                    status_state, status_reason = derived
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        parent_work_item_id=parent_work_item_id,
+                        worker_id=worker_id,
+                        state=status_state,
+                        origin_epoch=origin_epoch,
+                        terminal_reason=status_reason,
+                    )
                 recorder = retained_recorders.get(work_item_id)
                 if recorder is not None:
                     self._register_retained_recorder_if_open(work_item_id, recorder)
@@ -2595,14 +2611,7 @@ class SessionHost:
             origin_epoch=origin_epoch,
             role=role,
         )
-        try:
-            await origin.scheduler.start_next(work_item_id)
-        except Exception:  # noqa: BLE001 - result already committed; speech failure must not propagate
-            # A no-TTS/submission-failed result may still reach
-            # result_ready: that state describes canonical commit, not
-            # audio. start_next's own except-path already recorded
-            # DELIVERY_UNKNOWN and released the coordinator slot.
-            logger.opt(exception=True).debug("speech submission failed after commit; result stands")
+        await origin.scheduler.start_next(work_item_id)
         return result
 
     def session_handshake(self) -> dict[str, Any]:

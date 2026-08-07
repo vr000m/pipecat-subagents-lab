@@ -387,6 +387,11 @@ async def _attach_connection(
         runtime.observer.subscribe(emit_frame)
 
         client_ready_sent = False
+        # Guards SnapshotBarrier construction-through-flush below: two
+        # concurrent snapshot-request messages on the same connection would
+        # otherwise open two barriers against the same observer/state pair
+        # and corrupt each other's watermark/buffer.
+        snapshot_lock = asyncio.Lock()
 
         @worker.rtvi.event_handler("on_client_ready")
         async def on_client_ready(_rtvi: Any) -> None:
@@ -407,39 +412,44 @@ async def _attach_connection(
             )
             if not snapshot_requested or not host.accepts(runtime.epoch):
                 return
-            # Pause the observer before reading any state so no incremental
-            # captured from here on can be dispatched (via the emitter's
-            # asyncio.create_task scheduling) ahead of the snapshot -- the
-            # barrier owns synchronous SessionState._emit() callbacks between
-            # this point and install_baseline() below.
-            barrier = SnapshotBarrier(observer=runtime.observer, state=host.state)
-            barrier.subscribe_paused()
-            publisher.set_snapshot(runtime.observer.snapshot())
-            snapshot = publisher.snapshot()
-            if snapshot is None:
-                barrier.cancel()
-                return
-            # install_baseline() reseeds the observer's projected sequence at
-            # snapshot.sequence only after the barrier frame is acknowledged.
-            # The observer's projected sequence only advances for events
-            # visible to *this* connection, while the snapshot is stamped
-            # from the global SessionState watermark, which also advances
-            # for invisible events (a capability-gated work_status on a
-            # connection that never advertised work_status_v1). Reseeding
-            # from the value actually stamped on the wire -- publisher.snapshot()
-            # re-reads the sequence provider -- keeps the client's
-            # lastAppliedSequence and the observer's counter identical by
-            # construction, so the next incremental is snapshot_sequence + 1.
-            await barrier.install_baseline(
-                watermark=snapshot.sequence, flush_writer=worker.queue_frame
-            )
-            # Non-capable projections omit the status section entirely
-            # (field absent, not an empty array) so the frozen
-            # pre-Phase-3 runtime-snapshot schema still validates this
-            # connection's snapshots (Requirements). The exclusion is
-            # owned by RuntimeSnapshot.wire_payload, not by this caller.
-            frame_data = snapshot.wire_payload(include_work_status=runtime.supports_work_status)
-            await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
+            # Serialize concurrent snapshot-request messages: at most one
+            # SnapshotBarrier may be open per connection at a time, or two
+            # barriers racing against the same observer/state pair could
+            # corrupt each other's watermark/buffer.
+            async with snapshot_lock:
+                # Pause the observer before reading any state so no incremental
+                # captured from here on can be dispatched (via the emitter's
+                # asyncio.create_task scheduling) ahead of the snapshot -- the
+                # barrier owns synchronous SessionState._emit() callbacks between
+                # this point and install_baseline() below.
+                barrier = SnapshotBarrier(observer=runtime.observer, state=host.state)
+                barrier.subscribe_paused()
+                publisher.set_snapshot(runtime.observer.snapshot())
+                snapshot = publisher.snapshot()
+                if snapshot is None:
+                    barrier.cancel()
+                    return
+                # install_baseline() reseeds the observer's projected sequence at
+                # snapshot.sequence only after the barrier frame is acknowledged.
+                # The observer's projected sequence only advances for events
+                # visible to *this* connection, while the snapshot is stamped
+                # from the global SessionState watermark, which also advances
+                # for invisible events (a capability-gated work_status on a
+                # connection that never advertised work_status_v1). Reseeding
+                # from the value actually stamped on the wire -- publisher.snapshot()
+                # re-reads the sequence provider -- keeps the client's
+                # lastAppliedSequence and the observer's counter identical by
+                # construction, so the next incremental is snapshot_sequence + 1.
+                await barrier.install_baseline(
+                    watermark=snapshot.sequence, flush_writer=worker.queue_frame
+                )
+                # Non-capable projections omit the status section entirely
+                # (field absent, not an empty array) so the frozen
+                # pre-Phase-3 runtime-snapshot schema still validates this
+                # connection's snapshots (Requirements). The exclusion is
+                # owned by RuntimeSnapshot.wire_payload, not by this caller.
+                frame_data = snapshot.wire_payload(include_work_status=runtime.supports_work_status)
+                await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
 
         # WorkerRunner has no remove-workers API in the pinned wheel. Run each
         # connection worker through its real PipelineWorker lifecycle task so
