@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, Literal, get_args
+from typing import Any, ClassVar, Literal, get_args
 
 from loguru import logger
 
@@ -129,6 +129,16 @@ class Result:
 
 
 class WorkItemCoordinator:
+    #: The ``Config`` fields this constructor is allowed to override onto
+    #: whatever ``Config`` it was handed (see ``__init__``'s ``replace`` call
+    #: below). ``SessionHost`` reconciles its own ``Config`` against a
+    #: coordinator's by excluding exactly these fields, so the two components
+    #: read one declaration instead of duplicating a literal list that can
+    #: silently drift when a field is added or removed here.
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"max_work_items_per_turn", "multi_intent_wait_timeout_ms"}
+    )
+
     def __init__(
         self,
         registry: WorkerRegistry | None = None,

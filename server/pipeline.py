@@ -16,11 +16,12 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
 from .config import Config, FeaturePolicy, PromotionManifest
-from .connection_arbiter import ConnectionArbiter
+from .connection_arbiter import Connection, ConnectionArbiter
 from .contracts import (
     GroundedResult,
     RoutingDecision,
     RoutingState,
+    SnapshotHandshake,
     TerminalReason,
     TranscriptEntry,
     WorkerState,
@@ -66,7 +67,12 @@ from .speech_scheduler import (
     SpeechScheduler,
     UtteranceLease,
 )
-from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
+from .work_item_coordinator import (
+    FAILURE_KINDS,
+    LateResult,
+    WorkItemCoordinator,
+    WorkItemFailure,
+)
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 
@@ -289,6 +295,38 @@ def _work_status_for_outcome(
     return "failed", ("retention_rejected" if terminal_kind == "retention_rejected" else None)
 
 
+#: Commit outcomes that mean "this exact result was already delivered once, or
+#: belongs to a superseded epoch" -- the work itself succeeded, so suppressing
+#: the redundant copy is not a failure of the work item.
+_SUPPRESSED_COMMIT_OUTCOMES: frozenset[str] = frozenset(
+    {"suppressed_duplicate", "suppressed_stale"}
+)
+
+
+def _late_commit_work_status(
+    work_outcome: str | None,
+    *,
+    commit_outcome: str | None,
+    terminal_kind: str | None = None,
+) -> tuple[WorkStatusState, TerminalReason | None] | None:
+    """The coarse work-status for one late-result commit attempt.
+
+    A suppressed duplicate or suppressed stale result emits *no* status at
+    all: the work item already reached its terminal state from the copy that
+    did commit, and reporting the suppression as ``failed`` would tell a
+    capable client that successful work had failed. Every other case defers to
+    ``_work_status_for_outcome`` so the late and foreground sites cannot drift.
+    """
+    if commit_outcome in _SUPPRESSED_COMMIT_OUTCOMES:
+        return None
+    return _work_status_for_outcome(
+        work_outcome,
+        cancelled=work_outcome == "cancelled",
+        committed=commit_outcome == "committed",
+        terminal_kind=terminal_kind,
+    )
+
+
 def _child_work_status_after_dispatch(
     outcome_label: str | None,
     *,
@@ -467,17 +505,23 @@ class SessionHost:
         # The coordinator is the other config holder in this object graph; a
         # divergent one is a split-brain, since the host reads every switch
         # (timeouts included) off ``self.config``. Fail fast at construction
-        # rather than letting two Configs drive one session. WorkItemCoordinator's
-        # own constructor is allowed to override max_work_items_per_turn and
-        # multi_intent_wait_timeout_ms onto whatever Config it was given (see
-        # its docstring/tests), so those two fields are coordinator-owned and
+        # rather than letting two Configs drive one session. The coordinator's
+        # own constructor is allowed to override a declared set of fields onto
+        # whatever Config it was given, so those coordinator-owned fields are
         # excluded from this comparison; every other field must still match.
+        # The set is read from the coordinator itself (falling back to
+        # WorkItemCoordinator's declaration for duck-typed test coordinators)
+        # rather than re-listed here, so adding or removing a coordinator-owned
+        # field cannot silently turn every construction into a boot-time
+        # ValueError raised from the wrong component.
         coordinator_config = getattr(coordinator, "config", None)
         if coordinator_config is not None:
+            owned_fields = getattr(
+                coordinator, "OWNED_CONFIG_FIELDS", WorkItemCoordinator.OWNED_CONFIG_FIELDS
+            )
             comparable_coordinator_config = replace(
                 coordinator_config,
-                max_work_items_per_turn=self.config.max_work_items_per_turn,
-                multi_intent_wait_timeout_ms=self.config.multi_intent_wait_timeout_ms,
+                **{field_name: getattr(self.config, field_name) for field_name in owned_fields},
             )
             if comparable_coordinator_config != self.config:
                 raise ValueError("SessionHost config conflicts with the coordinator's Config")
@@ -514,6 +558,13 @@ class SessionHost:
         # each turn's normal completion/cancellation/failure cleanup -- never
         # retained as an unbounded process-lifetime set.
         self._ack_emitted_turns: set[str] = set()
+        # Authoritative turn -> delegated-child-work-item registry. Ack
+        # ownership and the sole-delegated-child cancellation decision are
+        # answered from this map rather than by re-deriving the
+        # ``work-{turn_id}[-{index}]`` naming convention at each call site.
+        # Populated at each delegated child's dispatch and dropped in the
+        # owning turn handler's cleanup, alongside the ack latch.
+        self._turn_work_items: dict[str, set[str]] = {}
         # Keep deferred ack-admission tasks referenced so they aren't
         # garbage-collected mid-flight; see _schedule_ack_admission.
         self._ack_admission_tasks: set[asyncio.Task[Any]] = set()
@@ -907,7 +958,11 @@ class SessionHost:
             return True
         return redeemed
 
-    def validate_patch_handshake(self, connection: Any, handshake: Any) -> None:
+    def validate_patch_handshake(
+        self,
+        connection: Connection | ConnectionPipeline | None,
+        handshake: SnapshotHandshake,
+    ) -> None:
         """Enforce immutable capability binding for a PATCH ICE-candidate request.
 
         An omitted ``capabilities`` field inherits the POST-bound set; a
@@ -915,11 +970,21 @@ class SessionHost:
         request is rejected. Neither branch mutates ``connection`` or its
         already-constructed ``RuntimeObserver``: capability entitlement is
         immutable for the life of a promoted epoch (Requirements).
+
+        Both concrete carriers are accepted because both real call sites are
+        typed: ``server.app`` passes the live ``ConnectionPipeline`` (whose
+        ``capabilities`` property reads straight off its ``RuntimeObserver``)
+        while the arbiter-level tests pass the promoted ``Connection``. A
+        ``None`` connection means nothing was promoted, so the bound set is
+        empty and any presented capability is a mismatch. Attributes are read
+        directly rather than via ``getattr`` defaults, so a wrong argument or
+        a future field rename raises instead of silently degrading to "no
+        capabilities presented".
         """
-        if not getattr(handshake, "capabilities_present", False):
+        if not handshake.capabilities_present:
             return
-        bound = frozenset(getattr(connection, "capabilities", ()))
-        presented = frozenset(getattr(handshake, "capabilities", ()))
+        bound = frozenset(connection.capabilities) if connection is not None else frozenset()
+        presented = frozenset(handshake.capabilities)
         if presented != bound:
             raise ValueError("capabilities cannot change after connection promotion")
 
@@ -933,19 +998,31 @@ class SessionHost:
     def _clear_ack_latch(self, turn_id: str) -> None:
         self._ack_emitted_turns.discard(turn_id)
 
+    def _register_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
+        """Record one delegated child as belonging to ``turn_id``.
+
+        This registry -- not the ``work-{turn_id}[-{index}]`` naming
+        convention -- is the authority for ack ownership and the
+        sole-delegated-child cancellation decision, so a turn id containing a
+        hyphen can never make a prefix match ambiguous.
+        """
+        self._turn_work_items.setdefault(turn_id, set()).add(work_item_id)
+
+    def _release_turn_work_items(self, turn_id: str) -> None:
+        self._turn_work_items.pop(turn_id, None)
+
     def _ack_turn_for_work_item(self, work_item_id: str) -> str | None:
         """The latched semantic turn that owns ``work_item_id``, if any.
 
         A control message ("stop that") arrives as its own semantic turn, so
         the turn being cancelled is never the control turn: the ack that must
-        be settled belongs to the *target child's* turn. Delegated children
-        are named ``work-{turn_id}`` (single intent) or ``work-{turn_id}-{i}``
-        (multi-intent) at their two creation sites, so matching against the
-        live latch set resolves the owner without a second registry and
-        without the ambiguity of parsing a turn id back out of the string.
+        be settled belongs to the *target child's* turn. Resolved from the
+        explicit turn -> delegated-child registry rather than by re-deriving
+        the work-item naming convention here; only a turn that still holds an
+        ack latch can own an ack to settle.
         """
-        for candidate in self._ack_emitted_turns:
-            if work_item_id == f"work-{candidate}" or work_item_id.startswith(f"work-{candidate}-"):
+        for candidate, work_items in self._turn_work_items.items():
+            if work_item_id in work_items and candidate in self._ack_emitted_turns:
                 return candidate
         return None
 
@@ -968,6 +1045,7 @@ class SessionHost:
         *,
         turn_id: str,
         origin_epoch: int,
+        dispatched: bool,
         search_task: asyncio.Task[Any] | None = None,
     ) -> None:
         """Enqueue this turn's one delegation-confirmed ack.
@@ -978,11 +1056,33 @@ class SessionHost:
         progress that hasn't happened). A child that bails before enqueueing
         does not consume the turn's one ack slot -- otherwise a turn whose
         first child had no TTS (or resolved instantly) would be permanently
-        ack-less. When ``search_task`` is supplied, this yields exactly one
-        scheduling tick first: a search that already resolved within that
-        tick has no real delegation latency to acknowledge, so no ack is
-        queued at all ('without claiming progress that hasn't happened').
+        ack-less.
+
+        ``dispatched`` is required at every call site and states whether the
+        caller has *already* handed this turn's search to the coordinator:
+
+        * ``dispatched=True`` -- the caller dispatched the search itself and
+          passes the resulting handle as ``search_task``. A ``None`` handle
+          means the coordinator refused the work for lack of capacity, so
+          there is no delegation to acknowledge and no ack is queued: the
+          turn is about to speak "the search service is busy", which an ack
+          would directly contradict. A live handle yields exactly one
+          scheduling tick first, so a search that already resolved has no
+          real delegation latency to acknowledge either.
+        * ``dispatched=False`` -- the pending-dialogue and multi-intent paths,
+          where dispatch happens inside ``coordinator.submit`` and the plan
+          requires the ack at the delegation *decision* (dev plan Phase 1:
+          "invoke it immediately after the first eligible multi-intent child
+          decision"). There is no handle to inspect at this point, and
+          ``search_task`` must be ``None``.
         """
+        if dispatched and search_task is None:
+            # Capacity-rejected dispatch: nothing was delegated, so nothing
+            # may be acknowledged. Not latched either -- a later eligible
+            # child of the same turn can still claim the turn's one ack.
+            return
+        if not dispatched and search_task is not None:
+            raise ValueError("search_task may only be supplied on an already-dispatched path")
         if not self.feature_policy.enable_early_ack or turn_id in self._ack_emitted_turns:
             return
         if (
@@ -1016,13 +1116,22 @@ class SessionHost:
         # so a later genuinely-slow child of the same turn can still claim it.
         self._ack_emitted_turns.add(turn_id)
         enqueue_ack()
-        self._schedule_ack_admission(origin, ack_work_item_id, enqueue_ack)
+        self._schedule_ack_admission(
+            origin,
+            ack_work_item_id,
+            enqueue_ack,
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+        )
 
     def _schedule_ack_admission(
         self,
         origin: ConnectionPipeline,
         ack_work_item_id: str,
         enqueue_ack: Callable[[], None],
+        *,
+        turn_id: str,
+        origin_epoch: int,
     ) -> None:
         """Admit a just-enqueued ack on a later scheduling tick, not inline.
 
@@ -1044,7 +1153,22 @@ class SessionHost:
                 # start_next's own except-path already released the
                 # coordinator slot and discarded the item from scheduler
                 # bookkeeping entirely, so re-queue a fresh ack item rather
-                # than leaving none at all.
+                # than leaving none at all -- but only while the ack is still
+                # live. A cancellation, reconnect, or newer promoted epoch
+                # racing this failure would otherwise leave a stale ack queued
+                # on a turn that no longer exists, to be spoken later.
+                if (
+                    turn_id not in self._ack_emitted_turns
+                    or self.connection is not origin
+                    or not origin.active
+                    or origin.epoch != origin_epoch
+                    or not self.accepts(origin_epoch)
+                ):
+                    logger.opt(exception=True).debug(
+                        "early ack failed to start and its turn/epoch is no longer live; "
+                        "discarding it instead of re-queueing"
+                    )
+                    return
                 logger.opt(exception=True).debug(
                     "early ack failed to start; leaving it queued for a later retry"
                 )
@@ -1098,9 +1222,21 @@ class SessionHost:
             child_work_item_id, exclude_work_item_id=exclude_work_item_id
         )
         cancelled_speech = scheduler.cancel(child_work_item_id)
-        remaining = set(scheduler.pending_work_item_ids(exclude=ack_work_item_id))
+        # Sole-child determination is scoped to *this turn's own* delegated
+        # children. Reading the scheduler's connection-wide queues alone would
+        # let an unrelated turn's queued or admitted speech keep this turn's
+        # ack alive after its only child was cancelled -- and that ack could
+        # then still be admitted and spoken.
+        # "Still live" is positive evidence -- an in-flight work/turn task, or
+        # queued/admitted speech -- intersected with this turn's own delegated
+        # children, never the connection-wide scheduler view on its own.
+        own_work_items = self._turn_work_items.get(turn_id, set())
+        scheduler_live = set(scheduler.pending_work_item_ids(exclude=ack_work_item_id))
         if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
-            remaining.add(scheduler.active.item.work_item_id)
+            scheduler_live.add(scheduler.active.item.work_item_id)
+        live = scheduler_live | set(self._inflight_work_tasks) | set(self._inflight_turn_tasks)
+        remaining = (live & own_work_items) - self._cancelled_work_items
+        remaining.discard(child_work_item_id)
         if not remaining:
             scheduler.cancel(ack_work_item_id)
             self._clear_ack_latch(turn_id)
@@ -1365,6 +1501,7 @@ class SessionHost:
                 return outcome
             child = turn_recorder.new_child(work_item_id=work_item_id)
             delegated_children[work_item_id] = worker_id
+            self._register_turn_work_item(turn_id, work_item_id)
             self._emit_work_status(
                 turn_id=turn_id,
                 work_item_id=work_item_id,
@@ -1390,11 +1527,15 @@ class SessionHost:
                 # a deferred task -- scheduled strictly after this search
                 # task's own first step -- so a reconnect racing in on the
                 # very same turn can still fence the still-queued ack before
-                # it ever reaches the old connection's transport.
+                # it ever reaches the old connection's transport. A refused
+                # dispatch (``search_task is None``) delegates nothing, so it
+                # acknowledges nothing -- see ``_emit_early_ack``'s
+                # ``dispatched`` contract.
                 await self._emit_early_ack(
                     origin,
                     turn_id=turn_id,
                     origin_epoch=origin_epoch,
+                    dispatched=True,
                     search_task=search_task,
                 )
                 execution = await self._search_with_timeout(
@@ -1406,6 +1547,7 @@ class SessionHost:
                     worker_id=worker_id,
                     work_item_id=work_item_id,
                     task=search_task,
+                    task_dispatched=True,
                 )
                 search_ms = (time.perf_counter() - search_started) * 1000
                 child_outcome_label: WorkItemOutcome
@@ -1432,9 +1574,16 @@ class SessionHost:
                         # and let the `background` status stand alone instead
                         # of speaking a second canonical timeout result or
                         # writing a transcript/history entry (Requirements).
+                        #
+                        # Returns ``None``, not the internal ``SearchExecution``:
+                        # every sibling branch of this handler returns the
+                        # committed ``GroundedResult``, and this branch
+                        # deliberately commits nothing. ``None`` says exactly
+                        # that, instead of handing the caller a differently
+                        # shaped object behind an ``Any`` return type.
                         child.finalize(outcome="retained", app_worker_id=worker_id)
                         turn_recorder.finalize()
-                        return execution
+                        return None
                     result = canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
@@ -1495,23 +1644,42 @@ class SessionHost:
             # it when the late result lands. Only an actual cancellation
             # settles it here.
             retained_still_open = child_outcome_label == "retained" and not was_cancelled
-            if not retained_still_open:
-                derived = _work_status_for_outcome(
+            derived = (
+                None
+                if retained_still_open
+                else _work_status_for_outcome(
                     child_outcome_label,
                     cancelled=was_cancelled,
                     terminal_kind=child_outcome_label,
                 )
+            )
+            # Terminal status is emitted only *after* the canonical commit
+            # succeeds. Emitting `result_ready` first would tell a capable
+            # client the result was committed and display-ready even when the
+            # commit then raised or the turn was cancelled before it ran; a
+            # commit failure settles the child to `failed` instead.
+            try:
+                committed = await self._commit_and_speak(result, origin, role=speech_role)
+            except Exception:
                 if derived is not None:
-                    status_state, status_reason = derived
                     self._emit_work_status(
                         turn_id=turn_id,
                         work_item_id=work_item_id,
                         worker_id=worker_id,
-                        state=status_state,
+                        state="failed",
                         origin_epoch=origin_epoch,
-                        terminal_reason=status_reason,
                     )
-            committed = await self._commit_and_speak(result, origin, role=speech_role)
+                raise
+            if derived is not None:
+                status_state, status_reason = derived
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state=status_state,
+                    origin_epoch=origin_epoch,
+                    terminal_reason=status_reason,
+                )
             commit_ms = (time.perf_counter() - commit_started) * 1000
             child.finalize(
                 outcome=child_outcome_label,
@@ -1537,11 +1705,15 @@ class SessionHost:
                 turn_recorder.finalize(outcome="cancelled")
             raise
         except Exception:
+            self._fail_child_work_statuses(
+                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            )
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="failed")
             raise
         finally:
             self._clear_ack_latch(turn_id)
+            self._release_turn_work_items(turn_id)
 
     async def _handle_pending(
         self,
@@ -1575,12 +1747,18 @@ class SessionHost:
             await self._register_runner_worker(worker)
             worker_id = owner_id or "main"
             self._known_work_items.add(work_item_id)
-            await self._emit_early_ack(origin, turn_id=turn_id, origin_epoch=origin.epoch)
+            # Dispatch happens inside ``coordinator.submit`` below, so there is
+            # no handle to inspect here; the plan requires the ack at the
+            # delegation decision, not after submission returns.
+            await self._emit_early_ack(
+                origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
+            )
             clarification_context = self._clarification_context(pending, transcript)
             child = turn_recorder.new_child(work_item_id=work_item_id)
             # A continuation turn delegates genuine worker work, so it owns a
             # client-visible parent status exactly like a single-intent turn.
             delegated_children[work_item_id] = worker_id
+            self._register_turn_work_item(turn_id, work_item_id)
             self._emit_work_status(
                 turn_id=turn_id,
                 work_item_id=work_item_id,
@@ -1655,15 +1833,31 @@ class SessionHost:
                     outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
                 )
             elif submitted.pending_work_item_ids:
+                child_outcome_label = "retained"
+                child.finalize(outcome="retained", app_worker_id=worker_id)
+                self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+                if origin.supports_work_status and self.feature_policy.enable_background_status:
+                    # Same capability-gated rule the single-intent path takes:
+                    # a capable client gets the `background` status alone, not
+                    # a second canonical timeout result plus its transcript and
+                    # result-history entries (Requirements). Without this early
+                    # return the status *and* the legacy result were both
+                    # delivered, duplicating the turn for capable clients.
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state="background",
+                        origin_epoch=origin_epoch,
+                    )
+                    turn_recorder.finalize()
+                    return None
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
                     text="That is taking longer than expected; I will continue in the background.",
                     origin_epoch=origin.epoch,
                 )
-                child_outcome_label = "retained"
-                child.finalize(outcome="retained", app_worker_id=worker_id)
-                self._register_retained_recorder_if_open(work_item_id, retained_recorder)
             else:
                 failure_outcome: WorkItemOutcome = (
                     self._failure_child_outcome(submitted.failures[0])
@@ -1686,6 +1880,20 @@ class SessionHost:
                 cancelled=was_cancelled,
                 terminal_kind=child_outcome_label,
             )
+            # Terminal status only after the canonical commit succeeds; see the
+            # matching comment in the single-intent path.
+            try:
+                committed = await self._commit_and_speak(result, origin, role=speech_role)
+            except Exception:
+                if derived is not None:
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state="failed",
+                        origin_epoch=origin_epoch,
+                    )
+                raise
             if derived is not None:
                 status_state, status_reason = derived
                 self._emit_work_status(
@@ -1696,7 +1904,6 @@ class SessionHost:
                     origin_epoch=origin_epoch,
                     terminal_reason=status_reason,
                 )
-            committed = await self._commit_and_speak(result, origin, role=speech_role)
             turn_recorder.finalize()
             return committed
         except asyncio.CancelledError:
@@ -1707,11 +1914,15 @@ class SessionHost:
                 turn_recorder.finalize(outcome="cancelled")
             raise
         except Exception:
+            self._fail_child_work_statuses(
+                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            )
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="failed")
             raise
         finally:
             self._clear_ack_latch(turn_id)
+            self._release_turn_work_items(turn_id)
 
     async def _handle_multi_intent(
         self,
@@ -1826,6 +2037,7 @@ class SessionHost:
                 # unsupported, clarify, and dispatch-failure items returned
                 # above and never allocate a client-visible status.
                 delegated_children[item_work_item_id] = worker_id
+                self._register_turn_work_item(turn_id, item_work_item_id)
                 self._emit_work_status(
                     turn_id=turn_id,
                     work_item_id=item_work_item_id,
@@ -1842,7 +2054,12 @@ class SessionHost:
                     if index == 0 and pending is not None
                     else None
                 )
-                await self._emit_early_ack(origin, turn_id=turn_id, origin_epoch=origin.epoch)
+                # Dispatch happens inside ``coordinator.submit`` below; the plan
+                # requires the parent ack at the first eligible child
+                # *decision*, so there is no handle to inspect here.
+                await self._emit_early_ack(
+                    origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
+                )
 
             index_to_worker_id = dict(zip(runnable_indexes, runnable, strict=True))
 
@@ -1941,6 +2158,17 @@ class SessionHost:
                 f"work-{turn_id}-{index}": index for index in runnable_indexes
             }
             speech_roles: dict[int, SpeechRole] = {}
+            # Terminal per-child statuses are held here and emitted only after
+            # that child's canonical commit succeeds, so `result_ready` can
+            # never be published for a result whose commit then raised. Keyed
+            # by index -> (work_item_id, worker_id, state, terminal_reason).
+            deferred_status: dict[
+                int, tuple[str, str | None, WorkStatusState, TerminalReason | None]
+            ] = {}
+            # Every dispatched child that the coordinator accounted for in some
+            # fan-in bucket. Anything left over is reconciled to a terminal
+            # `failed` below, so the parent can never stay `searching` forever.
+            attributed_indexes: set[int] = set()
             # Two passes: settle last-wins content first, then attribute each
             # matched item exactly once from the result that actually commits.
             # Finalizing on first sight would name a discarded result_id in the
@@ -1971,6 +2199,7 @@ class SessionHost:
                     result_id=final_result.result_id,
                 )
                 item_work_item_id = f"work-{turn_id}-{index}"
+                attributed_indexes.add(index)
                 derived = _work_status_for_outcome(
                     item_outcome,
                     cancelled=item_work_item_id in self._cancelled_work_items,
@@ -1978,14 +2207,11 @@ class SessionHost:
                 )
                 if derived is not None:
                     status_state, status_reason = derived
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=item_work_item_id,
-                        parent_work_item_id=parent_work_item_id,
-                        worker_id=worker_id,
-                        state=status_state,
-                        origin_epoch=origin_epoch,
-                        terminal_reason=status_reason,
+                    deferred_status[index] = (
+                        item_work_item_id,
+                        worker_id,
+                        status_state,
+                        status_reason,
                     )
             for work_item_id in submitted.pending_work_item_ids:
                 matched = index_for_work_item_id.get(work_item_id)
@@ -1996,14 +2222,27 @@ class SessionHost:
                     )
                     continue
                 item_index = matched
+                attributed_indexes.add(item_index)
                 worker_id = index_to_worker_id[item_index][0]
-                results[item_index] = canonical_result(
-                    worker_id=worker_id,
-                    turn_id=f"{turn_id}-{item_index}",
-                    text="That item is taking longer than expected; I will continue in the background.",
-                    origin_epoch=origin.epoch,
-                )
-                speech_roles[item_index] = ROLE_TIMEOUT_NOTICE
+                if not (
+                    origin.supports_work_status and self.feature_policy.enable_background_status
+                ):
+                    # Capability-blind clients keep the legacy per-item timeout
+                    # notice. A capable client gets the `background` status
+                    # below and nothing else: committing and speaking the
+                    # notice as well would duplicate the canonical result,
+                    # transcript, and history the status is meant to replace
+                    # (same rule as the single-intent and pending paths).
+                    results[item_index] = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=f"{turn_id}-{item_index}",
+                        text=(
+                            "That item is taking longer than expected; "
+                            "I will continue in the background."
+                        ),
+                        origin_epoch=origin.epoch,
+                    )
+                    speech_roles[item_index] = ROLE_TIMEOUT_NOTICE
                 child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
                 # Retained is not terminal: `background` is the truthful state
                 # until the late result lands (same rule as the single-intent
@@ -2035,6 +2274,7 @@ class SessionHost:
                     )
                     continue
                 item_index = matched
+                attributed_indexes.add(item_index)
                 results[item_index] = canonical_result(
                     worker_id=failure.worker_id,
                     turn_id=f"{turn_id}-{item_index}",
@@ -2053,15 +2293,40 @@ class SessionHost:
                 )
                 if derived is not None:
                     status_state, status_reason = derived
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=failure.work_item_id,
-                        parent_work_item_id=parent_work_item_id,
-                        worker_id=failure.worker_id,
-                        state=status_state,
-                        origin_epoch=origin_epoch,
-                        terminal_reason=status_reason,
+                    deferred_status[item_index] = (
+                        failure.work_item_id,
+                        failure.worker_id,
+                        status_state,
+                        status_reason,
                     )
+            # Reconcile every dispatched child the coordinator never accounted
+            # for in any fan-in bucket. Without this a child whose result,
+            # pending record, or failure never came back (or came back with an
+            # unattributable id) leaves its work-status on `searching`, and the
+            # parent aggregate stays non-terminal forever for a capable client.
+            for index in runnable_indexes:
+                if index in attributed_indexes:
+                    continue
+                unmatched_work_item_id = f"work-{turn_id}-{index}"
+                logger.warning(
+                    f"multi-intent fan-in for {turn_id}: dispatched work item "
+                    f"{unmatched_work_item_id} was never accounted for; reconciling it "
+                    f"to a terminal failed status"
+                )
+                if not child_recorders[index].finalized:
+                    child_recorders[index].finalize(
+                        outcome="failed", app_worker_id=index_to_worker_id[index][0]
+                    )
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=unmatched_work_item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=index_to_worker_id[index][0],
+                    state="cancelled"
+                    if unmatched_work_item_id in self._cancelled_work_items
+                    else "failed",
+                    origin_epoch=origin_epoch,
+                )
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             committed = []
             commit_exceptions: list[Exception] = []
@@ -2071,6 +2336,10 @@ class SessionHost:
                 # not abort the loop and drop already-computed sibling
                 # results; each item is isolated and the first failure is
                 # re-raised only after every item has been committed.
+                #
+                # Each item's terminal work-status is emitted only after its
+                # own commit returns, so `result_ready` is never published for
+                # a result whose commit raised.
                 try:
                     committed.append(
                         await self._commit_and_speak(
@@ -2084,6 +2353,44 @@ class SessionHost:
                     )
                     committed.append(results[index])
                     commit_exceptions.append(exc)
+                    pending_status = deferred_status.pop(index, None)
+                    if pending_status is not None:
+                        failed_item_id, failed_worker_id, _state, _reason = pending_status
+                        self._emit_work_status(
+                            turn_id=turn_id,
+                            work_item_id=failed_item_id,
+                            parent_work_item_id=parent_work_item_id,
+                            worker_id=failed_worker_id,
+                            state="failed",
+                            origin_epoch=origin_epoch,
+                        )
+                else:
+                    pending_status = deferred_status.pop(index, None)
+                    if pending_status is not None:
+                        item_id, item_worker_id, status_state, status_reason = pending_status
+                        self._emit_work_status(
+                            turn_id=turn_id,
+                            work_item_id=item_id,
+                            parent_work_item_id=parent_work_item_id,
+                            worker_id=item_worker_id,
+                            state=status_state,
+                            origin_epoch=origin_epoch,
+                            terminal_reason=status_reason,
+                        )
+            # A deferred status whose index never reached the commit loop (its
+            # result was dropped from `results` between derivation and commit)
+            # still has to terminalize rather than strand the parent.
+            for item_id, item_worker_id, status_state, status_reason in deferred_status.values():
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=item_worker_id,
+                    state=status_state,
+                    origin_epoch=origin_epoch,
+                    terminal_reason=status_reason,
+                )
+            deferred_status.clear()
             if commit_exceptions:
                 raise commit_exceptions[0]
             turn_recorder.finalize()
@@ -2099,11 +2406,18 @@ class SessionHost:
                 turn_recorder.finalize(outcome="cancelled")
             raise
         except Exception:
+            self._fail_child_work_statuses(
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children=delegated_children,
+                parent_work_item_id=parent_work_item_id,
+            )
             if not turn_recorder.finalized:
                 turn_recorder.finalize(outcome="failed")
             raise
         finally:
             self._clear_ack_latch(turn_id)
+            self._release_turn_work_items(turn_id)
 
     def _worker_clarification_result(
         self,
@@ -2181,8 +2495,19 @@ class SessionHost:
         work_item_id: str | None = None,
         clarification_context: ClarificationContext | None = None,
         task: asyncio.Task[Any] | None = None,
+        task_dispatched: bool = False,
     ) -> SearchExecution:
+        """Wait out the foreground window for one delegated search.
+
+        ``task_dispatched`` states that the caller already attempted dispatch
+        and is passing the outcome as ``task``; a ``None`` task then means the
+        coordinator refused for lack of capacity and must not be retried here.
+        Re-dispatching would build a second search coroutine only to have the
+        coordinator close it again.
+        """
         coordinator = self._require_coordinator()
+        if task is None and task_dispatched:
+            return SearchExecution("capacity_rejected")
         if task is None:
             task = self._dispatch_search_task(
                 search,
@@ -2553,10 +2878,9 @@ class SessionHost:
                     delivery_disposition=delivery_disposition,
                     result_id=result_id,
                 )
-            derived = _work_status_for_outcome(
+            derived = _late_commit_work_status(
                 work_outcome,
-                cancelled=work_outcome == "cancelled",
-                committed=commit_outcome == "committed",
+                commit_outcome=commit_outcome,
                 terminal_kind=late.terminal_kind,
             )
             if derived is not None:
@@ -2791,24 +3115,28 @@ class SessionHost:
             terminal_reason=terminal_reason,
         )
 
-    def _cancel_child_work_statuses(
+    def _terminalize_child_work_statuses(
         self,
         *,
         turn_id: str,
         origin_epoch: int,
         children: Mapping[str, str | None],
+        state: WorkStatusState,
         parent_work_item_id: str | None = None,
+        terminal_reason: TerminalReason | None = None,
     ) -> None:
-        """Terminalize every still-non-terminal delegated child as ``cancelled``.
+        """Terminalize every still-non-terminal delegated child as ``state``.
 
-        A turn cancelled mid-flight would otherwise strand a capable client on
-        a non-terminal ``routing``/``searching`` record forever. ``children``
-        maps each delegated child's ``work_item_id`` to its worker id.
+        A turn that ends mid-flight -- cancelled *or* failed on an unexpected
+        exception after ``routing``/``searching`` was already emitted -- would
+        otherwise strand a capable client on a non-terminal record forever.
+        ``children`` maps each delegated child's ``work_item_id`` to its
+        worker id.
 
         Idempotent by construction, so callers do not have to track which
         children already settled: ``legal_work_status_transition`` rejects any
-        move out of a terminal child state, rejects ``cancelled`` as a
-        cold-start state (a child that never had a status is a no-op), and
+        move out of a terminal child state, rejects ``cancelled``/``failed`` as
+        cold-start states (a child that never had a status is a no-op), and
         ``_reaggregate_parent`` never regresses an already-terminal parent.
         """
         for work_item_id, worker_id in children.items():
@@ -2817,9 +3145,51 @@ class SessionHost:
                 work_item_id=work_item_id,
                 parent_work_item_id=parent_work_item_id,
                 worker_id=worker_id,
-                state="cancelled",
+                state=state,
                 origin_epoch=origin_epoch,
+                terminal_reason=terminal_reason,
             )
+
+    def _cancel_child_work_statuses(
+        self,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        children: Mapping[str, str | None],
+        parent_work_item_id: str | None = None,
+    ) -> None:
+        """Terminalize every still-non-terminal delegated child as ``cancelled``."""
+        self._terminalize_child_work_statuses(
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+            children=children,
+            state="cancelled",
+            parent_work_item_id=parent_work_item_id,
+        )
+
+    def _fail_child_work_statuses(
+        self,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        children: Mapping[str, str | None],
+        parent_work_item_id: str | None = None,
+    ) -> None:
+        """Terminalize every still-non-terminal delegated child as ``failed``.
+
+        Used by the turn handlers' generic exception path: an exception raised
+        after ``routing``/``searching`` was emitted (for example from
+        ``coordinator.submit``) previously finalized only telemetry, leaving
+        every registered child -- and therefore the parent -- permanently
+        non-terminal for a capable client.
+        """
+        self._terminalize_child_work_statuses(
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+            children=children,
+            state="failed",
+            parent_work_item_id=parent_work_item_id,
+        )
 
     def accepts(self, epoch: int | None) -> bool:
         return (

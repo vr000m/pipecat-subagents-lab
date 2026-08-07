@@ -467,6 +467,11 @@ def test_cancel_turn_or_child_removes_only_the_named_childs_speech_and_leaves_th
             result_id="result-1-1",
             text="child two",
         )
+        # Ack ownership and the sole-child decision are answered from the
+        # turn -> delegated-child registry, so this hand-built turn registers
+        # its children exactly as a real turn handler would.
+        host._register_turn_work_item("turn-1", "work-1-0")
+        host._register_turn_work_item("turn-1", "work-1-1")
 
         await host.cancel_turn_or_child("turn-1", "work-1-0")
 
