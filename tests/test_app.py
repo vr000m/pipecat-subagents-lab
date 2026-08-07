@@ -17,9 +17,10 @@ from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 from starlette.requests import Request as _StarletteRequest
 
 import server.app as app_module
+import server.observers as observers_module
 from server.app import _handshake_from_query, create_app
 from server.config import Config
-from server.contracts import GroundedResult, SnapshotHandshake
+from server.contracts import GroundedResult, SnapshotHandshake, WorkerState
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
 from server.router import LazyRouterProvider, Router
@@ -1367,6 +1368,167 @@ def test_concurrent_snapshot_requests_on_one_connection_are_serialized() -> None
         assert active_barriers == 0
         snapshot_frames = [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"]
         assert len(snapshot_frames) == 2
+
+    asyncio.run(run())
+
+
+class NeverAcknowledgingPipelineWorker(FrameCapturingPipelineWorker):
+    """Fake worker that drops the barrier frame instead of acknowledging it,
+    modelling a connection worker cancelled or replaced between the barrier
+    write and its drain."""
+
+    async def queue_frame(self, frame: object) -> None:
+        if callable(getattr(frame, "acknowledge", None)):
+            return
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_an_unacknowledged_barrier_does_not_leave_the_observer_paused_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the snapshot-request handler awaited `install_baseline`
+    with no timeout and no cleanup path, so a dropped barrier frame left the
+    observer paused with an unbounded buffer for the rest of the connection.
+    The install must time out, abort, and leave incremental delivery working.
+    """
+    monkeypatch.setattr(observers_module, "SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS", 0.01)
+
+    async def run() -> None:
+        NeverAcknowledgingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        inner = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                inner,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=NeverAcknowledgingPipelineWorker,
+            )
+        finally:
+            inner.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = NeverAcknowledgingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+        await worker.rtvi.handlers["on_client_message"](
+            worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+        )
+
+        assert runtime.observer._paused is False
+        assert runtime.observer._buffer == []
+        # A failed install must not put a snapshot on the wire.
+        assert [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"] == []
+
+        host.state.set_worker(
+            WorkerState(
+                worker_id="worker-after-failed-install",
+                topic="weather",
+                model_policy="deep",
+                status="idle",
+                origin_epoch=runtime.epoch,
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert [frame for frame in worker.frames if frame["kind"] == "worker"], (
+            "incremental delivery must survive an aborted snapshot install"
+        )
+
+    asyncio.run(run())
+
+
+class BarrierRacingPipelineWorker(FrameCapturingPipelineWorker):
+    """Fake worker that emits an authoritative state event at the moment the
+    barrier frame drains, so the event is buffered by the paused observer and
+    must be replayed strictly after the snapshot frame."""
+
+    emit_on_barrier: ClassVar[Callable[[], None] | None] = None
+
+    async def queue_frame(self, frame: object) -> None:
+        # The real PipelineWorker.queue_frame awaits its queue, so it yields
+        # to the loop. Model that: a replay task scheduled by resume() would
+        # otherwise never get to run before the caller's own next write.
+        await asyncio.sleep(0)
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            emit = type(self).emit_on_barrier
+            if emit is not None:
+                emit()
+            acknowledge()
+            return
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_the_snapshot_frame_is_queued_before_any_buffered_incremental() -> None:
+    """Regression: the handler queued the `runtime_snapshot` frame only after
+    `install_baseline` returned, so `resume()` could replay a buffered
+    incremental ahead of the snapshot that establishes the watermark the
+    client applies it against."""
+
+    async def run() -> None:
+        BarrierRacingPipelineWorker.constructed = []
+        BarrierRacingPipelineWorker.emit_on_barrier = None
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=BarrierRacingPipelineWorker,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = BarrierRacingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        def emit_while_paused() -> None:
+            host.state.set_worker(
+                WorkerState(
+                    worker_id="worker-raced-with-the-barrier",
+                    topic="weather",
+                    model_policy="deep",
+                    status="idle",
+                    origin_epoch=runtime.epoch,
+                )
+            )
+
+        # The structural assertion: the snapshot must already be on the wire
+        # at the moment the observer resumes, so no scheduling detail of the
+        # replay can put a buffered incremental ahead of it.
+        kinds_at_resume: list[str] = []
+        original_resume = runtime.observer.resume
+
+        def recording_resume(watermark: int | None = None) -> None:
+            kinds_at_resume.extend(frame["kind"] for frame in worker.frames)
+            original_resume(watermark)
+
+        runtime.observer.resume = recording_resume  # type: ignore[method-assign]
+
+        BarrierRacingPipelineWorker.emit_on_barrier = emit_while_paused
+        try:
+            await worker.rtvi.handlers["on_client_message"](
+                worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+            )
+        finally:
+            BarrierRacingPipelineWorker.emit_on_barrier = None
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert "runtime_snapshot" in kinds_at_resume, (
+            "the snapshot frame must be written before the buffer is replayed"
+        )
+        kinds = [frame["kind"] for frame in worker.frames]
+        assert "worker" in kinds
+        assert kinds.index("runtime_snapshot") < kinds.index("worker"), (
+            "the buffered incremental must be replayed after the snapshot frame"
+        )
 
     asyncio.run(run())
 

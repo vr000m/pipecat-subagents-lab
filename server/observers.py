@@ -29,6 +29,16 @@ _ALWAYS_VISIBLE_KINDS = frozenset(
 _CAPABILITY_GATED_KINDS = frozenset({"work_status"})
 _VISIBLE_KINDS = _ALWAYS_VISIBLE_KINDS | _CAPABILITY_GATED_KINDS
 
+# Upper bound on how long `SnapshotBarrier.install_baseline` waits for its
+# flush frame to be acknowledged. The plan requires the observer to own
+# "timeout/error completion" and to fail closed when the writer cannot
+# acknowledge: the frame only resolves its handle once it traverses the
+# connection pipeline, so a worker cancelled or replaced between the write
+# and the drain would otherwise never resolve it, leaving the observer
+# paused forever with an unbounded buffer and the caller's snapshot lock
+# held.
+SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass(frozen=True)
 class ProjectedEvent:
@@ -127,8 +137,15 @@ class RuntimeObserver:
         )
 
     def _deliver(self, event: StateEvent) -> None:
+        # The emitter check must precede project(): project() advances the
+        # connection-projected sequence as a side effect, so projecting an
+        # event that can never be emitted burns a sequence number and opens a
+        # permanent gap between this counter and the client's
+        # lastAppliedSequence.
+        if self._emit is None:
+            return
         projected = self.project(event)
-        if projected is None or self._emit is None:
+        if projected is None:
             return
         result = self._emit(projected)
         # A connection emitter is normally a coroutine scheduled by the
@@ -165,6 +182,13 @@ class RuntimeObserver:
             self._unsubscribe()
             self._unsubscribe = None
         self._emit = None
+        # Teardown while a SnapshotBarrier is open would otherwise leave the
+        # observer paused holding a buffer that can no longer be delivered
+        # (the emitter is gone). A later subscribe() re-attaches the raw
+        # listener but nothing resumes it, so the observer would stay mute
+        # for the rest of its life. Detaching clears the pause/buffer state.
+        self._paused = False
+        self._buffer.clear()
 
     def pause(self) -> None:
         """Buffer subsequent state events instead of projecting/emitting them.
@@ -243,12 +267,44 @@ class SnapshotBarrier:
         self.observer = observer
         self.state = state
         self._generation = 0
+        # True between subscribe_paused() and whichever settle path runs
+        # first. Makes cancel() idempotent so a caller that also cancels
+        # defensively in its own except/finally cannot replay a buffer twice
+        # or unpause a barrier it no longer owns.
+        self._open = False
 
     def subscribe_paused(self) -> None:
+        self._open = True
         self.observer.pause()
 
-    async def install_baseline(self, *, watermark: int, flush_writer: Callable[[Any], Any]) -> None:
-        """Write the barrier frame, await its delivery, then reseed and replay."""
+    async def install_baseline(
+        self,
+        *,
+        watermark: int,
+        flush_writer: Callable[[Any], Any],
+        snapshot_writer: Callable[[], Any] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Write the barrier frame, await its delivery, write the snapshot, replay.
+
+        Ordering contract, in this exact order:
+
+        1. push the barrier frame through the same serialized writer the
+           incrementals use;
+        2. wait (bounded by ``timeout``) for its acknowledgement, which proves
+           every incremental queued before the barrier has already drained
+           past the acknowledging processor;
+        3. call ``snapshot_writer`` -- the frame that actually establishes the
+           client's ``lastAppliedSequence`` watermark must be queued *before*
+           any buffered event is replayed, or a replayed event reaches the
+           client describing state it has no baseline to apply it against;
+        4. only then reseed the observer and replay the buffer.
+
+        Fails closed: any writer error, acknowledgement timeout, or
+        cancellation aborts the install via :meth:`cancel` (no watermark
+        change, buffer replayed) and re-raises, rather than leaving the
+        observer paused with a growing buffer forever.
+        """
         from .speech_lifecycle import SnapshotBarrierFlushFrame
 
         self._generation += 1
@@ -262,10 +318,26 @@ class SnapshotBarrier:
             token=f"{self.state.session_id}-{watermark}-{self._generation}",
             acknowledge=acknowledge,
         )
-        await flush_writer(frame)
-        await acked
+        wait_seconds = SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS if timeout is None else timeout
+        try:
+            await flush_writer(frame)
+            await asyncio.wait_for(acked, wait_seconds)
+            if snapshot_writer is not None:
+                await snapshot_writer()
+        except BaseException:
+            acked.cancel()
+            self.cancel()
+            raise
+        self._open = False
         self.observer.resume(watermark)
 
     def cancel(self) -> None:
-        """Abort a paused install without a watermark change (e.g. snapshot not ready)."""
+        """Abort a paused install without a watermark change (e.g. snapshot not ready).
+
+        Idempotent: only the first call after :meth:`subscribe_paused`
+        resumes the observer.
+        """
+        if not self._open:
+            return
+        self._open = False
         self.observer.resume(None)

@@ -232,6 +232,245 @@ class TestSnapshotBarrierOrdering:
         assert sequences == sorted(sequences)
         assert len(sequences) == len(set(sequences))
 
+    def test_a_never_acknowledged_barrier_times_out_and_aborts_the_install(self) -> None:
+        """Regression: `install_baseline` used to `await acked` unbounded. A
+        connection worker cancelled or replaced between the write and the
+        drain silently drops the barrier frame, so the future never resolves,
+        the observer stays paused forever, `_buffer` grows unbounded and the
+        caller's snapshot lock is never released. The wait must be bounded and
+        the failed install must degrade to an aborted install."""
+        delivered: list[object] = []
+
+        async def body() -> None:
+            state = SessionState(session_id="session-1")
+            state.active_epoch = 1
+            observer = RuntimeObserver(state, epoch=1)
+            barrier = SnapshotBarrier(observer=observer, state=state)
+            barrier.subscribe_paused()
+            observer.subscribe(delivered.append)
+
+            async def never_acknowledges(_frame: object) -> None:
+                return None
+
+            state.set_worker(
+                WorkerState(
+                    worker_id="worker-weather",
+                    topic="weather",
+                    model_policy="deep",
+                    status="idle",
+                    origin_epoch=1,
+                )
+            )
+            with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+                await barrier.install_baseline(
+                    watermark=state.sequence,
+                    flush_writer=never_acknowledges,
+                    timeout=0.01,
+                )
+            # Failing closed means the observer is usable again, not paused
+            # forever behind an undeliverable barrier.
+            assert observer._paused is False
+            assert observer._buffer == []
+            # A later event still reaches the client.
+            state.set_worker(
+                WorkerState(
+                    worker_id="worker-second",
+                    topic="weather",
+                    model_policy="deep",
+                    status="idle",
+                    origin_epoch=1,
+                )
+            )
+
+        run(body)
+
+        assert len(delivered) == 2
+
+    def test_a_cancelled_install_aborts_instead_of_leaving_the_observer_paused(self) -> None:
+        """Same defect via task cancellation rather than timeout."""
+
+        async def body() -> None:
+            state = SessionState(session_id="session-1")
+            state.active_epoch = 1
+            observer = RuntimeObserver(state, epoch=1)
+            barrier = SnapshotBarrier(observer=observer, state=state)
+            barrier.subscribe_paused()
+            observer.subscribe(lambda _event: None)
+
+            async def never_acknowledges(_frame: object) -> None:
+                return None
+
+            task = asyncio.create_task(
+                barrier.install_baseline(
+                    watermark=state.sequence,
+                    flush_writer=never_acknowledges,
+                    timeout=30.0,
+                )
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert observer._paused is False
+            assert observer._buffer == []
+
+        run(body)
+
+    def test_the_snapshot_frame_is_written_before_any_buffered_event_is_replayed(self) -> None:
+        """Regression: the caller queued the `runtime_snapshot` frame only
+        after `install_baseline` returned, so `resume()` could replay a
+        buffered event before the client had the snapshot state that event
+        must be applied against."""
+        order: list[str] = []
+
+        async def body() -> None:
+            state = SessionState(session_id="session-1")
+            state.active_epoch = 1
+            observer = RuntimeObserver(state, epoch=1)
+            barrier = SnapshotBarrier(observer=observer, state=state)
+            barrier.subscribe_paused()
+            observer.subscribe(lambda _event: order.append("incremental"))
+            watermark = state.sequence
+            state.set_worker(
+                WorkerState(
+                    worker_id="worker-weather",
+                    topic="weather",
+                    model_policy="deep",
+                    status="idle",
+                    origin_epoch=1,
+                )
+            )  # buffered above the watermark -- must be replayed after the snapshot
+
+            async def write_snapshot() -> None:
+                order.append("snapshot")
+
+            await barrier.install_baseline(
+                watermark=watermark,
+                flush_writer=self._fake_writer([]),
+                snapshot_writer=write_snapshot,
+            )
+
+        run(body)
+
+        assert order == ["snapshot", "incremental"]
+
+    def test_a_failing_snapshot_writer_aborts_the_install(self) -> None:
+        """The snapshot write is inside the barrier, so its failure must take
+        the same fail-closed path as a writer/ack failure."""
+
+        async def body() -> None:
+            state = SessionState(session_id="session-1")
+            state.active_epoch = 1
+            observer = RuntimeObserver(state, epoch=1)
+            barrier = SnapshotBarrier(observer=observer, state=state)
+            barrier.subscribe_paused()
+            observer.subscribe(lambda _event: None)
+
+            async def failing_snapshot() -> None:
+                raise RuntimeError("worker queue closed")
+
+            with pytest.raises(RuntimeError):
+                await barrier.install_baseline(
+                    watermark=state.sequence,
+                    flush_writer=self._fake_writer([]),
+                    snapshot_writer=failing_snapshot,
+                )
+            assert observer._paused is False
+            # The aborted install must not have installed the watermark.
+            assert observer.projected_sequence == 0
+
+        run(body)
+
+
+# --- teardown while a barrier is open --------------------------------------
+
+
+@pytest.mark.skipif(RuntimeObserver is None, reason="server.observers.RuntimeObserver missing")
+def test_unsubscribe_clears_pause_and_buffer_so_resubscribe_is_not_mute() -> None:
+    """Regression: `unsubscribe()` cleared `_unsubscribe`/`_emit` but left
+    `_paused=True` and a nonempty `_buffer` when teardown raced an open
+    `SnapshotBarrier`. A later `subscribe()` re-attached the listener but
+    nothing ever resumed it, so the observer was permanently mute."""
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    observer = RuntimeObserver(state, epoch=1)
+    observer.subscribe(lambda _event: None)
+    observer.pause()
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-weather",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+    assert observer._buffer, "precondition: the paused observer buffered the event"
+
+    observer.unsubscribe()
+    assert observer._paused is False
+    assert observer._buffer == []
+
+    delivered: list[object] = []
+    observer.subscribe(delivered.append)
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-second",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+    assert len(delivered) == 1, "a resubscribed observer must not stay mute"
+
+
+# --- emitter-less delivery must not burn a projected sequence --------------
+
+
+@pytest.mark.skipif(RuntimeObserver is None, reason="server.observers.RuntimeObserver missing")
+def test_an_event_with_no_emitter_does_not_burn_a_projected_sequence() -> None:
+    """Regression: `_deliver` called `project()` (which increments the
+    projected sequence) before checking `_emit is None`, so an event arriving
+    with no emitter attached opened a permanent gap between the server's
+    projected sequence and the client's last-applied sequence."""
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    observer = RuntimeObserver(state, epoch=1)
+    observer.seed(state.sequence)
+    # Attach the raw state listener without an emitter: pause() is the
+    # production path that does this (SnapshotBarrier.subscribe_paused).
+    observer.pause()
+    observer.resume(None)
+    assert observer._emit is None
+    watermark = observer.projected_sequence
+
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-weather",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+    assert observer.projected_sequence == watermark, (
+        "an event with no emitter must not advance the projected sequence"
+    )
+
+    delivered: list[object] = []
+    observer.subscribe(delivered.append)
+    state.set_worker(
+        WorkerState(
+            worker_id="worker-second",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+    )
+    assert delivered[0].sequence == watermark + 1  # type: ignore[attr-defined]
+
 
 # --- C1: snapshot install must re-seed the projected sequence -------------
 

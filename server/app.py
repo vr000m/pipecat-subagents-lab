@@ -440,16 +440,49 @@ async def _attach_connection(
                 # re-reads the sequence provider -- keeps the client's
                 # lastAppliedSequence and the observer's counter identical by
                 # construction, so the next incremental is snapshot_sequence + 1.
-                await barrier.install_baseline(
-                    watermark=snapshot.sequence, flush_writer=worker.queue_frame
-                )
+                #
                 # Non-capable projections omit the status section entirely
                 # (field absent, not an empty array) so the frozen
                 # pre-Phase-3 runtime-snapshot schema still validates this
                 # connection's snapshots (Requirements). The exclusion is
                 # owned by RuntimeSnapshot.wire_payload, not by this caller.
-                frame_data = snapshot.wire_payload(include_work_status=runtime.supports_work_status)
-                await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
+                # Read the entitlement off the observer, which is also what
+                # decides snapshot *content* (RuntimeObserver.snapshot() calls
+                # SessionState.snapshot(include_work_status=self.supports_work_status)).
+                # The content gate and this wire-presence gate are therefore
+                # provably one source, not two booleans kept in agreement by
+                # convention via ConnectionPipeline's proxy property.
+                frame_data = snapshot.wire_payload(
+                    include_work_status=runtime.observer.supports_work_status
+                )
+
+                async def write_snapshot() -> None:
+                    await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
+
+                # The snapshot frame is written *by* install_baseline, between
+                # the barrier acknowledgement and the buffered replay, so a
+                # buffered incremental can never reach the client ahead of the
+                # snapshot that establishes the watermark it applies against.
+                try:
+                    await barrier.install_baseline(
+                        watermark=snapshot.sequence,
+                        flush_writer=worker.queue_frame,
+                        snapshot_writer=write_snapshot,
+                    )
+                except asyncio.CancelledError:
+                    # Cancellation between the write and the drain (worker
+                    # replaced/torn down) must not leave the observer paused
+                    # with an unbounded buffer and this lock's invariant
+                    # silently broken.
+                    barrier.cancel()
+                    raise
+                except Exception:  # noqa: BLE001  # intentional catch-all: a failed snapshot install must never leave the observer paused
+                    barrier.cancel()
+                    _loguru_logger.warning(
+                        "snapshot barrier install failed; incremental delivery resumed "
+                        "without a new watermark"
+                    )
+                    return
 
         # WorkerRunner has no remove-workers API in the pinned wheel. Run each
         # connection worker through its real PipelineWorker lifecycle task so
