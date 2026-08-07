@@ -21,7 +21,6 @@ fakes -- is ``audibility_unverified`` and ``promotion_eligible=false``.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from pathlib import Path
@@ -30,7 +29,13 @@ from typing import Any
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _evidence_common import EvidenceGateError, closed_object, require_nonempty_str, require_type
+from _evidence_common import (
+    EvidenceGateError,
+    closed_object,
+    load_json,
+    require_nonempty_str,
+    require_type,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-transport-browser-contract.json"
@@ -192,12 +197,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        with args.input.open("r", encoding="utf-8") as handle:
-            record = json.load(handle)
+        record = load_json(args.input)
         if not isinstance(record, dict):
             raise EvidenceGateError("artifact must be a JSON object")
         validate_artifact(record)
-    except (EvidenceGateError, json.JSONDecodeError, OSError) as exc:
+    except EvidenceGateError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 
