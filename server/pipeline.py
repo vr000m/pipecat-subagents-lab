@@ -1730,6 +1730,11 @@ class SessionHost:
         # single progressive record instead of one per item.
         parent_work_item_id = f"work-{turn_id}"
         delegated_children: dict[str, str | None] = {}
+        # Captured before the first await below (route_envelope/_dispatch/
+        # _emit_early_ack per work item), which may span other turns being
+        # accepted concurrently: this is the turn-sequence snapshot
+        # LateDeliveryContext needs to detect a newer-turn arrival.
+        dispatch_turn_sequence = self._turn_sequence
         try:
             results: dict[int, Any] = {}
             runnable: list[tuple[str, str]] = []
@@ -1893,8 +1898,6 @@ class SessionHost:
                 for index in runnable_indexes
             }
             on_late_terminal = self._make_late_terminal_handler(retained_recorders)
-
-            dispatch_turn_sequence = self._turn_sequence
 
             def _multi_intent_late_context(late: LateResult) -> LateDeliveryContext:
                 return self._new_late_delivery_context(
