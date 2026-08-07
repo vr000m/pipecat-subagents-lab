@@ -102,6 +102,11 @@ and only alongside `failed`), and `origin_epoch`. Legal transitions are
 `routing -> searching|failed|cancelled`; `searching ->
 background|result_ready|failed|cancelled`; `background ->
 result_ready|failed|cancelled`; `result_ready|failed|cancelled` are terminal.
+A work item with no prior record may start cold at `routing`, `searching`,
+`background`, `result_ready`, or `failed` -- `failed` because a child can fail
+before it is ever routed (missing worker or missing search capability) and its
+parent must still terminalize -- but never at `cancelled`, so a blind
+whole-turn cancel sweep leaves a child that never started untouched.
 Parent aggregation over delegated children is exhaustive: `routing` while any
 child is routing; `searching` while any child is searching and none is
 routing; `background` while no child is active and at least one remains

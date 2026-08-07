@@ -123,6 +123,22 @@ def test_same_state_is_not_a_legal_transition() -> None:
         assert legal_work_status_transition(state, state) is False
 
 
+def test_cold_start_allows_failed_but_never_cancelled() -> None:
+    """The cold-start rule carries two production obligations at once.
+
+    `failed` must be cold-startable: server/pipeline.py records a
+    missing-worker / missing-search child straight at `failed` with no
+    preceding `routing`, and the parent join must still terminalize.
+    `cancelled` must NOT be, because SessionHost._cancel_child_work_statuses
+    sweeps the entire delegated child set blindly and relies on this
+    rejection to leave a never-started child untouched.
+    """
+    assert legal_work_status_transition(None, "failed") is True
+    assert legal_work_status_transition(None, "cancelled") is False
+    for state in ("routing", "searching", "background", "result_ready"):
+        assert legal_work_status_transition(None, state) is True
+
+
 # --- SessionState.set_child_work_status / parent join / ledger ------------
 
 
@@ -148,6 +164,52 @@ def test_single_delegated_child_creates_a_visible_parent_status() -> None:
     assert len(statuses) == 1
     assert statuses[0].state == "routing"
     assert statuses[0].work_item_id == "work-1"
+
+
+def test_cold_start_cancelled_is_rejected_and_leaves_no_ledger_residue() -> None:
+    """Regression: set_child_work_status only validated when a prior child
+    record existed, so `legal_work_status_transition(None, "cancelled")` --
+    the rule _cancel_child_work_statuses documents its idempotency on -- was
+    unreachable from production and a blind cancel sweep invented a
+    `cancelled` record for a child that never had a status.
+
+    Also asserts the three-dict lockstep invariant: a rejected record must
+    not leave a stray _work_status_children key behind.
+    """
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+
+    event = state.set_child_work_status(
+        turn_id="turn-1", work_item_id="never-started", state="cancelled", origin_epoch=1
+    )
+
+    assert event is None
+    assert state.work_status_snapshot() == ()
+    assert state._work_status_children == {}
+    assert state._work_status_parents == {}
+    assert state._work_status_sequence == {}
+
+
+def test_cold_start_failed_still_terminalizes_a_never_routed_child() -> None:
+    """The missing-worker / missing-search paths in server/pipeline.py record
+    `failed` with no preceding `routing`; that must remain legal or a capable
+    client is stranded with no parent status at all for the turn."""
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+
+    event = state.set_child_work_status(
+        turn_id="turn-1",
+        work_item_id="work-1",
+        state="failed",
+        origin_epoch=1,
+        terminal_reason="missing_worker",
+    )
+
+    assert event is not None
+    statuses = state.work_status_snapshot()
+    assert len(statuses) == 1
+    assert statuses[0].state == "failed"
+    assert statuses[0].terminal_reason == "missing_worker"
 
 
 def test_mixed_multi_intent_parent_aggregates_only_its_delegated_children() -> None:

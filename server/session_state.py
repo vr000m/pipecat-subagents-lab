@@ -311,12 +311,28 @@ class SessionState:
         cancelled (all-cancelled) which wins over result_ready (Requirements).
         """
         key = WorkStatusKey(origin_epoch, turn_id, parent_work_item_id or work_item_id)
-        children = self._work_status_children.setdefault(key, {})
-        previous_child = children.get(work_item_id)
-        if previous_child is not None and not legal_work_status_transition(
-            previous_child.state, state
+        # Validate before touching the ledger, and validate unconditionally.
+        # A missing prior record is a *cold start*, not "no rule to apply":
+        # legal_work_status_transition(None, ...) is what rejects inventing a
+        # child directly at `cancelled`, which is exactly the guarantee
+        # SessionHost._cancel_child_work_statuses documents for its blind
+        # whole-child-set sweep. Short-circuiting on `previous_child is not
+        # None` made that branch unreachable from every production caller.
+        # Nothing is inserted on the reject path either: a bare
+        # setdefault() would leave an empty children dict keyed without a
+        # matching _work_status_parents/_work_status_sequence entry, breaking
+        # the three-dict lockstep invariant documented in __init__.
+        existing_children = self._work_status_children.get(key)
+        previous_child = existing_children.get(work_item_id) if existing_children else None
+        if not legal_work_status_transition(
+            previous_child.state if previous_child is not None else None, state
         ):
             return None
+        children = (
+            existing_children
+            if existing_children is not None
+            else self._work_status_children.setdefault(key, {})
+        )
         children[work_item_id] = WorkStatus(
             turn_id=turn_id,
             work_item_id=work_item_id,
@@ -439,6 +455,25 @@ class SessionState:
             state._speech_history[progress.utterance_id] = [progress]
         state.routing = snapshot.routing
         state.transcript.extend(snapshot.transcript)
+        # Rehydrate the work-status ledger. The wire carries only the parent
+        # aggregate per WorkStatusKey (children are server-internal), so the
+        # children map stays empty and a later child record simply
+        # re-aggregates against the restored parent, which still cannot
+        # regress a terminal state. The per-key event_sequence MUST be
+        # restored too: restarting it at 1 would make every post-restore
+        # record look stale to the browser reducer and be dropped.
+        for status in snapshot.work_status:
+            key = WorkStatusKey(status.origin_epoch, status.turn_id, status.work_item_id or "")
+            state._work_status_children.setdefault(key, {})
+            state._work_status_sequence[key] = status.event_sequence
+            state._work_status_parents[key] = _WorkStatusRecord(
+                status=status,
+                # The original terminal instant is not on the wire (monotonic
+                # clocks are not comparable across processes anyway), so the
+                # five-minute TTL restarts from the restore point rather than
+                # being silently treated as already expired.
+                terminal_at=time.monotonic() if status.state in WORK_STATUS_TERMINAL else None,
+            )
         return state
 
     def snapshot(

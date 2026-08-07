@@ -152,8 +152,17 @@ function projectedWorkStatus(status) {
   };
 }
 
+// Mirrors the server's WorkStatusKey = (origin_epoch, turn_id, parent
+// work item) exactly. `origin_epoch` is part of the identity, not decoration:
+// `event_sequence` is allocated per that whole triple, so two server records
+// differing only by epoch each restart their sequence at 1. Keying without
+// the epoch collapses them into one entry, where the reducer's
+// `previous.event_sequence >= projected.event_sequence` staleness guard would
+// silently drop the newer-epoch record. Terminal records deliberately survive
+// reconnect carrying their historical origin_epoch, so cross-epoch collisions
+// on one turn_id are a supported case, not a corner case.
 function workStatusKey(status) {
-  return `${status.turn_id}::${status.work_item_id ?? ""}`;
+  return `${status.origin_epoch ?? ""}::${status.turn_id}::${status.work_item_id ?? ""}`;
 }
 
 function projectedSpeech(progress) {

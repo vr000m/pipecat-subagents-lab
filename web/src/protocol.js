@@ -1,6 +1,7 @@
 import { applyMessage, createInitialState } from "./state.js";
 import groundedResultSchema from "../../shared/schemas/grounded-result.json";
 import runtimeSnapshotSchema from "../../shared/schemas/runtime-snapshot.json";
+import workStatusSchema from "../../shared/schemas/work-status.json";
 
 export const CONTRACT_VERSION = "v1.0";
 // Capability name gating the `work_status` wire kind. Must match
@@ -25,6 +26,13 @@ const groundedResultKeys = Object.freeze(Object.keys(groundedResultSchema.proper
 const runtimeSnapshotKeys = Object.freeze(
   Object.keys(runtimeSnapshotSchema.properties).filter((key) => key !== "work_status"),
 );
+// shared/schemas/work-status.json lists every one of these as `required`, so
+// the browser check is symmetric (no extra keys AND no missing keys) rather
+// than extra-keys-only. `terminal_reason` and `origin_epoch` are nullable but
+// still mandatory on the wire -- the Python side always emits them as literal
+// null -- so treating an absent key as acceptable would have quietly diverged
+// from the schema.
+const workStatusKeys = Object.freeze(Object.keys(workStatusSchema.properties));
 const workStatusStates = new Set([
   "routing",
   "searching",
@@ -142,8 +150,7 @@ function validTranscript(value) {
 }
 
 function validWorkStatus(value) {
-  const keys = ["turn_id", "work_item_id", "worker_id", "state", "event_sequence", "terminal_reason", "origin_epoch"];
-  if (!value || typeof value !== "object" || Object.keys(value).some((key) => !keys.includes(key))) return false;
+  if (!hasExactKeys(value, workStatusKeys)) return false;
   const optionalString = (item) => item === null || typeof item === "string";
   if (typeof value.turn_id !== "string" || value.turn_id.length === 0) return false;
   if (!optionalString(value.work_item_id) || !optionalString(value.worker_id)) return false;
@@ -151,7 +158,7 @@ function validWorkStatus(value) {
   if (!Number.isInteger(value.event_sequence) || value.event_sequence < 0) return false;
   if (value.terminal_reason !== null && !["missing_worker", "retention_rejected"].includes(value.terminal_reason)) return false;
   if (value.terminal_reason !== null && value.state !== "failed") return false;
-  return Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
+  return validOrigin(value.origin_epoch);
 }
 
 export function validateServerMessage(message) {

@@ -402,7 +402,7 @@ const hasWorkStatusField = Object.hasOwn(createInitialState(), "workStatus");
 
 if (hasWorkStatusField) {
   describe("Phase 3 work_status reducer", () => {
-    test("an incremental work_status message updates state.workStatus keyed by work_item_id", () => {
+    test("an incremental work_status message updates state.workStatus keyed by (origin_epoch, turn_id, work_item_id)", () => {
       let state = createInitialState();
       state = applyServerMessage(state, snapshot(1));
       state = applyServerMessage(state, {
@@ -419,7 +419,46 @@ if (hasWorkStatusField) {
         },
       });
 
-      expect(state.workStatus?.["turn-1::work-1"]?.state).toBe("background");
+      expect(state.workStatus?.["1::turn-1::work-1"]?.state).toBe("background");
+    });
+
+    // Regression: the reducer key must carry origin_epoch, matching the
+    // server's WorkStatusKey = (origin_epoch, turn_id, parent work item).
+    // event_sequence is allocated per that triple and restarts at 1 for a new
+    // epoch, so an epoch-less key collapsed the two records into one and the
+    // staleness guard dropped the newer epoch's record.
+    test("two records differing only by origin_epoch do not collide in the reducer", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, {
+        ...snapshot(1),
+        data: {
+          ...snapshot(1).data,
+          work_status: [
+            {
+              turn_id: "turn-1",
+              work_item_id: "work-1",
+              worker_id: null,
+              state: "result_ready",
+              event_sequence: 4,
+              terminal_reason: null,
+              origin_epoch: 1,
+            },
+            {
+              turn_id: "turn-1",
+              work_item_id: "work-1",
+              worker_id: null,
+              state: "searching",
+              event_sequence: 1,
+              terminal_reason: null,
+              origin_epoch: 2,
+            },
+          ],
+        },
+      });
+
+      expect(Object.keys(state.workStatus).length).toBe(2);
+      expect(state.workStatus["1::turn-1::work-1"].state).toBe("result_ready");
+      expect(state.workStatus["2::turn-1::work-1"].state).toBe("searching");
     });
 
     test("a snapshot embeds a cross-epoch terminal work_status without adopting the envelope epoch", () => {
@@ -441,7 +480,7 @@ if (hasWorkStatusField) {
       };
       state = applyServerMessage(state, withStatus);
 
-      const preserved = state.workStatus?.["turn-1::work-1"];
+      const preserved = state.workStatus?.["1::turn-1::work-1"];
       expect(preserved?.origin_epoch).toBe(1);
     });
   });

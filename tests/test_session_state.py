@@ -282,6 +282,45 @@ def test_snapshot_round_trip_rebuilds_worker_result_history_and_delivery_project
     assert restored.speech["utt-2"].state == DeliveryState.INTERRUPTED_BY_RECONNECT
 
 
+@pytest.mark.skipif(
+    not hasattr(SessionState, "set_child_work_status"),
+    reason="SessionState.set_child_work_status is not implemented yet",
+)
+def test_snapshot_round_trip_rebuilds_the_work_status_ledger_and_its_sequences() -> None:
+    """Regression: snapshot(include_work_status=True) serialized the ledger
+    but from_snapshot dropped it entirely, so a reconnect/state round trip
+    lost every work-status record and restarted per-key event_sequence at 1 --
+    which the browser reducer then rejects as stale against the record it
+    already holds."""
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-1", state="routing", origin_epoch=1
+    )
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-1", state="searching", origin_epoch=1
+    )
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-1", state="result_ready", origin_epoch=1
+    )
+    original = state.work_status_snapshot()
+    assert len(original) == 1
+    assert original[0].state == "result_ready"
+    assert original[0].event_sequence == 3
+
+    restored = SessionState.from_snapshot(state.snapshot(origin_epoch=2, include_work_status=True))
+
+    rehydrated = restored.work_status_snapshot()
+    assert [item.model_dump() for item in rehydrated] == [item.model_dump() for item in original], (
+        "terminal record, its historical origin_epoch, and its event_sequence must survive"
+    )
+    # The per-key counter continues from the restored value rather than
+    # restarting: a later record for the same key must outrank the one the
+    # client already applied.
+    key = WorkStatusKey(origin_epoch=1, turn_id="turn-1", parent_key="work-1")
+    assert restored._work_status_sequence[key] == 3
+
+
 # --- Phase 3: WorkStatusKey identity and independent sequence ownership ----
 
 

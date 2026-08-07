@@ -13,6 +13,9 @@ const packageSource = JSON.parse(readFileSync(new URL("../package.json", import.
 const messageSchema = JSON.parse(
   readFileSync(new URL("../../shared/schemas/rtvi-message.json", import.meta.url), "utf8"),
 );
+const workStatusSchema = JSON.parse(
+  readFileSync(new URL("../../shared/schemas/work-status.json", import.meta.url), "utf8"),
+);
 const result = (resultId, originEpoch = 1) => {
   const citations = [{ title: "Source", url: "https://example.com/source" }];
   return {
@@ -536,6 +539,36 @@ test("validateServerMessage rejects a work_status payload carrying word-level pr
     origin_epoch: 1,
   };
   expect(validateServerMessage(message)).toBe(false);
+});
+
+// Regression: validWorkStatus rolled its own extra-keys-only check, so a
+// payload that simply omitted a key was judged against per-field rules that
+// disagreed with it -- an absent `terminal_reason` was rejected (undefined
+// !== null) while the key check had treated the key as optional. The wire
+// schema settles it: shared/schemas/work-status.json lists all seven keys as
+// `required`, nullable or not, so the check is now symmetric and the
+// per-field null tests are consistent with it.
+test("work_status key presence matches shared/schemas/work-status.json exactly", () => {
+  const envelope = (data) => ({
+    contract_version: "v1.0",
+    session_id: "session-1",
+    sequence: 1,
+    kind: "work_status",
+    data,
+    origin_epoch: 1,
+  });
+  const required = workStatusSchema.required;
+  expect(required).toEqual(Object.keys(workStatusSchema.properties));
+
+  // Every nullable-but-required key present as an explicit null is accepted.
+  expect(validateServerMessage(envelope(workStatus()))).toBe(true);
+
+  // Dropping any required key is rejected, including the nullable ones.
+  for (const key of required) {
+    const partial = workStatus();
+    delete partial[key];
+    expect(validateServerMessage(envelope(partial))).toBe(false);
+  }
 });
 
 test("validateServerMessage rejects work_status using the WorkItemEvent-reserved started/progress states", () => {
