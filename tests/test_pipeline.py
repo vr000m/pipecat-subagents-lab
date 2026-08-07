@@ -3754,6 +3754,76 @@ def test_pending_search_submit_exception_still_emits_failed_parent() -> None:
     asyncio.run(run())
 
 
+def test_multi_intent_commit_failure_does_not_drop_sibling_results() -> None:
+    """A commit/speak failure on one item must not abort processing of the
+    remaining fanned-out items in the same multi-intent turn: each item's
+    state is already durably committed by ``_commit_and_speak`` before it can
+    raise, so aborting the loop early would silently discard an
+    already-completed sibling result.
+    """
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(_text: str, _catalogue: object) -> object:
+                decision = type("Decision", (), {"action": "existing_worker"})()
+                return type("Envelope", (), {"decision": decision, "prose": None})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                return worker
+
+        sink = CollectingMeasurementSink()
+        coordinator = Coordinator()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=coordinator, measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome", (), {"work_items": ("first item", "second item"), "pending_dialogue": None}
+        )()
+
+        attempted: list[object] = []
+
+        async def flaky_commit_and_speak(
+            result: object, *_args: object, **_kwargs: object
+        ) -> object:
+            attempted.append(result)
+            if len(attempted) == 1:
+                raise RuntimeError("commit exploded")
+            return result
+
+        host._commit_and_speak = flaky_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit exploded"):
+            await host._handle_multi_intent(
+                outcome,
+                "",
+                origin,
+                "turn-multi-commit-partial-fail",
+                host._new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-multi-commit-partial-fail"
+                ),
+            )
+
+        assert len(attempted) == 2
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_multi_intent_commit_exception_still_emits_failed_parent() -> None:
     """``_handle_multi_intent`` must finalize ``app_turn_foreground`` as
     ``failed`` even when ``_commit_and_speak`` raises after work items have

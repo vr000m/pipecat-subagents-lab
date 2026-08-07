@@ -2064,12 +2064,28 @@ class SessionHost:
                     )
             origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
             committed = []
+            commit_exceptions: list[Exception] = []
             for index in sorted(results):
-                committed.append(
-                    await self._commit_and_speak(
-                        results[index], origin, role=speech_roles.get(index, ROLE_RESULT)
+                # _commit_and_speak durably commits state before it ever
+                # attempts to speak, so a speak-time failure on one item must
+                # not abort the loop and drop already-computed sibling
+                # results; each item is isolated and the first failure is
+                # re-raised only after every item has been committed.
+                try:
+                    committed.append(
+                        await self._commit_and_speak(
+                            results[index], origin, role=speech_roles.get(index, ROLE_RESULT)
+                        )
                     )
-                )
+                except Exception as exc:  # noqa: BLE001  # isolate one item's speak failure from its siblings; re-raised below once all items are committed
+                    logger.exception(
+                        f"multi-intent commit for {turn_id}: item {index} failed after its "
+                        f"state was already committed; continuing with remaining items"
+                    )
+                    committed.append(results[index])
+                    commit_exceptions.append(exc)
+            if commit_exceptions:
+                raise commit_exceptions[0]
             turn_recorder.finalize()
             return tuple(committed)
         except asyncio.CancelledError:
