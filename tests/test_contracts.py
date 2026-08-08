@@ -23,6 +23,7 @@ from server.contracts import (
     WorkItemEvent,
     WorkItemState,
     WorkStatus,
+    resolve_work_status_wire_presence,
     validate_contract,
 )
 from server.contracts import WORK_STATUS_STATES as _IMPL_WORK_STATUS_STATES
@@ -616,3 +617,23 @@ def test_work_status_capability_constant_matches_the_browser_constant() -> None:
 
     assert match is not None
     assert WORK_STATUS_V1 == match.group(1)
+
+
+def test_resolve_work_status_wire_presence_is_the_single_capability_gate() -> None:
+    """`resolve_work_status_wire_presence` must be the sole capability-gate
+    implementation: both `RuntimeObserver.supports_work_status` and the
+    app.py snapshot-reseed call site must call it by name rather than
+    independently re-testing `WORK_STATUS_V1 in capabilities`."""
+    import inspect
+
+    import server.app as app_module
+    import server.observers as observers_module
+
+    assert resolve_work_status_wire_presence(frozenset({"work_status_v1"})) is True
+    assert resolve_work_status_wire_presence(frozenset()) is False
+
+    observer_source = inspect.getsource(observers_module.RuntimeObserver.supports_work_status.fget)
+    assert "resolve_work_status_wire_presence" in observer_source
+
+    app_source = inspect.getsource(app_module)
+    assert "resolve_work_status_wire_presence" in app_source

@@ -1134,3 +1134,27 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def test_late_result_disposition_reads_only_the_cached_promotion_eligible_boolean() -> None:
+    """`_late_result_disposition` must consult the boolean cached at
+    construction time (`self._promotion_eligible`), never re-derive it from
+    `self._promotion_manifest` at call time. Mutating `_promotion_manifest`
+    to None after construction -- without touching the cached boolean --
+    must not flip the disposition to display-only."""
+
+    async def run() -> None:
+        from server.config import PromotionManifest
+
+        host, origin = await _connected_host(
+            promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
+        )
+        context = _late_delivery_context(host)
+
+        host._promotion_manifest = None
+
+        disposition = host._late_result_disposition(context, origin=origin)
+        assert disposition == "autoplay"
+        await host.shutdown()
+
+    asyncio.run(run())

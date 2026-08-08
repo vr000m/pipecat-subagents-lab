@@ -531,6 +531,9 @@ class SessionHost:
         # exactly like a manifest that failed to load -- fail-closed to
         # display-only, never a boot-time error.
         self._promotion_manifest = promotion_manifest
+        self._promotion_eligible: bool = bool(
+            promotion_manifest is not None and promotion_manifest.promotion_eligible
+        )
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
         self.coordinator = coordinator
@@ -2614,8 +2617,7 @@ class SessionHost:
         """
         if not self.feature_policy.enable_autoplay_policy:
             return "autoplay"
-        manifest = self._promotion_manifest
-        if manifest is None or not manifest.promotion_eligible:
+        if not self._promotion_eligible:
             return "display_only"
         if context.origin_epoch != origin.epoch:
             return "display_only"

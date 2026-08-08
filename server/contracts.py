@@ -264,6 +264,18 @@ class InterruptionEvent(StrictModel):
 # wire kind. The browser mirrors it in `web/src/protocol.js`; the two literals
 # must agree exactly (asserted in tests/test_contracts.py).
 WORK_STATUS_V1 = "work_status_v1"
+
+
+def resolve_work_status_wire_presence(capabilities: frozenset[str]) -> bool:
+    """Single source for the work_status capability gate.
+
+    Both snapshot *content* (SessionState.snapshot(include_work_status=...))
+    and *wire presence* (RuntimeSnapshot.wire_payload(include_work_status=...))
+    must call this instead of independently testing WORK_STATUS_V1 membership.
+    """
+    return WORK_STATUS_V1 in capabilities
+
+
 WORK_STATUS_STATES = (
     "routing",
     "searching",

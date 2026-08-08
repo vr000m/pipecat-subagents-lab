@@ -36,7 +36,7 @@ from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config, load_promotion_manifest
-from .contracts import CONTRACT_VERSION, SnapshotHandshake
+from .contracts import CONTRACT_VERSION, SnapshotHandshake, resolve_work_status_wire_presence
 from .observers import ProjectedEvent, SnapshotBarrier
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
@@ -453,7 +453,9 @@ async def _attach_connection(
                 # provably one source, not two booleans kept in agreement by
                 # convention via ConnectionPipeline's proxy property.
                 frame_data = snapshot.wire_payload(
-                    include_work_status=runtime.observer.supports_work_status
+                    include_work_status=resolve_work_status_wire_presence(
+                        runtime.observer.capabilities
+                    )
                 )
 
                 async def write_snapshot() -> None:
