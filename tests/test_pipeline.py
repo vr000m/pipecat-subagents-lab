@@ -466,7 +466,15 @@ def test_output_teardown_must_finish_before_lifecycle_slot_is_released() -> None
         cleanup = asyncio.create_task(lifecycle.provider_error(token))
         await teardown_started.wait()
 
-        assert lifecycle.occupied is True
+        held = lifecycle.generation_for_token(token)
+        assert held is not None
+        assert lifecycle.slot_token == token, (
+            "the admitted generation's token must still be the sole slot occupant "
+            "while its teardown is in flight"
+        )
+        assert held.tombstoned is True
+        assert held.teardown_pending is True
+        # Corroborating, non-authoritative mirrors.
         assert connection.scheduler.active is not None
         assert connection.active is False
         assert await connection.scheduler.start_next() is None
@@ -474,7 +482,12 @@ def test_output_teardown_must_finish_before_lifecycle_slot_is_released() -> None
         allow_teardown.set()
         await cleanup
 
-        assert lifecycle.occupied is False
+        assert lifecycle.generation_for_token(token) is None, (
+            "the terminalized generation must be reaped once teardown completes"
+        )
+        assert lifecycle.slot_token is None, (
+            "the token oracle must show the slot released, not merely a mirror flag"
+        )
         assert connection.scheduler.active is None
         assert [frame.text for frame in worker.frames if isinstance(frame, TTSSpeakFrame)] == [
             "Active answer"
@@ -576,15 +589,29 @@ def test_interruption_terminal_barrier_starts_queued_speech_only_after_release(
             connection.scheduler.cancel("work-active")
         await connection.scheduler.wait_for_stops()
         assert connection.scheduler.active is None
-        assert lifecycle.occupied is True
+        held = lifecycle.generation_for_token(token)
+        assert held is not None
+        assert lifecycle.slot_token == token, (
+            "the interrupted generation's token must still be the sole slot "
+            "occupant before the terminal barrier runs"
+        )
+        assert held.tombstoned is True
 
         terminal = lifecycle.on_transport_bot_stopped()
         assert terminal is not None
         await terminal
 
-        assert lifecycle.occupied is True
+        assert lifecycle.generation_for_token(token) is None, (
+            "the interrupted generation must be reaped once terminalized"
+        )
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.work_item_id == "work-queued"
+        queued_token = connection.scheduler.active.token
+        assert queued_token != token
+        assert lifecycle.slot_token == queued_token, (
+            "the token oracle must show the queued generation as the new sole "
+            "slot occupant, not merely the scheduler mirror"
+        )
         assert [frame.text for frame in worker.frames if isinstance(frame, TTSSpeakFrame)] == [
             "Active answer",
             "Queued answer",
