@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import statistics
 import sys
@@ -26,12 +27,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._evidence_common import EvidenceGateError, EvidenceStatus, load_jsonl
-from scripts.run_query_context_experiment import scorer_hash, validate_raw_record
+from scripts._evidence_common import (
+    MIN_PAIRED_SAMPLES_PER_CELL,
+    EvidenceGateError,
+    EvidenceStatus,
+    FixtureIndex,
+    load_jsonl,
+    validate_against_fixture,
+)
+from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1.json"
 
 BOOTSTRAP_ITERATIONS = 10_000
 BOOTSTRAP_SEED = 0
-MIN_PAIRED_SAMPLES_PER_CELL = 30
 PROMOTION_MEDIAN_IMPROVEMENT = 0.10
 PROMOTION_BOOTSTRAP_LOWER_BOUND = 0.05
 QUALITY_FLOOR = 0.90
@@ -107,23 +117,27 @@ def _median(values: list[float]) -> float:
     return statistics.median(values)
 
 
-def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
+def build_analysis(records: list[dict[str, Any]], *, fixture_index: FixtureIndex) -> dict[str, Any]:
     """Apply the full Phase 4B promotion rubric to a clean set of raw records.
 
     Raises ``EvidenceGateError`` for input-contract violations (missing
     dimensions, forbidden/unknown fields, duplicate or unpaired fixture-turn
     identities, mixed fixture/scorer versions, mixed selected dimensions, a
-    scorer_hash that does not bind its own record). Returns a terminal result
-    dict for every other outcome, including halts required by named
+    scorer_hash that does not bind its own record, or matched IDs/quality_score
+    that do not resolve against the versioned fixture). Returns a terminal
+    result dict for every other outcome, including halts required by named
     assumptions (a)-(d).
 
-    Re-validates every record against the strict raw allowlist even though
-    ``collect_query_context_latency.py`` already did so: the analyzer must
-    not silently trust its input file's provenance, since nothing prevents a
-    hand-edited or externally produced JSONL from reaching this script. The
-    key-set check alone was not enough -- wrong numeric types, negative
-    values, and invalid enums passed straight through into the statistics --
-    so this runs the same full type/range validator the collector uses.
+    Re-validates every record against the strict raw allowlist and the
+    versioned fixture even though ``collect_query_context_latency.py``
+    already did so: the analyzer must not silently trust its input file's
+    provenance, since nothing prevents a hand-edited or externally produced
+    JSONL from reaching this script. The key-set check alone was not enough
+    -- wrong numeric types, negative values, invalid enums, and invented
+    fixture IDs (with a correctly self-recomputed ``scorer_hash``, which
+    proves only internal consistency, not forgery-resistance) all passed
+    straight through into the statistics -- so this runs the same full
+    type/range validator and fixture-binding check the collector uses.
     """
     for index, record in enumerate(records):
         where = f"record {index}"
@@ -145,8 +159,15 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
         if record["scorer_hash"] != expected_scorer_hash:
             raise EvidenceGateError(
                 f"{where}: scorer_hash does not match its record's matched IDs/quality_score "
-                "-- forged, edited, or mismatched scorer provenance"
+                "-- internally inconsistent scorer provenance"
             )
+        # A keyless self-hash proves only that scorer_hash agrees with the
+        # record's OWN fields -- it cannot detect an editor who invents
+        # unknown fixture IDs and recomputes the hash from those fabricated
+        # values. Every match ID and the quality_score are therefore also
+        # resolved against the versioned fixture, exactly as the collector
+        # already does before it ever writes this script's input.
+        validate_against_fixture(record, index=fixture_index, where=where)
 
     fixture_versions = {r["fixture_version"] for r in records}
     if len(fixture_versions) > 1:
@@ -319,7 +340,12 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
             resample_medians.append(_median(resample))
         bootstrap_overall_medians.append(_median(resample_medians))
     bootstrap_overall_medians.sort()
-    lower_bound_index = int(0.05 * BOOTSTRAP_ITERATIONS)
+    # `int(0.05 * N)` truncates towards zero, so for N=10_000 it picked index
+    # 500 -- the 501st order statistic, one past the true 5th-percentile
+    # index -- biasing the lower bound slightly toward easier promotion.
+    # `ceil(0.05 * N) - 1` is the correct (0-indexed) percentile-index
+    # formula; `max(0, ...)` guards a degenerate N where the ceiling is 0.
+    lower_bound_index = max(0, math.ceil(0.05 * BOOTSTRAP_ITERATIONS) - 1)
     bootstrap_lower_bound = bootstrap_overall_medians[lower_bound_index]
 
     # Quality gating already happened per-stratum above (halts with
@@ -352,29 +378,50 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
 
-def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
+def analyze(
+    records: list[dict[str, Any]], *, fixture_path: Path = DEFAULT_FIXTURE_PATH
+) -> dict[str, Any]:
     if len(records) == 1 and "status" in records[0] and "quality_score" not in records[0]:
         status_record = records[0]
+        status = status_record["status"]
+        if status not in {member.value for member in EvidenceStatus}:
+            raise EvidenceGateError(f"status record: invalid status {status!r}")
+        reason = status_record.get("reason")
+        if reason is not None and (not isinstance(reason, str) or not reason or len(reason) > 200):
+            raise EvidenceGateError(
+                "status record: reason must be null or a bounded non-empty string"
+            )
         return _terminal(
-            status=status_record["status"],
-            reason=status_record.get("reason"),
+            status=status,
+            reason=reason,
             promotion_eligible=False,
             analysis=None,
         )
     if not records:
         return _terminal(status=EvidenceStatus.NOT_RUN.value, reason="no_paid_samples")
-    return build_analysis(records)
+    fixture_index = FixtureIndex(load_fixture(fixture_path))
+    return build_analysis(records, fixture_index=fixture_index)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=DEFAULT_FIXTURE_PATH,
+        help=(
+            "Versioned quality fixture every record's match IDs and quality_score are "
+            "resolved against. Defaults to the committed Phase 4A fixture, matching "
+            "collect_query_context_latency.py's default."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
         records = load_jsonl(args.input)
-        result = analyze(records)
+        result = analyze(records, fixture_path=args.fixture)
     except (EvidenceGateError, OSError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

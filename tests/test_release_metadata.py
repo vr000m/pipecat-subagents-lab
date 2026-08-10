@@ -33,14 +33,12 @@ in this test.
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT_PATH = REPO_ROOT / "scripts" / "check_release_metadata.py"
 
 VALID_PYPROJECT = """\
 [project]
@@ -63,13 +61,9 @@ VALID_CHANGELOG = """\
 
 
 def _load_script() -> Any:
-    if not SCRIPT_PATH.exists():
-        pytest.skip(f"{SCRIPT_PATH} not yet implemented (Phase 4 concurrent implementer)")
-    spec = importlib.util.spec_from_file_location("check_release_metadata", SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    import scripts.check_release_metadata
+
+    return scripts.check_release_metadata
 
 
 def _write_pair(

@@ -41,7 +41,6 @@ conductor's fix cycle, not a mistake in this file.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -49,41 +48,25 @@ from typing import Any
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER_PATH = REPO_ROOT / "scripts" / "run_query_context_experiment.py"
-COLLECTOR_PATH = REPO_ROOT / "scripts" / "collect_query_context_latency.py"
-ANALYZER_PATH = REPO_ROOT / "scripts" / "analyze_query_context_latency.py"
-EVIDENCE_COMMON_PATH = REPO_ROOT / "scripts" / "_evidence_common.py"
 REAL_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1.json"
 
 
-def _load(path: Path, name: str) -> Any:
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def _evidence_common() -> Any:
-    return _load(EVIDENCE_COMMON_PATH, "_evidence_common_qcl")
+    from scripts import _evidence_common
+
+    return _evidence_common
 
 
 def _runner() -> Any:
-    if not RUNNER_PATH.exists():
-        pytest.skip(f"{RUNNER_PATH} not yet implemented (Phase 4 concurrent implementer)")
-    return _load(RUNNER_PATH, "run_query_context_experiment")
+    return pytest.importorskip("scripts.run_query_context_experiment")
 
 
 def _collector() -> Any:
-    if not COLLECTOR_PATH.exists():
-        pytest.skip(f"{COLLECTOR_PATH} not yet implemented (Phase 4 concurrent implementer)")
-    return _load(COLLECTOR_PATH, "collect_query_context_latency")
+    return pytest.importorskip("scripts.collect_query_context_latency")
 
 
 def _analyzer() -> Any:
-    if not ANALYZER_PATH.exists():
-        pytest.skip(f"{ANALYZER_PATH} not yet implemented (Phase 4 concurrent implementer)")
-    return _load(ANALYZER_PATH, "analyze_query_context_latency")
+    return pytest.importorskip("scripts.analyze_query_context_latency")
 
 
 def _fixture_path() -> Path:
@@ -357,6 +340,20 @@ def test_runner_scorer_clamps_score_to_zero_when_disallowed_claims_exceed_matche
 
 COLLECTOR_FIXTURE_VERSION = "qcl-test-v1"
 
+# The analyzer's promotion-threshold tests need quality_score values at finer
+# granularity (e.g. 0.945, 0.92) than the 2-item fact/citation turns below can
+# express (only 0.0/0.5/1.0 are reachable with a denominator of 2). These
+# "pquality-*" turns are dedicated to that use (see `_paired_cells`) and use a
+# disjoint turn-id namespace so they never collide with the fact-1/cite-1
+# turns other tests (and the collector's own tests) rely on.
+ANALYZER_QUALITY_FACT_COUNT = 1000
+ANALYZER_QUALITY_TURN_COUNT = 100
+
+
+def _quality_matched_fact_ids(quality: float) -> list[str]:
+    matched = round(quality * ANALYZER_QUALITY_FACT_COUNT)
+    return [f"qfact-{k}" for k in range(matched)]
+
 
 def _collector_fixture(tmp_path: Path) -> Path:
     path = tmp_path / "collector-fixture.json"
@@ -375,6 +372,20 @@ def _collector_fixture(tmp_path: Path) -> Path:
                     "disallowed_claims": [{"id": "claim-1", "match_pattern": "zeta"}],
                 }
                 for i in range(64)
+            ]
+            + [
+                {
+                    "turn_id": f"pquality-{i}",
+                    "query": "q",
+                    "prior_queries": [],
+                    "required_facts": [
+                        {"id": f"qfact-{k}", "match_pattern": f"qfact-{k}-pattern"}
+                        for k in range(ANALYZER_QUALITY_FACT_COUNT)
+                    ],
+                    "expected_citations": [],
+                    "disallowed_claims": [],
+                }
+                for i in range(ANALYZER_QUALITY_TURN_COUNT)
             ],
         }
         path.write_text(json.dumps(fixture), encoding="utf-8")
@@ -382,6 +393,23 @@ def _collector_fixture(tmp_path: Path) -> Path:
 
 
 def _collector_argv(input_path: Path, output: Path, tmp_path: Path) -> list[str]:
+    return [
+        "--input",
+        str(input_path),
+        "--output",
+        str(output),
+        "--fixture",
+        str(_collector_fixture(tmp_path)),
+    ]
+
+
+def _analyzer_argv(input_path: Path, output: Path, tmp_path: Path) -> list[str]:
+    """The analyzer now resolves match IDs/quality_score against a versioned
+    fixture too (matching the collector's forgery gate), so every analyzer
+    ``main()`` invocation in this module needs a ``--fixture`` pointing at a
+    fixture whose turns/IDs match ``_valid_raw_record``/``_paired_cells``.
+    ``_collector_fixture`` already builds exactly that shape (64 turns,
+    fact-1/cite-1/claim-1), so it is reused here rather than duplicated."""
     return [
         "--input",
         str(input_path),
@@ -596,12 +624,47 @@ def test_analyzer_passes_through_a_collector_blocked_status_record(tmp_path: Pat
     }
     input_path = _analysis_input(tmp_path, [status_record])
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["status"] == common.EvidenceStatus.BLOCKED.value
     assert result["reason"] == "undersized_cell"
     assert result["promotion_eligible"] is False
     assert result["analysis"] is None
+
+
+def test_analyzer_rejects_a_status_record_with_an_out_of_vocabulary_status(tmp_path: Path) -> None:
+    """Regression: the single-status-record passthrough copied
+    ``status``/``reason`` verbatim from input with no validation against the
+    closed ``EvidenceStatus`` vocabulary, so a forged status value would have
+    reached a manifest reader unfiltered."""
+    module = _analyzer()
+    status_record = {
+        "status": "not_a_real_status",
+        "reason": "made up",
+        "promotion_eligible": False,
+        "record_count": 1,
+        "generated_at_utc": "2026-08-05T00:00:00Z",
+    }
+    input_path = _analysis_input(tmp_path, [status_record])
+    output = tmp_path / "analysis.json"
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
+    assert exit_code != 0
+
+
+def test_analyzer_rejects_a_status_record_with_an_empty_string_reason(tmp_path: Path) -> None:
+    module = _analyzer()
+    common = _evidence_common()
+    status_record = {
+        "status": common.EvidenceStatus.BLOCKED.value,
+        "reason": "",
+        "promotion_eligible": False,
+        "record_count": 1,
+        "generated_at_utc": "2026-08-05T00:00:00Z",
+    }
+    input_path = _analysis_input(tmp_path, [status_record])
+    output = tmp_path / "analysis.json"
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
+    assert exit_code != 0
 
 
 def test_analyzer_reports_blocked_undersized_cell_below_30_paired_samples(tmp_path: Path) -> None:
@@ -623,7 +686,7 @@ def test_analyzer_reports_blocked_undersized_cell_below_30_paired_samples(tmp_pa
     ]
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["status"] == common.EvidenceStatus.BLOCKED.value
     assert result["reason"] == "undersized_cell"
@@ -659,7 +722,7 @@ def test_analyzer_reports_blocked_provider_effect_uncontrolled_when_no_stratum_e
     ]
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["status"] == common.EvidenceStatus.BLOCKED.value
     assert result["reason"] == "provider_effect_uncontrolled"
@@ -703,7 +766,7 @@ def test_analyzer_excludes_contaminated_samples_leaving_a_stratum_undersized(
     )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     # Only 20 clean baseline records exist (the 15 retry-contaminated ones
     # are excluded), so even though 35 narrowed records exist, pairing tops
@@ -720,8 +783,9 @@ def _paired_cells(
     quality: float = 0.95,
 ) -> list[dict[str, Any]]:
     records = []
+    matched_fact_ids = _quality_matched_fact_ids(quality)
     for i in range(n):
-        turn_id = f"turn-{i}"
+        turn_id = f"pquality-{i}"
         records.append(
             _valid_raw_record(
                 run_id=f"run-base-{i}",
@@ -730,6 +794,8 @@ def _paired_cells(
                 latency_ms=baseline_latency,
                 quality_score=quality,
                 context_chars=1000 + i,
+                matched_fact_ids=matched_fact_ids,
+                matched_citation_ids=[],
             )
         )
         records.append(
@@ -741,6 +807,8 @@ def _paired_cells(
                 latency_ms=narrowed_latency,
                 quality_score=quality,
                 context_chars=200 + i,
+                matched_fact_ids=matched_fact_ids,
+                matched_citation_ids=[],
             )
         )
     return records
@@ -751,7 +819,7 @@ def test_analyzer_promotes_when_thresholds_are_comfortably_exceeded(tmp_path: Pa
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["status"] == "promoted"
     assert result["promotion_eligible"] is True
@@ -763,7 +831,7 @@ def test_analyzer_does_not_promote_when_improvement_is_below_10_percent(tmp_path
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=910)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["status"] == "not_promoted"
     assert result["promotion_eligible"] is False
@@ -779,7 +847,7 @@ def test_analyzer_promotes_at_exactly_the_10_percent_boundary_inclusive(tmp_path
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=900)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["analysis"]["median_relative_latency_improvement"] == pytest.approx(0.10)
     assert result["promotion_eligible"] is True
@@ -790,7 +858,7 @@ def test_analyzer_does_not_promote_just_below_the_10_percent_boundary(tmp_path: 
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=901)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["analysis"]["median_relative_latency_improvement"] < 0.10
     assert result["promotion_eligible"] is False
@@ -803,7 +871,7 @@ def test_analyzer_rejects_baseline_below_quality_floor(tmp_path: Path) -> None:
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600, quality=0.85)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["promotion_eligible"] is False
     assert result["reason"] == "baseline_below_quality_floor"
@@ -814,7 +882,7 @@ def test_analyzer_accepts_baseline_exactly_at_quality_floor(tmp_path: Path) -> N
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600, quality=0.90)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["reason"] != "baseline_below_quality_floor"
 
@@ -823,7 +891,7 @@ def test_analyzer_does_not_promote_when_quality_drop_exceeds_0_02(tmp_path: Path
     module = _analyzer()
     records = []
     for i in range(30):
-        turn_id = f"turn-{i}"
+        turn_id = f"pquality-{i}"
         records.append(
             _valid_raw_record(
                 run_id=f"run-base-{i}",
@@ -832,6 +900,8 @@ def test_analyzer_does_not_promote_when_quality_drop_exceeds_0_02(tmp_path: Path
                 latency_ms=1000,
                 quality_score=0.95,
                 context_chars=1000 + i,
+                matched_fact_ids=_quality_matched_fact_ids(0.95),
+                matched_citation_ids=[],
             )
         )
         records.append(
@@ -843,11 +913,13 @@ def test_analyzer_does_not_promote_when_quality_drop_exceeds_0_02(tmp_path: Path
                 latency_ms=600,
                 quality_score=0.92,
                 context_chars=200 + i,
+                matched_fact_ids=_quality_matched_fact_ids(0.92),
+                matched_citation_ids=[],
             )
         )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["promotion_eligible"] is False
     assert result["reason"] == "quality_drop_exceeded"
@@ -860,7 +932,7 @@ def test_analyzer_promotes_at_exactly_a_0_02_quality_drop_boundary(tmp_path: Pat
     module = _analyzer()
     records = []
     for i in range(30):
-        turn_id = f"turn-{i}"
+        turn_id = f"pquality-{i}"
         records.append(
             _valid_raw_record(
                 run_id=f"run-base-{i}",
@@ -869,6 +941,8 @@ def test_analyzer_promotes_at_exactly_a_0_02_quality_drop_boundary(tmp_path: Pat
                 latency_ms=1000,
                 quality_score=0.95,
                 context_chars=1000 + i,
+                matched_fact_ids=_quality_matched_fact_ids(0.95),
+                matched_citation_ids=[],
             )
         )
         records.append(
@@ -880,11 +954,13 @@ def test_analyzer_promotes_at_exactly_a_0_02_quality_drop_boundary(tmp_path: Pat
                 latency_ms=600,
                 quality_score=0.93,
                 context_chars=200 + i,
+                matched_fact_ids=_quality_matched_fact_ids(0.93),
+                matched_citation_ids=[],
             )
         )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["reason"] != "quality_drop_exceeded"
     assert result["promotion_eligible"] is True
@@ -898,7 +974,8 @@ def test_analyzer_halts_baseline_too_noisy_above_sd_0_01(tmp_path: Path) -> None
     records = []
     noisy_scores = [0.99, 0.85] * 15
     for i, score in enumerate(noisy_scores):
-        turn_id = f"turn-{i}"
+        turn_id = f"pquality-{i}"
+        matched_fact_ids = _quality_matched_fact_ids(score)
         records.append(
             _valid_raw_record(
                 run_id=f"run-base-{i}",
@@ -907,6 +984,8 @@ def test_analyzer_halts_baseline_too_noisy_above_sd_0_01(tmp_path: Path) -> None
                 latency_ms=1000,
                 quality_score=score,
                 context_chars=1000 + i,
+                matched_fact_ids=matched_fact_ids,
+                matched_citation_ids=[],
             )
         )
         records.append(
@@ -918,11 +997,13 @@ def test_analyzer_halts_baseline_too_noisy_above_sd_0_01(tmp_path: Path) -> None
                 latency_ms=600,
                 quality_score=score,
                 context_chars=200 + i,
+                matched_fact_ids=matched_fact_ids,
+                matched_citation_ids=[],
             )
         )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["promotion_eligible"] is False
     assert result["reason"] == "baseline_too_noisy"
@@ -939,7 +1020,8 @@ def test_analyzer_accepts_baseline_variance_comfortably_below_sd_0_01(tmp_path: 
     scores = [0.945, 0.955] * 15  # pstdev = 0.005, well under the 0.01 threshold
     records = []
     for i, score in enumerate(scores):
-        turn_id = f"turn-{i}"
+        turn_id = f"pquality-{i}"
+        matched_fact_ids = _quality_matched_fact_ids(score)
         records.append(
             _valid_raw_record(
                 run_id=f"run-base-{i}",
@@ -948,6 +1030,8 @@ def test_analyzer_accepts_baseline_variance_comfortably_below_sd_0_01(tmp_path: 
                 latency_ms=1000,
                 quality_score=score,
                 context_chars=1000 + i,
+                matched_fact_ids=matched_fact_ids,
+                matched_citation_ids=[],
             )
         )
         records.append(
@@ -959,11 +1043,13 @@ def test_analyzer_accepts_baseline_variance_comfortably_below_sd_0_01(tmp_path: 
                 latency_ms=600,
                 quality_score=score,
                 context_chars=200 + i,
+                matched_fact_ids=matched_fact_ids,
+                matched_citation_ids=[],
             )
         )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     assert result["reason"] != "baseline_too_noisy"
 
@@ -976,7 +1062,7 @@ def test_analyzer_raises_on_duplicate_fixture_turn_identity_within_a_condition(
     records.append(dict(records[0]))  # exact duplicate baseline identity
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
     assert exit_code != 0
 
 
@@ -984,16 +1070,19 @@ def test_analyzer_excludes_unpaired_identities_from_the_paired_count(tmp_path: P
     module = _analyzer()
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
     records.append(
+        # "turn-40" is outside `_paired_cells(n=30, ...)`'s turn-0..29 range but
+        # still resolves against the shared 64-turn fixture, so it stays
+        # unpaired without tripping the fixture's unknown-turn-identity check.
         _valid_raw_record(
             run_id="run-orphan",
-            fixture_turn_id="turn-orphan",
+            fixture_turn_id="turn-40",
             condition="baseline",
             latency_ms=1000,
         )
     )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     stratum = next(iter(result["analysis"]["strata"].values()))
     assert stratum["paired_sample_count"] == 30
@@ -1006,7 +1095,7 @@ def test_analyzer_computes_spearman_correlation_between_context_chars_and_latenc
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    module.main(["--input", str(input_path), "--output", str(output)])
+    module.main(_analyzer_argv(input_path, output, tmp_path))
     result = json.loads(output.read_text())
     stratum = next(iter(result["analysis"]["strata"].values()))
     correlation = stratum["spearman_context_vs_latency"]
@@ -1034,8 +1123,8 @@ def test_analyzer_bootstrap_is_exactly_reproducible_with_seed_0(tmp_path: Path) 
     input_path = _analysis_input(tmp_path, records)
     first_output = tmp_path / "first.json"
     second_output = tmp_path / "second.json"
-    module.main(["--input", str(input_path), "--output", str(first_output)])
-    module.main(["--input", str(input_path), "--output", str(second_output)])
+    module.main(_analyzer_argv(input_path, first_output, tmp_path))
+    module.main(_analyzer_argv(input_path, second_output, tmp_path))
     first = json.loads(first_output.read_text())
     second = json.loads(second_output.read_text())
     first.pop("generated_at_utc", None)
@@ -1055,7 +1144,7 @@ def test_analyzer_rejects_forbidden_raw_fields(tmp_path: Path) -> None:
     records[0]["prompt"] = "leaked prompt text"
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
     assert exit_code != 0
 
 
@@ -1068,7 +1157,7 @@ def test_analyzer_rejects_a_missing_selected_dimension(tmp_path: Path) -> None:
     del records[0]["selected_dimension"]
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
     assert exit_code != 0
 
 
@@ -1084,8 +1173,52 @@ def test_analyzer_rejects_a_record_with_a_scorer_hash_that_does_not_match_the_fi
     records[0]["scorer_hash"] = "a" * 64
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
     assert exit_code != 0
+
+
+def test_analyzer_rejects_invented_fixture_ids_even_with_a_correctly_recomputed_scorer_hash(
+    tmp_path: Path,
+) -> None:
+    """Regression: `build_analysis` recomputed `scorer_hash` from the
+    record's OWN fields and treated a match as proof of provenance, but a
+    keyless self-hash only proves internal consistency, not that the
+    matched IDs/facts are real. A reviewer building records with invented
+    fixture IDs/facts, a favorable latency spread, and a correctly
+    recomputed `scorer_hash` got `promotion_eligible=True` from the analyzer
+    while the SAME records were correctly rejected by the collector's
+    fixture-binding check. This builds an all-invented-ID record set through
+    the same `--fixture` gate the collector uses and asserts the analyzer
+    now fails it too."""
+    module = _analyzer()
+    forged_fact_ids = [f"forged-fact-{i}" for i in range(3)]
+    records = []
+    for i in range(30):
+        turn_id = f"pquality-{i}"
+        for run_prefix, condition, latency in (
+            ("run-base", "baseline", 1000),
+            ("run-narrow", "narrowed", 600),
+        ):
+            records.append(
+                _valid_raw_record(
+                    run_id=f"{run_prefix}-{i}",
+                    fixture_turn_id=turn_id,
+                    condition=condition,
+                    selected_value=2 if condition == "narrowed" else 4,
+                    latency_ms=latency,
+                    quality_score=1.0,
+                    context_chars=1000 + i,
+                    matched_fact_ids=forged_fact_ids,
+                    matched_citation_ids=[],
+                )
+            )
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
+    assert exit_code != 0
+    assert (
+        not output.exists() or json.loads(output.read_text()).get("promotion_eligible") is not True
+    )
 
 
 def test_analyzer_blocks_promotion_when_one_stratum_is_undersized_and_another_is_complete(
@@ -1101,7 +1234,7 @@ def test_analyzer_blocks_promotion_when_one_stratum_is_undersized_and_another_is
         records.append({**record, "model": "gpt-undersized", "run_id": f"under-{record['run_id']}"})
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    assert module.main(["--input", str(input_path), "--output", str(output)]) == 0
+    assert module.main(_analyzer_argv(input_path, output, tmp_path)) == 0
     result = json.loads(output.read_text())
     assert result["status"] == common.EvidenceStatus.BLOCKED.value
     assert result["reason"] == "incomplete_stratum_coverage"
@@ -1117,7 +1250,7 @@ def test_analyzer_rejects_mixed_selected_dimension_values(tmp_path: Path) -> Non
     records[0]["selected_dimension"] = "answer_chars"
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
     assert exit_code != 0
 
 
@@ -1127,7 +1260,7 @@ def test_analyzer_rejects_mixed_fixture_versions(tmp_path: Path) -> None:
     records[0]["fixture_version"] = "some-other-version"
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
     assert exit_code != 0
 
 
@@ -1137,7 +1270,7 @@ def test_analyzer_rejects_mixed_scorer_versions(tmp_path: Path) -> None:
     records[0]["scorer_version"] = "some-other-scorer"
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
     assert exit_code != 0
 
 
@@ -1161,7 +1294,13 @@ def test_dry_run_records_feed_directly_into_the_analyzer_as_a_valid_shape(
     common = _evidence_common()
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    exit_code = analyzer.main(["--input", str(input_path), "--output", str(output)])
+    # Dry-run records are scored against the real committed fixture (not the
+    # synthetic qcl-test-v1 one `_analyzer_argv` uses for `_valid_raw_record`-
+    # built records), so this end-to-end test resolves against that same real
+    # fixture rather than `_analyzer_argv`'s default.
+    exit_code = analyzer.main(
+        ["--input", str(input_path), "--output", str(output), "--fixture", str(_fixture_path())]
+    )
     assert exit_code == 0
     result = json.loads(output.read_text())
     assert result["status"] == common.EvidenceStatus.BLOCKED.value
@@ -1407,4 +1546,4 @@ def test_analyzer_rejects_type_and_range_violations(tmp_path: Path, override: di
     records[0].update(override)
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
-    assert module.main(["--input", str(input_path), "--output", str(output)]) != 0
+    assert module.main(_analyzer_argv(input_path, output, tmp_path)) != 0

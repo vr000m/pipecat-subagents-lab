@@ -85,6 +85,10 @@ def source_commit() -> str:
     return _run_git("rev-parse", "HEAD")
 
 
+def _tracked_files() -> set[str]:
+    return set(_run_git("ls-files").splitlines())
+
+
 def source_tree_hash() -> str:
     """A deterministic filtered hash over `RUNTIME_TREE_GLOBS`'s tracked files.
 
@@ -93,10 +97,21 @@ def source_tree_hash() -> str:
     produces a value, matching `--check-release-inputs`'s no-clean-tree
     requirement; only `--shell-export`'s dirty-tree rejection enforces that
     the release build is exact.
+
+    Every glob match is filtered through `git ls-files` before hashing: a
+    gitignored file that happens to match one of `RUNTIME_TREE_GLOBS` (e.g. a
+    local build artifact under `web/src/`) would otherwise silently change
+    the computed release identity on an otherwise clean tree, contradicting
+    the "currently-tracked" claim below.
     """
+    tracked = _tracked_files()
     paths: set[Path] = set()
     for pattern in RUNTIME_TREE_GLOBS:
-        paths.update(p for p in REPO_ROOT.glob(pattern) if p.is_file())
+        paths.update(
+            p
+            for p in REPO_ROOT.glob(pattern)
+            if p.is_file() and str(p.relative_to(REPO_ROOT)) in tracked
+        )
     digest_input = bytearray()
     for path in sorted(paths, key=lambda p: str(p.relative_to(REPO_ROOT))):
         rel = str(path.relative_to(REPO_ROOT)).encode("utf-8")

@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -43,9 +42,6 @@ from typing import Any
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate_v013_evidence.py"
-EVIDENCE_COMMON_PATH = REPO_ROOT / "scripts" / "_evidence_common.py"
-TRANSPORT_VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate_phase2_transport_browser_contract.py"
 POST_CHANGE_SCHEMA_PATH = (
     REPO_ROOT / "shared" / "schemas" / "v013-query-context-post-change-analysis.json"
 )
@@ -70,21 +66,10 @@ NORMALIZED_INPUT_HASH = "1" * 64
 CONTROL_FINGERPRINT = "2" * 64
 
 
-def _load(path: Path, name: str) -> Any:
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def _validator() -> Any:
-    if not VALIDATOR_PATH.exists() or not TRANSPORT_VALIDATOR_PATH.exists():
-        pytest.skip(
-            "validate_v013_evidence.py / validate_phase2_transport_browser_contract.py "
-            "not fully available"
-        )
-    return _load(VALIDATOR_PATH, "validate_v013_evidence_phase4c")
+    import scripts.validate_v013_evidence
+
+    return scripts.validate_v013_evidence
 
 
 def _config_module() -> Any:
@@ -294,7 +279,7 @@ def _attempt_write_manifest(
             output=output,
         )
         return module, manifest
-    except (module.EvidenceGateError, module.EvidenceValidationError):
+    except module.EvidenceGateError:
         return module, None
 
 
@@ -384,7 +369,8 @@ def test_write_manifest_rejects_a_byte_mutated_phase4c_file(tmp_path: Path) -> N
     declared/hashed elsewhere must fail hash verification. This simulates
     the mutation by hashing a pristine copy, then corrupting the file the
     writer actually reads."""
-    common = _load(EVIDENCE_COMMON_PATH, "_evidence_common_phase4c")
+    from scripts import _evidence_common as common
+
     pristine = _valid_phase4c_artifact()
     phase4c_path = _write_json(tmp_path / "phase4c.json", pristine)
     original_hash = common.sha256_file(phase4c_path)
@@ -412,7 +398,8 @@ def test_write_manifest_stores_phase4c_hash_under_the_documented_top_level_field
     entry that load_promotion_manifest never reads."""
     payload = _valid_phase4c_artifact()
     phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
-    common = _load(EVIDENCE_COMMON_PATH, "_evidence_common_phase4c_2")
+    from scripts import _evidence_common as common
+
     expected_hash = common.sha256_file(phase4c_path)
     _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
     assert manifest is not None, "a fully valid promoted phase4c artifact must be accepted"
@@ -454,7 +441,29 @@ def test_write_manifest_no_change_final_manifest_omits_phase4c_field(tmp_path: P
 # --- load_promotion_manifest: runtime phase4c binding check ----------------
 
 
-def _base_manifest(**overrides: Any) -> dict[str, Any]:
+def _write_dummy_evidence_file(tmp_path: Path, name: str, content: bytes) -> dict[str, str]:
+    """A real file with a real digest, so the loader's byte-verification of
+    `inputs[phase]` (mirroring the Phase 4C byte-check) can actually resolve
+    it -- a placeholder path/hash pair no longer suffices."""
+    path = tmp_path / name
+    if not path.exists():
+        path.write_bytes(content)
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _base_manifest(tmp_path: Path, **overrides: Any) -> dict[str, Any]:
+    inputs = {
+        "phase0": _write_dummy_evidence_file(tmp_path, "phase0.jsonl", b"phase0-evidence\n"),
+        "phase1": _write_dummy_evidence_file(tmp_path, "phase1.jsonl", b"phase1-evidence\n"),
+        "phase2": _write_dummy_evidence_file(
+            tmp_path, "phase2-transport.json", b"phase2-evidence\n"
+        ),
+        "phase3": _write_dummy_evidence_file(
+            tmp_path,
+            "phase3-completion.json",
+            json.dumps(PHASE3_COMPLETION_PAYLOAD).encode("utf-8"),
+        ),
+    }
     payload = {
         "manifest_phase": "final",
         "promotion_eligible": True,
@@ -471,15 +480,15 @@ def _base_manifest(**overrides: Any) -> dict[str, Any]:
         "feature_policy_fingerprint": CONTROL_FINGERPRINT,
         "deployed_at_utc": "2026-08-04T00:00:00Z",
         "generated_at_utc": "2026-08-05T00:00:00Z",
-        "phase3_completion_hash": PHASE3_COMPLETION_HASH,
+        # The phase3-completion.json file above is written from
+        # PHASE3_COMPLETION_PAYLOAD, so its real digest equals
+        # PHASE3_COMPLETION_HASH -- the phase3 input binding and the
+        # top-level completion hash stay consistent, as the real writer
+        # above emits.
+        "phase3_completion_hash": inputs["phase3"]["sha256"],
         # A `final` manifest must bind every earlier phase, as the real writer
         # above emits.
-        "inputs": {
-            "phase0": {"path": "phase0.jsonl", "sha256": "0" * 64},
-            "phase1": {"path": "phase1.jsonl", "sha256": "1" * 64},
-            "phase2": {"path": "phase2-transport.json", "sha256": "2" * 64},
-            "phase3": {"path": "phase3-completion.json", "sha256": PHASE3_COMPLETION_HASH},
-        },
+        "inputs": inputs,
     }
     payload.update(overrides)
     return payload
@@ -511,7 +520,10 @@ def test_load_promotion_manifest_with_no_phase4c_field_is_a_valid_no_change_mani
     config_module = _config_module()
     manifest_path = tmp_path / "manifest.json"
     config = _config_for(tmp_path, manifest_path)
-    _write_json(manifest_path, _base_manifest(feature_policy_fingerprint=_real_fingerprint(config)))
+    _write_json(
+        manifest_path,
+        _base_manifest(tmp_path, feature_policy_fingerprint=_real_fingerprint(config)),
+    )
     verdict = config_module.load_promotion_manifest(config)
     assert verdict.promotion_eligible is True
 
@@ -526,6 +538,7 @@ def test_load_promotion_manifest_rejects_a_phase4c_hash_that_does_not_match_the_
     _write_json(
         manifest_path,
         _base_manifest(
+            tmp_path,
             feature_policy_fingerprint=_real_fingerprint(config),
             # A well-formed digest that simply is not the artifact's: a non-hex
             # value is now rejected as a malformed binding before the content
@@ -551,6 +564,7 @@ def test_load_promotion_manifest_treats_an_unresolvable_phase4c_artifact_as_fore
     _write_json(
         manifest_path,
         _base_manifest(
+            tmp_path,
             feature_policy_fingerprint=_real_fingerprint(config),
             phase4c_artifact_sha256="f" * 64,
         ),

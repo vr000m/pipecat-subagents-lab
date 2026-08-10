@@ -111,15 +111,53 @@ STATUSES = frozenset(
 
 
 def _lockfile_dependency_anchor() -> tuple[str, str]:
-    """Read the pinned package version/integrity from web/bun.lock."""
-    text = BUN_LOCK_PATH.read_text(encoding="utf-8")
-    match = re.search(
-        rf'"{re.escape(PACKAGE_NAME)}":\s*\["{re.escape(PACKAGE_NAME)}@([^"]+)"[^\]]*"(sha512-[^"]+)"\]',
-        text,
-    )
-    if not match:
-        raise EvidenceGateError(f"{PACKAGE_NAME} not found in {BUN_LOCK_PATH}")
-    return match.group(1), match.group(2)
+    """Read the pinned package version/integrity from web/bun.lock.
+
+    Anchored to a line that *starts* with ``"<package>":`` followed
+    immediately by an array (``:\\s*\\[``): a dependency reference nested
+    inside another package's own ``dependencies``/``peerDependencies`` object
+    (e.g. ``"@pipecat-ai/small-webrtc-transport": "^1.10.6"``) has no leading
+    array bracket, so it cannot be mistaken for this package's own top-level
+    lockfile entry -- the previous unanchored ``re.search`` over the whole
+    file could match whichever occurrence came first. The body between the
+    version and the integrity hash is matched lazily (``.*?``) rather than
+    with ``[^\\]]*``, since a dependency object containing a literal ``]``
+    (e.g. an array-valued field) would otherwise stop the match early or fail
+    to find the real closing bracket at all.
+    """
+    for line in BUN_LOCK_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip().rstrip(",")
+        if not stripped.startswith(f'"{PACKAGE_NAME}":'):
+            continue
+        match = re.match(
+            rf'"{re.escape(PACKAGE_NAME)}":\s*\["{re.escape(PACKAGE_NAME)}@([^"]+)".*?'
+            r'"(sha512-[^"]+)"\]$',
+            stripped,
+        )
+        if match:
+            return match.group(1), match.group(2)
+    raise EvidenceGateError(f"{PACKAGE_NAME} not found in {BUN_LOCK_PATH}")
+
+
+def _package_json_declared_version() -> str:
+    """The version `@pipecat-ai/small-webrtc-transport` is pinned to in
+    web/package.json's own dependency declaration.
+
+    `PACKAGE_JSON_PATH` was previously declared but never read, despite the
+    module docstring's claim that it checks "web/package.json/web/bun.lock"
+    -- only the lockfile was actually consulted. Reading it here lets
+    `validate_artifact` catch package.json/bun.lock drift (an updated
+    dependency declaration whose lockfile was never regenerated) instead of
+    silently trusting the lockfile alone.
+    """
+    import json as _json
+
+    data = _json.loads(PACKAGE_JSON_PATH.read_text(encoding="utf-8"))
+    dependencies = data.get("dependencies")
+    version = dependencies.get(PACKAGE_NAME) if isinstance(dependencies, dict) else None
+    if not isinstance(version, str) or not version:
+        raise EvidenceGateError(f"{PACKAGE_NAME} not found in {PACKAGE_JSON_PATH} dependencies")
+    return version
 
 
 def validate_artifact(record: dict[str, Any]) -> None:
@@ -184,6 +222,17 @@ def validate_artifact(record: dict[str, Any]) -> None:
     ):
         raise EvidenceGateError(
             "package_version/package_integrity do not match web/bun.lock's pinned dependency"
+        )
+    # web/package.json is the declared dependency; web/bun.lock is its
+    # resolved lock. If a package.json version bump was never followed by a
+    # lockfile regeneration, the artifact could still match the (now stale)
+    # lockfile pin while silently describing a dependency that package.json
+    # itself no longer declares.
+    declared_version = _package_json_declared_version()
+    if declared_version != locked_version:
+        raise EvidenceGateError(
+            f"web/package.json declares {PACKAGE_NAME}@{declared_version} but web/bun.lock "
+            f"is pinned to {locked_version} -- regenerate the lockfile"
         )
 
     # `source_anchor` names the source the check was actually run against.

@@ -22,7 +22,6 @@ all (e.g. not a git repository).
 
 from __future__ import annotations
 
-import importlib.util
 import re
 import subprocess
 from pathlib import Path
@@ -31,7 +30,6 @@ from typing import Any
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT_PATH = REPO_ROOT / "scripts" / "emit_v013_deployment_metadata.py"
 
 EXPORT_RE = re.compile(r"^(PIPECAT_[A-Z_]+)=(.*)$", re.MULTILINE)
 
@@ -65,13 +63,9 @@ NON_RUNTIME_FILES = (
 
 
 def _load_module() -> Any:
-    if not SCRIPT_PATH.exists():
-        pytest.skip(f"{SCRIPT_PATH} not yet implemented (Phase 2 concurrent implementer)")
-    spec = importlib.util.spec_from_file_location("emit_v013_deployment_metadata", SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    import scripts.emit_v013_deployment_metadata
+
+    return scripts.emit_v013_deployment_metadata
 
 
 def _init_clean_release_tree(tmp_path: Path) -> Path:
@@ -249,3 +243,24 @@ def test_runtime_tree_hash_ignores_evidence_and_tooling_files(
     (repo / rel).write_text("mutated non-runtime content\n", encoding="utf-8")
 
     assert module.source_tree_hash() == before, f"{rel} must stay outside the runtime tree hash"
+
+
+def test_runtime_tree_hash_ignores_a_gitignored_file_matching_a_runtime_glob(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: every `RUNTIME_TREE_GLOBS` match was hashed with no
+    `git ls-files` filter, despite the docstring's "currently-tracked" claim
+    -- a gitignored file matching the glob (e.g. a local build artifact
+    under `web/src/`) would silently change the computed release identity on
+    an otherwise clean tree."""
+    module = _load_module()
+    repo = _init_clean_release_tree(tmp_path)
+    monkeypatch.setattr(module, "REPO_ROOT", repo)
+
+    before = module.source_tree_hash()
+    untracked_runtime_file = repo / "web" / "src" / "untracked-build-artifact.js"
+    untracked_runtime_file.write_text("// never committed\n", encoding="utf-8")
+
+    assert module.source_tree_hash() == before, (
+        "an untracked file matching a runtime glob must not change the release identity"
+    )

@@ -584,10 +584,28 @@ def _evidence_schema_hash() -> str:
     return hashlib.sha256(schema.read_bytes()).hexdigest()
 
 
-def _final_manifest(*, config: Config | None = None, **overrides: object) -> dict:
+def _write_dummy_evidence_file(tmp_path: Path, name: str, content: bytes) -> dict[str, str]:
+    """A real file with a real digest, so the loader's byte-verification of
+    `inputs[phase]` (mirroring the Phase 4C byte-check) can actually resolve
+    it -- a placeholder path/hash pair no longer suffices."""
+    import hashlib
+
+    path = tmp_path / name
+    if not path.exists():
+        path.write_bytes(content)
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _final_manifest(*, tmp_path: Path, config: Config | None = None, **overrides: object) -> dict:
     from server.config import FeaturePolicy, feature_policy_fingerprint
 
     resolved_config = config or Config()
+    inputs = {
+        "phase0": _write_dummy_evidence_file(tmp_path, "phase0.jsonl", b"phase0-evidence\n"),
+        "phase1": _write_dummy_evidence_file(tmp_path, "phase1.jsonl", b"phase1-evidence\n"),
+        "phase2": _write_dummy_evidence_file(tmp_path, "phase2.json", b"phase2-evidence\n"),
+        "phase3": _write_dummy_evidence_file(tmp_path, "phase3.json", b"phase3-evidence\n"),
+    }
     manifest = {
         "manifest_phase": "final",
         "promotion_eligible": True,
@@ -601,16 +619,10 @@ def _final_manifest(*, config: Config | None = None, **overrides: object) -> dic
         ),
         "deployed_at_utc": "2026-08-04T00:00:00Z",
         "generated_at_utc": "2026-08-04T00:05:00Z",
-        "phase3_completion_hash": "3" * 64,
-        "inputs": {
-            "phase0": {"path": "phase0.jsonl", "sha256": "0" * 64},
-            "phase1": {"path": "phase1.jsonl", "sha256": "1" * 64},
-            "phase2": {"path": "phase2.json", "sha256": "2" * 64},
-            # The Phase 3 input binding and the top-level completion hash are
-            # two records of the same fact; the loader now requires them to
-            # agree.
-            "phase3": {"path": "phase3.json", "sha256": "3" * 64},
-        },
+        # The Phase 3 input binding and the top-level completion hash are two
+        # records of the same fact; the loader requires them to agree.
+        "phase3_completion_hash": inputs["phase3"]["sha256"],
+        "inputs": inputs,
     }
     manifest.update(overrides)
     return manifest
@@ -651,7 +663,7 @@ def test_load_promotion_manifest_missing_required_field_is_schema_invalid(tmp_pa
 
     load_promotion_manifest = _load_promotion_manifest()
     manifest_path = tmp_path / "manifest.json"
-    incomplete = _final_manifest()
+    incomplete = _final_manifest(tmp_path=tmp_path)
     del incomplete["schema_hash"]
     manifest_path.write_text(json.dumps(incomplete), encoding="utf-8")
     config = Config(promotion_manifest_path=str(manifest_path))
@@ -670,7 +682,11 @@ def test_load_promotion_manifest_provisional_phase_always_fails_closed(tmp_path:
     load_promotion_manifest = _load_promotion_manifest()
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
-        json.dumps(_final_manifest(manifest_phase="provisional", promotion_eligible=True)),
+        json.dumps(
+            _final_manifest(
+                tmp_path=tmp_path, manifest_phase="provisional", promotion_eligible=True
+            )
+        ),
         encoding="utf-8",
     )
     config = Config(promotion_manifest_path=str(manifest_path))
@@ -690,7 +706,7 @@ def test_load_promotion_manifest_wrong_phase_final_without_phase3_completion_is_
 
     load_promotion_manifest = _load_promotion_manifest()
     manifest_path = tmp_path / "manifest.json"
-    incomplete = _final_manifest()
+    incomplete = _final_manifest(tmp_path=tmp_path)
     del incomplete["phase3_completion_hash"]
     manifest_path.write_text(json.dumps(incomplete), encoding="utf-8")
     config = Config(promotion_manifest_path=str(manifest_path))
@@ -712,7 +728,8 @@ def test_load_promotion_manifest_source_commit_mismatch_fails_closed(tmp_path: P
         deployed_at_utc="2026-08-01T00:00:00Z",
     )
     Path(config.promotion_manifest_path).write_text(
-        json.dumps(_final_manifest(config=config, source_commit="a" * 40)), encoding="utf-8"
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config, source_commit="a" * 40)),
+        encoding="utf-8",
     )
 
     verdict = load_promotion_manifest(config)
@@ -728,7 +745,7 @@ def test_load_promotion_manifest_policy_fingerprint_mismatch_fails_closed(tmp_pa
     manifest_path = tmp_path / "manifest.json"
     # Fingerprinted against the default (all-on) FeaturePolicy, then loaded
     # with a Config whose FeaturePolicy differs -- a stale binding.
-    manifest_path.write_text(json.dumps(_final_manifest()), encoding="utf-8")
+    manifest_path.write_text(json.dumps(_final_manifest(tmp_path=tmp_path)), encoding="utf-8")
     config = Config(
         promotion_manifest_path=str(manifest_path),
         enable_autoplay_policy=False,
@@ -756,7 +773,11 @@ def test_load_promotion_manifest_stale_generated_before_deployed_fails_closed(
         deployed_at_utc="2026-08-04T00:00:00Z",
     )
     Path(config.promotion_manifest_path).write_text(
-        json.dumps(_final_manifest(config=config, generated_at_utc="2026-08-01T00:00:00Z")),
+        json.dumps(
+            _final_manifest(
+                tmp_path=tmp_path, config=config, generated_at_utc="2026-08-01T00:00:00Z"
+            )
+        ),
         encoding="utf-8",
     )
 
@@ -780,7 +801,12 @@ def test_load_promotion_manifest_promotion_eligible_false_stays_display_only(
     )
     Path(config.promotion_manifest_path).write_text(
         json.dumps(
-            _final_manifest(config=config, promotion_eligible=False, reason="real_stratum_missing")
+            _final_manifest(
+                tmp_path=tmp_path,
+                config=config,
+                promotion_eligible=False,
+                reason="real_stratum_missing",
+            )
         ),
         encoding="utf-8",
     )
@@ -804,7 +830,7 @@ def test_load_promotion_manifest_valid_matching_final_manifest_is_promotion_elig
         deployed_at_utc="2026-08-01T00:00:00Z",
     )
     Path(config.promotion_manifest_path).write_text(
-        json.dumps(_final_manifest(config=config)), encoding="utf-8"
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config)), encoding="utf-8"
     )
 
     verdict = load_promotion_manifest(config)
@@ -852,7 +878,8 @@ def test_load_promotion_manifest_non_string_timestamp_fails_closed_without_raisi
     manifest_path = tmp_path / "manifest.json"
     config = _bound_config(manifest_path)
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, generated_at_utc=12345)), encoding="utf-8"
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config, generated_at_utc=12345)),
+        encoding="utf-8",
     )
 
     verdict = load_promotion_manifest(config)  # must not raise
@@ -868,7 +895,8 @@ def test_load_promotion_manifest_rejects_non_dict_inputs(tmp_path: Path) -> None
     manifest_path = tmp_path / "manifest.json"
     config = _bound_config(manifest_path)
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, inputs="not-a-mapping")), encoding="utf-8"
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config, inputs="not-a-mapping")),
+        encoding="utf-8",
     )
 
     verdict = load_promotion_manifest(config)
@@ -884,7 +912,8 @@ def test_load_promotion_manifest_rejects_a_non_hex_schema_hash(tmp_path: Path) -
     manifest_path = tmp_path / "manifest.json"
     config = _bound_config(manifest_path)
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, schema_hash="not-a-hash")), encoding="utf-8"
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config, schema_hash="not-a-hash")),
+        encoding="utf-8",
     )
 
     verdict = load_promotion_manifest(config)
@@ -900,7 +929,8 @@ def test_load_promotion_manifest_rejects_a_non_hex_phase3_completion_hash(tmp_pa
     manifest_path = tmp_path / "manifest.json"
     config = _bound_config(manifest_path)
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, phase3_completion_hash="yes")), encoding="utf-8"
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config, phase3_completion_hash="yes")),
+        encoding="utf-8",
     )
 
     verdict = load_promotion_manifest(config)
@@ -922,7 +952,9 @@ def test_load_promotion_manifest_unset_source_identity_is_unbound_not_skipped(
         source_tree_hash="b" * 64,
         deployed_at_utc="2026-08-01T00:00:00Z",
     )
-    manifest_path.write_text(json.dumps(_final_manifest(config=config)), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config)), encoding="utf-8"
+    )
 
     verdict = load_promotion_manifest(config)
 
@@ -942,14 +974,22 @@ def test_load_promotion_manifest_compares_timestamps_as_instants_not_strings(
 
     config = _bound_config(manifest_path, deployed_at_utc="2026-01-01T00:00:00+00:00")
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, generated_at_utc="2026-01-01T00:00:00Z")),
+        json.dumps(
+            _final_manifest(
+                tmp_path=tmp_path, config=config, generated_at_utc="2026-01-01T00:00:00Z"
+            )
+        ),
         encoding="utf-8",
     )
     assert load_promotion_manifest(config).promotion_eligible is True
 
     config = _bound_config(manifest_path, deployed_at_utc="2026-01-01T00:00:00Z")
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, generated_at_utc="2026-01-01T00:00:00+00:00")),
+        json.dumps(
+            _final_manifest(
+                tmp_path=tmp_path, config=config, generated_at_utc="2026-01-01T00:00:00+00:00"
+            )
+        ),
         encoding="utf-8",
     )
     assert load_promotion_manifest(config).promotion_eligible is True
@@ -984,7 +1024,9 @@ def test_load_promotion_manifest_without_a_phase4c_path_is_unresolvable(tmp_path
     config = _bound_config(manifest_path)
     assert config.phase4c_artifact_path is None
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, phase4c_artifact_sha256="f" * 64)),
+        json.dumps(
+            _final_manifest(tmp_path=tmp_path, config=config, phase4c_artifact_sha256="f" * 64)
+        ),
         encoding="utf-8",
     )
 
@@ -992,6 +1034,76 @@ def test_load_promotion_manifest_without_a_phase4c_path_is_unresolvable(tmp_path
 
     assert verdict.promotion_eligible is False
     assert verdict.reason == "phase4c_unresolvable"
+
+
+def test_load_promotion_manifest_rejects_a_final_manifest_omitting_a_configured_phase4c_binding(
+    tmp_path: Path,
+) -> None:
+    """Regression: Phase 4C binding only ran `if phase4c_hash is not None`,
+    so an otherwise-valid `final` manifest could simply OMIT
+    `phase4c_artifact_sha256` to skip byte-verification entirely, even when
+    `config.phase4c_artifact_path` is set (the deployment declared it wants
+    Phase 4C attestation). Omitting the field must fail closed, not be
+    treated as a no-Phase-4C-needed release."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    phase4c_path = tmp_path / "phase4c.json"
+    phase4c_path.write_text("{}", encoding="utf-8")
+    config = _bound_config(manifest_path, phase4c_artifact_path=str(phase4c_path))
+    manifest_without_phase4c = _final_manifest(tmp_path=tmp_path, config=config)
+    assert "phase4c_artifact_sha256" not in manifest_without_phase4c
+    manifest_path.write_text(json.dumps(manifest_without_phase4c), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "phase4c_binding_missing"
+
+
+def test_load_promotion_manifest_rejects_a_final_manifest_with_a_tampered_phase0_input_hash(
+    tmp_path: Path,
+) -> None:
+    """Regression: unlike Phase 4C (byte-verified via `sha256(path.read_bytes())`),
+    the Phase 0/1/2/3 `inputs` entries were only shape-checked (a non-empty
+    path string, a well-formed hex digest) -- nothing recomputed the digest
+    against the actual file on disk, so a `final` manifest's declared
+    evidence hashes were never proven to describe the files they name."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest = _final_manifest(tmp_path=tmp_path, config=config)
+    # Mutate the on-disk phase0 file after its hash was recorded, so the
+    # manifest's declared digest no longer matches the actual bytes.
+    phase0_path = Path(manifest["inputs"]["phase0"]["path"])
+    phase0_path.write_bytes(b"tampered-after-hashing\n")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "evidence_mismatch"
+
+
+def test_load_promotion_manifest_rejects_a_final_manifest_whose_phase1_input_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest = _final_manifest(tmp_path=tmp_path, config=config)
+    Path(manifest["inputs"]["phase1"]["path"]).unlink()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "evidence_unresolvable"
 
 
 def test_release_version_default_matches_the_packaged_project_version() -> None:
@@ -1023,7 +1135,7 @@ def _write_manifest_for(tmp_path: Path, **overrides: object):
     manifest_path = tmp_path / "manifest.json"
     config = _bound_config(manifest_path)
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, **overrides)), encoding="utf-8"
+        json.dumps(_final_manifest(tmp_path=tmp_path, config=config, **overrides)), encoding="utf-8"
     )
     return config
 
@@ -1134,15 +1246,18 @@ def test_load_promotion_manifest_rejects_a_final_manifest_missing_a_phase0_bindi
 ) -> None:
     """A `final` manifest attests the whole evidence chain, so a valid Phase 3
     binding alone is not enough."""
+    import json
+
     load_promotion_manifest = _load_promotion_manifest()
-    config = _write_manifest_for(
-        tmp_path,
-        inputs={
-            "phase1": {"path": "phase1.jsonl", "sha256": "1" * 64},
-            "phase2": {"path": "phase2.json", "sha256": "2" * 64},
-            "phase3": {"path": "phase3.json", "sha256": "3" * 64},
-        },
-    )
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    # Drop phase0 from an otherwise-real, internally-consistent inputs set
+    # (rather than hand-crafting placeholder phase1/2/3 entries) so this
+    # exercises only the missing-phase0 completeness gate, not an incidental
+    # phase3_completion_hash/inputs.phase3.sha256 mismatch.
+    manifest = _final_manifest(tmp_path=tmp_path, config=config)
+    del manifest["inputs"]["phase0"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     verdict = load_promotion_manifest(config)
 
@@ -1162,7 +1277,9 @@ def test_load_promotion_manifest_rejects_a_malformed_generated_at_utc_with_no_de
     config = _bound_config(manifest_path, deployed_at_utc=None)
     assert config.deployed_at_utc is None
     manifest_path.write_text(
-        json.dumps(_final_manifest(config=config, generated_at_utc="not-a-timestamp")),
+        json.dumps(
+            _final_manifest(tmp_path=tmp_path, config=config, generated_at_utc="not-a-timestamp")
+        ),
         encoding="utf-8",
     )
 

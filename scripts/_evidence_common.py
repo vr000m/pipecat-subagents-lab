@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,12 @@ class EvidenceStatus(str, Enum):
 
 class EvidenceGateError(ValueError):
     """Raised when an evidence artifact or manifest fails a hard gate check."""
+
+
+# Gates two halves of the same Phase 4 promotion decision (the collector's
+# per-cell undersizing check and the analyzer's per-stratum pairing check);
+# defined once here so the two scripts cannot drift apart on the minimum.
+MIN_PAIRED_SAMPLES_PER_CELL = 30
 
 
 def sha256_file(path: Path) -> str:
@@ -79,9 +85,24 @@ def load_json(path: Path) -> Any:
         raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise EvidenceGateError(f"malformed JSON in {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise EvidenceGateError(f"undecodable evidence input {path}: {exc}") from exc
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
+def load_jsonl(
+    path: Path,
+    *,
+    validate_record: Callable[[int, dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Read a JSONL file, converting every read/parse failure into a gate error.
+
+    ``validate_record``, when given, is called as ``validate_record(line_no,
+    record)`` immediately after each record is parsed and before it is
+    appended -- so a caller needing per-line-number diagnostics (the
+    collector's raw-record validation) can raise its own
+    ``EvidenceGateError`` with that context, without duplicating this
+    function's own read/parse handling.
+    """
     if not path.exists():
         raise EvidenceGateError(f"missing evidence input: {path}")
     records: list[dict[str, Any]] = []
@@ -89,18 +110,25 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
         handle = path.open("r", encoding="utf-8")
     except OSError as exc:
         raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
-    with handle:
-        for line_no, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise EvidenceGateError(f"{path}: line {line_no}: invalid JSON ({exc})") from exc
-            if not isinstance(record, dict):
-                raise EvidenceGateError(f"{path}: line {line_no}: expected a JSON object")
-            records.append(record)
+    try:
+        with handle:
+            for line_no, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise EvidenceGateError(
+                        f"{path}: line {line_no}: invalid JSON ({exc})"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise EvidenceGateError(f"{path}: line {line_no}: expected a JSON object")
+                if validate_record is not None:
+                    validate_record(line_no, record)
+                records.append(record)
+    except UnicodeDecodeError as exc:
+        raise EvidenceGateError(f"undecodable evidence input {path}: {exc}") from exc
     return records
 
 
@@ -147,3 +175,113 @@ def closed_object(
     missing = required - set(record)
     if missing:
         raise EvidenceGateError(f"missing required field(s) {sorted(missing)}")
+
+
+class FixtureIndex:
+    """The versioned Phase 4 quality fixture's own view of what a record may
+    legally claim.
+
+    Neither the collector nor the analyzer can re-run `score_response`: raw
+    records deliberately carry no response text (that is the point of the
+    strict allowlist). What each *can* do -- and, before this was shared,
+    only the collector did -- is refuse to take a record's self-reported
+    matches on trust. Recomputing `scorer_hash` from fields the record
+    itself supplies proves only internal consistency: an editor who invents
+    unknown or duplicate matches and recomputes the hash from those
+    fabricated values passes that check. Every match ID is therefore
+    resolved against the versioned fixture, and `quality_score` is
+    recomputed from the fixture's own denominator. Shared here so the
+    collector's and analyzer's forgery checks cannot drift apart.
+    """
+
+    def __init__(self, fixture: dict[str, Any]) -> None:
+        self.version: str = fixture["fixture_version"]
+        self.turns: dict[str, dict[str, Any]] = {t["turn_id"]: t for t in fixture["turns"]}
+
+    def turn_for(self, fixture_turn_id: str) -> dict[str, Any]:
+        # The runner pairs repeats as "<turn_id>#<repeat_index>".
+        base_id = fixture_turn_id.split("#", 1)[0]
+        turn = self.turns.get(base_id)
+        if turn is None:
+            raise EvidenceGateError(
+                f"fixture_turn_id {fixture_turn_id!r} does not resolve to a turn in fixture "
+                f"version {self.version!r}"
+            )
+        return turn
+
+
+def _check_ids_against_fixture(
+    claimed: list[str], known: list[str], *, field: str, where: str
+) -> None:
+    unknown = [value for value in claimed if value not in set(known)]
+    if unknown:
+        raise EvidenceGateError(
+            f"{where}: {field} contains ID(s) {sorted(unknown)} that the versioned "
+            "fixture does not declare -- forged or fabricated match"
+        )
+    if len(claimed) != len(set(claimed)):
+        raise EvidenceGateError(f"{where}: {field} contains duplicate IDs")
+
+
+def validate_against_fixture(record: dict[str, Any], *, index: FixtureIndex, where: str) -> None:
+    """Resolve one raw record's fixture identity, match IDs, and quality_score
+    against the versioned fixture ``index`` was built from.
+
+    Raises ``EvidenceGateError`` for a fixture-version mismatch, an unknown
+    fixture-turn identity, an invented/duplicate match ID, a citation
+    claimed without its fixture-expected fact, or a ``quality_score`` that
+    does not equal the fixture-derived score for the record's matched IDs.
+    """
+    if record["fixture_version"] != index.version:
+        raise EvidenceGateError(
+            f"{where}: fixture_version {record['fixture_version']!r} does not match the "
+            f"loaded fixture {index.version!r}"
+        )
+    turn = index.turn_for(record["fixture_turn_id"])
+    _check_ids_against_fixture(
+        record["matched_fact_ids"],
+        [fact["id"] for fact in turn["required_facts"]],
+        field="matched_fact_ids",
+        where=where,
+    )
+    _check_ids_against_fixture(
+        record["matched_citation_ids"],
+        [cite["id"] for cite in turn["expected_citations"]],
+        field="matched_citation_ids",
+        where=where,
+    )
+    _check_ids_against_fixture(
+        record["matched_disallowed_claim_ids"],
+        [claim["id"] for claim in turn["disallowed_claims"]],
+        field="matched_disallowed_claim_ids",
+        where=where,
+    )
+    # A citation is valid only when the fixture-expected fact it maps to was
+    # also matched -- the same binding `score_response` applies.
+    matched_facts = set(record["matched_fact_ids"])
+    for cite in turn["expected_citations"]:
+        if cite["id"] not in record["matched_citation_ids"]:
+            continue
+        expected_fact_id = cite.get("fact_id")
+        if expected_fact_id is not None and expected_fact_id not in matched_facts:
+            raise EvidenceGateError(
+                f"{where}: citation {cite['id']!r} is claimed without its "
+                f"fixture-expected fact {expected_fact_id!r}"
+            )
+
+    denominator = len(turn["required_facts"]) + len(turn["expected_citations"])
+    if denominator == 0:
+        raise EvidenceGateError(
+            f"{where}: fixture turn {turn['turn_id']!r} has a zero quality-score denominator"
+        )
+    numerator = (
+        len(record["matched_fact_ids"])
+        + len(record["matched_citation_ids"])
+        - len(record["matched_disallowed_claim_ids"])
+    )
+    expected_score = max(0.0, min(1.0, numerator / denominator))
+    if abs(float(record["quality_score"]) - expected_score) > 1e-9:
+        raise EvidenceGateError(
+            f"{where}: quality_score {record['quality_score']!r} is not the fixture-derived "
+            f"score {expected_score!r} for its matched IDs"
+        )

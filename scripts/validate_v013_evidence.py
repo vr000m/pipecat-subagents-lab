@@ -40,6 +40,7 @@ from scripts._evidence_common import (
 from scripts.validate_phase2_transport_browser_contract import (
     validate_artifact as validate_transport_browser_artifact,
 )
+from server.config import Config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
@@ -147,15 +148,11 @@ PHASE_SCENARIO_MIN_COUNT: Mapping[str, Mapping[str, int]] = {
 }
 
 
-class EvidenceValidationError(ValueError):
-    """Raised when a record or artifact fails the evidence contract."""
-
-
 def _require_type(value: Any, kinds: tuple[type, ...], field: str, index: int) -> None:
     if isinstance(value, bool) and bool not in kinds:
-        raise EvidenceValidationError(f"record {index}: {field} must not be a bool, got {value!r}")
+        raise EvidenceGateError(f"record {index}: {field} must not be a bool, got {value!r}")
     if not isinstance(value, kinds):
-        raise EvidenceValidationError(
+        raise EvidenceGateError(
             f"record {index}: {field} expected {kinds}, got {type(value).__name__}"
         )
 
@@ -163,114 +160,109 @@ def _require_type(value: Any, kinds: tuple[type, ...], field: str, index: int) -
 def validate_record(record: Mapping[str, Any], index: int) -> None:
     unknown = set(record) - ALL_FIELDS
     if unknown:
-        raise EvidenceValidationError(f"record {index}: unknown field(s) {sorted(unknown)}")
+        raise EvidenceGateError(f"record {index}: unknown field(s) {sorted(unknown)}")
     missing = [name for name in REQUIRED_FIELDS if name not in record]
     if missing:
-        raise EvidenceValidationError(f"record {index}: missing required field(s) {missing}")
+        raise EvidenceGateError(f"record {index}: missing required field(s) {missing}")
 
     if record["phase"] not in PHASES:
-        raise EvidenceValidationError(f"record {index}: invalid phase {record['phase']!r}")
+        raise EvidenceGateError(f"record {index}: invalid phase {record['phase']!r}")
 
     phase_extra = PHASE_EXTRA_REQUIRED_FIELDS.get(record["phase"], ())
     missing_extra = [name for name in phase_extra if name not in record]
     if missing_extra:
-        raise EvidenceValidationError(
+        raise EvidenceGateError(
             f"record {index}: phase={record['phase']!r} missing required field(s) {missing_extra}"
         )
 
     for field in ("scenario", "turn_id", "provider", "model", "run_id"):
         _require_type(record[field], (str,), field, index)
         if not record[field]:
-            raise EvidenceValidationError(f"record {index}: {field} must be non-empty")
+            raise EvidenceGateError(f"record {index}: {field} must be non-empty")
     if record["outcome"] not in OUTCOMES:
-        raise EvidenceValidationError(f"record {index}: invalid outcome {record['outcome']!r}")
+        raise EvidenceGateError(f"record {index}: invalid outcome {record['outcome']!r}")
     if record["disposition"] not in DISPOSITIONS:
-        raise EvidenceValidationError(
-            f"record {index}: invalid disposition {record['disposition']!r}"
-        )
+        raise EvidenceGateError(f"record {index}: invalid disposition {record['disposition']!r}")
 
     latency = record["routing_phase_latency_ms"]
     if latency is not None:
         _require_type(latency, (int, float), "routing_phase_latency_ms", index)
         if latency < 0:
-            raise EvidenceValidationError(f"record {index}: routing_phase_latency_ms must be >= 0")
+            raise EvidenceGateError(f"record {index}: routing_phase_latency_ms must be >= 0")
 
     _require_type(record["sample_timestamp_ms"], (int,), "sample_timestamp_ms", index)
     if record["sample_timestamp_ms"] < 0:
-        raise EvidenceValidationError(f"record {index}: sample_timestamp_ms must be >= 0")
+        raise EvidenceGateError(f"record {index}: sample_timestamp_ms must be >= 0")
     _require_type(record["sample_index"], (int,), "sample_index", index)
     if record["sample_index"] < 0:
-        raise EvidenceValidationError(f"record {index}: sample_index must be >= 0")
+        raise EvidenceGateError(f"record {index}: sample_index must be >= 0")
     _require_type(record["sample_count"], (int,), "sample_count", index)
     if record["sample_count"] < 1:
-        raise EvidenceValidationError(f"record {index}: sample_count must be >= 1")
+        raise EvidenceGateError(f"record {index}: sample_count must be >= 1")
 
     if "work_item_id" in record and record["work_item_id"] is not None:
         _require_type(record["work_item_id"], (str,), "work_item_id", index)
         if not record["work_item_id"]:
-            raise EvidenceValidationError(f"record {index}: work_item_id must be non-empty")
+            raise EvidenceGateError(f"record {index}: work_item_id must be non-empty")
     for field in ("query_chars", "context_chars"):
         if field in record and record[field] is not None:
             _require_type(record[field], (int,), field, index)
             if record[field] < 0:
-                raise EvidenceValidationError(f"record {index}: {field} must be >= 0")
+                raise EvidenceGateError(f"record {index}: {field} must be >= 0")
     if "wall_clock_time" in record and record["wall_clock_time"] is not None:
         _require_type(record["wall_clock_time"], (str,), "wall_clock_time", index)
 
     if "ack_id" in record and record["ack_id"] is not None:
         _require_type(record["ack_id"], (str,), "ack_id", index)
         if not record["ack_id"]:
-            raise EvidenceValidationError(f"record {index}: ack_id must be non-empty")
+            raise EvidenceGateError(f"record {index}: ack_id must be non-empty")
     if "ack_enqueued" in record and record["ack_enqueued"] is not None:
         _require_type(record["ack_enqueued"], (bool,), "ack_enqueued", index)
     if "ack_enqueued_ms" in record and record["ack_enqueued_ms"] is not None:
         _require_type(record["ack_enqueued_ms"], (int,), "ack_enqueued_ms", index)
         if record["ack_enqueued_ms"] < 0:
-            raise EvidenceValidationError(f"record {index}: ack_enqueued_ms must be >= 0")
+            raise EvidenceGateError(f"record {index}: ack_enqueued_ms must be >= 0")
     if (
         "ack_terminal_state" in record
         and record["ack_terminal_state"] is not None
         and record["ack_terminal_state"] not in ACK_TERMINAL_STATES
     ):
-        raise EvidenceValidationError(
+        raise EvidenceGateError(
             f"record {index}: invalid ack_terminal_state {record['ack_terminal_state']!r}"
         )
 
 
 def load_records(input_path: Path) -> list[dict[str, Any]]:
-    try:
-        return load_jsonl(input_path)
-    except EvidenceGateError as exc:
-        raise EvidenceValidationError(str(exc)) from exc
+    return load_jsonl(input_path)
 
 
 def check_phase_minimums(phase: str, records: Sequence[Mapping[str, Any]]) -> None:
     minimums = PHASE_MINIMUMS.get(phase)
     if minimums is None:
-        raise EvidenceValidationError(f"no coverage minimums declared for phase {phase!r}")
+        raise EvidenceGateError(f"no coverage minimums declared for phase {phase!r}")
 
     phase_records = [r for r in records if r["phase"] == phase]
     if not phase_records:
-        raise EvidenceValidationError(f"no records found for phase {phase!r}")
+        raise EvidenceGateError(f"no records found for phase {phase!r}")
 
     seen_scenarios = {r["scenario"] for r in phase_records}
     missing_scenarios = minimums["scenarios"] - seen_scenarios
     if missing_scenarios:
-        raise EvidenceValidationError(
+        raise EvidenceGateError(
             f"phase {phase!r}: missing scenario coverage for {sorted(missing_scenarios)}"
         )
 
     seen_outcomes = {r["outcome"] for r in phase_records}
     missing_outcomes = minimums["outcomes"] - seen_outcomes
     if missing_outcomes:
-        raise EvidenceValidationError(
+        raise EvidenceGateError(
             f"phase {phase!r}: missing outcome coverage for {sorted(missing_outcomes)}"
         )
 
     seen_strata = {(r["provider"], r["model"]) for r in phase_records}
     missing_strata = minimums["provider_model_strata"] - seen_strata
     if missing_strata:
-        raise EvidenceValidationError(
+        raise EvidenceGateError(
             f"phase {phase!r}: missing provider/model stratum coverage for {sorted(missing_strata)}"
         )
 
@@ -278,7 +270,7 @@ def check_phase_minimums(phase: str, records: Sequence[Mapping[str, Any]]) -> No
     for scenario, minimum in min_counts.items():
         count = sum(1 for r in phase_records if r["scenario"] == scenario)
         if count < minimum:
-            raise EvidenceValidationError(
+            raise EvidenceGateError(
                 f"phase {phase!r}: scenario {scenario!r} requires >= {minimum} record(s), got {count}"
             )
 
@@ -577,7 +569,13 @@ def write_manifest(
             )
         )
 
-    schema_hash = sha256_file(SCHEMA_PATH) if SCHEMA_PATH.exists() else ""
+    if not SCHEMA_PATH.exists():
+        # Stamping an empty digest here would still print "OK: ...
+        # promotion_eligible=True" even though `server/config.py`'s reader
+        # recomputes this same schema and fails closed on it downstream --
+        # better to fail the writer now than mislead the operator running it.
+        raise EvidenceGateError(f"evidence schema missing, cannot stamp manifest: {SCHEMA_PATH}")
+    schema_hash = sha256_file(SCHEMA_PATH)
     manifest = {
         "manifest_phase": manifest_phase,
         "promotion_eligible": promotion_eligible,
@@ -585,7 +583,7 @@ def write_manifest(
         "schema_hash": schema_hash,
         "source_commit": source_commit,
         "source_tree_hash": source_tree_hash,
-        "release_version": "0.1.3",
+        "release_version": Config().release_version,
         "feature_policy_fingerprint": feature_policy_fingerprint,
         "deployed_at_utc": deployed_at_utc,
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -753,7 +751,7 @@ def main(argv: list[str] | None = None) -> int:
                 feature_policy_fingerprint=args.feature_policy_fingerprint,
                 output=args.output,
             )
-        except (EvidenceValidationError, EvidenceGateError, OSError) as exc:
+        except (EvidenceGateError, OSError) as exc:
             print(f"FAIL: {exc}", file=sys.stderr)
             return 1
         print(
@@ -767,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         records = validate_artifact(args.phase, args.input)
-    except EvidenceValidationError as exc:
+    except EvidenceGateError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 

@@ -466,6 +466,23 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # phase must be bound too; only a provisional manifest may lack them.
     if not _MANIFEST_REQUIRED_FINAL_INPUTS <= set(manifest["inputs"]):
         return replace(identity, reason="incomplete_final_manifest")
+    # Unlike Phase 4C (byte-verified below), the Phase 0/1/2/3 `inputs`
+    # entries were previously only shape-checked (a non-empty path string, a
+    # well-formed hex digest) -- nothing recomputed the digest against the
+    # actual file on disk, so a `final` manifest's declared evidence hashes
+    # were never actually proven to describe the files they name. Making the
+    # Phase 4C byte-check the rule rather than the exception closes that gap.
+    for _phase_name in _MANIFEST_REQUIRED_FINAL_INPUTS:
+        _phase_entry = manifest["inputs"][_phase_name]
+        _phase_path = Path(_phase_entry["path"])
+        if not _phase_path.is_absolute():
+            _phase_path = Path(__file__).resolve().parents[1] / _phase_path
+        try:
+            _actual_phase_hash = hashlib.sha256(_phase_path.read_bytes()).hexdigest()
+        except OSError:
+            return replace(identity, reason="evidence_unresolvable")
+        if _actual_phase_hash != _phase_entry["sha256"]:
+            return replace(identity, reason="evidence_mismatch")
 
     policy = FeaturePolicy.from_config(config)
     expected_fingerprint = feature_policy_fingerprint(policy)
@@ -494,7 +511,18 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # readable file whose current bytes actually match it -- an unresolvable
     # or mismatched artifact is treated as stale/foreign, never trusted blindly.
     phase4c_hash = manifest.get("phase4c_artifact_sha256")
-    if phase4c_hash is not None:
+    if phase4c_hash is None:
+        # Omitting the field entirely must not be indistinguishable from "no
+        # Phase 4C attestation applies" when this deployment explicitly wants
+        # one: if `config.phase4c_artifact_path` is configured, an otherwise
+        # -valid `final` manifest that simply drops the field would silently
+        # skip the byte-verification below rather than being caught as an
+        # incomplete binding. The "both absent" case (no configured path,
+        # no declared hash) is the genuine no-Phase-4C-needed release and
+        # stays eligible.
+        if config.phase4c_artifact_path:
+            return replace(identity, reason="phase4c_binding_missing")
+    else:
         # Present-but-unusable is a forged binding, not an absent one: `""` or a
         # malformed digest previously fell through the truthiness test and
         # skipped every Phase 4C check.

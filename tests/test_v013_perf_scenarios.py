@@ -15,13 +15,13 @@ scope for this fixture (see ``scripts/smoke_conversation.py``).
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+from scripts.validate_v013_evidence import validate_artifact
 from server.perf_metrics import (
     AppTurnRecorder,
     CollectingMeasurementSink,
@@ -30,24 +30,6 @@ from server.perf_metrics import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_PATH = REPO_ROOT / "docs" / "benchmarks" / "v0.1.3-phase0-transport-baseline.jsonl"
-
-
-def _load_validator() -> Any:
-    """Import scripts/validate_v013_evidence.py by path.
-
-    ``scripts/`` is not a package, so this loads the module directly rather
-    than mutating ``sys.path`` at import time.
-    """
-    spec = importlib.util.spec_from_file_location(
-        "validate_v013_evidence", REPO_ROOT / "scripts" / "validate_v013_evidence.py"
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-validate_artifact = _load_validator().validate_artifact
 
 UNAVAILABLE = "unavailable"
 

@@ -27,7 +27,6 @@ matters for the *recorded reason*, even though ``promotion_eligible`` stays
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -35,34 +34,18 @@ from typing import Any
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate_v013_evidence.py"
-EVIDENCE_COMMON_PATH = REPO_ROOT / "scripts" / "_evidence_common.py"
-TRANSPORT_VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate_phase2_transport_browser_contract.py"
-
-
-def _load(path: Path, name: str) -> Any:
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _validator() -> Any:
-    if not VALIDATOR_PATH.exists() or not TRANSPORT_VALIDATOR_PATH.exists():
-        pytest.skip(
-            "validate_v013_evidence.py / validate_phase2_transport_browser_contract.py "
-            "not yet implemented (Phase 2 concurrent implementer)"
-        )
-    return _load(VALIDATOR_PATH, "validate_v013_evidence")
+    import scripts.validate_v013_evidence
+
+    return scripts.validate_v013_evidence
 
 
 def _evidence_common() -> Any:
-    if not EVIDENCE_COMMON_PATH.exists():
-        pytest.skip(
-            "scripts/_evidence_common.py not yet implemented (Phase 2 concurrent implementer)"
-        )
-    return _load(EVIDENCE_COMMON_PATH, "_evidence_common")
+    from scripts import _evidence_common
+
+    return _evidence_common
 
 
 UNAVAILABLE = "unavailable"
@@ -440,16 +423,9 @@ def test_evidence_common_status_enum_contains_the_documented_values() -> None:
 # `--phase3-input` and rejects any mismatch against the earlier phase0/1/2
 # artifacts, schema, source identity, or deployment/policy fingerprint.
 
-RECORD_PHASE3_PATH = REPO_ROOT / "scripts" / "record_phase3_completion.py"
-
 
 def _record_phase3_completion_script() -> Any:
-    if not RECORD_PHASE3_PATH.exists():
-        pytest.skip(
-            "scripts/record_phase3_completion.py not yet implemented "
-            "(Phase 3 concurrent implementer)"
-        )
-    return _load(RECORD_PHASE3_PATH, "record_phase3_completion")
+    return pytest.importorskip("scripts.record_phase3_completion")
 
 
 COMMAND_DIGEST = "e" * 64
@@ -781,7 +757,7 @@ def test_has_real_provider_stratum_rejects_an_unallowlisted_self_declared_provid
 
 def test_has_real_provider_stratum_accepts_an_allowlisted_pair() -> None:
     module = _validator()
-    provider, model = sorted(module.REAL_PROVIDER_ALLOWLIST)[0]
+    provider, model = min(module.REAL_PROVIDER_ALLOWLIST)
     records = [_phase0_record(provider=provider, model=model)]
 
     assert module.has_real_provider_stratum(records) is True

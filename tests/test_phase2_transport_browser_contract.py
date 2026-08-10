@@ -18,7 +18,6 @@ tests/test_v013_perf_scenarios.py) since ``scripts/`` is not a package.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -26,7 +25,6 @@ from typing import Any
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT_PATH = REPO_ROOT / "scripts" / "validate_phase2_transport_browser_contract.py"
 BUN_LOCK_PATH = REPO_ROOT / "web" / "bun.lock"
 PACKAGE_NAME = "@pipecat-ai/small-webrtc-transport"
 
@@ -51,15 +49,9 @@ SOURCE_ANCHOR = "https://github.com/pipecat-ai/small-webrtc-transport/tree/v1.10
 
 
 def _load_validator() -> Any:
-    if not SCRIPT_PATH.exists():
-        pytest.skip(f"{SCRIPT_PATH} not yet implemented (Phase 2 concurrent implementer)")
-    spec = importlib.util.spec_from_file_location(
-        "validate_phase2_transport_browser_contract", SCRIPT_PATH
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    import scripts.validate_phase2_transport_browser_contract
+
+    return scripts.validate_phase2_transport_browser_contract
 
 
 def _valid_audibility(**overrides: Any) -> dict[str, Any]:

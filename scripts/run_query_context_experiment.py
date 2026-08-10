@@ -85,7 +85,11 @@ RAW_REQUIRED = frozenset(
         "recorded_at_utc",
     }
 )
-RAW_ALLOWED = RAW_REQUIRED
+# `fixture_sha256` is populated by the collector (a sha256 of the exact
+# fixture file bytes each record's matched IDs/quality_score were resolved
+# against), not by the runner's raw output, so it is allowed but not
+# required -- an artifact predating this field is still valid raw shape.
+RAW_ALLOWED = RAW_REQUIRED | frozenset({"fixture_sha256"})
 
 
 OUTCOMES = frozenset({"success", "error", "timeout"})
@@ -174,6 +178,14 @@ def validate_raw_record(record: dict[str, Any], *, where: str = "record") -> Non
         require_type(snapshot, (str,), f"{where}: retrieval_snapshot_id")
         if not snapshot:
             raise EvidenceGateError(f"{where}: retrieval_snapshot_id must be non-empty or null")
+
+    if "fixture_sha256" in record:
+        fixture_digest = record["fixture_sha256"]
+        require_type(fixture_digest, (str,), f"{where}: fixture_sha256")
+        if len(fixture_digest) != 64 or any(c not in "0123456789abcdef" for c in fixture_digest):
+            raise EvidenceGateError(
+                f"{where}: fixture_sha256 must be a 64-character lowercase hex digest"
+            )
 
 
 def scorer_hash(

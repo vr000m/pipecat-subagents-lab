@@ -26,10 +26,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._evidence_common import EvidenceGateError, EvidenceStatus, require_nonempty_str
+from scripts._evidence_common import (
+    MIN_PAIRED_SAMPLES_PER_CELL,
+    EvidenceGateError,
+    EvidenceStatus,
+    FixtureIndex,
+    load_jsonl,
+    require_nonempty_str,
+    sha256_file,
+    validate_against_fixture,
+)
 from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
 
-MIN_PAIRED_SAMPLES_PER_CELL = 30
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1.json"
 
@@ -67,114 +75,13 @@ def _status_record(
     }
 
 
-class _FixtureIndex:
-    """The versioned fixture's own view of what any record may legally claim.
-
-    The collector cannot re-run `score_response`: raw records deliberately
-    carry no response text (that is the point of the strict allowlist). What
-    it *can* do -- and previously did not -- is refuse to take the record's
-    self-reported matches on trust. Recomputing `scorer_hash` from fields
-    the record itself supplies proves only internal consistency: an editor
-    who invents unknown or duplicate matches and recomputes the hash from
-    those fabricated values passes that check. Every match ID is therefore
-    resolved against the versioned fixture, and `quality_score` is
-    recomputed from the fixture's own denominator.
-    """
-
-    def __init__(self, fixture: dict[str, Any]) -> None:
-        self.version: str = fixture["fixture_version"]
-        self.turns: dict[str, dict[str, Any]] = {t["turn_id"]: t for t in fixture["turns"]}
-
-    def turn_for(self, fixture_turn_id: str) -> dict[str, Any]:
-        # The runner pairs repeats as "<turn_id>#<repeat_index>".
-        base_id = fixture_turn_id.split("#", 1)[0]
-        turn = self.turns.get(base_id)
-        if turn is None:
-            raise EvidenceGateError(
-                f"fixture_turn_id {fixture_turn_id!r} does not resolve to a turn in fixture "
-                f"version {self.version!r}"
-            )
-        return turn
-
-
-def _check_ids_against_fixture(
-    claimed: list[str], known: list[str], *, field: str, line_no: int
-) -> None:
-    unknown = [value for value in claimed if value not in set(known)]
-    if unknown:
-        raise EvidenceGateError(
-            f"line {line_no}: {field} contains ID(s) {sorted(unknown)} that the versioned "
-            "fixture does not declare -- forged or fabricated match"
-        )
-    if len(claimed) != len(set(claimed)):
-        raise EvidenceGateError(f"line {line_no}: {field} contains duplicate IDs")
-
-
-def _validate_against_fixture(
-    record: dict[str, Any], *, index: _FixtureIndex, line_no: int
-) -> None:
-    if record["fixture_version"] != index.version:
-        raise EvidenceGateError(
-            f"line {line_no}: fixture_version {record['fixture_version']!r} does not match the "
-            f"loaded fixture {index.version!r}"
-        )
-    turn = index.turn_for(record["fixture_turn_id"])
-    _check_ids_against_fixture(
-        record["matched_fact_ids"],
-        [fact["id"] for fact in turn["required_facts"]],
-        field="matched_fact_ids",
-        line_no=line_no,
-    )
-    _check_ids_against_fixture(
-        record["matched_citation_ids"],
-        [cite["id"] for cite in turn["expected_citations"]],
-        field="matched_citation_ids",
-        line_no=line_no,
-    )
-    _check_ids_against_fixture(
-        record["matched_disallowed_claim_ids"],
-        [claim["id"] for claim in turn["disallowed_claims"]],
-        field="matched_disallowed_claim_ids",
-        line_no=line_no,
-    )
-    # A citation is valid only when the fixture-expected fact it maps to was
-    # also matched -- the same binding `score_response` applies.
-    matched_facts = set(record["matched_fact_ids"])
-    for cite in turn["expected_citations"]:
-        if cite["id"] not in record["matched_citation_ids"]:
-            continue
-        expected_fact_id = cite.get("fact_id")
-        if expected_fact_id is not None and expected_fact_id not in matched_facts:
-            raise EvidenceGateError(
-                f"line {line_no}: citation {cite['id']!r} is claimed without its "
-                f"fixture-expected fact {expected_fact_id!r}"
-            )
-
-    denominator = len(turn["required_facts"]) + len(turn["expected_citations"])
-    if denominator == 0:
-        raise EvidenceGateError(
-            f"line {line_no}: fixture turn {turn['turn_id']!r} has a zero quality-score denominator"
-        )
-    numerator = (
-        len(record["matched_fact_ids"])
-        + len(record["matched_citation_ids"])
-        - len(record["matched_disallowed_claim_ids"])
-    )
-    expected_score = max(0.0, min(1.0, numerator / denominator))
-    if abs(float(record["quality_score"]) - expected_score) > 1e-9:
-        raise EvidenceGateError(
-            f"line {line_no}: quality_score {record['quality_score']!r} is not the fixture-derived "
-            f"score {expected_score!r} for its matched IDs"
-        )
-
-
 def _validate_raw_record(
-    record: dict[str, Any], *, line_no: int, fixture_index: _FixtureIndex
+    record: dict[str, Any], *, line_no: int, fixture_index: FixtureIndex
 ) -> None:
     if "status" in record:
         raise EvidenceGateError(f"line {line_no}: raw records must not carry a 'status' field")
     validate_raw_record(record, where=f"line {line_no}")
-    _validate_against_fixture(record, index=fixture_index, line_no=line_no)
+    validate_against_fixture(record, index=fixture_index, where=f"line {line_no}")
     expected_hash = scorer_hash(
         record["fixture_version"],
         record["fixture_turn_id"],
@@ -186,7 +93,7 @@ def _validate_raw_record(
     if record["scorer_hash"] != expected_hash:
         raise EvidenceGateError(
             f"line {line_no}: scorer_hash does not match its record's matched IDs/quality_score "
-            "-- forged, edited, or mismatched scorer provenance"
+            "-- internally inconsistent scorer provenance"
         )
 
 
@@ -195,22 +102,12 @@ def _cell_key(record: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def load_and_validate_raw(input_path: Path, *, fixture_path: Path) -> list[dict[str, Any]]:
-    fixture_index = _FixtureIndex(load_fixture(fixture_path))
-    records: list[dict[str, Any]] = []
-    with input_path.open("r", encoding="utf-8") as handle:
-        for line_no, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise EvidenceGateError(f"line {line_no}: invalid JSON ({exc})") from exc
-            if not isinstance(record, dict):
-                raise EvidenceGateError(f"line {line_no}: expected a JSON object")
-            _validate_raw_record(record, line_no=line_no, fixture_index=fixture_index)
-            records.append(record)
-    return records
+    fixture_index = FixtureIndex(load_fixture(fixture_path))
+
+    def _validate(line_no: int, record: dict[str, Any]) -> None:
+        _validate_raw_record(record, line_no=line_no, fixture_index=fixture_index)
+
+    return load_jsonl(input_path, validate_record=_validate)
 
 
 def normalize(
@@ -305,6 +202,16 @@ def main(argv: list[str] | None = None) -> int:
                 source_commit=args.source_commit,
                 source_tree_hash=args.source_tree_hash,
             )
+            if data_records:
+                # Bind each emitted record to the exact fixture bytes its
+                # matched IDs/quality_score were resolved against, not just
+                # the fixture's self-declared version string, so downstream
+                # Phase 4C binding can eventually tie the artifact to those
+                # bytes.
+                fixture_digest = sha256_file(args.fixture)
+                data_records = [
+                    {**record, "fixture_sha256": fixture_digest} for record in data_records
+                ]
     except (EvidenceGateError, OSError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
