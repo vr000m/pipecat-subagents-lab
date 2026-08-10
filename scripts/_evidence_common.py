@@ -104,7 +104,10 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+# Unanchored + `fullmatch` (the `server.config._is_hex_hash` idiom) rather than
+# `^...$` + `match`: `$` also matches just before a trailing newline, so
+# `"a" * 64 + "\n"` passed the anchored version.
+HEX64_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def require_hex64(value: Any, field: str) -> str:
@@ -115,7 +118,7 @@ def require_hex64(value: Any, field: str) -> str:
     here so none of them re-implements a weaker version of the same check.
     """
     require_type(value, (str,), field)
-    if HEX64_RE.match(value) is None:
+    if HEX64_RE.fullmatch(value) is None:
         raise EvidenceGateError(f"{field} must be a 64-character lowercase hex SHA-256 digest")
     return value
 

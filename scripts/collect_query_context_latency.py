@@ -29,7 +29,7 @@ from typing import Any
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _evidence_common import EvidenceGateError, EvidenceStatus
+from _evidence_common import EvidenceGateError, EvidenceStatus, require_nonempty_str
 from run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
 
 MIN_PAIRED_SAMPLES_PER_CELL = 30
@@ -41,12 +41,31 @@ def _now_utc() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _status_record(*, status: str, reason: str, record_count: int = 0) -> dict[str, Any]:
+def _status_record(
+    *,
+    status: str,
+    reason: str,
+    record_count: int = 0,
+    source_commit: str | None = None,
+    source_tree_hash: str | None = None,
+) -> dict[str, Any]:
+    """Build the deterministic status line written in place of data records.
+
+    Carries the same ``source_commit``/``source_tree_hash`` identity the other
+    evidence artifacts record (see ``scripts/record_phase3_completion.py``): a
+    blocked or not-run outcome is itself evidence a manifest cites, and
+    without the identity binding it could not be tied to the checkout it was
+    produced from -- any later run could be passed off as this one. They stay
+    ``None`` when the caller supplies no identity, so the field set is stable
+    and an unbound record is visibly unbound rather than merely silent.
+    """
     return {
         "status": status,
         "reason": reason,
         "promotion_eligible": False,
         "record_count": record_count,
+        "source_commit": source_commit,
+        "source_tree_hash": source_tree_hash,
         "generated_at_utc": _now_utc(),
     }
 
@@ -199,6 +218,9 @@ def load_and_validate_raw(input_path: Path, *, fixture_path: Path) -> list[dict[
 
 def normalize(
     records: list[dict[str, Any]],
+    *,
+    source_commit: str | None = None,
+    source_tree_hash: str | None = None,
 ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]]]:
     """Return (status, status_record_or_none, data_records).
 
@@ -209,7 +231,12 @@ def normalize(
     if not records:
         return (
             EvidenceStatus.NOT_RUN.value,
-            _status_record(status=EvidenceStatus.NOT_RUN.value, reason="no_paid_samples"),
+            _status_record(
+                status=EvidenceStatus.NOT_RUN.value,
+                reason="no_paid_samples",
+                source_commit=source_commit,
+                source_tree_hash=source_tree_hash,
+            ),
             [],
         )
 
@@ -223,6 +250,8 @@ def normalize(
                 status=EvidenceStatus.BLOCKED.value,
                 reason="undersized_cell",
                 record_count=len(records),
+                source_commit=source_commit,
+                source_tree_hash=source_tree_hash,
             )
             | {"undersized_cells": detail},
             [],
@@ -244,18 +273,41 @@ def main(argv: list[str] | None = None) -> int:
             "documented --input/--output invocation is unchanged."
         ),
     )
+    parser.add_argument(
+        "--source-commit",
+        default=None,
+        help="Commit the run was produced from; recorded in a blocked/not-run status line.",
+    )
+    parser.add_argument(
+        "--source-tree-hash",
+        default=None,
+        help="Tree hash the run was produced from; recorded in a blocked/not-run status line.",
+    )
     args = parser.parse_args(argv)
 
     try:
+        if args.source_commit is not None:
+            require_nonempty_str(args.source_commit, "--source-commit")
+        if args.source_tree_hash is not None:
+            require_nonempty_str(args.source_tree_hash, "--source-tree-hash")
         if not args.input.exists():
             _status, status_record, data_records = (
                 EvidenceStatus.NOT_RUN.value,
-                _status_record(status=EvidenceStatus.NOT_RUN.value, reason="no_paid_samples"),
+                _status_record(
+                    status=EvidenceStatus.NOT_RUN.value,
+                    reason="no_paid_samples",
+                    source_commit=args.source_commit,
+                    source_tree_hash=args.source_tree_hash,
+                ),
                 [],
             )
         else:
             raw_records = load_and_validate_raw(args.input, fixture_path=args.fixture)
-            _status, status_record, data_records = normalize(raw_records)
+            _status, status_record, data_records = normalize(
+                raw_records,
+                source_commit=args.source_commit,
+                source_tree_hash=args.source_tree_hash,
+            )
     except (EvidenceGateError, OSError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

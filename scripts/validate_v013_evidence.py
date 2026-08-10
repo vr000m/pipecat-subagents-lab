@@ -126,6 +126,19 @@ PHASE_MINIMUMS: Mapping[str, Mapping[str, frozenset[Any]]] = {
         "provider_model_strata": frozenset({("unavailable", "unavailable")}),
     },
 }
+# The (provider, model) pairs this release actually supports for paid, real
+# evidence collection. `has_real_provider_stratum` checks membership here
+# rather than "is not the string 'unavailable'": the negative check let an
+# artifact self-declare any provider name (e.g. "fake-provider") into the
+# paid stratum. The only real pair the collection tooling can produce is
+# `run_query_context_experiment.DEFAULT_PROVIDER`/`DEFAULT_MODEL`; the
+# runner's dry-run stratum ("synthetic"/"dry-run-fixture") is deliberately
+# absent. Adding a provider/model here is what admits it to promotion.
+REAL_PROVIDER_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("openai", "gpt-4o-search-preview"),
+    }
+)
 # "two records each for the queued-discard and admitted-completion race
 # scenarios" -- a minimum *count*, not just presence, so it is checked
 # separately from PHASE_MINIMUMS' presence-only sets.
@@ -279,13 +292,16 @@ def validate_artifact(phase: str, input_path: Path) -> list[dict[str, Any]]:
 
 
 def has_real_provider_stratum(records: list[Mapping[str, Any]]) -> bool:
-    """True if any record uses a non-credential-free provider/model stratum.
+    """True if any record uses an allowlisted real provider/model stratum.
 
     The credential-free ``unavailable``/``unavailable`` stratum can validate
     schema/lifecycle correctness but can never make a manifest
-    promotion-eligible; this is the check that enforces that split.
+    promotion-eligible; this is the check that enforces that split. Membership
+    in ``REAL_PROVIDER_ALLOWLIST`` is required rather than merely differing
+    from ``"unavailable"``, so an artifact cannot self-declare an arbitrary
+    provider name into the paid stratum.
     """
-    return any(r["provider"] != "unavailable" or r["model"] != "unavailable" for r in records)
+    return any((r["provider"], r["model"]) in REAL_PROVIDER_ALLOWLIST for r in records)
 
 
 def _validate_transport_contract(input_path: Path) -> dict[str, Any]:
@@ -381,7 +397,9 @@ PHASE4C_STRING_FIELDS = frozenset({"fixture_version", "scorer_version", "generat
 PHASE4C_ALLOWED_FIELDS = (
     frozenset({"status", "promotion_eligible"}) | PHASE4C_HASH_LIKE_FIELDS | PHASE4C_STRING_FIELDS
 )
-_HEX_RE = re.compile(r"^[0-9a-f]+$")
+# Unanchored + `fullmatch`, matching `_evidence_common.HEX64_RE` and
+# `server.config._is_hex_hash`: `$` also matches before a trailing newline.
+_HEX_RE = re.compile(r"[0-9a-f]+")
 
 
 def _validate_phase4c_artifact(payload: Any) -> None:
@@ -420,7 +438,7 @@ def _validate_phase4c_artifact(payload: Any) -> None:
             # manifest that the schema would have rejected.
             require_hex64(value, f"phase4c artifact: {name}")
             continue
-        if not isinstance(value, str) or not value or not _HEX_RE.match(value):
+        if not isinstance(value, str) or not value or not _HEX_RE.fullmatch(value):
             raise EvidenceGateError(
                 f"phase4c artifact: {name} must be a non-empty lowercase hex string"
             )

@@ -472,7 +472,12 @@ def _base_manifest(**overrides: Any) -> dict[str, Any]:
         "deployed_at_utc": "2026-08-04T00:00:00Z",
         "generated_at_utc": "2026-08-05T00:00:00Z",
         "phase3_completion_hash": PHASE3_COMPLETION_HASH,
+        # A `final` manifest must bind every earlier phase, as the real writer
+        # above emits.
         "inputs": {
+            "phase0": {"path": "phase0.jsonl", "sha256": "0" * 64},
+            "phase1": {"path": "phase1.jsonl", "sha256": "1" * 64},
+            "phase2": {"path": "phase2-transport.json", "sha256": "2" * 64},
             "phase3": {"path": "phase3-completion.json", "sha256": PHASE3_COMPLETION_HASH},
         },
     }
@@ -522,7 +527,10 @@ def test_load_promotion_manifest_rejects_a_phase4c_hash_that_does_not_match_the_
         manifest_path,
         _base_manifest(
             feature_policy_fingerprint=_real_fingerprint(config),
-            phase4c_artifact_sha256="wrong" + "0" * 59,
+            # A well-formed digest that simply is not the artifact's: a non-hex
+            # value is now rejected as a malformed binding before the content
+            # comparison this test is about.
+            phase4c_artifact_sha256="a" * 64,
         ),
     )
     config = _add_phase4c_path(config, phase4c_path)

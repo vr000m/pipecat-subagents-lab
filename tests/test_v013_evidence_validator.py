@@ -724,3 +724,64 @@ def test_atomic_write_ignores_a_planted_predictable_temp_file(tmp_path: Path) ->
 
     assert victim.read_text(encoding="utf-8") == "untouched"
     assert json.loads(output.read_text())["manifest_phase"] == "new"
+
+
+# --- hex-digest validation and the paid-stratum allowlist -------------------
+#
+# Both hex patterns were `^...$` matched with `re.match`, and `$` also matches
+# immediately before a trailing newline -- so a digest with a trailing `\n`
+# validated. And `has_real_provider_stratum` tested `!= "unavailable"`, so any
+# self-declared provider name counted as a real paid stratum.
+
+
+def _phase4c_artifact(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "promoted",
+        "promotion_eligible": True,
+        "post_change_source_commit": SOURCE_COMMIT,
+        "post_change_source_tree_hash": SOURCE_TREE_HASH,
+        "phase3_completion_hash": "1" * 64,
+        "phase4b_baseline_input_sha256": "2" * 64,
+        "phase4b_normalized_input_sha256": "3" * 64,
+        "experiment_command_digest": "4" * 64,
+        "analyzer_command_digest": "5" * 64,
+        "scorer_hash": "6" * 64,
+        "control_fingerprint": "7" * 64,
+        "fixture_version": "qcl-test-v1",
+        "scorer_version": "scorer-v1",
+        "generated_at_utc": "2026-08-05T00:00:00Z",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_require_hex64_rejects_a_digest_with_a_trailing_newline() -> None:
+    module = _evidence_common()
+
+    with pytest.raises(module.EvidenceGateError):
+        module.require_hex64("a" * 64 + "\n", "some_field")
+
+
+def test_phase4c_hash_like_field_rejects_a_digest_with_a_trailing_newline() -> None:
+    """`_HEX_RE` guards the non-SHA256 hash-like Phase 4C fields; a trailing
+    newline must not pass there either."""
+    module = _validator()
+    payload = _phase4c_artifact(experiment_command_digest="4" * 64 + "\n")
+
+    with pytest.raises(module.EvidenceGateError):
+        module._validate_phase4c_artifact(payload)
+
+
+def test_has_real_provider_stratum_rejects_an_unallowlisted_self_declared_provider() -> None:
+    module = _validator()
+    records = [_phase0_record(provider="fake-provider-not-unavailable", model="also-fake")]
+
+    assert module.has_real_provider_stratum(records) is False
+
+
+def test_has_real_provider_stratum_accepts_an_allowlisted_pair() -> None:
+    module = _validator()
+    provider, model = sorted(module.REAL_PROVIDER_ALLOWLIST)[0]
+    records = [_phase0_record(provider=provider, model=model)]
+
+    assert module.has_real_provider_stratum(records) is True

@@ -529,6 +529,34 @@ def test_collector_passes_through_a_fully_populated_cell(tmp_path: Path) -> None
     assert all("status" not in line for line in lines)
 
 
+def test_collector_blocked_status_record_carries_source_commit_and_tree_hash(
+    tmp_path: Path,
+) -> None:
+    """A blocked outcome is itself evidence a manifest cites, so it has to
+    carry the same source_commit/source_tree_hash identity binding a
+    successful run's artifacts do -- otherwise any later run's status line
+    could be passed off as this checkout's."""
+    module = _collector()
+    common = _evidence_common()
+    raw_input = tmp_path / "raw.jsonl"
+    _write_jsonl(raw_input, [_valid_raw_record()])  # one record: undersized cell
+    output = tmp_path / "normalized.jsonl"
+    exit_code = module.main(
+        [
+            *_collector_argv(raw_input, output, tmp_path),
+            "--source-commit",
+            "abc123",
+            "--source-tree-hash",
+            "def456",
+        ]
+    )
+    assert exit_code == 0
+    line = json.loads(output.read_text().splitlines()[0])
+    assert line["status"] == common.EvidenceStatus.BLOCKED.value
+    assert line["source_commit"] == "abc123"
+    assert line["source_tree_hash"] == "def456"
+
+
 # --- 4B: analyzer -----------------------------------------------------------
 
 
@@ -1017,36 +1045,79 @@ def test_analyzer_bootstrap_is_exactly_reproducible_with_seed_0(tmp_path: Path) 
     assert first["analysis"]["bootstrap_iterations"] == 10_000
 
 
-def test_analyzer_gap_does_not_yet_reject_forbidden_raw_fields(tmp_path: Path) -> None:
-    """KNOWN GAP: the plan's Testing Notes list 'forbidden raw fields' among
-    the analyzer's own rejection matrix, but the delivered analyze()/
-    build_analysis() never runs the closed_object allowlist check itself
-    (only the runner/collector do). This documents the gap as an xfail
-    rather than silently omitting the plan-required case."""
+def test_analyzer_rejects_forbidden_raw_fields(tmp_path: Path) -> None:
+    """The plan's Testing Notes list 'forbidden raw fields' among the
+    analyzer's own rejection matrix: build_analysis() re-runs the strict raw
+    allowlist over its input rather than trusting the collector to have done
+    it, so a leaked prompt field is rejected here too."""
     module = _analyzer()
     records = _paired_cells(n=5, baseline_latency=1000, narrowed_latency=600)
     records[0]["prompt"] = "leaked prompt text"
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
     exit_code = module.main(["--input", str(input_path), "--output", str(output)])
-    if exit_code == 0:
-        pytest.xfail("analyzer does not re-run the raw allowlist check itself (Phase 4B gap)")
     assert exit_code != 0
 
 
-def test_analyzer_gap_does_not_yet_reject_a_missing_selected_dimension(tmp_path: Path) -> None:
-    """KNOWN GAP: 'analyzer tests cover missing dimensions' per the plan's
-    Phase 4B testing notes, but build_analysis() never reads
-    selected_dimension at all, so a record missing it is silently accepted
-    today."""
+def test_analyzer_rejects_a_missing_selected_dimension(tmp_path: Path) -> None:
+    """'Analyzer tests cover missing dimensions' per the plan's Phase 4B
+    testing notes: selected_dimension is a required raw field, so a record
+    missing it must not reach the promotion rubric."""
     module = _analyzer()
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
     del records[0]["selected_dimension"]
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
     exit_code = module.main(["--input", str(input_path), "--output", str(output)])
-    if exit_code == 0:
-        pytest.xfail("analyzer does not validate selected_dimension presence (Phase 4B gap)")
+    assert exit_code != 0
+
+
+def test_analyzer_rejects_a_record_with_a_scorer_hash_that_does_not_match_the_fixture(
+    tmp_path: Path,
+) -> None:
+    """The analyzer is the promotion gate, and nothing stops a hand-edited
+    JSONL from reaching it after the collector ran. A scorer_hash that the
+    record's own fixture identity, matched IDs, and quality_score do not
+    derive is forged provenance and must be rejected, not analyzed."""
+    module = _analyzer()
+    records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    records[0]["scorer_hash"] = "a" * 64
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
+    assert exit_code != 0
+
+
+def test_analyzer_blocks_promotion_when_one_stratum_is_undersized_and_another_is_complete(
+    tmp_path: Path,
+) -> None:
+    """A complete stratum next to an undersized one used to promote on the
+    complete one alone. Incomplete coverage of the collected strata blocks the
+    whole decision."""
+    module = _analyzer()
+    common = _evidence_common()
+    records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    for record in _paired_cells(n=5, baseline_latency=1000, narrowed_latency=600):
+        records.append({**record, "model": "gpt-undersized", "run_id": f"under-{record['run_id']}"})
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    assert module.main(["--input", str(input_path), "--output", str(output)]) == 0
+    result = json.loads(output.read_text())
+    assert result["status"] == common.EvidenceStatus.BLOCKED.value
+    assert result["reason"] == "incomplete_stratum_coverage"
+    assert result["promotion_eligible"] is False
+    assert result["analysis"]["undersized_strata"] == ["openai/gpt-undersized=5"]
+
+
+def test_analyzer_rejects_mixed_selected_dimension_values(tmp_path: Path) -> None:
+    """Two dimensions in one input describe two different experiments; pooling
+    them would attribute one dimension's latency change to the other."""
+    module = _analyzer()
+    records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    records[0]["selected_dimension"] = "answer_chars"
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    exit_code = module.main(["--input", str(input_path), "--output", str(output)])
     assert exit_code != 0
 
 

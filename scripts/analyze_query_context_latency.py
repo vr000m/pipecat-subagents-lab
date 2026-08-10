@@ -30,7 +30,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _evidence_common import EvidenceGateError, EvidenceStatus, load_jsonl
-from run_query_context_experiment import validate_raw_record
+from run_query_context_experiment import scorer_hash, validate_raw_record
 
 BOOTSTRAP_ITERATIONS = 10_000
 BOOTSTRAP_SEED = 0
@@ -115,9 +115,10 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     Raises ``EvidenceGateError`` for input-contract violations (missing
     dimensions, forbidden/unknown fields, duplicate or unpaired fixture-turn
-    identities, mixed fixture versions). Returns a terminal result dict for
-    every other outcome, including halts required by named assumptions
-    (a)-(d).
+    identities, mixed fixture/scorer versions, mixed selected dimensions, a
+    scorer_hash that does not bind its own record). Returns a terminal result
+    dict for every other outcome, including halts required by named
+    assumptions (a)-(d).
 
     Re-validates every record against the strict raw allowlist even though
     ``collect_query_context_latency.py`` already did so: the analyzer must
@@ -128,7 +129,27 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
     so this runs the same full type/range validator the collector uses.
     """
     for index, record in enumerate(records):
-        validate_raw_record(record, where=f"record {index}")
+        where = f"record {index}"
+        validate_raw_record(record, where=where)
+        # Shape validation alone accepted a record whose scorer_hash was
+        # unrelated to the matched IDs and quality_score it claims, so an edit
+        # made after scoring (or a wholly invented row) reached the promotion
+        # rubric. Recomputing the same provenance hash the runner emitted
+        # binds each row back to its own scored values, the way the collector
+        # already does before it ever writes the analyzer's input.
+        expected_scorer_hash = scorer_hash(
+            record["fixture_version"],
+            record["fixture_turn_id"],
+            matched_fact_ids=record["matched_fact_ids"],
+            matched_citation_ids=record["matched_citation_ids"],
+            matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
+            quality_score=record["quality_score"],
+        )
+        if record["scorer_hash"] != expected_scorer_hash:
+            raise EvidenceGateError(
+                f"{where}: scorer_hash does not match its record's matched IDs/quality_score "
+                "-- forged, edited, or mismatched scorer provenance"
+            )
 
     fixture_versions = {r["fixture_version"] for r in records}
     if len(fixture_versions) > 1:
@@ -138,6 +159,13 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
     scorer_versions = {r["scorer_version"] for r in records}
     if len(scorer_versions) > 1:
         raise EvidenceGateError(f"mixed scorer_version values in input: {sorted(scorer_versions)}")
+    selected_dimensions = {r["selected_dimension"] for r in records}
+    if len(selected_dimensions) > 1:
+        raise EvidenceGateError(
+            f"mixed selected_dimension values in input: {sorted(selected_dimensions)} -- the "
+            "experiment selects exactly one dimension, so records from different dimensions "
+            "describe different experiments and must not be pooled"
+        )
 
     by_stratum: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for record in records:
@@ -260,6 +288,24 @@ def build_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
             status=EvidenceStatus.BLOCKED.value,
             reason="undersized_cell",
             analysis={"undersized_strata": undersized},
+        )
+
+    # A stratum that was dropped for too few pairs or for having no
+    # retrieval-snapshot control was only excluded from the pairwise analysis,
+    # so a run where one provider/model collected cleanly and another did not
+    # still promoted -- on the surviving stratum alone, silently narrowing the
+    # claim from "this holds across the collected strata" to "this holds
+    # somewhere". Any dropped stratum means the collected evidence does not
+    # cover the strata it purports to, so the whole decision blocks.
+    if undersized or uncontrolled_strata:
+        return _terminal(
+            status=EvidenceStatus.BLOCKED.value,
+            reason="incomplete_stratum_coverage",
+            analysis={
+                "strata": per_stratum_report,
+                "undersized_strata": undersized,
+                "uncontrolled_strata": uncontrolled_strata,
+            },
         )
 
     strata = sorted(per_stratum_pair_improvements)

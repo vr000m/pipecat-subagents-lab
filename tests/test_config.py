@@ -1098,6 +1098,80 @@ def test_load_promotion_manifest_rejects_a_final_manifest_with_no_phase3_input_e
     assert verdict.reason == "incomplete_final_manifest"
 
 
+def test_load_promotion_manifest_treats_an_unreadable_schema_file_as_unverifiable_not_matching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an unreadable schema file returned "matches", making
+    "cannot verify" indistinguishable from "verified" to the caller."""
+    from server import config as config_module
+
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(tmp_path)
+    monkeypatch.setattr(
+        config_module, "_EVIDENCE_SCHEMA_PATH", tmp_path / "no-such-schema.json", raising=True
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_unverifiable"
+
+
+def test_load_promotion_manifest_rejects_an_empty_string_phase4c_hash(tmp_path: Path) -> None:
+    """Regression: `if phase4c_hash:` treated `""` as absent, skipping every
+    Phase 4C path and hash check."""
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(tmp_path, phase4c_artifact_sha256="")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "phase4c_binding_mismatch"
+
+
+def test_load_promotion_manifest_rejects_a_final_manifest_missing_a_phase0_binding(
+    tmp_path: Path,
+) -> None:
+    """A `final` manifest attests the whole evidence chain, so a valid Phase 3
+    binding alone is not enough."""
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(
+        tmp_path,
+        inputs={
+            "phase1": {"path": "phase1.jsonl", "sha256": "1" * 64},
+            "phase2": {"path": "phase2.json", "sha256": "2" * 64},
+            "phase3": {"path": "phase3.json", "sha256": "3" * 64},
+        },
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "incomplete_final_manifest"
+
+
+def test_load_promotion_manifest_rejects_a_malformed_generated_at_utc_with_no_deployed_at_configured(
+    tmp_path: Path,
+) -> None:
+    """Regression: `generated_at_utc` was only parsed inside the staleness
+    comparison, so with `deployed_at_utc` unset its format was never checked."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path, deployed_at_utc=None)
+    assert config.deployed_at_utc is None
+    manifest_path.write_text(
+        json.dumps(_final_manifest(config=config, generated_at_utc="not-a-timestamp")),
+        encoding="utf-8",
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_invalid"
+
+
 @pytest.mark.parametrize(
     "env_name",
     [

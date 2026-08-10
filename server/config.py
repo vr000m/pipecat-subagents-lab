@@ -15,6 +15,7 @@ from importlib.metadata import version as _package_version
 from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 _FALLBACK_RELEASE_VERSION = "0.1.3"
@@ -279,6 +280,10 @@ _MANIFEST_REQUIRED_FIELDS = frozenset(
 )
 
 
+# Every phase a `final` manifest must carry an `inputs` binding for.
+_MANIFEST_REQUIRED_FINAL_INPUTS = frozenset({"phase0", "phase1", "phase2", "phase3"})
+
+
 _HEX_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 
 # Manifest keys whose value must be a JSON string. `reason` is deliberately
@@ -306,22 +311,24 @@ def _is_hex_hash(value: object) -> bool:
 _EVIDENCE_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "shared/schemas/v013-evidence.json"
 
 
-def _schema_hash_matches(declared: str) -> bool:
+def _schema_hash_matches(declared: str) -> Literal["match", "mismatch", "unverifiable"]:
     """Recompute the evidence schema digest the manifest declares.
 
     The writer stamps `schema_hash` from `shared/schemas/v013-evidence.json`;
     accepting it as "some 64-hex string" let a forged manifest declare an
     arbitrary schema binding. The evidence schemas are deliberately excluded
-    from the deployable runtime set, so a packaged install legitimately may
-    not ship this file -- when it is absent the digest is unverifiable and
-    this check abstains rather than failing a valid deployment. When the file
-    *is* present (dev, CI, repo checkout) the digest must match.
+    from the deployable runtime set, so a packaged install may genuinely not
+    ship this file -- but "cannot verify" is not "verified", so it is reported
+    as its own state rather than collapsed into a match, and the caller decides
+    fail-closed.
     """
     try:
         data = _EVIDENCE_SCHEMA_PATH.read_bytes()
     except OSError:
-        return True
-    return hashlib.sha256(data).hexdigest() == declared
+        return "unverifiable"
+    if hashlib.sha256(data).hexdigest() == declared:
+        return "match"
+    return "mismatch"
 
 
 def _parse_utc_timestamp(value: str) -> datetime:
@@ -408,8 +415,18 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
             return _unavailable("manifest_schema_invalid")
         if not _is_hex_hash(entry.get("sha256")):
             return _unavailable("manifest_schema_invalid")
-    if not _schema_hash_matches(manifest["schema_hash"]):
+    schema_verdict = _schema_hash_matches(manifest["schema_hash"])
+    if schema_verdict == "unverifiable":
+        return _unavailable("manifest_schema_unverifiable")
+    if schema_verdict == "mismatch":
         return _unavailable("manifest_schema_hash_mismatch")
+    # `generated_at_utc` is parsed unconditionally: when no `deployed_at_utc`
+    # is configured there is no staleness comparison to force the parse, and a
+    # field whose format was never checked is not a verified field.
+    try:
+        generated_at = _parse_utc_timestamp(manifest["generated_at_utc"])
+    except ValueError:
+        return _unavailable("manifest_schema_invalid")
 
     manifest_phase = manifest["manifest_phase"]
     if manifest_phase not in {"provisional", "final"}:
@@ -445,6 +462,10 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         return replace(identity, reason="incomplete_final_manifest")
     if phase3_entry.get("sha256") != manifest["phase3_completion_hash"]:
         return replace(identity, reason="phase3_binding_mismatch")
+    # A *final* manifest attests the whole evidence chain, so every earlier
+    # phase must be bound too; only a provisional manifest may lack them.
+    if not _MANIFEST_REQUIRED_FINAL_INPUTS <= set(manifest["inputs"]):
+        return replace(identity, reason="incomplete_final_manifest")
 
     policy = FeaturePolicy.from_config(config)
     expected_fingerprint = feature_policy_fingerprint(policy)
@@ -462,9 +483,7 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         if manifest[manifest_key] != config_value:
             return replace(identity, reason="source_mismatch")
     deployed_at = config.deployed_at_utc
-    if deployed_at and _parse_utc_timestamp(manifest["generated_at_utc"]) < _parse_utc_timestamp(
-        deployed_at
-    ):
+    if deployed_at and generated_at < _parse_utc_timestamp(deployed_at):
         return replace(identity, reason="stale")
 
     if manifest["promotion_eligible"] is not True:
@@ -475,7 +494,12 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # readable file whose current bytes actually match it -- an unresolvable
     # or mismatched artifact is treated as stale/foreign, never trusted blindly.
     phase4c_hash = manifest.get("phase4c_artifact_sha256")
-    if phase4c_hash:
+    if phase4c_hash is not None:
+        # Present-but-unusable is a forged binding, not an absent one: `""` or a
+        # malformed digest previously fell through the truthiness test and
+        # skipped every Phase 4C check.
+        if not _is_hex_hash(phase4c_hash):
+            return replace(identity, reason="phase4c_binding_mismatch")
         phase4c_artifact_path = config.phase4c_artifact_path
         if not phase4c_artifact_path:
             return replace(identity, reason="phase4c_unresolvable")
