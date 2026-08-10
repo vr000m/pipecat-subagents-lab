@@ -113,6 +113,26 @@ def test_pause_preserves_paused_state_and_resume_records_resumed_transition() ->
     assert scheduler.state.speech[replay.utterance_id].state == DeliveryState.RESUMED
 
 
+def test_reconnect_interrupt_terminalizes_paused_items_instead_of_stranding_them() -> None:
+    """A paused utterance is only resumable through this scheduler, which a
+    reconnect discards -- so ``interrupt(reconnect=True)`` must terminalize it
+    rather than leave a non-terminal PAUSED record shipping in every future
+    snapshot."""
+    state = SessionState()
+    scheduler = _scheduler(state)
+    first = enqueue(scheduler, "work-1", "answer")
+    asyncio.run(scheduler.start_next())
+    scheduler.pause("work-1")
+    assert state.speech[first.utterance_id].state == DeliveryState.PAUSED
+
+    scheduler.interrupt(reconnect=True)
+
+    assert scheduler.paused("work-1") is None
+    assert state.speech[first.utterance_id].state == DeliveryState.INTERRUPTED_BY_RECONNECT
+    snapshot_states = [progress.state for progress in state.snapshot().speech_progress]
+    assert DeliveryState.PAUSED not in snapshot_states
+
+
 def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
     async def run() -> None:
         scheduler = _scheduler()

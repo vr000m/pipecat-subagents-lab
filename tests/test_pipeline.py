@@ -351,6 +351,37 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
     asyncio.run(run())
 
 
+def test_synthesis_started_on_a_superseded_connection_does_not_mutate_scheduler_state() -> None:
+    """Only the *active* connection's provider callbacks may mutate scheduler
+    state. ``synthesis_started`` was the one branch of ``on_tts_event`` missing
+    the ``current`` guard its three siblings carry."""
+
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+
+        await host._handle_transcript("Riga weather")
+        assert connection.scheduler.active is not None
+        utterance_id = connection.scheduler.active.item.utterance_id
+
+        # Supersede without deactivate()'s interrupt, which would release the
+        # lease and make provider_started's own guard fire for the wrong reason.
+        connection.active = False
+
+        await tts.on_event("synthesis_started", utterance_id)
+
+        assert connection.scheduler._provider_contexts == {}
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_delivery_completed_event_does_not_bypass_the_lifecycle_coordinator() -> None:
     """With a coordinator installed, an on_event-based "delivery_completed"
     callback must not release the scheduler's active lease directly -- only
@@ -4310,6 +4341,53 @@ def test_retained_result_from_replaced_origin_epoch_suppresses_commit_as_stale()
     asyncio.run(run())
 
 
+def test_suppressed_stale_late_commit_terminalizes_the_work_status() -> None:
+    """``suppressed_stale`` fires when the late result's own ``origin_epoch``
+    differs from the one its ledger key was dispatched under, so *no* copy
+    committed under this key. Emitting no status (the ``suppressed_duplicate``
+    rule) stranded the child at its dispatch-time ``searching`` and shipped the
+    non-terminal parent in every subsequent snapshot."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(measurement_sink=sink)
+        result = GroundedResult(
+            result_id="result-stale-status",
+            worker_id="worker-search",
+            turn_id="turn-stale-status",
+            text="Old",
+            spoken_text="Old",
+            origin_epoch=1,
+        )
+        _register_dispatch_recorder(
+            host, "work-stale-status", origin_epoch=2, turn_id="turn-stale-status"
+        )
+        host._emit_work_status(
+            turn_id="turn-stale-status",
+            work_item_id="work-stale-status",
+            worker_id="worker-search",
+            state="searching",
+            origin_epoch=2,
+        )
+        assert host.state.work_status_snapshot()[0].state == "searching"
+
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host,
+                turn_id="turn-stale-status",
+                work_item_id="work-stale-status",
+                origin_epoch=2,
+            ),
+            LateResult(work_item_id="work-stale-status", worker_id="worker-search", result=result),
+        )
+
+        parent = host.state.work_status_snapshot()[0]
+        assert parent.work_item_id == "work-stale-status"
+        assert parent.state == "failed"
+
+    asyncio.run(run())
+
+
 def test_retained_result_without_active_connection_marks_speech_disconnected() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
@@ -6160,9 +6238,11 @@ def _reference_delegated_child_site(
 def _reference_late_commit_site(
     work_outcome: str | None, commit_outcome: str | None, terminal_kind: str | None
 ) -> tuple[str, str | None] | None:
-    if commit_outcome in {"suppressed_duplicate", "suppressed_stale"}:
-        # The work already succeeded once; suppressing the redundant copy is
-        # not a failure of the work item, so no status is emitted at all.
+    if commit_outcome == "suppressed_duplicate":
+        # Another copy of this exact result_id already committed and drove the
+        # work item terminal, so no status is emitted at all. suppressed_stale
+        # is not in that position -- nothing committed under this ledger key --
+        # so it must still terminalize below.
         return None
     if work_outcome == "completed" and commit_outcome == "committed":
         return "result_ready", None
@@ -7126,8 +7206,15 @@ def test_suppressed_duplicate_late_result_emits_no_work_status() -> None:
     asyncio.run(run())
 
 
-def test_suppressed_stale_late_result_emits_no_work_status() -> None:
-    """I4, stale-epoch half of the same suppression rule."""
+def test_suppressed_stale_late_result_emits_terminal_work_status() -> None:
+    """I4, stale-epoch half of the suppression rule.
+
+    Unlike a suppressed duplicate (some other copy already committed and
+    drove the work item terminal), a suppressed-stale result means no copy
+    committed under this ledger key at all -- emitting nothing would strand
+    the child, and the parent aggregate with it, at its non-terminal
+    dispatch-time status forever.
+    """
 
     from server.work_item_coordinator import LateResult
 
@@ -7155,7 +7242,7 @@ def test_suppressed_stale_late_result_emits_no_work_status() -> None:
             ),
         )
 
-        assert _work_status_states(host) == []
+        assert _work_status_states(host) == ["failed"]
         await host.shutdown()
 
     asyncio.run(run())
@@ -7332,6 +7419,119 @@ def test_multi_intent_child_never_returned_by_fan_in_is_reconciled_to_failed() -
         assert parent.work_item_id == "work-turn-fan"
         assert parent.state == "failed"
         assert _work_status_states(host)[-1] == "failed"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_during_the_early_ack_yield_window_reaches_the_dispatched_search() -> None:
+    """``_search_with_timeout`` registers the search task, but it is not entered
+    until after ``_emit_early_ack`` awaits a scheduling tick. A cancel arriving
+    inside that yield window unwinds the (tracked) turn task; unless the search
+    task is tracked at dispatch it stays untracked and keeps running with its
+    result discarded."""
+
+    async def run() -> None:
+        class SlowWorker(ResultWorker):
+            async def search(
+                self, query: str, *, turn_id: str, origin_epoch: int | None
+            ) -> GroundedResult:
+                await asyncio.sleep(5)
+                return await super().search(query, turn_id=turn_id, origin_epoch=origin_epoch)
+
+        worker = SlowWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "slow", "model_policy": "deep"},
+        )()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=RoutedCoordinator(worker),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+
+        dispatched: list[asyncio.Task[object]] = []
+        real_dispatch = host._dispatch_search_task
+
+        def recording_dispatch(*args: object, **kwargs: object) -> object:
+            task = real_dispatch(*args, **kwargs)  # type: ignore[arg-type]
+            if task is not None:
+                dispatched.append(task)
+            return task
+
+        host._dispatch_search_task = recording_dispatch  # type: ignore[method-assign]
+
+        tracked_at_ack: list[bool] = []
+        real_emit_early_ack = host._emit_early_ack
+
+        async def cancelling_emit_early_ack(*args: object, **kwargs: object) -> None:
+            tracked_at_ack.append(
+                any(dispatched[0] in tasks for tasks in host._inflight_work_tasks.values())
+            )
+            # A cancel landing exactly inside the ack's scheduling-tick yield.
+            host._cancel_work(None)
+            await real_emit_early_ack(*args, **kwargs)  # type: ignore[arg-type]
+
+        host._emit_early_ack = cancelling_emit_early_ack  # type: ignore[method-assign]
+
+        turn = asyncio.create_task(host._handle_transcript("slow search"))
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        assert dispatched, "the search was never dispatched"
+        assert tracked_at_ack == [True], "the search task was untracked across the yield window"
+        await asyncio.gather(*dispatched, return_exceptions=True)
+        assert dispatched[0].cancelled()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_cancel_racing_the_commit_downgrades_the_pre_derived_status() -> None:
+    """``deferred_status`` is derived for every matched item *before* the commit
+    loop. A cancel landing between that derivation and an item's
+    ``_commit_and_speak`` await makes the commit silently no-op (it
+    short-circuits and returns the result unchanged rather than raising), so the
+    pre-derived ``result_ready`` must be downgraded to the outcome that actually
+    happened instead of being published as-is."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(results=(_fan_in_result("turn-race-0", "first answer"),)), sink
+        )
+        origin = await host.connect(_capable_handshake(host, 1))
+
+        real_commit_and_speak = host._commit_and_speak
+
+        async def cancel_racing_commit_and_speak(
+            result: GroundedResult, *args: object, **kwargs: object
+        ) -> object:
+            # Stand in for a concurrent cancel arriving after derivation but
+            # before this item's commit reads the cancel set.
+            host._cancelled_work_items.add(f"work-{result.turn_id}")
+            return await real_commit_and_speak(result, *args, **kwargs)  # type: ignore[arg-type]
+
+        host._commit_and_speak = cancel_racing_commit_and_speak  # type: ignore[method-assign]
+
+        await host._handle_multi_intent(
+            _multi_intent_outcome("only item"),
+            "only item",
+            origin,
+            "turn-race",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-race"),
+        )
+
+        # The turn's sole child was suppressed, so the parent aggregate is that
+        # child's state. Before the fix this published ``result_ready`` for a
+        # commit that never happened.
+        parent = host.state.work_status_snapshot()[0]
+        assert parent.work_item_id == "work-turn-race"
+        assert parent.state == "cancelled"
+        assert "result_ready" not in _work_status_states(host)
         await host.shutdown()
 
     asyncio.run(run())

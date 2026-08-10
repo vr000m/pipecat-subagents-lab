@@ -93,6 +93,7 @@ class SessionState:
     # entry per delegated turn forever. Mirrors the handshake-token cap in
     # pipeline.py (evict oldest-first once over the cap).
     _MAX_WORK_STATUS_KEYS = 256
+    _MAX_WORK_STATUS_SEQUENCES = 8192
 
     def __init__(self, session_id: str | None = None, resume_token: str | None = None) -> None:
         self.session_id = session_id or f"session-{uuid4().hex}"
@@ -113,13 +114,16 @@ class SessionState:
         # WorkStatusKey. Both hold the per-key event_sequence independently
         # of the global SessionState sequence (Requirements/Sequence
         # namespaces).
-        # Ledger invariant: the three dicts are keyed in lockstep. Every
-        # insertion and every eviction must touch all three together -- a key
-        # dropped from _work_status_parents but left in
-        # _work_status_sequence would let a later record for the same key
-        # resume from a stale counter (or, after a full drop of only the
-        # parent, restart event_sequence at 1) and be rejected as stale by
-        # the client reducer. _forget_work_status() is the only eviction path.
+        # Ledger invariant: _work_status_children and _work_status_parents are
+        # keyed in lockstep, and every insertion touches all three dicts
+        # together. Eviction is deliberately *not* symmetric:
+        # _work_status_sequence outlives the record it counts for. An evicted
+        # key can still be written again -- a sibling multi-intent child, or a
+        # late commit's finalization, may call set_child_work_status for the
+        # same key after its parent went terminal -- and dropping the counter
+        # would restart event_sequence at 1, which the client reducer rejects
+        # as stale. The counter is one int per key, so it is capped separately
+        # and far more generously than the records themselves.
         self._work_status_children: dict[WorkStatusKey, dict[str, WorkStatus]] = {}
         self._work_status_parents: dict[WorkStatusKey, _WorkStatusRecord] = {}
         self._work_status_sequence: dict[WorkStatusKey, int] = {}
@@ -376,10 +380,31 @@ class SessionState:
         return self._emit("work_status", status.model_dump(mode="json"))
 
     def _forget_work_status(self, key: WorkStatusKey) -> None:
-        """Drop one ledger key from all three dicts in lockstep."""
+        """Drop one ledger key's records, keeping its event_sequence counter.
+
+        See the eviction note in ``__init__``: the counter must survive so a
+        later record for the same key continues monotonically instead of
+        restarting at 1.
+        """
         self._work_status_children.pop(key, None)
         self._work_status_parents.pop(key, None)
-        self._work_status_sequence.pop(key, None)
+        self._prune_work_status_sequences()
+
+    def _prune_work_status_sequences(self) -> None:
+        """Bound the surviving-counter map, dropping oldest orphans first.
+
+        Only counters whose records are already gone are eligible; among those
+        the least recently inserted goes first (dicts preserve insertion order,
+        and re-writing an existing key does not move it).
+        """
+        if len(self._work_status_sequence) <= self._MAX_WORK_STATUS_SEQUENCES:
+            return
+        excess = len(self._work_status_sequence) - self._MAX_WORK_STATUS_SEQUENCES
+        orphans = [
+            key for key in self._work_status_sequence if key not in self._work_status_parents
+        ]
+        for key in orphans[:excess]:
+            self._work_status_sequence.pop(key, None)
 
     def _evict_work_status_overflow(self, *, protect: WorkStatusKey) -> None:
         """Bound the ledger, evicting the oldest terminal record first.

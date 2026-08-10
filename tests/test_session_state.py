@@ -383,18 +383,20 @@ def _ledger_keysets(state: SessionState) -> tuple[set, set, set]:
 
 
 def assert_ledger_lockstep(state: SessionState) -> None:
-    """Invariant: the three work-status dicts are keyed in lockstep.
+    """Invariant: the two *record* dicts are keyed in lockstep, and every live
+    record has an ``event_sequence`` counter.
 
-    A key retained in ``_work_status_sequence`` after being dropped from
-    ``_work_status_parents`` would let ``event_sequence`` continue from a
-    stale counter (or restart at 1 after a full drop) and be rejected by the
-    client reducer, so insertion and eviction must always touch all three.
+    The counter map is deliberately a superset: an evicted key can still be
+    written again (a sibling multi-intent child, or a late commit's
+    finalization), and dropping its counter would restart ``event_sequence`` at
+    1 and be rejected as stale by the client reducer.
     """
     children, parents, sequence = _ledger_keysets(state)
-    assert children == parents == sequence
+    assert children == parents
+    assert parents <= sequence
 
 
-def test_expired_terminal_work_status_is_deleted_from_all_three_ledger_dicts(
+def test_expired_terminal_work_status_record_is_deleted_but_its_sequence_survives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = [0.0]
@@ -412,8 +414,55 @@ def test_expired_terminal_work_status_is_deleted_from_all_three_ledger_dicts(
 
     assert key not in state._work_status_children
     assert key not in state._work_status_parents
-    assert key not in state._work_status_sequence
+    assert state._work_status_sequence[key] == 1
     assert_ledger_lockstep(state)
+
+
+@pytest.mark.parametrize("evict_via", ("ttl", "overflow"))
+def test_event_sequence_continues_after_its_record_was_evicted(
+    monkeypatch: pytest.MonkeyPatch, evict_via: str
+) -> None:
+    """Regression: eviction used to drop ``_work_status_sequence[key]`` too, so
+    a later record for the same key (a sibling multi-intent child, or a late
+    commit's finalization) restarted ``event_sequence`` at 1 and was rejected
+    as stale by the client reducer."""
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    for child_state in ("routing", "searching", "result_ready"):
+        state.set_child_work_status(
+            turn_id="turn-1",
+            work_item_id="child-a",
+            parent_work_item_id="parent-1",
+            state=child_state,
+            origin_epoch=1,
+        )
+    key = next(iter(state._work_status_parents))
+    assert state._work_status_parents[key].status.event_sequence == 3
+
+    if evict_via == "ttl":
+        clock[0] = WORK_STATUS_TTL_SECONDS
+        assert state.work_status_snapshot() == ()
+    else:
+        for index in range(SessionState._MAX_WORK_STATUS_KEYS + 1):
+            clock[0] = float(index + 1)
+            state.set_child_work_status(
+                turn_id=f"filler-{index}",
+                work_item_id=f"work-{index}",
+                state="result_ready",
+                origin_epoch=1,
+            )
+    assert key not in state._work_status_parents
+
+    state.set_child_work_status(
+        turn_id="turn-1",
+        work_item_id="child-b",
+        parent_work_item_id="parent-1",
+        state="routing",
+        origin_epoch=1,
+    )
+    assert state._work_status_parents[key].status.event_sequence == 4
 
 
 def test_live_terminal_work_status_is_not_deleted_before_the_ttl(

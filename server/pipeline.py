@@ -295,14 +295,6 @@ def _work_status_for_outcome(
     return "failed", ("retention_rejected" if terminal_kind == "retention_rejected" else None)
 
 
-#: Commit outcomes that mean "this exact result was already delivered once, or
-#: belongs to a superseded epoch" -- the work itself succeeded, so suppressing
-#: the redundant copy is not a failure of the work item.
-_SUPPRESSED_COMMIT_OUTCOMES: frozenset[str] = frozenset(
-    {"suppressed_duplicate", "suppressed_stale"}
-)
-
-
 def _late_commit_work_status(
     work_outcome: str | None,
     *,
@@ -311,13 +303,19 @@ def _late_commit_work_status(
 ) -> tuple[WorkStatusState, TerminalReason | None] | None:
     """The coarse work-status for one late-result commit attempt.
 
-    A suppressed duplicate or suppressed stale result emits *no* status at
-    all: the work item already reached its terminal state from the copy that
-    did commit, and reporting the suppression as ``failed`` would tell a
-    capable client that successful work had failed. Every other case defers to
-    ``_work_status_for_outcome`` so the late and foreground sites cannot drift.
+    A suppressed *duplicate* emits no status at all: some other copy of this
+    exact ``result_id`` already committed and drove the work item to its
+    terminal state, so reporting the redundant copy as ``failed`` would tell a
+    capable client that successful work had failed. ``suppressed_stale`` is
+    *not* in that position -- it fires when the late result's own
+    ``origin_epoch`` differs from the one its ledger key was dispatched under,
+    which means no copy committed under this key at all. Emitting nothing
+    there strands the child at its non-terminal dispatch-time status, and the
+    parent aggregate with it, for the life of the session. Every other case
+    defers to ``_work_status_for_outcome`` so the late and foreground sites
+    cannot drift.
     """
-    if commit_outcome in _SUPPRESSED_COMMIT_OUTCOMES:
+    if commit_outcome == "suppressed_duplicate":
         return None
     return _work_status_for_outcome(
         work_outcome,
@@ -816,7 +814,7 @@ class SessionHost:
                         callback_result = await callback_result
                 current = self.connection is pipeline and pipeline.active
                 has_lifecycle = pipeline.lifecycle is not None
-                if event == "synthesis_started":
+                if event == "synthesis_started" and current:
                     pipeline.scheduler.provider_started(context_id)
                 elif event == "synthesis_ended" and current:
                     pipeline.scheduler.provider_synthesis_ended(context_id)
@@ -1553,6 +1551,15 @@ class SessionHost:
                 search_task = self._dispatch_search_task(
                     search, transcript, turn_id=turn_id, origin_epoch=origin_epoch
                 )
+                if search_task is not None:
+                    # Track before the first await below. `_emit_early_ack`
+                    # yields a scheduling tick to the search, and
+                    # `_search_with_timeout` only registers the task after
+                    # that; a cancel arriving inside the yield window reaches
+                    # the (tracked) turn task and unwinds this frame without
+                    # ever touching an untracked search task, which would keep
+                    # running with its result discarded.
+                    self._track_work_task(work_item_id, search_task)
                 self._emit_work_status(
                     turn_id=turn_id,
                     work_item_id=work_item_id,
@@ -2404,10 +2411,21 @@ class SessionHost:
                 # Each item's terminal work-status is emitted only after its
                 # own commit returns, so `result_ready` is never published for
                 # a result whose commit raised.
+                #
+                # `deferred_status` was derived above from the cancel set as it
+                # stood *before* this loop. A cancel landing between then and
+                # this await makes _commit_and_speak silently skip the commit
+                # and return normally, so the pre-derived status has to be
+                # downgraded to the outcome that actually happened rather than
+                # published as-is.
+                suppressed: set[str] = set()
                 try:
                     committed.append(
                         await self._commit_and_speak(
-                            results[index], origin, role=speech_roles.get(index, ROLE_RESULT)
+                            results[index],
+                            origin,
+                            role=speech_roles.get(index, ROLE_RESULT),
+                            suppressed_out=suppressed,
                         )
                     )
                 except Exception as exc:  # noqa: BLE001  # isolate one item's speak failure from its siblings; re-raised below once all items are committed
@@ -2432,6 +2450,8 @@ class SessionHost:
                     pending_status = deferred_status.pop(index, None)
                     if pending_status is not None:
                         item_id, item_worker_id, status_state, status_reason = pending_status
+                        if item_id in suppressed:
+                            status_state, status_reason = "cancelled", None
                         self._emit_work_status(
                             turn_id=turn_id,
                             work_item_id=item_id,
@@ -2993,6 +3013,7 @@ class SessionHost:
         *,
         role: SpeechRole = ROLE_RESULT,
         require_tts: bool = True,
+        suppressed_out: set[str] | None = None,
     ) -> GroundedResult:
         """Commit a result and speak only when its originating epoch is active.
 
@@ -3001,6 +3022,14 @@ class SessionHost:
         the default), while the main-responder direct/unsupported/clarify
         replies still enqueue through the scheduler's no-TTS pre-admission
         terminal path so their progress is recorded even with no transport.
+
+        The cancelled short-circuit below returns the result unchanged rather
+        than raising, and it consumes the cancel marker as it goes, so a
+        caller cannot tell after the fact that nothing was committed. A caller
+        whose own bookkeeping depends on that (the multi-intent commit loop,
+        which pre-derives each item's terminal work-status before the loop)
+        passes ``suppressed_out`` to receive the work_item_id of any commit
+        this call actually suppressed.
         """
         origin_epoch = result.origin_epoch
         work_item_id = f"work-{result.turn_id}"
@@ -3008,6 +3037,8 @@ class SessionHost:
             self._cancelled_work_items.discard(work_item_id)
             self._known_work_items.discard(work_item_id)
             self._clarification_candidates.pop(result.result_id, None)
+            if suppressed_out is not None:
+                suppressed_out.add(work_item_id)
             return result
         self._commit_result_state(result)
         self._known_work_items.discard(work_item_id)

@@ -423,6 +423,19 @@ class SpeechScheduler:
                     )
             self._queues.clear()
             self._ack_index.clear()
+            # A paused item holds a non-terminal PAUSED record in
+            # SessionState.speech, and only resume() can clear it. After a
+            # reconnect this scheduler and its lifecycle coordinator are gone,
+            # so no resume can ever arrive, and the snapshot would ship that
+            # PAUSED entry forever. Terminalize it like any queued item.
+            for item in self._paused.values():
+                self._emit_progress(
+                    item,
+                    state,
+                    allow_stale_reconnect=True,
+                    **({"origin_epoch": epoch} if epoch is not None else {}),
+                )
+            self._paused.clear()
         return active_item
 
     def pause(self, work_item_id: str) -> None:
