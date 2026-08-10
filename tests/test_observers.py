@@ -37,6 +37,11 @@ def run(coro_fn) -> None:
     asyncio.run(coro_fn())
 
 
+async def _no_snapshot() -> None:
+    """No-op ``snapshot_writer`` for call sites that don't care about step 3."""
+    return
+
+
 # --- RuntimeObserver.subscribe() no longer constructs RTVIServerMessageFrame
 
 
@@ -172,7 +177,9 @@ class TestSnapshotBarrierOrdering:
                     origin_epoch=1,
                 )
             )  # queued behind the barrier -- must not reach the network yet
-            await barrier.install_baseline(watermark=state.sequence, flush_writer=writer)
+            await barrier.install_baseline(
+                watermark=state.sequence, flush_writer=writer, snapshot_writer=_no_snapshot
+            )
 
         run(body)
 
@@ -202,7 +209,11 @@ class TestSnapshotBarrierOrdering:
                 )
             )
             watermark = state.sequence  # equal to the just-queued event's sequence
-            await barrier.install_baseline(watermark=watermark, flush_writer=self._fake_writer([]))
+            await barrier.install_baseline(
+                watermark=watermark,
+                flush_writer=self._fake_writer([]),
+                snapshot_writer=_no_snapshot,
+            )
 
         run(body)
 
@@ -229,7 +240,11 @@ class TestSnapshotBarrierOrdering:
                     origin_epoch=1,
                 )
             )  # sequence above the pre-recorded watermark
-            await barrier.install_baseline(watermark=watermark, flush_writer=self._fake_writer([]))
+            await barrier.install_baseline(
+                watermark=watermark,
+                flush_writer=self._fake_writer([]),
+                snapshot_writer=_no_snapshot,
+            )
 
         run(body)
 
@@ -252,7 +267,11 @@ class TestSnapshotBarrierOrdering:
 
             observer.subscribe(on_projected)
             watermark = state.sequence
-            await barrier.install_baseline(watermark=watermark, flush_writer=self._fake_writer([]))
+            await barrier.install_baseline(
+                watermark=watermark,
+                flush_writer=self._fake_writer([]),
+                snapshot_writer=_no_snapshot,
+            )
             state.set_worker(
                 WorkerState(
                     worker_id="worker-weather",
@@ -301,6 +320,7 @@ class TestSnapshotBarrierOrdering:
                 await barrier.install_baseline(
                     watermark=state.sequence,
                     flush_writer=never_acknowledges,
+                    snapshot_writer=_no_snapshot,
                     timeout=0.01,
                 )
             # Failing closed means the observer is usable again, not paused
@@ -340,6 +360,7 @@ class TestSnapshotBarrierOrdering:
                 barrier.install_baseline(
                     watermark=state.sequence,
                     flush_writer=never_acknowledges,
+                    snapshot_writer=_no_snapshot,
                     timeout=30.0,
                 )
             )

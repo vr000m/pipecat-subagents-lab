@@ -465,6 +465,44 @@ def test_event_sequence_continues_after_its_record_was_evicted(
     assert state._work_status_parents[key].status.event_sequence == 4
 
 
+def test_work_status_sequence_survives_high_volume_eviction_and_never_restarts_at_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the sequence-counter map used to be pruned once distinct
+    WorkStatusKeys crossed a fixed threshold, dropping counters for
+    already-evicted-but-orphaned keys. A key reused after its counter was
+    pruned would restart ``event_sequence`` at 1 -- rejected as stale by the
+    client reducer. The counter map must survive unboundedly instead."""
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+
+    state.set_child_work_status(
+        turn_id="turn-first", work_item_id="work-first", state="result_ready", origin_epoch=1
+    )
+    first_key = next(iter(state._work_status_parents))
+
+    distinct_keys_beyond_the_old_threshold = 8192 + 500
+    for index in range(distinct_keys_beyond_the_old_threshold):
+        clock[0] = float(index + 1)
+        state.set_child_work_status(
+            turn_id=f"filler-{index}",
+            work_item_id=f"work-{index}",
+            state="result_ready",
+            origin_epoch=1,
+        )
+
+    assert first_key not in state._work_status_parents
+    assert state._work_status_sequence[first_key] == 1
+    assert len(state._work_status_sequence) > 8192
+
+    state.set_child_work_status(
+        turn_id="turn-first", work_item_id="work-first", state="routing", origin_epoch=1
+    )
+    assert state._work_status_parents[first_key].status.event_sequence == 2
+
+
 def test_live_terminal_work_status_is_not_deleted_before_the_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

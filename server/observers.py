@@ -24,11 +24,14 @@ _ALWAYS_VISIBLE_KINDS = frozenset(
     }
 )
 # Kinds admitted only when the connection negotiated the matching capability.
-# Membership here is the *admission* half; the per-kind capability check in
-# ``RuntimeObserver._visible`` is the *gate* half. A kind must appear in
-# exactly one of these two sets.
-_CAPABILITY_GATED_KINDS = frozenset({"work_status"})
-_VISIBLE_KINDS = _ALWAYS_VISIBLE_KINDS | _CAPABILITY_GATED_KINDS
+# Each predicate is the *gate* half, consulted by ``RuntimeObserver._visible``;
+# membership in this mapping is the *admission* half. A gated kind is looked
+# up here rather than hardcoded per-kind in ``_visible``, so a future gated
+# kind added only here cannot be silently admitted ungated.
+_CAPABILITY_GATED_KINDS: dict[str, Callable[[RuntimeObserver], bool]] = {
+    "work_status": lambda observer: observer.supports_work_status,
+}
+_VISIBLE_KINDS = _ALWAYS_VISIBLE_KINDS | frozenset(_CAPABILITY_GATED_KINDS)
 
 # Upper bound on how long `SnapshotBarrier.install_baseline` waits for its
 # flush frame to be acknowledged. The plan requires the observer to own
@@ -76,6 +79,9 @@ class RuntimeObserver:
         self._unsubscribe: Callable[[], None] | None = None
         self._projected_sequence = 0
         self._emit: Callable[[Any], Any] | None = None
+        # Keep deferred emit tasks referenced so they aren't garbage-collected
+        # mid-flight (e.g. suspended inside worker.queue_frame); see _deliver.
+        self._emit_tasks: set[asyncio.Task[Any]] = set()
         # SnapshotBarrier pause/replay state. Buffers raw StateEvents (not yet
         # projected) while a barrier owns the handoff between deciding to
         # (re)install a snapshot and actually installing its watermark.
@@ -101,7 +107,8 @@ class RuntimeObserver:
     def _visible(self, event: StateEvent) -> bool:
         if event.payload.get("origin_epoch") != self.epoch:
             return False
-        if event.kind == "work_status" and not self.supports_work_status:
+        gate = _CAPABILITY_GATED_KINDS.get(event.kind)
+        if gate is not None and not gate(self):
             return False
         return event.kind in _VISIBLE_KINDS
 
@@ -152,7 +159,9 @@ class RuntimeObserver:
         # A connection emitter is normally a coroutine scheduled by the
         # transport callback. Do not make state mutation await a network send.
         if inspect.isawaitable(result):
-            asyncio.create_task(result)
+            task = asyncio.create_task(result)
+            self._emit_tasks.add(task)
+            task.add_done_callback(self._emit_tasks.discard)
 
     def _on_event(self, event: StateEvent) -> None:
         if self._paused:
@@ -293,7 +302,7 @@ class SnapshotBarrier:
         *,
         watermark: int,
         flush_writer: Callable[[Any], Any],
-        snapshot_writer: Callable[[], Any] | None = None,
+        snapshot_writer: Callable[[], Any],
         timeout: float | None = None,
     ) -> None:
         """Write the barrier frame, await its delivery, write the snapshot, replay.
@@ -332,8 +341,7 @@ class SnapshotBarrier:
         try:
             await flush_writer(frame)
             await asyncio.wait_for(acked, wait_seconds)
-            if snapshot_writer is not None:
-                await snapshot_writer()
+            await snapshot_writer()
         except BaseException:
             acked.cancel()
             self.cancel()
