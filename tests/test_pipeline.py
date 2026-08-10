@@ -7492,3 +7492,228 @@ def test_validate_patch_handshake_raises_on_a_wrong_handshake_argument() -> None
     host = SessionHost(runner_factory=LifecycleRunner)
     with pytest.raises(AttributeError):
         host.validate_patch_handshake(None, object())  # type: ignore[arg-type]
+
+
+# --- Batch 1: ack lifecycle ownership across retained work -----------------
+#
+# An ack belongs to the semantic turn that delegated the work. Four coupled
+# gaps let that ownership be dropped or misattributed while the work was still
+# running, so an ack could be spoken for work the user had cancelled or that
+# had already been rejected.
+
+
+def test_ack_work_item_id_accessor_matches_every_call_site() -> None:
+    """The ack's scheduler key is built in exactly one place. A call site that
+    rebuilt the ``ack-{turn_id}`` literal itself would keep working until the
+    format changed, then silently fail to find the ack it meant to settle."""
+    import inspect
+
+    from server.speech_scheduler import ROLE_ACK
+
+    assert inspect.getsource(SessionHost).count('f"ack-{turn_id}"') == 1
+
+    async def run() -> None:
+        from unittest.mock import patch
+
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+        turn_id = "turn-accessor"
+        calls: list[str] = []
+
+        def spy(spied_turn_id: str) -> str:
+            calls.append(spied_turn_id)
+            return f"spy-ack-{spied_turn_id}"
+
+        with patch.object(SessionHost, "_ack_work_item_id", staticmethod(spy)):
+            # Emission: the enqueued key is the accessor's, not a literal.
+            await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
+            assert f"spy-ack-{turn_id}" in origin.scheduler._queues
+            assert origin.scheduler._queues[f"spy-ack-{turn_id}"][0].role == ROLE_ACK
+
+            # Cancellation: settling the sole delegated child finds that key.
+            host._register_turn_work_item(turn_id, "work-turn-accessor")
+            await host.cancel_turn_or_child(turn_id, "work-turn-accessor", origin=origin)
+            assert f"spy-ack-{turn_id}" not in origin.scheduler._queues
+            assert turn_id not in host._ack_emitted_turns
+
+            # A turn handler's post-commit discard reaches the same key.
+            await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
+            assert origin.scheduler.discard_queued_ack(host._ack_work_item_id(turn_id)) is not None
+
+        assert calls.count(turn_id) >= 3
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
+    """A capable client's retained continuation returns from its handler while
+    the child keeps running. Releasing the turn's ack ownership on that early
+    return left a later cancel unable to resolve the child back to its turn,
+    so the queued ack survived and could still be spoken for cancelled work."""
+
+    from server.speech_scheduler import ROLE_ACK
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = _pending_host(_submitted(pending_work_item_ids=("work-turn-pending",)), sink)
+        origin = await host.connect(_capable_handshake(host, 1))
+        turn_id = "turn-pending"
+        ack_work_item_id = host._ack_work_item_id(turn_id)
+        host._ack_emitted_turns.add(turn_id)
+        origin.scheduler.enqueue(
+            result_id=None,
+            work_item_id=ack_work_item_id,
+            run_id=f"run-{ack_work_item_id}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=ack_work_item_id,
+            turn_id=turn_id,
+        )
+
+        assert (
+            await host._handle_pending(
+                _pending_outcome(),
+                "continue please",
+                origin,
+                turn_id,
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+            )
+            is None
+        )
+
+        # The child is still running, so its ack ownership outlives the handler.
+        assert host._turn_work_items.get(turn_id) == {"work-turn-pending"}
+        assert host._ack_turn_for_work_item("work-turn-pending") == turn_id
+
+        await host.cancel_turn_or_child(
+            host._ack_turn_for_work_item("work-turn-pending"),
+            "work-turn-pending",
+            origin=origin,
+        )
+
+        assert ack_work_item_id not in origin.scheduler._queues
+        assert ack_work_item_id not in origin.scheduler._ack_index
+        assert turn_id not in host._ack_emitted_turns
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_rejection_retracts_an_already_admitted_ack() -> None:
+    """A turn whose every dispatched item is rejected speaks nothing, so an ack
+    already admitted to the transport would be the turn's only utterance -- a
+    promise of a result that is never coming. ``discard_queued_ack`` cannot
+    reach an admitted item, so the retraction has to use ``cancel``."""
+
+    from server.speech_scheduler import ROLE_ACK
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(_submitted(), sink)
+        host.tts = FakeTTS()
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+        turn_id = "turn-fan"
+        ack_work_item_id = host._ack_work_item_id(turn_id)
+        host._ack_emitted_turns.add(turn_id)
+        origin.scheduler.enqueue(
+            result_id=None,
+            work_item_id=ack_work_item_id,
+            run_id=f"run-{ack_work_item_id}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=ack_work_item_id,
+            turn_id=turn_id,
+        )
+        await origin.scheduler.start_next(ack_work_item_id)
+        active = origin.scheduler.active
+        assert active is not None and active.item.role == ROLE_ACK
+
+        committed = await host._handle_multi_intent(
+            _multi_intent_outcome("first", "second"),
+            "first and second",
+            origin,
+            turn_id,
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+        )
+
+        assert committed == ()
+        assert origin.scheduler.active is None
+        assert ack_work_item_id not in origin.scheduler._queues
+        assert ack_work_item_id not in origin.scheduler._ack_index
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> None:
+    """A cancel whose target has no latched ack owner must still cancel that
+    target's work and speech, and must not settle some other turn's ack. The
+    control turn's own id is not a safe fallback owner."""
+
+    from server.speech_scheduler import ROLE_ACK
+
+    async def run() -> None:
+        class ControlCoordinator:
+            def __init__(self) -> None:
+                self.target: str | None = None
+
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": (self.target,) if self.target else (),
+                        "control_action": "cancel",
+                    },
+                )()
+
+        coordinator = ControlCoordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS(), coordinator=coordinator)
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+
+        # An unrelated turn holding a live, latched ack. Nothing about
+        # cancelling an unowned target may touch it.
+        other_turn = "turn-other"
+        other_ack = host._ack_work_item_id(other_turn)
+        host._ack_emitted_turns.add(other_turn)
+        host._register_turn_work_item(other_turn, "work-turn-other")
+        origin.scheduler.enqueue(
+            result_id=None,
+            work_item_id=other_ack,
+            run_id=f"run-{other_ack}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=other_ack,
+            turn_id=other_turn,
+        )
+        # The cancel target: real queued speech, but no latched ack owner.
+        origin.scheduler.enqueue(
+            result_id="result-orphan",
+            work_item_id="work-orphan",
+            run_id="run-orphan",
+            text="orphan answer",
+            origin_epoch=1,
+        )
+        assert host._ack_turn_for_work_item("work-orphan") is None
+
+        coordinator.target = "work-orphan"
+        await host._handle_transcript("cancel work-orphan")
+
+        # The target's own cancellation still ran...
+        assert "work-orphan" not in origin.scheduler._queues
+        # ...and the unrelated turn's ack and latch are untouched.
+        assert other_ack in origin.scheduler._queues
+        assert other_turn in host._ack_emitted_turns
+        assert host._turn_work_items.get(other_turn) == {"work-turn-other"}
+        await host.shutdown()
+
+    asyncio.run(run())

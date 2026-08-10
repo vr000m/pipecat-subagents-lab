@@ -998,6 +998,11 @@ class SessionHost:
             self.connection = None
             self.state.active_epoch = None
 
+    @staticmethod
+    def _ack_work_item_id(turn_id: str) -> str:
+        """The one synthetic scheduler key this turn's ack is enqueued under."""
+        return f"ack-{turn_id}"
+
     def _clear_ack_latch(self, turn_id: str) -> None:
         self._ack_emitted_turns.discard(turn_id)
 
@@ -1013,6 +1018,22 @@ class SessionHost:
 
     def _release_turn_work_items(self, turn_id: str) -> None:
         self._turn_work_items.pop(turn_id, None)
+
+    def _release_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
+        """Release one delegated child, keeping the turn's ack alive for siblings.
+
+        The turn's ack latch is settled only once the *last* registered child
+        is released: a turn whose other children are still running in the
+        background must stay resolvable by ``_ack_turn_for_work_item`` so a
+        later cancel can still find and settle its ack.
+        """
+        items = self._turn_work_items.get(turn_id)
+        if items is None:
+            return
+        items.discard(work_item_id)
+        if not items:
+            self._turn_work_items.pop(turn_id, None)
+            self._clear_ack_latch(turn_id)
 
     def _ack_turn_for_work_item(self, work_item_id: str) -> str | None:
         """The latched semantic turn that owns ``work_item_id``, if any.
@@ -1099,7 +1120,7 @@ class SessionHost:
             await asyncio.sleep(0)
             if search_task.done():
                 return
-        ack_work_item_id = f"ack-{turn_id}"
+        ack_work_item_id = self._ack_work_item_id(turn_id)
 
         def enqueue_ack() -> None:
             origin.scheduler.enqueue(
@@ -1183,7 +1204,7 @@ class SessionHost:
 
     async def cancel_turn_or_child(
         self,
-        turn_id: str,
+        turn_id: str | None,
         child_work_item_id: str | None = None,
         *,
         origin: ConnectionPipeline | None = None,
@@ -1204,17 +1225,24 @@ class SessionHost:
         pair for the *requested* target only: the parent ack is ephemeral and
         never counts towards a caller's "did this cancel hit anything?"
         decision.
+
+        ``turn_id`` is ``None`` when no latched ack owns the target: the
+        target's own work and speech are still cancelled, and only the
+        ack-settling half is skipped. Passing an unrelated turn instead (the
+        control turn, say) would settle *that* turn's ack.
         """
         origin = origin or self.connection
-        ack_work_item_id = f"ack-{turn_id}"
+        ack_work_item_id = self._ack_work_item_id(turn_id) if turn_id is not None else None
         if origin is None:
-            self._clear_ack_latch(turn_id)
+            if turn_id is not None:
+                self._clear_ack_latch(turn_id)
             return (), ()
         scheduler = origin.scheduler
         if child_work_item_id is None:
             cancelled_work = self._cancel_work(None, exclude_work_item_id=exclude_work_item_id)
             cancelled_speech = scheduler.cancel(None)
-            self._clear_ack_latch(turn_id)
+            if turn_id is not None:
+                self._clear_ack_latch(turn_id)
             for item in cancelled_speech:
                 # A whole-turn sweep removes every live ack, including acks
                 # belonging to earlier turns; their latches go with them.
@@ -1225,6 +1253,8 @@ class SessionHost:
             child_work_item_id, exclude_work_item_id=exclude_work_item_id
         )
         cancelled_speech = scheduler.cancel(child_work_item_id)
+        if turn_id is None or ack_work_item_id is None:
+            return cancelled_work, cancelled_speech
         # Sole-child determination is scoped to *this turn's own* delegated
         # children. Reading the scheduler's connection-wide queues alone would
         # let an unrelated turn's queued or admitted speech keep this turn's
@@ -1277,6 +1307,11 @@ class SessionHost:
         # Delegated children that have had a work_status emitted, so a
         # cancellation of this turn can terminalize whichever are still open.
         delegated_children: dict[str, str | None] = {}
+        # Set once this turn hands its child to the background: the ack latch
+        # and work-item registry must then outlive this handler so a cancel
+        # arriving before the late result can still resolve the child back to
+        # this turn's ack. ``commit_late_result_once`` releases them instead.
+        retained_still_open = False
         try:
             turn_task = asyncio.current_task()
             if turn_task is not None:
@@ -1362,10 +1397,11 @@ class SessionHost:
                         # that child was the sole remaining delegated child --
                         # an ack must never be spoken after the user cancelled
                         # the work it was acknowledging.
+                        # A targeted cancel settles the *target's* owning turn
+                        # ack, or none at all. Falling back to this control
+                        # turn's own id would settle an unrelated turn's ack.
                         cancel_turn_id = (
-                            self._ack_turn_for_work_item(target) or turn_id
-                            if target is not None
-                            else turn_id
+                            self._ack_turn_for_work_item(target) if target is not None else turn_id
                         )
                         cancelled_work, cancelled_speech = await self.cancel_turn_or_child(
                             cancel_turn_id,
@@ -1586,6 +1622,7 @@ class SessionHost:
                         # shaped object behind an ``Any`` return type.
                         child.finalize(outcome="retained", app_worker_id=worker_id)
                         turn_recorder.finalize()
+                        retained_still_open = True
                         return None
                     result = canonical_result(
                         worker_id=worker_id,
@@ -1641,7 +1678,7 @@ class SessionHost:
             was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
+            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
             # A retained child is not terminal: its truthful `background`
             # status was already emitted above and the coordinator terminalizes
             # it when the late result lands. Only an actual cancellation
@@ -1715,8 +1752,9 @@ class SessionHost:
                 turn_recorder.finalize(outcome="failed")
             raise
         finally:
-            self._clear_ack_latch(turn_id)
-            self._release_turn_work_items(turn_id)
+            if not retained_still_open:
+                self._clear_ack_latch(turn_id)
+                self._release_turn_work_items(turn_id)
 
     async def _handle_pending(
         self,
@@ -1729,6 +1767,9 @@ class SessionHost:
         coordinator = self._require_coordinator()
         origin_epoch = origin.epoch
         delegated_children: dict[str, str | None] = {}
+        # See the single-intent handler: a retained child keeps this turn's ack
+        # ownership alive past the handler's own return.
+        retained_still_open = False
         # Captured before the first await below, which may span other turns
         # being accepted concurrently: this is the turn-sequence snapshot
         # LateDeliveryContext needs to detect a newer-turn arrival.
@@ -1837,6 +1878,7 @@ class SessionHost:
                 )
             elif submitted.pending_work_item_ids:
                 child_outcome_label = "retained"
+                retained_still_open = True
                 child.finalize(outcome="retained", app_worker_id=worker_id)
                 self._register_retained_recorder_if_open(work_item_id, retained_recorder)
                 if origin.supports_work_status and self.feature_policy.enable_background_status:
@@ -1876,8 +1918,11 @@ class SessionHost:
                 child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
+            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
             was_cancelled = work_item_id in self._cancelled_work_items
+            # A cancelled child is settled here and now, so its ack ownership
+            # does not have to survive for a late result that will not speak.
+            retained_still_open = retained_still_open and not was_cancelled
             derived = _child_work_status_after_dispatch(
                 child_outcome_label,
                 cancelled=was_cancelled,
@@ -1924,8 +1969,9 @@ class SessionHost:
                 turn_recorder.finalize(outcome="failed")
             raise
         finally:
-            self._clear_ack_latch(turn_id)
-            self._release_turn_work_items(turn_id)
+            if not retained_still_open:
+                self._clear_ack_latch(turn_id)
+                self._release_turn_work_items(turn_id)
 
     async def _handle_multi_intent(
         self,
@@ -1944,6 +1990,10 @@ class SessionHost:
         # single progressive record instead of one per item.
         parent_work_item_id = f"work-{turn_id}"
         delegated_children: dict[str, str | None] = {}
+        # Children handed to the background by this turn. They keep their
+        # registry entry (and with it the turn's ack ownership) past the
+        # handler's return; ``commit_late_result_once`` releases each one.
+        retained_work_items: set[str] = set()
         # Captured before the first await below (route_envelope/_dispatch/
         # _emit_early_ack per work item), which may span other turns being
         # accepted concurrently: this is the turn-sequence snapshot
@@ -2226,6 +2276,8 @@ class SessionHost:
                     continue
                 item_index = matched
                 attributed_indexes.add(item_index)
+                if work_item_id not in self._cancelled_work_items:
+                    retained_work_items.add(work_item_id)
                 worker_id = index_to_worker_id[item_index][0]
                 if not (
                     origin.supports_work_status and self.feature_policy.enable_background_status
@@ -2330,7 +2382,16 @@ class SessionHost:
                     else "failed",
                     origin_epoch=origin_epoch,
                 )
-            origin.scheduler.discard_queued_ack(f"ack-{turn_id}")
+            if not results and not retained_work_items:
+                # Nothing will be spoken and nothing is still running: every
+                # dispatched item was rejected or never accounted for. An ack
+                # already admitted to the transport would then be this turn's
+                # only utterance -- a promise of a result that is never
+                # coming -- and `discard_queued_ack` below cannot reach it, so
+                # retract it in whatever state it is in. Both calls are
+                # idempotent, and `cancel` also clears the ack index entry.
+                origin.scheduler.cancel(self._ack_work_item_id(turn_id))
+            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
             committed = []
             commit_exceptions: list[Exception] = []
             for index in sorted(results):
@@ -2419,8 +2480,13 @@ class SessionHost:
                 turn_recorder.finalize(outcome="failed")
             raise
         finally:
-            self._clear_ack_latch(turn_id)
-            self._release_turn_work_items(turn_id)
+            if retained_work_items:
+                for item_work_item_id in delegated_children:
+                    if item_work_item_id not in retained_work_items:
+                        self._release_turn_work_item(turn_id, item_work_item_id)
+            else:
+                self._clear_ack_latch(turn_id)
+                self._release_turn_work_items(turn_id)
 
     def _worker_clarification_result(
         self,
@@ -2872,6 +2938,10 @@ class SessionHost:
                     else:
                         delivery_disposition = "display_only"
         finally:
+            # This work item is terminal, so the turn handler's deferred
+            # release lands here: the last retained child of a turn settles
+            # its ack ownership.
+            self._release_turn_work_item(context.turn_id, context.work_item_id)
             if recorder is not None:
                 recorder.finalize(
                     work_outcome=work_outcome,
@@ -3244,6 +3314,11 @@ class SessionHost:
         for work_item_id, recorder in tuple(self._retained_recorders.items()):
             recorder.finalize()
             self._retained_recorders.pop(work_item_id, None)
+        # A retained child's ack ownership is released by its late-result
+        # callback, which shutdown suppresses. Drop what is left rather than
+        # carrying it for the process's remaining lifetime.
+        self._turn_work_items.clear()
+        self._ack_emitted_turns.clear()
         stop = getattr(self.runner, "stop", None)
         if stop is not None:
             result = stop()
