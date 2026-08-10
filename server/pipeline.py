@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from .config import Config, FeaturePolicy, PromotionManifest
 from .connection_arbiter import Connection, ConnectionArbiter
 from .contracts import (
+    WORK_STATUS_TERMINAL,
     GroundedResult,
     RoutingDecision,
     RoutingState,
@@ -27,6 +28,7 @@ from .contracts import (
     WorkerState,
     WorkStatusState,
 )
+from .frames import CONNECTION_LOCAL_FRAMES
 from .observers import RuntimeObserver
 from .perf_metrics import (
     AppTurnRecorder,
@@ -48,7 +50,6 @@ from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
 from .session_state import SessionState
 from .speech_lifecycle import (
-    CONNECTION_LOCAL_FRAMES,
     DeliveryDisposition,
     EventLoopTimerScheduler,
     GenerationIdentity,
@@ -130,8 +131,7 @@ def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
         return _FallbackBridge()
     excluded = kwargs.pop("exclude_frames", ())
     # The authoritative set of connection-local frame types lives in
-    # CONNECTION_LOCAL_FRAMES (server/speech_lifecycle.py); extend it there,
-    # not here.
+    # CONNECTION_LOCAL_FRAMES (server/frames.py); extend it there, not here.
     kwargs["exclude_frames"] = tuple(dict.fromkeys((*CONNECTION_LOCAL_FRAMES, *excluded)))
     return BusBridgeProcessor(bus=bus, worker_name=worker_name, **kwargs)
 
@@ -1014,8 +1014,15 @@ class SessionHost:
         """
         self._turn_work_items.setdefault(turn_id, set()).add(work_item_id)
 
-    def _release_turn_work_items(self, turn_id: str) -> None:
+    def _release_all_turn_work_items(self, turn_id: str) -> None:
+        """Release every delegated child of ``turn_id`` and settle its ack latch.
+
+        Unlike ``_release_turn_work_item`` (singular), which keeps the latch
+        alive until the *last* child is released, this drops the whole set at
+        once, so the latch is settled unconditionally alongside it.
+        """
         self._turn_work_items.pop(turn_id, None)
+        self._clear_ack_latch(turn_id)
 
     def _release_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
         """Release one delegated child, keeping the turn's ack alive for siblings.
@@ -1682,7 +1689,7 @@ class SessionHost:
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "failed"
-            was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
+            was_cancelled = work_item_id in self._cancelled_work_items
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
             origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
@@ -1745,23 +1752,28 @@ class SessionHost:
             )
             return committed
         except asyncio.CancelledError:
-            self._cancel_child_work_statuses(
-                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            self._finalize_turn_exception(
+                cancelled=True,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
             )
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="cancelled")
             raise
         except Exception:
-            self._fail_child_work_statuses(
-                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            self._finalize_turn_exception(
+                cancelled=False,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
             )
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="failed")
             raise
         finally:
             if not retained_still_open:
-                self._clear_ack_latch(turn_id)
-                self._release_turn_work_items(turn_id)
+                self._release_all_turn_work_items(turn_id)
 
     async def _handle_pending(
         self,
@@ -1940,7 +1952,13 @@ class SessionHost:
             try:
                 committed = await self._commit_and_speak(result, origin, role=speech_role)
             except Exception:
-                if derived is not None:
+                # ``derived`` can be a non-terminal ("background", None) tuple
+                # for a retained-and-not-cancelled child (see
+                # ``_child_work_status_after_dispatch``); only a terminal
+                # derived state should be overridden to "failed" here -- a
+                # still-legitimately-running child must stay on "background"
+                # so its own late result can terminalize it later.
+                if derived is not None and derived[0] in WORK_STATUS_TERMINAL:
                     self._emit_work_status(
                         turn_id=turn_id,
                         work_item_id=work_item_id,
@@ -1962,23 +1980,28 @@ class SessionHost:
             turn_recorder.finalize()
             return committed
         except asyncio.CancelledError:
-            self._cancel_child_work_statuses(
-                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            self._finalize_turn_exception(
+                cancelled=True,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
             )
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="cancelled")
             raise
         except Exception:
-            self._fail_child_work_statuses(
-                turn_id=turn_id, origin_epoch=origin_epoch, children=delegated_children
+            self._finalize_turn_exception(
+                cancelled=False,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
             )
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="failed")
             raise
         finally:
             if not retained_still_open:
-                self._clear_ack_latch(turn_id)
-                self._release_turn_work_items(turn_id)
+                self._release_all_turn_work_items(turn_id)
 
     async def _handle_multi_intent(
         self,
@@ -2480,24 +2503,30 @@ class SessionHost:
             turn_recorder.finalize()
             return tuple(committed)
         except asyncio.CancelledError:
-            self._cancel_child_work_statuses(
+            self._finalize_turn_exception(
+                cancelled=True,
                 turn_id=turn_id,
                 origin_epoch=origin_epoch,
-                children=delegated_children,
+                children={
+                    k: v for k, v in delegated_children.items() if k not in retained_work_items
+                },
+                turn_recorder=turn_recorder,
+                origin=origin,
                 parent_work_item_id=parent_work_item_id,
             )
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="cancelled")
             raise
         except Exception:
-            self._fail_child_work_statuses(
+            self._finalize_turn_exception(
+                cancelled=False,
                 turn_id=turn_id,
                 origin_epoch=origin_epoch,
-                children=delegated_children,
+                children={
+                    k: v for k, v in delegated_children.items() if k not in retained_work_items
+                },
+                turn_recorder=turn_recorder,
+                origin=origin,
                 parent_work_item_id=parent_work_item_id,
             )
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="failed")
             raise
         finally:
             if retained_work_items:
@@ -2505,8 +2534,7 @@ class SessionHost:
                     if item_work_item_id not in retained_work_items:
                         self._release_turn_work_item(turn_id, item_work_item_id)
             else:
-                self._clear_ack_latch(turn_id)
-                self._release_turn_work_items(turn_id)
+                self._release_all_turn_work_items(turn_id)
 
     def _worker_clarification_result(
         self,
@@ -2925,17 +2953,22 @@ class SessionHost:
                         policy_disposition = self._late_result_disposition(
                             context, origin=speakable
                         )
+                        # A retained result supersedes only its own queued
+                        # timeout notice, not other same-work queued speech,
+                        # and never an utterance already admitted to the
+                        # transport slot. This must run regardless of which
+                        # branch below is taken -- a display-only verdict
+                        # still leaves a still-queued (not yet admitted)
+                        # "taking longer" notice stale once the real result
+                        # has committed, and it would otherwise be spoken
+                        # later.
+                        speakable.scheduler.discard_queued_notice(late.work_item_id)
                         if policy_disposition == "display_only":
                             delivery_disposition = "display_only"
                             speech_outcome = "not_applicable"
                         else:
                             delivery_disposition = "autoplay"
                             try:
-                                # A retained result supersedes only its own
-                                # queued timeout notice, not other same-work
-                                # queued speech, and never an utterance that has
-                                # already been admitted to the transport slot.
-                                speakable.scheduler.discard_queued_notice(late.work_item_id)
                                 speakable.scheduler.enqueue(
                                     result_id=result.result_id,
                                     work_item_id=late.work_item_id,
@@ -2960,7 +2993,15 @@ class SessionHost:
         finally:
             # This work item is terminal, so the turn handler's deferred
             # release lands here: the last retained child of a turn settles
-            # its ack ownership.
+            # its ack ownership. Any ack still queued for this turn is now
+            # stale -- every branch above has already decided this turn's
+            # outcome -- so discard it before releasing ownership, or an
+            # unrelated generation later freeing the transport lane could
+            # still speak it after the real result was already committed.
+            if self.connection is not None:
+                self.connection.scheduler.discard_queued_ack(
+                    self._ack_work_item_id(context.turn_id)
+                )
             self._release_turn_work_item(context.turn_id, context.work_item_id)
             if recorder is not None:
                 recorder.finalize(
@@ -3299,6 +3340,51 @@ class SessionHost:
             parent_work_item_id=parent_work_item_id,
         )
 
+    def _finalize_turn_exception(
+        self,
+        *,
+        cancelled: bool,
+        turn_id: str,
+        origin_epoch: int,
+        children: Mapping[str, str | None],
+        turn_recorder: AppTurnRecorder,
+        origin: Any = None,
+        parent_work_item_id: str | None = None,
+    ) -> None:
+        """Shared cleanup for a turn handler's ``CancelledError``/``Exception`` epilogue.
+
+        ``children`` must already exclude any delegated child the caller is
+        still keeping open for background completion (retained-and-not-
+        cancelled work): sweeping one of those to a terminal state here would
+        strand it there permanently, since ``background -> failed``/
+        ``cancelled`` is itself a legal transition and the late result could
+        then never terminalize it again.
+
+        Also discards this turn's still-queued early ack, if any: an
+        exception on this path means no result was ever committed and spoken
+        for the ack to precede, so a queued-but-not-yet-admitted ack left
+        behind here would otherwise be spoken later once an unrelated
+        generation frees the transport lane.
+        """
+        if origin is not None:
+            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
+        if cancelled:
+            self._cancel_child_work_statuses(
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children=children,
+                parent_work_item_id=parent_work_item_id,
+            )
+        else:
+            self._fail_child_work_statuses(
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children=children,
+                parent_work_item_id=parent_work_item_id,
+            )
+        if not turn_recorder.finalized:
+            turn_recorder.finalize(outcome="cancelled" if cancelled else "failed")
+
     def accepts(self, epoch: int | None) -> bool:
         return (
             not self._closing
@@ -3319,6 +3405,11 @@ class SessionHost:
             task.cancel()
         if registrations:
             await asyncio.gather(*registrations, return_exceptions=True)
+        ack_admission_tasks = tuple(self._ack_admission_tasks)
+        for task in ack_admission_tasks:
+            task.cancel()
+        if ack_admission_tasks:
+            await asyncio.gather(*ack_admission_tasks, return_exceptions=True)
         shutdowns = set(self._background_shutdowns)
         if self.connection is not None:
             connection = self.connection

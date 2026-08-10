@@ -26,8 +26,8 @@ import server.pipeline as pipeline_module
 import server.speech_lifecycle
 from server.config import Config, PromotionManifest
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
+from server.frames import CONNECTION_LOCAL_FRAMES, SnapshotBarrierFlushFrame
 from server.perf_metrics import CollectingMeasurementSink
-from server.frames import SnapshotBarrierFlushFrame
 from server.pipeline import (
     CanonicalResultAdapter,
     LateDeliveryContext,
@@ -38,7 +38,6 @@ from server.pipeline import (
 from server.registry import UnsupportedWorkerType, WorkerRegistry
 from server.services.tts import CorrelatedTTSSpeakFrame
 from server.speech_lifecycle import (
-    CONNECTION_LOCAL_FRAMES,
     SpeechGenerationFlushAckFrame,
     SpeechGenerationMarkerFrame,
 )
@@ -7914,6 +7913,252 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
         assert other_ack in origin.scheduler._queues
         assert other_turn in host._ack_emitted_turns
         assert host._turn_work_items.get(other_turn) == {"work-turn-other"}
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_sibling_commit_exception_does_not_fail_a_retained_child() -> None:
+    """A still-running retained child must not be swept to ``failed`` by the
+    generic exception handler when an unrelated sibling's commit raises in
+    the same turn.
+
+    Before the fix, the outer ``except Exception:`` in ``_handle_multi_intent``
+    passed the *whole* ``delegated_children`` mapping -- including a child
+    still legitimately running in the background -- to
+    ``_fail_child_work_statuses``. ``background -> failed`` is itself a legal
+    transition, so that child was permanently terminalized and its later,
+    genuinely successful late result could never flip it to ``result_ready``.
+    """
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(
+            _submitted(
+                results=(_fan_in_result("turn-fan-0", "first answer"),),
+                pending_work_item_ids=("work-turn-fan-1",),
+            ),
+            sink,
+        )
+        origin = await host.connect(_capable_handshake(host, 1))
+        assert origin.supports_work_status
+        assert host.feature_policy.enable_background_status
+
+        async def boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("speak failed")
+
+        host._commit_and_speak = boom  # item 0's commit/speak raises
+
+        with pytest.raises(RuntimeError):
+            await host._handle_multi_intent(
+                _multi_intent_outcome("first item", "second item"),
+                "",
+                origin,
+                "turn-fan",
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-fan"),
+            )
+
+        def child_states() -> dict[str, str]:
+            return {
+                work_item_id: status.state
+                for kids in host.state._work_status_children.values()
+                for work_item_id, status in kids.items()
+            }
+
+        states = child_states()
+        assert states["work-turn-fan-0"] == "failed"
+        # The retained sibling must stay non-terminal, not be swept to
+        # "failed" by the outer exception handler.
+        assert states["work-turn-fan-1"] == "background"
+        assert "work-turn-fan-1" in host._retained_recorders
+
+        # The late result for the retained child now lands and succeeds; it
+        # must still be able to terminalize the child to "result_ready".
+        late = type(
+            "Late",
+            (),
+            {
+                "work_item_id": "work-turn-fan-1",
+                "worker_id": "worker-search",
+                "error": None,
+                "terminal_kind": None,
+                "result": _fan_in_result("turn-fan-1", "late answer"),
+            },
+        )()
+        late_context = host._new_late_delivery_context(
+            turn_id="turn-fan",
+            work_item_id="work-turn-fan-1",
+            origin_epoch=1,
+            parent_work_item_id="work-turn-fan",
+        )
+        await host.commit_late_result_once(late_context, late)
+
+        assert child_states()["work-turn-fan-1"] == "result_ready"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_late_result_display_only_still_discards_the_stale_queued_notice() -> None:
+    """A still-queued 'taking longer' notice for a retained work item must be
+    discarded once its real result commits, even when the late-result
+    disposition verdict is ``display_only`` rather than ``autoplay``.
+
+    Before the fix, ``discard_queued_notice`` was only called on the
+    autoplay branch of ``commit_late_result_once``; a display-only verdict
+    left the stale notice queued, to be spoken later once some other item
+    admitted and drained it.
+    """
+
+    async def run() -> None:
+        # tts=FakeTTS() keeps this connection speakable; no promotion_manifest
+        # means `_promotion_eligible` defaults false, so
+        # `_late_result_disposition` returns "display_only" below.
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        scheduler = origin.scheduler
+
+        scheduler.enqueue(
+            result_id="result-notice",
+            work_item_id="work-b",
+            run_id="run-notice",
+            text="That is taking longer than expected; I will continue in the background.",
+            origin_epoch=1,
+            role=ROLE_TIMEOUT_NOTICE,
+        )
+
+        late_context = LateDeliveryContext(
+            turn_id="turn-b",
+            work_item_id="work-b",
+            origin_epoch=1,
+            ack_timestamp=None,
+            accepted_turn_sequence=host._turn_sequence,
+        )
+        assert host._late_result_disposition(late_context, origin=origin) == "display_only"
+
+        final = GroundedResult(
+            result_id="result-final",
+            worker_id="worker-search",
+            turn_id="turn-b",
+            text="final answer",
+            spoken_text="final answer",
+            origin_epoch=1,
+        )
+        await host.commit_late_result_once(
+            late_context,
+            LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
+        )
+
+        remaining_roles = [item.role for item in scheduler._queues.get("work-b", ())]
+        assert ROLE_TIMEOUT_NOTICE not in remaining_roles
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_path() -> None:
+    """A capable retained turn's early ack must not survive its own work
+    item's terminalization.
+
+    Before the fix, ``commit_late_result_once``'s ``finally`` only released
+    turn ownership; it never discarded a still-queued ack. If some unrelated
+    generation later freed the transport lane, the stale ack could then be
+    spoken after the real result had already committed.
+    """
+
+    async def run() -> None:
+        from server.speech_scheduler import ROLE_ACK
+
+        host = SessionHost(runner_factory=LifecycleRunner)
+        origin = await host.connect(connection_handshake(host, 1))
+        scheduler = origin.scheduler
+
+        ack_work_item_id = host._ack_work_item_id("turn-b")
+        scheduler.enqueue(
+            result_id=None,
+            work_item_id=ack_work_item_id,
+            run_id=f"run-{ack_work_item_id}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=ack_work_item_id,
+            turn_id="turn-b",
+        )
+        host._ack_emitted_turns.add("turn-b")
+        host._register_turn_work_item("turn-b", "work-b")
+
+        final = GroundedResult(
+            result_id="result-final",
+            worker_id="worker-search",
+            turn_id="turn-b",
+            text="final answer",
+            spoken_text="final answer",
+            origin_epoch=1,
+        )
+        await host.commit_late_result_once(
+            LateDeliveryContext(
+                turn_id="turn-b",
+                work_item_id="work-b",
+                origin_epoch=1,
+                ack_timestamp=None,
+                accepted_turn_sequence=host._turn_sequence,
+            ),
+            LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
+        )
+
+        assert ack_work_item_id not in scheduler._ack_index
+        assert ack_work_item_id not in scheduler._queues
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
+    """Fix 6 regression: if ``coordinator.submit()`` raises after
+    ``_emit_early_ack`` already enqueued this turn's ack, the exception path
+    must discard that ack rather than leaving it queued. Before the fix,
+    this no-result exception path cleared turn ownership but never touched
+    the scheduler's queued ack item."""
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        ack_seen_queued = False
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                nonlocal ack_seen_queued
+                ack_seen_queued = ack_work_item_id in origin.scheduler._ack_index
+                raise RuntimeError("submit exploded")
+
+        tts = FakeTTS()
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=Coordinator(), tts=tts)
+        origin = await host.connect(_capable_handshake(host, 1))
+        ack_work_item_id = host._ack_work_item_id("turn-pending")
+
+        with pytest.raises(RuntimeError):
+            await host._handle_pending(
+                _pending_outcome(),
+                "continue please",
+                origin,
+                "turn-pending",
+                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+            )
+
+        # The ack must have actually been queued before the exception, or
+        # this test would not exercise the gap at all.
+        assert ack_seen_queued is True
+        assert ack_work_item_id not in origin.scheduler._ack_index
         await host.shutdown()
 
     asyncio.run(run())

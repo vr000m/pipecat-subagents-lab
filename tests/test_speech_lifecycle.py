@@ -22,9 +22,8 @@ import asyncio
 
 import pytest
 
-from server.frames import SnapshotBarrierFlushFrame
+from server.frames import CONNECTION_LOCAL_FRAMES, SnapshotBarrierFlushFrame
 from server.speech_lifecycle import (
-    CONNECTION_LOCAL_FRAMES,
     DeliveryDisposition,
     GenerationIdentity,
     GenerationPhase,
@@ -689,6 +688,44 @@ def test_barge_in_never_automatically_admits_the_next_generation() -> None:
     # decide to admit the next generation.
     assert coordinator.occupied is True
     assert coordinator.slot_token == generation_a.token
+
+
+def test_uncontexted_interruption_fences_the_slot_until_cleanup_dispatch_completes() -> None:
+    """An interruption with no bound TTS context must fence the slot exactly
+    like the bound-context path (``test_barge_in_never_automatically_admits_
+    the_next_generation``), not free it synchronously.
+
+    Before the fix, ``record_interruption`` called ``_terminalize_state``
+    synchronously in this branch, freeing the slot before its
+    fire-and-forget cleanup dispatch had a chance to run. A replacement item
+    could then be admitted -- and its own frames queued -- ahead of the old
+    generation's own queued stop/cleanup frame, so a later-dispatched
+    interruption frame could land after the replacement's frames and
+    interrupt it instead.
+    """
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+        # No TTS context is ever bound to generation_a.
+
+        coordinator.record_interruption(generation_a.token, pause=False)
+
+        # The slot must still be fenced (occupied) immediately after the
+        # call returns -- the scheduled cleanup dispatch has not run yet.
+        assert coordinator.try_admit(identity("work-2", "utt-b")) is None
+        assert coordinator.occupied is True
+        assert coordinator.slot_token == generation_a.token
+
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        # Only once the scheduled cleanup dispatch has actually run does the
+        # slot free and the next generation get to admit.
+        generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
+        assert generation_b is not None
+
+    run(body)
 
 
 def test_pause_records_paused_disposition_and_retains_the_barrier() -> None:

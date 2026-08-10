@@ -29,9 +29,7 @@ from enum import Enum
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from pipecat.frames.frames import Frame, SystemFrame, TTSSpeakFrame
-
-from .frames import SnapshotBarrierFlushFrame
+from pipecat.frames.frames import SystemFrame
 
 
 class GenerationPhase(str, Enum):
@@ -154,27 +152,6 @@ class SpeechGenerationFlushAckFrame(SystemFrame):
     """
 
     token: str = ""
-
-
-CONNECTION_LOCAL_FRAMES: tuple[type[Frame], ...] = (
-    TTSSpeakFrame,
-    SpeechGenerationMarkerFrame,
-    SpeechGenerationFlushAckFrame,
-    SnapshotBarrierFlushFrame,
-)
-"""Frame types that must never cross WorkerBus.
-
-BusBridgeProcessor forwards a frame downstream locally only if it is a
-lifecycle frame, an OutputTransportMessageUrgentFrame, or explicitly listed
-in exclude_frames; every other frame type is diverted to the bus and never
-reaches the rest of the connection pipeline. A connection-local frame
-omitted from this tuple is silently dropped from the local pipeline with no
-error or log (see docs/architecture.md, "Bus bridge frame exclusions").
-
-Any new frame type consumed by TransportSpeechLifecycleProcessor or
-GenericProviderErrorObserver (both defined below) must be added here at the
-moment it is defined.
-"""
 
 
 class Clock(Protocol):
@@ -495,19 +472,29 @@ class SpeechLifecycleCoordinator:
         generation.disposition = disposition
         generation.tombstoned = True
         if generation.context_id is None:
-            # No TTS context was ever bound to this generation: no cleanup
-            # dispatch has anything to cancel and no flush-ack barrier can
-            # ever traverse it, so the slot frees immediately (synchronously,
-            # so callers with no running event loop still observe it) instead
-            # of arming a timer for an acknowledgement that structurally
-            # cannot arrive. Any cleanup/terminal callbacks are still
-            # dispatched, best-effort, fire-and-forget.
-            self._schedule(self._call(self._dispatch_cleanup, token, generation.identity))
-            terminal = self._terminalize_state(token, disposition)
-            if terminal is not None:
-                self._schedule(
-                    self._call(self._on_terminal, token, terminal.identity, terminal.disposition)
-                )
+            # No TTS context was ever bound to this generation: no flush-ack
+            # barrier can ever traverse it, so there is nothing to wait on
+            # from TTS. But the slot must still stay fenced (occupied) until
+            # the queued cleanup/stop dispatch is confirmed serialized --
+            # freeing it synchronously here would let the next item be
+            # admitted, and its frames queued, before this generation's own
+            # cleanup frame is actually sent, so a generic interruption frame
+            # dispatched later could land after the replacement's frames and
+            # interrupt it instead. Mirror the bound-context_id path below by
+            # deferring both the cleanup dispatch and the terminalization
+            # into a single scheduled unit, in order -- but only when a loop
+            # is actually running to race against: `_schedule`'s no-loop
+            # fallback silently drops the coroutine (fine for the purely
+            # best-effort cleanup dispatch elsewhere, not fine for the
+            # terminalization this method must still guarantee), and with no
+            # running loop nothing else can be admitted concurrently anyway,
+            # so the fencing this deferral exists to provide is moot.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(self._finalize_uncontexted_interruption(token, disposition))
+            else:
+                self._schedule(self._finalize_uncontexted_interruption(token, disposition))
             return
         forwarded_at = self._clock.now()
         self._arm(token, forwarded_at + self._grace, self._on_interruption_timeout)
@@ -714,6 +701,19 @@ class SpeechLifecycleCoordinator:
             token, generation.disposition or DeliveryDisposition.DELIVERY_UNKNOWN
         )
         self.connection_epoch += 1
+
+    async def _finalize_uncontexted_interruption(
+        self, token: str, disposition: DeliveryDisposition
+    ) -> None:
+        """Dispatch cleanup for an interruption with no bound TTS context,
+        then terminalize -- in that order, as one scheduled unit, so the slot
+        stays fenced (occupied) until the cleanup dispatch is confirmed
+        serialized instead of freeing synchronously ahead of it."""
+        generation = self._generations.get(token)
+        if generation is None or generation.terminalized:
+            return
+        await self._call(self._dispatch_cleanup, token, generation.identity)
+        await self._terminalize(token, disposition)
 
     async def _terminalize(self, token: str, disposition: DeliveryDisposition) -> None:
         generation = self._terminalize_state(token, disposition)
