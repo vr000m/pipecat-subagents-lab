@@ -1594,6 +1594,28 @@ def test_capable_snapshot_carries_the_work_status_field() -> None:
     assert isinstance(data["work_status"], list)
 
 
+def test_snapshot_wire_presence_reads_the_observers_single_accessor() -> None:
+    """I12: the wire-presence gate and the snapshot-content gate must be one
+    source. Forcing ``RuntimeObserver.supports_work_status`` to False on a
+    connection that *did* advertise `work_status_v1` must omit the field: a
+    caller that re-derived presence from `capabilities` instead would keep the
+    field while the content gate dropped its contents.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            observers_module.RuntimeObserver,
+            "supports_work_status",
+            property(lambda self: False),
+            raising=True,
+        )
+        frame = _snapshot_frame_data(capabilities=("work_status_v1",))
+    finally:
+        monkeypatch.undo()
+
+    assert "work_status" not in frame["data"]
+
+
 # --- Batch 7: single-decoder handshake parsing, bounds, and 409-vs-400 -------
 #
 # I14: `capabilities` must decode through Starlette's QueryParams like every
@@ -1682,6 +1704,31 @@ def test_handshake_rejects_oversized_capabilities_payloads(payload: list[str]) -
     with pytest.raises(Exception) as excinfo:
         _handshake_from_query(host, _raw_request(query))
     assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[" * 400 + "]" * 400,
+        "[" * 20000,
+        "x" * 5000,
+    ],
+)
+def test_handshake_rejects_pathological_capabilities_strings_as_400(raw: str) -> None:
+    """RecursionError derives from RuntimeError, not ValueError: deeply nested
+    input must still be a 400, never an uncaught 500. The raw-length bound
+    turns away the pathological shapes before the parser sees them."""
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=quote(raw),
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", None) == 400
 
 
 @pytest.mark.parametrize(

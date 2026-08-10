@@ -36,7 +36,7 @@ from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config, load_promotion_manifest
-from .contracts import CONTRACT_VERSION, SnapshotHandshake, resolve_work_status_wire_presence
+from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .observers import ProjectedEvent, SnapshotBarrier
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
@@ -60,6 +60,12 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # oversized name is malformed input, not a large-but-valid handshake.
 _MAX_CAPABILITY_ENTRIES = 16
 _MAX_CAPABILITY_NAME_LENGTH = 64
+# The widest well-formed field is a JSON array of the maximum number of
+# maximum-length names: brackets, one pair of quotes per name, and the commas
+# between them. Bounding the raw string keeps pathological input (deep nesting,
+# megabyte payloads) away from the parser rather than relying on the parser's
+# own limits.
+_MAX_CAPABILITY_FIELD_LENGTH = 2 + _MAX_CAPABILITY_ENTRIES * (_MAX_CAPABILITY_NAME_LENGTH + 3)
 
 
 def _configure_logging() -> None:
@@ -177,9 +183,13 @@ def _decode_capabilities(request: Request) -> tuple[tuple[str, ...], bool]:
         return (), False
     if len(matches) > 1:
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    if len(matches[0]) > _MAX_CAPABILITY_FIELD_LENGTH:
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
     try:
         decoded = json.loads(matches[0])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
+        # RecursionError derives from RuntimeError, not ValueError: without it
+        # deeply nested input escapes as an uncaught 500 instead of a 400.
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
     if not isinstance(decoded, list) or len(decoded) > _MAX_CAPABILITY_ENTRIES:
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
@@ -453,9 +463,7 @@ async def _attach_connection(
                 # provably one source, not two booleans kept in agreement by
                 # convention via ConnectionPipeline's proxy property.
                 frame_data = snapshot.wire_payload(
-                    include_work_status=resolve_work_status_wire_presence(
-                        runtime.observer.capabilities
-                    )
+                    include_work_status=runtime.observer.supports_work_status
                 )
 
                 async def write_snapshot() -> None:

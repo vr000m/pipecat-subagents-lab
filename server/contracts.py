@@ -298,13 +298,12 @@ _WORK_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 WORK_STATUS_TERMINAL = frozenset({"result_ready", "failed", "cancelled"})
 # States a work item may be recorded at with no prior status of its own.
-# ``failed`` is cold-startable because a child can fail before it is ever
-# routed (missing worker, missing search capability -- server/pipeline.py
-# emits `failed`/`missing_worker` there without a preceding `routing`), and
-# the parent join must still terminalize. ``cancelled`` is deliberately NOT
-# cold-startable: SessionHost._cancel_child_work_statuses sweeps the whole
-# delegated child set on a turn cancel and relies on this rejection to make
-# a child that never had a status a no-op rather than inventing one.
+# ``failed`` is cold-startable because failure can precede routing (a missing
+# worker or missing search capability fails a child that was never routed),
+# and the parent join must still terminalize. ``cancelled`` is deliberately
+# NOT cold-startable: a cancel that sweeps an entire delegated child set must
+# be a no-op for children that never had a status, rather than inventing a
+# terminal record for work that was never started.
 WORK_STATUS_COLD_START = frozenset({"routing", "searching", "background", "result_ready", "failed"})
 
 

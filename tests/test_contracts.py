@@ -621,9 +621,11 @@ def test_work_status_capability_constant_matches_the_browser_constant() -> None:
 
 def test_resolve_work_status_wire_presence_is_the_single_capability_gate() -> None:
     """`resolve_work_status_wire_presence` must be the sole capability-gate
-    implementation: both `RuntimeObserver.supports_work_status` and the
-    app.py snapshot-reseed call site must call it by name rather than
-    independently re-testing `WORK_STATUS_V1 in capabilities`."""
+    implementation. `RuntimeObserver.supports_work_status` calls it by name and
+    is the one accessor every consumer reads; no other module may re-test
+    `WORK_STATUS_V1 in capabilities` for itself. app.py in particular routes
+    the snapshot wire-presence decision through the observer accessor, so the
+    content gate and the wire gate are provably one source."""
     import inspect
 
     import server.app as app_module
@@ -636,4 +638,6 @@ def test_resolve_work_status_wire_presence_is_the_single_capability_gate() -> No
     assert "resolve_work_status_wire_presence" in observer_source
 
     app_source = inspect.getsource(app_module)
-    assert "resolve_work_status_wire_presence" in app_source
+    assert "runtime.observer.supports_work_status" in app_source
+    assert f"{WORK_STATUS_V1!r} in" not in app_source
+    assert f'"{WORK_STATUS_V1}" in' not in app_source

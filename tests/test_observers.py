@@ -98,6 +98,42 @@ def test_frame_and_messages_are_removed_or_explicitly_private_diagnostic_only() 
         assert callable(public_messages)
 
 
+def test_messages_reports_projected_not_global_sequences() -> None:
+    """The diagnostic API is a *projected*-event API: an invisible event must
+    not consume a reported sequence number, or the sequences it hands callers
+    skip and no longer match what ``project()`` would have assigned.
+
+    Invariant: ``messages()`` sequences are 1..n contiguous over the visible
+    events only, and ``after_sequence`` filters on that same numbering.
+    """
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    # No capabilities -> `work_status` events are invisible on this connection.
+    observer = RuntimeObserver(state, epoch=1, capabilities=frozenset())
+
+    # One invisible event first, so global and projected numbering diverge
+    # from the very first visible event.
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-0", state="searching", origin_epoch=1
+    )
+    for index in range(2):
+        state.set_worker(
+            WorkerState(
+                worker_id=f"worker-{index}",
+                topic="weather",
+                model_policy="deep",
+                status="idle",
+                origin_epoch=1,
+            )
+        )
+
+    messages = observer.messages()
+
+    assert [message["kind"] for message in messages] == ["worker", "worker"]
+    assert [message["sequence"] for message in messages] == [1, 2]
+    assert observer.messages(after_sequence=1) == messages[1:]
+
+
 # --- SnapshotBarrier ordering (Testing Notes (a)-(d)) ----------------------
 
 

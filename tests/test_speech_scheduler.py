@@ -506,6 +506,19 @@ def test_discard_queued_ack_cannot_remove_an_admitted_ack() -> None:
     assert scheduler.active.item.ack_id == ack.ack_id
 
 
+def test_normal_admission_clears_the_ack_index_entry() -> None:
+    """The index only ever resolves still-queued acks, so a mapping left
+    behind by normal admission is a per-ack leak on a long-lived connection."""
+    scheduler = _scheduler()
+    for index in range(3):
+        ack = enqueue_ack(scheduler, turn_id=f"turn-{index}")
+        admitted = asyncio.run(scheduler.start_next())
+        assert admitted is not None and admitted.ack_id == ack.ack_id
+        scheduler.delivery_unknown(admitted.utterance_id)
+
+    assert scheduler._ack_index == {}
+
+
 def test_cancel_with_the_ack_work_item_id_removes_only_the_parent_ack() -> None:
     """Plan: 'cancel(work_item_id) therefore only ever removes the ack when
     called with ack_work_item_id (i.e. a whole-turn cancel); cancelling a

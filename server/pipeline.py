@@ -3261,7 +3261,12 @@ class SessionHost:
         children: Mapping[str, str | None],
         parent_work_item_id: str | None = None,
     ) -> None:
-        """Terminalize every still-non-terminal delegated child as ``cancelled``."""
+        """Terminalize every still-non-terminal delegated child as ``cancelled``.
+
+        Safe to call as a blind sweep over the whole delegated child set: a
+        child that never had a status is skipped, because ``cancelled`` is not
+        in ``WORK_STATUS_COLD_START``.
+        """
         self._terminalize_child_work_statuses(
             turn_id=turn_id,
             origin_epoch=origin_epoch,

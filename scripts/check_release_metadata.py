@@ -16,11 +16,11 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-PYPROJECT_VERSION_RE = re.compile(r'(?m)^version\s*=\s*"([^"]+)"')
 CHANGELOG_HEADING_RE = re.compile(r"(?m)^##\s*\[([^\]]+)\]\s*(?:-\s*(\S+))?\s*$")
 
 
@@ -29,11 +29,16 @@ class ReleaseMetadataError(ValueError):
 
 
 def read_pyproject_version(pyproject_path: Path) -> str:
-    text = pyproject_path.read_text(encoding="utf-8")
-    match = PYPROJECT_VERSION_RE.search(text)
-    if not match:
-        raise ReleaseMetadataError(f'{pyproject_path}: no `version = "..."` field found')
-    return match.group(1)
+    try:
+        with pyproject_path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        raise ReleaseMetadataError(f"{pyproject_path}: invalid TOML: {exc}") from exc
+    project = data.get("project")
+    version = project.get("version") if isinstance(project, dict) else None
+    if not isinstance(version, str) or not version:
+        raise ReleaseMetadataError(f"{pyproject_path}: no `[project] version` string found")
+    return version
 
 
 def read_changelog_release(changelog_path: Path) -> tuple[str, str | None]:

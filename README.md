@@ -457,6 +457,91 @@ current turn's budget values. No record ever contains transcript, prompt,
 response, citation, or credential content — this stays console-only and does
 not project into RTVI or browser state.
 
+## Scripts
+
+Every module in `scripts/` except `_evidence_common.py` (a shared helper) is a
+command-line entry point. Only the paid harnesses need hosted credentials;
+every gate and validator is credential-free.
+
+Smoke and benchmark:
+
+- `smoke_server.py` — starts the real server and verifies its credential-free
+  HTTP boundary.
+- `smoke_conversation.py` — bounded, paid router-to-web-search conversation
+  smoke. Useful when changing turn handling or delegation.
+- `benchmark_speech.py` — local speech smoke (credential-free) or paid
+  provider comparison over identical text and audio.
+
+Phase 4 query-context narrowing experiment (run in this order):
+
+- `run_query_context_experiment.py` — bounded experiment runner producing raw
+  samples (Phase 4A).
+- `collect_query_context_latency.py` — normalizes raw samples into the
+  artifact the analyzer consumes (Phase 4A).
+- `analyze_query_context_latency.py` — deterministic, credential-free
+  promotion decision over the collected artifact (Phase 4B).
+
+Release and evidence gates:
+
+- `emit_v013_deployment_metadata.py` — derives the deployment identity
+  (`PIPECAT_SOURCE_COMMIT`, `PIPECAT_SOURCE_TREE_HASH`,
+  `PIPECAT_DEPLOYED_AT_UTC`, `PIPECAT_FEATURE_POLICY_FINGERPRINT`) from a
+  clean release checkout. Refuses a dirty or untracked tree.
+- `validate_v013_evidence.py` — validates evidence artifacts against their
+  schemas and phase minimums, and with `--write-manifest` writes the
+  promotion manifest.
+- `validate_phase2_transport_browser_contract.py` — validates the Phase 2
+  transport/browser contract artifact.
+- `record_phase3_completion.py` — records the exact Phase 3 command digest,
+  source commit, and tree hash after that phase's test command passes.
+- `check_release_metadata.py` — checks that `pyproject.toml` and
+  `CHANGELOG.md` agree on the release version and date. Run at release
+  finalization.
+
+## Promotion manifest
+
+`docs/benchmarks/v0.1.3-promotion-manifest.json` is the single artifact that
+decides whether the runtime may enable autoplay. It binds the accumulated
+evidence artifacts (their SHA-256 hashes plus the schema hash) to one
+deployment identity: release version, source commit, filtered source tree
+hash, `FeaturePolicy` fingerprint, and deployment timestamp. At startup
+`server.config.load_promotion_manifest()` re-verifies every binding against
+the running `Config` and **fails closed** — a missing, malformed, foreign, or
+stale manifest silently degrades to display-only rather than blocking boot.
+
+A `manifest_phase=provisional` manifest is permanently
+`promotion_eligible=false` and exists only for diagnostics; only a
+`manifest_phase=final` manifest bound to a Phase 3 completion record can make
+the runtime promotion-eligible.
+
+CI's `release-metadata` job (`.github/workflows/ci.yml`, `main` pushes only)
+regenerates the provisional manifest: it runs
+`emit_v013_deployment_metadata.py --shell-export` into `$GITHUB_ENV`, then
+`validate_v013_evidence.py --write-manifest --manifest-phase provisional`
+with the Phase 0-2 inputs and the exported identity values.
+
+To regenerate locally, export the same identity from a clean checkout and run
+the writer by hand:
+
+```sh
+eval "$(uv run python scripts/emit_v013_deployment_metadata.py --shell-export)"
+uv run python scripts/validate_v013_evidence.py --write-manifest --manifest-phase provisional \
+  --phase0-input docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl \
+  --phase1-input docs/benchmarks/v0.1.3-phase1-ack-evidence.jsonl \
+  --phase2-input docs/benchmarks/v0.1.3-phase2-transport-browser-contract.json \
+  --source-commit "$PIPECAT_SOURCE_COMMIT" \
+  --source-tree-hash "$PIPECAT_SOURCE_TREE_HASH" \
+  --deployed-at-utc "$PIPECAT_DEPLOYED_AT_UTC" \
+  --feature-policy-fingerprint "$PIPECAT_FEATURE_POLICY_FINGERPRINT" \
+  --output docs/benchmarks/v0.1.3-promotion-manifest.json
+```
+
+Add `--manifest-phase final --phase3-input
+docs/benchmarks/v0.1.3-phase3-completion.json` (and optionally
+`--phase4c-input …`) to produce the final, activation-eligible manifest. A
+dirty tree makes the emitter refuse, so a locally-modified checkout cannot
+produce an eligible manifest.
+
 ## Repository layout
 
 ```text

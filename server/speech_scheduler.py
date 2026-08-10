@@ -242,6 +242,11 @@ class SpeechScheduler:
             return None
         generation = disposition.generation
         self._queues[item.work_item_id].pop(0)
+        if item.role == ROLE_ACK and item.ack_id is not None:
+            # The index only ever resolves still-queued acks; leaving the
+            # mapping behind after admission would accumulate one stale entry
+            # per admitted ack for the life of the connection.
+            self._ack_index.pop(item.ack_id, None)
         if not self._queues[item.work_item_id]:
             # Drop the now-empty queue key, exactly as every other queue
             # mutator does. A retained empty list is indistinguishable from

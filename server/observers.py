@@ -10,6 +10,7 @@ from typing import Any
 
 from .contracts import RuntimeSnapshot, resolve_work_status_wire_presence
 from .session_state import SessionState, StateEvent
+from .speech_lifecycle import SnapshotBarrierFlushFrame
 
 _ALWAYS_VISIBLE_KINDS = frozenset(
     {
@@ -228,11 +229,11 @@ class RuntimeObserver:
             origin_epoch=self.epoch, include_work_status=self.supports_work_status
         )
 
-    def _payload(self, event: StateEvent) -> dict[str, Any]:
+    def _payload(self, event: StateEvent, sequence: int) -> dict[str, Any]:
         return {
             "contract_version": "v1.0",
             "session_id": self.state.session_id,
-            "sequence": event.sequence,
+            "sequence": sequence,
             "kind": event.kind,
             "data": event.payload,
             "origin_epoch": (
@@ -243,12 +244,22 @@ class RuntimeObserver:
         }
 
     def messages(self, after_sequence: int = 0) -> tuple[dict[str, Any], ...]:
-        """Diagnostic projected-event API; never a network serializer."""
-        return tuple(
-            self._payload(event)
-            for event in self.state.events
-            if event.sequence > after_sequence and self._visible(event)
-        )
+        """Diagnostic projected-event API; never a network serializer.
+
+        Both the reported ``sequence`` and ``after_sequence`` are
+        connection-projected, matching :meth:`project`: an invisible event does
+        not advance the numbering, so a returned sequence can be fed straight
+        back in without skipping the events that followed it.
+        """
+        projected: list[dict[str, Any]] = []
+        sequence = 0
+        for event in self.state.events:
+            if not self._visible(event):
+                continue
+            sequence += 1
+            if sequence > after_sequence:
+                projected.append(self._payload(event, sequence))
+        return tuple(projected)
 
 
 class SnapshotBarrier:
@@ -305,7 +316,6 @@ class SnapshotBarrier:
         change, buffer replayed) and re-raises, rather than leaving the
         observer paused with a growing buffer forever.
         """
-        from .speech_lifecycle import SnapshotBarrierFlushFrame
 
         self._generation += 1
         acked: asyncio.Future[None] = asyncio.get_running_loop().create_future()
