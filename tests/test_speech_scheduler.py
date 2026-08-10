@@ -113,6 +113,27 @@ def test_pause_preserves_paused_state_and_resume_records_resumed_transition() ->
     assert scheduler.state.speech[replay.utterance_id].state == DeliveryState.RESUMED
 
 
+def test_resume_terminalizes_the_old_paused_utterance_instead_of_stranding_it() -> None:
+    """``resume()`` replays a paused item under a NEW utterance_id (minted by
+    ``enqueue()``), so nothing else would ever terminalize the OLD id's
+    PAUSED record in ``SessionState.speech`` -- it would otherwise ship in
+    every future RuntimeSnapshot for the rest of the process lifetime."""
+    scheduler = _scheduler()
+    first = enqueue(scheduler, "work-1", "answer")
+    asyncio.run(scheduler.start_next())
+
+    scheduler.pause("work-1")
+    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.PAUSED
+
+    replay = scheduler.resume("work-1")
+    assert replay is not None
+    assert replay.utterance_id != first.utterance_id
+    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.INTERRUPTED
+
+    snapshot_states = [progress.state for progress in scheduler.state.snapshot().speech_progress]
+    assert DeliveryState.PAUSED not in snapshot_states
+
+
 def test_reconnect_interrupt_terminalizes_paused_items_instead_of_stranding_them() -> None:
     """A paused utterance is only resumable through this scheduler, which a
     reconnect discards -- so ``interrupt(reconnect=True)`` must terminalize it

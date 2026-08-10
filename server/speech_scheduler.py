@@ -185,6 +185,34 @@ class SpeechScheduler:
         self._emit_progress(item, DeliveryState.QUEUED)
         return item
 
+    def _set_queue(self, work_item_id: str, items: list[SpeechItem]) -> None:
+        """Write back a work item's queue, dropping the key entirely if empty.
+
+        A retained empty list is indistinguishable from pending work to any
+        caller that inspects the queue keys (see ``pending_work_item_ids``),
+        so every queue mutator funnels its write-back through here.
+        """
+        if items:
+            self._queues[work_item_id] = items
+        else:
+            self._queues.pop(work_item_id, None)
+
+    def _discard_queued(
+        self, work_item_id: str, *, matches: Callable[[SpeechItem], bool]
+    ) -> tuple[SpeechItem, ...]:
+        """Drop every still-queued item matching ``matches`` from one queue.
+
+        Other queued items in the same queue, and every queued item under a
+        different work-item key, are left untouched and keep their relative
+        order.
+        """
+        queue = self._queues.get(work_item_id, [])
+        discarded = tuple(item for item in queue if matches(item))
+        if not discarded:
+            return ()
+        self._set_queue(work_item_id, [item for item in queue if not matches(item)])
+        return discarded
+
     def discard_queued_ack(self, ack_id: str) -> SpeechItem | None:
         """Atomically drop one still-queued ack, clearing its index entry.
 
@@ -197,20 +225,11 @@ class SpeechScheduler:
         work_item_id = self._ack_index.get(ack_id)
         if work_item_id is None:
             return None
-        queue = self._queues.get(work_item_id, [])
-        discarded = next(
-            (item for item in queue if item.role == ROLE_ACK and item.ack_id == ack_id), None
+        discarded = self._discard_queued(
+            work_item_id, matches=lambda item: item.role == ROLE_ACK and item.ack_id == ack_id
         )
-        if discarded is None:
-            self._ack_index.pop(ack_id, None)
-            return None
-        remaining = [item for item in queue if item is not discarded]
-        if remaining:
-            self._queues[work_item_id] = remaining
-        else:
-            self._queues.pop(work_item_id, None)
         self._ack_index.pop(ack_id, None)
-        return discarded
+        return discarded[0] if discarded else None
 
     async def start_next(self, work_item_id: str | None = None) -> SpeechItem | None:
         if self._active is not None or self.lifecycle.occupied:
@@ -241,17 +260,14 @@ class SpeechScheduler:
                 self._emit_progress(item, DeliveryState.DELIVERY_UNKNOWN)
             return None
         generation = disposition.generation
-        self._queues[item.work_item_id].pop(0)
+        queue = self._queues[item.work_item_id]
+        queue.pop(0)
         if item.role == ROLE_ACK and item.ack_id is not None:
             # The index only ever resolves still-queued acks; leaving the
             # mapping behind after admission would accumulate one stale entry
             # per admitted ack for the life of the connection.
             self._ack_index.pop(item.ack_id, None)
-        if not self._queues[item.work_item_id]:
-            # Drop the now-empty queue key, exactly as every other queue
-            # mutator does. A retained empty list is indistinguishable from
-            # pending work to any caller that inspects the queue keys.
-            self._queues.pop(item.work_item_id, None)
+        self._set_queue(item.work_item_id, queue)
         token = generation.token
         lease = UtteranceLease(item, token)
         self._active = lease
@@ -336,8 +352,7 @@ class SpeechScheduler:
         queue = self._queues.get(item.work_item_id)
         if queue and queue[0] is item:
             queue.pop(0)
-            if not queue:
-                self._queues.pop(item.work_item_id, None)
+            self._set_queue(item.work_item_id, queue)
 
     def provider_started(self, context_id: str) -> None:
         """Bind a correlated Pipecat TTS context to its active scheduler lease."""
@@ -458,11 +473,20 @@ class SpeechScheduler:
     def resume(self, target: str | SpeechItem | None = None) -> SpeechItem | None:
         work_item_id = target.work_item_id if isinstance(target, SpeechItem) else target
         item = self.paused(work_item_id)
+        was_paused = item is not None
         if item is None and isinstance(target, SpeechItem):
             item = target
         if item is None:
             return None
         self._paused.pop(item.work_item_id, None)
+        if was_paused:
+            # A paused item holds a non-terminal PAUSED record in
+            # SessionState.speech keyed by its own utterance_id. The replay
+            # below mints a NEW utterance_id (matching the interrupted-replay
+            # path below), so nothing else ever terminalizes the OLD id --
+            # terminalize it here the same way interrupt() already does for
+            # every other paused item (see the reconnect branch above).
+            self._emit_progress(item, DeliveryState.INTERRUPTED)
         replay = self.enqueue(
             result_id=item.result_id,
             work_item_id=item.work_item_id,
@@ -512,17 +536,9 @@ class SpeechScheduler:
         speech, or a notice already admitted to the transport slot) are left
         untouched and keep their relative order.
         """
-        queue = self._queues.get(work_item_id)
-        if not queue:
-            return ()
-        remaining = [item for item in queue if item.role != ROLE_TIMEOUT_NOTICE]
-        discarded = tuple(item for item in queue if item.role == ROLE_TIMEOUT_NOTICE)
-        if not discarded:
-            return ()
-        if remaining:
-            self._queues[work_item_id] = remaining
-        else:
-            self._queues.pop(work_item_id, None)
+        discarded = self._discard_queued(
+            work_item_id, matches=lambda item: item.role == ROLE_TIMEOUT_NOTICE
+        )
         for item in discarded:
             self._emit_progress(item, DeliveryState.INTERRUPTED)
         return discarded
