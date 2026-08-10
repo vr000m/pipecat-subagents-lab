@@ -40,14 +40,10 @@ import argparse
 import re
 import subprocess
 import sys
+from datetime import UTC
 from pathlib import Path
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from datetime import UTC
-
-from _evidence_common import sha256_bytes
+from scripts._evidence_common import sha256_bytes
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -117,8 +113,6 @@ def deployed_at_utc() -> str:
 
 
 def feature_policy_fingerprint_value() -> str:
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
     from server.config import FeaturePolicy, feature_policy_fingerprint, load_config
 
     config = load_config()

@@ -126,11 +126,9 @@ class RTVIMessagePublisher:
     ) -> RTVIMessage | None:
         """Serialize an already-sequenced typed event (Phase 3 observer path).
 
-        Validates and serializes the caller-supplied envelope sequence
-        rather than allocating one; the connection-projected sequence is
-        owned exclusively by ``RuntimeObserver``. Returns ``None`` for a
-        stale (non-active-epoch) origin, matching every other publisher
-        method's epoch fence.
+        Sequence ownership is described once in this class's docstring.
+        Returns ``None`` for a stale (non-active-epoch) origin, matching
+        every other publisher method's epoch fence.
         """
         if origin_epoch != self.active_epoch:
             return None

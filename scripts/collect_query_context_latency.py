@@ -26,11 +26,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _evidence_common import EvidenceGateError, EvidenceStatus, require_nonempty_str
-from run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
+from scripts._evidence_common import EvidenceGateError, EvidenceStatus, require_nonempty_str
+from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
 
 MIN_PAIRED_SAMPLES_PER_CELL = 30
 REPO_ROOT = Path(__file__).resolve().parent.parent

@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .contracts import RuntimeSnapshot, resolve_work_status_wire_presence
+from .frames import SnapshotBarrierFlushFrame
 from .session_state import SessionState, StateEvent
-from .speech_lifecycle import SnapshotBarrierFlushFrame
 
 _ALWAYS_VISIBLE_KINDS = frozenset(
     {
@@ -265,7 +265,7 @@ class RuntimeObserver:
 class SnapshotBarrier:
     """Owns the ordering handoff when a snapshot is (re)installed for a connection.
 
-    Pairs with ``SnapshotBarrierFlushFrame`` (`server/speech_lifecycle.py`):
+    Pairs with ``SnapshotBarrierFlushFrame`` (`server/frames.py`):
     :meth:`subscribe_paused` pauses ``observer`` synchronously so no event
     captured after that point can be dispatched ahead of the barrier, then
     :meth:`install_baseline` pushes the flush frame through the same

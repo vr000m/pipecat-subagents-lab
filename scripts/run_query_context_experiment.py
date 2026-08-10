@@ -40,10 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _evidence_common import EvidenceGateError, closed_object, require_type
+from scripts._evidence_common import EvidenceGateError, closed_object, require_type
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

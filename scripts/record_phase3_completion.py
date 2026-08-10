@@ -15,10 +15,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _evidence_common import EvidenceGateError, require_nonempty_str
+from scripts._evidence_common import EvidenceGateError, require_nonempty_str
 
 
 def build_record(

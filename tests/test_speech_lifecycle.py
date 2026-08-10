@@ -22,13 +22,13 @@ import asyncio
 
 import pytest
 
+from server.frames import SnapshotBarrierFlushFrame
 from server.speech_lifecycle import (
     CONNECTION_LOCAL_FRAMES,
     DeliveryDisposition,
     GenerationIdentity,
     GenerationPhase,
     ManualTimerScheduler,
-    SnapshotBarrierFlushFrame,
     SpeechLifecycleCoordinator,
 )
 

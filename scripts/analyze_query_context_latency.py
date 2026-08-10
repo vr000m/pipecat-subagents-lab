@@ -26,11 +26,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _evidence_common import EvidenceGateError, EvidenceStatus, load_jsonl
-from run_query_context_experiment import scorer_hash, validate_raw_record
+from scripts._evidence_common import EvidenceGateError, EvidenceStatus, load_jsonl
+from scripts.run_query_context_experiment import scorer_hash, validate_raw_record
 
 BOOTSTRAP_ITERATIONS = 10_000
 BOOTSTRAP_SEED = 0

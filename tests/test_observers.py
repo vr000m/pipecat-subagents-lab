@@ -176,7 +176,7 @@ class TestSnapshotBarrierOrdering:
 
         run(body)
 
-        from server.speech_lifecycle import SnapshotBarrierFlushFrame
+        from server.frames import SnapshotBarrierFlushFrame
 
         assert network, "the barrier flush frame must be written"
         assert isinstance(network[0], SnapshotBarrierFlushFrame)

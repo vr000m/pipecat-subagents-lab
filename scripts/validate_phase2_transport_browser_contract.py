@@ -26,10 +26,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _evidence_common import (
+from scripts._evidence_common import (
     EvidenceGateError,
     closed_object,
     load_json,

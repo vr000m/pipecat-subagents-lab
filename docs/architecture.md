@@ -37,7 +37,10 @@ reaches the rest of the connection pipeline unless another worker echoes it
 back. Any new connection-local frame type introduced downstream of the
 bridge — not just `TTSSpeakFrame` — must be added to `CONNECTION_LOCAL_FRAMES`
 at its definition site, or it is silently dropped from the local pipeline
-with no error. `test_framework_bridge_keeps_speech_on_connection_pipeline`
+with no error. Connection-local frames with no speech semantics are defined
+in `server/frames.py` (currently `SnapshotBarrierFlushFrame`) so that
+`server/observers.py` can reference them without importing the speech
+vocabulary; they are still registered in `CONNECTION_LOCAL_FRAMES`. `test_framework_bridge_keeps_speech_on_connection_pipeline`
 and `test_connection_local_frames_covers_every_private_speech_frame`
 (`tests/test_pipeline.py`) enforce this. `CONNECTION_LOCAL_FRAMES` was
 originally a hand-maintained tuple built inline in `framework_bridge()`

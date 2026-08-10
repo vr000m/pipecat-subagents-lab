@@ -37,6 +37,7 @@ from pipecat.workers.base_worker import WorkerParams
 
 from .config import Config, load_config, load_promotion_manifest
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
+from .frames import SnapshotBarrierFlushFrame
 from .observers import ProjectedEvent, SnapshotBarrier
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
@@ -47,7 +48,6 @@ from .rtvi_messages import RTVIMessagePublisher
 from .services.factory import create_stt, create_tts
 from .speech_lifecycle import (
     GenericProviderErrorObserver,
-    SnapshotBarrierFlushFrame,
     TransportSpeechLifecycleProcessor,
 )
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
@@ -377,7 +377,8 @@ async def _attach_connection(
         # Seed the connection-projected sequence at the current snapshot
         # watermark before subscribing, so the first delivered incremental
         # is contiguous with whatever snapshot the client requests next
-        # (Phase 3 barrier ordering; see RuntimeObserver.seed).
+        # (Phase 3 barrier ordering; see RuntimeObserver.seed, and
+        # RTVIMessagePublisher's docstring for who owns which sequence).
         runtime.observer.seed(host.state.sequence)
 
         async def emit_frame(projected: ProjectedEvent) -> None:

@@ -27,6 +27,7 @@ import server.speech_lifecycle
 from server.config import Config, PromotionManifest
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.perf_metrics import CollectingMeasurementSink
+from server.frames import SnapshotBarrierFlushFrame
 from server.pipeline import (
     CanonicalResultAdapter,
     LateDeliveryContext,
@@ -38,7 +39,6 @@ from server.registry import UnsupportedWorkerType, WorkerRegistry
 from server.services.tts import CorrelatedTTSSpeakFrame
 from server.speech_lifecycle import (
     CONNECTION_LOCAL_FRAMES,
-    SnapshotBarrierFlushFrame,
     SpeechGenerationFlushAckFrame,
     SpeechGenerationMarkerFrame,
 )

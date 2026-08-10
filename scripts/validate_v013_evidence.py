@@ -30,15 +30,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _evidence_common import (
+from scripts._evidence_common import (
     EvidenceGateError,
     load_json,
     load_jsonl,
     require_hex64,
     sha256_file,
+)
+from scripts.validate_phase2_transport_browser_contract import (
+    validate_artifact as validate_transport_browser_artifact,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -307,23 +307,13 @@ def has_real_provider_stratum(records: list[Mapping[str, Any]]) -> bool:
 def _validate_transport_contract(input_path: Path) -> dict[str, Any]:
     """Revalidate the Phase 2 transport/browser contract artifact.
 
-    Delegates to `validate_phase2_transport_browser_contract.py` (loaded by
-    path, since `scripts/` is not a package) so this writer never
-    re-implements or drifts from that gate's own logic.
+    Delegates to `scripts.validate_phase2_transport_browser_contract` so this
+    writer never re-implements or drifts from that gate's own logic.
     """
-    spec_path = Path(__file__).resolve().parent / "validate_phase2_transport_browser_contract.py"
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "validate_phase2_transport_browser_contract", spec_path
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
     record = load_json(input_path)
     if not isinstance(record, dict):
         raise EvidenceGateError("transport contract artifact must be a JSON object")
-    module.validate_artifact(record)
+    validate_transport_browser_artifact(record)
     return record
 
 
