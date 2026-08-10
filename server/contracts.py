@@ -276,14 +276,6 @@ def resolve_work_status_wire_presence(capabilities: frozenset[str]) -> bool:
     return WORK_STATUS_V1 in capabilities
 
 
-WORK_STATUS_STATES = (
-    "routing",
-    "searching",
-    "background",
-    "result_ready",
-    "failed",
-    "cancelled",
-)
 WorkStatusState = Literal[
     "routing", "searching", "background", "result_ready", "failed", "cancelled"
 ]
@@ -296,7 +288,13 @@ _WORK_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
     "failed": frozenset(),
     "cancelled": frozenset(),
 }
-WORK_STATUS_TERMINAL = frozenset({"result_ready", "failed", "cancelled"})
+# Derived from _WORK_STATUS_TRANSITIONS so the state vocabulary has a single
+# hand-written source; WorkStatusState stays hand-written separately because
+# pydantic needs a literal type, which cannot be derived at type-check time.
+WORK_STATUS_STATES = tuple(_WORK_STATUS_TRANSITIONS)
+WORK_STATUS_TERMINAL = frozenset(
+    state for state, successors in _WORK_STATUS_TRANSITIONS.items() if not successors
+)
 # States a work item may be recorded at with no prior status of its own.
 # ``failed`` is cold-startable because failure can precede routing (a missing
 # worker or missing search capability fails a child that was never routed),

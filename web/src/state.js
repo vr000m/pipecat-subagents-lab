@@ -165,6 +165,59 @@ function workStatusKey(status) {
   return `${status.origin_epoch ?? ""}::${status.turn_id}::${status.work_item_id ?? ""}`;
 }
 
+// Client-side mirror of server/session_state.py's ledger bound
+// (_MAX_WORK_STATUS_KEYS / WORK_STATUS_TTL_SECONDS): a long, gap-free session
+// never receives a snapshot rebuild, so an insert-only map would otherwise
+// keep every terminal record rendered indefinitely. This is a simplified
+// version of the server's eviction, not a byte-for-byte port.
+const WORK_STATUS_MAX_KEYS = 256;
+const WORK_STATUS_TERMINAL_TTL_MS = 5 * 60 * 1000;
+const WORK_STATUS_TERMINAL_STATES = new Set(["result_ready", "failed", "cancelled"]);
+
+function pruneExpiredWorkStatus(workStatus, now) {
+  let changed = false;
+  const next = {};
+  for (const [key, record] of Object.entries(workStatus)) {
+    if (record._terminalSince !== undefined && now - record._terminalSince >= WORK_STATUS_TERMINAL_TTL_MS) {
+      changed = true;
+      continue;
+    }
+    next[key] = record;
+  }
+  return changed ? next : workStatus;
+}
+
+// Terminal-first eviction, oldest terminal first, mirroring
+// _evict_work_status_overflow's ordering; `protectKey` is the record just
+// written and is never the eviction victim.
+function evictOldestWorkStatus(workStatus, protectKey) {
+  if (Object.keys(workStatus).length <= WORK_STATUS_MAX_KEYS) return workStatus;
+  const next = { ...workStatus };
+  while (Object.keys(next).length > WORK_STATUS_MAX_KEYS) {
+    const candidates = Object.keys(next).filter((key) => key !== protectKey);
+    if (candidates.length === 0) break;
+    let oldestKey = candidates[0];
+    for (const key of candidates) {
+      const a = next[key];
+      const b = next[oldestKey];
+      const aTerminal = a._terminalSince !== undefined;
+      const bTerminal = b._terminalSince !== undefined;
+      const aIsOlder = aTerminal !== bTerminal ? aTerminal : (a._terminalSince ?? 0) < (b._terminalSince ?? 0);
+      if (aIsOlder) oldestKey = key;
+    }
+    delete next[oldestKey];
+  }
+  return next;
+}
+
+function upsertWorkStatus(workStatus, key, projected, now = Date.now()) {
+  const record = WORK_STATUS_TERMINAL_STATES.has(projected.state)
+    ? { ...projected, _terminalSince: now }
+    : projected;
+  const withEntry = { ...workStatus, [key]: record };
+  return evictOldestWorkStatus(pruneExpiredWorkStatus(withEntry, now), key);
+}
+
 function projectedSpeech(progress) {
   if (!progress || typeof progress !== "object" || !progress.utterance_id) return null;
   return {
@@ -188,12 +241,11 @@ function snapshotState(state, snapshot, sequence) {
       .filter(Boolean)
       .map((item) => [item.utterance_id, item]),
   );
-  const workStatus = Object.fromEntries(
-    (Array.isArray(snapshot.work_status) ? snapshot.work_status : [])
-      .map(projectedWorkStatus)
-      .filter(Boolean)
-      .map((item) => [workStatusKey(item), item]),
-  );
+  const now = Date.now();
+  const workStatus = (Array.isArray(snapshot.work_status) ? snapshot.work_status : [])
+    .map(projectedWorkStatus)
+    .filter(Boolean)
+    .reduce((acc, item) => upsertWorkStatus(acc, workStatusKey(item), item, now), {});
   const diagnostics = {
     ...state.localDiagnostics,
     lastSequence: snapshotSequence,
@@ -248,7 +300,7 @@ function applyIncrement(state, payload) {
       const key = workStatusKey(projected);
       const previous = state.workStatus[key];
       if (previous && previous.event_sequence >= projected.event_sequence) return state;
-      return { ...state, workStatus: { ...state.workStatus, [key]: projected } };
+      return { ...state, workStatus: upsertWorkStatus(state.workStatus, key, projected) };
     }
     case "user_transcript":
     case "bot_transcript":

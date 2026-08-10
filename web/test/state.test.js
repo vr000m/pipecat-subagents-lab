@@ -483,6 +483,65 @@ if (hasWorkStatusField) {
       const preserved = state.workStatus?.["1::turn-1::work-1"];
       expect(preserved?.origin_epoch).toBe(1);
     });
+
+    // Regression: the client's workStatus map was insert-only and unbounded,
+    // unlike the server's capped, terminal-first-evicting ledger (see
+    // server/session_state.py's _evict_work_status_overflow). A long,
+    // gap-free session would otherwise grow this map forever.
+    test("the workStatus ledger is bounded, evicting the oldest terminal record first", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      for (let index = 0; index < 300; index += 1) {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: index + 2,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: {
+            turn_id: `turn-${index}`,
+            work_item_id: `work-${index}`,
+            state: "result_ready",
+            event_sequence: 0,
+            origin_epoch: 1,
+          },
+        });
+      }
+
+      const keys = Object.keys(state.workStatus);
+      expect(keys.length).toBeLessThanOrEqual(256);
+      expect(state.workStatus["1::turn-299::work-299"]).toBeDefined();
+      expect(state.workStatus["1::turn-0::work-0"]).toBeUndefined();
+    });
+
+    test("a terminal work_status record expires once the TTL window elapses", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 2,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "result_ready", event_sequence: 0, origin_epoch: 1 },
+      });
+      expect(state.workStatus["1::turn-1::work-1"]).toBeDefined();
+
+      const realNow = Date.now;
+      Date.now = () => realNow() + 6 * 60 * 1000;
+      try {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 3,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: { turn_id: "turn-2", work_item_id: "work-2", state: "routing", event_sequence: 0, origin_epoch: 1 },
+        });
+      } finally {
+        Date.now = realNow;
+      }
+
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+      expect(state.workStatus["1::turn-2::work-2"]).toBeDefined();
+    });
   });
 } else {
   test.skip("Phase 3 work_status reducer not implemented yet (state.js has no workStatus field)", () => {});

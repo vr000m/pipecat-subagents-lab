@@ -76,10 +76,14 @@ function transcriptTurn(item, state) {
 }
 
 function workStatusLog(state) {
-  const entries = Object.values(state.workStatus || {});
+  const entries = Object.entries(state.workStatus || {});
   if (entries.length === 0) return "";
+  // Epoch is part of the record's identity (see state.js's workStatusKey):
+  // after a reconnect, one turn_id can have two records at different
+  // epochs. Rendering the epoch keeps those rows visually distinguishable
+  // instead of looking like duplicate/contradictory entries for one turn.
   const items = entries
-    .map((item) => `<li class="work-status ${escape(item.state)}">${escape(item.turn_id)} · ${escape(item.state)}${item.terminal_reason ? ` (${escape(item.terminal_reason)})` : ""}</li>`)
+    .map(([key, item]) => `<li class="work-status ${escape(item.state)}" data-work-status-key="${escape(key)}">${escape(item.turn_id)} · epoch ${escape(item.origin_epoch ?? "unknown")} · ${escape(item.state)}${item.terminal_reason ? ` (${escape(item.terminal_reason)})` : ""}</li>`)
     .join("");
   return `<h2>Work status</h2><ul class="work-status-log">${items}</ul>`;
 }
