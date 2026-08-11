@@ -6240,6 +6240,62 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
     asyncio.run(run())
 
 
+def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_live_sibling() -> None:
+    """Regression for round-5 review-gauntlet Theme H (Codex adversarial
+    finding): a multi-intent turn's coordinator-retained background
+    children are not tracked in the host's own ``_inflight_work_tasks``/
+    ``_inflight_turn_tasks`` maps once their turn handler has returned --
+    only the coordinator's own bookkeeping (``live_work_item_ids``) still
+    knows they're live. Before the fix, cancelling one such child made the
+    host's local ``remaining`` liveness check empty even though the sibling
+    was still running in the coordinator, so the parent ack was wrongly
+    cancelled/cleared out from under the still-live sibling."""
+
+    from server.speech_scheduler import ROLE_ACK
+
+    async def run() -> None:
+        class RetainedChildCoordinator:
+            def live_work_item_ids(self) -> frozenset[str]:
+                # The sibling child is live only here -- not in the scheduler,
+                # not in the host's own _inflight_* maps -- exactly the state
+                # a coordinator-retained background task leaves behind once
+                # its turn handler has returned.
+                return frozenset({"work-turn-h-1"})
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=RetainedChildCoordinator(),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        turn_id = "turn-h"
+        ack_work_item_id = f"ack-{turn_id}"
+        host._ack_emitted_turns.add(turn_id)
+        connection.scheduler.enqueue(
+            result_id=None,
+            work_item_id=ack_work_item_id,
+            run_id=f"run-{ack_work_item_id}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=ack_work_item_id,
+            turn_id=turn_id,
+        )
+        host._register_turn_work_item(turn_id, "work-turn-h-0")
+        host._register_turn_work_item(turn_id, "work-turn-h-1")
+
+        await host.cancel_turn_or_child(turn_id, "work-turn-h-0", origin=connection)
+
+        assert ack_work_item_id in connection.scheduler._queues, (
+            "the ack must survive: a coordinator-retained sibling is still live"
+        )
+        assert turn_id in host._ack_emitted_turns
+
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 # --- M12: one shared outcome -> work-status derivation ---------------------
 #
 # Both status-deriving call sites (the delegated-child finalization path and
@@ -7726,6 +7782,81 @@ def test_ack_admission_retries_after_a_transient_start_next_failure(
         assert len(attempts) >= 2, "the ack admission must be retried after the transient failure"
         active = origin.scheduler._active
         assert active is not None and active.item.work_item_id == ack_work_item_id
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_ack_admission_retry_gives_up_after_max_attempts_instead_of_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for round-5 review-gauntlet Theme A: before the fix, a
+    persistently failing ``start_next`` (e.g. the connection's worker never
+    attaches for the turn's whole lifetime) retried the ack admission
+    forever at ``_ACK_ADMISSION_RETRY_DELAY_SECONDS`` cadence, with no cap on
+    attempt count. Past ``_ACK_ADMISSION_MAX_ATTEMPTS`` the ack must be
+    abandoned instead: its queued item discarded and the turn's ack latch
+    cleared, so retries stop and the turn's ack slot is freed."""
+    import server.pipeline as pipeline_module
+    from server.speech_scheduler import ROLE_ACK
+
+    monkeypatch.setattr(pipeline_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(pipeline_module, "_ACK_ADMISSION_MAX_ATTEMPTS", 3)
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        attempts: list[str | None] = []
+
+        async def always_failing_start_next(work_item_id: str | None = None):
+            attempts.append(work_item_id)
+            raise RuntimeError("worker never attaches")
+
+        origin.scheduler.start_next = always_failing_start_next  # type: ignore[method-assign]
+
+        turn_id = "turn-never-attaches"
+        ack_work_item_id = "ack-turn-never-attaches"
+
+        def enqueue_ack() -> None:
+            origin.scheduler.enqueue(
+                result_id=None,
+                work_item_id=ack_work_item_id,
+                run_id=f"run-{ack_work_item_id}",
+                text="One moment.",
+                origin_epoch=origin.epoch,
+                role=ROLE_ACK,
+                ack_id=ack_work_item_id,
+                turn_id=turn_id,
+            )
+
+        host._ack_emitted_turns.add(turn_id)
+        enqueue_ack()
+        host._schedule_ack_admission(
+            origin,
+            ack_work_item_id,
+            enqueue_ack,
+            turn_id=turn_id,
+            origin_epoch=origin.epoch,
+        )
+
+        for _ in range(200):
+            if turn_id not in host._ack_emitted_turns:
+                break
+            await asyncio.sleep(0.01)
+
+        assert turn_id not in host._ack_emitted_turns, (
+            "the ack latch must be cleared after giving up"
+        )
+        assert len(attempts) == 3, "retries must stop at the attempt cap, not continue forever"
+        assert ack_work_item_id not in origin.scheduler._queues, (
+            "the abandoned ack's queued item must be discarded"
+        )
+
+        # No further attempts arrive even after waiting well past another
+        # retry interval -- proving the loop actually stopped, not just that
+        # the assertion above raced a slow retry.
+        await asyncio.sleep(0.05)
+        assert len(attempts) == 3
         await host.shutdown()
 
     asyncio.run(run())

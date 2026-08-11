@@ -84,6 +84,13 @@ persistently unavailable worker retries at a steady, low-frequency cadence
 instead of a tight loop, while a short-lived unavailability window still
 gets the ack delivered without waiting on an unrelated speech admission."""
 
+_ACK_ADMISSION_MAX_ATTEMPTS = 4
+"""Cap on early-ack admission retries. A worker that never attaches for a
+turn's whole lifetime would otherwise retry forever at
+``_ACK_ADMISSION_RETRY_DELAY_SECONDS`` cadence; past this many attempts the
+ack is abandoned (its queued item discarded, its latch cleared) rather than
+retried indefinitely."""
+
 
 class _FallbackBridge:
     """Dependency-free marker used only when the pinned bridge API is absent."""
@@ -512,6 +519,14 @@ class SessionHost:
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
+        # Kept on getattr, not a direct ``coordinator.registry`` access, even
+        # though the Coordinator Protocol declares ``registry`` required:
+        # many duck-typed test-double coordinators in the suite construct
+        # without a ``registry``/``config`` attribute at all, and this is the
+        # one place in __init__ where a coordinator can legitimately still be
+        # ``None`` at the point of use. Converting this to a direct attribute
+        # access breaks that whole class of test doubles; see the Coordinator
+        # Protocol's own docstring in work_item_coordinator.py.
         coordinator_registry = getattr(coordinator, "registry", None)
         if registry is None and coordinator_registry is not None:
             registry = coordinator_registry
@@ -530,11 +545,14 @@ class SessionHost:
         # whatever Config it was given, so those coordinator-owned fields are
         # excluded from this comparison; every other field must still match.
         # The set is read from the coordinator itself (falling back to
-        # WorkItemCoordinator's declaration for duck-typed test coordinators)
+        # WorkItemCoordinator's declaration for duck-typed test coordinators
+        # that construct without declaring the Coordinator Protocol's
+        # required OWNED_CONFIG_FIELDS ClassVar -- this getattr fallback is
+        # kept deliberately, see the Coordinator Protocol's own docstring)
         # rather than re-listed here, so adding or removing a coordinator-owned
         # field cannot silently turn every construction into a boot-time
         # ValueError raised from the wrong component.
-        coordinator_config = getattr(coordinator, "config", None)
+        coordinator_config = getattr(coordinator, "config", None)  # see registry getattr note above
         if coordinator_config is not None:
             owned_fields = getattr(
                 coordinator, "OWNED_CONFIG_FIELDS", WorkItemCoordinator.OWNED_CONFIG_FIELDS
@@ -1175,6 +1193,7 @@ class SessionHost:
             enqueue_ack,
             turn_id=turn_id,
             origin_epoch=origin_epoch,
+            attempt=1,
         )
 
     def _schedule_ack_admission(
@@ -1185,6 +1204,7 @@ class SessionHost:
         *,
         turn_id: str,
         origin_epoch: int,
+        attempt: int = 1,
     ) -> None:
         """Admit a just-enqueued ack on a later scheduling tick, not inline.
 
@@ -1194,6 +1214,15 @@ class SessionHost:
         result that is already ready, can still discard the ack while it is
         merely queued (``discard_queued_ack`` / ``SpeechScheduler.interrupt``)
         before it is ever handed to the transport.
+
+        ``attempt`` counts this call as one admission attempt (the caller's
+        own initial ``enqueue_ack()`` plus this scheduling call is attempt 1).
+        A persistently unavailable worker (e.g. never attaches for the whole
+        turn) would otherwise retry forever at
+        ``_ACK_ADMISSION_RETRY_DELAY_SECONDS`` cadence; past
+        ``_ACK_ADMISSION_MAX_ATTEMPTS`` the ack is abandoned instead --
+        its queued item discarded and the turn's ack latch cleared -- rather
+        than left retrying indefinitely.
         """
 
         async def admit() -> None:
@@ -1222,6 +1251,15 @@ class SessionHost:
                         "discarding it instead of re-queueing"
                     )
                     return
+                if attempt >= _ACK_ADMISSION_MAX_ATTEMPTS:
+                    logger.opt(exception=True).debug(
+                        "early ack failed to start after {} attempts; abandoning it "
+                        "instead of retrying indefinitely",
+                        attempt,
+                    )
+                    origin.scheduler.discard_queued_ack(ack_work_item_id)
+                    self._clear_ack_latch(turn_id)
+                    return
                 logger.opt(exception=True).debug(
                     "early ack failed to start; leaving it queued for a later retry"
                 )
@@ -1235,6 +1273,7 @@ class SessionHost:
                         enqueue_ack,
                         turn_id=turn_id,
                         origin_epoch=origin_epoch,
+                        attempt=attempt + 1,
                     )
 
                 retry_task = asyncio.create_task(retry_after_delay())
@@ -1303,14 +1342,24 @@ class SessionHost:
         # let an unrelated turn's queued or admitted speech keep this turn's
         # ack alive after its only child was cancelled -- and that ack could
         # then still be admitted and spoken.
-        # "Still live" is positive evidence -- an in-flight work/turn task, or
-        # queued/admitted speech -- intersected with this turn's own delegated
-        # children, never the connection-wide scheduler view on its own.
+        # "Still live" is positive evidence -- an in-flight work/turn task,
+        # queued/admitted speech, or a coordinator-retained background task
+        # (this host's own _inflight_* maps stop tracking a child once its
+        # turn handler has retained it as background) -- intersected with
+        # this turn's own delegated children, never the connection-wide
+        # scheduler view on its own.
         own_work_items = self._turn_work_items.get(turn_id, set())
         scheduler_live = set(scheduler.pending_work_item_ids(exclude=ack_work_item_id))
         if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
             scheduler_live.add(scheduler.active.item.work_item_id)
-        live = scheduler_live | set(self._inflight_work_tasks) | set(self._inflight_turn_tasks)
+        live_lookup = getattr(self.coordinator, "live_work_item_ids", None)
+        coordinator_live = live_lookup() if live_lookup is not None else frozenset()
+        live = (
+            scheduler_live
+            | set(self._inflight_work_tasks)
+            | set(self._inflight_turn_tasks)
+            | coordinator_live
+        )
         remaining = (live & own_work_items) - self._cancelled_work_items
         remaining.discard(child_work_item_id)
         if not remaining:
@@ -1318,7 +1367,7 @@ class SessionHost:
             self._clear_ack_latch(turn_id)
         return cancelled_work, cancelled_speech
 
-    def _require_coordinator(self) -> Any:
+    def _require_coordinator(self) -> Coordinator:
         coordinator = self.coordinator
         if coordinator is None:
             raise RuntimeError("coordinator is required to execute work")
@@ -1837,7 +1886,11 @@ class SessionHost:
             owner_id = pending.owner_id if pending is not None else None
             if owner_id is None:
                 owner_id = outcome.work_items[0] if outcome.work_items else None
-            registered = coordinator.registry.get(owner_id) if owner_id else None
+            registered = (
+                coordinator.registry.get(owner_id)
+                if owner_id and coordinator.registry is not None
+                else None
+            )
             worker = registered.worker if registered is not None else None
             search = getattr(worker, "search", None)
             work_item_id = f"work-{turn_id}"
@@ -2082,13 +2135,20 @@ class SessionHost:
                 child_recorders[index] = child
                 worker = None
                 if index == 0 and pending is not None:
-                    registered = coordinator.registry.get(pending.owner_id)
+                    registered = (
+                        coordinator.registry.get(pending.owner_id)
+                        if coordinator.registry is not None
+                        else None
+                    )
                     worker = registered.worker if registered is not None else None
                 else:
-                    catalogue = coordinator.registry.catalogue()
                     try:
+                        registry, router = coordinator.registry, coordinator.router
+                        if registry is None or router is None:
+                            raise RuntimeError("registry and router are required to route")
+                        catalogue = registry.catalogue()
                         envelope = await asyncio.to_thread(
-                            coordinator.router.route_envelope,
+                            router.route_envelope,
                             item_text,
                             catalogue,
                         )
@@ -2632,6 +2692,13 @@ class SessionHost:
         }
         if clarification_context is not None:
             kwargs["clarification_context"] = clarification_context
+        # Kept on getattr, not a direct ``self.coordinator.start_task`` call,
+        # even though the Coordinator Protocol declares ``start_task``
+        # required: most duck-typed test-double coordinators across the
+        # suite (dozens, verified empirically) implement only the subset of
+        # methods their specific test exercises and do not declare
+        # ``start_task`` at all. See the Coordinator Protocol's own
+        # docstring in work_item_coordinator.py.
         starter = getattr(self.coordinator, "start_task", None)
         return (
             starter(search(query, **kwargs))
@@ -3215,6 +3282,8 @@ class SessionHost:
             for item_id in dict.fromkeys((*self._inflight_turn_tasks, *self._inflight_work_tasks))
             if (work_item_id is None or item_id == work_item_id) and item_id != exclude_work_item_id
         )
+        # Kept on getattr for the same reason as start_task above -- dozens
+        # of duck-typed test coordinators do not implement ``cancel``.
         coordinator_cancel = getattr(self.coordinator, "cancel", None)
         if coordinator_cancel is not None:
             selected = tuple(dict.fromkeys((*selected, *coordinator_cancel(work_item_id))))
@@ -3429,6 +3498,12 @@ class SessionHost:
             for task in done:
                 if not task.cancelled():
                     task.exception()
+        # Kept on getattr for the same reason as start_task/cancel above --
+        # dozens of duck-typed test coordinators do not implement
+        # ``shutdown``. The Protocol declares it ``async def shutdown(self)
+        # -> None``, so a conforming coordinator's result is always
+        # awaitable; ``inspect.isawaitable`` only accommodates the
+        # non-conforming test doubles that happen to define a sync one.
         coordinator_shutdown = getattr(self.coordinator, "shutdown", None)
         if coordinator_shutdown is not None:
             result = coordinator_shutdown()

@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
+from typing import Any, ClassVar, Literal, Protocol, get_args
 
 from loguru import logger
 
@@ -128,19 +128,25 @@ class Result:
     citations: tuple[Any, ...] = ()
 
 
-@runtime_checkable
 class Coordinator(Protocol):
     """The SessionHost <-> coordinator boundary, declared explicitly.
 
     ``SessionHost`` previously typed its ``coordinator`` field as ``Any``
-    and duck-typed it via five separate ``getattr(coordinator, ...)``
-    probes, with production code defaulting to this concrete class's own
+    and duck-typed it via separate ``getattr(coordinator, ...)`` probes,
+    with production code defaulting to this concrete class's own
     attributes to accommodate test doubles. This Protocol is the single
     declaration of what a coordinator must provide, matching
     ``WorkItemCoordinator``'s actual public surface as used by
-    ``server/pipeline.py``. Genuinely optional members (features a caller
-    probes with ``getattr`` and tolerates being absent) are intentionally
-    left off this Protocol and stay on ``getattr`` probes at the call site.
+    ``server/pipeline.py``. Every member declared here is required and is
+    accessed directly (via ``_require_coordinator() -> Coordinator`` or an
+    explicit ``self.coordinator is not None`` guard), not through
+    ``getattr``, everywhere the coordinator's identity is already settled.
+    The one remaining exception is ``SessionHost.__init__`` itself, where
+    ``registry``, ``config``, and ``OWNED_CONFIG_FIELDS`` all stay behind
+    ``getattr`` fallbacks on purpose: a large number of duck-typed
+    test-double coordinators across the suite construct without declaring
+    those members at all, and requiring full Protocol conformance from
+    every test double is out of scope for this pass.
     """
 
     registry: WorkerRegistry | None
@@ -183,6 +189,17 @@ class Coordinator(Protocol):
     def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
 
     async def shutdown(self) -> None: ...
+
+    def add_worker_clarification(
+        self,
+        *,
+        session_id: str,
+        worker_id: str,
+        turn_id: str,
+        result_id: str,
+        original_query: str,
+        question: str,
+    ) -> None: ...
 
 
 class WorkItemCoordinator:
@@ -521,6 +538,20 @@ class WorkItemCoordinator:
         for item_id in selected:
             self._work_tasks[item_id].cancel()
         return selected
+
+    def live_work_item_ids(self) -> frozenset[str]:
+        """Work items the coordinator still owns a live task for.
+
+        Covers coordinator-retained background work (``retain_late_task``)
+        that a caller's own local turn/work-task bookkeeping does not track
+        once a turn handler has returned -- see ``SessionHost.
+        cancel_turn_or_child``'s sole-child liveness check. Deliberately not
+        declared on the ``Coordinator`` Protocol: it is brand new and no
+        existing duck-typed test-double coordinator implements it, so the
+        one call site probes it with ``getattr`` and tolerates its absence,
+        same as any other genuinely optional member.
+        """
+        return frozenset(self._work_tasks)
 
     @staticmethod
     def pending_intent(transcript: str) -> str:

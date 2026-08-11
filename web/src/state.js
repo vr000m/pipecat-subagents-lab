@@ -213,9 +213,19 @@ function evictOldestWorkStatus(workStatus, protectKey) {
 function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previousRecord = workStatus[key]) {
   // Preserve an already-terminal key's original `_terminalSince` (e.g. a
   // reconnect snapshot re-delivering the same terminal record) instead of
-  // restamping it to `now`: the server's five-minute TTL is measured from
-  // when the record actually went terminal, not from whenever the client
-  // last happened to receive it (protocol.md, "Progressive work status").
+  // restamping it to `now`: within this serving process, the server's
+  // five-minute TTL is measured from when the record actually went
+  // terminal, not from whenever the client last happened to receive it
+  // (protocol.md, "Progressive work status") -- though
+  // `SessionState.from_snapshot` does restamp `terminal_at` on restore (no
+  // production caller today, only tests), so this is not a cross-process
+  // guarantee.
+  //
+  // If a terminal record was pruned client-side and a later snapshot
+  // re-adds the same key, `previousRecord` is undefined here and this
+  // grants a fresh five-minute window -- bounded today only because the
+  // server also prunes at projection and stops sending it, not because
+  // this function independently enforces the TTL.
   const record = WORK_STATUS_TERMINAL_STATES.has(projected.state)
     ? { ...projected, _terminalSince: previousRecord?._terminalSince ?? now }
     : projected;
@@ -257,6 +267,11 @@ function snapshotState(state, snapshot, sequence) {
     .filter(Boolean)
     .reduce((acc, item) => {
       const key = workStatusKey(item);
+      // `previousRecord` is seeded from the pre-snapshot `state.workStatus`,
+      // not from `acc` (the in-progress reduce accumulator). Harmless today
+      // since a snapshot carries at most one parent record per key, but
+      // would make this non-idempotent under a hypothetical future
+      // duplicate-key-within-one-snapshot case.
       return upsertWorkStatus(acc, key, item, now, state.workStatus[key]);
     }, {});
   const diagnostics = {

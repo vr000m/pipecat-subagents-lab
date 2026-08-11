@@ -239,36 +239,40 @@ class SpeechScheduler:
         identity: GenerationIdentity | None = None
         disposition: Any = None
         for key in keys:
-            candidate = self._queues[key][0] if self._queues.get(key) else None
-            if candidate is None:
-                continue
-            candidate_identity = GenerationIdentity(
-                candidate.utterance_id,
-                candidate.work_item_id,
-                candidate.origin_epoch,
-                role=candidate.role if candidate.role == ROLE_ACK else "result",
-                turn_id=candidate.turn_id,
-                ack_id=candidate.ack_id,
-            )
-            candidate_disposition = self.lifecycle.pre_admission_disposition(candidate_identity)
-            if isinstance(candidate_disposition, PreAdmissionTerminal):
-                # The transport slot is still provably free (checked above,
-                # and nothing here awaits) -- a terminal disposition rejects
-                # only this candidate, not the slot itself, so the next
-                # candidate key deserves its own admission attempt instead of
-                # stalling until an unrelated caller happens to call
-                # start_next again.
-                self._discard_from_queue(candidate)
-                if candidate.role == ROLE_ACK:
-                    if candidate.ack_id is not None:
-                        self._ack_index.pop(candidate.ack_id, None)
-                    if self._on_ack_terminal is not None:
-                        self._on_ack_terminal(candidate_identity, candidate_disposition.reason)
-                else:
-                    self._emit_progress(candidate, DeliveryState.DELIVERY_UNKNOWN)
-                continue
-            item, identity, disposition = candidate, candidate_identity, candidate_disposition
-            break
+            while True:
+                candidate = self._queues[key][0] if self._queues.get(key) else None
+                if candidate is None:
+                    break
+                candidate_identity = GenerationIdentity(
+                    candidate.utterance_id,
+                    candidate.work_item_id,
+                    candidate.origin_epoch,
+                    role=candidate.role if candidate.role == ROLE_ACK else "result",
+                    turn_id=candidate.turn_id,
+                    ack_id=candidate.ack_id,
+                )
+                candidate_disposition = self.lifecycle.pre_admission_disposition(candidate_identity)
+                if isinstance(candidate_disposition, PreAdmissionTerminal):
+                    # The transport slot is still provably free (checked
+                    # above, and nothing here awaits) -- a terminal
+                    # disposition rejects only this candidate, not the slot
+                    # itself, so this same key's newly-exposed next item
+                    # deserves its own admission attempt before moving on to
+                    # another key, instead of stalling until an unrelated
+                    # caller happens to call start_next again.
+                    self._discard_from_queue(candidate)
+                    if candidate.role == ROLE_ACK:
+                        if candidate.ack_id is not None:
+                            self._ack_index.pop(candidate.ack_id, None)
+                        if self._on_ack_terminal is not None:
+                            self._on_ack_terminal(candidate_identity, candidate_disposition.reason)
+                    else:
+                        self._emit_progress(candidate, DeliveryState.DELIVERY_UNKNOWN)
+                    continue
+                item, identity, disposition = candidate, candidate_identity, candidate_disposition
+                break
+            if item is not None:
+                break
         if item is None or identity is None:
             return None
         if disposition is None:
@@ -442,20 +446,30 @@ class SpeechScheduler:
         by any future caller -- it leaks into every later connection's
         ``RuntimeSnapshot.speech_progress`` forever.
 
-        ``full_stop`` is for a same-epoch, non-reconnect teardown (e.g.
-        ``ConnectionPipeline.shutdown``'s "speech output teardown"/"session
-        shutdown" paths): those still need the sweep -- this scheduler is
-        gone either way -- but must record plain ``INTERRUPTED`` (not
-        ``INTERRUPTED_BY_RECONNECT``) and must not bypass ``SessionState``'s
-        active-epoch fence, since a same-epoch teardown never advanced
-        ``active_epoch`` the way a reconnect does.
+        ``full_stop`` is for a teardown (e.g. ``ConnectionPipeline.shutdown``'s
+        "speech output teardown"/"session shutdown" paths, or
+        ``deactivate()``) where this scheduler is being discarded for good
+        but the disposition recorded should stay plain ``INTERRUPTED`` (not
+        ``INTERRUPTED_BY_RECONNECT``) unless ``reconnect`` is also set.
 
-        ``reconnect`` changes both the recorded disposition (``INTERRUPTED``
-        vs. ``INTERRUPTED_BY_RECONNECT``) and whether the emission bypasses
-        that fence (``allow_stale_reconnect``): a genuine reconnect has
-        already advanced ``active_epoch`` past these items' origin epoch by
-        the time this runs, so the fence must be bypassed or the emission is
-        silently dropped.
+        ``reconnect`` changes the recorded disposition (``INTERRUPTED`` vs.
+        ``INTERRUPTED_BY_RECONNECT``); a genuine reconnect has already
+        advanced ``active_epoch`` past these items' origin epoch by the time
+        this runs.
+
+        Both ``reconnect`` and ``full_stop`` bypass ``SessionState``'s
+        active-epoch fence (``allow_stale_reconnect=reconnect or
+        full_stop``): a same-epoch teardown is *usually* not expected to
+        have advanced ``active_epoch``, but a teardown dispatched as a
+        separate task after an ``await`` (``dispatch_lifecycle_teardown`` ->
+        ``schedule_pipeline_shutdown`` -> ``shutdown(reconnect=False)`` ->
+        ``deactivate`` -> here) is not guaranteed same-epoch by
+        construction -- a promotion can land in that window and advance
+        ``active_epoch`` first. Since this scheduler is gone either way once
+        ``full_stop`` is set, the bypass must track "is this scheduler being
+        discarded" rather than "was this a reconnect", or a same-epoch-only
+        assumption silently drops every queued/paused terminal record
+        ``full_stop`` exists to emit.
         """
         state = DeliveryState.INTERRUPTED_BY_RECONNECT if reconnect else DeliveryState.INTERRUPTED
         active_item = self._active.item if self._active is not None else None
@@ -469,7 +483,7 @@ class SpeechScheduler:
             self._emit_progress(
                 active_item,
                 state,
-                allow_stale_reconnect=reconnect,
+                allow_stale_reconnect=reconnect or full_stop,
                 **({"origin_epoch": epoch} if epoch is not None else {}),
             )
             self._release(active_item.utterance_id)
@@ -479,7 +493,7 @@ class SpeechScheduler:
                     self._emit_progress(
                         item,
                         state,
-                        allow_stale_reconnect=reconnect,
+                        allow_stale_reconnect=reconnect or full_stop,
                         **({"origin_epoch": epoch} if epoch is not None else {}),
                     )
             self._queues.clear()
@@ -493,7 +507,7 @@ class SpeechScheduler:
                 self._emit_progress(
                     item,
                     state,
-                    allow_stale_reconnect=reconnect,
+                    allow_stale_reconnect=reconnect or full_stop,
                     **({"origin_epoch": epoch} if epoch is not None else {}),
                 )
             self._paused.clear()

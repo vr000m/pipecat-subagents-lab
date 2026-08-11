@@ -410,6 +410,44 @@ def test_full_stop_terminalizes_active_queued_and_paused_items_without_reconnect
     assert scheduler._paused == {}
 
 
+def test_full_stop_without_reconnect_still_emits_when_active_epoch_already_advanced() -> None:
+    """Regression for round-5 review-gauntlet Theme B: ``full_stop=True,
+    reconnect=False`` used to pass ``allow_stale_reconnect=reconnect`` (i.e.
+    ``False``), so if ``active_epoch`` had already advanced past these
+    items' origin epoch by the time the sweep ran -- e.g. a promotion
+    landing in the async gap between ``dispatch_lifecycle_teardown``
+    scheduling ``shutdown(reconnect=False)`` as a separate task and that
+    task actually running ``deactivate()`` -- ``SessionState.speech_progress``
+    silently dropped the terminal record instead of storing it, defeating
+    the exact leak ``full_stop`` was added to fix. The bypass must track
+    "this scheduler is being discarded" (``full_stop``), not "was this
+    literally a reconnect".
+    """
+    scheduler = _scheduler()
+    paused = enqueue(scheduler, "work-1", "to-be-paused")
+    asyncio.run(scheduler.start_next())
+    scheduler.pause("work-1")
+
+    active = enqueue(scheduler, "work-2", "active")
+    asyncio.run(scheduler.start_next())
+    queued = enqueue(scheduler, "work-3", "queued")
+
+    # Simulate a promotion advancing active_epoch during the async gap
+    # before this same-epoch teardown's sweep runs.
+    scheduler.state.active_epoch = 999
+
+    scheduler.interrupt(full_stop=True, reconnect=False)
+
+    assert scheduler.state.speech[active.utterance_id].state == DeliveryState.INTERRUPTED
+    assert scheduler.state.speech[queued.utterance_id].state == DeliveryState.INTERRUPTED
+    assert scheduler.state.speech[paused.utterance_id].state == DeliveryState.INTERRUPTED
+    # Disposition must stay plain INTERRUPTED, not INTERRUPTED_BY_RECONNECT,
+    # since reconnect=False -- only the fence-bypass tracks full_stop.
+    assert scheduler.state.speech[active.utterance_id].state != (
+        DeliveryState.INTERRUPTED_BY_RECONNECT
+    )
+
+
 def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:
     scheduler = _scheduler()
     old_item = enqueue(scheduler, "work-1", "old")
@@ -679,6 +717,38 @@ def test_start_next_with_no_key_probes_every_candidate_after_a_terminal_disposit
     scheduler = _scheduler(lifecycle=lifecycle, speak=None)
     first = enqueue(scheduler, "work-1", "direct answer")
     second = enqueue(scheduler, "work-2", "clarify")
+
+    assert asyncio.run(scheduler.start_next()) is None
+
+    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+    assert scheduler.state.speech[second.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+    assert scheduler.pending_work_item_ids() == frozenset()
+
+
+def test_start_next_probes_the_same_keys_newly_exposed_second_item_after_a_terminal_head() -> None:
+    """Regression for round-5 review-gauntlet Theme I: on a terminal
+    pre-admission disposition, ``start_next`` discarded the candidate and
+    moved on to the *next key* in its probe list without re-checking the
+    same key's newly-exposed second item -- not a correctness break (the
+    sibling is swept on the next call), but incomplete relative to the
+    finding's own goal of clearing everything the transport slot's
+    provable freedom allows in one call. Two items queued under the same
+    work-item key must both be cleared by a single ``start_next()`` call.
+    """
+    lifecycle = _lifecycle(tts_available=False)
+    scheduler = _scheduler(lifecycle=lifecycle, speak=None)
+    first = scheduler.enqueue(
+        result_id="result-first",
+        work_item_id="work-1",
+        run_id="run-first",
+        text="first",
+    )
+    second = scheduler.enqueue(
+        result_id="result-second",
+        work_item_id="work-1",
+        run_id="run-second",
+        text="second",
+    )
 
     assert asyncio.run(scheduler.start_next()) is None
 

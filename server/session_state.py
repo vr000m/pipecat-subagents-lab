@@ -73,8 +73,9 @@ class WorkStatusKey(NamedTuple):
     key; a ``direct``/``unsupported``/``clarify`` routing action never does
     (Requirements). That gate is about how the key comes to exist, not which
     states it may later reach: a worker-raised ``clarify``/``declined`` on an
-    already-delegated child settles that already-open key at
-    ``result_ready``, not a non-terminal state.
+    already-delegated child settles that child terminal at ``result_ready``
+    once its canonical result commits -- not a non-terminal state -- and at
+    ``failed`` instead if that commit fails or is stale.
     """
 
     origin_epoch: int | None

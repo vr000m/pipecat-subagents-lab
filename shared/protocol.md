@@ -94,9 +94,11 @@ message-kind fallback. Only an `existing_worker`/`new_worker` routing
 `direct`/`unsupported`/`clarify` routing action never does. That allocation
 gate is about how the parent record comes to exist, not about which states
 it may later reach: a worker that raises `clarify` or `declined` on a child
-that was already delegated this way is a terminal outcome on that
-already-open record, settling it at `result_ready` (the canonical result is
-still committed and spoken) rather than leaving it non-terminal.
+that was already delegated this way is a terminal outcome for that child,
+settling that child terminal at `result_ready` (the canonical result is
+still committed and display-ready) once its canonical result commits --
+rather than leaving it non-terminal -- and settling it at `failed` instead
+if that commit fails or is stale; the parent re-aggregates as usual.
 
 Each payload carries `turn_id`, a nullable `work_item_id` (the parent key for
 a mixed multi-intent turn), a nullable `worker_id`, the coarse `state` enum,
