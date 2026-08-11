@@ -163,6 +163,105 @@ def test_tts_completion_uses_only_one_provider_signal() -> None:
     assert type(hosted_processors[1]).__name__ == "_SpeechCompletionProcessor"
 
 
+def test_snapshot_barrier_consumer_ack_is_not_blocked_by_a_stuck_downstream_dataframe() -> None:
+    """Regression for round-4 findings (code-review #1, Codex #2): the barrier
+    consumer's docstring used to claim it is "the last processor before
+    transport.output()", and Codex argued the ack therefore fires before
+    downstream TTS/lifecycle processors have actually drained it.
+
+    Neither claim matches pipecat's real frame-processing model: every RTVI
+    frame involved here (``RTVIServerMessageFrame`` and
+    ``SnapshotBarrierFlushFrame``) is a ``SystemFrame``, and pipecat's
+    ``FrameProcessor`` routes ``SystemFrame`` instances through a dedicated
+    input queue that bypasses the ordinary per-frame ``DataFrame`` queue
+    entirely (see ``FrameProcessor.__input_frame_task_handler``). This test
+    proves it directly: a ``DataFrame`` wedged forever in a slow downstream
+    stage does not block the barrier's acknowledgement, and a later RTVI
+    frame queued after the ack still arrives at the sink strictly after an
+    earlier one queued before it -- the real ordering invariant the barrier
+    exists to provide.
+    """
+    import dataclasses as _dc
+
+    from pipecat.frames.frames import DataFrame, EndFrame
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.worker import PipelineWorker
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+    from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
+    from pipecat.workers.runner import WorkerRunner
+
+    from server.app import _SnapshotBarrierConsumer
+    from server.frames import SnapshotBarrierFlushFrame
+
+    @_dc.dataclass
+    class _WedgedDataFrame(DataFrame):
+        pass
+
+    class _SlowSink(FrameProcessor):
+        """Blocks forever on a DataFrame; passes everything else straight
+        through -- standing in for a real downstream stage (TTS/lifecycle)
+        that never resolves the wedged frame during this test."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.received: list[object] = []
+            self._stuck = asyncio.get_event_loop().create_future()
+
+        async def process_frame(self, frame: object, direction: FrameDirection) -> None:
+            await super().process_frame(frame, direction)
+            self.received.append(frame)
+            if isinstance(frame, _WedgedDataFrame):
+                await self._stuck  # never resolves within this test
+            await self.push_frame(frame, direction)
+
+    async def body() -> None:
+        sink = _SlowSink()
+        pipeline = Pipeline([_SnapshotBarrierConsumer(), sink])
+        worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
+
+        acked = asyncio.get_event_loop().create_future()
+
+        def acknowledge() -> None:
+            if not acked.done():
+                acked.set_result(None)
+
+        async def push_frames() -> None:
+            await asyncio.sleep(0.01)
+            await worker.queue_frame(_WedgedDataFrame())
+            incremental_1 = RTVIServerMessageFrame(data={"seq": 1})
+            await worker.queue_frame(incremental_1)
+            await worker.queue_frame(SnapshotBarrierFlushFrame(token="t", acknowledge=acknowledge))
+            # Proves the ack does not wait on the wedged DataFrame stuck in
+            # sink's DataFrame-only queue.
+            await asyncio.wait_for(acked, timeout=2.0)
+            incremental_2 = RTVIServerMessageFrame(data={"seq": 2})
+            await worker.queue_frame(incremental_2)
+            # Give the sink's system-frame queue a chance to drain both
+            # incrementals (independent of the still-wedged DataFrame),
+            # then release the wedge and end the pipeline cleanly.
+            for _ in range(50):
+                if incremental_2 in sink.received:
+                    break
+                await asyncio.sleep(0.01)
+            if not sink._stuck.done():
+                sink._stuck.set_result(None)
+            await worker.queue_frame(EndFrame())
+
+        runner = WorkerRunner()
+        await runner.add_workers(worker)
+        await asyncio.wait_for(asyncio.gather(runner.run(), push_frames()), timeout=10.0)
+
+        rtvi_order = [f for f in sink.received if isinstance(f, RTVIServerMessageFrame)]
+        assert [f.data["seq"] for f in rtvi_order] == [1, 2], (
+            "RTVI incrementals must remain strictly ordered end-to-end even "
+            "though the barrier consumer is not the literal last processor "
+            "and even though the ack fired while a DataFrame was still "
+            "wedged downstream"
+        )
+
+    asyncio.run(body())
+
+
 def test_connection_setup_failure_cleans_and_fences_promoted_runtime() -> None:
     async def run() -> None:
         tts = FailingTTS()

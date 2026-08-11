@@ -70,11 +70,19 @@ from .speech_scheduler import (
 )
 from .work_item_coordinator import (
     FAILURE_KINDS,
+    Coordinator,
     LateResult,
     WorkItemCoordinator,
     WorkItemFailure,
 )
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
+
+_ACK_ADMISSION_RETRY_DELAY_SECONDS = 0.25
+"""Backoff before re-attempting a failed early-ack admission (e.g. the
+connection's Pipecat worker has not attached yet). Bounded and real-time so a
+persistently unavailable worker retries at a steady, low-frequency cadence
+instead of a tight loop, while a short-lived unavailability window still
+gets the ack delivered without waiting on an unrelated speech admission."""
 
 
 class _FallbackBridge:
@@ -389,16 +397,30 @@ class ConnectionPipeline:
 
     def deactivate(self, *, reconnect: bool = True) -> None:
         self.active = False
-        self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect)
+        # full_stop=True: deactivate() always means this connection is being
+        # retired for good (shutdown or reconnect-promotion), so its queued
+        # and paused speech items must be swept regardless of `reconnect`'s
+        # value -- not just on a genuine reconnect (server/speech_scheduler.py
+        # SpeechScheduler.interrupt docstring).
+        self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect, full_stop=True)
 
-    async def shutdown(self, *, reason: str = "connection replaced") -> None:
+    async def shutdown(self, *, reason: str = "connection replaced", reconnect: bool) -> None:
         """Fence this connection and stop its Pipecat worker, if attached.
 
         Always forces scheduler cleanup, even if something upstream (e.g. a
         failed output teardown) already set ``active = False`` directly
         without releasing the scheduler's active lease.
+
+        ``reconnect`` is an explicit, caller-supplied classification -- not
+        inferred from ``reason``. ``reason`` is a free-text diagnostic string
+        with no stable set of reconnect-implying values (e.g. "connection
+        replaced during setup" is just as much a reconnect as "connection
+        replaced", but would not match an exact-string check); inferring
+        ``reconnect`` from it silently mis-classifies any call site whose
+        wording doesn't match exactly, dropping a still-active utterance's
+        origin-epoch fencing (see ``SpeechScheduler.interrupt``).
         """
-        self.deactivate(reconnect=reason == "connection replaced")
+        self.deactivate(reconnect=reconnect)
         if self.worker is not None:
             cancel = getattr(self.worker, "cancel", None)
             if cancel is not None:
@@ -481,7 +503,7 @@ class SessionHost:
         runner_factory: Callable[[], Any] | None = None,
         stt: Any | None = None,
         tts: Any | None = None,
-        coordinator: Any | None = None,
+        coordinator: Coordinator | None = None,
         *,
         measurement_sink: MeasurementSink | None = None,
         config: Config | None = None,
@@ -715,7 +737,7 @@ class SessionHost:
                 await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
 
         def schedule_pipeline_shutdown(reason: str) -> None:
-            task = asyncio.create_task(pipeline.shutdown(reason=reason))
+            task = asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
             self._background_shutdowns.add(task)
             task.add_done_callback(self._background_shutdowns.discard)
 
@@ -854,7 +876,9 @@ class SessionHost:
         self.connection = pipeline
         if old_connection is not None:
             old_connection.deactivate()
-            task = asyncio.create_task(old_connection.shutdown(reason="connection replaced"))
+            task = asyncio.create_task(
+                old_connection.shutdown(reason="connection replaced", reconnect=True)
+            )
             self._background_shutdowns.add(task)
             task.add_done_callback(self._background_shutdowns.discard)
         await self._register_persistent_workers()
@@ -1203,6 +1227,20 @@ class SessionHost:
                 )
                 enqueue_ack()
 
+                async def retry_after_delay() -> None:
+                    await asyncio.sleep(_ACK_ADMISSION_RETRY_DELAY_SECONDS)
+                    self._schedule_ack_admission(
+                        origin,
+                        ack_work_item_id,
+                        enqueue_ack,
+                        turn_id=turn_id,
+                        origin_epoch=origin_epoch,
+                    )
+
+                retry_task = asyncio.create_task(retry_after_delay())
+                self._ack_admission_tasks.add(retry_task)
+                retry_task.add_done_callback(self._ack_admission_tasks.discard)
+
         task = asyncio.create_task(admit())
         self._ack_admission_tasks.add(task)
         task.add_done_callback(self._ack_admission_tasks.discard)
@@ -1356,6 +1394,7 @@ class SessionHost:
                 control_action: ControlAction | None = None
                 control_outcome: ControlOutcome | None = None
                 ack_override: str | None = None
+                target: str | None = None
                 if outcome.kind == "control":
                     # Explicit ``Any`` (not inferred): getattr's 3-arg overload with a
                     # literal ``None`` default types as ``Any | None``, and that ``| None``
@@ -3277,11 +3316,17 @@ class SessionHost:
         ``children`` maps each delegated child's ``work_item_id`` to its
         worker id.
 
-        Idempotent by construction, so callers do not have to track which
-        children already settled: ``legal_work_status_transition`` rejects any
-        move out of a terminal child state, rejects ``cancelled``/``failed`` as
-        cold-start states (a child that never had a status is a no-op), and
-        ``_reaggregate_parent`` never regresses an already-terminal parent.
+        Idempotent against a child that already settled:
+        ``legal_work_status_transition`` rejects any move out of a terminal
+        child state, and ``_reaggregate_parent`` never regresses an
+        already-terminal parent. It does *not* reject every ``state`` as a
+        cold start -- only ``cancelled`` is excluded from
+        ``WORK_STATUS_COLD_START``; ``failed`` (used by
+        ``_finalize_turn_exception``'s non-cancelled branch) is legally
+        cold-startable. Safety for a child that never had a status therefore
+        rests on caller
+        discipline (every ``children`` entry already has a ``routing``
+        status by the time this runs), not on this mechanism.
         """
         for work_item_id, worker_id in children.items():
             self._emit_work_status(
@@ -3293,52 +3338,6 @@ class SessionHost:
                 origin_epoch=origin_epoch,
                 terminal_reason=terminal_reason,
             )
-
-    def _cancel_child_work_statuses(
-        self,
-        *,
-        turn_id: str,
-        origin_epoch: int,
-        children: Mapping[str, str | None],
-        parent_work_item_id: str | None = None,
-    ) -> None:
-        """Terminalize every still-non-terminal delegated child as ``cancelled``.
-
-        Safe to call as a blind sweep over the whole delegated child set: a
-        child that never had a status is skipped, because ``cancelled`` is not
-        in ``WORK_STATUS_COLD_START``.
-        """
-        self._terminalize_child_work_statuses(
-            turn_id=turn_id,
-            origin_epoch=origin_epoch,
-            children=children,
-            state="cancelled",
-            parent_work_item_id=parent_work_item_id,
-        )
-
-    def _fail_child_work_statuses(
-        self,
-        *,
-        turn_id: str,
-        origin_epoch: int,
-        children: Mapping[str, str | None],
-        parent_work_item_id: str | None = None,
-    ) -> None:
-        """Terminalize every still-non-terminal delegated child as ``failed``.
-
-        Used by the turn handlers' generic exception path: an exception raised
-        after ``routing``/``searching`` was emitted (for example from
-        ``coordinator.submit``) previously finalized only telemetry, leaving
-        every registered child -- and therefore the parent -- permanently
-        non-terminal for a capable client.
-        """
-        self._terminalize_child_work_statuses(
-            turn_id=turn_id,
-            origin_epoch=origin_epoch,
-            children=children,
-            state="failed",
-            parent_work_item_id=parent_work_item_id,
-        )
 
     def _finalize_turn_exception(
         self,
@@ -3368,20 +3367,19 @@ class SessionHost:
         """
         if origin is not None:
             origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
-        if cancelled:
-            self._cancel_child_work_statuses(
-                turn_id=turn_id,
-                origin_epoch=origin_epoch,
-                children=children,
-                parent_work_item_id=parent_work_item_id,
-            )
-        else:
-            self._fail_child_work_statuses(
-                turn_id=turn_id,
-                origin_epoch=origin_epoch,
-                children=children,
-                parent_work_item_id=parent_work_item_id,
-            )
+        # A blind sweep over the whole delegated child set is safe either
+        # way: a child that never had a status is skipped on the
+        # ``cancelled`` branch (not in ``WORK_STATUS_COLD_START``) and is a
+        # legal cold start on the ``failed`` branch, but every ``children``
+        # entry here already has a ``routing`` status by construction (see
+        # ``_terminalize_child_work_statuses``).
+        self._terminalize_child_work_statuses(
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+            children=children,
+            state="cancelled" if cancelled else "failed",
+            parent_work_item_id=parent_work_item_id,
+        )
         if not turn_recorder.finalized:
             turn_recorder.finalize(outcome="cancelled" if cancelled else "failed")
 
@@ -3415,7 +3413,9 @@ class SessionHost:
             connection = self.connection
             connection.deactivate(reconnect=False)
             self.connection = None
-            shutdowns.add(asyncio.create_task(connection.shutdown(reason="session shutdown")))
+            shutdowns.add(
+                asyncio.create_task(connection.shutdown(reason="session shutdown", reconnect=False))
+            )
         if shutdowns:
             done, pending = await asyncio.wait(
                 shutdowns,

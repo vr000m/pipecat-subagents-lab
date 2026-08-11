@@ -53,6 +53,11 @@ RUNTIME_IDENTITY_FILES = (
     "shared/protocol.md",
     "pyproject.toml",
     "uv.lock",
+    "shared/schemas/rtvi-message.json",
+    "shared/schemas/snapshot-handshake.json",
+    "shared/schemas/work-status.json",
+    "shared/schemas/runtime-snapshot.json",
+    "shared/schemas/grounded-result.json",
 )
 NON_RUNTIME_FILES = (
     "docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl",

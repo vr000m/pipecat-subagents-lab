@@ -68,9 +68,13 @@ class WorkStatusKey(NamedTuple):
 
     ``parent_key`` is the delegated-child grouping key -- the parent
     ``work_item_id`` for a mixed multi-intent turn, or the sole
-    ``work_item_id`` for a single-delegation turn. Only delegated children
-    ever allocate a key; direct/unsupported/clarify/declined outcomes never
-    hold a delegated parent status open (Requirements).
+    ``work_item_id`` for a single-delegation turn. Only an
+    ``existing_worker``/``new_worker`` routing *decision* ever allocates a
+    key; a ``direct``/``unsupported``/``clarify`` routing action never does
+    (Requirements). That gate is about how the key comes to exist, not which
+    states it may later reach: a worker-raised ``clarify``/``declined`` on an
+    already-delegated child settles that already-open key at
+    ``result_ready``, not a non-terminal state.
     """
 
     origin_epoch: int | None

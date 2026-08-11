@@ -446,7 +446,7 @@ def test_missing_post_tts_ack_escalates_to_verified_connection_teardown() -> Non
         assert teardown_calls == [generation.token]
         assert generation.terminalized is True
         assert coordinator.occupied is False
-        assert coordinator.connection_epoch == 1
+        assert coordinator._teardown_generation == 1
 
     run(body)
 
@@ -724,6 +724,45 @@ def test_uncontexted_interruption_fences_the_slot_until_cleanup_dispatch_complet
         # slot free and the next generation get to admit.
         generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
         assert generation_b is not None
+
+    run(body)
+
+
+def test_uncontexted_interruption_cleanup_dispatch_failure_escalates_to_teardown() -> None:
+    """Regression for round-4 Codex finding #3: before the fix,
+    ``_finalize_uncontexted_interruption`` awaited ``_dispatch_cleanup``
+    with no try/except. A raise there skipped ``_terminalize`` entirely,
+    leaving the slot fenced forever with no timer armed and no teardown
+    fallback -- unlike the bound-context path
+    (``test_cleanup_dispatch_failure_escalates_to_verified_connection_teardown``),
+    which already caught the same failure and fell back to teardown.
+    """
+
+    async def body() -> None:
+        teardown_calls: list[str] = []
+
+        async def cleanup_failed(_token: str, _identity: GenerationIdentity) -> None:
+            raise RuntimeError("queueing interruption failed")
+
+        async def teardown(token: str, _identity: GenerationIdentity) -> None:
+            teardown_calls.append(token)
+            await coordinator.teardown_complete(token)
+
+        coordinator, _ = make_coordinator(
+            dispatch_cleanup=cleanup_failed,
+            dispatch_teardown=teardown,
+        )
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+        # No TTS context is ever bound to generation.
+
+        coordinator.record_interruption(generation.token, pause=False)
+
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert teardown_calls == [generation.token]
+        assert generation.terminalized is True
+        assert coordinator.occupied is False
 
     run(body)
 
@@ -1008,7 +1047,7 @@ async def _terminalize_generation_a(
     directly, exactly as barge-in does. Reconnect and shutdown share the
     drain/teardown path because the coordinator exposes no reconnect- or
     shutdown-specific hook: a fresh connection-scoped lane is this same
-    coordinator's post-``teardown_complete`` state (``connection_epoch``
+    coordinator's post-``teardown_complete`` state (``_teardown_generation``
     bump), per the plan's fallback sequence diagram and
     ``server/pipeline.py``'s per-connection ``lifecycle`` field.
     """

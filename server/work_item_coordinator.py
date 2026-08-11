@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Literal, get_args
+from typing import Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
 
 from loguru import logger
 
@@ -126,6 +126,63 @@ class Result:
     outcome: str = ""
     text: str = ""
     citations: tuple[Any, ...] = ()
+
+
+@runtime_checkable
+class Coordinator(Protocol):
+    """The SessionHost <-> coordinator boundary, declared explicitly.
+
+    ``SessionHost`` previously typed its ``coordinator`` field as ``Any``
+    and duck-typed it via five separate ``getattr(coordinator, ...)``
+    probes, with production code defaulting to this concrete class's own
+    attributes to accommodate test doubles. This Protocol is the single
+    declaration of what a coordinator must provide, matching
+    ``WorkItemCoordinator``'s actual public surface as used by
+    ``server/pipeline.py``. Genuinely optional members (features a caller
+    probes with ``getattr`` and tolerates being absent) are intentionally
+    left off this Protocol and stay on ``getattr`` probes at the call site.
+    """
+
+    registry: WorkerRegistry | None
+    router: Router | None
+    config: Config
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]]
+
+    def arbitrate(self, session_id: str, transcript: str) -> DispatchOutcome: ...
+
+    def dispatch(
+        self,
+        decision: RoutingDecision,
+        operation: Callable[[Any], Any] | None = None,
+        catalogue: WorkerCatalogue | None = None,
+    ) -> Any: ...
+
+    def start_task(self, operation: Any) -> asyncio.Task[Any] | None: ...
+
+    async def submit(
+        self,
+        turn_id: str,
+        items: list[tuple[str, str]],
+        worker: Callable[[str, str], Any],
+        *,
+        on_late_complete: Callable[[LateResult], Any] | None = None,
+        work_item_ids: list[str] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
+    ) -> SubmittedOutcome: ...
+
+    def retain_late_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        work_item_id: str,
+        worker_id: str,
+        on_complete: Callable[[LateResult], Any] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
+    ) -> bool: ...
+
+    def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
+
+    async def shutdown(self) -> None: ...
 
 
 class WorkItemCoordinator:

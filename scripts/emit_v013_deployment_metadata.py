@@ -26,7 +26,7 @@ remains display-only" rule.
 
 ``PIPECAT_SOURCE_TREE_HASH`` is a deterministic filtered hash of the
 committed deployable runtime set: ``server/**``, ``web/src/**`` (scripts and
-stylesheets), ``web/index.html``, ``shared/protocol.md``, the four runtime
+stylesheets), ``web/index.html``, ``shared/protocol.md``, the five runtime
 JSON schemas, package/build metadata, and both lockfiles (``web/bun.lock``
 and ``uv.lock``) -- explicitly excluding ``docs/benchmarks/**``,
 evidence ``v013-*`` schemas, test fixtures, scripts, and generated evidence.
@@ -60,6 +60,7 @@ RUNTIME_TREE_GLOBS = (
     "shared/schemas/snapshot-handshake.json",
     "shared/schemas/work-status.json",
     "shared/schemas/runtime-snapshot.json",
+    "shared/schemas/grounded-result.json",
     "web/package.json",
     "web/bun.lock",
     "pyproject.toml",

@@ -235,29 +235,43 @@ class SpeechScheduler:
         if self._active is not None or self.lifecycle.occupied:
             return None
         keys = [work_item_id] if work_item_id else list(self._queues)
-        item = next((self._queues[key][0] for key in keys if self._queues.get(key)), None)
-        if item is None:
+        item: SpeechItem | None = None
+        identity: GenerationIdentity | None = None
+        disposition: Any = None
+        for key in keys:
+            candidate = self._queues[key][0] if self._queues.get(key) else None
+            if candidate is None:
+                continue
+            candidate_identity = GenerationIdentity(
+                candidate.utterance_id,
+                candidate.work_item_id,
+                candidate.origin_epoch,
+                role=candidate.role if candidate.role == ROLE_ACK else "result",
+                turn_id=candidate.turn_id,
+                ack_id=candidate.ack_id,
+            )
+            candidate_disposition = self.lifecycle.pre_admission_disposition(candidate_identity)
+            if isinstance(candidate_disposition, PreAdmissionTerminal):
+                # The transport slot is still provably free (checked above,
+                # and nothing here awaits) -- a terminal disposition rejects
+                # only this candidate, not the slot itself, so the next
+                # candidate key deserves its own admission attempt instead of
+                # stalling until an unrelated caller happens to call
+                # start_next again.
+                self._discard_from_queue(candidate)
+                if candidate.role == ROLE_ACK:
+                    if candidate.ack_id is not None:
+                        self._ack_index.pop(candidate.ack_id, None)
+                    if self._on_ack_terminal is not None:
+                        self._on_ack_terminal(candidate_identity, candidate_disposition.reason)
+                else:
+                    self._emit_progress(candidate, DeliveryState.DELIVERY_UNKNOWN)
+                continue
+            item, identity, disposition = candidate, candidate_identity, candidate_disposition
+            break
+        if item is None or identity is None:
             return None
-        identity = GenerationIdentity(
-            item.utterance_id,
-            item.work_item_id,
-            item.origin_epoch,
-            role=item.role if item.role == ROLE_ACK else "result",
-            turn_id=item.turn_id,
-            ack_id=item.ack_id,
-        )
-        disposition = self.lifecycle.pre_admission_disposition(identity)
         if disposition is None:
-            return None
-        if isinstance(disposition, PreAdmissionTerminal):
-            self._discard_from_queue(item)
-            if item.role == ROLE_ACK:
-                if item.ack_id is not None:
-                    self._ack_index.pop(item.ack_id, None)
-                if self._on_ack_terminal is not None:
-                    self._on_ack_terminal(identity, disposition.reason)
-            else:
-                self._emit_progress(item, DeliveryState.DELIVERY_UNKNOWN)
             return None
         generation = disposition.generation
         queue = self._queues[item.work_item_id]
@@ -415,11 +429,38 @@ class SpeechScheduler:
             self.lifecycle.release_generation(token)
         self._release(utterance_id)
 
-    def interrupt(self, *, epoch: int | None = None, reconnect: bool = False) -> SpeechItem | None:
+    def interrupt(
+        self, *, epoch: int | None = None, reconnect: bool = False, full_stop: bool = False
+    ) -> SpeechItem | None:
+        """Interrupt the active lease -- task-locally by default, leaving
+        other work items' queues untouched (``test_scheduler_stop_is_task_
+        local_when_other_work_is_queued``); a genuine reconnect (or an
+        explicit ``full_stop``) additionally sweeps every queued and paused
+        item across every work-item key, because in both cases this
+        scheduler is being discarded for good, and a queued/paused item
+        left behind is neither in ``session_state._TERMINAL`` nor reachable
+        by any future caller -- it leaks into every later connection's
+        ``RuntimeSnapshot.speech_progress`` forever.
+
+        ``full_stop`` is for a same-epoch, non-reconnect teardown (e.g.
+        ``ConnectionPipeline.shutdown``'s "speech output teardown"/"session
+        shutdown" paths): those still need the sweep -- this scheduler is
+        gone either way -- but must record plain ``INTERRUPTED`` (not
+        ``INTERRUPTED_BY_RECONNECT``) and must not bypass ``SessionState``'s
+        active-epoch fence, since a same-epoch teardown never advanced
+        ``active_epoch`` the way a reconnect does.
+
+        ``reconnect`` changes both the recorded disposition (``INTERRUPTED``
+        vs. ``INTERRUPTED_BY_RECONNECT``) and whether the emission bypasses
+        that fence (``allow_stale_reconnect``): a genuine reconnect has
+        already advanced ``active_epoch`` past these items' origin epoch by
+        the time this runs, so the fence must be bypassed or the emission is
+        silently dropped.
+        """
         state = DeliveryState.INTERRUPTED_BY_RECONNECT if reconnect else DeliveryState.INTERRUPTED
         active_item = self._active.item if self._active is not None else None
         active_token = self._active.token if self._active is not None else None
-        if active_item is None and not reconnect:
+        if active_item is None and not reconnect and not full_stop:
             return None
         if active_item is not None:
             if active_token is not None:
@@ -432,27 +473,27 @@ class SpeechScheduler:
                 **({"origin_epoch": epoch} if epoch is not None else {}),
             )
             self._release(active_item.utterance_id)
-        if reconnect:
+        if reconnect or full_stop:
             for queue in self._queues.values():
                 for item in queue:
                     self._emit_progress(
                         item,
                         state,
-                        allow_stale_reconnect=True,
+                        allow_stale_reconnect=reconnect,
                         **({"origin_epoch": epoch} if epoch is not None else {}),
                     )
             self._queues.clear()
             self._ack_index.clear()
             # A paused item holds a non-terminal PAUSED record in
-            # SessionState.speech, and only resume() can clear it. After a
-            # reconnect this scheduler and its lifecycle coordinator are gone,
-            # so no resume can ever arrive, and the snapshot would ship that
-            # PAUSED entry forever. Terminalize it like any queued item.
+            # SessionState.speech, and only resume() can clear it. Once this
+            # scheduler is discarded no resume can ever arrive, and the
+            # snapshot would ship that PAUSED entry forever. Terminalize it
+            # like any queued item.
             for item in self._paused.values():
                 self._emit_progress(
                     item,
                     state,
-                    allow_stale_reconnect=True,
+                    allow_stale_reconnect=reconnect,
                     **({"origin_epoch": epoch} if epoch is not None else {}),
                 )
             self._paused.clear()

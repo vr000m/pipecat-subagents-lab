@@ -119,10 +119,18 @@ class _SpeechCompletionProcessor(FrameProcessor):
 class _SnapshotBarrierConsumer(FrameProcessor):
     """Resolves a `SnapshotBarrierFlushFrame`'s acknowledge handle.
 
-    Placed as the last processor before `transport.output()`, so a frame
-    reaching it has already passed every other connection-local processor
-    queued ahead of it -- the drain `SnapshotBarrier.install_baseline`
-    waits on. The frame is private and never reaches transport output.
+    Not literally the last processor before `transport.output()` --
+    `GenericProviderErrorObserver` and `TransportSpeechLifecycleProcessor`
+    are appended after it when a TTS/lifecycle pair is configured (see the
+    invariant comment at this class's call site in `_attach_connection`).
+    That position is still correct because both this frame and every RTVI
+    incremental (`RTVIServerMessageFrame`) are pipecat `SystemFrame`
+    instances, which pipecat routes through a dedicated per-processor queue
+    that bypasses the ordinary `DataFrame` queue entirely -- so relative
+    order between an incremental queued before this frame and one queued
+    after stays intact end-to-end regardless of how slow or stuck any
+    downstream `DataFrame`-only stage (e.g. TTS audio synthesis) is. The
+    frame is private and never reaches transport output.
     """
 
     async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
@@ -276,7 +284,7 @@ async def _attach_connection(
         if runtime.tts is not None and hasattr(runtime.tts, "connect"):
             await runtime.tts.connect()
         if not host.accepts(runtime.epoch):
-            await runtime.shutdown(reason="connection replaced during setup")
+            await runtime.shutdown(reason="connection replaced during setup", reconnect=True)
             return
         output_sample_rate = getattr(runtime.tts, "sample_rate", 24000)
         params = TransportParams(
@@ -361,7 +369,7 @@ async def _attach_connection(
         )
     except BaseException:
         host.abort_connection(runtime)
-        await runtime.shutdown(reason="connection setup failed")
+        await runtime.shutdown(reason="connection setup failed", reconnect=False)
         raise
     try:
         publisher = RTVIMessagePublisher(
@@ -371,7 +379,7 @@ async def _attach_connection(
         runtime.worker = worker
         runtime.output_teardown = getattr(connection, "disconnect", None)
         if not host.accepts(runtime.epoch):
-            await runtime.shutdown(reason="connection replaced during setup")
+            await runtime.shutdown(reason="connection replaced during setup", reconnect=True)
             return
 
         # Seed the connection-projected sequence at the current snapshot
@@ -513,7 +521,9 @@ async def _attach_connection(
                 except asyncio.CancelledError:
                     return
                 if error is not None:
-                    asyncio.create_task(runtime.shutdown(reason="Small WebRTC worker failed"))
+                    asyncio.create_task(
+                        runtime.shutdown(reason="Small WebRTC worker failed", reconnect=False)
+                    )
 
             runtime.worker_task.add_done_callback(worker_finished)
         else:
@@ -525,7 +535,7 @@ async def _attach_connection(
                 await attached
     except BaseException:
         host.abort_connection(runtime)
-        await runtime.shutdown(reason="connection setup failed")
+        await runtime.shutdown(reason="connection setup failed", reconnect=False)
         raise
 
 

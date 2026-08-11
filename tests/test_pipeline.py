@@ -539,7 +539,7 @@ def test_shutdown_still_forces_scheduler_cleanup_after_teardown_exception() -> N
             "sanity: the failing teardown should not itself release the lease"
         )
 
-        await connection.shutdown(reason="session shutdown")
+        await connection.shutdown(reason="session shutdown", reconnect=False)
 
         assert connection.scheduler.active is None
 
@@ -2153,8 +2153,9 @@ def test_session_shutdown_fences_connection_before_coordinator() -> None:
             def deactivate(self, *, reconnect: bool) -> None:
                 assert reconnect is False
 
-            async def shutdown(self, *, reason: str) -> None:
+            async def shutdown(self, *, reason: str, reconnect: bool) -> None:
                 assert reason == "session shutdown"
+                assert reconnect is False
                 events.append("connection")
 
         class Coordinator:
@@ -6974,10 +6975,11 @@ def test_cancel_status_sweep_is_idempotent_for_already_terminal_children() -> No
         settled = _work_status_states(host)
 
         for _ in range(3):
-            host._cancel_child_work_statuses(
+            host._terminalize_child_work_statuses(
                 turn_id="turn-idem",
                 origin_epoch=1,
                 children={"work-turn-idem": None},
+                state="cancelled",
             )
 
         assert _work_status_states(host) == settled
@@ -7662,6 +7664,124 @@ def test_ack_admission_retry_is_discarded_when_the_turn_is_no_longer_live() -> N
     asyncio.run(run())
 
 
+def test_ack_admission_retries_after_a_transient_start_next_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for round-4 Codex finding #4: before the fix, a failed ack
+    admission was re-queued (``enqueue_ack()``) but nothing scheduled another
+    admission attempt for that same key -- the ack stayed dormant forever
+    unless an unrelated speech admission happened to call ``start_next``
+    again. Now a delayed retry is scheduled automatically and actually
+    admits the ack once the transient failure clears."""
+    import server.pipeline as pipeline_module
+    from server.speech_scheduler import ROLE_ACK
+
+    monkeypatch.setattr(pipeline_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.001)
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+        attempts: list[str | None] = []
+        real_start_next = origin.scheduler.start_next
+
+        async def flaky_start_next(work_item_id: str | None = None):
+            attempts.append(work_item_id)
+            if len(attempts) == 1:
+                raise RuntimeError("worker not attached yet")
+            return await real_start_next(work_item_id)
+
+        origin.scheduler.start_next = flaky_start_next  # type: ignore[method-assign]
+
+        turn_id = "turn-retry"
+        ack_work_item_id = "ack-turn-retry"
+
+        def enqueue_ack() -> None:
+            origin.scheduler.enqueue(
+                result_id=None,
+                work_item_id=ack_work_item_id,
+                run_id=f"run-{ack_work_item_id}",
+                text="One moment.",
+                origin_epoch=origin.epoch,
+                role=ROLE_ACK,
+                ack_id=ack_work_item_id,
+                turn_id=turn_id,
+            )
+
+        host._ack_emitted_turns.add(turn_id)
+        enqueue_ack()
+        host._schedule_ack_admission(
+            origin,
+            ack_work_item_id,
+            enqueue_ack,
+            turn_id=turn_id,
+            origin_epoch=origin.epoch,
+        )
+
+        for _ in range(200):
+            if len(attempts) >= 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert len(attempts) >= 2, "the ack admission must be retried after the transient failure"
+        active = origin.scheduler._active
+        assert active is not None and active.item.work_item_id == ack_work_item_id
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_attach_connection_setup_race_shutdown_terminalizes_the_active_utterance() -> None:
+    """Regression for round-4 deep-review logic finding #6:
+    ``ConnectionPipeline.shutdown`` used to infer ``reconnect`` from an exact
+    string match on ``reason`` (``reason == "connection replaced"``).
+    ``server/app.py``'s ``_attach_connection`` shuts a stale connection down
+    with ``reason="connection replaced during setup"`` -- a different string
+    that the old exact match missed, so it wrongly took the
+    ``reconnect=False`` branch. That meant ``SpeechScheduler.interrupt``
+    stamped the still-active utterance with the connection's own (now stale)
+    epoch, which ``SessionState.speech_progress`` then silently dropped
+    because ``active_epoch`` had already advanced past it -- leaving the
+    utterance stuck at ``STARTED`` forever, shipped in every later snapshot.
+
+    ``shutdown`` now takes ``reconnect`` as an explicit parameter instead of
+    inferring it, and ``_attach_connection``'s setup-race call sites pass
+    ``reconnect=True``."""
+    from server.contracts import DeliveryState
+    from server.speech_scheduler import ROLE_RESULT
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        stale = await host.connect(connection_handshake(host, 1))
+        stale.worker = QueueingPipelineWorker()
+
+        stale.scheduler.enqueue(
+            result_id="result-1",
+            work_item_id="work-1",
+            run_id="run-1",
+            text="answer",
+            origin_epoch=stale.epoch,
+            role=ROLE_RESULT,
+        )
+        active = await stale.scheduler.start_next()
+        assert active is not None
+        assert host.state.speech[active.utterance_id].state == DeliveryState.STARTED
+
+        # Simulate a concurrent, newer connect() promoting a fresh epoch
+        # while this connection's own `_attach_connection` setup was still
+        # in flight -- exactly what `host.accepts(runtime.epoch)` catches.
+        host.state.active_epoch = stale.epoch + 1
+
+        await stale.shutdown(reason="connection replaced during setup", reconnect=True)
+
+        assert host.state.speech[active.utterance_id].state == (
+            DeliveryState.INTERRUPTED_BY_RECONNECT
+        ), "the active utterance must not be left stuck at STARTED after the setup race"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_coordinator_declares_the_config_fields_it_owns() -> None:
     """I12: ``SessionHost`` reconciles its Config against the coordinator's by
     excluding exactly the coordinator-owned fields. That set must be declared
@@ -7953,7 +8073,8 @@ def test_multi_intent_sibling_commit_exception_does_not_fail_a_retained_child() 
     Before the fix, the outer ``except Exception:`` in ``_handle_multi_intent``
     passed the *whole* ``delegated_children`` mapping -- including a child
     still legitimately running in the background -- to
-    ``_fail_child_work_statuses``. ``background -> failed`` is itself a legal
+    ``_terminalize_child_work_statuses`` with ``state="failed"``.
+    ``background -> failed`` is itself a legal
     transition, so that child was permanently terminalized and its later,
     genuinely successful late result could never flip it to ``result_ready``.
     """

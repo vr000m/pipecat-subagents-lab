@@ -269,7 +269,11 @@ class SpeechLifecycleCoordinator:
         self._context_tombstones: OrderedDict[str, None] = OrderedDict()
         self._timer_handles: dict[str, TimerHandle] = {}
         self._connection_closed = False
-        self.connection_epoch = 0
+        # Counts completed teardowns, not a "connection epoch" -- that concept
+        # is already owned by ConnectionArbiter/ConnectionPipeline.epoch/
+        # SessionState.active_epoch. Private: write-only in production, read
+        # only by tests asserting a teardown actually ran.
+        self._teardown_generation = 0
 
     @property
     def occupied(self) -> bool:
@@ -700,7 +704,7 @@ class SpeechLifecycleCoordinator:
         await self._terminalize(
             token, generation.disposition or DeliveryDisposition.DELIVERY_UNKNOWN
         )
-        self.connection_epoch += 1
+        self._teardown_generation += 1
 
     async def _finalize_uncontexted_interruption(
         self, token: str, disposition: DeliveryDisposition
@@ -712,7 +716,11 @@ class SpeechLifecycleCoordinator:
         generation = self._generations.get(token)
         if generation is None or generation.terminalized:
             return
-        await self._call(self._dispatch_cleanup, token, generation.identity)
+        try:
+            await self._call(self._dispatch_cleanup, token, generation.identity)
+        except Exception:  # noqa: BLE001 - mirror _begin_cleanup: any dispatch failure falls back to teardown
+            await self._request_teardown(token)
+            return
         await self._terminalize(token, disposition)
 
     async def _terminalize(self, token: str, disposition: DeliveryDisposition) -> None:

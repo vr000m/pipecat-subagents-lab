@@ -484,6 +484,62 @@ if (hasWorkStatusField) {
       expect(preserved?.origin_epoch).toBe(1);
     });
 
+    // Regression: protocol.md's five-minute terminal TTL is a server-side
+    // projection measured from when a record actually went terminal, but
+    // `snapshotState` used to restamp `_terminalSince` to `now` on every
+    // snapshot rebuild -- so a reconnect gave an already-old terminal record
+    // a fresh five minutes instead of honoring the server's remaining TTL.
+    test("a reconnect snapshot preserves an already-terminal record's original TTL clock", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, {
+        ...snapshot(1),
+        data: {
+          ...snapshot(1).data,
+          work_status: [
+            {
+              turn_id: "turn-1",
+              work_item_id: "work-1",
+              worker_id: null,
+              state: "result_ready",
+              event_sequence: 1,
+              terminal_reason: null,
+              origin_epoch: 1,
+            },
+          ],
+        },
+      });
+      const firstTerminalSince = state.workStatus["1::turn-1::work-1"]._terminalSince;
+      expect(firstTerminalSince).toBeDefined();
+
+      const realNow = Date.now;
+      Date.now = () => realNow() + 60 * 1000;
+      try {
+        // A second, later snapshot re-delivers the same terminal record --
+        // e.g. a reconnect -- unchanged apart from wall-clock time passing.
+        state = applyServerMessage(state, {
+          ...snapshot(2),
+          data: {
+            ...snapshot(2).data,
+            work_status: [
+              {
+                turn_id: "turn-1",
+                work_item_id: "work-1",
+                worker_id: null,
+                state: "result_ready",
+                event_sequence: 1,
+                terminal_reason: null,
+                origin_epoch: 1,
+              },
+            ],
+          },
+        });
+      } finally {
+        Date.now = realNow;
+      }
+
+      expect(state.workStatus["1::turn-1::work-1"]._terminalSince).toBe(firstTerminalSince);
+    });
+
     // Regression: the client's workStatus map was insert-only and unbounded,
     // unlike the server's capped, terminal-first-evicting ledger (see
     // server/session_state.py's _evict_work_status_overflow). A long,

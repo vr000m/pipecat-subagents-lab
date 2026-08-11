@@ -89,10 +89,14 @@ does not satisfy or close that reservation.
 The optional snapshot-handshake capability `work_status_v1` gates a coarse,
 truthful `work_status` RTVI kind. Absent or unknown capability names mean
 unsupported; no capability state is ever inferred from browser rendering or
-message-kind fallback. Only delegated children (`existing_worker`/
-`new_worker` routes) hold a client-visible parent work-status record; direct,
-unsupported, clarify, and declined outcomes remain internal, non-delegated
-join outcomes and never emit `work_status`.
+message-kind fallback. Only an `existing_worker`/`new_worker` routing
+*decision* allocates a client-visible parent work-status record; a
+`direct`/`unsupported`/`clarify` routing action never does. That allocation
+gate is about how the parent record comes to exist, not about which states
+it may later reach: a worker that raises `clarify` or `declined` on a child
+that was already delegated this way is a terminal outcome on that
+already-open record, settling it at `result_ready` (the canonical result is
+still committed and spoken) rather than leaving it non-terminal.
 
 Each payload carries `turn_id`, a nullable `work_item_id` (the parent key for
 a mixed multi-intent turn), a nullable `worker_id`, the coarse `state` enum,
@@ -107,6 +111,14 @@ A work item with no prior record may start cold at `routing`, `searching`,
 before it is ever routed (missing worker or missing search capability) and its
 parent must still terminalize -- but never at `cancelled`, so a blind
 whole-turn cancel sweep leaves a child that never started untouched.
+
+This transition table governs per-child bookkeeping only. The wire-visible
+parent record is a pure recomputation over its current child set on every
+change, not a step through this table in its own right, so the table does
+not constrain it directly; the parent's only wire-level invariants are that
+a terminal parent state never regresses and that its `event_sequence`
+strictly increases.
+
 Parent aggregation over delegated children is exhaustive: `routing` while any
 child is routing; `searching` while any child is searching and none is
 routing; `background` while no child is active and at least one remains

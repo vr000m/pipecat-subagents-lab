@@ -210,9 +210,14 @@ function evictOldestWorkStatus(workStatus, protectKey) {
   return next;
 }
 
-function upsertWorkStatus(workStatus, key, projected, now = Date.now()) {
+function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previousRecord = workStatus[key]) {
+  // Preserve an already-terminal key's original `_terminalSince` (e.g. a
+  // reconnect snapshot re-delivering the same terminal record) instead of
+  // restamping it to `now`: the server's five-minute TTL is measured from
+  // when the record actually went terminal, not from whenever the client
+  // last happened to receive it (protocol.md, "Progressive work status").
   const record = WORK_STATUS_TERMINAL_STATES.has(projected.state)
-    ? { ...projected, _terminalSince: now }
+    ? { ...projected, _terminalSince: previousRecord?._terminalSince ?? now }
     : projected;
   const withEntry = { ...workStatus, [key]: record };
   return evictOldestWorkStatus(pruneExpiredWorkStatus(withEntry, now), key);
@@ -242,10 +247,18 @@ function snapshotState(state, snapshot, sequence) {
       .map((item) => [item.utterance_id, item]),
   );
   const now = Date.now();
+  // The snapshot is still a full replacement (a key the server no longer
+  // reports must disappear, e.g. server-side eviction) -- but a key that
+  // does reappear keeps its pre-snapshot `_terminalSince` looked up from
+  // `state.workStatus` explicitly, rather than restamping a fresh TTL
+  // window on every reconnect.
   const workStatus = (Array.isArray(snapshot.work_status) ? snapshot.work_status : [])
     .map(projectedWorkStatus)
     .filter(Boolean)
-    .reduce((acc, item) => upsertWorkStatus(acc, workStatusKey(item), item, now), {});
+    .reduce((acc, item) => {
+      const key = workStatusKey(item);
+      return upsertWorkStatus(acc, key, item, now, state.workStatus[key]);
+    }, {});
   const diagnostics = {
     ...state.localDiagnostics,
     lastSequence: snapshotSequence,

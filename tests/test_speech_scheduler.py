@@ -374,6 +374,42 @@ def test_reconnect_terminally_cancels_active_and_queued_old_epoch_items() -> Non
     )
 
 
+def test_full_stop_terminalizes_active_queued_and_paused_items_without_reconnect() -> None:
+    """Regression for round-4 deep-review logic finding #7: on a same-epoch,
+    non-reconnect teardown (``ConnectionPipeline.shutdown``'s "speech output
+    teardown"/"session shutdown" paths), only the active lease used to be
+    terminalized -- queued and paused items on other work-item keys were
+    left as ``QUEUED``/``PAUSED`` forever, leaking into every later
+    connection's snapshot because the scheduler carrying them is discarded
+    with no other terminalizer. ``full_stop=True`` (what
+    ``ConnectionPipeline.deactivate`` now always passes) sweeps them too,
+    while recording plain ``INTERRUPTED`` (not ``INTERRUPTED_BY_RECONNECT``)
+    and without bypassing the active-epoch fence -- unlike a genuine
+    reconnect, this teardown never advanced ``active_epoch``.
+
+    A bare ``interrupt()`` (``full_stop=False``, the default) must still
+    behave task-locally, per
+    ``test_scheduler_stop_is_task_local_when_other_work_is_queued``.
+    """
+    scheduler = _scheduler()
+    paused = enqueue(scheduler, "work-1", "to-be-paused")
+    asyncio.run(scheduler.start_next())
+    scheduler.pause("work-1")
+    assert scheduler.state.speech[paused.utterance_id].state == DeliveryState.PAUSED
+
+    active = enqueue(scheduler, "work-2", "active")
+    asyncio.run(scheduler.start_next())
+    queued = enqueue(scheduler, "work-3", "queued")
+
+    scheduler.interrupt(full_stop=True)
+
+    assert scheduler.state.speech[active.utterance_id].state == DeliveryState.INTERRUPTED
+    assert scheduler.state.speech[queued.utterance_id].state == DeliveryState.INTERRUPTED
+    assert scheduler.state.speech[paused.utterance_id].state == DeliveryState.INTERRUPTED
+    assert scheduler._queues == {}
+    assert scheduler._paused == {}
+
+
 def test_delayed_callbacks_from_reconnected_utterance_are_ignored() -> None:
     scheduler = _scheduler()
     old_item = enqueue(scheduler, "work-1", "old")
@@ -626,6 +662,27 @@ def test_no_tts_result_never_occupies_the_slot_waiting_for_the_start_timeout() -
     # The next item is handled in the same way, immediately: nothing had to
     # wait for a start-timeout to expire before the slot could be reused.
     assert asyncio.run(scheduler.start_next("work-2")) is None
+    assert scheduler.state.speech[second.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
+    assert scheduler.pending_work_item_ids() == frozenset()
+
+
+def test_start_next_with_no_key_probes_every_candidate_after_a_terminal_disposition() -> None:
+    """Regression for round-4 deep-review logic finding #8 (minor,
+    hardening): a probe-any-key ``start_next()`` call used to discard only
+    the first candidate key's head item on a terminal pre-admission
+    disposition and return ``None`` immediately, even though the transport
+    slot was still provably free -- leaving every other queued key's item
+    stranded until an unrelated caller happened to call ``start_next``
+    again. It must keep probing remaining candidate keys in the same call.
+    """
+    lifecycle = _lifecycle(tts_available=False)
+    scheduler = _scheduler(lifecycle=lifecycle, speak=None)
+    first = enqueue(scheduler, "work-1", "direct answer")
+    second = enqueue(scheduler, "work-2", "clarify")
+
+    assert asyncio.run(scheduler.start_next()) is None
+
+    assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
     assert scheduler.state.speech[second.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
     assert scheduler.pending_work_item_ids() == frozenset()
 
