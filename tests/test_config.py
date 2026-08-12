@@ -12,6 +12,20 @@ import pytest
 from server.config import Config, ConfigError, FeaturePolicy, load_config
 
 
+@pytest.fixture(autouse=True)
+def _confine_manifest_evidence_root_to_tmp_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`load_promotion_manifest` confines manifest-declared `inputs[*].path`
+    entries to the repo root; point that root at each test's own `tmp_path`
+    so existing fixtures can keep writing dummy evidence files there while
+    still exercising the real containment check (relative-path resolution,
+    `is_relative_to`, `is_file`), not a bypass of it."""
+    import server.config as _config_module
+
+    monkeypatch.setattr(_config_module, "_REPO_ROOT", tmp_path)
+
+
 def test_feature_switch_defaults_are_true() -> None:
     config = Config()
 
@@ -593,7 +607,9 @@ def _write_dummy_evidence_file(tmp_path: Path, name: str, content: bytes) -> dic
     path = tmp_path / name
     if not path.exists():
         path.write_bytes(content)
-    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    # Relative to the repo root the loader confines evidence reads to (this
+    # test module's `tmp_path`, via the autouse `_REPO_ROOT` monkeypatch).
+    return {"path": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 def _final_manifest(*, tmp_path: Path, config: Config | None = None, **overrides: object) -> dict:
@@ -838,6 +854,56 @@ def test_load_promotion_manifest_valid_matching_final_manifest_is_promotion_elig
     assert verdict.promotion_eligible is True
 
 
+def test_load_promotion_manifest_rejects_an_absolute_phase_input_path(tmp_path: Path) -> None:
+    """Regression: a manifest-declared `inputs[*].path` is attacker-steerable
+    (it lives inside the artifact under validation, not operator config), so
+    an absolute path must never be accepted as a runtime read target -- e.g.
+    `/etc/shadow` -- even though its digest would legitimately fail to match."""
+    import hashlib
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest = _final_manifest(tmp_path=tmp_path, config=config)
+    outside_secret = tmp_path.parent / "outside-secret.txt"
+    outside_secret.write_bytes(b"do-not-read-me\n")
+    manifest["inputs"]["phase0"] = {
+        "path": str(outside_secret),
+        "sha256": hashlib.sha256(outside_secret.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "evidence_unresolvable"
+
+
+def test_load_promotion_manifest_rejects_a_traversal_phase_input_path(tmp_path: Path) -> None:
+    """Regression: a relative `inputs[*].path` containing `../` must not be
+    allowed to escape the confined repo root after resolution."""
+    import hashlib
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest = _final_manifest(tmp_path=tmp_path, config=config)
+    outside_secret = tmp_path.parent / "outside-secret.txt"
+    outside_secret.write_bytes(b"do-not-read-me\n")
+    manifest["inputs"]["phase0"] = {
+        "path": f"../{outside_secret.name}",
+        "sha256": hashlib.sha256(outside_secret.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "evidence_unresolvable"
+
+
 def test_load_promotion_manifest_missing_or_malformed_metadata_never_blocks_server_startup(
     tmp_path: Path,
 ) -> None:
@@ -1078,7 +1144,7 @@ def test_load_promotion_manifest_rejects_a_final_manifest_with_a_tampered_phase0
     manifest = _final_manifest(tmp_path=tmp_path, config=config)
     # Mutate the on-disk phase0 file after its hash was recorded, so the
     # manifest's declared digest no longer matches the actual bytes.
-    phase0_path = Path(manifest["inputs"]["phase0"]["path"])
+    phase0_path = tmp_path / manifest["inputs"]["phase0"]["path"]
     phase0_path.write_bytes(b"tampered-after-hashing\n")
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
@@ -1097,7 +1163,7 @@ def test_load_promotion_manifest_rejects_a_final_manifest_whose_phase1_input_fil
     manifest_path = tmp_path / "manifest.json"
     config = _bound_config(manifest_path)
     manifest = _final_manifest(tmp_path=tmp_path, config=config)
-    Path(manifest["inputs"]["phase1"]["path"]).unlink()
+    (tmp_path / manifest["inputs"]["phase1"]["path"]).unlink()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     verdict = load_promotion_manifest(config)

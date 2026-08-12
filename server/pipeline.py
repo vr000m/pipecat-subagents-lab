@@ -66,7 +66,6 @@ from .speech_scheduler import (
     SpeechItem,
     SpeechRole,
     SpeechScheduler,
-    UtteranceLease,
 )
 from .work_item_coordinator import (
     FAILURE_KINDS,
@@ -1185,8 +1184,8 @@ class SessionHost:
         # above (no TTS, superseded origin, stale epoch, or a search that
         # resolved within one tick) never spent this turn's single ack slot,
         # so a later genuinely-slow child of the same turn can still claim it.
-        self._ack_emitted_turns.add(turn_id)
         enqueue_ack()
+        self._ack_emitted_turns.add(turn_id)
         self._schedule_ack_admission(
             origin,
             ack_work_item_id,
@@ -1352,6 +1351,9 @@ class SessionHost:
         scheduler_live = set(scheduler.pending_work_item_ids(exclude=ack_work_item_id))
         if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
             scheduler_live.add(scheduler.active.item.work_item_id)
+        # ``live_work_item_ids`` is intentionally not a required Protocol
+        # member -- it is new and no duck-typed test coordinator implements
+        # it, so this site tolerates its absence like any other optional one.
         live_lookup = getattr(self.coordinator, "live_work_item_ids", None)
         coordinator_live = live_lookup() if live_lookup is not None else frozenset()
         live = (
@@ -1459,13 +1461,10 @@ class SessionHost:
                             if outcome.work_items
                             else origin.scheduler.active.item.work_item_id
                         )
-                        active_lease: UtteranceLease | None = origin.scheduler.active
-                        if (
-                            origin.lifecycle is not None
-                            and active_lease is not None
-                            and active_lease.item.work_item_id == target
-                        ):
-                            origin.lifecycle.record_interruption(active_lease.token, pause=True)
+                        # scheduler.pause() already calls record_interruption
+                        # itself when the target matches the active lease --
+                        # calling it here too would double-schedule the
+                        # uncontexted-generation cleanup coroutine.
                         origin.scheduler.pause(target)
                         await origin.scheduler.wait_for_stops()
                         control_outcome = "applied"
@@ -1477,13 +1476,11 @@ class SessionHost:
                             control_outcome = "applied"
                     elif action in {"cancel", "stop"}:
                         target = outcome.work_items[0] if outcome.work_items else None
-                        active_lease = origin.scheduler.active
-                        if (
-                            origin.lifecycle is not None
-                            and active_lease is not None
-                            and (target is None or active_lease.item.work_item_id == target)
-                        ):
-                            origin.lifecycle.record_interruption(active_lease.token, pause=False)
+                        # cancel_turn_or_child routes through scheduler.cancel(),
+                        # which already calls record_interruption itself when
+                        # the target matches the active lease -- calling it
+                        # here too would double-schedule the
+                        # uncontexted-generation cleanup coroutine.
                         # Route every explicit cancel/stop through the host's
                         # cancellation boundary so a targeted child cancel also
                         # settles this turn's parent ack (and its latch) when
@@ -2252,7 +2249,23 @@ class SessionHost:
             outcome_labels: dict[int, WorkItemOutcome] = {}
 
             async def execute(worker_id: str, query: str) -> GroundedResult:
-                item_index = execution_indexes[(worker_id, query)].pop(0)
+                pending_indexes = execution_indexes.get((worker_id, query))
+                if not pending_indexes:
+                    # Mirrors the warn-and-skip guard the sibling echo-derived
+                    # lookups (index_for_item_turn_id, index_for_work_item_id)
+                    # use below: a coordinator invoking execute with an
+                    # unexpected pair, or more times than dispatched, must not
+                    # raise a bare KeyError/IndexError with no diagnostic
+                    # trail. The task this coroutine runs in still surfaces
+                    # the raise as a WorkItemFailure, same as any other
+                    # worker exception.
+                    logger.warning(
+                        f"multi-intent fan-in for {turn_id}: execute() invoked for "
+                        f"worker_id={worker_id!r} query={query!r} with no matching "
+                        f"dispatched work item"
+                    )
+                    raise KeyError(f"no dispatched work item for {worker_id!r}/{query!r}")
+                item_index = pending_indexes.pop(0)
                 item_turn_id = f"{turn_id}-{item_index}"
                 search = runnable_workers[item_index].search
                 try:
@@ -2511,6 +2524,14 @@ class SessionHost:
                     else "failed",
                     origin_epoch=origin_epoch,
                 )
+                # This is the one path a multi-intent child can reach without
+                # going through `results`/`_commit_and_speak`, both of which
+                # discard their own ids -- without this it stays in
+                # `_known_work_items`/`_cancelled_work_items` for the rest of
+                # the process lifetime, the one unbounded set in a diff that
+                # explicitly bounds every sibling.
+                self._known_work_items.discard(unmatched_work_item_id)
+                self._cancelled_work_items.discard(unmatched_work_item_id)
             if not results and not retained_work_items:
                 # Nothing will be spoken and nothing is still running: every
                 # dispatched item was rejected or never accounted for. An ack

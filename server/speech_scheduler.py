@@ -15,6 +15,8 @@ from .session_state import SessionState
 from .speech_lifecycle import (
     DeliveryDisposition,
     GenerationIdentity,
+    PreAdmissionAdmit,
+    PreAdmissionBusy,
     PreAdmissionTerminal,
     PreAdmissionTerminalReason,
     SpeechLifecycleCoordinator,
@@ -79,7 +81,6 @@ class SpeechScheduler:
         self._provider_contexts: dict[str, str] = {}
         self._stop_tasks: set[asyncio.Future[Any]] = set()
         self._advance_tasks: set[asyncio.Future[Any]] = set()
-        self._ack_index: dict[str, str] = {}
 
     def _signal_stop(self, item: SpeechItem) -> None:
         if self.stop is None:
@@ -179,8 +180,6 @@ class SpeechScheduler:
             turn_id=turn_id,
         )
         self._queues.setdefault(work_item_id, []).append(item)
-        if role == ROLE_ACK and ack_id is not None:
-            self._ack_index[ack_id] = work_item_id
         self._emit_progress(item, DeliveryState.DISPLAYED)
         self._emit_progress(item, DeliveryState.QUEUED)
         return item
@@ -214,21 +213,21 @@ class SpeechScheduler:
         return discarded
 
     def discard_queued_ack(self, ack_id: str) -> SpeechItem | None:
-        """Atomically drop one still-queued ack, clearing its index entry.
+        """Atomically drop one still-queued ack.
 
+        ``ack_id`` is also the synthetic ack queue key: every production ack
+        enqueue passes ``work_item_id=ack_id`` (``enqueue`` defaults
+        ``ack_id`` to ``work_item_id`` when omitted), so the queue key is
+        resolved directly rather than through a separate identity index.
         Only the still-queued ack for ``ack_id`` is removed; other queued
         items for the same work-item key (there should be none, since the
         synthetic ack queue key is disjoint from real work-item keys) and
         every other queued/paused/active item are left untouched. An
         already-admitted ack cannot be discarded this way.
         """
-        work_item_id = self._ack_index.get(ack_id)
-        if work_item_id is None:
-            return None
         discarded = self._discard_queued(
-            work_item_id, matches=lambda item: item.role == ROLE_ACK and item.ack_id == ack_id
+            ack_id, matches=lambda item: item.role == ROLE_ACK and item.ack_id == ack_id
         )
-        self._ack_index.pop(ack_id, None)
         return discarded[0] if discarded else None
 
     async def start_next(self, work_item_id: str | None = None) -> SpeechItem | None:
@@ -237,7 +236,7 @@ class SpeechScheduler:
         keys = [work_item_id] if work_item_id else list(self._queues)
         item: SpeechItem | None = None
         identity: GenerationIdentity | None = None
-        disposition: Any = None
+        disposition: PreAdmissionAdmit | None = None
         for key in keys:
             while True:
                 candidate = self._queues[key][0] if self._queues.get(key) else None
@@ -262,29 +261,27 @@ class SpeechScheduler:
                     # caller happens to call start_next again.
                     self._discard_from_queue(candidate)
                     if candidate.role == ROLE_ACK:
-                        if candidate.ack_id is not None:
-                            self._ack_index.pop(candidate.ack_id, None)
                         if self._on_ack_terminal is not None:
                             self._on_ack_terminal(candidate_identity, candidate_disposition.reason)
                     else:
                         self._emit_progress(candidate, DeliveryState.DELIVERY_UNKNOWN)
                     continue
+                if isinstance(candidate_disposition, PreAdmissionBusy):
+                    # The slot is occupied, not terminal -- unreachable today
+                    # (the top-of-method guard already confirmed the slot is
+                    # free before this loop starts), but a genuine "retry
+                    # later" outcome, not a candidate rejection: nothing else
+                    # in this call will admit either, so stop scanning.
+                    return None
                 item, identity, disposition = candidate, candidate_identity, candidate_disposition
                 break
             if item is not None:
                 break
-        if item is None or identity is None:
-            return None
-        if disposition is None:
+        if item is None or identity is None or disposition is None:
             return None
         generation = disposition.generation
         queue = self._queues[item.work_item_id]
         queue.pop(0)
-        if item.role == ROLE_ACK and item.ack_id is not None:
-            # The index only ever resolves still-queued acks; leaving the
-            # mapping behind after admission would accumulate one stale entry
-            # per admitted ack for the life of the connection.
-            self._ack_index.pop(item.ack_id, None)
         self._set_queue(item.work_item_id, queue)
         token = generation.token
         lease = UtteranceLease(item, token)
@@ -497,7 +494,13 @@ class SpeechScheduler:
                         **({"origin_epoch": epoch} if epoch is not None else {}),
                     )
             self._queues.clear()
-            self._ack_index.clear()
+            # A fire-and-forget queue-advance task (_schedule_queue_advance)
+            # re-probes a queue key on a later tick after a submission
+            # failure. With the queues just cleared above, any such task
+            # still pending has nothing left to advance onto -- cancel it
+            # rather than let it run against a scheduler being discarded.
+            for task in tuple(self._advance_tasks):
+                task.cancel()
             # A paused item holds a non-terminal PAUSED record in
             # SessionState.speech, and only resume() can clear it. Once this
             # scheduler is discarded no resume can ever arrive, and the
@@ -572,8 +575,6 @@ class SpeechScheduler:
         for key in keys:
             for item in self._queues.pop(key, []):
                 self._emit_progress(item, DeliveryState.INTERRUPTED)
-                if item.role == ROLE_ACK and item.ack_id is not None:
-                    self._ack_index.pop(item.ack_id, None)
                 cancelled.append(item)
         paused_keys = [work_item_id] if work_item_id is not None else list(self._paused)
         for key in paused_keys:

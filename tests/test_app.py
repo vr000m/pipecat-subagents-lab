@@ -1409,11 +1409,16 @@ class YieldingFrameCapturingPipelineWorker(FrameCapturingPipelineWorker):
         await super().queue_frame(frame)
 
 
-def test_concurrent_snapshot_requests_on_one_connection_are_serialized() -> None:
+def test_concurrent_snapshot_requests_on_one_connection_are_coalesced() -> None:
     """Two snapshot-request messages firing concurrently on the same
     connection must not open two ``SnapshotBarrier``s at once: each barrier
     pauses/resumes the one shared observer, so an overlap would let one
     request's resume/reseed corrupt the other's in-flight watermark/buffer.
+
+    The second request is coalesced (dropped), not queued behind the lock: a
+    snapshot rebuild is idempotent, so the in-flight one already satisfies
+    it, and queuing instead would let a client spam this message into an
+    unbounded lock-waiter backlog.
     """
 
     async def run() -> None:
@@ -1461,12 +1466,12 @@ def test_concurrent_snapshot_requests_on_one_connection_are_serialized() -> None
             worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
         )
 
-        # The lock must ensure the second barrier never opens before the
-        # first resumes: at most one pause-without-matching-resume at a time.
+        # At most one pause-without-matching-resume at a time, and the
+        # coalesced second request never opened a barrier at all.
         assert max_concurrent_barriers == 1
         assert active_barriers == 0
         snapshot_frames = [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"]
-        assert len(snapshot_frames) == 2
+        assert len(snapshot_frames) == 1
 
     asyncio.run(run())
 

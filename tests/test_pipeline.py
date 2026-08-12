@@ -1445,6 +1445,67 @@ def test_pause_control_stops_active_speech_before_confirmation() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("action", ["pause", "cancel"])
+def test_control_action_calls_record_interruption_exactly_once(action: str) -> None:
+    """Regression: the pause and cancel/stop control-turn handlers called
+    ``lifecycle.record_interruption`` directly, then again via
+    ``scheduler.pause()``/``scheduler.cancel()``, which already call it
+    themselves when the target matches the active lease. Harmless for a
+    bound-context generation (just re-arms a timer), but for an uncontexted
+    generation each call schedules its own finalize coroutine, dispatching
+    cleanup twice."""
+
+    async def run() -> None:
+        class ControlCoordinator:
+            def arbitrate(self, _session_id: str, _transcript: str) -> object:
+                return type(
+                    "Outcome",
+                    (),
+                    {
+                        "kind": "control",
+                        "decision": None,
+                        "work_items": (),
+                        "control_action": action,
+                    },
+                )()
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=ControlCoordinator(),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        connection.worker = QueueingPipelineWorker()
+        connection.scheduler.enqueue(
+            result_id="result-active",
+            work_item_id="work-active",
+            run_id="run-active",
+            text="Active answer",
+            origin_epoch=1,
+        )
+        await connection.scheduler.start_next()
+        assert connection.scheduler.active is not None
+        active_token = connection.scheduler.active.token
+
+        assert connection.lifecycle is not None
+        calls: list[str] = []
+        original = connection.lifecycle.record_interruption
+
+        def spy(token: str, *, pause: bool = False) -> None:
+            calls.append(token)
+            original(token, pause=pause)
+
+        connection.lifecycle.record_interruption = spy  # type: ignore[method-assign]
+
+        await host._handle_transcript(action)
+        await acknowledge_lifecycle_flush(connection, active_token)
+
+        assert calls == [active_token]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_pause_targeting_a_queued_item_does_not_tombstone_the_active_speech() -> None:
     async def run() -> None:
         class ControlCoordinator:
@@ -3690,6 +3751,75 @@ def test_multi_intent_mixed_outcomes_emit_one_child_per_item_and_mixed_parent() 
     asyncio.run(run())
 
 
+def test_multi_intent_execute_called_more_times_than_dispatched_raises_cleanly() -> None:
+    """Regression: `execute()`'s (worker_id, query) lookup previously did
+    `execution_indexes[(worker_id, query)].pop(0)` directly, unlike the
+    sibling echo-derived lookups in this same handler (`index_for_item_turn_id`,
+    `index_for_work_item_id`), which warn-and-skip on a miss. A coordinator
+    invoking `execute` for the same pair more times than dispatched (the
+    dispatched index list is now empty) raised a bare `IndexError` with no
+    diagnostic trail; it must instead raise a clean, guarded error."""
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config(max_work_items_per_turn=4)
+
+            @staticmethod
+            def catalogue() -> object:
+                return object()
+
+        class Router:
+            @staticmethod
+            def route_envelope(text: str, _catalogue: object) -> object:
+                decision = type("Decision", (), {"action": "existing_worker"})()
+                return type("Envelope", (), {"decision": decision, "prose": None})()
+
+        captured: dict[str, object] = {}
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=Router())
+
+            def dispatch(self, decision: object, **_: object) -> object:
+                return worker
+
+            async def submit(
+                self, turn_id: object, items: object, worker_fn: object, **kwargs: object
+            ) -> object:
+                captured["execute"] = worker_fn
+                captured["items"] = items
+                return await super().submit(turn_id, items, worker_fn, **kwargs)  # type: ignore[arg-type]
+
+        coordinator = Coordinator()
+        host = SessionHost(runner_factory=LifecycleRunner, coordinator=coordinator)
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = type(
+            "Outcome",
+            (),
+            {"work_items": ("search it",), "pending_dialogue": None},
+        )()
+
+        await host._handle_multi_intent(
+            outcome,
+            "",
+            origin,
+            "turn-extra",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-extra"),
+        )
+
+        execute = captured["execute"]
+        worker_id, query = captured["items"][0]  # type: ignore[index]
+
+        with pytest.raises(KeyError):
+            await execute(worker_id, query)  # type: ignore[operator]
+
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_multi_intent_all_completed_emits_completed_parent_and_all_completed_children() -> None:
     async def run() -> None:
         worker = ResultWorker()
@@ -5730,6 +5860,34 @@ def test_multi_intent_malformed_pending_and_failure_ids_warn_instead_of_raising(
     asyncio.run(run())
 
 
+def test_multi_intent_reconciled_unattributed_child_is_discarded_from_known_work_items() -> None:
+    """Regression: a dispatched multi-intent child that reaches the reconcile
+    loop (never accounted for in results/pending/failures) kept its id in
+    `_known_work_items` (and `_cancelled_work_items`) for the rest of the
+    process lifetime -- the one unbounded set in a diff that explicitly
+    bounds every sibling (`_MAX_WORK_STATUS_KEYS`, `_MAX_WORK_STATUS_SEQUENCES`,
+    `_MAX_HANDSHAKE_TOKENS`, `context_tombstone_limit`)."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(_submitted(), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_multi_intent(
+            _multi_intent_outcome("first item"),
+            "",
+            origin,
+            "turn-orphan",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-orphan"),
+        )
+
+        assert "work-turn-orphan-0" not in host._known_work_items
+        assert "work-turn-orphan-0" not in host._cancelled_work_items
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()
@@ -6498,9 +6656,8 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
     mixed multi-intent. ``_emit_early_ack`` returns at its very first line
     when the flag is off, so this asserts the turn-scoped latch
     (``host._ack_emitted_turns``), the scheduler's ack queue/active lease
-    (``_ack_items``, matching the enabled-ack tests above), and the
-    scheduler's ack_id index (``origin.scheduler._ack_index``) all stay
-    empty even though every path here is otherwise ack-eligible (a real TTS
+    (``_ack_items``, matching the enabled-ack tests above) all stay empty
+    even though every path here is otherwise ack-eligible (a real TTS
     connection, a genuinely in-flight delegated child)."""
 
     async def run() -> None:
@@ -6523,7 +6680,6 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
 
             assert _ack_items(origin.scheduler) == []
             assert host._ack_emitted_turns == set()
-            assert origin.scheduler._ack_index == {}
 
             search.release.set()
             result = await asyncio.wait_for(pending, timeout=1)
@@ -6565,7 +6721,6 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
 
             assert _ack_items(origin.scheduler) == []
             assert host._ack_emitted_turns == set()
-            assert origin.scheduler._ack_index == {}
 
         else:
             assert path == "mixed_multi_intent"
@@ -6639,7 +6794,6 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
 
             assert _ack_items(origin.scheduler) == []
             assert host._ack_emitted_turns == set()
-            assert origin.scheduler._ack_index == {}
 
             search.release.set()
             await asyncio.wait_for(pending, timeout=1)
@@ -6649,7 +6803,6 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
         # left any deferred ack admission task or index entry behind either.
         assert _ack_items(origin.scheduler) == []
         assert host._ack_emitted_turns == set()
-        assert origin.scheduler._ack_index == {}
         await host.shutdown()
 
     asyncio.run(run())
@@ -7223,7 +7376,6 @@ def test_capacity_rejected_dispatch_emits_no_ack_and_never_dispatches_twice() ->
         assert "search service is busy" in result.text
         assert _ack_items(origin.scheduler) == []
         assert host._ack_emitted_turns == set()
-        assert origin.scheduler._ack_index == {}
         # Exactly one dispatch attempt: the refused one.
         assert worker.creations == 1
         await host.shutdown()
@@ -8072,7 +8224,6 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
         )
 
         assert ack_work_item_id not in origin.scheduler._queues
-        assert ack_work_item_id not in origin.scheduler._ack_index
         assert turn_id not in host._ack_emitted_turns
         await host.shutdown()
 
@@ -8121,7 +8272,6 @@ def test_multi_intent_rejection_retracts_an_already_admitted_ack() -> None:
         assert committed == ()
         assert origin.scheduler.active is None
         assert ack_work_item_id not in origin.scheduler._queues
-        assert ack_work_item_id not in origin.scheduler._ack_index
         await host.shutdown()
 
     asyncio.run(run())
@@ -8385,7 +8535,6 @@ def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_p
             LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
         )
 
-        assert ack_work_item_id not in scheduler._ack_index
         assert ack_work_item_id not in scheduler._queues
         await host.shutdown()
 
@@ -8417,7 +8566,7 @@ def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
 
             async def submit(self, *_args: object, **_kwargs: object) -> object:
                 nonlocal ack_seen_queued
-                ack_seen_queued = ack_work_item_id in origin.scheduler._ack_index
+                ack_seen_queued = ack_work_item_id in origin.scheduler._queues
                 raise RuntimeError("submit exploded")
 
         tts = FakeTTS()
@@ -8437,7 +8586,7 @@ def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
         # The ack must have actually been queued before the exception, or
         # this test would not exercise the gap at all.
         assert ack_seen_queued is True
-        assert ack_work_item_id not in origin.scheduler._ack_index
+        assert ack_work_item_id not in origin.scheduler._queues
         await host.shutdown()
 
     asyncio.run(run())

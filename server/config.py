@@ -308,7 +308,35 @@ def _is_hex_hash(value: object) -> bool:
     return isinstance(value, str) and _HEX_HASH_PATTERN.fullmatch(value) is not None
 
 
-_EVIDENCE_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "shared/schemas/v013-evidence.json"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_EVIDENCE_SCHEMA_PATH = _REPO_ROOT / "shared/schemas/v013-evidence.json"
+
+# A manifest-declared evidence input is attacker-steerable (it lives inside the
+# artifact under scrutiny), so it is capped well above any real evidence file
+# to bound the read even once path confinement has already ruled out traversal.
+_MAX_EVIDENCE_INPUT_BYTES = 8 * 1024 * 1024
+
+
+def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
+    """Resolve a manifest-declared evidence path, confined to the repo tree.
+
+    `raw_path` comes from `manifest["inputs"][phase]["path"]`, a value the
+    artifact under validation declares about itself -- not an operator
+    setting. Accepting it as a runtime read target without containment would
+    be an attacker-steerable arbitrary-file-read primitive (absolute paths,
+    `..` traversal, devices, FIFOs). Returns `None` when the path is absolute,
+    escapes the repo root after resolution, or does not name a regular file.
+    """
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        return None
+    resolved = (_REPO_ROOT / candidate).resolve()
+    if not resolved.is_relative_to(_REPO_ROOT):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
 
 
 def _schema_hash_matches(declared: str) -> Literal["match", "mismatch", "unverifiable"]:
@@ -377,7 +405,7 @@ def load_promotion_manifest(config: Config) -> PromotionManifest:
 def _load_promotion_manifest(config: Config) -> PromotionManifest:
     path = Path(config.promotion_manifest_path)
     if not path.is_absolute():
-        path = Path(__file__).resolve().parents[1] / path
+        path = _REPO_ROOT / path
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
@@ -474,10 +502,12 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # Phase 4C byte-check the rule rather than the exception closes that gap.
     for _phase_name in _MANIFEST_REQUIRED_FINAL_INPUTS:
         _phase_entry = manifest["inputs"][_phase_name]
-        _phase_path = Path(_phase_entry["path"])
-        if not _phase_path.is_absolute():
-            _phase_path = Path(__file__).resolve().parents[1] / _phase_path
+        _phase_path = _resolve_confined_evidence_path(_phase_entry["path"])
+        if _phase_path is None:
+            return replace(identity, reason="evidence_unresolvable")
         try:
+            if _phase_path.stat().st_size > _MAX_EVIDENCE_INPUT_BYTES:
+                return replace(identity, reason="evidence_unresolvable")
             _actual_phase_hash = hashlib.sha256(_phase_path.read_bytes()).hexdigest()
         except OSError:
             return replace(identity, reason="evidence_unresolvable")
@@ -533,7 +563,7 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
             return replace(identity, reason="phase4c_unresolvable")
         phase4c_path = Path(phase4c_artifact_path)
         if not phase4c_path.is_absolute():
-            phase4c_path = Path(__file__).resolve().parents[1] / phase4c_path
+            phase4c_path = _REPO_ROOT / phase4c_path
         try:
             actual_hash = hashlib.sha256(phase4c_path.read_bytes()).hexdigest()
         except OSError:

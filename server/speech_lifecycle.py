@@ -94,16 +94,17 @@ class PreAdmissionAdmit:
 
     generation: SpeechGeneration
 
-    @property
-    def admitted(self) -> bool:
-        return True
-
 
 @dataclass(frozen=True)
 class PreAdmissionTerminal:
     """The identity is terminal before admission; no transport token issued."""
 
     reason: PreAdmissionTerminalReason
+
+
+@dataclass(frozen=True)
+class PreAdmissionBusy:
+    """The transport slot is merely occupied; retry later, not terminal."""
 
 
 @dataclass
@@ -304,7 +305,7 @@ class SpeechLifecycleCoordinator:
 
     def pre_admission_disposition(
         self, identity: GenerationIdentity
-    ) -> PreAdmissionAdmit | PreAdmissionTerminal | None:
+    ) -> PreAdmissionAdmit | PreAdmissionTerminal | PreAdmissionBusy:
         """Idempotent pre-admission check, run before any queue pop or
         ``_active`` assignment.
 
@@ -312,9 +313,9 @@ class SpeechLifecycleCoordinator:
         exists at all (``no_tts``) or the injected transport-acceptance
         predicate rejects the connection (``unavailable_transport``); a
         ``Terminal`` result allocates no transport token, arms no timer, and
-        invokes no admitted-generation callback. Returns ``None`` when the
-        slot is merely occupied (retry later, not terminal). Otherwise
-        admits normally and returns ``PreAdmissionAdmit``.
+        invokes no admitted-generation callback. Returns ``PreAdmissionBusy``
+        when the slot is merely occupied (retry later, not terminal).
+        Otherwise admits normally and returns ``PreAdmissionAdmit``.
 
         The ``no_tts`` gate is role-independent. ``tts_available`` is the
         same connection-level fact that decides whether ``SpeechScheduler``
@@ -342,7 +343,7 @@ class SpeechLifecycleCoordinator:
             return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
         generation = self.try_admit(identity)
         if generation is None:
-            return None
+            return PreAdmissionBusy()
         return PreAdmissionAdmit(generation)
 
     def mark_handed_to_tts(self, token: str) -> None:
@@ -487,16 +488,23 @@ class SpeechLifecycleCoordinator:
             # interrupt it instead. Mirror the bound-context_id path below by
             # deferring both the cleanup dispatch and the terminalization
             # into a single scheduled unit, in order -- but only when a loop
-            # is actually running to race against: `_schedule`'s no-loop
-            # fallback silently drops the coroutine (fine for the purely
-            # best-effort cleanup dispatch elsewhere, not fine for the
-            # terminalization this method must still guarantee), and with no
-            # running loop nothing else can be admitted concurrently anyway,
-            # so the fencing this deferral exists to provide is moot.
+            # is actually running to race against.
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                asyncio.run(self._finalize_uncontexted_interruption(token, disposition))
+                # No running loop: nothing else can be admitted or interleave
+                # in the meantime, so the fencing the scheduled path exists
+                # to provide is moot here -- only the terminal state
+                # transition itself still needs to happen. `asyncio.run()`
+                # would spin up a throwaway loop whose closing races any
+                # future a real `dispatch_cleanup`/`on_terminal` callback
+                # creates against the *actual* running loop (queuing frames
+                # through the pipeline, starting the next admission) -- a
+                # wrong-event-loop hazard, not a safe substitute. Terminalize
+                # synchronously instead: the async side-effect callbacks
+                # inherently require a real loop to run safely, and this
+                # branch is only reachable with none running.
+                self._terminalize_state(token, disposition)
             else:
                 self._schedule(self._finalize_uncontexted_interruption(token, disposition))
             return

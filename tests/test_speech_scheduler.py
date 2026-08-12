@@ -601,9 +601,13 @@ def test_discard_queued_ack_cannot_remove_an_admitted_ack() -> None:
     assert scheduler.active.item.ack_id == ack.ack_id
 
 
-def test_normal_admission_clears_the_ack_index_entry() -> None:
-    """The index only ever resolves still-queued acks, so a mapping left
-    behind by normal admission is a per-ack leak on a long-lived connection."""
+def test_normal_admission_clears_the_ack_queue_key() -> None:
+    """Regression for the round-6 deep-review architecture finding that
+    ``_ack_index`` was a redundant, hand-maintained identity map (``ack_id``
+    and ``work_item_id`` are the same string at every production call site,
+    and the ack's queue key already *is* its ``ack_id``): ``_ack_index`` was
+    removed, so the equivalent invariant this test now proves is that normal
+    admission leaves no leftover queue entry for any admitted ack."""
     scheduler = _scheduler()
     for index in range(3):
         ack = enqueue_ack(scheduler, turn_id=f"turn-{index}")
@@ -611,7 +615,7 @@ def test_normal_admission_clears_the_ack_index_entry() -> None:
         assert admitted is not None and admitted.ack_id == ack.ack_id
         scheduler.delivery_unknown(admitted.utterance_id)
 
-    assert scheduler._ack_index == {}
+    assert scheduler._queues == {}
 
 
 def test_cancel_with_the_ack_work_item_id_removes_only_the_parent_ack() -> None:
@@ -792,6 +796,43 @@ def test_submission_failure_advances_other_pending_work_without_a_further_start_
         assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
         assert scheduler.active is not None
         assert scheduler.active.item.utterance_id == second.utterance_id
+
+    asyncio.run(run())
+
+
+def test_full_stop_cancels_a_pending_queue_advance_task() -> None:
+    """Regression: a fire-and-forget queue-advance task
+    (``_schedule_queue_advance``, scheduled after a submission failure) was
+    never cancelled or drained on ``full_stop``/``reconnect``, unlike every
+    other fire-and-forget registry (``_stop_tasks`` has ``wait_for_stops()``).
+    With the queues just cleared by ``full_stop``, it has nothing left to
+    advance onto."""
+
+    async def run() -> None:
+        async def speak(_item) -> None:
+            raise RuntimeError("provider unavailable")
+
+        scheduler = _scheduler(speak=speak)
+        enqueue(scheduler, "work-1", "first")
+        enqueue(scheduler, "work-2", "second")
+
+        try:
+            await scheduler.start_next("work-1")
+        except RuntimeError:
+            pass
+
+        # The deferred re-probe task is scheduled but has not run yet.
+        assert len(scheduler._advance_tasks) == 1
+        pending_task = next(iter(scheduler._advance_tasks))
+        assert not pending_task.done()
+
+        scheduler.interrupt(full_stop=True)
+
+        assert pending_task.cancelling() > 0
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert pending_task.cancelled()
+        assert scheduler._advance_tasks == set()
 
     asyncio.run(run())
 

@@ -431,10 +431,17 @@ async def _attach_connection(
             )
             if not snapshot_requested or not host.accepts(runtime.epoch):
                 return
-            # Serialize concurrent snapshot-request messages: at most one
-            # SnapshotBarrier may be open per connection at a time, or two
-            # barriers racing against the same observer/state pair could
-            # corrupt each other's watermark/buffer.
+            # Coalesce, don't queue, concurrent snapshot-request messages: at
+            # most one SnapshotBarrier may be open per connection at a time,
+            # or two barriers racing against the same observer/state pair
+            # could corrupt each other's watermark/buffer. A snapshot rebuild
+            # is idempotent, so an in-flight one already satisfies a
+            # concurrent request -- blocking on the lock instead would let a
+            # client spam this message and build an unbounded lock-waiter
+            # queue, each holding a task open for up to
+            # SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS.
+            if snapshot_lock.locked():
+                return
             async with snapshot_lock:
                 # Pause the observer before reading any state so no incremental
                 # captured from here on can be dispatched (via the emitter's

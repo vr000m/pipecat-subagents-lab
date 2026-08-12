@@ -78,6 +78,18 @@ def _config_module() -> Any:
     return config_module
 
 
+@pytest.fixture(autouse=True)
+def _confine_manifest_evidence_root_to_tmp_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`load_promotion_manifest` confines manifest-declared `inputs[*].path`
+    entries to the repo root; point that root at each test's own `tmp_path`
+    so `_base_manifest`'s dummy evidence files can keep living there while
+    still exercising the real containment check, not a bypass of it."""
+    config_module = _config_module()
+    monkeypatch.setattr(config_module, "_REPO_ROOT", tmp_path)
+
+
 def _valid_phase4c_artifact(**overrides: Any) -> dict[str, Any]:
     payload = {
         "status": "promoted",
@@ -448,7 +460,9 @@ def _write_dummy_evidence_file(tmp_path: Path, name: str, content: bytes) -> dic
     path = tmp_path / name
     if not path.exists():
         path.write_bytes(content)
-    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    # Relative to the repo root the loader confines evidence reads to (this
+    # test module's `tmp_path`, via the autouse `_REPO_ROOT` monkeypatch).
+    return {"path": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 def _base_manifest(tmp_path: Path, **overrides: Any) -> dict[str, Any]:

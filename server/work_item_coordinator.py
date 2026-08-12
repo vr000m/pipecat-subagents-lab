@@ -141,12 +141,25 @@ class Coordinator(Protocol):
     accessed directly (via ``_require_coordinator() -> Coordinator`` or an
     explicit ``self.coordinator is not None`` guard), not through
     ``getattr``, everywhere the coordinator's identity is already settled.
-    The one remaining exception is ``SessionHost.__init__`` itself, where
-    ``registry``, ``config``, and ``OWNED_CONFIG_FIELDS`` all stay behind
-    ``getattr`` fallbacks on purpose: a large number of duck-typed
+    Every member is required except at the following call sites, which stay
+    behind ``getattr`` fallbacks on purpose: a large number of duck-typed
     test-double coordinators across the suite construct without declaring
-    those members at all, and requiring full Protocol conformance from
-    every test double is out of scope for this pass.
+    the full Protocol surface, and requiring full conformance from every
+    test double is out of scope for this pass (round 5 tried converting
+    these to required direct access and reverted it after the change broke
+    67 of ``tests/test_pipeline.py``'s tests).
+
+    - ``SessionHost.__init__`` (``server/pipeline.py``): ``registry``,
+      ``config``, and ``OWNED_CONFIG_FIELDS``.
+    - ``server/pipeline.py:1357``: ``live_work_item_ids`` (also not a
+      required Protocol member -- see ``live_work_item_ids``'s own note).
+    - ``server/pipeline.py:2723``, ``:3308``, ``:3528``: ``start_task``,
+      ``cancel``, and ``shutdown`` respectively, at their call sites outside
+      ``__init__``.
+
+    Exact line numbers drift; each site carries its own inline comment
+    documenting the exemption, which is the source of truth if this
+    docstring goes stale.
     """
 
     registry: WorkerRegistry | None

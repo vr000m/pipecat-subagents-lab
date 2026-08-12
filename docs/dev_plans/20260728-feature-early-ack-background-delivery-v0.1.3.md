@@ -1,6 +1,6 @@
 # Task: v0.1.3 — Early Acknowledgement and Background-Delivery Policy
 
-**Status**: Phases 0–3 implemented and complete; Phase 4 (query-context narrowing) implemented but not promoted (`promotion_eligible=false`, `reason=real_stratum_missing` — no paid-provider evidence collected, by design). Review-gauntlet round 1 complete (35 findings fixed, `de0c5c4`..`f12d30b`); all 6 round-1 follow-ups resolved 2026-08-06 (`2da0b85`..`9dd5114`). Round 2 (2026-08-09) fixed the promotion-manifest/evidence-gate cluster plus ack/work-item lifecycle races. Round 3 (2026-08-10) fixed a bug reproduced by execution (a still-running retained/background child wrongly permanently failed) plus the Phase 4B forged-evidence gap, both corroborated by multiple gates. Round 4 (2026-08-10/11, `a324ca5`) fixed 14 of 18 reconciled findings (1 disproven, 3 deferred) — ack-admission retry, full-stop speech sweep, and the Coordinator Protocol declaration, among others; see its Known Follow-ups section below. Round 5 is in progress. All 23 acceptance criteria and all known follow-ups through round 4 checked. Final CI-equivalent chain (ruff, mypy, pytest, bun build/test/lint, smoke_server, check_release_metadata, gitleaks) has passed end-to-end after every round through round 4 (most recently against `a324ca5`: pytest 1326 passed/1 skipped, mypy clean, bun test 86 passed/1 skipped).
+**Status**: Phases 0–3 implemented and complete; Phase 4 (query-context narrowing) implemented but not promoted (`promotion_eligible=false`, `reason=real_stratum_missing` — no paid-provider evidence collected, by design). Review-gauntlet round 1 complete (35 findings fixed, `de0c5c4`..`f12d30b`); all 6 round-1 follow-ups resolved 2026-08-06 (`2da0b85`..`9dd5114`). Round 2 (2026-08-09) fixed the promotion-manifest/evidence-gate cluster plus ack/work-item lifecycle races. Round 3 (2026-08-10) fixed a bug reproduced by execution (a still-running retained/background child wrongly permanently failed) plus the Phase 4B forged-evidence gap, both corroborated by multiple gates. Round 4 (2026-08-10/11, `a324ca5`) fixed 14 of 18 reconciled findings (1 disproven, 3 deferred) — ack-admission retry, full-stop speech sweep, and the Coordinator Protocol declaration, among others; see its Known Follow-ups section below. Round 5 (2026-08-11, `f64a573`) fixed 8 of 9 themes (A, B, E, F, G, H, I, plus the non-quarantined half of C), 1 theme deferred with reason (D), 1 sub-finding quarantined-local (C's getattr-removal), 0 halts; see its Known Follow-ups section below. All 23 acceptance criteria and all known follow-ups through round 5 checked. Final CI-equivalent chain (ruff, mypy, pytest, bun build/test/lint, smoke_server, check_release_metadata, gitleaks) has passed end-to-end after every round through round 5 (most recently against `f64a573`: pytest 1330 passed/1 skipped, mypy clean (30 files), ruff check/format clean, bun test 86 passed/1 skipped, eslint clean).
 **Component**: Pipecat subagents
 **Assigned to**: Unassigned
 **Priority**: High
@@ -416,7 +416,24 @@ _To be filled during implementation._
 
 ## Final Results
 
-_To be filled on completion._
+Feature complete on `feature/early-ack-background-delivery-v0.1.3` as of `f64a573`. All 23 acceptance criteria above are checked and verified.
+
+**Feature completeness:**
+- **Phase 1 (early acknowledgement, P0):** shipped. A shared delegation-confirmed ack covers the direct, pending-dialogue, and multi-intent paths exactly once, is ephemeral/interruptible/non-canonical, and never enters canonical result state.
+- **Phase 2 (background-delivery policy, P1):** shipped, gated by `enable_autoplay_policy`. Autoplay requires a schema-valid, promotion-eligible `manifest_phase=final` promotion manifest with complete real provider/model strata; unavailable/blocked/malformed/contaminated evidence always forces `commit_display_only`. Commit remains exactly once and epoch-gated in every case.
+- **Phase 3 (progressive RTVI status, P1/P2):** shipped. Capability-gated `work_status` handshake/wire contract, bounded client and server state, epoch-disambiguated reconnect rows, and a single derived state-vocabulary source (`server/contracts.py`).
+- **Phase 4 (query-context narrowing, P2, experimental):** implemented but **not promoted** — `promotion_eligible=false`, `reason=real_stratum_missing` (no paid-provider evidence collected, by design; no v0.1.3 phase mandates paid real-strata collection). This is the documented "not promoted — data did not support it" outcome, not a defect.
+
+**Review-gauntlet history (5 rounds):**
+- Round 1 (2026-08-05/08): 35 findings fixed (`de0c5c4`..`f12d30b`), plus 6 structural findings grilled and resolved (`2da0b85`..`9dd5114`).
+- Round 2 (2026-08-09, `5c13b11`..`2b07c8f`): promotion-manifest/evidence-gate cluster hardened, ack/work-item lifecycle races fixed.
+- Round 3 (2026-08-10, `9bd822b`..`1882aff`, `be656d4`): a bug reproduced by execution (a still-running retained/background child wrongly permanently failed) and the Phase 4B forged-evidence gap fixed, both corroborated by multiple gates.
+- Round 4 (2026-08-10/11, `a324ca5`): 14 of 18 reconciled findings fixed (1 disproven, 3 deferred) — ack-admission retry, full-stop speech sweep, Coordinator Protocol declaration.
+- Round 5 (2026-08-11, `f64a573`): 8 of 9 themes fixed (A, B, E, F, G, H, I, plus the non-quarantined half of C), 1 deferred with reason (D — a 3-state `InterruptScope` enum, judged out of scope), 1 sub-finding quarantined-local (C's `getattr`-removal, reverted after breaking 67 tests against duck-typed test-double coordinators), 0 halts.
+
+Three structural findings remain deliberately deferred, consistent with the risk-based deferral pattern across all 5 rounds: `SessionHost` responsibility sizing/sprawl, `commit_late_result_once`'s classify/effects split, and promotion-manifest vocabulary's placement in `server/config.py`.
+
+**Final verification (against `f64a573`):** `uv run pytest` — 1330 passed, 1 skipped; `uv run mypy server` — clean (30 files); `uv run ruff check .` / `ruff format --check .` — clean; `cd web && bun test` — 86 passed, 1 skip; `bun run lint` — clean.
 
 ## Known Follow-ups (Review Gauntlet Round 1, 2026-08-05)
 

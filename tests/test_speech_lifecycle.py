@@ -28,6 +28,7 @@ from server.speech_lifecycle import (
     GenerationIdentity,
     GenerationPhase,
     ManualTimerScheduler,
+    PreAdmissionAdmit,
     SpeechLifecycleCoordinator,
 )
 
@@ -726,6 +727,40 @@ def test_uncontexted_interruption_fences_the_slot_until_cleanup_dispatch_complet
         assert generation_b is not None
 
     run(body)
+
+
+def test_uncontexted_interruption_with_no_running_loop_terminalizes_synchronously() -> None:
+    """Regression for round-6 deep-review findings 7/12: the no-running-loop
+    branch of ``record_interruption`` previously called ``asyncio.run(...)``,
+    spinning up a throwaway event loop whose closing races any future a real
+    async ``dispatch_cleanup``/``on_terminal`` callback creates against the
+    *actual* production loop -- a wrong-event-loop hazard. This branch is
+    only reachable with no loop running at all, so nothing else can
+    interleave in the meantime; ``record_interruption`` must terminalize
+    synchronously instead of attempting to run the async callbacks through a
+    throwaway loop."""
+    cleanup_calls: list[str] = []
+
+    async def dispatch_cleanup(token: str, _identity: GenerationIdentity) -> None:
+        cleanup_calls.append(token)
+
+    coordinator, _ = make_coordinator(dispatch_cleanup=dispatch_cleanup, auto_ack_cleanup=False)
+    generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+    # No TTS context is ever bound to this generation, and this call happens
+    # with no asyncio event loop running at all (this test is not `async def`
+    # and is not wrapped in `asyncio.run`).
+
+    coordinator.record_interruption(generation.token, pause=False)
+
+    # Terminalized synchronously: the slot frees immediately, unlike the
+    # with-a-running-loop path (test_uncontexted_interruption_fences_the_
+    # slot_until_cleanup_dispatch_completes), which stays fenced until the
+    # scheduled task actually runs.
+    assert coordinator.occupied is False
+    assert coordinator.generation_for_token(generation.token) is None
+    # The async dispatch_cleanup callback is never run through a throwaway
+    # loop -- it inherently requires a real one, and none is running here.
+    assert cleanup_calls == []
 
 
 def test_uncontexted_interruption_cleanup_dispatch_failure_escalates_to_teardown() -> None:
@@ -1469,6 +1504,24 @@ def test_pre_admission_terminal_reason_is_a_closed_no_tts_unavailable_transport_
     }
 
 
+def test_pre_admission_disposition_is_busy_not_terminal_when_the_slot_is_occupied() -> None:
+    """Regression: ``PreAdmissionBusy`` (added so the scheduler's isinstance
+    chain is actually type-checked, replacing a bare ``None`` sentinel) must
+    be returned -- not a terminal disposition and not ``PreAdmissionAdmit``
+    -- when the sole transport slot is already occupied by another
+    generation."""
+    from server.speech_lifecycle import PreAdmissionBusy
+
+    coordinator, _clock = make_coordinator()
+    first = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+    assert isinstance(first, PreAdmissionAdmit)
+    assert coordinator.occupied is True
+
+    second = coordinator.pre_admission_disposition(identity("work-2", "utt-2"))
+
+    assert isinstance(second, PreAdmissionBusy)
+
+
 def test_pre_admission_disposition_admits_a_normal_ack_when_tts_and_transport_are_available() -> (
     None
 ):
@@ -1479,7 +1532,7 @@ def test_pre_admission_disposition_admits_a_normal_ack_when_tts_and_transport_ar
 
     disposition = coordinator.pre_admission_disposition(ack_identity)
 
-    assert getattr(disposition, "admitted", None) is True or disposition == "admit"
+    assert isinstance(disposition, PreAdmissionAdmit)
     assert coordinator.occupied is True
 
 
@@ -1547,7 +1600,7 @@ def test_pre_admission_disposition_still_admits_a_result_when_transport_is_unacc
 
     disposition = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
 
-    assert getattr(disposition, "admitted", None) is True
+    assert isinstance(disposition, PreAdmissionAdmit)
     assert coordinator.occupied is True
 
 
