@@ -161,13 +161,23 @@ class SpeechScheduler:
         ack_id: str | None = None,
         turn_id: str | None = None,
     ) -> SpeechItem:
-        if role == ROLE_ACK and ack_id is None:
-            # The synthetic ack queue key (``ack-{turn_id}``) and the ack's
-            # identity are the same string throughout production call
-            # sites; default it here so every ack enqueue satisfies
-            # SpeechItem's ack_id requirement without every caller having
-            # to repeat work_item_id as ack_id explicitly.
-            ack_id = work_item_id
+        if role == ROLE_ACK:
+            if ack_id is None:
+                # The synthetic ack queue key (``ack-{turn_id}``) and the
+                # ack's identity are the same string throughout production
+                # call sites; default it here so every ack enqueue satisfies
+                # SpeechItem's ack_id requirement without every caller
+                # having to repeat work_item_id as ack_id explicitly.
+                ack_id = work_item_id
+            elif ack_id != work_item_id:
+                # discard_queued_ack indexes self._queues[ack_id] directly,
+                # correct only while the two are equal. A caller passing a
+                # divergent ack_id would make discards on this item silently
+                # miss (read as "nothing queued") instead of failing loudly,
+                # so enforce the invariant here rather than let it drift.
+                raise ValueError(
+                    f"ack_id ({ack_id!r}) must equal work_item_id ({work_item_id!r}) or be omitted"
+                )
         item = SpeechItem(
             result_id=result_id,
             work_item_id=work_item_id,

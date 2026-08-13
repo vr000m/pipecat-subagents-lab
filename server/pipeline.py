@@ -1222,6 +1222,15 @@ class SessionHost:
         ``_ACK_ADMISSION_MAX_ATTEMPTS`` the ack is abandoned instead --
         its queued item discarded and the turn's ack latch cleared -- rather
         than left retrying indefinitely.
+
+        Clearing the turn's ack latch on abandonment is a deliberate
+        at-most-one-per-attempt-chain guarantee, not an at-most-one-
+        delivered guarantee: it also makes the latch available again, so a
+        later eligible sibling in the same multi-intent turn can still
+        enqueue its own ack after this one is abandoned. That is safe --
+        the abandoned ack was discarded, never spoken -- but "one ack per
+        turn" should be read as "one ack per admission attempt chain," not
+        as a promise that at most one ack is ever queued for a turn.
         """
 
         async def admit() -> None:
@@ -2527,11 +2536,21 @@ class SessionHost:
                 # This is the one path a multi-intent child can reach without
                 # going through `results`/`_commit_and_speak`, both of which
                 # discard their own ids -- without this it stays in
-                # `_known_work_items`/`_cancelled_work_items` for the rest of
-                # the process lifetime, the one unbounded set in a diff that
-                # explicitly bounds every sibling.
+                # `_known_work_items` for the rest of the process lifetime,
+                # the one unbounded set in a diff that explicitly bounds
+                # every sibling.
+                #
+                # `_cancelled_work_items` is deliberately NOT discarded here,
+                # unlike every other discard site: this fires when the
+                # child's fate is *unknown* (it may still be alive), not
+                # known-terminal like every sibling discard site. A late
+                # callback that later arrives for this id must still see it
+                # as cancelled -- discarding the marker here would let a
+                # result the user actually cancelled be committed and
+                # autoplayed instead of suppressed. The cancel marker is one
+                # string and is consumed on the late-result path anyway, so
+                # leaving it costs nothing.
                 self._known_work_items.discard(unmatched_work_item_id)
-                self._cancelled_work_items.discard(unmatched_work_item_id)
             if not results and not retained_work_items:
                 # Nothing will be spoken and nothing is still running: every
                 # dispatched item was rejected or never accounted for. An ack
@@ -2539,7 +2558,8 @@ class SessionHost:
                 # only utterance -- a promise of a result that is never
                 # coming -- and `discard_queued_ack` below cannot reach it, so
                 # retract it in whatever state it is in. Both calls are
-                # idempotent, and `cancel` also clears the ack index entry.
+                # idempotent, and both target the same queue slot keyed by
+                # `ack_id == work_item_id`.
                 origin.scheduler.cancel(self._ack_work_item_id(turn_id))
             origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
             committed = []

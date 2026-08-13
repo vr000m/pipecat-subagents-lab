@@ -78,7 +78,12 @@ The active browser protocol exposes delivery states `displayed`,
 nor any current state proves browser decode, playout, or audibility. Terminal
 delivery precedence is reconnect interruption, interruption, confirmed
 completion, unknown delivery, then cancellation; duplicate or late events
-cannot replace an already terminal outcome. Word-level progress remains
+cannot replace an already terminal outcome. `v0.1.3` also emits, at most
+once per delegating semantic turn, an ephemeral, wire-invisible
+acknowledgement utterance: it is user-audible but carries no `result_id`,
+is never queryable through any of the states above, and never enters
+canonical result state. Browser-visible speech state therefore does not
+account for all audio the connection may have played. Word-level progress remains
 reserved for a future, verified extension beyond this release: the `v0.1.3`
 Phase 3 `work_status` kind below is a coarse, truthful progress contract only
 (`routing`/`searching`/`background`/`result_ready`/`failed`/`cancelled`) and
@@ -129,8 +134,10 @@ failed, otherwise `cancelled` applies only when every child is cancelled,
 otherwise `result_ready`. `result_ready` means the canonical result is
 committed and display-ready -- it does not mean speech was queued, delivered,
 or heard. Terminal records preserve their original `origin_epoch` and remain
-in a capable client's reconnect snapshot for a five-minute session-clock TTL,
-pruned lazily at projection time.
+in a capable client's reconnect snapshot until removed, whichever comes
+first of: a five-minute session-clock TTL, or bounded-capacity eviction
+once the record set exceeds 256 keys (terminal-first, oldest-first).
+Removal is pruned lazily at projection time.
 
 Capability negotiation carries one URL-encoded JSON array of capability names
 in a single `capabilities` query parameter on both the `POST /api/rtc` offer
@@ -199,15 +206,27 @@ boundary closes; browser SDK transcript callbacks are not authoritative state.
 
 ## Contract inventory
 
-- `rtvi-message.json` and its eight payload schemas (including
-  `work-status.json`) define the active server-to-browser boundary listed
-  above.
+- `rtvi-message.json` and the seven payload schemas covering its eight
+  `kind` values (including `work-status.json`; `user_transcript` and
+  `bot_transcript` share `transcript-entry.json`) define the active
+  server-to-browser boundary listed above.
 - `snapshot-handshake.json` defines same-origin HTTP session discovery,
   reconnect negotiation, and the optional `capabilities` carrier; it is not
-  an RTVI state message.
+  an RTVI state message. Capability negotiation is bounded: at most
+  `_MAX_CAPABILITY_ENTRIES` (16) capability names, each at most
+  `_MAX_CAPABILITY_NAME_LENGTH` (64) characters, and the whole encoded
+  `capabilities` field at most `_MAX_CAPABILITY_FIELD_LENGTH` bytes
+  (`server/app.py`); the snapshot-handshake response also carries a
+  `capabilities_present` boolean distinguishing "no `capabilities` query
+  parameter was sent" from "an empty capability set was sent."
 - `routing-decision.json` defines the internal router-to-dispatch decision.
 - `work-item-event.json` and `interruption-event.json` reserve deferred
   lifecycle contracts and are not emitted by v1.0.
+- `v013-evidence.json`, `v013-query-context-raw.json`,
+  `v013-query-context-post-change-analysis.json`, and
+  `v013-transport-browser-contract.json` are Phase 4 evidence-gate
+  artifacts, validated by `scripts/validate_v013_evidence.py` and
+  siblings; they are internal analysis inputs, not a wire boundary.
 
 Reconnect uses `session_id`, a resume token/known-process identity, proposed
 epoch, and the last snapshot sequence. The new epoch is fenced before the

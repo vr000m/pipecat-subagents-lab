@@ -5888,6 +5888,74 @@ def test_multi_intent_reconciled_unattributed_child_is_discarded_from_known_work
     asyncio.run(run())
 
 
+def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_turn_cancel() -> (
+    None
+):
+    """Regression: unlike every other discard site, the reconcile loop fires
+    when a child's fate is *unknown* (it may still be alive), not
+    known-terminal. A prior round's fix discarded the id from both
+    `_known_work_items` and `_cancelled_work_items`, which would make a late
+    callback arriving afterwards read `was_cancelled=False` and commit +
+    autoplay a result the user actually cancelled. The cancel marker must
+    survive the reconcile-loop discard so a late callback for this id is
+    still treated as cancelled."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(_submitted(), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        # Stand in for a whole-turn cancel that landed before the reconcile
+        # loop ran.
+        host._cancelled_work_items.add("work-turn-orphan-0")
+
+        await host._handle_multi_intent(
+            _multi_intent_outcome("first item"),
+            "",
+            origin,
+            "turn-orphan",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-orphan"),
+        )
+
+        assert "work-turn-orphan-0" not in host._known_work_items
+        assert "work-turn-orphan-0" in host._cancelled_work_items
+
+        _register_dispatch_recorder(
+            host, "work-turn-orphan-0", origin_epoch=origin.epoch, turn_id="turn-orphan"
+        )
+        late_result = GroundedResult(
+            result_id="result-turn-orphan-0",
+            worker_id="worker-search",
+            turn_id="turn-orphan",
+            text="a late answer",
+            spoken_text="a late answer",
+            origin_epoch=origin.epoch,
+        )
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host,
+                turn_id="turn-orphan",
+                work_item_id="work-turn-orphan-0",
+                origin_epoch=origin.epoch,
+            ),
+            LateResult(
+                work_item_id="work-turn-orphan-0", worker_id="worker-search", result=late_result
+            ),
+        )
+
+        # Still committed (canonical state is never lost), but treated as
+        # cancelled: not spoken/autoplayed.
+        assert host.state.result_history("worker-search") == (late_result,)
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "cancelled"
+        assert fields["commit_outcome"] == "committed"
+        assert fields["speech_outcome"] == "cancelled"
+        assert fields["delivery_disposition"] == "display_only"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
     async def run() -> None:
         sink = CollectingMeasurementSink()

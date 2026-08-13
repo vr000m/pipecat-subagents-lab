@@ -1476,6 +1476,80 @@ def test_concurrent_snapshot_requests_on_one_connection_are_coalesced() -> None:
     asyncio.run(run())
 
 
+class FailFirstBarrierThenAcknowledgePipelineWorker(FrameCapturingPipelineWorker):
+    """Drops the first barrier frame it sees (so that attempt's
+    ``install_baseline`` times out), acknowledges every subsequent one
+    normally. Models the in-flight snapshot attempt that a coalesced
+    request raced against actually failing."""
+
+    barrier_frames_seen: ClassVar[int] = 0
+
+    async def queue_frame(self, frame: object) -> None:
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            type(self).barrier_frames_seen += 1
+            if type(self).barrier_frames_seen == 1:
+                return
+            acknowledge()
+            return
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_a_coalesced_snapshot_request_is_retried_once_if_the_in_flight_attempt_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: coalescing (``if snapshot_lock.locked(): return``) used to
+    drop a concurrent snapshot-request unconditionally, even when the
+    in-flight attempt it coalesced against then failed without delivering a
+    snapshot. The client had already set ``snapshotRequestPending`` and
+    discards every incremental until a snapshot arrives, with no retry of
+    its own -- stranding it until manual reconnect. The lock holder must
+    retry once when a coalesced request was flagged during a failed
+    attempt."""
+    monkeypatch.setattr(observers_module, "SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS", 0.01)
+    FailFirstBarrierThenAcknowledgePipelineWorker.barrier_frames_seen = 0
+
+    async def run() -> None:
+        FailFirstBarrierThenAcknowledgePipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        inner = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                inner,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=FailFirstBarrierThenAcknowledgePipelineWorker,
+            )
+        finally:
+            inner.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = FailFirstBarrierThenAcknowledgePipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        message = SimpleNamespace(type="snapshot-request", data=None)
+        # Both requests fire concurrently: the first acquires the lock and
+        # starts an attempt that will time out waiting for its barrier ack
+        # (the timeout wait is an await point the second request's handler
+        # can interleave at); the second finds the lock held, is coalesced,
+        # and flags a recheck instead of being silently dropped.
+        await asyncio.gather(
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+        )
+
+        assert FailFirstBarrierThenAcknowledgePipelineWorker.barrier_frames_seen == 2, (
+            "the coalesced request's recheck must trigger a second attempt"
+        )
+        assert runtime.observer._paused is False
+        snapshot_frames = [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"]
+        assert len(snapshot_frames) == 1, "the retried attempt must deliver exactly one snapshot"
+
+    asyncio.run(run())
+
+
 class NeverAcknowledgingPipelineWorker(FrameCapturingPipelineWorker):
     """Fake worker that drops the barrier frame instead of acknowledging it,
     modelling a connection worker cancelled or replaced between the barrier

@@ -547,6 +547,27 @@ def test_result_item_still_requires_a_result_id() -> None:
     assert result.ack_id is None
 
 
+def test_enqueue_raises_when_an_explicit_ack_id_diverges_from_work_item_id() -> None:
+    """discard_queued_ack indexes self._queues[ack_id] directly, correct
+    only while ack_id == work_item_id. A divergent ack_id must fail loudly
+    at enqueue time rather than silently make later discards miss."""
+    scheduler = _scheduler()
+
+    try:
+        scheduler.enqueue(
+            work_item_id="ack-turn-1",
+            run_id="run-ack-turn-1",
+            result_id=None,
+            text="One moment.",
+            role=ROLE_ACK,
+            ack_id="ack-turn-2",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for divergent ack_id")
+
+
 def test_ack_items_never_reach_session_state_speech_progress() -> None:
     """Plan: 'route every speech_progress-shaped emission ... through a
     single internal _emit_progress(item, state) helper that no-ops for

@@ -151,15 +151,17 @@ class Coordinator(Protocol):
 
     - ``SessionHost.__init__`` (``server/pipeline.py``): ``registry``,
       ``config``, and ``OWNED_CONFIG_FIELDS``.
-    - ``server/pipeline.py:1357``: ``live_work_item_ids`` (also not a
-      required Protocol member -- see ``live_work_item_ids``'s own note).
-    - ``server/pipeline.py:2723``, ``:3308``, ``:3528``: ``start_task``,
+    - ``SessionHost.cancel_turn_or_child`` (``server/pipeline.py``):
+      ``live_work_item_ids`` (also not a required Protocol member -- see
+      ``live_work_item_ids``'s own note).
+    - ``SessionHost._dispatch_search_task``, ``SessionHost._cancel_work``,
+      and ``SessionHost.shutdown`` (``server/pipeline.py``): ``start_task``,
       ``cancel``, and ``shutdown`` respectively, at their call sites outside
       ``__init__``.
 
-    Exact line numbers drift; each site carries its own inline comment
-    documenting the exemption, which is the source of truth if this
-    docstring goes stale.
+    Method names, not line numbers, are the source of truth here; each site
+    also carries its own inline comment documenting the exemption in case
+    this docstring goes stale.
     """
 
     registry: WorkerRegistry | None

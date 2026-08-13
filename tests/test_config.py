@@ -880,6 +880,36 @@ def test_load_promotion_manifest_rejects_an_absolute_phase_input_path(tmp_path: 
     assert verdict.reason == "evidence_unresolvable"
 
 
+def test_load_promotion_manifest_rejects_an_oversized_phase_input_path(tmp_path: Path) -> None:
+    """Regression: `_MAX_EVIDENCE_INPUT_BYTES` is declared alongside
+    `_resolve_confined_evidence_path` as part of the same rationale, but the
+    helper never used to consult it -- the cap was applied separately at the
+    call site, so a second caller would inherit path confinement but
+    silently not the read-size cap. The cap now lives inside the helper
+    itself so every caller inherits both together."""
+    import hashlib
+    import json
+
+    from server import config as _config_module
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest = _final_manifest(tmp_path=tmp_path, config=config)
+    oversized = tmp_path / "oversized-phase0.jsonl"
+    oversized.write_bytes(b"x" * (_config_module._MAX_EVIDENCE_INPUT_BYTES + 1))
+    manifest["inputs"]["phase0"] = {
+        "path": oversized.name,
+        "sha256": hashlib.sha256(oversized.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "evidence_unresolvable"
+
+
 def test_load_promotion_manifest_rejects_a_traversal_phase_input_path(tmp_path: Path) -> None:
     """Regression: a relative `inputs[*].path` containing `../` must not be
     allowed to escape the confined repo root after resolution."""

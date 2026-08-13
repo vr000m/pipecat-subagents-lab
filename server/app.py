@@ -411,6 +411,17 @@ async def _attach_connection(
         # otherwise open two barriers against the same observer/state pair
         # and corrupt each other's watermark/buffer.
         snapshot_lock = asyncio.Lock()
+        # Set by a snapshot-request that got coalesced away (found the lock
+        # already held) instead of simply being dropped. If the in-flight
+        # attempt fails without ever delivering a snapshot -- install_baseline
+        # raises, or publisher.snapshot() returns None -- a dropped coalesced
+        # request would otherwise strand the client: it already set
+        # snapshotRequestPending and discards every incremental until a
+        # snapshot arrives, and never retries on its own while that flag is
+        # set (web/src/state.js). The lock holder consults this flag after
+        # its own attempt and retries once if it is set, rather than queuing
+        # unboundedly for every coalesced request.
+        snapshot_recheck_requested = False
 
         @worker.rtvi.event_handler("on_client_ready")
         async def on_client_ready(_rtvi: Any) -> None:
@@ -421,8 +432,86 @@ async def _attach_connection(
                 client_ready_sent = True
                 publisher.client_ready(epoch=runtime.epoch)
 
+        async def attempt_snapshot_delivery() -> bool:
+            """One snapshot-delivery attempt under ``snapshot_lock``.
+
+            Returns ``True`` iff a snapshot was actually delivered to the
+            client, ``False`` on a failure that left nothing delivered (a
+            retry may be warranted). ``asyncio.CancelledError`` propagates
+            uncaught -- cancellation means this task itself is being torn
+            down, not a candidate for an in-place retry.
+            """
+            # Pause the observer before reading any state so no incremental
+            # captured from here on can be dispatched (via the emitter's
+            # asyncio.create_task scheduling) ahead of the snapshot -- the
+            # barrier owns synchronous SessionState._emit() callbacks between
+            # this point and install_baseline() below.
+            barrier = SnapshotBarrier(observer=runtime.observer, state=host.state)
+            barrier.subscribe_paused()
+            publisher.set_snapshot(runtime.observer.snapshot())
+            snapshot = publisher.snapshot()
+            if snapshot is None:
+                barrier.cancel()
+                return False
+            # install_baseline() reseeds the observer's projected sequence at
+            # snapshot.sequence only after the barrier frame is acknowledged.
+            # The observer's projected sequence only advances for events
+            # visible to *this* connection, while the snapshot is stamped
+            # from the global SessionState watermark, which also advances
+            # for invisible events (a capability-gated work_status on a
+            # connection that never advertised work_status_v1). Reseeding
+            # from the value actually stamped on the wire -- publisher.snapshot()
+            # re-reads the sequence provider -- keeps the client's
+            # lastAppliedSequence and the observer's counter identical by
+            # construction, so the next incremental is snapshot_sequence + 1.
+            #
+            # Non-capable projections omit the status section entirely
+            # (field absent, not an empty array) so the frozen
+            # pre-Phase-3 runtime-snapshot schema still validates this
+            # connection's snapshots (Requirements). The exclusion is
+            # owned by RuntimeSnapshot.wire_payload, not by this caller.
+            # Read the entitlement off the observer, which is also what
+            # decides snapshot *content* (RuntimeObserver.snapshot() calls
+            # SessionState.snapshot(include_work_status=self.supports_work_status)).
+            # The content gate and this wire-presence gate are therefore
+            # provably one source, not two booleans kept in agreement by
+            # convention via ConnectionPipeline's proxy property.
+            frame_data = snapshot.wire_payload(
+                include_work_status=runtime.observer.supports_work_status
+            )
+
+            async def write_snapshot() -> None:
+                await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
+
+            # The snapshot frame is written *by* install_baseline, between
+            # the barrier acknowledgement and the buffered replay, so a
+            # buffered incremental can never reach the client ahead of the
+            # snapshot that establishes the watermark it applies against.
+            try:
+                await barrier.install_baseline(
+                    watermark=snapshot.sequence,
+                    flush_writer=worker.queue_frame,
+                    snapshot_writer=write_snapshot,
+                )
+            except asyncio.CancelledError:
+                # Cancellation between the write and the drain (worker
+                # replaced/torn down) must not leave the observer paused
+                # with an unbounded buffer and this lock's invariant
+                # silently broken.
+                barrier.cancel()
+                raise
+            except Exception:  # noqa: BLE001  # intentional catch-all: a failed snapshot install must never leave the observer paused
+                barrier.cancel()
+                _loguru_logger.warning(
+                    "snapshot barrier install failed; incremental delivery resumed "
+                    "without a new watermark"
+                )
+                return False
+            return True
+
         @worker.rtvi.event_handler("on_client_message")
         async def on_client_message(_rtvi: Any, message: Any) -> None:
+            nonlocal snapshot_recheck_requested
             data = getattr(message, "data", None)
             snapshot_requested = message.type == "snapshot-request" or (
                 message.type == "client-message"
@@ -441,74 +530,22 @@ async def _attach_connection(
             # queue, each holding a task open for up to
             # SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS.
             if snapshot_lock.locked():
+                snapshot_recheck_requested = True
                 return
             async with snapshot_lock:
-                # Pause the observer before reading any state so no incremental
-                # captured from here on can be dispatched (via the emitter's
-                # asyncio.create_task scheduling) ahead of the snapshot -- the
-                # barrier owns synchronous SessionState._emit() callbacks between
-                # this point and install_baseline() below.
-                barrier = SnapshotBarrier(observer=runtime.observer, state=host.state)
-                barrier.subscribe_paused()
-                publisher.set_snapshot(runtime.observer.snapshot())
-                snapshot = publisher.snapshot()
-                if snapshot is None:
-                    barrier.cancel()
-                    return
-                # install_baseline() reseeds the observer's projected sequence at
-                # snapshot.sequence only after the barrier frame is acknowledged.
-                # The observer's projected sequence only advances for events
-                # visible to *this* connection, while the snapshot is stamped
-                # from the global SessionState watermark, which also advances
-                # for invisible events (a capability-gated work_status on a
-                # connection that never advertised work_status_v1). Reseeding
-                # from the value actually stamped on the wire -- publisher.snapshot()
-                # re-reads the sequence provider -- keeps the client's
-                # lastAppliedSequence and the observer's counter identical by
-                # construction, so the next incremental is snapshot_sequence + 1.
-                #
-                # Non-capable projections omit the status section entirely
-                # (field absent, not an empty array) so the frozen
-                # pre-Phase-3 runtime-snapshot schema still validates this
-                # connection's snapshots (Requirements). The exclusion is
-                # owned by RuntimeSnapshot.wire_payload, not by this caller.
-                # Read the entitlement off the observer, which is also what
-                # decides snapshot *content* (RuntimeObserver.snapshot() calls
-                # SessionState.snapshot(include_work_status=self.supports_work_status)).
-                # The content gate and this wire-presence gate are therefore
-                # provably one source, not two booleans kept in agreement by
-                # convention via ConnectionPipeline's proxy property.
-                frame_data = snapshot.wire_payload(
-                    include_work_status=runtime.observer.supports_work_status
-                )
-
-                async def write_snapshot() -> None:
-                    await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
-
-                # The snapshot frame is written *by* install_baseline, between
-                # the barrier acknowledgement and the buffered replay, so a
-                # buffered incremental can never reach the client ahead of the
-                # snapshot that establishes the watermark it applies against.
-                try:
-                    await barrier.install_baseline(
-                        watermark=snapshot.sequence,
-                        flush_writer=worker.queue_frame,
-                        snapshot_writer=write_snapshot,
-                    )
-                except asyncio.CancelledError:
-                    # Cancellation between the write and the drain (worker
-                    # replaced/torn down) must not leave the observer paused
-                    # with an unbounded buffer and this lock's invariant
-                    # silently broken.
-                    barrier.cancel()
-                    raise
-                except Exception:  # noqa: BLE001  # intentional catch-all: a failed snapshot install must never leave the observer paused
-                    barrier.cancel()
-                    _loguru_logger.warning(
-                        "snapshot barrier install failed; incremental delivery resumed "
-                        "without a new watermark"
-                    )
-                    return
+                # Retry at most once: the first pass is this request's own
+                # attempt, the second only runs if a coalesced request was
+                # flagged during that attempt and it did not deliver a
+                # snapshot. A request coalesced during the retry itself sets
+                # the flag again but is not chased further -- one extra
+                # attempt is enough to stop silently stranding a client
+                # without letting a spamming client build unbounded retries.
+                for _attempt in range(2):
+                    snapshot_recheck_requested = False
+                    if await attempt_snapshot_delivery():
+                        break
+                    if not snapshot_recheck_requested:
+                        break
 
         # WorkerRunner has no remove-workers API in the pinned wheel. Run each
         # connection worker through its real PipelineWorker lifecycle task so

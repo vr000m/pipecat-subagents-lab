@@ -319,14 +319,18 @@ _MAX_EVIDENCE_INPUT_BYTES = 8 * 1024 * 1024
 
 
 def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
-    """Resolve a manifest-declared evidence path, confined to the repo tree.
+    """Resolve a manifest-declared evidence path, confined to the repo tree
+    and bounded in size.
 
     `raw_path` comes from `manifest["inputs"][phase]["path"]`, a value the
     artifact under validation declares about itself -- not an operator
     setting. Accepting it as a runtime read target without containment would
     be an attacker-steerable arbitrary-file-read primitive (absolute paths,
     `..` traversal, devices, FIFOs). Returns `None` when the path is absolute,
-    escapes the repo root after resolution, or does not name a regular file.
+    escapes the repo root after resolution, does not name a regular file, or
+    exceeds `_MAX_EVIDENCE_INPUT_BYTES` -- the size cap lives here, not at the
+    call site, so every caller inherits both the confinement and the read-size
+    bound together rather than having to remember to apply the cap itself.
     """
     candidate = Path(raw_path)
     if candidate.is_absolute():
@@ -334,7 +338,10 @@ def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
     resolved = (_REPO_ROOT / candidate).resolve()
     if not resolved.is_relative_to(_REPO_ROOT):
         return None
-    if not resolved.is_file():
+    try:
+        if not resolved.is_file() or resolved.stat().st_size > _MAX_EVIDENCE_INPUT_BYTES:
+            return None
+    except OSError:
         return None
     return resolved
 
@@ -506,8 +513,6 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         if _phase_path is None:
             return replace(identity, reason="evidence_unresolvable")
         try:
-            if _phase_path.stat().st_size > _MAX_EVIDENCE_INPUT_BYTES:
-                return replace(identity, reason="evidence_unresolvable")
             _actual_phase_hash = hashlib.sha256(_phase_path.read_bytes()).hexdigest()
         except OSError:
             return replace(identity, reason="evidence_unresolvable")
