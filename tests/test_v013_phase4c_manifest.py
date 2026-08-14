@@ -85,9 +85,18 @@ def _confine_manifest_evidence_root_to_tmp_path(
     """`load_promotion_manifest` confines manifest-declared `inputs[*].path`
     entries to the repo root; point that root at each test's own `tmp_path`
     so `_base_manifest`'s dummy evidence files can keep living there while
-    still exercising the real containment check, not a bypass of it."""
+    still exercising the real containment check, not a bypass of it.
+
+    `write_manifest` (this module's other direct caller, via
+    `_attempt_write_manifest`) applies the same confinement on the write
+    side through its own module-level `REPO_ROOT` (see
+    `_repo_relative_evidence_path`) -- patch both, or every
+    `_attempt_write_manifest` call raises `EvidenceGateError` on the first
+    (phase0) input before ever reaching the phase4c-specific behavior each
+    test in this module actually exercises."""
     config_module = _config_module()
     monkeypatch.setattr(config_module, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(_validator(), "REPO_ROOT", tmp_path)
 
 
 def _valid_phase4c_artifact(**overrides: Any) -> dict[str, Any]:

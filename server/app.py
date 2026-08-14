@@ -448,8 +448,19 @@ async def _attach_connection(
             # this point and install_baseline() below.
             barrier = SnapshotBarrier(observer=runtime.observer, state=host.state)
             barrier.subscribe_paused()
-            publisher.set_snapshot(runtime.observer.snapshot())
-            snapshot = publisher.snapshot()
+            try:
+                publisher.set_snapshot(runtime.observer.snapshot())
+                snapshot = publisher.snapshot()
+            except asyncio.CancelledError:
+                barrier.cancel()
+                raise
+            except Exception:  # noqa: BLE001  # intentional catch-all: mirrors install_baseline's own must-not-leave-paused guarantee below
+                barrier.cancel()
+                _loguru_logger.warning(
+                    "snapshot construction failed; incremental delivery resumed "
+                    "without a new watermark"
+                )
+                return False
             if snapshot is None:
                 barrier.cancel()
                 return False
@@ -476,18 +487,22 @@ async def _attach_connection(
             # The content gate and this wire-presence gate are therefore
             # provably one source, not two booleans kept in agreement by
             # convention via ConnectionPipeline's proxy property.
-            frame_data = snapshot.wire_payload(
-                include_work_status=runtime.observer.supports_work_status
-            )
-
-            async def write_snapshot() -> None:
-                await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
-
             # The snapshot frame is written *by* install_baseline, between
             # the barrier acknowledgement and the buffered replay, so a
             # buffered incremental can never reach the client ahead of the
             # snapshot that establishes the watermark it applies against.
+            # ``wire_payload()`` is deliberately inside this try too -- it can
+            # raise (e.g. a monotonicity assertion in the payload/envelope
+            # validators), and that must not leave the observer paused any
+            # more than a failure inside ``install_baseline`` itself would.
             try:
+                frame_data = snapshot.wire_payload(
+                    include_work_status=runtime.observer.supports_work_status
+                )
+
+                async def write_snapshot() -> None:
+                    await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
+
                 await barrier.install_baseline(
                     watermark=snapshot.sequence,
                     flush_writer=worker.queue_frame,
@@ -540,7 +555,21 @@ async def _attach_connection(
                 # the flag again but is not chased further -- one extra
                 # attempt is enough to stop silently stranding a client
                 # without letting a spamming client build unbounded retries.
+                #
+                # Re-checking acceptance on every iteration (not just before
+                # the lock was acquired) matters because a single attempt can
+                # block for up to SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS awaiting
+                # its barrier ack: this connection can be superseded by a
+                # reconnect (or torn down) entirely within that window. A
+                # retry that ran anyway would call barrier.subscribe_paused()
+                # on this connection's (by then retired) observer, which
+                # re-attaches it to the still-live, shared SessionState event
+                # bus with nothing left to ever unsubscribe it again -- and
+                # would write the resulting frame through this closure's
+                # captured (by then cancelled) ``worker``.
                 for _attempt in range(2):
+                    if not host.accepts(runtime.epoch):
+                        break
                     snapshot_recheck_requested = False
                     if await attempt_snapshot_delivery():
                         break

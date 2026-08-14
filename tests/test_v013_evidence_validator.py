@@ -42,6 +42,20 @@ def _validator() -> Any:
     return scripts.validate_v013_evidence
 
 
+@pytest.fixture(autouse=True)
+def _confine_manifest_evidence_root_to_tmp_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``write_manifest`` resolves each evidence input relative to its own
+    module's ``REPO_ROOT`` and raises ``EvidenceGateError`` for an input that
+    doesn't live under it (mirroring ``load_promotion_manifest``'s read-side
+    confinement -- see ``_repo_relative_evidence_path``). Point that root at
+    each test's own ``tmp_path`` so existing fixtures can keep writing dummy
+    evidence files there while still exercising the real relative-path
+    resolution, not a bypass of it."""
+    monkeypatch.setattr(_validator(), "REPO_ROOT", tmp_path)
+
+
 def _evidence_common() -> Any:
     from scripts import _evidence_common
 
@@ -394,7 +408,11 @@ def test_write_manifest_embeds_artifact_hashes_for_all_three_inputs(tmp_path: Pa
     manifest = json.loads((tmp_path / "promotion-manifest.json").read_text())
     inputs = manifest["inputs"]
     for phase_name, input_path in (("phase0", phase0), ("phase1", phase1), ("phase2", phase2)):
-        assert inputs[phase_name]["path"] == str(input_path)
+        # Repo-relative (here, relative to the confined tmp_path), not the
+        # absolute str(input_path) -- load_promotion_manifest rejects an
+        # absolute manifest-declared path outright (server/config.py
+        # _resolve_confined_evidence_path), so the writer must never emit one.
+        assert inputs[phase_name]["path"] == input_path.name
         assert len(inputs[phase_name]["sha256"]) == 64  # sha256 hex digest
 
 
@@ -524,7 +542,10 @@ def test_final_manifest_requires_phase3_input_and_binds_its_hash(tmp_path: Path)
 
     assert exit_code == 0
     manifest = json.loads((tmp_path / "promotion-manifest.json").read_text())
-    assert manifest["inputs"]["phase3"]["path"] == str(phase3)
+    # Repo-relative (here, relative to the confined tmp_path), not the
+    # absolute str(phase3) -- see the identical note in
+    # test_write_manifest_embeds_artifact_hashes_for_all_three_inputs.
+    assert manifest["inputs"]["phase3"]["path"] == phase3.name
     assert len(manifest["inputs"]["phase3"]["sha256"]) == 64
 
 

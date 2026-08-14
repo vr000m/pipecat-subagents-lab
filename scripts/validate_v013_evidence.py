@@ -472,6 +472,33 @@ def _bind_phase4c_artifact(
         )
 
 
+def _repo_relative_evidence_path(input_path: Path) -> str:
+    """Resolve ``input_path`` and express it relative to ``REPO_ROOT`` for
+    storage in the manifest's ``inputs[*].path`` field.
+
+    ``server.config.load_promotion_manifest`` treats a manifest-declared
+    evidence path as attacker-steerable (the artifact under validation
+    declares it about itself) and confines it to the repo tree, rejecting
+    every absolute path outright -- so writing an absolute path here (the
+    natural CLI form in CI, e.g. ``$GITHUB_WORKSPACE/...``) would silently
+    produce a manifest the loader can never accept: `promotion_eligible`
+    would resolve to `False`/`evidence_unresolvable` at server boot with no
+    error surfaced anywhere. Failing loudly here, at write time -- while a
+    human or CI log is watching -- is strictly better than that silent
+    degradation.
+    """
+    resolved = input_path.resolve()
+    try:
+        return resolved.relative_to(REPO_ROOT).as_posix()
+    except ValueError as exc:
+        raise EvidenceGateError(
+            f"evidence input {input_path} (resolved: {resolved}) must live under "
+            f"the repo root ({REPO_ROOT}) -- load_promotion_manifest confines every "
+            "manifest-declared evidence path to the repo tree and would otherwise "
+            "silently reject this manifest at load time"
+        ) from exc
+
+
 def write_manifest(
     *,
     manifest_phase: str,
@@ -519,12 +546,24 @@ def write_manifest(
     )
 
     inputs: dict[str, dict[str, str]] = {
-        "phase0": {"path": str(phase0_input), "sha256": sha256_file(phase0_input)},
-        "phase1": {"path": str(phase1_input), "sha256": sha256_file(phase1_input)},
-        "phase2": {"path": str(phase2_input), "sha256": sha256_file(phase2_input)},
+        "phase0": {
+            "path": _repo_relative_evidence_path(phase0_input),
+            "sha256": sha256_file(phase0_input),
+        },
+        "phase1": {
+            "path": _repo_relative_evidence_path(phase1_input),
+            "sha256": sha256_file(phase1_input),
+        },
+        "phase2": {
+            "path": _repo_relative_evidence_path(phase2_input),
+            "sha256": sha256_file(phase2_input),
+        },
     }
     if phase3_input is not None:
-        inputs["phase3"] = {"path": str(phase3_input), "sha256": sha256_file(phase3_input)}
+        inputs["phase3"] = {
+            "path": _repo_relative_evidence_path(phase3_input),
+            "sha256": sha256_file(phase3_input),
+        }
 
     phase4c_artifact_sha256: str | None = None
     if phase4c_input is not None:
@@ -537,7 +576,10 @@ def write_manifest(
             phase3_sha256=inputs["phase3"]["sha256"] if phase3_input is not None else None,
         )
         phase4c_artifact_sha256 = sha256_file(phase4c_input)
-        inputs["phase4c"] = {"path": str(phase4c_input), "sha256": phase4c_artifact_sha256}
+        inputs["phase4c"] = {
+            "path": _repo_relative_evidence_path(phase4c_input),
+            "sha256": phase4c_artifact_sha256,
+        }
 
     real_stratum_present = has_real_provider_stratum([*phase0_records, *phase1_records])
     transport_eligible = bool(transport_record.get("promotion_eligible"))

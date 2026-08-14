@@ -730,21 +730,35 @@ def test_uncontexted_interruption_fences_the_slot_until_cleanup_dispatch_complet
 
 
 def test_uncontexted_interruption_with_no_running_loop_terminalizes_synchronously() -> None:
-    """Regression for round-6 deep-review findings 7/12: the no-running-loop
-    branch of ``record_interruption`` previously called ``asyncio.run(...)``,
-    spinning up a throwaway event loop whose closing races any future a real
-    async ``dispatch_cleanup``/``on_terminal`` callback creates against the
-    *actual* production loop -- a wrong-event-loop hazard. This branch is
-    only reachable with no loop running at all, so nothing else can
-    interleave in the meantime; ``record_interruption`` must terminalize
-    synchronously instead of attempting to run the async callbacks through a
-    throwaway loop."""
+    """Regression: the no-running-loop branch of ``record_interruption`` must
+    still run ``dispatch_cleanup`` and ``on_terminal`` -- production wires
+    ``on_terminal`` to the scheduler's own queue-advance
+    (``pipeline.scheduler.start_next()``) and ``dispatch_cleanup`` to speech
+    teardown, so silently skipping them (a round-6 fix's over-correction for
+    a theoretical ``asyncio.run()``-throwaway-loop hazard) would leave the
+    scheduler with no notification the slot freed. This branch is only
+    reachable with no event loop running anywhere on this thread at all --
+    in practice a synchronous caller, not live concurrent production traffic
+    on a second loop -- so running the finalize coroutine via
+    ``asyncio.run()`` is not racing a second loop that exists at the same
+    time; it is the only loop in play. ``record_interruption`` still
+    terminalizes synchronously in the sense that matters to the caller: by
+    the time it returns, the slot is already free and both callbacks have
+    already run."""
     cleanup_calls: list[str] = []
+    terminal_calls: list[str] = []
 
     async def dispatch_cleanup(token: str, _identity: GenerationIdentity) -> None:
         cleanup_calls.append(token)
 
-    coordinator, _ = make_coordinator(dispatch_cleanup=dispatch_cleanup, auto_ack_cleanup=False)
+    async def on_terminal(
+        token: str, _identity: GenerationIdentity, _disposition: DeliveryDisposition
+    ) -> None:
+        terminal_calls.append(token)
+
+    coordinator, _ = make_coordinator(
+        dispatch_cleanup=dispatch_cleanup, on_terminal=on_terminal, auto_ack_cleanup=False
+    )
     generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
     # No TTS context is ever bound to this generation, and this call happens
     # with no asyncio event loop running at all (this test is not `async def`
@@ -758,9 +772,9 @@ def test_uncontexted_interruption_with_no_running_loop_terminalizes_synchronousl
     # scheduled task actually runs.
     assert coordinator.occupied is False
     assert coordinator.generation_for_token(generation.token) is None
-    # The async dispatch_cleanup callback is never run through a throwaway
-    # loop -- it inherently requires a real one, and none is running here.
-    assert cleanup_calls == []
+    # Both async callbacks must still run -- via asyncio.run(), not dropped.
+    assert cleanup_calls == [generation.token]
+    assert terminal_calls == [generation.token]
 
 
 def test_uncontexted_interruption_cleanup_dispatch_failure_escalates_to_teardown() -> None:
@@ -1501,6 +1515,7 @@ def test_pre_admission_terminal_reason_is_a_closed_no_tts_unavailable_transport_
     assert {member.value for member in PreAdmissionTerminalReason} == {
         "no_tts",
         "unavailable_transport",
+        "connection_closed",
     }
 
 
@@ -1520,6 +1535,28 @@ def test_pre_admission_disposition_is_busy_not_terminal_when_the_slot_is_occupie
     second = coordinator.pre_admission_disposition(identity("work-2", "utt-2"))
 
     assert isinstance(second, PreAdmissionBusy)
+
+
+def test_pre_admission_disposition_is_terminal_not_busy_after_connection_closed() -> None:
+    """Regression: ``connection_closed()`` clears ``_slot_token`` alongside
+    ``_connection_closed``, so the free-slot top-of-method guard in
+    ``SpeechScheduler.start_next`` cannot detect this case -- only
+    ``try_admit``'s own ``_connection_closed`` check refuses. Before this
+    fix that refusal surfaced as ``PreAdmissionBusy`` ("retry later, not
+    terminal"), so a caller that trusts the type's stated contract and
+    retries (e.g. a deferred ack-admission retry) would spin against a
+    connection that can never admit again instead of terminalizing. It must
+    surface as a ``PreAdmissionTerminal(CONNECTION_CLOSED)`` instead, the
+    same as every other permanent pre-admission rejection."""
+    from server.speech_lifecycle import PreAdmissionTerminal, PreAdmissionTerminalReason
+
+    coordinator, _clock = make_coordinator()
+    coordinator.connection_closed()
+
+    disposition = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+
+    assert isinstance(disposition, PreAdmissionTerminal)
+    assert disposition.reason == PreAdmissionTerminalReason.CONNECTION_CLOSED
 
 
 def test_pre_admission_disposition_admits_a_normal_ack_when_tts_and_transport_are_available() -> (

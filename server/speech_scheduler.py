@@ -81,6 +81,15 @@ class SpeechScheduler:
         self._provider_contexts: dict[str, str] = {}
         self._stop_tasks: set[asyncio.Future[Any]] = set()
         self._advance_tasks: set[asyncio.Future[Any]] = set()
+        # Set once by interrupt(full_stop=True): this scheduler is being
+        # discarded for good and never admits again. _schedule_queue_advance
+        # consults it so a task that is already past this check when
+        # full_stop's own cancel() sweep runs -- and whose in-flight
+        # start_next() then fails and re-schedules itself from inside a
+        # caught CancelledError -- cannot re-populate _advance_tasks after
+        # the sweep already ran (task.cancel() only requests cancellation;
+        # start_next's own broad except clause can observe and swallow it).
+        self._discarded = False
 
     def _signal_stop(self, item: SpeechItem) -> None:
         if self.stop is None:
@@ -279,9 +288,16 @@ class SpeechScheduler:
                 if isinstance(candidate_disposition, PreAdmissionBusy):
                     # The slot is occupied, not terminal -- unreachable today
                     # (the top-of-method guard already confirmed the slot is
-                    # free before this loop starts), but a genuine "retry
-                    # later" outcome, not a candidate rejection: nothing else
-                    # in this call will admit either, so stop scanning.
+                    # free before this loop starts, and nothing here awaits),
+                    # but a genuine "retry later" outcome, not a candidate
+                    # rejection: nothing else in this call will admit either,
+                    # so stop scanning. This is only true because a closed
+                    # connection is its own PreAdmissionTerminal reason
+                    # (CONNECTION_CLOSED) checked before try_admit ever runs
+                    # -- try_admit's own _connection_closed guard would
+                    # otherwise also surface here as PreAdmissionBusy, a
+                    # permanent condition this branch's contract assumes
+                    # is always worth retrying.
                     return None
                 item, identity, disposition = candidate, candidate_identity, candidate_disposition
                 break
@@ -346,7 +362,18 @@ class SpeechScheduler:
         original exception reaches that owner first, and any failure of the
         advance itself is swallowed -- it is a best-effort re-probe, and the
         newly admitted item's own progress bookkeeping already recorded it.
+
+        A no-op once ``interrupt(reconnect=True)``/``interrupt(full_stop=True)``
+        has run: this scheduler is being discarded for good at that point, so
+        there is nothing left to advance onto, and a caller reached via a
+        submission failure that was itself caused by a race against that
+        same interrupt (``start_next``'s except clause can observe and
+        swallow the ``CancelledError`` interrupt's own cleanup sweep sent it,
+        then land here) must not re-populate ``_advance_tasks`` after that
+        sweep already ran.
         """
+        if self._discarded:
+            return
 
         async def advance() -> None:
             try:
@@ -495,6 +522,14 @@ class SpeechScheduler:
             )
             self._release(active_item.utterance_id)
         if reconnect or full_stop:
+            # Set before the cancel() sweep below: a task already past
+            # _schedule_queue_advance's own discarded-check (i.e. already
+            # running) can still have task.cancel() swallowed by start_next's
+            # broad except clause, which then calls _schedule_queue_advance
+            # again from inside its own exception handler. That re-entrant
+            # call must see this scheduler as already discarded, or it
+            # re-populates _advance_tasks right after this loop empties it.
+            self._discarded = True
             for queue in self._queues.values():
                 for item in queue:
                     self._emit_progress(
@@ -527,6 +562,13 @@ class SpeechScheduler:
         return active_item
 
     def pause(self, work_item_id: str) -> None:
+        """Pause the active lease if it matches ``work_item_id``, else no-op.
+
+        Calls ``self.lifecycle.record_interruption(token, pause=True)`` for
+        the active lease when it matches -- callers must not also call it
+        themselves, or an uncontexted generation's cleanup coroutine gets
+        double-scheduled.
+        """
         if self._active and self._active.item.work_item_id == work_item_id:
             item = self._active.item
             token = self._active.token
@@ -569,7 +611,13 @@ class SpeechScheduler:
         return replay
 
     def cancel(self, work_item_id: str | None = None) -> tuple[SpeechItem, ...]:
-        """Cancel active, queued, and paused speech for one work item or all work."""
+        """Cancel active, queued, and paused speech for one work item or all work.
+
+        Calls ``self.lifecycle.record_interruption(token, pause=False)`` for
+        the active lease when it matches (or when ``work_item_id`` is
+        ``None``) -- callers must not also call it themselves, or an
+        uncontexted generation's cleanup coroutine gets double-scheduled.
+        """
         cancelled: list[SpeechItem] = []
         if self._active is not None and (
             work_item_id is None or self._active.item.work_item_id == work_item_id

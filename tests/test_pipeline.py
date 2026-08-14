@@ -5860,13 +5860,21 @@ def test_multi_intent_malformed_pending_and_failure_ids_warn_instead_of_raising(
     asyncio.run(run())
 
 
-def test_multi_intent_reconciled_unattributed_child_is_discarded_from_known_work_items() -> None:
-    """Regression: a dispatched multi-intent child that reaches the reconcile
-    loop (never accounted for in results/pending/failures) kept its id in
-    `_known_work_items` (and `_cancelled_work_items`) for the rest of the
-    process lifetime -- the one unbounded set in a diff that explicitly
-    bounds every sibling (`_MAX_WORK_STATUS_KEYS`, `_MAX_WORK_STATUS_SEQUENCES`,
-    `_MAX_HANDSHAKE_TOKENS`, `context_tombstone_limit`)."""
+def test_multi_intent_reconciled_unattributed_child_still_honours_a_subsequent_whole_turn_cancel() -> (
+    None
+):
+    """Regression: the reconcile loop used to discard a dispatched multi-
+    intent child that reaches it (never accounted for in
+    results/pending/failures) from `_known_work_items`. That set is the
+    *only* remaining registry `_cancel_work(None)` (a whole-turn cancel) can
+    use to reach this id once the coordinator's own live-task tracking has
+    already dropped it -- which it typically has, or this id would have been
+    attributed normally instead of landing here. Discarding it at reconcile
+    time meant a whole-turn cancel arriving *after* reconcile could no
+    longer mark this id cancelled at all, so a late result arriving for it
+    afterwards would be committed and autoplayed despite the user having
+    cancelled the turn. `_known_work_items` must still contain the id after
+    reconcile so a later whole-turn cancel can still reach it."""
 
     async def run() -> None:
         sink = CollectingMeasurementSink()
@@ -5881,8 +5889,46 @@ def test_multi_intent_reconciled_unattributed_child_is_discarded_from_known_work
             host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-orphan"),
         )
 
-        assert "work-turn-orphan-0" not in host._known_work_items
+        # Still reachable after reconcile -- not yet cancelled.
+        assert "work-turn-orphan-0" in host._known_work_items
         assert "work-turn-orphan-0" not in host._cancelled_work_items
+
+        # A whole-turn cancel landing after the reconcile loop ran must still
+        # be able to mark this id cancelled.
+        await host.cancel_turn_or_child(None, None, origin=origin)
+
+        assert "work-turn-orphan-0" in host._cancelled_work_items
+
+        _register_dispatch_recorder(
+            host, "work-turn-orphan-0", origin_epoch=origin.epoch, turn_id="turn-orphan"
+        )
+        late_result = GroundedResult(
+            result_id="result-turn-orphan-0",
+            worker_id="worker-search",
+            turn_id="turn-orphan",
+            text="a late answer",
+            spoken_text="a late answer",
+            origin_epoch=origin.epoch,
+        )
+        await host.commit_late_result_once(
+            _late_delivery_context(
+                host,
+                turn_id="turn-orphan",
+                work_item_id="work-turn-orphan-0",
+                origin_epoch=origin.epoch,
+            ),
+            LateResult(
+                work_item_id="work-turn-orphan-0", worker_id="worker-search", result=late_result
+            ),
+        )
+
+        # Still committed (canonical state is never lost), but treated as
+        # cancelled: not spoken/autoplayed -- proving the whole-turn cancel
+        # that landed *after* reconcile was still honoured.
+        assert host.state.result_history("worker-search") == (late_result,)
+        fields = _background_records(sink)[0].fields
+        assert fields["work_outcome"] == "cancelled"
+        assert fields["commit_outcome"] == "committed"
         await host.shutdown()
 
     asyncio.run(run())
@@ -5897,8 +5943,11 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_
     `_known_work_items` and `_cancelled_work_items`, which would make a late
     callback arriving afterwards read `was_cancelled=False` and commit +
     autoplay a result the user actually cancelled. The cancel marker must
-    survive the reconcile-loop discard so a late callback for this id is
-    still treated as cancelled."""
+    survive the reconcile loop so a late callback for this id is still
+    treated as cancelled -- and (see the sibling
+    ..._subsequent_whole_turn_cancel test) `_known_work_items` must survive
+    it too, so a whole-turn cancel arriving *after* reconcile can still
+    reach this id at all."""
 
     async def run() -> None:
         sink = CollectingMeasurementSink()
@@ -5917,7 +5966,7 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_
             host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-orphan"),
         )
 
-        assert "work-turn-orphan-0" not in host._known_work_items
+        assert "work-turn-orphan-0" in host._known_work_items
         assert "work-turn-orphan-0" in host._cancelled_work_items
 
         _register_dispatch_recorder(

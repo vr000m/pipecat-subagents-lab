@@ -1470,10 +1470,8 @@ class SessionHost:
                             if outcome.work_items
                             else origin.scheduler.active.item.work_item_id
                         )
-                        # scheduler.pause() already calls record_interruption
-                        # itself when the target matches the active lease --
-                        # calling it here too would double-schedule the
-                        # uncontexted-generation cleanup coroutine.
+                        # Do not also call lifecycle.record_interruption here
+                        # -- see the contract on SpeechScheduler.pause().
                         origin.scheduler.pause(target)
                         await origin.scheduler.wait_for_stops()
                         control_outcome = "applied"
@@ -1485,11 +1483,9 @@ class SessionHost:
                             control_outcome = "applied"
                     elif action in {"cancel", "stop"}:
                         target = outcome.work_items[0] if outcome.work_items else None
-                        # cancel_turn_or_child routes through scheduler.cancel(),
-                        # which already calls record_interruption itself when
-                        # the target matches the active lease -- calling it
-                        # here too would double-schedule the
-                        # uncontexted-generation cleanup coroutine.
+                        # cancel_turn_or_child routes through scheduler.cancel()
+                        # -- do not also call lifecycle.record_interruption
+                        # here; see the contract on SpeechScheduler.cancel().
                         # Route every explicit cancel/stop through the host's
                         # cancellation boundary so a targeted child cancel also
                         # settles this turn's parent ack (and its latch) when
@@ -2533,24 +2529,40 @@ class SessionHost:
                     else "failed",
                     origin_epoch=origin_epoch,
                 )
-                # This is the one path a multi-intent child can reach without
-                # going through `results`/`_commit_and_speak`, both of which
-                # discard their own ids -- without this it stays in
-                # `_known_work_items` for the rest of the process lifetime,
-                # the one unbounded set in a diff that explicitly bounds
-                # every sibling.
+                # Neither `_known_work_items` nor `_cancelled_work_items` is
+                # discarded here, unlike every other discard site: this fires
+                # when the child's fate is *unknown* (it may still be a
+                # coordinator-retained task whose late result hasn't arrived
+                # yet), not known-terminal like every sibling discard site.
                 #
-                # `_cancelled_work_items` is deliberately NOT discarded here,
-                # unlike every other discard site: this fires when the
-                # child's fate is *unknown* (it may still be alive), not
-                # known-terminal like every sibling discard site. A late
-                # callback that later arrives for this id must still see it
-                # as cancelled -- discarding the marker here would let a
-                # result the user actually cancelled be committed and
-                # autoplayed instead of suppressed. The cancel marker is one
-                # string and is consumed on the late-result path anyway, so
-                # leaving it costs nothing.
-                self._known_work_items.discard(unmatched_work_item_id)
+                # `_known_work_items` feeds `_cancel_work(None)`'s whole-turn
+                # cancel set (line ~3332). Discarding it here would remove
+                # the *only* remaining registry that can still reach this id
+                # if a whole-turn cancel arrives *after* this reconcile loop
+                # runs but *before* (or instead of) a late result: by then
+                # the coordinator's own task has typically already completed
+                # and been popped from its live-task registry (that's part
+                # of why this id is unattributed here in the first place),
+                # so `coordinator.cancel(None)` cannot re-derive it either.
+                # Losing that reachability would silently commit and
+                # autoplay a result the user actually cancelled -- the exact
+                # failure this whole mechanism exists to prevent, just
+                # triggered by a cancel landing after reconcile instead of
+                # before it. `_cancelled_work_items` must stay for the
+                # matching reason: a late callback that arrives for this id
+                # must still see it as cancelled if a whole-turn cancel
+                # landed (before *or* after this loop).
+                #
+                # The accepted cost is a leak of one short string per set,
+                # per multi-intent child, in the rare case that is reconciled
+                # here and *never* receives a late result at all (no cancel,
+                # no callback, ever) -- every other path that discards these
+                # ids fires exactly when that late result (or an explicit
+                # cancel) finally does arrive. Bounding that residual case
+                # would mean adopting the TTL/bounded-eviction pattern
+                # `shared/protocol.md` already documents for reconnect
+                # snapshot terminal records, which is a larger, separately
+                # scoped change.
             if not results and not retained_work_items:
                 # Nothing will be spoken and nothing is still running: every
                 # dispatched item was rejected or never accounted for. An ack

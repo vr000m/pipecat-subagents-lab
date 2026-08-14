@@ -86,6 +86,7 @@ class PreAdmissionTerminalReason(str, Enum):
 
     NO_TTS = "no_tts"
     UNAVAILABLE_TRANSPORT = "unavailable_transport"
+    CONNECTION_CLOSED = "connection_closed"
 
 
 @dataclass(frozen=True)
@@ -310,11 +311,14 @@ class SpeechLifecycleCoordinator:
         ``_active`` assignment.
 
         Returns a closed-enum terminal disposition when no transport lane
-        exists at all (``no_tts``) or the injected transport-acceptance
-        predicate rejects the connection (``unavailable_transport``); a
+        exists at all (``no_tts``), the injected transport-acceptance
+        predicate rejects the connection (``unavailable_transport``), or this
+        connection has already been torn down (``connection_closed``); a
         ``Terminal`` result allocates no transport token, arms no timer, and
         invokes no admitted-generation callback. Returns ``PreAdmissionBusy``
-        when the slot is merely occupied (retry later, not terminal).
+        when the slot is merely occupied (retry later, not terminal) --
+        genuinely retry-worthy, unlike ``connection_closed``, which is
+        permanent for this coordinator's lifetime.
         Otherwise admits normally and returns ``PreAdmissionAdmit``.
 
         The ``no_tts`` gate is role-independent. ``tts_available`` is the
@@ -332,6 +336,14 @@ class SpeechLifecycleCoordinator:
         optional, TTS-lane-only speech that is safe to drop before admission,
         while a result with a live TTS lane keeps admitting and terminalizes
         through the normal delivery path.
+
+        The ``connection_closed`` gate is role-independent, like ``no_tts``:
+        ``connection_closed()`` clears ``_slot_token`` alongside
+        ``_connection_closed``, so ``occupied`` (``_slot_token is not
+        None``) cannot detect this case on its own -- without this gate,
+        ``try_admit`` still refuses (its own ``_connection_closed`` check),
+        but that refusal surfaced as ``PreAdmissionBusy``, misrepresenting a
+        permanent condition as one merely worth retrying later.
         """
         if not self._tts_available:
             return PreAdmissionTerminal(PreAdmissionTerminalReason.NO_TTS)
@@ -341,6 +353,8 @@ class SpeechLifecycleCoordinator:
             and not self._transport_acceptance()
         ):
             return PreAdmissionTerminal(PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
+        if self._connection_closed:
+            return PreAdmissionTerminal(PreAdmissionTerminalReason.CONNECTION_CLOSED)
         generation = self.try_admit(identity)
         if generation is None:
             return PreAdmissionBusy()
@@ -494,17 +508,27 @@ class SpeechLifecycleCoordinator:
             except RuntimeError:
                 # No running loop: nothing else can be admitted or interleave
                 # in the meantime, so the fencing the scheduled path exists
-                # to provide is moot here -- only the terminal state
-                # transition itself still needs to happen. `asyncio.run()`
-                # would spin up a throwaway loop whose closing races any
-                # future a real `dispatch_cleanup`/`on_terminal` callback
-                # creates against the *actual* running loop (queuing frames
-                # through the pipeline, starting the next admission) -- a
-                # wrong-event-loop hazard, not a safe substitute. Terminalize
-                # synchronously instead: the async side-effect callbacks
-                # inherently require a real loop to run safely, and this
-                # branch is only reachable with none running.
-                self._terminalize_state(token, disposition)
+                # to provide is moot here -- but `dispatch_cleanup` and
+                # `on_terminal` still need to run: they are not fencing, they
+                # are the caller's own side effects (production wires
+                # `on_terminal` to the scheduler's queue-advance and
+                # `dispatch_cleanup` to speech teardown), and dropping them
+                # silently leaves the scheduler with no notification the slot
+                # freed. A prior version of this branch called
+                # `_terminalize_state` directly instead of running
+                # `_finalize_uncontexted_interruption`, on the theory that
+                # `asyncio.run()`'s throwaway loop could race a real one any
+                # future the callbacks create -- but that silently dropped
+                # both callbacks even for a purely synchronous one with no
+                # loop dependency at all, which is a confirmed regression,
+                # not just a theoretical one. This branch is only reachable
+                # with no event loop running anywhere on this thread at all
+                # (see the class docstring / round-3 history: in practice
+                # that means a synchronous caller, overwhelmingly a test, not
+                # live concurrent production traffic on a second loop), so
+                # `asyncio.run()` here is not racing a second loop that
+                # exists at the same time -- it is the only loop in play.
+                asyncio.run(self._finalize_uncontexted_interruption(token, disposition))
             else:
                 self._schedule(self._finalize_uncontexted_interruption(token, disposition))
             return

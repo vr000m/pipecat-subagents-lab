@@ -858,6 +858,65 @@ def test_full_stop_cancels_a_pending_queue_advance_task() -> None:
     asyncio.run(run())
 
 
+def test_full_stop_does_not_resurrect_an_advance_task_that_is_already_running() -> None:
+    """Regression: the sibling test above only proves the not-yet-started
+    case, where ``task.cancel()`` sets ``_must_cancel`` before the coroutine
+    body ever runs. An advance task that has already entered ``start_next``
+    and suspended inside ``speak()`` behaves differently: the delivered
+    ``CancelledError`` lands in ``start_next``'s own ``except BaseException``
+    handler, which -- as part of its normal submission-failure cleanup --
+    calls ``_schedule_queue_advance`` again, and that re-raised
+    ``CancelledError`` is then swallowed by ``advance()``'s own
+    ``except BaseException``, so the task completes normally (not as
+    cancelled) having re-populated ``_advance_tasks`` right after
+    ``full_stop``'s one-shot sweep already emptied it.
+    ``_schedule_queue_advance`` must refuse to schedule once this scheduler
+    has been discarded, regardless of which path reaches it."""
+
+    async def run() -> None:
+        entered_speak = asyncio.Event()
+        release_speak = asyncio.Event()
+
+        async def speak(item) -> None:
+            if item.work_item_id == "work-1":
+                raise RuntimeError("provider unavailable")
+            entered_speak.set()
+            await release_speak.wait()
+
+        scheduler = _scheduler(speak=speak)
+        enqueue(scheduler, "work-1", "first")
+        enqueue(scheduler, "work-2", "second")
+
+        try:
+            await scheduler.start_next("work-1")
+        except RuntimeError:
+            pass
+
+        # Let the deferred re-probe task actually run: it should admit
+        # work-2 and suspend inside speak(), not merely sit pending.
+        assert len(scheduler._advance_tasks) == 1
+        running_task = next(iter(scheduler._advance_tasks))
+        await asyncio.wait_for(entered_speak.wait(), timeout=1)
+        assert not running_task.done()
+        assert scheduler.active is not None
+        assert scheduler.active.item.work_item_id == "work-2"
+
+        scheduler.interrupt(full_stop=True)
+
+        # Let the cancellation actually propagate through start_next's/
+        # advance()'s exception handlers to completion.
+        await asyncio.wait_for(running_task, timeout=1)
+
+        assert scheduler._advance_tasks == set(), (
+            "start_next's own failure-cleanup path re-scheduled a fresh "
+            "advance task after full_stop's sweep already ran"
+        )
+
+        release_speak.set()
+
+    asyncio.run(run())
+
+
 def test_submission_failure_leaves_its_own_work_item_key_for_its_owner_to_retry() -> None:
     """The failed item's own key is excluded from the deferred re-probe: its
     owner catches the propagating exception and decides whether to re-queue

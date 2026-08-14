@@ -570,6 +570,22 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         if not phase4c_path.is_absolute():
             phase4c_path = _REPO_ROOT / phase4c_path
         try:
+            # phase4c_artifact_path is operator config (env/TOML), not
+            # manifest-declared, so it is not attacker-steerable the way the
+            # phase0-3 `inputs[*].path` entries are -- but it is still an
+            # operator-controllable path read on the server-boot path, and
+            # `_resolve_confined_evidence_path`'s sibling reads apply the
+            # same is_file()/_MAX_EVIDENCE_INPUT_BYTES bound for exactly that
+            # reason: an accidental device-file or FIFO path would otherwise
+            # make `read_bytes()` block indefinitely (`/dev/zero` never
+            # reaches EOF), hanging or OOM-killing server boot instead of
+            # degrading to `phase4c_unresolvable` like every other
+            # unreadable-path case here.
+            if (
+                not phase4c_path.is_file()
+                or phase4c_path.stat().st_size > _MAX_EVIDENCE_INPUT_BYTES
+            ):
+                return replace(identity, reason="phase4c_unresolvable")
             actual_hash = hashlib.sha256(phase4c_path.read_bytes()).hexdigest()
         except OSError:
             return replace(identity, reason="phase4c_unresolvable")

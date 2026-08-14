@@ -1132,6 +1132,36 @@ def test_load_promotion_manifest_without_a_phase4c_path_is_unresolvable(tmp_path
     assert verdict.reason == "phase4c_unresolvable"
 
 
+def test_load_promotion_manifest_rejects_an_oversized_phase4c_artifact_path(tmp_path: Path) -> None:
+    """Regression: `phase4c_artifact_path` (operator config -- env var or
+    TOML `[features]` table, never manifest-declared) was read via a bare
+    `read_bytes()` with no `is_file()`/size check, unlike the sibling
+    phase0-3 `inputs[*].path` entries `_resolve_confined_evidence_path`
+    already bounds. An operator misconfiguring it to point at a character
+    device (e.g. `/dev/zero`, which never reaches EOF) would make
+    `read_bytes()` block indefinitely, hanging or OOM-killing server boot
+    instead of degrading to `phase4c_unresolvable` like every other
+    unreadable-path case here. A regular file over the same
+    `_MAX_EVIDENCE_INPUT_BYTES` cap the phase0-3 inputs already enforce
+    exercises the same guard without needing a real device file in CI."""
+    import json
+
+    from server import config as _config_module
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    phase4c_path = tmp_path / "phase4c.json"
+    phase4c_path.write_bytes(b"x" * (_config_module._MAX_EVIDENCE_INPUT_BYTES + 1))
+    config = _bound_config(manifest_path, phase4c_artifact_path=str(phase4c_path))
+    manifest = _final_manifest(tmp_path=tmp_path, config=config, phase4c_artifact_sha256="f" * 64)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "phase4c_unresolvable"
+
+
 def test_load_promotion_manifest_rejects_a_final_manifest_omitting_a_configured_phase4c_binding(
     tmp_path: Path,
 ) -> None:
