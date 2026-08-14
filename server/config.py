@@ -318,6 +318,24 @@ _EVIDENCE_SCHEMA_PATH = _REPO_ROOT / "shared/schemas/v013-evidence.json"
 _MAX_EVIDENCE_INPUT_BYTES = 8 * 1024 * 1024
 
 
+def _regular_file_within_evidence_size_cap(path: Path) -> bool:
+    """True iff `path` names a regular file at or under `_MAX_EVIDENCE_INPUT_BYTES`.
+
+    A single `os.stat()`/`Path.stat()` call backs both checks: `Path.is_file()`
+    is itself a `stat()` call, so testing it and `Path.stat().st_size`
+    separately would double the syscall for every evidence-file read this
+    gates. `stat.S_ISREG` reads the file-type bits off that one call's result
+    instead.
+    """
+    from stat import S_ISREG
+
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    return S_ISREG(st.st_mode) and st.st_size <= _MAX_EVIDENCE_INPUT_BYTES
+
+
 def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
     """Resolve a manifest-declared evidence path, confined to the repo tree
     and bounded in size.
@@ -338,10 +356,7 @@ def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
     resolved = (_REPO_ROOT / candidate).resolve()
     if not resolved.is_relative_to(_REPO_ROOT):
         return None
-    try:
-        if not resolved.is_file() or resolved.stat().st_size > _MAX_EVIDENCE_INPUT_BYTES:
-            return None
-    except OSError:
+    if not _regular_file_within_evidence_size_cap(resolved):
         return None
     return resolved
 
@@ -575,16 +590,13 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
             # phase0-3 `inputs[*].path` entries are -- but it is still an
             # operator-controllable path read on the server-boot path, and
             # `_resolve_confined_evidence_path`'s sibling reads apply the
-            # same is_file()/_MAX_EVIDENCE_INPUT_BYTES bound for exactly that
-            # reason: an accidental device-file or FIFO path would otherwise
-            # make `read_bytes()` block indefinitely (`/dev/zero` never
-            # reaches EOF), hanging or OOM-killing server boot instead of
-            # degrading to `phase4c_unresolvable` like every other
-            # unreadable-path case here.
-            if (
-                not phase4c_path.is_file()
-                or phase4c_path.stat().st_size > _MAX_EVIDENCE_INPUT_BYTES
-            ):
+            # same size/regular-file bound for exactly that reason: an
+            # accidental device-file or FIFO path would otherwise make
+            # `read_bytes()` block indefinitely (`/dev/zero` never reaches
+            # EOF), hanging or OOM-killing server boot instead of degrading
+            # to `phase4c_unresolvable` like every other unreadable-path
+            # case here.
+            if not _regular_file_within_evidence_size_cap(phase4c_path):
                 return replace(identity, reason="phase4c_unresolvable")
             actual_hash = hashlib.sha256(phase4c_path.read_bytes()).hexdigest()
         except OSError:
