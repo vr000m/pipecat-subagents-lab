@@ -1176,6 +1176,28 @@ def test_analyzer_rejects_a_missing_selected_dimension(tmp_path: Path) -> None:
     assert exit_code != 0
 
 
+def test_analyzer_rejects_a_record_missing_provider_with_evidence_gate_error_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """Regression: the synthetic-dry-run gate used to read
+    ``r["provider"]``/``r["model"]`` on every record before
+    ``validate_raw_record`` ran, so a malformed record missing either key
+    raised a raw KeyError instead of the documented EvidenceGateError.
+    ``main()`` only catches ``(EvidenceGateError, OSError)``, so that KeyError
+    would have propagated as an unhandled traceback rather than the
+    documented ``FAIL: ...`` exit. Shape validation must run before the gate
+    reads either field, on every record, regardless of whether that record
+    is ultimately synthetic."""
+    module = _analyzer()
+    records = _paired_cells(n=5, baseline_latency=1000, narrowed_latency=600)
+    del records[0]["provider"]
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
+    assert exit_code != 0
+    assert not output.exists()
+
+
 def test_analyzer_rejects_a_record_with_a_scorer_hash_that_does_not_match_the_fixture(
     tmp_path: Path,
 ) -> None:

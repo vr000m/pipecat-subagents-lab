@@ -154,13 +154,20 @@ def build_analysis(
     straight through into the statistics -- so this runs the same full
     type/range validator and fixture-binding check the collector uses.
     """
+    # Shape is validated first, unconditionally, so neither this gate's own
+    # key reads below nor the promotion rubric ever run against an
+    # unvalidated record: a malformed record missing `provider`/`model`
+    # would otherwise raise a raw KeyError here instead of the documented
+    # EvidenceGateError, which main()'s except clause does not catch.
+    for index, record in enumerate(records):
+        validate_raw_record(record, where=f"record {index}")
+
     # Assumption: a dry-run/synthetic row is never promotion input. Until now
     # that held only as an incidental side effect of dry-run records carrying
     # `retrieval_snapshot_id=None`, which routed their stratum into
     # `provider_effect_uncontrolled`; a synthetic row with a snapshot id and a
     # hit/miss cache status would have reached the promotion rubric. This is
-    # the explicit gate. Shape is still validated first so dry-run output
-    # stays provably analyzer-input-compatible.
+    # the explicit gate.
     synthetic_strata = sorted(
         {
             f"{r['provider']}/{r['model']}"
@@ -169,8 +176,6 @@ def build_analysis(
         }
     )
     if synthetic_strata:
-        for index, record in enumerate(records):
-            validate_raw_record(record, where=f"record {index}")
         return _terminal(
             status=EvidenceStatus.BLOCKED.value,
             reason="synthetic_dry_run_input",
@@ -179,7 +184,6 @@ def build_analysis(
 
     for index, record in enumerate(records):
         where = f"record {index}"
-        validate_raw_record(record, where=where)
         # Shape validation alone accepted a record whose scorer_hash was
         # unrelated to the matched IDs and quality_score it claims, so an edit
         # made after scoring (or a wholly invented row) reached the promotion
