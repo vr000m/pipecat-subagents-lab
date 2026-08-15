@@ -589,10 +589,25 @@ def test_collector_blocked_status_record_carries_source_commit_and_tree_hash(
 
 
 def _analysis_input(
-    tmp_path: Path, records: list[dict[str, Any]], name: str = "normalized.jsonl"
+    tmp_path: Path,
+    records: list[dict[str, Any]],
+    name: str = "normalized.jsonl",
+    *,
+    fixture: Path | None = None,
 ) -> Path:
+    """Write analyzer input, stamping each record's ``fixture_sha256``.
+
+    The analyzer requires every record to bind the exact fixture bytes it will
+    be analyzed against -- ``fixture_version`` alone is self-declared and binds
+    nothing -- so this mirrors what the collector stamps in production.
+    ``fixture`` defaults to the same synthetic fixture ``_analyzer_argv``
+    passes; a record that already declares a digest keeps it, so
+    missing/mismatched-digest rejection tests can opt out.
+    """
+    common = _evidence_common()
+    digest = common.sha256_file(fixture if fixture is not None else _collector_fixture(tmp_path))
     path = tmp_path / name
-    _write_jsonl(path, records)
+    _write_jsonl(path, [{"fixture_sha256": digest, **record} for record in records])
     return path
 
 
@@ -1281,18 +1296,19 @@ def test_analyzer_rejects_mixed_scorer_versions(tmp_path: Path) -> None:
 def test_dry_run_records_feed_directly_into_the_analyzer_as_a_valid_shape(
     tmp_path: Path,
 ) -> None:
-    """The runner's dry-run records use provider="synthetic" and
-    retrieval_snapshot_id=None and are never treated as real evidence -- the
-    analyzer must always resolve them to blocked/provider_effect_uncontrolled
-    (no discoverable retrieval-snapshot control) or blocked/undersized_cell,
-    never a promotion decision. This is still valuable schema-compatibility
-    coverage: it proves 4A's dry-run output is shape-compatible with the
-    analyzer's input contract (same field set as a collector-normalized
-    cell) end to end, before any paid collection exists."""
+    """The runner's dry-run records use provider="synthetic" and are never
+    treated as real evidence. Round 7 made that an explicit terminal gate --
+    `blocked`/`synthetic_dry_run_input` -- rather than an incidental
+    consequence of `retrieval_snapshot_id=None` routing the stratum into
+    `provider_effect_uncontrolled`. Shape is still validated before the gate
+    returns, so this remains schema-compatibility coverage: it proves 4A's
+    dry-run output is shape-compatible with the analyzer's input contract
+    (same field set as a collector-normalized cell) end to end, before any
+    paid collection exists."""
     records = _dry_run_records(tmp_path, baseline_repeats=15)
     analyzer = _analyzer()
     common = _evidence_common()
-    input_path = _analysis_input(tmp_path, records)
+    input_path = _analysis_input(tmp_path, records, fixture=_fixture_path())
     output = tmp_path / "analysis.json"
     # Dry-run records are scored against the real committed fixture (not the
     # synthetic qcl-test-v1 one `_analyzer_argv` uses for `_valid_raw_record`-
@@ -1304,6 +1320,7 @@ def test_dry_run_records_feed_directly_into_the_analyzer_as_a_valid_shape(
     assert exit_code == 0
     result = json.loads(output.read_text())
     assert result["status"] == common.EvidenceStatus.BLOCKED.value
+    assert result["reason"] == "synthetic_dry_run_input"
     assert result["promotion_eligible"] is False
 
 
@@ -1547,3 +1564,84 @@ def test_analyzer_rejects_type_and_range_violations(tmp_path: Path, override: di
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
     assert module.main(_analyzer_argv(input_path, output, tmp_path)) != 0
+
+
+# --- Review-gauntlet round 7 -------------------------------------------
+
+
+def test_analyzer_rejects_a_record_that_declares_no_fixture_digest(tmp_path: Path) -> None:
+    """Round 7 (security + spec, corroborated independently): the collector
+    stamps ``fixture_sha256`` on every record precisely so downstream binding
+    can tie the artifact to those exact fixture bytes, but nothing ever
+    compared it -- it was only shape-checked as 64 lowercase hex characters.
+    A record that binds no fixture bytes cannot support a promotion
+    decision."""
+    module = _analyzer()
+    records = [
+        {k: v for k, v in record.items() if k != "fixture_sha256"}
+        for record in _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    ]
+    input_path = tmp_path / "normalized.jsonl"
+    _write_jsonl(input_path, records)
+    output = tmp_path / "analysis.json"
+    assert module.main(_analyzer_argv(input_path, output, tmp_path)) != 0
+
+
+def test_analyzer_rejects_records_scored_against_different_fixture_bytes(tmp_path: Path) -> None:
+    """Round 7: ``fixture_version`` is a self-declared string, so it binds
+    nothing. A ``--fixture`` file carrying the same version but weaker
+    required_facts/expected_citations/disallowed_claims let forged match IDs
+    and an inflated quality_score resolve cleanly into
+    ``promoted``/``promotion_eligible=true``. The digest is now compared
+    against ``sha256_file(fixture_path)``."""
+    module = _analyzer()
+    records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    # A digest of some other file: same shape, different bytes.
+    other = tmp_path / "other-fixture.json"
+    other.write_text("{}", encoding="utf-8")
+    input_path = _analysis_input(tmp_path, records, fixture=other)
+    output = tmp_path / "analysis.json"
+    assert module.main(_analyzer_argv(input_path, output, tmp_path)) != 0
+
+
+def test_analyzer_publishes_the_bound_fixture_digest_in_a_promoted_analysis(
+    tmp_path: Path,
+) -> None:
+    """Round 7: the digest the decision was made under is emitted so a
+    downstream evidence binder can verify it, rather than trusting
+    ``fixture_version``."""
+    module = _analyzer()
+    common = _evidence_common()
+    records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    module.main(_analyzer_argv(input_path, output, tmp_path))
+    result = json.loads(output.read_text())
+    assert result["status"] == "promoted"
+    assert result["analysis"]["fixture_sha256"] == common.sha256_file(_collector_fixture(tmp_path))
+
+
+def test_analyzer_blocks_a_synthetic_stratum_that_looks_fully_controlled(
+    tmp_path: Path,
+) -> None:
+    """Round 7 (spec): the runner documents that Phase 4B always treats
+    dry-run/synthetic records as ineligible, but there was no explicit
+    provider/model gate -- dry-run rows were rejected only as a side effect
+    of ``retrieval_snapshot_id=None`` routing them into
+    ``provider_effect_uncontrolled``. A synthetic row carrying a snapshot id
+    and a hit/miss cache status would have reached the promotion rubric."""
+    module = _analyzer()
+    common = _evidence_common()
+    records = [
+        {**record, "provider": "synthetic", "model": "dry-run-fixture"}
+        for record in _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
+    ]
+    assert all(r["retrieval_snapshot_id"] is not None for r in records)
+    assert all(r["cache_status"] in {"hit", "miss"} for r in records)
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    assert module.main(_analyzer_argv(input_path, output, tmp_path)) == 0
+    result = json.loads(output.read_text())
+    assert result["status"] == common.EvidenceStatus.BLOCKED.value
+    assert result["reason"] == "synthetic_dry_run_input"
+    assert result["promotion_eligible"] is False

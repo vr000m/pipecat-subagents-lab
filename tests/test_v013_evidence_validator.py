@@ -745,6 +745,7 @@ def _phase4c_artifact(**overrides: Any) -> dict[str, Any]:
         "scorer_hash": "6" * 64,
         "control_fingerprint": "7" * 64,
         "fixture_version": "qcl-test-v1",
+        "fixture_sha256": "8" * 64,
         "scorer_version": "scorer-v1",
         "generated_at_utc": "2026-08-05T00:00:00Z",
     }

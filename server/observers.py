@@ -223,15 +223,23 @@ class RuntimeObserver:
         once, in order, before any newly-arriving event is dispatched.
         ``watermark=None`` (an aborted snapshot install) replays every
         buffered event without dropping or reseeding anything.
+
+        The drain runs while still paused so an event raised re-entrantly by
+        a listener during replay lands at the tail of the buffer instead of
+        being delivered immediately, overtaking events still queued ahead of
+        it.
         """
-        self._paused = False
         if watermark is not None:
             self.seed(watermark)
-        buffered, self._buffer = self._buffer, []
-        for event in buffered:
+        index = 0
+        while index < len(self._buffer):
+            event = self._buffer[index]
+            index += 1
             if watermark is not None and event.sequence <= watermark:
                 continue
             self._deliver(event)
+        self._buffer.clear()
+        self._paused = False
 
     def snapshot(self) -> RuntimeSnapshot:
         return self.state.snapshot(
@@ -324,7 +332,14 @@ class SnapshotBarrier:
         cancellation aborts the install via :meth:`cancel` (no watermark
         change, buffer replayed) and re-raises, rather than leaving the
         observer paused with a growing buffer forever.
+
+        Requires an open barrier (:meth:`subscribe_paused` with no settle
+        since). Installing without one would reseed the connection-projected
+        sequence to ``watermark`` past events already delivered, so it raises
+        rather than silently skipping them.
         """
+        if not self._open:
+            raise RuntimeError("install_baseline requires an open barrier; call subscribe_paused")
 
         self._generation += 1
         acked: asyncio.Future[None] = asyncio.get_running_loop().create_future()

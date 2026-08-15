@@ -339,6 +339,25 @@ def _late_commit_work_status(
     )
 
 
+def _work_status_after_commit_failure(
+    derived: tuple[WorkStatusState, TerminalReason | None] | None,
+) -> tuple[WorkStatusState, TerminalReason | None] | None:
+    """The status to publish when the canonical commit itself raised.
+
+    ``None`` means "publish nothing": either no status was derived at all, or
+    the derived state is non-terminal (a still-legitimately-running
+    ``background`` child, which must stay reachable by its own late result).
+    A cancellation still classifies the work item regardless of the commit
+    outcome -- the same precedence ``_work_status_for_outcome`` documents --
+    so it is published as ``cancelled``, not overridden to ``failed``.
+    """
+    if derived is None or derived[0] not in WORK_STATUS_TERMINAL:
+        return None
+    if derived[0] == "cancelled":
+        return derived
+    return "failed", None
+
+
 def _child_work_status_after_dispatch(
     outcome_label: str | None,
     *,
@@ -529,7 +548,12 @@ class SessionHost:
         coordinator_registry = getattr(coordinator, "registry", None)
         if registry is None and coordinator_registry is not None:
             registry = coordinator_registry
-        self.registry = registry or WorkerRegistry()
+        # The fallback registry is built from the caller's own Config, not a
+        # default one: constructing WorkerRegistry() here and then comparing
+        # its default Config against ``config`` below rejected every
+        # non-default config as "conflicting" with a registry this
+        # constructor had just invented.
+        self.registry = registry or WorkerRegistry(config=config)
         if coordinator_registry is not None and coordinator_registry is not self.registry:
             raise ValueError("SessionHost and coordinator must share one WorkerRegistry")
         registry_config = getattr(self.registry, "config", None)
@@ -1044,6 +1068,27 @@ class SessionHost:
 
     def _clear_ack_latch(self, turn_id: str) -> None:
         self._ack_emitted_turns.discard(turn_id)
+
+    def _settle_turn_ack(
+        self, scheduler: Any, turn_id: str, *, cancel_admitted: bool = False
+    ) -> None:
+        """Retract this turn's ack and close its admission-retry chain.
+
+        Clearing the latch is the half a bare ``discard_queued_ack`` misses:
+        ``_schedule_ack_admission``'s failure path re-enqueues a fresh ack
+        whenever it still reads the turn as live, so an admission failure
+        landing after the turn already discarded its ack would put one back
+        with nothing left to remove it -- to be spoken after the canonical
+        result. The retry reads the same latch this clears.
+
+        ``cancel_admitted`` additionally retracts an ack that already reached
+        the transport, for the turns that end with nothing to say at all.
+        """
+        ack_work_item_id = self._ack_work_item_id(turn_id)
+        if cancel_admitted:
+            scheduler.cancel(ack_work_item_id)
+        scheduler.discard_queued_ack(ack_work_item_id)
+        self._clear_ack_latch(turn_id)
 
     def _register_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
         """Record one delegated child as belonging to ``turn_id``.
@@ -1782,7 +1827,7 @@ class SessionHost:
             was_cancelled = work_item_id in self._cancelled_work_items
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
+            self._settle_turn_ack(origin.scheduler, turn_id)
             # A retained child is not terminal: its truthful `background`
             # status was already emitted above and the coordinator terminalizes
             # it when the late result lands. Only an actual cancellation
@@ -1805,13 +1850,15 @@ class SessionHost:
             try:
                 committed = await self._commit_and_speak(result, origin, role=speech_role)
             except Exception:
-                if derived is not None:
+                failure_status = _work_status_after_commit_failure(derived)
+                if failure_status is not None:
                     self._emit_work_status(
                         turn_id=turn_id,
                         work_item_id=work_item_id,
                         worker_id=worker_id,
-                        state="failed",
+                        state=failure_status[0],
                         origin_epoch=origin_epoch,
+                        terminal_reason=failure_status[1],
                     )
                 raise
             if derived is not None:
@@ -2031,7 +2078,17 @@ class SessionHost:
                 child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
+            # This turn's ack was enqueued at the delegation *decision*, before
+            # coordinator.submit could report whether the work was accepted at
+            # all. Nothing committed and nothing is still running here, so the
+            # ack promises a result that is never coming; retract it even if it
+            # already reached the transport (the multi-intent path's own
+            # "nothing accepted" branch does the same).
+            self._settle_turn_ack(
+                origin.scheduler,
+                turn_id,
+                cancel_admitted=not submitted.results and not submitted.pending_work_item_ids,
+            )
             was_cancelled = work_item_id in self._cancelled_work_items
             # A cancelled child is settled here and now, so its ack ownership
             # does not have to survive for a late result that will not speak.
@@ -2046,19 +2103,15 @@ class SessionHost:
             try:
                 committed = await self._commit_and_speak(result, origin, role=speech_role)
             except Exception:
-                # ``derived`` can be a non-terminal ("background", None) tuple
-                # for a retained-and-not-cancelled child (see
-                # ``_child_work_status_after_dispatch``); only a terminal
-                # derived state should be overridden to "failed" here -- a
-                # still-legitimately-running child must stay on "background"
-                # so its own late result can terminalize it later.
-                if derived is not None and derived[0] in WORK_STATUS_TERMINAL:
+                failure_status = _work_status_after_commit_failure(derived)
+                if failure_status is not None:
                     self._emit_work_status(
                         turn_id=turn_id,
                         work_item_id=work_item_id,
                         worker_id=worker_id,
-                        state="failed",
+                        state=failure_status[0],
                         origin_epoch=origin_epoch,
+                        terminal_reason=failure_status[1],
                     )
                 raise
             if derived is not None:
@@ -2264,10 +2317,12 @@ class SessionHost:
                     # trail. The task this coroutine runs in still surfaces
                     # the raise as a WorkItemFailure, same as any other
                     # worker exception.
+                    # The user's spoken query is deliberately absent: log lines
+                    # never carry transcript text (see services/stt.py). It is
+                    # still on the KeyError raised below for diagnostics.
                     logger.warning(
                         f"multi-intent fan-in for {turn_id}: execute() invoked for "
-                        f"worker_id={worker_id!r} query={query!r} with no matching "
-                        f"dispatched work item"
+                        f"worker_id={worker_id!r} with no matching dispatched work item"
                     )
                     raise KeyError(f"no dispatched work item for {worker_id!r}/{query!r}")
                 item_index = pending_indexes.pop(0)
@@ -2568,12 +2623,11 @@ class SessionHost:
                 # dispatched item was rejected or never accounted for. An ack
                 # already admitted to the transport would then be this turn's
                 # only utterance -- a promise of a result that is never
-                # coming -- and `discard_queued_ack` below cannot reach it, so
-                # retract it in whatever state it is in. Both calls are
-                # idempotent, and both target the same queue slot keyed by
-                # `ack_id == work_item_id`.
-                origin.scheduler.cancel(self._ack_work_item_id(turn_id))
-            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
+                # coming -- and a plain queued-ack discard cannot reach it, so
+                # retract it in whatever state it is in.
+                self._settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=True)
+            else:
+                self._settle_turn_ack(origin.scheduler, turn_id)
             committed = []
             commit_exceptions: list[Exception] = []
             for index in sorted(results):
@@ -3158,9 +3212,7 @@ class SessionHost:
             # unrelated generation later freeing the transport lane could
             # still speak it after the real result was already committed.
             if self.connection is not None:
-                self.connection.scheduler.discard_queued_ack(
-                    self._ack_work_item_id(context.turn_id)
-                )
+                self._settle_turn_ack(self.connection.scheduler, context.turn_id)
             self._release_turn_work_item(context.turn_id, context.work_item_id)
             if recorder is not None:
                 recorder.finalize(
@@ -3488,7 +3540,7 @@ class SessionHost:
         generation frees the transport lane.
         """
         if origin is not None:
-            origin.scheduler.discard_queued_ack(self._ack_work_item_id(turn_id))
+            self._settle_turn_ack(origin.scheduler, turn_id)
         # A blind sweep over the whole delegated child set is safe either
         # way: a child that never had a status is skipped on the
         # ``cancelled`` branch (not in ``WORK_STATUS_COLD_START``) and is a

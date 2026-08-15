@@ -269,9 +269,11 @@ WORK_STATUS_V1 = "work_status_v1"
 def resolve_work_status_wire_presence(capabilities: frozenset[str]) -> bool:
     """Single source for the work_status capability gate.
 
-    Both snapshot *content* (SessionState.snapshot(include_work_status=...))
+    ``RuntimeObserver.supports_work_status`` is the sole caller, by design:
+    both snapshot *content* (SessionState.snapshot(include_work_status=...))
     and *wire presence* (RuntimeSnapshot.wire_payload(include_work_status=...))
-    must call this instead of independently testing WORK_STATUS_V1 membership.
+    read that property rather than testing WORK_STATUS_V1 membership
+    themselves, so the literal appears in exactly one predicate.
     """
     return WORK_STATUS_V1 in capabilities
 

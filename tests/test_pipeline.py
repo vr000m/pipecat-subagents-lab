@@ -32,6 +32,7 @@ from server.pipeline import (
     CanonicalResultAdapter,
     LateDeliveryContext,
     SessionHost,
+    _work_status_after_commit_failure,
     build_pipeline,
     framework_bridge,
 )
@@ -41,7 +42,7 @@ from server.speech_lifecycle import (
     SpeechGenerationFlushAckFrame,
     SpeechGenerationMarkerFrame,
 )
-from server.speech_scheduler import ROLE_RESULT, ROLE_TIMEOUT_NOTICE
+from server.speech_scheduler import ROLE_ACK, ROLE_RESULT, ROLE_TIMEOUT_NOTICE
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.work_item_coordinator import LateResult, WorkItemCoordinator
 from server.workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
@@ -8707,3 +8708,166 @@ def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
         await host.shutdown()
 
     asyncio.run(run())
+
+
+# --- Review-gauntlet round 7 --------------------------------------------
+#
+# One regression test per applied fix, each of which fails against the
+# pre-fix implementation.
+
+
+def test_pending_turn_retracts_its_ack_when_submit_accepts_nothing() -> None:
+    """Round 7 (Codex): the pending-dialogue path enqueues its ack at the
+    delegation *decision*, before ``coordinator.submit`` can report whether
+    the work was accepted. A capacity rejection then left the ack admitted
+    and spoken -- the turn's only utterance would have been a promise of a
+    result that was never coming, immediately contradicted by the "could not
+    be completed" reply."""
+
+    async def run() -> None:
+        worker = ResultWorker()
+
+        class Registry:
+            config = Config()
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        registry = Registry()
+
+        class RefusingCoordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=registry)
+
+            def start_task(self, operation: object) -> None:
+                close = getattr(operation, "close", None)
+                if close is not None:
+                    close()
+                return None
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=RefusingCoordinator(),
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+
+        pending = type(
+            "Pending",
+            (),
+            {
+                "owner_id": "worker-search",
+                "original_query": "continue please",
+                "question": "Which one?",
+            },
+        )()
+        outcome = type("Outcome", (), {"pending_dialogue": pending, "work_items": ()})()
+        turn_id = "turn-pending-capacity"
+
+        await host._handle_pending(
+            outcome,
+            "continue please",
+            origin,
+            turn_id,
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+        )
+
+        assert _ack_items(origin.scheduler) == []
+        assert host._ack_emitted_turns == set()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_ack_admission_failure_after_the_turn_settled_does_not_requeue_it() -> None:
+    """Round 7 (Codex): the deferred admission's failure path re-enqueues a
+    fresh ack while it reads the turn as live. The turn's own
+    ``discard_queued_ack`` ran before ``_commit_and_speak``, and the latch was
+    only cleared later, so a failure landing in that window put an ack back
+    with nothing left to remove it -- to be spoken after the canonical
+    result. Settling the ack now clears the latch, which is what the retry
+    reads."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+        turn_id = "turn-settled"
+        ack_work_item_id = host._ack_work_item_id(turn_id)
+
+        def enqueue_ack() -> None:
+            origin.scheduler.enqueue(
+                result_id=None,
+                work_item_id=ack_work_item_id,
+                run_id=f"run-{ack_work_item_id}",
+                text="Let me look that up.",
+                origin_epoch=origin.epoch,
+                role=ROLE_ACK,
+                ack_id=ack_work_item_id,
+                turn_id=turn_id,
+            )
+
+        enqueue_ack()
+        host._ack_emitted_turns.add(turn_id)
+
+        # The turn reaches its canonical commit and settles the ack.
+        host._settle_turn_ack(origin.scheduler, turn_id)
+        assert _ack_items(origin.scheduler) == []
+
+        async def failing_start_next(_work_item_id: str | None = None) -> None:
+            raise RuntimeError("transport not attached")
+
+        origin.scheduler.start_next = failing_start_next  # type: ignore[method-assign]
+        host._schedule_ack_admission(
+            origin,
+            ack_work_item_id,
+            enqueue_ack,
+            turn_id=turn_id,
+            origin_epoch=origin.epoch,
+            attempt=1,
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert _ack_items(origin.scheduler) == []
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_session_host_accepts_a_non_default_config_without_a_registry() -> None:
+    """Round 7 (Codex): the fallback registry was built as ``WorkerRegistry()``
+    -- with a default Config -- and then compared against the caller's
+    ``config``, so every non-default Config was rejected as "conflicting" with
+    a registry this constructor had just invented."""
+    config = Config(max_work_items_per_turn=4)
+    host = SessionHost(config=config)
+    assert host.config == config
+    assert host.registry.config == config
+
+
+def test_cancelled_child_whose_commit_raises_is_reported_cancelled_not_failed() -> None:
+    """Round 7 (deep-review/logic): cancellation classifies a work item
+    regardless of whether its result additionally cleared the commit fences
+    (``_work_status_for_outcome``). The commit-failure epilogue published
+    ``failed`` unconditionally instead, and a terminal parent never
+    regresses, so nothing could correct it afterwards."""
+    assert _work_status_after_commit_failure(("cancelled", None)) == ("cancelled", None)
+    assert _work_status_after_commit_failure(("result_ready", None)) == ("failed", None)
+    assert _work_status_after_commit_failure(("background", None)) is None
+    assert _work_status_after_commit_failure(None) is None
+
+
+def test_multi_intent_fan_in_guard_never_logs_the_spoken_query() -> None:
+    """Round 7 (security): the fan-in guard logged the user's spoken search
+    query verbatim at WARNING level, unlike every sibling log line in the
+    server (services/stt.py deliberately omits transcript text). The query
+    stays on the KeyError raised on the next line, which is not logged."""
+    import inspect
+
+    source = inspect.getsource(SessionHost._handle_multi_intent)
+    guard = source[source.index("no matching") - 400 : source.index("no matching") + 200]
+    assert "query={query!r}" not in guard
+    assert 'raise KeyError(f"no dispatched work item for {worker_id!r}/{query!r}")' in source

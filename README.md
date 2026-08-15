@@ -163,7 +163,11 @@ empty. `WEBSEARCH_PHASE4C_ARTIFACT_PATH`
 completion artifact whose SHA-256 the manifest's `phase4c_artifact_sha256`
 field is checked against, when present; leaving it unset makes any manifest
 declaring that field resolve to a `phase4c_unresolvable` (display-only)
-verdict. The three boolean flags are parsed strictly: only `true` or `false`
+verdict. `WEBSEARCH_RELEASE_VERSION` (`[features].release_version`, default
+the installed package version) overrides the release version the promotion
+manifest's own `release_version` field is bind-checked against; it must not be
+empty, and overriding it to a version the manifest was not cut for resolves to
+a display-only verdict. The three boolean flags are parsed strictly: only `true` or `false`
 (case-insensitive) is accepted, and any other value fails startup.
 
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.

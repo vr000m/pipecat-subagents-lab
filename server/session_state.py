@@ -133,6 +133,13 @@ class SessionState:
         self._work_status_children: dict[WorkStatusKey, dict[str, WorkStatus]] = {}
         self._work_status_parents: dict[WorkStatusKey, _WorkStatusRecord] = {}
         self._work_status_sequence: dict[WorkStatusKey, int] = {}
+        # Keys whose parent record was terminal when it was dropped (TTL
+        # expiry or overflow eviction). Bounded by the same reasoning as
+        # _work_status_sequence -- a NamedTuple key in a set is cheap -- and
+        # kept for the same reason: without it a post-drop child record
+        # cold-starts the key and re-derives a parent state from a single
+        # child, resurrecting a record clients already applied as terminal.
+        self._work_status_terminal_keys: set[WorkStatusKey] = set()
 
     @property
     def events(self) -> tuple[StateEvent, ...]:
@@ -360,6 +367,16 @@ class SessionState:
             return None
         parent_state, parent_reason = self._aggregate(children)
         record = self._work_status_parents.get(key)
+        if record is None and key in self._work_status_terminal_keys:
+            # The record is gone (TTL expiry or overflow eviction) but it was
+            # terminal when it went. Re-deriving a state here would resurrect
+            # the key below a terminal state clients have already applied,
+            # which the live-record guard below would have refused.
+            return None
+        # ``terminal_reason`` is first-write-wins by construction, not by
+        # oversight: WorkStatus only permits a reason on ``failed``, and
+        # ``failed`` is terminal, so the no-regression guard below already
+        # forbids a second reason from ever landing on the same key.
         if record is not None and record.status.state == parent_state:
             return None
         # The parent's "state" is a pure recomputation over the current child
@@ -390,29 +407,37 @@ class SessionState:
 
         See the eviction note in ``__init__``: the counter must survive so a
         later record for the same key continues monotonically instead of
-        restarting at 1. It is never pruned, by design.
+        restarting at 1. It is never pruned, by design. A terminal record
+        additionally leaves a tombstone so a later child write cannot
+        cold-start the key back below the terminal state clients applied.
         """
         self._work_status_children.pop(key, None)
-        self._work_status_parents.pop(key, None)
+        record = self._work_status_parents.pop(key, None)
+        if record is not None and record.status.state in WORK_STATUS_TERMINAL:
+            self._work_status_terminal_keys.add(key)
 
     def _evict_work_status_overflow(self, *, protect: WorkStatusKey) -> None:
         """Bound the ledger, evicting the oldest terminal record first.
 
-        Non-terminal records (``terminal_at is None``) are still live parent
-        aggregates, so they are only evicted once no terminal record remains;
-        among equals the least recently inserted goes first. ``protect`` is
-        the key just written and is never the eviction victim.
+        Only terminal records are evictable. A non-terminal record
+        (``terminal_at is None``) is a live parent aggregate whose children
+        map is the sole memory of which children exist; dropping it makes the
+        next ``set_child_work_status`` for that key a cold start, which turns
+        a whole-child-set cancel sweep into a no-op and strands the parent
+        non-terminal forever. When every retained record is live the ledger
+        deliberately exceeds the cap instead. ``protect`` is the key just
+        written and is never the eviction victim.
         """
         while len(self._work_status_parents) > self._MAX_WORK_STATUS_KEYS:
-            candidates = [item for item in self._work_status_parents if item != protect]
+            candidates = [
+                item
+                for item, record in self._work_status_parents.items()
+                if item != protect and record.terminal_at is not None
+            ]
             if not candidates:
                 return
             oldest = min(
-                candidates,
-                key=lambda item: (
-                    self._work_status_parents[item].terminal_at is None,
-                    self._work_status_parents[item].terminal_at or 0.0,
-                ),
+                candidates, key=lambda item: self._work_status_parents[item].terminal_at or 0.0
             )
             self._forget_work_status(oldest)
 
@@ -434,27 +459,30 @@ class SessionState:
             return "cancelled", None
         return "result_ready", None
 
-    def work_status_snapshot(self) -> tuple[WorkStatus, ...]:
-        """Return live parent work-status records, pruning expired terminals."""
+    def prune_expired_work_status(self) -> None:
+        """Forget every terminal record past the five-minute TTL.
+
+        Split out of ``work_status_snapshot`` so the projection stays a pure
+        read: expiry is inclusive at the boundary, and an expired record is
+        forgotten entirely (leaving only its tombstone and event_sequence) so
+        the ledger does not grow for the process lifetime.
+        """
         now = time.monotonic()
-        live: list[WorkStatus] = []
-        expired: list[WorkStatusKey] = []
-        for key, record in self._work_status_parents.items():
-            if (
-                record.terminal_at is not None
-                and (now - record.terminal_at) >= WORK_STATUS_TTL_SECONDS
-            ):
-                # Expiry is inclusive at the boundary; the record is both
-                # excluded from this projection and forgotten entirely, so
-                # the ledger does not grow for the process lifetime.
-                expired.append(key)
-                continue
-            live.append(record.status)
+        expired = [
+            key
+            for key, record in self._work_status_parents.items()
+            if record.terminal_at is not None
+            and (now - record.terminal_at) >= WORK_STATUS_TTL_SECONDS
+        ]
         for key in expired:
             # Collected first: deleting during iteration would mutate the
             # dict being walked.
             self._forget_work_status(key)
-        return tuple(live)
+
+    def work_status_snapshot(self) -> tuple[WorkStatus, ...]:
+        """Return live parent work-status records, pruning expired terminals first."""
+        self.prune_expired_work_status()
+        return tuple(record.status for record in self._work_status_parents.values())
 
     @classmethod
     def from_snapshot(cls, snapshot: RuntimeSnapshot) -> SessionState:

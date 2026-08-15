@@ -1439,3 +1439,41 @@ def test_load_config_explicitly_empty_identity_settings_are_not_silently_default
 
     assert config.source_commit == ""
     assert config.source_tree_hash == ""
+
+
+def test_load_promotion_manifest_rejects_an_oversized_manifest_path(tmp_path: Path) -> None:
+    """Round 7 (security): `promotion_manifest_path` is operator config, read
+    on the boot path with a bare `read_text()` guarded only by `except
+    OSError` -- unlike `phase4c_artifact_path`, which got the regular-file/
+    size guard for exactly this reason. A path naming a character device
+    (`/dev/zero`) or FIFO would hang or OOM-kill boot instead of degrading to
+    a display-only verdict. This is the *first* evidence read boot takes, so
+    it is the one that must fail closed. An oversized regular file exercises
+    the same guard without needing a device file in CI."""
+    from server import config as _config_module
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"x" * (_config_module._MAX_EVIDENCE_INPUT_BYTES + 1))
+    config = _bound_config(manifest_path)
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_missing"
+
+
+def test_load_promotion_manifest_rejects_a_manifest_path_naming_a_directory(
+    tmp_path: Path,
+) -> None:
+    """The same guard's non-regular-file half: a directory is the CI-safe
+    stand-in for the device/FIFO case."""
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_dir = tmp_path / "manifest.json"
+    manifest_dir.mkdir()
+    config = _bound_config(manifest_dir)
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_missing"

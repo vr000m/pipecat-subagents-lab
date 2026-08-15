@@ -659,3 +659,82 @@ def test_work_status_visibility_flips_with_the_negotiated_capability() -> None:
     assert capable[0].kind == "work_status"
 
     assert project_one_work_status(frozenset()) == []
+
+
+# --- Review-gauntlet round 7 -------------------------------------------
+
+
+@pytest.mark.skipif(RuntimeObserver is None, reason="server.observers.RuntimeObserver missing")
+def test_resume_replay_keeps_order_when_a_listener_raises_a_re_entrant_event() -> None:
+    """Round 7 (deep-review/logic): ``resume()`` cleared ``_paused`` before
+    replaying, so an event raised synchronously by a listener during replay
+    was delivered immediately -- overtaking events still queued ahead of it
+    and breaking in-order replay. The drain now runs while still paused, so a
+    re-entrant event lands at the tail of the buffer being drained."""
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    observer = RuntimeObserver(state, epoch=1)
+    delivered: list[str] = []
+    reentered = False
+
+    def worker(worker_id: str) -> WorkerState:
+        return WorkerState(
+            worker_id=worker_id,
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        )
+
+    def emit(event: object) -> None:
+        nonlocal reentered
+        worker_id = event.data["worker_id"]  # type: ignore[attr-defined]
+        delivered.append(worker_id)
+        if worker_id == "worker-a" and not reentered:
+            reentered = True
+            state.set_worker(worker("worker-reentrant"))
+
+    observer.subscribe(emit)
+    observer.pause()
+    state.set_worker(worker("worker-a"))
+    state.set_worker(worker("worker-b"))
+    observer.resume()
+
+    assert delivered == ["worker-a", "worker-b", "worker-reentrant"]
+
+
+@pytest.mark.skipif(SnapshotBarrier is None, reason="server.observers.SnapshotBarrier missing")
+def test_install_baseline_without_an_open_barrier_is_refused() -> None:
+    """Round 7 (deep-review/logic): ``install_baseline`` never checked
+    ``_open``. Called without a preceding ``subscribe_paused`` (or after
+    ``cancel``) it still reseeded the connection-projected sequence to
+    ``watermark``, silently jumping past events already delivered."""
+
+    async def scenario() -> None:
+        state = SessionState(session_id="session-1")
+        observer = RuntimeObserver(state, epoch=1)
+        barrier = SnapshotBarrier(observer=observer, state=state)
+        writes: list[object] = []
+
+        async def flush_writer(frame: object) -> None:
+            writes.append(frame)
+            frame.acknowledge()
+
+        async def snapshot_writer() -> None:
+            writes.append("snapshot")
+
+        with pytest.raises(RuntimeError):
+            await barrier.install_baseline(
+                watermark=99, flush_writer=flush_writer, snapshot_writer=snapshot_writer
+            )
+        assert writes == []
+
+        barrier.subscribe_paused()
+        barrier.cancel()
+        with pytest.raises(RuntimeError):
+            await barrier.install_baseline(
+                watermark=99, flush_writer=flush_writer, snapshot_writer=snapshot_writer
+            )
+        assert writes == []
+
+    run(lambda: scenario())

@@ -428,6 +428,12 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     path = Path(config.promotion_manifest_path)
     if not path.is_absolute():
         path = _REPO_ROOT / path
+    # Same guard `phase4c_artifact_path` takes, and for the same reason: this
+    # is operator config, and a path that names a device or FIFO would hang or
+    # OOM-kill server boot on read_text(). This is the first evidence read the
+    # boot path takes, so it is the one that must fail closed.
+    if not _regular_file_within_evidence_size_cap(path):
+        return _unavailable("manifest_missing")
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:

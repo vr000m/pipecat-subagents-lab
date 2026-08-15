@@ -363,6 +363,12 @@ PHASE4C_HASH_LIKE_FIELDS = frozenset(
         "experiment_command_digest",
         "analyzer_command_digest",
         "scorer_hash",
+        # The sha256 of the exact quality-fixture bytes the Phase 4B
+        # decision was scored against. `fixture_version` alone is a
+        # self-declared string, so it binds nothing: a same-version fixture
+        # with weaker required_facts/expected_citations/disallowed_claims
+        # would resolve forged match IDs cleanly.
+        "fixture_sha256",
         "control_fingerprint",
     }
 )
@@ -373,6 +379,7 @@ PHASE4C_SHA256_FIELDS = frozenset(
         "phase4b_baseline_input_sha256",
         "phase4b_normalized_input_sha256",
         "scorer_hash",
+        "fixture_sha256",
     }
 )
 PHASE4C_STRING_FIELDS = frozenset({"fixture_version", "scorer_version", "generated_at_utc"})

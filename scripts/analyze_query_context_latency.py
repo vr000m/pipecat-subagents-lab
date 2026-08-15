@@ -33,6 +33,7 @@ from scripts._evidence_common import (
     EvidenceStatus,
     FixtureIndex,
     load_jsonl,
+    sha256_file,
     validate_against_fixture,
 )
 from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
@@ -117,7 +118,21 @@ def _median(values: list[float]) -> float:
     return statistics.median(values)
 
 
-def build_analysis(records: list[dict[str, Any]], *, fixture_index: FixtureIndex) -> dict[str, Any]:
+# Provider/model pairs that `run_query_context_experiment.py` stamps on
+# synthetic dry-run records. A dry-run row must never reach the promotion
+# rubric; until now it was only rejected as an incidental side effect of
+# carrying `retrieval_snapshot_id=None` (routing its stratum into
+# `provider_effect_uncontrolled`), so a synthetic row with a snapshot id and a
+# hit/miss cache status would have promoted.
+SYNTHETIC_STRATA = frozenset({("synthetic", "dry-run-fixture")})
+
+
+def build_analysis(
+    records: list[dict[str, Any]],
+    *,
+    fixture_index: FixtureIndex,
+    fixture_sha256: str,
+) -> dict[str, Any]:
     """Apply the full Phase 4B promotion rubric to a clean set of raw records.
 
     Raises ``EvidenceGateError`` for input-contract violations (missing
@@ -139,6 +154,29 @@ def build_analysis(records: list[dict[str, Any]], *, fixture_index: FixtureIndex
     straight through into the statistics -- so this runs the same full
     type/range validator and fixture-binding check the collector uses.
     """
+    # Assumption: a dry-run/synthetic row is never promotion input. Until now
+    # that held only as an incidental side effect of dry-run records carrying
+    # `retrieval_snapshot_id=None`, which routed their stratum into
+    # `provider_effect_uncontrolled`; a synthetic row with a snapshot id and a
+    # hit/miss cache status would have reached the promotion rubric. This is
+    # the explicit gate. Shape is still validated first so dry-run output
+    # stays provably analyzer-input-compatible.
+    synthetic_strata = sorted(
+        {
+            f"{r['provider']}/{r['model']}"
+            for r in records
+            if (r["provider"], r["model"]) in SYNTHETIC_STRATA
+        }
+    )
+    if synthetic_strata:
+        for index, record in enumerate(records):
+            validate_raw_record(record, where=f"record {index}")
+        return _terminal(
+            status=EvidenceStatus.BLOCKED.value,
+            reason="synthetic_dry_run_input",
+            analysis={"synthetic_strata": synthetic_strata},
+        )
+
     for index, record in enumerate(records):
         where = f"record {index}"
         validate_raw_record(record, where=where)
@@ -168,6 +206,24 @@ def build_analysis(records: list[dict[str, Any]], *, fixture_index: FixtureIndex
         # resolved against the versioned fixture, exactly as the collector
         # already does before it ever writes this script's input.
         validate_against_fixture(record, index=fixture_index, where=where)
+        # `fixture_version` is a string the record declares about itself, so it
+        # binds nothing: a `--fixture` file carrying the same version string
+        # but weaker required_facts/expected_citations/disallowed_claims would
+        # resolve forged match IDs and an inflated quality_score cleanly. The
+        # collector stamps the digest of the exact fixture bytes it scored
+        # against precisely so this check can exist; without comparing it, the
+        # digest was only ever shape-checked as 64 hex characters.
+        declared_digest = record.get("fixture_sha256")
+        if declared_digest is None:
+            raise EvidenceGateError(
+                f"{where}: fixture_sha256 is required -- a record that does not bind the exact "
+                "fixture bytes it was scored against cannot support a promotion decision"
+            )
+        if declared_digest != fixture_sha256:
+            raise EvidenceGateError(
+                f"{where}: fixture_sha256 {declared_digest} does not match the analysis fixture "
+                f"{fixture_sha256} -- the record was scored against different fixture bytes"
+            )
 
     fixture_versions = {r["fixture_version"] for r in records}
     if len(fixture_versions) > 1:
@@ -358,6 +414,10 @@ def build_analysis(records: list[dict[str, Any]], *, fixture_index: FixtureIndex
 
     analysis = {
         "strata": per_stratum_report,
+        # Published so a downstream evidence binder can verify the promotion
+        # decision against the exact fixture bytes it was made under, rather
+        # than against a self-declared fixture_version string.
+        "fixture_sha256": fixture_sha256,
         "median_relative_latency_improvement": equal_weight_median,
         "bootstrap_lower_bound_95": bootstrap_lower_bound,
         "bootstrap_iterations": BOOTSTRAP_ITERATIONS,
@@ -400,7 +460,9 @@ def analyze(
     if not records:
         return _terminal(status=EvidenceStatus.NOT_RUN.value, reason="no_paid_samples")
     fixture_index = FixtureIndex(load_fixture(fixture_path))
-    return build_analysis(records, fixture_index=fixture_index)
+    return build_analysis(
+        records, fixture_index=fixture_index, fixture_sha256=sha256_file(fixture_path)
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

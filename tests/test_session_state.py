@@ -419,13 +419,15 @@ def test_expired_terminal_work_status_record_is_deleted_but_its_sequence_survive
 
 
 @pytest.mark.parametrize("evict_via", ("ttl", "overflow"))
-def test_event_sequence_continues_after_its_record_was_evicted(
+def test_evicted_terminal_key_is_not_resurrected_and_keeps_its_sequence(
     monkeypatch: pytest.MonkeyPatch, evict_via: str
 ) -> None:
-    """Regression: eviction used to drop ``_work_status_sequence[key]`` too, so
-    a later record for the same key (a sibling multi-intent child, or a late
-    commit's finalization) restarted ``event_sequence`` at 1 and was rejected
-    as stale by the client reducer."""
+    """Regression (Round 7): dropping a *terminal* record left no trace, so a
+    later child write for the same key cold-started it and re-derived a
+    non-terminal parent from that single child -- regressing a terminal state
+    clients had already applied. A tombstone now refuses the write, and
+    ``_work_status_sequence[key]`` still survives so nothing could restart at
+    1 even if the key did become writable again."""
     clock = [0.0]
     monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
     state = SessionState(session_id="session-1")
@@ -455,14 +457,18 @@ def test_event_sequence_continues_after_its_record_was_evicted(
             )
     assert key not in state._work_status_parents
 
-    state.set_child_work_status(
-        turn_id="turn-1",
-        work_item_id="child-b",
-        parent_work_item_id="parent-1",
-        state="routing",
-        origin_epoch=1,
+    assert (
+        state.set_child_work_status(
+            turn_id="turn-1",
+            work_item_id="child-b",
+            parent_work_item_id="parent-1",
+            state="routing",
+            origin_epoch=1,
+        )
+        is None
     )
-    assert state._work_status_parents[key].status.event_sequence == 4
+    assert key not in state._work_status_parents
+    assert state._work_status_sequence[key] == 3
 
 
 def test_work_status_sequence_survives_high_volume_eviction_and_never_restarts_at_one(
@@ -497,10 +503,14 @@ def test_work_status_sequence_survives_high_volume_eviction_and_never_restarts_a
     assert state._work_status_sequence[first_key] == 1
     assert len(state._work_status_sequence) > 8192
 
-    state.set_child_work_status(
-        turn_id="turn-first", work_item_id="work-first", state="routing", origin_epoch=1
+    # The evicted key was terminal, so its tombstone also refuses the rewrite
+    # outright; the surviving counter is the second line of defence.
+    assert (
+        state.set_child_work_status(
+            turn_id="turn-first", work_item_id="work-first", state="routing", origin_epoch=1
+        )
+        is None
     )
-    assert state._work_status_parents[first_key].status.event_sequence == 2
 
 
 def test_live_terminal_work_status_is_not_deleted_before_the_ttl(
@@ -570,3 +580,76 @@ def test_capping_never_evicts_a_still_active_record(
     assert len(state._work_status_parents) == cap
     assert any(key.turn_id == "turn-active" for key in state._work_status_parents)
     assert_ledger_lockstep(state)
+
+
+# --- Review-gauntlet round 7 -------------------------------------------
+
+
+def test_overflow_eviction_never_drops_a_live_non_terminal_record() -> None:
+    """Round 7 (deep-review/logic): once every retained key was non-terminal
+    the cap evicted a *live* parent, dropping its children map. The next
+    ``set_child_work_status`` for that key then saw ``previous_child=None``
+    (a cold start), so a whole-child-set cancel sweep became a no-op and the
+    parent could never terminalize. The ledger now exceeds the cap instead."""
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    for index in range(SessionState._MAX_WORK_STATUS_KEYS + 4):
+        state.set_child_work_status(
+            turn_id=f"turn-{index}",
+            work_item_id=f"work-{index}",
+            state="routing",
+            origin_epoch=1,
+        )
+
+    assert len(state._work_status_parents) == SessionState._MAX_WORK_STATUS_KEYS + 4
+    first = WorkStatusKey(1, "turn-0", "work-0")
+    assert state._work_status_children[first] == {
+        "work-0": state._work_status_children[first]["work-0"]
+    }
+    # The children map survived, so a cancel sweep is not a cold start.
+    assert (
+        state.set_child_work_status(
+            turn_id="turn-0", work_item_id="work-0", state="cancelled", origin_epoch=1
+        )
+        is not None
+    )
+    assert state._work_status_parents[first].status.state == "cancelled"
+    assert_ledger_lockstep(state)
+
+
+def test_ttl_expired_terminal_key_is_not_resurrected_by_a_late_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 (deep-review/logic): TTL pruning dropped a key's children map
+    but kept nothing to say it had ever been terminal. A late commit's
+    finalization arriving after the five-minute TTL cold-started the key and
+    re-derived a parent state from that single child, resurfacing it below a
+    terminal state clients had already applied."""
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-1")
+    state.active_epoch = 1
+    state.set_child_work_status(
+        turn_id="turn-1", work_item_id="work-1", state="result_ready", origin_epoch=1
+    )
+    key = WorkStatusKey(1, "turn-1", "work-1")
+
+    clock[0] = WORK_STATUS_TTL_SECONDS
+    assert state.work_status_snapshot() == ()
+    assert key not in state._work_status_parents
+
+    assert (
+        state.set_child_work_status(
+            turn_id="turn-1", work_item_id="work-1", state="routing", origin_epoch=1
+        )
+        is None
+    )
+    assert key not in state._work_status_parents
+    assert state.work_status_snapshot() == ()
+
+
+def test_prune_expired_work_status_is_the_named_mutating_step() -> None:
+    """Round 7 (deep-review/architecture): the TTL prune was an unnamed side
+    effect of a read-shaped ``work_status_snapshot()``. It is now its own
+    named step."""
+    assert callable(SessionState.prune_expired_work_status)

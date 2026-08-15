@@ -111,6 +111,7 @@ def _valid_phase4c_artifact(**overrides: Any) -> dict[str, Any]:
         "experiment_command_digest": "3" * 64,
         "analyzer_command_digest": "4" * 64,
         "fixture_version": "qcl-test-v1",
+        "fixture_sha256": "a" * 64,
         "scorer_version": "scorer-v1",
         "scorer_hash": "5" * 64,
         "control_fingerprint": CONTROL_FINGERPRINT,
@@ -652,7 +653,13 @@ def test_write_manifest_accepts_the_schema_spelled_phase4b_fields(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    "field", ["phase4b_baseline_input_sha256", "phase4b_normalized_input_sha256", "scorer_hash"]
+    "field",
+    [
+        "phase4b_baseline_input_sha256",
+        "phase4b_normalized_input_sha256",
+        "scorer_hash",
+        "fixture_sha256",
+    ],
 )
 @pytest.mark.parametrize("bad_value", ["abc123", "a" * 63, "a" * 65])
 def test_write_manifest_rejects_non_64_char_sha256_bindings(
@@ -690,6 +697,21 @@ def test_write_manifest_rejects_a_phase4c_bound_to_a_foreign_phase3_completion(
     digest of the Phase 3 artifact bound into this same manifest must be
     rejected as a cross-artifact mismatch, not accepted for being hex."""
     payload = _valid_phase4c_artifact(phase3_completion_hash="7" * 64)
+    phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
+    _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
+    assert manifest is None
+
+
+def test_write_manifest_rejects_a_phase4c_artifact_omitting_the_fixture_digest(
+    tmp_path: Path,
+) -> None:
+    """Round 7 (security + spec): the artifact bound `fixture_version` -- a
+    self-declared string -- and nothing else about the quality fixture the
+    Phase 4B decision was scored against. A same-version fixture with weaker
+    required_facts/expected_citations/disallowed_claims would have bound
+    cleanly. `fixture_sha256` is now required and byte-pinned."""
+    payload = _valid_phase4c_artifact()
+    del payload["fixture_sha256"]
     phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
     _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)
     assert manifest is None
