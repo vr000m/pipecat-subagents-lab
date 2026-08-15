@@ -268,6 +268,23 @@ tag or publish 0.1.1 without a passing routing-regression run. This exercises th
 live OpenAI router and worker without requiring browser media or local STT/TTS
 services.
 
+For the 0.1.3 early-ack/background-delivery policy, the following paid live
+smoke proves the ack-ordering contract itself rather than only the final
+result:
+
+```sh
+uv run python scripts/smoke_conversation.py --ack-ordering
+```
+
+Unlike the other scenarios above, this one wires a recording TTS/worker into
+the connection so the scheduler actually admits speech, then drives a real
+delegated search and asserts the early ack is admitted before the delegated
+result — proving the externally observable early-ack behavior against a live
+provider, not just the fake-coordinator coverage in
+`tests/test_pipeline.py::test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch`.
+Override the ack budget with `--max-ack-seconds` (default 15s) if routing
+latency is consistently tighter or looser than that.
+
 To compare the configured local services with Deepgram and Cartesia using the
 same text and PCM fixture:
 
