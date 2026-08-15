@@ -1310,8 +1310,7 @@ class SessionHost:
                         "instead of retrying indefinitely",
                         attempt,
                     )
-                    origin.scheduler.discard_queued_ack(ack_work_item_id)
-                    self._clear_ack_latch(turn_id)
+                    self._settle_turn_ack(origin.scheduler, turn_id)
                     return
                 logger.opt(exception=True).debug(
                     "early ack failed to start; leaving it queued for a later retry"
