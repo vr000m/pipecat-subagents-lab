@@ -63,6 +63,8 @@ async def _run_child(
     max_latency_seconds: float,
     max_routing_seconds: float,
     routing_regression: bool,
+    ack_ordering: bool,
+    max_ack_seconds: float,
 ) -> dict[str, Any]:
     from server.app import _default_session_host
     from server.perf_metrics import CollectingMeasurementSink
@@ -87,9 +89,19 @@ async def _run_child(
     # This smoke isolates the paid semantic path. Browser media and local speech
     # have separate deterministic/live acceptance commands.
     host.stt = None
-    host.tts = None
     await host.start()
     try:
+        if ack_ordering:
+            return await _run_ack_ordering(
+                host,
+                query,
+                max_ack_seconds=max_ack_seconds,
+                max_latency_seconds=max_latency_seconds,
+            )
+        # The single-turn and routing-regression scenarios don't exercise
+        # speech at all, so they run with TTS disabled (see _run_ack_ordering
+        # for the scenario that needs it wired up).
+        host.tts = None
         connection = await host.connect(
             {
                 "session_id": host.state.session_id,
@@ -146,6 +158,124 @@ async def _run_child(
         }
     finally:
         await host.shutdown()
+
+
+async def _run_ack_ordering(
+    host: Any,
+    query: str,
+    *,
+    max_ack_seconds: float,
+    max_latency_seconds: float,
+) -> dict[str, Any]:
+    """Prove the early ack is admitted for real speech while a live,
+    paid-provider delegated search is still in flight -- the externally
+    observable contract ``tests/test_pipeline.py::
+    test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch``
+    proves against a fake coordinator/worker. Uses a recording TTS/worker
+    (no audio synthesis, no extra cost) so the scheduler treats this
+    connection as TTS-capable and actually admits the ack, instead of the
+    ``host.tts = None`` isolation the other scenarios use.
+    """
+    from server.services.tts import CorrelatedTTSSpeakFrame
+    from server.speech_scheduler import ROLE_ACK, ROLE_RESULT
+
+    class _RecordingTTS:
+        on_event = None
+
+        @staticmethod
+        def correlated_speak_frame(
+            text: str, *, correlation_id: str, append_to_context: bool
+        ) -> CorrelatedTTSSpeakFrame:
+            return CorrelatedTTSSpeakFrame(
+                text=text, correlation_id=correlation_id, append_to_context=append_to_context
+            )
+
+    class _RecordingWorker:
+        async def queue_frame(self, frame: object) -> None:
+            del frame
+
+        async def cancel(self, *, reason: str) -> None:
+            del reason
+
+    host.tts = _RecordingTTS()
+    connection = await host.connect(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+        }
+    )
+    connection.worker = _RecordingWorker()
+    scheduler = connection.scheduler
+
+    started = time.perf_counter()
+    pending = asyncio.create_task(host._handle_transcript(query, origin=connection))
+
+    admissions: list[tuple[str, float]] = []
+    seen_tokens: set[str] = set()
+    ack_released = False
+    while True:
+        elapsed = time.perf_counter() - started
+        # Check admission before the done-check below: start_next() can admit
+        # the final result synchronously as the very last step of the task
+        # that _handle_transcript's own await resolves from, so a loop that
+        # exits on pending.done() without checking active one more time here
+        # would miss that admission entirely.
+        lease = scheduler.active
+        if lease is not None and lease.token not in seen_tokens:
+            seen_tokens.add(lease.token)
+            admissions.append((lease.item.role, elapsed * 1000))
+            if lease.item.role == ROLE_ACK:
+                lifecycle = connection.lifecycle
+                lifecycle.bind_context(lease.token, lease.item.utterance_id)
+                lifecycle.on_tts_started(lease.item.utterance_id)
+                lifecycle.on_tts_stopped(lease.item.utterance_id)
+                lifecycle.on_transport_bot_stopped()
+                ack_released = True
+        if pending.done():
+            break
+        if not ack_released and elapsed > max_ack_seconds:
+            queued_roles = [item.role for q in scheduler._queues.values() for item in q]
+            raise RuntimeError(
+                f"early ack was not admitted for real speech within {max_ack_seconds:.1f}s "
+                f"(active={scheduler.active!r}, queued_roles={queued_roles})"
+            )
+        if elapsed > max_latency_seconds:
+            pending.cancel()
+            raise RuntimeError(f"ack-ordering smoke exceeded {max_latency_seconds:.1f}s budget")
+        await asyncio.sleep(0.01)
+
+    value = await pending
+    results = value if isinstance(value, tuple) else (value,)
+    if len(results) != 1:
+        raise RuntimeError(f"expected one result, received {len(results)}")
+    result = results[0]
+    if result.worker_id == "main":
+        raise RuntimeError("ack-ordering smoke fell back to the main responder")
+    if result.ui_text in SAFE_FALLBACKS:
+        raise RuntimeError("ack-ordering smoke returned a safe fallback")
+
+    roles_seen = [role for role, _ in admissions]
+    if roles_seen.count(ROLE_ACK) != 1:
+        raise RuntimeError(f"expected exactly one ack admission, saw {roles_seen}")
+    if ROLE_RESULT not in roles_seen:
+        raise RuntimeError(f"the final result was never admitted for speech: saw {roles_seen}")
+    if roles_seen.index(ROLE_ACK) > roles_seen.index(ROLE_RESULT):
+        raise RuntimeError(f"the ack was admitted after the result: {admissions}")
+
+    ack_ms = next(ms for role, ms in admissions if role == ROLE_ACK)
+    result_ms = next(ms for role, ms in admissions if role == ROLE_RESULT)
+    if ack_ms > max_ack_seconds * 1000:
+        raise RuntimeError(
+            f"early ack admitted at {ack_ms:.1f}ms, budget {max_ack_seconds * 1000:.1f}ms"
+        )
+    return {
+        "scenario": "ack-ordering",
+        "worker": result.worker_id,
+        "ack_ms": round(ack_ms, 1),
+        "result_ms": round(result_ms, 1),
+    }
 
 
 async def _run_routing_regression(
@@ -216,6 +346,8 @@ def _child(
     max_latency_seconds: float,
     max_routing_seconds: float,
     routing_regression: bool,
+    ack_ordering: bool,
+    max_ack_seconds: float,
 ) -> int:
     metrics = asyncio.run(
         _run_child(
@@ -223,6 +355,8 @@ def _child(
             max_latency_seconds=max_latency_seconds,
             max_routing_seconds=max_routing_seconds,
             routing_regression=routing_regression,
+            ack_ordering=ack_ordering,
+            max_ack_seconds=max_ack_seconds,
         )
     )
     print(RESULT_PREFIX + json.dumps(metrics, sort_keys=True))
@@ -235,6 +369,8 @@ def _parent(
     max_latency_seconds: float,
     max_routing_seconds: float,
     routing_regression: bool,
+    ack_ordering: bool,
+    max_ack_seconds: float,
 ) -> int:
     command = [
         sys.executable,
@@ -246,9 +382,13 @@ def _parent(
         str(max_latency_seconds),
         "--max-routing-seconds",
         str(max_routing_seconds),
+        "--max-ack-seconds",
+        str(max_ack_seconds),
     ]
     if routing_regression:
         command.append("--routing-regression")
+    if ack_ordering:
+        command.append("--ack-ordering")
     try:
         completed = subprocess.run(
             command,
@@ -282,6 +422,13 @@ def _parent(
             f"max_routing_ms={metrics['max_routing_ms']} "
             f"max_total_ms={metrics['max_total_ms']}"
         )
+    elif metrics.get("scenario") == "ack-ordering":
+        print(
+            "ack-ordering smoke passed: "
+            f"worker={metrics['worker']} "
+            f"ack_ms={metrics['ack_ms']} "
+            f"result_ms={metrics['result_ms']}"
+        )
     else:
         print(
             "conversation smoke passed: "
@@ -307,6 +454,12 @@ def main() -> int:
         action="store_true",
         help="run the live Hi-then-weather routing regression sequence",
     )
+    parser.add_argument(
+        "--ack-ordering",
+        action="store_true",
+        help="prove the early ack is admitted for real speech before the delegated result",
+    )
+    parser.add_argument("--max-ack-seconds", type=float, default=15)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.query.strip():
@@ -317,6 +470,10 @@ def main() -> int:
         parser.error("--max-latency-seconds must be positive")
     if args.max_routing_seconds <= 0:
         parser.error("--max-routing-seconds must be positive")
+    if args.max_ack_seconds <= 0:
+        parser.error("--max-ack-seconds must be positive")
+    if args.routing_regression and args.ack_ordering:
+        parser.error("--routing-regression and --ack-ordering are mutually exclusive")
     if args.timeout <= args.max_latency_seconds:
         parser.error("--timeout must exceed --max-latency-seconds")
     return (
@@ -325,6 +482,8 @@ def main() -> int:
             args.max_latency_seconds,
             args.max_routing_seconds,
             args.routing_regression,
+            args.ack_ordering,
+            args.max_ack_seconds,
         )
         if args.child
         else _parent(
@@ -333,6 +492,8 @@ def main() -> int:
             args.max_latency_seconds,
             args.max_routing_seconds,
             args.routing_regression,
+            args.ack_ordering,
+            args.max_ack_seconds,
         )
     )
 
