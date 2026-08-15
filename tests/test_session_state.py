@@ -469,6 +469,16 @@ def test_evicted_terminal_key_is_not_resurrected_and_keeps_its_sequence(
     )
     assert key not in state._work_status_parents
     assert state._work_status_sequence[key] == 3
+    # Regression: the cold-start child write above is legal per
+    # set_child_work_status (it is `_reaggregate_parent`'s job, not
+    # `legal_work_status_transition`'s, to refuse a tombstoned key) and used
+    # to land in `_work_status_children` even though no parent record is ever
+    # (re)written for a tombstoned key. Neither TTL pruning nor overflow
+    # eviction scan `_work_status_children`, so that entry leaked for the
+    # process lifetime. A tombstoned key must have neither a children entry
+    # nor a parent record.
+    assert key not in state._work_status_children
+    assert_ledger_lockstep(state)
 
 
 def test_work_status_sequence_survives_high_volume_eviction_and_never_restarts_at_one(

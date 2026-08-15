@@ -372,6 +372,17 @@ class SessionState:
             # terminal when it went. Re-deriving a state here would resurrect
             # the key below a terminal state clients have already applied,
             # which the live-record guard below would have refused.
+            #
+            # A cold-start child write still legally lands in
+            # _work_status_children before this method runs (that rejection
+            # is set_child_work_status's job, not this one's), but since no
+            # parent record is ever (re)written for a tombstoned key, that
+            # children entry would otherwise never be visited by TTL pruning
+            # or overflow eviction -- both scan only _work_status_parents --
+            # and would leak for the process lifetime. Drop it here so the
+            # three-dict lockstep invariant (children keys == parents keys)
+            # holds: a tombstoned key has neither.
+            self._work_status_children.pop(key, None)
             return None
         # ``terminal_reason`` is first-write-wins by construction, not by
         # oversight: WorkStatus only permits a reason on ``failed``, and
