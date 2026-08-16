@@ -588,7 +588,15 @@ def write_manifest(
             "sha256": phase4c_artifact_sha256,
         }
 
-    real_stratum_present = has_real_provider_stratum([*phase0_records, *phase1_records])
+    # `validate_artifact` returns every record in the file regardless of that
+    # record's own `phase` field (only `check_phase_minimums` filters by
+    # phase). Filter here too, so a record mislabeled with an unrelated phase
+    # can't satisfy the paid-stratum gate without real phase0/phase1
+    # coverage.
+    real_stratum_present = has_real_provider_stratum(
+        [r for r in phase0_records if r["phase"] == "phase0"]
+        + [r for r in phase1_records if r["phase"] == "phase1"]
+    )
     transport_eligible = bool(transport_record.get("promotion_eligible"))
     phase3_complete = phase3_record is not None
 

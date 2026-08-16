@@ -339,6 +339,38 @@ def test_write_manifest_records_real_stratum_missing_reason_for_credential_free_
     assert manifest["reason"] == "real_stratum_missing"
 
 
+def test_write_manifest_ignores_a_real_stratum_record_mislabeled_into_the_phase0_file(
+    tmp_path: Path,
+) -> None:
+    """Regression: `validate_artifact` returns every record in a file
+    regardless of that record's own `phase` field -- only
+    `check_phase_minimums` filters by phase. A record whose own `phase` is
+    `phase4` (valid per PHASES, so it passes `validate_record`) but that
+    lives in the phase0 *file* must not count as phase0/phase1 real-stratum
+    coverage; otherwise one unrelated record could flip
+    `real_stratum_present` with zero real paid-stratum coverage of the phase
+    actually under validation."""
+    module = _validator()
+    provider, model = min(module.REAL_PROVIDER_ALLOWLIST)
+    contaminated_phase0 = [
+        *_phase0_fixture(),
+        _phase0_record(phase="phase4", provider=provider, model=model),
+    ]
+    phase0 = _write_jsonl(tmp_path, "phase0.jsonl", contaminated_phase0)
+    phase1 = _write_jsonl(tmp_path, "phase1.jsonl", _phase1_fixture())
+    phase2 = tmp_path / "phase2.json"
+    phase2.write_text(json.dumps(_valid_transport_artifact()))
+
+    exit_code = module.main(
+        _write_manifest_argv(tmp_path, phase0=phase0, phase1=phase1, phase2=phase2)
+    )
+
+    assert exit_code == 0
+    manifest = json.loads((tmp_path / "promotion-manifest.json").read_text())
+    assert manifest["promotion_eligible"] is False
+    assert manifest["reason"] == "real_stratum_missing"
+
+
 def test_write_manifest_refuses_to_recompute_the_phase2_transport_gate(tmp_path: Path) -> None:
     """Plan: the Phase 2 transport artifact's promotion_eligible/gate result
     is 'an input to this writer, not something this script recomputes.' An
