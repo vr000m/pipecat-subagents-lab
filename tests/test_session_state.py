@@ -658,6 +658,29 @@ def test_ttl_expired_terminal_key_is_not_resurrected_by_a_late_child(
     assert state.work_status_snapshot() == ()
 
 
+def test_retention_constants_match_the_shared_config_file() -> None:
+    """Parity guard: WORK_STATUS_TTL_SECONDS/_MAX_WORK_STATUS_KEYS must come
+    from shared/work-status-retention.json, not a hardcoded literal.
+
+    web/src/state.js loads the same file for WORK_STATUS_TERMINAL_TTL_MS /
+    WORK_STATUS_MAX_KEYS (see web/test/state.test.js's mirror of this test).
+    If a future edit reverts either side to an inline literal, this test
+    still passes as long as both literals happen to agree today -- it cannot
+    catch that regression by itself, but re-pointing either side at the
+    shared file is the fix this test exists to keep visible, and
+    shared/protocol.md's "Progressive work status" section documents the
+    values both files must agree on.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    config = _json.loads(
+        (_Path(__file__).resolve().parents[1] / "shared/work-status-retention.json").read_text()
+    )
+    assert WORK_STATUS_TTL_SECONDS == float(config["ttl_seconds"])
+    assert SessionState._MAX_WORK_STATUS_KEYS == int(config["max_keys"])
+
+
 def test_prune_expired_work_status_is_the_named_mutating_step() -> None:
     """Round 7 (deep-review/architecture): the TTL prune was an unnamed side
     effect of a read-shaped ``work_status_snapshot()``. It is now its own

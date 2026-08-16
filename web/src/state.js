@@ -1,3 +1,5 @@
+import workStatusRetention from "../../shared/work-status-retention.json";
+
 export const DELIVERY_COMPLETE = "delivery_completed";
 
 const EMPTY_DIAGNOSTICS = {
@@ -169,9 +171,17 @@ function workStatusKey(status) {
 // (_MAX_WORK_STATUS_KEYS / WORK_STATUS_TTL_SECONDS): a long, gap-free session
 // never receives a snapshot rebuild, so an insert-only map would otherwise
 // keep every terminal record rendered indefinitely. This is a simplified
-// version of the server's eviction, not a byte-for-byte port.
-const WORK_STATUS_MAX_KEYS = 256;
-const WORK_STATUS_TERMINAL_TTL_MS = 5 * 60 * 1000;
+// version of the server's eviction, not a byte-for-byte port -- the numeric
+// bounds below are loaded from the same shared/work-status-retention.json
+// server/session_state.py loads for WORK_STATUS_TTL_SECONDS /
+// _MAX_WORK_STATUS_KEYS, so the two numbers cannot silently drift apart. The
+// eligibility/ordering rules (terminal-only eviction, terminal-first/
+// oldest-first tiebreak) are hand-implemented per language in
+// evictOldestWorkStatus below and pinned by parity tests in
+// web/test/state.test.js and tests/test_session_state.py against
+// shared/protocol.md's "Progressive work status" retention section.
+export const WORK_STATUS_MAX_KEYS = workStatusRetention.max_keys;
+export const WORK_STATUS_TERMINAL_TTL_MS = workStatusRetention.ttl_seconds * 1000;
 const WORK_STATUS_TERMINAL_STATES = new Set(["result_ready", "failed", "cancelled"]);
 
 function pruneExpiredWorkStatus(workStatus, now) {

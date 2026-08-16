@@ -136,7 +136,12 @@ committed and display-ready -- it does not mean speech was queued, delivered,
 or heard. Terminal records preserve their original `origin_epoch` and remain
 in a capable client's reconnect snapshot until removed, whichever comes
 first of: a five-minute session-clock TTL, or bounded-capacity eviction
-once the record set exceeds 256 keys (terminal-first, oldest-first). Only
+once the record set exceeds 256 keys (terminal-first, oldest-first). Both
+numbers are defined once in `shared/work-status-retention.json`, which
+`server/session_state.py` and `web/src/state.js` both load rather than
+hardcoding independently -- so this section's "five minutes" and "256" are
+descriptive of that file's current values, not a second place to edit when
+they change. Only
 terminal records are eviction candidates -- evicting a live (non-terminal)
 record would erase the sole record of its children and strand the parent
 aggregate non-terminal forever, so eviction is refused while every retained

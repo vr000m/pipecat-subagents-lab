@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, NamedTuple
 from uuid import uuid4
 
@@ -25,11 +27,23 @@ from .contracts import (
 )
 from .results import ResultLog
 
+# Both retention numbers below are the single source of truth
+# shared/work-status-retention.json -- web/src/state.js loads the same file
+# for its WORK_STATUS_TERMINAL_TTL_MS / WORK_STATUS_MAX_KEYS. Only the
+# numeric bounds live there; the eligibility/ordering rules (terminal-only
+# eviction, terminal-first/oldest-first tiebreak) are hand-implemented per
+# language below and in web/src/state.js's evictOldestWorkStatus, and are
+# pinned by parity tests in tests/test_session_state.py and
+# web/test/state.test.js against shared/protocol.md's "Progressive work
+# status" retention section.
+_RETENTION_CONFIG_PATH = Path(__file__).resolve().parents[1] / "shared/work-status-retention.json"
+_retention_config = json.loads(_RETENTION_CONFIG_PATH.read_text())
+
 # Terminal work_status records remain in capable-client snapshots for a fixed
 # five-minute session-clock TTL (Requirements). SessionState has no timer
 # source, so pruning is lazy: a record is excluded from the projection once
 # its age is >= this TTL, never removed by a background timer.
-WORK_STATUS_TTL_SECONDS = 5 * 60.0
+WORK_STATUS_TTL_SECONDS = float(_retention_config["ttl_seconds"])
 
 _TERMINAL = {
     DeliveryState.DELIVERY_COMPLETED,
@@ -96,8 +110,10 @@ class SessionState:
     # SessionState. TTL pruning alone is not a bound: a session that never
     # requests a work-status snapshot would otherwise accumulate one ledger
     # entry per delegated turn forever. Mirrors the handshake-token cap in
-    # pipeline.py (evict oldest-first once over the cap).
-    _MAX_WORK_STATUS_KEYS = 256
+    # pipeline.py (evict oldest-first once over the cap). Sourced from
+    # shared/work-status-retention.json -- see the module-level comment above
+    # _RETENTION_CONFIG_PATH.
+    _MAX_WORK_STATUS_KEYS = int(_retention_config["max_keys"])
 
     def __init__(self, session_id: str | None = None, resume_token: str | None = None) -> None:
         self.session_id = session_id or f"session-{uuid4().hex}"

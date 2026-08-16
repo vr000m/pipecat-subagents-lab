@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { applyServerMessage, createInitialState } from "../src/state.js";
+import {
+  applyServerMessage,
+  createInitialState,
+  WORK_STATUS_MAX_KEYS,
+  WORK_STATUS_TERMINAL_TTL_MS,
+} from "../src/state.js";
+import workStatusRetention from "../../shared/work-status-retention.json";
 
 const result = (resultId) => ({
   result_id: resultId,
@@ -598,6 +604,22 @@ if (hasWorkStatusField) {
       expect(keys.length).toBe(300);
       expect(state.workStatus["1::turn-0::work-0"]).toBeDefined();
       expect(state.workStatus["1::turn-299::work-299"]).toBeDefined();
+    });
+
+    // Parity guard: WORK_STATUS_MAX_KEYS/WORK_STATUS_TERMINAL_TTL_MS must
+    // come from shared/work-status-retention.json, not a hardcoded literal.
+    // server/session_state.py loads the same file for
+    // WORK_STATUS_TTL_SECONDS/_MAX_WORK_STATUS_KEYS (see
+    // tests/test_session_state.py's mirror of this test). If a future edit
+    // reverts either side to an inline literal, this test still passes as
+    // long as both literals happen to agree today -- it cannot catch that
+    // regression by itself, but re-pointing either side at the shared file
+    // is the fix this test exists to keep visible, and
+    // shared/protocol.md's "Progressive work status" section documents the
+    // values both files must agree on.
+    test("retention constants match the shared config file", () => {
+      expect(WORK_STATUS_MAX_KEYS).toBe(workStatusRetention.max_keys);
+      expect(WORK_STATUS_TERMINAL_TTL_MS).toBe(workStatusRetention.ttl_seconds * 1000);
     });
 
     test("a terminal work_status record expires once the TTL window elapses", () => {
