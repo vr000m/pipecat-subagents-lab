@@ -90,6 +90,13 @@ class RuntimeObserver:
 
     @property
     def supports_work_status(self) -> bool:
+        """Whether the ``work_status_v1`` capability is in this connection's set.
+
+        Resolves against ``self.capabilities`` -- the normalized capability
+        set bound immutably to the connection's promoted epoch -- via the
+        single shared predicate ``resolve_work_status_wire_presence``
+        (Phase 3), so entitlement is never re-derived ad hoc elsewhere.
+        """
         return resolve_work_status_wire_presence(self.capabilities)
 
     @property

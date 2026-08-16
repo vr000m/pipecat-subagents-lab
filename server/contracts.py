@@ -317,6 +317,28 @@ def legal_work_status_transition(previous: str | None, state: str) -> bool:
 
 
 class WorkStatus(StrictModel):
+    """Per-work-item Phase 3 progress record gated by ``work_status_v1``.
+
+    Tracks one delegated child (or the parent join) through the coarse
+    ``routing -> searching -> background -> result_ready|failed|cancelled``
+    state machine enforced by :func:`legal_work_status_transition`; a record
+    may also start cold at any non-``cancelled`` state via
+    ``WORK_STATUS_COLD_START``. ``event_sequence`` is scoped per
+    ``(origin_epoch, turn_id, parent work item)`` and must strictly increase.
+    ``terminal_reason`` (``missing_worker`` or ``retention_rejected``) is only
+    ever set alongside ``state == "failed"``, enforced below.
+
+    The parent aggregate over a turn's delegated children is *not* a member
+    of this transition table in its own right -- it is a pure recomputation
+    over the current child set on every change (``routing`` while any child
+    is routing; ``searching`` while any child is searching and none is
+    routing; ``background`` while no child is active and at least one is
+    retained; once every child is terminal, ``failed`` wins over
+    ``cancelled`` wins over ``result_ready``). See shared/protocol.md
+    "Progressive work status" for the full wire contract, including the
+    five-minute / 256-key terminal-record retention rules.
+    """
+
     turn_id: str = Field(min_length=1)
     work_item_id: str | None = None
     worker_id: str | None = None
