@@ -75,6 +75,7 @@ from .work_item_coordinator import (
     WorkItemFailure,
     coordinator_view,
 )
+from .work_task_ledger import WorkTaskLedger
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 _ACK_ADMISSION_RETRY_DELAY_SECONDS = 0.25
@@ -611,10 +612,7 @@ class SessionHost:
         self._background_shutdowns: set[asyncio.Task[None]] = set()
         self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
         self._turn_sequence = 0
-        self._inflight_turn_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._inflight_work_tasks: dict[str, set[asyncio.Task[Any]]] = {}
-        self._known_work_items: set[str] = set()
-        self._cancelled_work_items: set[str] = set()
+        self._work_ledger = WorkTaskLedger()
         self._clarification_candidates: dict[str, dict[str, str]] = {}
         self._retained_recorders: dict[str, RetainedRecorder] = {}
         self._measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
@@ -3404,33 +3402,38 @@ class SessionHost:
             return coordinator.dispatch(decision)
         return coordinator.dispatch(decision, catalogue=catalogue)
 
+    # ------------------------------------------------------------------
+    # Work/turn task bookkeeping. Storage lives in `self._work_ledger`
+    # (server/work_task_ledger.py, deep-review Architecture finding #3);
+    # these properties forward to it so every other read/write call site in
+    # this class keeps working unchanged. `_track_work_task` and
+    # `_track_turn_task` are thin delegators to the ledger's tracking
+    # methods. `_cancel_work` still needs the coordinator (which the ledger
+    # deliberately has no handle to -- see the ledger's module docstring),
+    # so it composes the ledger's local selection/cancellation with the
+    # coordinator's own cancel; the union logic itself is unchanged.
+    # ------------------------------------------------------------------
+    @property
+    def _inflight_turn_tasks(self) -> dict[str, asyncio.Task[Any]]:
+        return self._work_ledger.turn_tasks
+
+    @property
+    def _inflight_work_tasks(self) -> dict[str, set[asyncio.Task[Any]]]:
+        return self._work_ledger.work_tasks
+
+    @property
+    def _known_work_items(self) -> set[str]:
+        return self._work_ledger.known_ids
+
+    @property
+    def _cancelled_work_items(self) -> set[str]:
+        return self._work_ledger.cancelled_ids
+
     def _track_work_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
-        self._known_work_items.add(work_item_id)
-        self._inflight_work_tasks.setdefault(work_item_id, set()).add(task)
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            tasks = self._inflight_work_tasks.get(work_item_id)
-            if tasks is None:
-                return
-            tasks.discard(completed_task)
-            if not tasks:
-                self._inflight_work_tasks.pop(work_item_id, None)
-
-        task.add_done_callback(completed)
+        self._work_ledger.register_work_task(work_item_id, task)
 
     def _track_turn_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
-        self._known_work_items.add(work_item_id)
-        self._inflight_turn_tasks[work_item_id] = task
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            if self._inflight_turn_tasks.get(work_item_id) is not completed_task:
-                return
-            self._inflight_turn_tasks.pop(work_item_id, None)
-            if work_item_id not in self._inflight_work_tasks:
-                self._known_work_items.discard(work_item_id)
-                self._cancelled_work_items.discard(work_item_id)
-
-        task.add_done_callback(completed)
+        self._work_ledger.register_turn_task(work_item_id, task)
 
     def _cancel_work(
         self,
@@ -3440,20 +3443,14 @@ class SessionHost:
     ) -> tuple[str, ...]:
         selected = tuple(
             item_id
-            for item_id in dict.fromkeys((*self._inflight_turn_tasks, *self._inflight_work_tasks))
+            for item_id in self._work_ledger.local_ids()
             if (work_item_id is None or item_id == work_item_id) and item_id != exclude_work_item_id
         )
         selected = tuple(dict.fromkeys((*selected, *self._coordinator_view.cancel(work_item_id))))
         if work_item_id is None:
-            selected = tuple(dict.fromkeys((*selected, *self._known_work_items)))
+            selected = tuple(dict.fromkeys((*selected, *self._work_ledger.known_ids)))
         selected = tuple(item for item in selected if item != exclude_work_item_id)
-        self._cancelled_work_items.update(selected)
-        for item_id in selected:
-            turn_task = self._inflight_turn_tasks.get(item_id)
-            if turn_task is not None:
-                turn_task.cancel()
-            for task in self._inflight_work_tasks.get(item_id, ()):
-                task.cancel()
+        self._work_ledger.cancel_selected(selected)
         return selected
 
     def _project_worker(
