@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.3] - 2026-08-05
+## [0.1.3] - 2026-08-16
 
 ### Added
 
@@ -155,6 +155,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside its replacement. A cleanup-dispatch failure now also escalates
   to connection teardown immediately, instead of permanently blocking all
   further speech admission on that connection.
+- A reconnect snapshot could still be raced by an incremental status update
+  dispatched moments earlier, delivering events to the client out of order;
+  and once a snapshot barrier install began, an unresponsive connection
+  worker could leave the runtime observer paused forever with an unbounded
+  event buffer and a lock that never released. The barrier now drains and
+  acknowledges through a bounded wait with a cancellation path, writes the
+  snapshot frame before replaying buffered events (so a replay could never
+  arrive ahead of the snapshot it applies against), and always resets
+  pause/buffer state on unsubscribe so a torn-down connection can't stay
+  permanently mute after reconnecting.
+- A late (retained) search result could still autoplay after the user had
+  already started a newer utterance: both the single-intent and
+  multi-intent turn handlers captured the turn's sequence number only after
+  earlier awaits, so a concurrent newer turn could bump the counter first
+  and make the late result compare as still-current. Both paths now
+  snapshot the sequence before their first await. Separately, a real TTS
+  submission failure during commit was silently swallowed instead of
+  failing the turn, and a mid-loop commit failure in the multi-intent path
+  could abort before already-computed sibling results — already reported to
+  the client as complete — were ever committed or spoken; each sibling is
+  now committed independently and the turn still records as failed.
+- SessionHost's search-timeout and shutdown-grace budgets moved onto
+  SessionHost.config, but the paid-conversation smoke harness was still
+  mutating the coordinator/registry config objects to raise the budget for
+  long-running paid searches, so its override silently no-op'd against the
+  real 15-second default and every paid run timed out into the generic
+  fallback with no citations.
+- A reconnect dropped the entire work-status ledger and its per-key
+  sequence counters instead of restoring them from the snapshot, and the
+  browser's reducer keyed status records without the epoch the server
+  includes, so two records differing only by epoch could collapse into one
+  and be discarded as stale; both are fixed, and a work item could also
+  cold-start directly into a "cancelled" state because the validation that
+  should have rejected it only ran once a prior record already existed. The
+  browser's own work-status store was also insert-only and unbounded with
+  no terminal-record expiry, so a long session would keep rendering
+  finished statuses indefinitely — it now mirrors the server's bounded,
+  TTL-evicting ledger.
+- A capacity-rejected turn could still speak its early acknowledgement
+  immediately before the "search service is busy" reply; a turn whose
+  exception handler fired while a sibling was still legitimately running in
+  the background could sweep that live child to a permanent "failed" state
+  (later contradicted when its real result committed successfully); and a
+  multi-intent turn where every dispatched child failed to land in any
+  results/pending/failure bucket could leave the parent's status stuck at
+  "searching" forever. All three are closed, along with a failed
+  ack-admission retry that no longer blindly re-enqueues into a stale
+  cancellation/reconnect window — it now re-checks the turn's liveness
+  first, and is capped so a stuck turn can't retry forever.
+- The v0.1.3 promotion-manifest evidence gate checked artifact shape but
+  not binding, letting several forged-but-well-shaped artifacts pass
+  validation: digest fields were checked by length rather than actual hex
+  content, an unreadable schema file was treated as "verified," an empty
+  Phase 4C hash string skipped its check entirely, and Phase 4B analysis
+  trusted a self-declared fixture version instead of the fixture's own
+  bytes. All are now checked against real content, and a manifest missing
+  required phase bindings is rejected rather than silently promoted —
+  closing paths that could have silently mis-gated autoplay eligibility for
+  a release.
+- `resume()` re-enqueued a paused utterance under a new id without ever
+  closing out the old id's record, so a stale "paused" entry rode along in
+  every snapshot for the rest of the process's life; a coalesced snapshot
+  request could be dropped with no retry if the in-flight request holding
+  the lock failed without delivering a snapshot, leaving the client stuck
+  discarding every incremental until a manual reconnect; and an
+  already-cancelled advance task could resurrect itself via its own
+  cancellation callback during a full stop. All three are fixed.
 
 ## [0.1.2] - 2026-07-28
 
