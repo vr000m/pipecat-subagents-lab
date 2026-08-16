@@ -217,6 +217,104 @@ class Coordinator(Protocol):
     ) -> None: ...
 
 
+class OptionalCoordinator(Protocol):
+    """The 7 ``Coordinator`` members accessed via ``getattr`` fallbacks.
+
+    ``registry``, ``config``, and ``OWNED_CONFIG_FIELDS`` are also declared
+    on ``Coordinator`` itself (they are required there); this Protocol
+    re-declares them alongside ``live_work_item_ids``, ``start_task``,
+    ``cancel``, and ``shutdown`` as the canonical spec for what a
+    coordinator implementer should provide to get more than
+    ``CoordinatorDefaults``' fallback behaviour. See ``Coordinator``'s
+    docstring for exactly which ``server/pipeline.py`` call sites read
+    these members through ``getattr`` instead of direct access, and why.
+    """
+
+    registry: WorkerRegistry | None
+    config: Config | None
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]]
+
+    def live_work_item_ids(self) -> frozenset[str]: ...
+
+    def start_task(self, operation: Any) -> asyncio.Task[Any] | None: ...
+
+    def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
+
+    async def shutdown(self) -> None: ...
+
+
+class CoordinatorDefaults:
+    """Concrete ``OptionalCoordinator`` implementation matching today's fallbacks.
+
+    Each member here reproduces, exactly, the fallback behaviour of the
+    corresponding ``getattr(coordinator, ..., default)`` call site in
+    ``server/pipeline.py`` documented on ``Coordinator``. A coordinator
+    implementation can subclass this to opt into the same defaults instead
+    of leaving the member undeclared.
+    """
+
+    registry: WorkerRegistry | None = None
+    config: Config | None = None
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = frozenset()
+
+    def live_work_item_ids(self) -> frozenset[str]:
+        return frozenset()
+
+    def start_task(self, operation: Any) -> asyncio.Task[Any] | None:
+        return asyncio.create_task(operation)
+
+    def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]:
+        return ()
+
+    async def shutdown(self) -> None:
+        return None
+
+
+@dataclass(frozen=True)
+class CoordinatorView:
+    """The 7 optional ``Coordinator`` members, resolved to concrete values.
+
+    Built once by ``coordinator_view`` so a caller reads plain attributes
+    and calls plain methods instead of repeating ``getattr(coordinator,
+    ..., default)`` at each of the ``server/pipeline.py`` call sites
+    documented on ``Coordinator``.
+    """
+
+    registry: WorkerRegistry | None
+    config: Config | None
+    OWNED_CONFIG_FIELDS: frozenset[str]
+    live_work_item_ids: Callable[[], frozenset[str]]
+    start_task: Callable[[Any], asyncio.Task[Any] | None]
+    cancel: Callable[..., tuple[str, ...]]
+    shutdown: Callable[[], Any]
+
+
+def coordinator_view(coordinator: Any) -> CoordinatorView:
+    """Resolve ``coordinator``'s 7 optional members, applying today's fallbacks.
+
+    Mirrors each ``getattr(coordinator, "<member>", <default>)`` call site
+    documented on ``Coordinator`` exactly once. Not wired into
+    ``server/pipeline.py`` yet -- those call sites still do their own
+    ``getattr`` probing until they are migrated to read through this view.
+    """
+    return CoordinatorView(
+        registry=getattr(coordinator, "registry", None),
+        config=getattr(coordinator, "config", None),
+        OWNED_CONFIG_FIELDS=getattr(
+            coordinator, "OWNED_CONFIG_FIELDS", WorkItemCoordinator.OWNED_CONFIG_FIELDS
+        ),
+        live_work_item_ids=getattr(coordinator, "live_work_item_ids", lambda: frozenset()),
+        start_task=getattr(coordinator, "start_task", None)
+        or (lambda operation: asyncio.create_task(operation)),
+        cancel=getattr(coordinator, "cancel", None) or (lambda work_item_id=None: ()),
+        shutdown=getattr(coordinator, "shutdown", None) or _noop_shutdown,
+    )
+
+
+async def _noop_shutdown() -> None:
+    return None
+
+
 class WorkItemCoordinator:
     #: The ``Config`` fields this constructor is allowed to override onto
     #: whatever ``Config`` it was handed (see ``__init__``'s ``replace`` call

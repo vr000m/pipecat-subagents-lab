@@ -8,9 +8,13 @@ import pytest
 
 from server.config import Config
 from server.work_item_coordinator import (
+    Coordinator,
+    CoordinatorDefaults,
+    OptionalCoordinator,
     PendingDialogue,
     WorkItemCoordinator,
     WorkItemFailure,
+    coordinator_view,
 )
 
 
@@ -1117,3 +1121,73 @@ def test_retain_late_task_on_complete_callback_receives_delivery_only_late_resul
     late = LateResult(work_item_id="work-1", worker_id="worker-1", result=None)
     disposition_like_fields = {"disposition", "commit_outcome", "autoplay"}
     assert not (disposition_like_fields & set(late.__dataclass_fields__))
+
+
+def test_work_item_coordinator_satisfies_the_full_coordinator_surface() -> None:
+    """``WorkItemCoordinator`` implements both the required ``Coordinator``
+    members and the optional ``OptionalCoordinator`` members -- the combined
+    surface ``server/pipeline.py`` relies on, whether accessed directly or
+    through a ``getattr`` fallback."""
+    coordinator = WorkItemCoordinator()
+    for protocol in (Coordinator, OptionalCoordinator):
+        for member_name in protocol.__protocol_attrs__:
+            assert hasattr(coordinator, member_name), (
+                f"WorkItemCoordinator is missing {protocol.__name__}.{member_name}"
+            )
+
+
+def test_coordinator_defaults_matches_pipeline_getattr_fallbacks() -> None:
+    """``CoordinatorDefaults`` reproduces exactly the fallback values
+    ``server/pipeline.py`` uses today when a coordinator omits an optional
+    member, so a coordinator can opt into these defaults by subclassing
+    instead of relying on scattered ``getattr`` fallbacks."""
+    defaults = CoordinatorDefaults()
+    assert defaults.registry is None
+    assert defaults.config is None
+    assert defaults.OWNED_CONFIG_FIELDS == frozenset()
+    assert defaults.live_work_item_ids() == frozenset()
+    assert defaults.cancel() == ()
+    assert defaults.cancel("work-1") == ()
+
+    async def run() -> None:
+        task = defaults.start_task(completed_worker("hi"))
+        assert isinstance(task, asyncio.Task)
+        assert await task == {"text": "hi", "citations": []}
+        await defaults.shutdown()
+
+    asyncio.run(run())
+
+
+def test_coordinator_view_resolves_bare_double_to_the_same_fallbacks() -> None:
+    """``coordinator_view`` on a coordinator double with none of the 7
+    optional members declared resolves to the same values the ``getattr``
+    fallbacks in ``server/pipeline.py`` produce today."""
+
+    class BareCoordinator:
+        pass
+
+    view = coordinator_view(BareCoordinator())
+    assert view.registry is None
+    assert view.config is None
+    assert view.OWNED_CONFIG_FIELDS == WorkItemCoordinator.OWNED_CONFIG_FIELDS
+    assert view.live_work_item_ids() == frozenset()
+    assert view.cancel() == ()
+
+    async def run() -> None:
+        task = view.start_task(completed_worker("hi"))
+        assert isinstance(task, asyncio.Task)
+        await task
+        await view.shutdown()
+
+    asyncio.run(run())
+
+
+def test_coordinator_view_prefers_a_conforming_coordinators_own_members() -> None:
+    """A coordinator that declares the optional members wins over
+    ``coordinator_view``'s fallbacks -- the view must not shadow a real
+    implementation with a default."""
+    coordinator = WorkItemCoordinator()
+    view = coordinator_view(coordinator)
+    assert view.registry is coordinator.registry
+    assert view.OWNED_CONFIG_FIELDS == coordinator.OWNED_CONFIG_FIELDS
+    assert view.cancel() == coordinator.cancel()
