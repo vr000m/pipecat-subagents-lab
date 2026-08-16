@@ -162,6 +162,33 @@ async def _run_child(
         await host.shutdown()
 
 
+async def _drive_lifecycle(connection: Any, lease: Any) -> None:
+    """Stand in for what a real transport does to an admitted generation:
+    bind the marker token, observe synthesis start/stop, then the fieldless
+    upstream bot stop. Mirrors tests/test_pipeline.py's
+    release_lifecycle_slot, including awaiting the coordinator's
+    fire-and-forget on_terminal task so the transport slot is actually
+    released (and the next queued item admitted) before this returns --
+    without that, a caller that tears the connection down right after (as
+    _run_ack_ordering does, via host.shutdown()) can race the coordinator's
+    still-in-flight generation termination against shutdown's own interrupt,
+    corrupting the recorded disposition.
+    """
+    lifecycle = connection.lifecycle
+    utterance_id = lease.item.utterance_id
+    bound = lifecycle.bind_context(lease.token, utterance_id)
+    started = lifecycle.on_tts_started(utterance_id) if bound else False
+    stopped = lifecycle.on_tts_stopped(utterance_id) if started else False
+    if not (bound and started and stopped):
+        raise RuntimeError(
+            f"lifecycle wiring rejected the {lease.item.role} generation "
+            f"(bind={bound}, started={started}, stopped={stopped}, token={lease.token!r})"
+        )
+    terminal = lifecycle.on_transport_bot_stopped()
+    if terminal is not None:
+        await terminal
+
+
 async def _run_ack_ordering(
     host: Any,
     query: str,
@@ -216,19 +243,6 @@ async def _run_ack_ordering(
     started = time.perf_counter()
     pending = asyncio.create_task(host._handle_transcript(query, origin=connection))
 
-    def _drive_lifecycle(connection: Any, lease: Any, *, role: str) -> None:
-        lifecycle = connection.lifecycle
-        utterance_id = lease.item.utterance_id
-        bound = lifecycle.bind_context(lease.token, utterance_id)
-        started = lifecycle.on_tts_started(utterance_id) if bound else False
-        stopped = lifecycle.on_tts_stopped(utterance_id) if started else False
-        if not (bound and started and stopped):
-            raise RuntimeError(
-                f"lifecycle wiring rejected the {role} generation "
-                f"(bind={bound}, started={started}, stopped={stopped}, token={lease.token!r})"
-            )
-        lifecycle.on_transport_bot_stopped()
-
     admissions: list[tuple[str, float]] = []
     seen_tokens: set[str] = set()
     ack_released = False
@@ -243,10 +257,15 @@ async def _run_ack_ordering(
         if lease is not None and lease.token not in seen_tokens:
             seen_tokens.add(lease.token)
             admissions.append((lease.item.role, elapsed * 1000))
-            _drive_lifecycle(connection, lease, role=lease.item.role)
+            try:
+                await _drive_lifecycle(connection, lease)
+            except RuntimeError:
+                pending.cancel()
+                raise
             if lease.item.role == ROLE_ACK:
                 ack_released = True
                 if elapsed > max_ack_seconds:
+                    pending.cancel()
                     raise RuntimeError(
                         f"early ack was admitted late, at {elapsed:.1f}s "
                         f"(budget {max_ack_seconds:.1f}s)"
@@ -287,10 +306,10 @@ async def _run_ack_ordering(
 
     ack_ms = next(ms for role, ms in admissions if role == ROLE_ACK)
     result_ms = next(ms for role, ms in admissions if role == ROLE_RESULT)
-    if ack_ms > max_ack_seconds * 1000:
-        raise RuntimeError(
-            f"early ack admitted at {ack_ms:.1f}ms, budget {max_ack_seconds * 1000:.1f}ms"
-        )
+    # No separate `ack_ms > max_ack_seconds * 1000` check here: the in-loop
+    # "early ack was admitted late" check above already raises at the same
+    # instant this value was captured, on the same elapsed-vs-max_ack_seconds
+    # comparison, so a second check on the same value can never fire.
     elapsed_ms = (time.perf_counter() - started) * 1000
     stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
     routing_ms = stage_metrics["routing_ms"]
