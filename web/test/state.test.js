@@ -569,6 +569,37 @@ if (hasWorkStatusField) {
       expect(state.workStatus["1::turn-0::work-0"]).toBeUndefined();
     });
 
+    // Regression: eviction used to consider every key regardless of
+    // terminality, so once the map exceeded 256 entries with zero terminal
+    // records, a live (non-terminal) parent aggregate got evicted anyway --
+    // diverging from the server's _evict_work_status_overflow, which
+    // deliberately lets the ledger exceed the cap rather than ever strand a
+    // live record non-terminal.
+    test("the workStatus ledger exceeds its cap rather than evict a live record when none are terminal", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      for (let index = 0; index < 300; index += 1) {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: index + 2,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: {
+            turn_id: `turn-${index}`,
+            work_item_id: `work-${index}`,
+            state: "searching",
+            event_sequence: 0,
+            origin_epoch: 1,
+          },
+        });
+      }
+
+      const keys = Object.keys(state.workStatus);
+      expect(keys.length).toBe(300);
+      expect(state.workStatus["1::turn-0::work-0"]).toBeDefined();
+      expect(state.workStatus["1::turn-299::work-299"]).toBeDefined();
+    });
+
     test("a terminal work_status record expires once the TTL window elapses", () => {
       let state = createInitialState();
       state = applyServerMessage(state, snapshot(1));

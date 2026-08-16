@@ -194,16 +194,16 @@ function evictOldestWorkStatus(workStatus, protectKey) {
   if (Object.keys(workStatus).length <= WORK_STATUS_MAX_KEYS) return workStatus;
   const next = { ...workStatus };
   while (Object.keys(next).length > WORK_STATUS_MAX_KEYS) {
-    const candidates = Object.keys(next).filter((key) => key !== protectKey);
+    // Only terminal records are evictable, matching the server's
+    // _evict_work_status_overflow: a non-terminal record is a live parent
+    // aggregate, and dropping it would strand it non-terminal forever. When
+    // every retained record is live, the ledger deliberately exceeds the cap
+    // instead of evicting one.
+    const candidates = Object.keys(next).filter((key) => key !== protectKey && next[key]._terminalSince !== undefined);
     if (candidates.length === 0) break;
     let oldestKey = candidates[0];
     for (const key of candidates) {
-      const a = next[key];
-      const b = next[oldestKey];
-      const aTerminal = a._terminalSince !== undefined;
-      const bTerminal = b._terminalSince !== undefined;
-      const aIsOlder = aTerminal !== bTerminal ? aTerminal : (a._terminalSince ?? 0) < (b._terminalSince ?? 0);
-      if (aIsOlder) oldestKey = key;
+      if (next[key]._terminalSince < next[oldestKey]._terminalSince) oldestKey = key;
     }
     delete next[oldestKey];
   }
