@@ -126,6 +126,15 @@ class SpeechScheduler:
         """
         return frozenset(key for key, queue in self._queues.items() if queue and key != exclude)
 
+    def queued_roles(self) -> tuple[SpeechRole, ...]:
+        """Roles of every currently queued (not yet active) speech item.
+
+        Public counterpart to pending_work_item_ids() for callers that need
+        per-item role rather than just work-item-key presence; keeps queue
+        internals encapsulated per this class's private-_queues contract.
+        """
+        return tuple(item.role for queue in self._queues.values() for item in queue)
+
     def paused(self, work_item_id: str | None = None) -> SpeechItem | None:
         if work_item_id is not None:
             return self._paused.get(work_item_id)

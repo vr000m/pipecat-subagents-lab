@@ -97,6 +97,8 @@ async def _run_child(
                 query,
                 max_ack_seconds=max_ack_seconds,
                 max_latency_seconds=max_latency_seconds,
+                sink=sink,
+                max_routing_seconds=max_routing_seconds,
             )
         # The single-turn and routing-regression scenarios don't exercise
         # speech at all, so they run with TTS disabled (see _run_ack_ordering
@@ -166,6 +168,8 @@ async def _run_ack_ordering(
     *,
     max_ack_seconds: float,
     max_latency_seconds: float,
+    sink: Any,
+    max_routing_seconds: float,
 ) -> dict[str, Any]:
     """Prove the early ack is admitted for real speech while a live,
     paid-provider delegated search is still in flight -- the externally
@@ -212,6 +216,19 @@ async def _run_ack_ordering(
     started = time.perf_counter()
     pending = asyncio.create_task(host._handle_transcript(query, origin=connection))
 
+    def _drive_lifecycle(connection: Any, lease: Any, *, role: str) -> None:
+        lifecycle = connection.lifecycle
+        utterance_id = lease.item.utterance_id
+        bound = lifecycle.bind_context(lease.token, utterance_id)
+        started = lifecycle.on_tts_started(utterance_id) if bound else False
+        stopped = lifecycle.on_tts_stopped(utterance_id) if started else False
+        if not (bound and started and stopped):
+            raise RuntimeError(
+                f"lifecycle wiring rejected the {role} generation "
+                f"(bind={bound}, started={started}, stopped={stopped}, token={lease.token!r})"
+            )
+        lifecycle.on_transport_bot_stopped()
+
     admissions: list[tuple[str, float]] = []
     seen_tokens: set[str] = set()
     ack_released = False
@@ -226,20 +243,20 @@ async def _run_ack_ordering(
         if lease is not None and lease.token not in seen_tokens:
             seen_tokens.add(lease.token)
             admissions.append((lease.item.role, elapsed * 1000))
+            _drive_lifecycle(connection, lease, role=lease.item.role)
             if lease.item.role == ROLE_ACK:
-                lifecycle = connection.lifecycle
-                lifecycle.bind_context(lease.token, lease.item.utterance_id)
-                lifecycle.on_tts_started(lease.item.utterance_id)
-                lifecycle.on_tts_stopped(lease.item.utterance_id)
-                lifecycle.on_transport_bot_stopped()
                 ack_released = True
+                if elapsed > max_ack_seconds:
+                    raise RuntimeError(
+                        f"early ack was admitted late, at {elapsed:.1f}s "
+                        f"(budget {max_ack_seconds:.1f}s)"
+                    )
         if pending.done():
             break
         if not ack_released and elapsed > max_ack_seconds:
-            queued_roles = [item.role for q in scheduler._queues.values() for item in q]
             raise RuntimeError(
                 f"early ack was not admitted for real speech within {max_ack_seconds:.1f}s "
-                f"(active={scheduler.active!r}, queued_roles={queued_roles})"
+                f"(active={scheduler.active!r}, queued_roles={scheduler.queued_roles()})"
             )
         if elapsed > max_latency_seconds:
             pending.cancel()
@@ -255,6 +272,10 @@ async def _run_ack_ordering(
         raise RuntimeError("ack-ordering smoke fell back to the main responder")
     if result.ui_text in SAFE_FALLBACKS:
         raise RuntimeError("ack-ordering smoke returned a safe fallback")
+    if not result.spoken_text or len(result.spoken_text) > 600:
+        raise RuntimeError("ack-ordering smoke returned an invalid spoken projection")
+    if not result.citations:
+        raise RuntimeError("ack-ordering smoke returned no normalized citations")
 
     roles_seen = [role for role, _ in admissions]
     if roles_seen.count(ROLE_ACK) != 1:
@@ -270,11 +291,19 @@ async def _run_ack_ordering(
         raise RuntimeError(
             f"early ack admitted at {ack_ms:.1f}ms, budget {max_ack_seconds * 1000:.1f}ms"
         )
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+    routing_ms = stage_metrics["routing_ms"]
+    if routing_ms > max_routing_seconds * 1000:
+        raise RuntimeError(
+            f"ack-ordering routing exceeded {max_routing_seconds:.1f}s budget: {routing_ms:.1f}ms"
+        )
     return {
         "scenario": "ack-ordering",
         "worker": result.worker_id,
         "ack_ms": round(ack_ms, 1),
         "result_ms": round(result_ms, 1),
+        "routing_ms": round(routing_ms, 1),
     }
 
 
@@ -427,7 +456,8 @@ def _parent(
             "ack-ordering smoke passed: "
             f"worker={metrics['worker']} "
             f"ack_ms={metrics['ack_ms']} "
-            f"result_ms={metrics['result_ms']}"
+            f"result_ms={metrics['result_ms']} "
+            f"routing_ms={metrics['routing_ms']}"
         )
     else:
         print(
@@ -472,6 +502,8 @@ def main() -> int:
         parser.error("--max-routing-seconds must be positive")
     if args.max_ack_seconds <= 0:
         parser.error("--max-ack-seconds must be positive")
+    if args.ack_ordering and args.max_ack_seconds >= args.max_latency_seconds:
+        parser.error("--max-ack-seconds must be less than --max-latency-seconds")
     if args.routing_regression and args.ack_ordering:
         parser.error("--routing-regression and --ack-ordering are mutually exclusive")
     if args.timeout <= args.max_latency_seconds:
