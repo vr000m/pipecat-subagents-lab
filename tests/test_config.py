@@ -17,13 +17,13 @@ def _confine_manifest_evidence_root_to_tmp_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`load_promotion_manifest` confines manifest-declared `inputs[*].path`
-    entries to the repo root; point that root at each test's own `tmp_path`
-    so existing fixtures can keep writing dummy evidence files there while
-    still exercising the real containment check (relative-path resolution,
-    `is_relative_to`, `is_file`), not a bypass of it."""
+    entries to the package root; point that root at each test's own
+    `tmp_path` so existing fixtures can keep writing dummy evidence files
+    there while still exercising the real containment check (relative-path
+    resolution, `is_relative_to`, `is_file`), not a bypass of it."""
     import server.config as _config_module
 
-    monkeypatch.setattr(_config_module, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(_config_module, "_PACKAGE_ROOT", tmp_path)
 
 
 def test_feature_switch_defaults_are_true() -> None:
@@ -607,8 +607,9 @@ def _write_dummy_evidence_file(tmp_path: Path, name: str, content: bytes) -> dic
     path = tmp_path / name
     if not path.exists():
         path.write_bytes(content)
-    # Relative to the repo root the loader confines evidence reads to (this
-    # test module's `tmp_path`, via the autouse `_REPO_ROOT` monkeypatch).
+    # Relative to the package root the loader confines evidence reads to
+    # (this test module's `tmp_path`, via the autouse `_PACKAGE_ROOT`
+    # monkeypatch).
     return {"path": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 

@@ -315,9 +315,25 @@ def _is_hex_hash(value: object) -> bool:
     return isinstance(value, str) and _HEX_HASH_PATTERN.fullmatch(value) is not None
 
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+"""Anchor for relative evidence/manifest paths: the directory this module's
+package lives in, not a git-repo lookup (`git rev-parse --show-toplevel`) and
+not the process CWD. In a repo checkout this happens to equal the repo root,
+which is where the name `_REPO_ROOT` came from; it was renamed because a
+packaged/standalone install of this server has no git tree at all, and the
+old name implied an assumption this module never actually made. The
+promotion-evidence tree (`docs/benchmarks/...`, `shared/schemas/...`) is
+deliberately excluded from the deployable package (see
+`_schema_hash_matches`), so a packaged install typically won't find these
+paths under `_PACKAGE_ROOT` -- that's expected, and every caller below
+degrades to a display-only fail-closed verdict (`manifest_missing`,
+`manifest_schema_unverifiable`, `phase4c_unresolvable`, ...) rather than
+raising. An operator deploying standalone who still wants promotion evidence
+honoured must point `promotion_manifest_path`/`phase4c_artifact_path` at an
+absolute path; a relative path is only meaningful inside a repo checkout.
+"""
 
-_EVIDENCE_SCHEMA_PATH = _REPO_ROOT / "shared/schemas/v013-evidence.json"
+_EVIDENCE_SCHEMA_PATH = _PACKAGE_ROOT / "shared/schemas/v013-evidence.json"
 
 # A manifest-declared evidence input is attacker-steerable (it lives inside the
 # artifact under scrutiny), so it is capped well above any real evidence file
@@ -360,8 +376,8 @@ def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
     candidate = Path(raw_path)
     if candidate.is_absolute():
         return None
-    resolved = (_REPO_ROOT / candidate).resolve()
-    if not resolved.is_relative_to(_REPO_ROOT):
+    resolved = (_PACKAGE_ROOT / candidate).resolve()
+    if not resolved.is_relative_to(_PACKAGE_ROOT):
         return None
     if not _regular_file_within_evidence_size_cap(resolved):
         return None
@@ -434,7 +450,7 @@ def load_promotion_manifest(config: Config) -> PromotionManifest:
 def _load_promotion_manifest(config: Config) -> PromotionManifest:
     path = Path(config.promotion_manifest_path)
     if not path.is_absolute():
-        path = _REPO_ROOT / path
+        path = _PACKAGE_ROOT / path
     # Same guard `phase4c_artifact_path` takes, and for the same reason: this
     # is operator config, and a path that names a device or FIFO would hang or
     # OOM-kill server boot on read_text(). This is the first evidence read the
@@ -596,7 +612,7 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
             return replace(identity, reason="phase4c_unresolvable")
         phase4c_path = Path(phase4c_artifact_path)
         if not phase4c_path.is_absolute():
-            phase4c_path = _REPO_ROOT / phase4c_path
+            phase4c_path = _PACKAGE_ROOT / phase4c_path
         try:
             # phase4c_artifact_path is operator config (env/TOML), not
             # manifest-declared, so it is not attacker-steerable the way the

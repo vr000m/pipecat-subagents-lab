@@ -83,9 +83,10 @@ def _confine_manifest_evidence_root_to_tmp_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`load_promotion_manifest` confines manifest-declared `inputs[*].path`
-    entries to the repo root; point that root at each test's own `tmp_path`
-    so `_base_manifest`'s dummy evidence files can keep living there while
-    still exercising the real containment check, not a bypass of it.
+    entries to the package root; point that root at each test's own
+    `tmp_path` so `_base_manifest`'s dummy evidence files can keep living
+    there while still exercising the real containment check, not a bypass
+    of it.
 
     `write_manifest` (this module's other direct caller, via
     `_attempt_write_manifest`) applies the same confinement on the write
@@ -95,7 +96,7 @@ def _confine_manifest_evidence_root_to_tmp_path(
     (phase0) input before ever reaching the phase4c-specific behavior each
     test in this module actually exercises."""
     config_module = _config_module()
-    monkeypatch.setattr(config_module, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(config_module, "_PACKAGE_ROOT", tmp_path)
     monkeypatch.setattr(_validator(), "REPO_ROOT", tmp_path)
 
 
@@ -470,8 +471,9 @@ def _write_dummy_evidence_file(tmp_path: Path, name: str, content: bytes) -> dic
     path = tmp_path / name
     if not path.exists():
         path.write_bytes(content)
-    # Relative to the repo root the loader confines evidence reads to (this
-    # test module's `tmp_path`, via the autouse `_REPO_ROOT` monkeypatch).
+    # Relative to the package root the loader confines evidence reads to
+    # (this test module's `tmp_path`, via the autouse `_PACKAGE_ROOT`
+    # monkeypatch).
     return {"path": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
