@@ -74,6 +74,13 @@ def _terminal(
 
 
 def _is_contaminated(record: dict[str, Any], *, retrieval_snapshot_exposed: bool) -> bool:
+    # A failed call's latency/quality_score are not a measurement of the
+    # narrowing effect -- `outcome` in {"error", "timeout"} means the
+    # fast-return/failure path produced these values, not a completed
+    # provider call, so such a record must never reach the latency/quality
+    # statistics regardless of its other fields.
+    if record["outcome"] != "success":
+        return True
     if record["attempt_count"] > 1 or record["retry_count"] > 0 or record["rate_limit_count"] > 0:
         return True
     if record["cache_status"] == "unknown":
@@ -197,6 +204,7 @@ def build_analysis(
             matched_citation_ids=record["matched_citation_ids"],
             matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
             quality_score=record["quality_score"],
+            scorer_version=record["scorer_version"],
         )
         if record["scorer_hash"] != expected_scorer_hash:
             raise EvidenceGateError(
@@ -254,15 +262,20 @@ def build_analysis(
     # snapshot id at all (no discoverable control), otherwise samples missing
     # it while siblings have it are excluded as contaminated.
     clean_by_stratum: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    excluded_contaminated_count: dict[str, int] = {}
     uncontrolled_strata: list[str] = []
-    for stratum, stratum_records in by_stratum.items():
+    for stratum in sorted(by_stratum):
+        stratum_records = by_stratum[stratum]
+        stratum_key = f"{stratum[0]}/{stratum[1]}"
         exposes_snapshot = any(r["retrieval_snapshot_id"] is not None for r in stratum_records)
         if not exposes_snapshot:
-            uncontrolled_strata.append(f"{stratum[0]}/{stratum[1]}")
+            uncontrolled_strata.append(stratum_key)
             continue
-        clean_by_stratum[stratum] = [
+        clean = [
             r for r in stratum_records if not _is_contaminated(r, retrieval_snapshot_exposed=True)
         ]
+        clean_by_stratum[stratum] = clean
+        excluded_contaminated_count[stratum_key] = len(stratum_records) - len(clean)
 
     if not clean_by_stratum:
         return _terminal(
@@ -275,7 +288,17 @@ def build_analysis(
     per_stratum_pair_improvements: dict[str, list[float]] = {}
     undersized: list[str] = []
 
-    for (provider, model), stratum_records in clean_by_stratum.items():
+    # Halt reasons are collected across every stratum before any terminal
+    # result is returned (instead of returning from inside this loop), and
+    # strata are visited in sorted key order, so the emitted report -- and
+    # which reason takes priority when strata disagree -- no longer depends
+    # on the order providers happened to first appear in the input file.
+    noisy_strata: list[str] = []
+    below_floor_strata: list[str] = []
+    quality_drop_strata: list[str] = []
+
+    for provider, model in sorted(clean_by_stratum):
+        stratum_records = clean_by_stratum[(provider, model)]
         stratum_key = f"{provider}/{model}"
         baseline = [r for r in stratum_records if r["condition"] == "baseline"]
         narrowed = [r for r in stratum_records if r["condition"] == "narrowed"]
@@ -298,14 +321,30 @@ def build_analysis(
 
         # Assumption (a): baseline run-to-run noise. Repeated baseline
         # quality scores must be stable enough that the score measures the
-        # context-window effect, not provider variance. An epsilon absorbs
-        # float round-off so an exact-SD-0.01 fixture is not misclassified
-        # as "too noisy" by a value like 0.010000000000000009.
+        # context-window effect, not provider variance. `fixture_turn_id` is
+        # `"<base_turn_id>#<repeat_index>"` (run_query_context_experiment.py),
+        # so pooling every paired id's quality_score together (as before)
+        # measured variance ACROSS distinct base turns -- which legitimately
+        # differ -- rather than variance across repeats of the SAME base
+        # turn. Grouping by base turn id and taking the worst within-group SD
+        # isolates true run-to-run noise. A base turn with only one repeat
+        # contributes no signal (pstdev of a single value is 0) and is
+        # skipped. An epsilon absorbs float round-off so an exact-SD-0.01
+        # fixture is not misclassified as "too noisy" by a value like
+        # 0.010000000000000009.
         baseline_quality = [baseline_by_id[i]["quality_score"] for i in paired_ids]
         narrowed_quality = [narrowed_by_id[i]["quality_score"] for i in paired_ids]
-        baseline_quality_sd = (
-            statistics.pstdev(baseline_quality) if len(baseline_quality) > 1 else 0.0
-        )
+        baseline_quality_by_base_turn: dict[str, list[float]] = defaultdict(list)
+        for i in paired_ids:
+            baseline_quality_by_base_turn[i.split("#", 1)[0]].append(
+                baseline_by_id[i]["quality_score"]
+            )
+        within_turn_sds = [
+            statistics.pstdev(scores)
+            for scores in baseline_quality_by_base_turn.values()
+            if len(scores) > 1
+        ]
+        baseline_quality_sd = max(within_turn_sds) if within_turn_sds else 0.0
         baseline_too_noisy = baseline_quality_sd > BASELINE_NOISE_SD_THRESHOLD + EPSILON
 
         baseline_quality_mean = statistics.fmean(baseline_quality)
@@ -319,18 +358,31 @@ def build_analysis(
 
         pair_latencies_baseline = [baseline_by_id[i]["latency_ms"] for i in paired_ids]
         pair_latencies_narrowed = [narrowed_by_id[i]["latency_ms"] for i in paired_ids]
+        for b in pair_latencies_baseline:
+            if not b:
+                raise EvidenceGateError(
+                    f"{stratum_key}: a paired baseline record has latency_ms == 0 -- a relative "
+                    "improvement cannot be computed against a zero baseline latency"
+                )
         rel_improvements = [
-            (b - n) / b if b else 0.0
-            for b, n in zip(pair_latencies_baseline, pair_latencies_narrowed)
+            (b - n) / b for b, n in zip(pair_latencies_baseline, pair_latencies_narrowed)
         ]
 
-        all_context = [r["context_chars"] for r in stratum_records]
-        all_latency = [r["latency_ms"] for r in stratum_records]
-        spearman = _spearman(all_context, all_latency)
+        # Every other statistic in this stratum is computed over the paired
+        # baseline/narrowed records (`paired_ids`), not every clean record --
+        # an unpaired baseline-only row published a correlation over a
+        # different, larger population than `paired_sample_count` reports.
+        paired_records = [baseline_by_id[i] for i in paired_ids] + [
+            narrowed_by_id[i] for i in paired_ids
+        ]
+        paired_context = [r["context_chars"] for r in paired_records]
+        paired_latency = [r["latency_ms"] for r in paired_records]
+        spearman = _spearman(paired_context, paired_latency)
 
         per_stratum_pair_improvements[stratum_key] = rel_improvements
         per_stratum_report[stratum_key] = {
             "paired_sample_count": len(paired_ids),
+            "excluded_contaminated_count": excluded_contaminated_count.get(stratum_key, 0),
             "spearman_context_vs_latency": spearman,
             "baseline_quality_mean": baseline_quality_mean,
             "narrowed_quality_mean": narrowed_quality_mean,
@@ -340,26 +392,47 @@ def build_analysis(
             "median_relative_improvement": _median(rel_improvements),
         }
 
-        # Named-assumption halts (a)/(b) take priority over the ordinary
-        # promotion rubric, per stratum, in the order the plan names them.
         if baseline_too_noisy:
-            return _terminal(
-                status="not_promoted",
-                reason="baseline_too_noisy",
-                analysis={"strata": per_stratum_report, "undersized_strata": undersized},
-            )
+            noisy_strata.append(stratum_key)
         if baseline_below_floor:
-            return _terminal(
-                status="not_promoted",
-                reason="baseline_below_quality_floor",
-                analysis={"strata": per_stratum_report, "undersized_strata": undersized},
-            )
+            below_floor_strata.append(stratum_key)
         if not quality_ok:
-            return _terminal(
-                status="not_promoted",
-                reason="quality_drop_exceeded",
-                analysis={"strata": per_stratum_report, "undersized_strata": undersized},
-            )
+            quality_drop_strata.append(stratum_key)
+
+    # Named-assumption halts (a)/(b) take priority over the ordinary
+    # promotion rubric, in the order the plan names them, evaluated across
+    # every stratum's result rather than stopping at the first stratum
+    # processed.
+    if noisy_strata:
+        return _terminal(
+            status="not_promoted",
+            reason="baseline_too_noisy",
+            analysis={
+                "strata": per_stratum_report,
+                "undersized_strata": undersized,
+                "noisy_strata": noisy_strata,
+            },
+        )
+    if below_floor_strata:
+        return _terminal(
+            status="not_promoted",
+            reason="baseline_below_quality_floor",
+            analysis={
+                "strata": per_stratum_report,
+                "undersized_strata": undersized,
+                "below_quality_floor_strata": below_floor_strata,
+            },
+        )
+    if quality_drop_strata:
+        return _terminal(
+            status="not_promoted",
+            reason="quality_drop_exceeded",
+            analysis={
+                "strata": per_stratum_report,
+                "undersized_strata": undersized,
+                "quality_drop_strata": quality_drop_strata,
+            },
+        )
 
     if not per_stratum_pair_improvements:
         return _terminal(

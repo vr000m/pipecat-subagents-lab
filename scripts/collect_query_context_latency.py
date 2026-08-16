@@ -89,6 +89,7 @@ def _validate_raw_record(
         matched_citation_ids=record["matched_citation_ids"],
         matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
         quality_score=record["quality_score"],
+        scorer_version=record["scorer_version"],
     )
     if record["scorer_hash"] != expected_hash:
         raise EvidenceGateError(

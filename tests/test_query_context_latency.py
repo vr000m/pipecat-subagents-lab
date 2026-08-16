@@ -121,6 +121,7 @@ def _real_scorer_hash(**kwargs: Any) -> str:
             matched_citation_ids=kwargs.get("matched_citation_ids", ["cite-1"]),
             matched_disallowed_claim_ids=kwargs.get("matched_disallowed_claim_ids", []),
             quality_score=kwargs.get("quality_score", 1.0),
+            scorer_version=kwargs.get("scorer_version", module.SCORER_VERSION),
         )
     except (TypeError, AttributeError):
         return "0" * 64
@@ -128,6 +129,7 @@ def _real_scorer_hash(**kwargs: Any) -> str:
 
 def _valid_raw_record(**overrides: Any) -> dict[str, Any]:
     scorer_hash = overrides.pop("scorer_hash", None) or _real_scorer_hash(**overrides)
+    module = _runner()
     payload = {
         "run_id": "run-0001",
         "run_block": 0,
@@ -147,7 +149,7 @@ def _valid_raw_record(**overrides: Any) -> dict[str, Any]:
         "matched_fact_ids": ["fact-1"],
         "matched_citation_ids": ["cite-1"],
         "matched_disallowed_claim_ids": [],
-        "scorer_version": "scorer-v1",
+        "scorer_version": module.SCORER_VERSION,
         "scorer_hash": scorer_hash,
         "attempt_count": 1,
         "retry_count": 0,
@@ -984,12 +986,20 @@ def test_analyzer_promotes_at_exactly_a_0_02_quality_drop_boundary(tmp_path: Pat
 def test_analyzer_halts_baseline_too_noisy_above_sd_0_01(tmp_path: Path) -> None:
     """Plan assumption (a): baseline repeated-run SD > 0.01 halts with
     reason='baseline_too_noisy' rather than applying the promotion rubric
-    against unmeasured provider noise."""
+    against unmeasured provider noise.
+
+    The noise gate measures WITHIN-turn repeat variance, not cross-turn
+    variance (see the ``baseline_quality_sd`` grouping in
+    scripts/analyze_query_context_latency.py) — so each pair of records
+    here shares one base turn id (``pquality-<i>#0``/``#1``, two repeats
+    of the same underlying fixture turn) rather than being 15 distinct
+    single-sample turns, which would carry no within-turn signal at all.
+    """
     module = _analyzer()
     records = []
     noisy_scores = [0.99, 0.85] * 15
     for i, score in enumerate(noisy_scores):
-        turn_id = f"pquality-{i}"
+        turn_id = f"pquality-{i // 2}#{i % 2}"
         matched_fact_ids = _quality_matched_fact_ids(score)
         records.append(
             _valid_raw_record(
@@ -1032,10 +1042,10 @@ def test_analyzer_accepts_baseline_variance_comfortably_below_sd_0_01(tmp_path: 
     sensitive at the exact boundary; see the strictly-above-threshold test
     for the other side of this boundary."""
     module = _analyzer()
-    scores = [0.945, 0.955] * 15  # pstdev = 0.005, well under the 0.01 threshold
+    scores = [0.945, 0.955] * 15  # within-turn pstdev = 0.005, well under the 0.01 threshold
     records = []
     for i, score in enumerate(scores):
-        turn_id = f"pquality-{i}"
+        turn_id = f"pquality-{i // 2}#{i % 2}"
         matched_fact_ids = _quality_matched_fact_ids(score)
         records.append(
             _valid_raw_record(
@@ -1305,6 +1315,37 @@ def test_analyzer_rejects_mixed_scorer_versions(tmp_path: Path) -> None:
     module = _analyzer()
     records = _paired_cells(n=5, baseline_latency=1000, narrowed_latency=600)
     records[0]["scorer_version"] = "some-other-scorer"
+    input_path = _analysis_input(tmp_path, records)
+    output = tmp_path / "analysis.json"
+    exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
+    assert exit_code != 0
+
+
+def test_analyzer_rejects_a_uniformly_forged_scorer_version_across_every_record(
+    tmp_path: Path,
+) -> None:
+    """Regression: `scorer_hash` used to bind the module constant
+    `SCORER_VERSION` regardless of what a record declared, so a
+    *uniformly* forged `scorer_version` across an entire batch produced a
+    matching digest for every record and defeated the mixed-versions check
+    (which only catches divergence *within* a batch). Mutating every record
+    to the same forged value must still be rejected."""
+    module = _analyzer()
+    runner = _runner()
+    records = _paired_cells(n=5, baseline_latency=1000, narrowed_latency=600)
+    forged_version = "forged-v1"
+    assert forged_version != runner.SCORER_VERSION
+    for record in records:
+        record["scorer_version"] = forged_version
+        record["scorer_hash"] = runner.scorer_hash(
+            record["fixture_version"],
+            record["fixture_turn_id"],
+            matched_fact_ids=record["matched_fact_ids"],
+            matched_citation_ids=record["matched_citation_ids"],
+            matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
+            quality_score=record["quality_score"],
+            scorer_version=forged_version,
+        )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
     exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))

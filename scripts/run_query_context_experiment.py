@@ -150,6 +150,18 @@ def validate_raw_record(record: dict[str, Any], *, where: str = "record") -> Non
         raise EvidenceGateError(f"{where}: invalid outcome {record['outcome']!r}")
     if record["cache_status"] not in CACHE_STATUSES:
         raise EvidenceGateError(f"{where}: invalid cache_status {record['cache_status']!r}")
+    # A record's declared `scorer_version` was previously never checked against
+    # anything -- `scorer_hash` bound the module constant `SCORER_VERSION`
+    # regardless of what a record claimed, so a uniformly forged
+    # `scorer_version` across an entire batch produced an identical, correctly
+    # matching digest and passed every gate. Rejecting any declared value that
+    # is not the actual current scorer version closes that gap independent of
+    # hash binding.
+    if record["scorer_version"] != SCORER_VERSION:
+        raise EvidenceGateError(
+            f"{where}: scorer_version {record['scorer_version']!r} does not match the "
+            f"current scorer version {SCORER_VERSION!r}"
+        )
 
     for field, kinds, minimum in _RAW_NUMERIC_FIELDS:
         value = record[field]
@@ -196,6 +208,7 @@ def scorer_hash(
     matched_citation_ids: list[str] | None = None,
     matched_disallowed_claim_ids: list[str] | None = None,
     quality_score: float | None = None,
+    scorer_version: str = SCORER_VERSION,
 ) -> str:
     """Provenance hash binding a scorer identity to a fixture (and, when the
     per-record fields are supplied, to one record's exact matched-ID sets and
@@ -209,6 +222,14 @@ def scorer_hash(
     scorer -- changes this hash's expected value, letting
     ``collect_query_context_latency.py`` detect the forgery by recomputing
     and comparing, with no fixture file of its own to consult.
+
+    ``scorer_version`` defaults to the module constant for internal callers
+    stamping a hash for a record they are about to emit (there is no
+    record yet to read a declared version from). A verifier recomputing this
+    hash to check an *existing* record must instead pass
+    ``record["scorer_version"]`` explicitly -- otherwise recomputing with the
+    constant regardless of what the record declares lets a uniformly forged
+    ``scorer_version`` produce a matching digest for every record in a batch.
     """
     fixture_turn_id = fixture_turn_id or ""
     matched_fact_ids = matched_fact_ids or []
@@ -216,7 +237,7 @@ def scorer_hash(
     matched_disallowed_claim_ids = matched_disallowed_claim_ids or []
     payload = json.dumps(
         {
-            "scorer_version": SCORER_VERSION,
+            "scorer_version": scorer_version,
             "fixture_version": fixture_version,
             "fixture_turn_id": fixture_turn_id,
             "matched_fact_ids": sorted(matched_fact_ids),

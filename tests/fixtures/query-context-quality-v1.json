@@ -37,7 +37,13 @@
     {
       "turn_id": "qc-turn-3",
       "query": "What licence does the Pipecat project use?",
-      "prior_queries": ["qc-turn-1", "qc-turn-2"],
+      "prior_queries": [
+        "How do I configure logging levels in Pipecat?",
+        "What LLM providers does Pipecat integrate with?",
+        "Can Pipecat run in a serverless environment?",
+        "qc-turn-1",
+        "qc-turn-2"
+      ],
       "required_facts": [
         {"id": "qc3-fact-licence-name", "match_pattern": "bsd"}
       ],
