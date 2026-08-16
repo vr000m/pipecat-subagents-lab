@@ -273,6 +273,7 @@ async def _run_ack_ordering(
         if pending.done():
             break
         if not ack_released and elapsed > max_ack_seconds:
+            pending.cancel()
             raise RuntimeError(
                 f"early ack was not admitted for real speech within {max_ack_seconds:.1f}s "
                 f"(active={scheduler.active!r}, queued_roles={scheduler.queued_roles()})"
