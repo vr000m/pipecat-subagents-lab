@@ -169,8 +169,15 @@ class Config:
             raise ConfigError("early_ack_text must not be empty")
         if not self.promotion_manifest_path.strip():
             raise ConfigError("promotion_manifest_path must not be empty")
+        if self.phase4c_artifact_path is not None and not self.phase4c_artifact_path.strip():
+            raise ConfigError("phase4c_artifact_path must not be empty")
         if not self.release_version.strip():
             raise ConfigError("release_version must not be empty")
+        if self.deployed_at_utc is not None:
+            try:
+                _parse_utc_timestamp(self.deployed_at_utc)
+            except ValueError as exc:
+                raise ConfigError("deployed_at_utc must be an ISO-8601 UTC timestamp") from exc
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
         object.__setattr__(self, "worker_model_policy", _models(self.worker_model_policy))
 
@@ -766,7 +773,10 @@ def load_config(
         ("PIPECAT_DEPLOYED_AT_UTC", "deployed_at_utc"),
     ):
         if env_name in values:
-            kwargs[field_name] = str(values[env_name])
+            raw_value = values[env_name]
+            if not isinstance(raw_value, str):
+                raise ConfigError(f"{env_name} must be a string")
+            kwargs[field_name] = raw_value
     if raw := values.get("WEBSEARCH_OPENAI_API_KEY_ENV"):
         kwargs["openai_api_key_env"] = raw
     if raw := values.get("WEBSEARCH_ROUTER_MODEL"):
