@@ -268,17 +268,21 @@ def test_interrupt_signals_provider_stop_before_releasing_active_lease() -> None
 
 
 def test_synthesis_end_is_not_completion_and_unknown_delivery_is_terminal() -> None:
-    scheduler = _scheduler()
+    coordinator = _lifecycle()
+    scheduler = _scheduler(lifecycle=coordinator)
     item = enqueue(scheduler, "work-1", "answer")
     asyncio.run(scheduler.start_next())
+    token = scheduler.active.token
 
     scheduler.synthesis_ended(item.utterance_id)
     assert scheduler.state.speech[item.utterance_id].state == DeliveryState.SYNTHESIS_ENDED
-    assert scheduler.active is not None
+    assert coordinator.slot_token == token
+    assert coordinator.generation_for_token(token) is not None
 
     scheduler.delivery_unknown(item.utterance_id)
     assert scheduler.state.speech[item.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
-    assert scheduler.active is None
+    assert coordinator.slot_token is None
+    assert coordinator.generation_for_token(token) is None
 
 
 def test_synthesis_failure_releases_lease_and_allows_next_item() -> None:

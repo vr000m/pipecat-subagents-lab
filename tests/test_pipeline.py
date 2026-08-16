@@ -402,6 +402,7 @@ def test_delivery_completed_event_does_not_bypass_the_lifecycle_coordinator() ->
 
         assert connection.scheduler.active is not None
         utterance_id = connection.scheduler.active.item.utterance_id
+        token = connection.scheduler.active.token
         connection.scheduler.enqueue(
             result_id="result-next",
             work_item_id="work-next",
@@ -413,9 +414,14 @@ def test_delivery_completed_event_does_not_bypass_the_lifecycle_coordinator() ->
         await tts.on_event("synthesis_started", utterance_id)
         await tts.on_event("delivery_completed", utterance_id)
 
-        assert connection.scheduler.active is not None, (
+        assert connection.lifecycle.slot_token == token, (
             "a lifecycle-bypassing delivery_completed callback must not release the slot"
         )
+        assert connection.lifecycle.generation_for_token(token) is not None, (
+            "the occupied generation must still be tracked by the lifecycle coordinator"
+        )
+        # Corroborating, non-authoritative mirrors.
+        assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.utterance_id == utterance_id
         await host.shutdown()
 
@@ -1088,7 +1094,8 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
         )
         await scheduler.start_next()
         assert scheduler.active is not None and scheduler.active.item == a_item
-        assert scheduler.lifecycle is not None and scheduler.lifecycle.occupied is True
+        a_token = scheduler.active.token
+        assert scheduler.lifecycle is not None and scheduler.lifecycle.slot_token == a_token
 
         before_notice = scheduler.enqueue(
             result_id="result-b-before",
@@ -1190,6 +1197,9 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
         assert other_item.result_id == "result-other"
 
         # A is not interrupted and still owns the transport slot.
+        assert scheduler.lifecycle.slot_token == a_token, (
+            "A's generation token must still be the sole slot occupant"
+        )
         assert scheduler.active is not None
         assert scheduler.active.item == a_item
         assert host.state.speech[a_item.utterance_id].state.value != "interrupted"
@@ -8744,7 +8754,6 @@ def test_pending_turn_retracts_its_ack_when_submit_accepts_nothing() -> None:
                 close = getattr(operation, "close", None)
                 if close is not None:
                     close()
-                return None
 
         host = SessionHost(
             runner_factory=LifecycleRunner,
