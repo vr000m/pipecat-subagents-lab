@@ -273,6 +273,29 @@ def _require_local_origin(request: Request, config: Config) -> None:
         raise HTTPException(status_code=403, detail="origin is not allowed for the local server")
 
 
+async def _close_setup_connection(connection: SmallWebRTCConnection) -> None:
+    """Best-effort close of the raw peer connection when setup aborts.
+
+    Neither ``ConnectionPipeline.shutdown`` nor the pipecat SmallWebRTC
+    request handler closes this on our behalf here: ``handle_web_request``
+    only logs an exception propagated from the connection callback (it never
+    calls ``connection.disconnect()`` itself), and ``shutdown()``'s worker
+    cancellation only reaches transport teardown once ``worker.run(...)``
+    has actually started consuming pipeline frames -- which none of the
+    three setup-failure paths in ``_attach_connection`` can guarantee. Only
+    a direct ``disconnect()`` call closes the peer connection in every case.
+    Calling it here is safe even when the transport later performs its own
+    teardown: ``SmallWebRTCClient.disconnect`` guards on
+    ``is_connected``/``is_closing`` and no-ops if already closed.
+    """
+    try:
+        await connection.disconnect()
+    except Exception:  # noqa: BLE001  # best-effort cleanup; never mask the original setup failure
+        _loguru_logger.exception(
+            "failed to close the Small WebRTC connection during setup teardown"
+        )
+
+
 async def _attach_connection(
     host: SessionHost,
     connection: SmallWebRTCConnection,
@@ -285,6 +308,7 @@ async def _attach_connection(
             await runtime.tts.connect()
         if not host.accepts(runtime.epoch):
             await runtime.shutdown(reason="connection replaced during setup", reconnect=True)
+            await _close_setup_connection(connection)
             return
         output_sample_rate = getattr(runtime.tts, "sample_rate", 24000)
         params = TransportParams(
@@ -368,8 +392,9 @@ async def _attach_connection(
             sink=host.measurement_sink,
         )
     except BaseException:
-        host.abort_connection(runtime)
+        host.abort_connection(runtime, reconnect=False)
         await runtime.shutdown(reason="connection setup failed", reconnect=False)
+        await _close_setup_connection(connection)
         raise
     try:
         publisher = RTVIMessagePublisher(
@@ -380,6 +405,7 @@ async def _attach_connection(
         runtime.output_teardown = getattr(connection, "disconnect", None)
         if not host.accepts(runtime.epoch):
             await runtime.shutdown(reason="connection replaced during setup", reconnect=True)
+            await _close_setup_connection(connection)
             return
 
         # Seed the connection-projected sequence at the current snapshot
@@ -607,8 +633,9 @@ async def _attach_connection(
             if hasattr(attached, "__await__"):
                 await attached
     except BaseException:
-        host.abort_connection(runtime)
+        host.abort_connection(runtime, reconnect=False)
         await runtime.shutdown(reason="connection setup failed", reconnect=False)
+        await _close_setup_connection(connection)
         raise
 
 

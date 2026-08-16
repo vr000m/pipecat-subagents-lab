@@ -418,6 +418,13 @@ class ConnectionPipeline:
 
     @property
     def supports_work_status(self) -> bool:
+        """Whether this connection negotiated the ``work_status_v1`` capability.
+
+        Delegates to the ``RuntimeObserver`` rather than testing
+        ``capabilities`` directly, so the single capability-gate predicate in
+        ``resolve_work_status_wire_presence`` stays the sole arbiter of
+        entitlement (Phase 3).
+        """
         return self.observer.supports_work_status
 
     def deactivate(self, *, reconnect: bool = True) -> None:
@@ -1054,10 +1061,17 @@ class SessionHost:
         if presented != bound:
             raise ValueError("capabilities cannot change after connection promotion")
 
-    def abort_connection(self, pipeline: ConnectionPipeline) -> None:
-        """Fence a promoted connection whose transport setup did not complete."""
+    def abort_connection(self, pipeline: ConnectionPipeline, *, reconnect: bool = True) -> None:
+        """Fence a promoted connection whose transport setup did not complete.
+
+        ``reconnect`` is forwarded to ``ConnectionPipeline.deactivate`` so
+        callers that immediately follow this with ``pipeline.shutdown(...,
+        reconnect=...)`` get a single, consistent classification instead of
+        this call's default sweeping the scheduler's queues as a reconnect
+        before ``shutdown`` ever runs (leaving nothing for it to classify).
+        """
         if self.connection is pipeline:
-            pipeline.deactivate()
+            pipeline.deactivate(reconnect=reconnect)
             self.connection = None
             self.state.active_epoch = None
 
@@ -1278,9 +1292,63 @@ class SessionHost:
         as a promise that at most one ack is ever queued for a turn.
         """
 
+        def _retry_or_abandon(*, log_reason: str, needs_requeue: bool) -> None:
+            # Shared by both admission-failure modes: an exception from
+            # start_next (e.g. the worker never attached) and a clean
+            # ``None`` return (the transport slot is occupied by another
+            # utterance). Both leave the ack still needing a home, so both
+            # must feed the same bounded retry/abandon chain instead of one
+            # of them silently doing nothing. ``needs_requeue`` distinguishes
+            # them: the exception path's own except-arm already discarded
+            # the item from scheduler bookkeeping, so it needs a fresh
+            # ``enqueue_ack()`` before the retry; the busy-slot ``None``
+            # path never dequeued the item in the first place (start_next
+            # returns early, before popping, when the slot is occupied), so
+            # calling ``enqueue_ack()`` there would queue a duplicate.
+            if (
+                turn_id not in self._ack_emitted_turns
+                or self.connection is not origin
+                or not origin.active
+                or origin.epoch != origin_epoch
+                or not self.accepts(origin_epoch)
+            ):
+                logger.debug(
+                    "early ack {} and its turn/epoch is no longer live; "
+                    "discarding it instead of re-queueing",
+                    log_reason,
+                )
+                return
+            if attempt >= _ACK_ADMISSION_MAX_ATTEMPTS:
+                logger.debug(
+                    "early ack {} after {} attempts; abandoning it "
+                    "instead of retrying indefinitely",
+                    log_reason,
+                    attempt,
+                )
+                self._settle_turn_ack(origin.scheduler, turn_id)
+                return
+            logger.debug("early ack {}; leaving it queued for a later retry", log_reason)
+            if needs_requeue:
+                enqueue_ack()
+
+            async def retry_after_delay() -> None:
+                await asyncio.sleep(_ACK_ADMISSION_RETRY_DELAY_SECONDS)
+                self._schedule_ack_admission(
+                    origin,
+                    ack_work_item_id,
+                    enqueue_ack,
+                    turn_id=turn_id,
+                    origin_epoch=origin_epoch,
+                    attempt=attempt + 1,
+                )
+
+            retry_task = asyncio.create_task(retry_after_delay())
+            self._ack_admission_tasks.add(retry_task)
+            retry_task.add_done_callback(self._ack_admission_tasks.discard)
+
         async def admit() -> None:
             try:
-                await origin.scheduler.start_next(ack_work_item_id)
+                admitted = await origin.scheduler.start_next(ack_work_item_id)
             except Exception:  # noqa: BLE001 - ack submission failure must never crash the turn
                 # The ack is ephemeral and best-effort: a submission failure
                 # (e.g. the connection's Pipecat worker has not attached
@@ -1292,45 +1360,19 @@ class SessionHost:
                 # live. A cancellation, reconnect, or newer promoted epoch
                 # racing this failure would otherwise leave a stale ack queued
                 # on a turn that no longer exists, to be spoken later.
-                if (
-                    turn_id not in self._ack_emitted_turns
-                    or self.connection is not origin
-                    or not origin.active
-                    or origin.epoch != origin_epoch
-                    or not self.accepts(origin_epoch)
-                ):
-                    logger.opt(exception=True).debug(
-                        "early ack failed to start and its turn/epoch is no longer live; "
-                        "discarding it instead of re-queueing"
-                    )
-                    return
-                if attempt >= _ACK_ADMISSION_MAX_ATTEMPTS:
-                    logger.opt(exception=True).debug(
-                        "early ack failed to start after {} attempts; abandoning it "
-                        "instead of retrying indefinitely",
-                        attempt,
-                    )
-                    self._settle_turn_ack(origin.scheduler, turn_id)
-                    return
-                logger.opt(exception=True).debug(
-                    "early ack failed to start; leaving it queued for a later retry"
-                )
-                enqueue_ack()
-
-                async def retry_after_delay() -> None:
-                    await asyncio.sleep(_ACK_ADMISSION_RETRY_DELAY_SECONDS)
-                    self._schedule_ack_admission(
-                        origin,
-                        ack_work_item_id,
-                        enqueue_ack,
-                        turn_id=turn_id,
-                        origin_epoch=origin_epoch,
-                        attempt=attempt + 1,
-                    )
-
-                retry_task = asyncio.create_task(retry_after_delay())
-                self._ack_admission_tasks.add(retry_task)
-                retry_task.add_done_callback(self._ack_admission_tasks.discard)
+                logger.opt(exception=True).debug("early ack failed to start")
+                _retry_or_abandon(log_reason="failed to start", needs_requeue=True)
+                return
+            if admitted is None:
+                # start_next returns ``None`` without raising whenever the
+                # transport slot is occupied -- the common case when a prior
+                # utterance is still speaking at delegation time. That is
+                # not success: the ack item was never dequeued (start_next
+                # returns before popping when the slot is occupied), so it
+                # must feed the same bounded retry/abandon chain the
+                # exception path uses, or it stays queued indefinitely past
+                # _ACK_ADMISSION_MAX_ATTEMPTS.
+                _retry_or_abandon(log_reason="found the transport slot busy", needs_requeue=False)
 
         task = asyncio.create_task(admit())
         self._ack_admission_tasks.add(task)
@@ -2040,6 +2082,20 @@ class SessionHost:
                 retained_still_open = True
                 child.finalize(outcome="retained", app_worker_id=worker_id)
                 self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+                # A retained work item is still working, so `background` is
+                # its truthful status on every connection -- the observer,
+                # not this call site, decides which connections may see it
+                # (same rule as the single-intent path at ~pipeline.py:1752).
+                # This must run regardless of capability, or a non-capable
+                # connection leaves the session's shared ledger stranded at
+                # `searching` forever.
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state="background",
+                    origin_epoch=origin_epoch,
+                )
                 if origin.supports_work_status and self.feature_policy.enable_background_status:
                     # Same capability-gated rule the single-intent path takes:
                     # a capable client gets the `background` status alone, not
@@ -2047,13 +2103,6 @@ class SessionHost:
                     # result-history entries (Requirements). Without this early
                     # return the status *and* the legacy result were both
                     # delivered, duplicating the turn for capable clients.
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state="background",
-                        origin_epoch=origin_epoch,
-                    )
                     turn_recorder.finalize()
                     return None
                 result = canonical_result(
@@ -3180,6 +3229,13 @@ class SessionHost:
                             speech_outcome = "not_applicable"
                         else:
                             delivery_disposition = "autoplay"
+                            # The canonical result is committing now, so this
+                            # turn's queued ack (if any) is stale as of this
+                            # point -- settle it before admission instead of
+                            # relying on the `finally` block below, which only
+                            # runs after `start_next()` has already had a
+                            # chance to admit the stale ack from the queue.
+                            self._settle_turn_ack(speakable.scheduler, context.turn_id)
                             try:
                                 speakable.scheduler.enqueue(
                                     result_id=result.result_id,
@@ -3194,7 +3250,7 @@ class SessionHost:
                                 pending_exception = exc
                             else:
                                 try:
-                                    await speakable.scheduler.start_next()
+                                    await speakable.scheduler.start_next(late.work_item_id)
                                 except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
                                     speech_outcome = "start_failed"
                                     pending_exception = exc
