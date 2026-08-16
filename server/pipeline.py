@@ -70,9 +70,10 @@ from .speech_scheduler import (
 from .work_item_coordinator import (
     FAILURE_KINDS,
     Coordinator,
+    CoordinatorView,
     LateResult,
-    WorkItemCoordinator,
     WorkItemFailure,
+    coordinator_view,
 )
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
@@ -544,15 +545,13 @@ class SessionHost:
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
-        # Kept on getattr, not a direct ``coordinator.registry`` access, even
-        # though the Coordinator Protocol declares ``registry`` required:
-        # many duck-typed test-double coordinators in the suite construct
-        # without a ``registry``/``config`` attribute at all, and this is the
-        # one place in __init__ where a coordinator can legitimately still be
-        # ``None`` at the point of use. Converting this to a direct attribute
-        # access breaks that whole class of test doubles; see the Coordinator
-        # Protocol's own docstring in work_item_coordinator.py.
-        coordinator_registry = getattr(coordinator, "registry", None)
+        # Assigned this early (well before the rest of __init__'s other
+        # attributes) so ``self._coordinator_view`` below -- and every other
+        # site in this class -- can read ``self.coordinator`` uniformly, in
+        # particular ``registry``/``config`` resolution just below, which
+        # needs it during construction itself.
+        self.coordinator = coordinator
+        coordinator_registry = self._coordinator_view.registry
         if registry is None and coordinator_registry is not None:
             registry = coordinator_registry
         # The fallback registry is built from the caller's own Config, not a
@@ -577,16 +576,14 @@ class SessionHost:
         # The set is read from the coordinator itself (falling back to
         # WorkItemCoordinator's declaration for duck-typed test coordinators
         # that construct without declaring the Coordinator Protocol's
-        # required OWNED_CONFIG_FIELDS ClassVar -- this getattr fallback is
-        # kept deliberately, see the Coordinator Protocol's own docstring)
-        # rather than re-listed here, so adding or removing a coordinator-owned
-        # field cannot silently turn every construction into a boot-time
-        # ValueError raised from the wrong component.
-        coordinator_config = getattr(coordinator, "config", None)  # see registry getattr note above
+        # required OWNED_CONFIG_FIELDS ClassVar, resolved above onto
+        # ``self._coordinator_view``) rather than re-listed here, so adding
+        # or removing a coordinator-owned field cannot silently turn every
+        # construction into a boot-time ValueError raised from the wrong
+        # component.
+        coordinator_config = self._coordinator_view.config
         if coordinator_config is not None:
-            owned_fields = getattr(
-                coordinator, "OWNED_CONFIG_FIELDS", WorkItemCoordinator.OWNED_CONFIG_FIELDS
-            )
+            owned_fields = self._coordinator_view.OWNED_CONFIG_FIELDS
             comparable_coordinator_config = replace(
                 coordinator_config,
                 **{field_name: getattr(self.config, field_name) for field_name in owned_fields},
@@ -604,7 +601,6 @@ class SessionHost:
         )
         self.runner_factory = runner_factory
         self.stt, self.tts = stt, tts
-        self.coordinator = coordinator
         self._tts_on_event = getattr(tts, "on_event", None)
         self.runner: Any = None
         self._runner_handles: dict[str, Any] = {}
@@ -1446,11 +1442,7 @@ class SessionHost:
         scheduler_live = set(scheduler.pending_work_item_ids(exclude=ack_work_item_id))
         if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
             scheduler_live.add(scheduler.active.item.work_item_id)
-        # ``live_work_item_ids`` is intentionally not a required Protocol
-        # member -- it is new and no duck-typed test coordinator implements
-        # it, so this site tolerates its absence like any other optional one.
-        live_lookup = getattr(self.coordinator, "live_work_item_ids", None)
-        coordinator_live = live_lookup() if live_lookup is not None else frozenset()
+        coordinator_live = self._coordinator_view.live_work_item_ids()
         live = (
             scheduler_live
             | set(self._inflight_work_tasks)
@@ -1469,6 +1461,27 @@ class SessionHost:
         if coordinator is None:
             raise RuntimeError("coordinator is required to execute work")
         return coordinator
+
+    @property
+    def _coordinator_view(self) -> CoordinatorView:
+        """Resolves the 7 ``Coordinator`` members this host reads through
+        ``getattr`` fallbacks rather than direct attribute access, even
+        though the Coordinator Protocol declares most of them required:
+        many duck-typed test-double coordinators across the suite construct
+        without declaring the full Protocol surface, and requiring full
+        conformance from every test double is out of scope (round 5 tried
+        converting these to required direct access and reverted it after
+        the change broke 67 of tests/test_pipeline.py's tests).
+
+        Computed fresh from ``self.coordinator`` on every access, not cached
+        at construction: several tests reassign ``host.coordinator`` after
+        ``__init__`` returns, and every call site here must see that
+        reassignment exactly as it would have via a bare
+        ``getattr(self.coordinator, ...)`` probe. See ``coordinator_view``
+        and ``Coordinator``'s own docstring in work_item_coordinator.py for
+        the full site-by-site rationale.
+        """
+        return coordinator_view(self.coordinator)
 
     async def _handle_transcript(
         self, transcript: str, *, origin: ConnectionPipeline | None = None
@@ -2847,19 +2860,7 @@ class SessionHost:
         }
         if clarification_context is not None:
             kwargs["clarification_context"] = clarification_context
-        # Kept on getattr, not a direct ``self.coordinator.start_task`` call,
-        # even though the Coordinator Protocol declares ``start_task``
-        # required: most duck-typed test-double coordinators across the
-        # suite (dozens, verified empirically) implement only the subset of
-        # methods their specific test exercises and do not declare
-        # ``start_task`` at all. See the Coordinator Protocol's own
-        # docstring in work_item_coordinator.py.
-        starter = getattr(self.coordinator, "start_task", None)
-        return (
-            starter(search(query, **kwargs))
-            if starter is not None
-            else asyncio.create_task(search(query, **kwargs))
-        )
+        return self._coordinator_view.start_task(search(query, **kwargs))
 
     async def _search_with_timeout(
         self,
@@ -3442,11 +3443,7 @@ class SessionHost:
             for item_id in dict.fromkeys((*self._inflight_turn_tasks, *self._inflight_work_tasks))
             if (work_item_id is None or item_id == work_item_id) and item_id != exclude_work_item_id
         )
-        # Kept on getattr for the same reason as start_task above -- dozens
-        # of duck-typed test coordinators do not implement ``cancel``.
-        coordinator_cancel = getattr(self.coordinator, "cancel", None)
-        if coordinator_cancel is not None:
-            selected = tuple(dict.fromkeys((*selected, *coordinator_cancel(work_item_id))))
+        selected = tuple(dict.fromkeys((*selected, *self._coordinator_view.cancel(work_item_id))))
         if work_item_id is None:
             selected = tuple(dict.fromkeys((*selected, *self._known_work_items)))
         selected = tuple(item for item in selected if item != exclude_work_item_id)
@@ -3658,17 +3655,14 @@ class SessionHost:
             for task in done:
                 if not task.cancelled():
                     task.exception()
-        # Kept on getattr for the same reason as start_task/cancel above --
-        # dozens of duck-typed test coordinators do not implement
-        # ``shutdown``. The Protocol declares it ``async def shutdown(self)
-        # -> None``, so a conforming coordinator's result is always
-        # awaitable; ``inspect.isawaitable`` only accommodates the
-        # non-conforming test doubles that happen to define a sync one.
-        coordinator_shutdown = getattr(self.coordinator, "shutdown", None)
-        if coordinator_shutdown is not None:
-            result = coordinator_shutdown()
-            if inspect.isawaitable(result):
-                await result
+        # The Protocol declares ``shutdown`` as ``async def shutdown(self) ->
+        # None``, so a conforming coordinator's result is always awaitable;
+        # ``inspect.isawaitable`` only accommodates the non-conforming test
+        # doubles that happen to define a sync one (``self._coordinator_view``
+        # resolves the callable itself, matching every other member here).
+        result = self._coordinator_view.shutdown()
+        if inspect.isawaitable(result):
+            await result
         # Coordinator work/callback tasks have now settled. Finalize every
         # retained recorder still open: unclaimed work is shutdown-cancelled,
         # while claimed work uses its recorded terminal kind and whatever
