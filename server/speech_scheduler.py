@@ -91,6 +91,35 @@ class SpeechScheduler:
         # start_next's own broad except clause can observe and swallow it).
         self._discarded = False
 
+    def _notify_ack_swept(self, item: SpeechItem) -> None:
+        """Route an ack discarded by ``interrupt()``'s queued/paused sweep
+        through the same ack-terminal notification ``start_next`` uses for
+        its ``PreAdmissionTerminal`` branch.
+
+        ``_emit_progress`` is a deliberate no-op for acks (they are
+        wire-invisible), so without this an ack swept here would vanish
+        silently instead of reaching ``_on_ack_terminal`` -- the codebase's
+        stated sole mutator for the pre-admission-terminal ack path
+        (``server/pipeline.py``'s ``ConnectionPipelineHost.on_ack_terminal``,
+        which clears the owning turn's ack latch). ``CONNECTION_CLOSED`` is
+        reused here rather than adding a new enum member: this sweep only
+        runs when the scheduler itself is being discarded for good
+        (``reconnect``/``full_stop``), the same "this connection is gone"
+        condition that reason already models, and the callback does not
+        branch on the reason value today regardless.
+        """
+        if item.role != ROLE_ACK or self._on_ack_terminal is None:
+            return
+        identity = GenerationIdentity(
+            item.utterance_id,
+            item.work_item_id,
+            item.origin_epoch,
+            role=ROLE_ACK,
+            turn_id=item.turn_id,
+            ack_id=item.ack_id,
+        )
+        self._on_ack_terminal(identity, PreAdmissionTerminalReason.CONNECTION_CLOSED)
+
     def _signal_stop(self, item: SpeechItem) -> None:
         if self.stop is None:
             return
@@ -547,6 +576,7 @@ class SpeechScheduler:
                         allow_stale_reconnect=reconnect or full_stop,
                         **({"origin_epoch": epoch} if epoch is not None else {}),
                     )
+                    self._notify_ack_swept(item)
             self._queues.clear()
             # A fire-and-forget queue-advance task (_schedule_queue_advance)
             # re-probes a queue key on a later tick after a submission
@@ -567,6 +597,7 @@ class SpeechScheduler:
                     allow_stale_reconnect=reconnect or full_stop,
                     **({"origin_epoch": epoch} if epoch is not None else {}),
                 )
+                self._notify_ack_swept(item)
             self._paused.clear()
         return active_item
 
