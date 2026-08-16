@@ -136,8 +136,12 @@ committed and display-ready -- it does not mean speech was queued, delivered,
 or heard. Terminal records preserve their original `origin_epoch` and remain
 in a capable client's reconnect snapshot until removed, whichever comes
 first of: a five-minute session-clock TTL, or bounded-capacity eviction
-once the record set exceeds 256 keys (terminal-first, oldest-first).
-Removal is pruned lazily at projection time.
+once the record set exceeds 256 keys (terminal-first, oldest-first). Only
+terminal records are eviction candidates -- evicting a live (non-terminal)
+record would erase the sole record of its children and strand the parent
+aggregate non-terminal forever, so eviction is refused while every retained
+record is live, and the 256-key bound is a soft cap that a live-record-heavy
+ledger may deliberately exceed. Removal is pruned lazily at projection time.
 
 Capability negotiation carries one URL-encoded JSON array of capability names
 in a single `capabilities` query parameter on both the `POST /api/rtc` offer
@@ -216,9 +220,12 @@ boundary closes; browser SDK transcript callbacks are not authoritative state.
   `_MAX_CAPABILITY_ENTRIES` (16) capability names, each at most
   `_MAX_CAPABILITY_NAME_LENGTH` (64) characters, and the whole encoded
   `capabilities` field at most `_MAX_CAPABILITY_FIELD_LENGTH` bytes
-  (`server/app.py`); the snapshot-handshake response also carries a
-  `capabilities_present` boolean distinguishing "no `capabilities` query
-  parameter was sent" from "an empty capability set was sent."
+  (`server/app.py`); on the request side, decoding the `capabilities` query
+  parameter also produces a `capabilities_present` boolean distinguishing
+  "no `capabilities` query parameter was sent" from "an empty capability set
+  was sent," which the server consumes to decide handshake behavior. This
+  flag is a request-parse artifact only -- the handshake response itself
+  (`SessionHost.session_handshake()`) never carries it back to the client.
 - `routing-decision.json` defines the internal router-to-dispatch decision.
 - `work-item-event.json` and `interruption-event.json` reserve deferred
   lifecycle contracts and are not emitted by v1.0.
