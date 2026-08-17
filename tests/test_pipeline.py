@@ -5945,6 +5945,102 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_subsequent_w
     asyncio.run(run())
 
 
+def test_multi_intent_whole_turn_cancel_between_children_reaches_the_already_acked_child() -> None:
+    """Regression (Step 5, SessionHost decomposition): the ledger used to
+    learn about a multi-intent turn's runnable children in one bulk
+    ``known_ids`` update issued *after* the entire fan-out loop -- while
+    each child's own early ack is emitted per-item, inside that loop, well
+    before the bulk update runs. A whole-turn/whole-connection cancel
+    landing in that window (after child 0's ack, while child 1 is still
+    being routed -- both awaits below) used to see child 0 as neither
+    locally task-backed (``coordinator.submit`` for the batch hasn't run
+    yet) nor known, so it fell out of every union and was never marked
+    cancelled -- despite already having claimed the turn's one ack.
+    ``known_ids`` registration must happen per-item, before that item's own
+    ack, matching the single-intent/pending-dialogue paths."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host, _worker = _fan_in_host(_submitted(), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+        turn_id = "turn-race"
+
+        captured_cancelled_work: list[str] = []
+        call_count = 0
+        original_emit_early_ack = host._emit_early_ack
+
+        async def racing_emit_early_ack(*args: object, **kwargs: object) -> None:
+            nonlocal call_count
+            call_count += 1
+            await original_emit_early_ack(*args, **kwargs)  # type: ignore[arg-type]
+            if call_count == 1:
+                # A whole-connection cancel racing in right after the first
+                # child's ack, before the second child is even routed.
+                cancelled_work, _ = await host.cancel_turn_or_child(None, None, origin=origin)
+                captured_cancelled_work.extend(cancelled_work)
+
+        host._emit_early_ack = racing_emit_early_ack  # type: ignore[method-assign]
+
+        await host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "first item and second item",
+            origin,
+            turn_id,
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+        )
+
+        assert f"work-{turn_id}-0" in captured_cancelled_work
+        assert f"work-{turn_id}-0" in host._cancelled_work_items
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancel_turn_or_child_sole_child_check_treats_a_known_only_sibling_as_live() -> None:
+    """``cancel_turn_or_child``'s sole-child ack-retraction decision must see
+    a sibling that is only in the ledger's ``known_ids`` (registered but not
+    yet task-backed -- e.g. mid multi-intent fan-out, before
+    ``coordinator.submit`` has run) as still live, not just siblings with a
+    local task, a scheduler entry, or a coordinator-tracked task. Regression
+    for the ``live`` union previously being built from
+    ``_inflight_work_tasks``/``_inflight_turn_tasks`` directly instead of
+    ``self._work_ledger.live_ids()``, which silently dropped ``known_ids``."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        connection = await host.connect(connection_handshake(host, 1))
+        turn_id = "turn-known-sibling"
+        ack_work_item_id = f"ack-{turn_id}"
+        host._ack_emitted_turns.add(turn_id)
+        connection.scheduler.enqueue(
+            result_id=None,
+            work_item_id=ack_work_item_id,
+            run_id=f"run-{ack_work_item_id}",
+            text="One moment.",
+            origin_epoch=1,
+            role=ROLE_ACK,
+            ack_id=ack_work_item_id,
+            turn_id=turn_id,
+        )
+        host._register_turn_work_item(turn_id, "work-known-sibling-0")
+        host._register_turn_work_item(turn_id, "work-known-sibling-1")
+        # Sibling 1 is known (registered) but has no local task, no
+        # scheduler entry, and no coordinator-live task -- exactly the
+        # ack-to-registration window a multi-intent turn passes through.
+        host._work_ledger.register_known("work-known-sibling-1")
+
+        await host.cancel_turn_or_child(turn_id, "work-known-sibling-0", origin=connection)
+
+        # The sole remaining child is still known/live, so the ack must
+        # survive -- it must not be retracted just because the sibling has
+        # no local or coordinator-tracked task yet.
+        assert ack_work_item_id in connection.scheduler._queues
+        assert turn_id in host._ack_emitted_turns
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_turn_cancel() -> (
     None
 ):

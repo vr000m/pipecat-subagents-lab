@@ -111,6 +111,16 @@ class WorkTaskLedger:
         """Ids with a locally tracked turn and/or work task, dedup-ordered."""
         return tuple(dict.fromkeys((*self.turn_tasks, *self.work_tasks)))
 
+    def pending_tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        """Every locally tracked task -- turn tasks and delegated work tasks.
+
+        For shutdown-time cancellation. ``known_ids`` entries with no
+        locally tracked task have no ``asyncio.Task`` to cancel here; those
+        belong to the coordinator, which the caller shuts down separately.
+        """
+        work = (task for tasks in self.work_tasks.values() for task in tasks)
+        return (*self.turn_tasks.values(), *work)
+
     def cancel_selected(self, selected_work_item_ids: Iterable[str]) -> None:
         """Mark the given ids cancelled and cancel any locally tracked tasks.
 

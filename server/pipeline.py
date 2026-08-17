@@ -1441,12 +1441,12 @@ class SessionHost:
         if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
             scheduler_live.add(scheduler.active.item.work_item_id)
         coordinator_live = self._coordinator_view.live_work_item_ids()
-        live = (
-            scheduler_live
-            | set(self._inflight_work_tasks)
-            | set(self._inflight_turn_tasks)
-            | coordinator_live
-        )
+        # `live_ids()` folds in the ledger's `known_ids` alongside its
+        # locally tracked turn/work tasks -- the same "live" definition
+        # `_cancel_work(None)` and `shutdown` use -- so a child registered
+        # but not yet task-backed (the ack-to-registration window in
+        # `_handle_multi_intent`) still counts as live here too.
+        live = scheduler_live | self._work_ledger.live_ids() | coordinator_live
         remaining = (live & own_work_items) - self._cancelled_work_items
         remaining.discard(child_work_item_id)
         if not remaining:
@@ -2334,6 +2334,14 @@ class SessionHost:
                 # above and never allocate a client-visible status.
                 delegated_children[item_work_item_id] = worker_id
                 self._register_turn_work_item(turn_id, item_work_item_id)
+                # Register in the ledger before this item's own early ack
+                # (below), matching the single-intent/pending-dialogue
+                # paths: a whole-turn/whole-connection cancel racing in
+                # between one child's ack and the next child's routing
+                # await must already see this child as known, not just the
+                # bulk `known_ids` update that used to run once after the
+                # entire fan-out loop.
+                self._work_ledger.register_known(item_work_item_id)
                 self._emit_work_status(
                     turn_id=turn_id,
                     work_item_id=item_work_item_id,
@@ -2417,8 +2425,10 @@ class SessionHost:
                         origin_epoch=origin.epoch,
                     )
 
+            # `known_ids` registration for each runnable item now happens
+            # per-item, before its own early ack, in the loop above -- this
+            # list is still needed below for `coordinator.submit`.
             work_item_ids = [f"work-{turn_id}-{index}" for index in runnable_indexes]
-            self._known_work_items.update(work_item_ids)
             retained_recorders: dict[str, RetainedRecorder] = {
                 f"work-{turn_id}-{index}": self._new_retained_recorder(
                     origin_epoch=origin.epoch,
@@ -3616,11 +3626,15 @@ class SessionHost:
 
     async def shutdown(self) -> None:
         self._closing = True
-        turn_tasks = tuple(self._inflight_turn_tasks.values())
-        for task in turn_tasks:
+        # Every locally tracked task -- turn tasks *and* delegated work
+        # tasks -- must be cancelled and awaited here; a work task with no
+        # turn task above it (e.g. a retained background child) used to be
+        # left running past shutdown because only `turn_tasks` was swept.
+        pending_tasks = self._work_ledger.pending_tasks()
+        for task in pending_tasks:
             task.cancel()
-        if turn_tasks:
-            await asyncio.gather(*turn_tasks, return_exceptions=True)
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         registrations = tuple(self._runner_registrations.values())
         for task in registrations:
             task.cancel()
