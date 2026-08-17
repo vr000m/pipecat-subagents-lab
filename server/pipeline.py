@@ -1149,6 +1149,7 @@ class SessionHost:
         *,
         turn_recorder: AppTurnRecorder,
         delegated_children: dict[str, str | None],
+        finalize_turn_on_failure: bool = True,
     ) -> DelegatedChild | None:
         """Set up one child work item for delegation to a worker's search.
 
@@ -1160,6 +1161,20 @@ class SessionHost:
         latter alongside ``_register_turn_work_item``, before any ack for
         this item can be admitted), and the ``routing`` status emit.
 
+        ``finalize_turn_on_failure`` controls whether a missing-worker/
+        missing-search rejection also finalizes ``turn_recorder`` as
+        ``"failed"``. Single-intent and pending-dialogue delegate exactly one
+        child per turn, so that child's rejection *is* the turn's outcome and
+        the default (``True``) finalizes it here, matching those call sites'
+        pre-conversion behavior. Multi-intent delegates N children under one
+        shared ``turn_recorder`` and finalizes it itself, once, after every
+        child (including any dispatched-but-not-delegated ones from routing
+        failures) has been accounted for -- finalizing here on the first
+        rejected child would latch the whole turn's outcome early and silently
+        drop every sibling still to come, since ``AppTurnRecorder.finalize``
+        is a one-shot latch. Multi-intent passes ``False`` and finalizes once
+        at the end of its own loop instead.
+
         Returns ``None`` after fully handling a rejection -- the caller
         should return/continue without further processing that item -- or a
         ``DelegatedChild`` on success.
@@ -1168,7 +1183,8 @@ class SessionHost:
         if worker is None:
             child = turn_recorder.new_child(work_item_id=request.work_item_id)
             child.finalize(outcome="missing_worker")
-            turn_recorder.finalize(outcome="failed")
+            if finalize_turn_on_failure:
+                turn_recorder.finalize(outcome="failed")
             self._emit_work_status(
                 turn_id=request.turn_id,
                 work_item_id=request.work_item_id,
@@ -1186,7 +1202,8 @@ class SessionHost:
         if search is None:
             child = turn_recorder.new_child(work_item_id=request.work_item_id)
             child.finalize(outcome="missing_search", app_worker_id=worker_id)
-            turn_recorder.finalize(outcome="failed")
+            if finalize_turn_on_failure:
+                turn_recorder.finalize(outcome="failed")
             self._emit_work_status(
                 turn_id=request.turn_id,
                 work_item_id=request.work_item_id,
@@ -2353,8 +2370,6 @@ class SessionHost:
             pending = getattr(outcome, "pending_dialogue", None)
             for index, item_text in enumerate(outcome.work_items):
                 item_work_item_id = f"work-{turn_id}-{index}"
-                child = turn_recorder.new_child(work_item_id=item_work_item_id)
-                child_recorders[index] = child
                 worker = None
                 if index == 0 and pending is not None:
                     registered = (
@@ -2385,7 +2400,9 @@ class SessionHost:
                             text="Routing is temporarily unavailable. Please try that request again.",
                             origin_epoch=origin.epoch,
                         )
-                        child.finalize(outcome="failed")
+                        turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
+                            outcome="failed"
+                        )
                         continue
                     decision = envelope.decision
                     action = getattr(decision, "action", None)
@@ -2404,7 +2421,9 @@ class SessionHost:
                             text=text,
                             origin_epoch=origin.epoch,
                         )
-                        child.finalize(outcome=action)
+                        turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
+                            outcome=action
+                        )
                         continue
                     try:
                         worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
@@ -2416,48 +2435,47 @@ class SessionHost:
                             text="I cannot access that capability here.",
                             origin_epoch=origin.epoch,
                         )
-                        child.finalize(outcome="failed")
+                        turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
+                            outcome="failed"
+                        )
                         continue
-                search = getattr(worker, "search", None)
-                if search is None:
+                # A worker has now been resolved (or confirmed absent, for the
+                # pending-dialogue index-0 case with no registered owner).
+                # ``_begin_delegation`` owns missing-worker/missing-search
+                # rejection, ``_project_worker(running)``, child-recorder
+                # creation, and known-ids/turn-work-item registration -- the
+                # same sequence single-intent and pending-dialogue already
+                # share. ``finalize_turn_on_failure=False`` because this
+                # turn_recorder is shared by every item in the fan-out: it is
+                # finalized once, after the whole loop, not on this one
+                # child's rejection (see the parameter's docstring).
+                delegation = self._begin_delegation(
+                    DelegationRequest(
+                        turn_id=turn_id,
+                        work_item_id=item_work_item_id,
+                        worker=worker,
+                        origin_epoch=origin_epoch,
+                        parent_work_item_id=parent_work_item_id,
+                    ),
+                    turn_recorder=turn_recorder,
+                    delegated_children=delegated_children,
+                    finalize_turn_on_failure=False,
+                )
+                if delegation is None:
+                    # The rejected child's own work-status/child-recorder
+                    # bookkeeping is already done inside ``_begin_delegation``;
+                    # unlike single-intent/pending-dialogue this turn does not
+                    # abort, so this item still owes the user a spoken result
+                    # for its slot, same text the pre-conversion code used.
                     results[index] = canonical_result(
                         worker_id="main",
                         turn_id=f"{turn_id}-{index}",
                         text="I cannot access that capability here.",
                         origin_epoch=origin.epoch,
                     )
-                    worker_id_for_child = (
-                        getattr(getattr(worker, "metadata", None), "worker_id", None)
-                        if worker is not None
-                        else None
-                    )
-                    child.finalize(
-                        outcome="missing_worker" if worker is None else "missing_search",
-                        app_worker_id=worker_id_for_child,
-                    )
                     continue
-                worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
-                # Only genuinely delegated items reach here: direct,
-                # unsupported, clarify, and dispatch-failure items returned
-                # above and never allocate a client-visible status.
-                delegated_children[item_work_item_id] = worker_id
-                self._register_turn_work_item(turn_id, item_work_item_id)
-                # Register in the ledger before this item's own early ack
-                # (below), matching the single-intent/pending-dialogue
-                # paths: a whole-turn/whole-connection cancel racing in
-                # between one child's ack and the next child's routing
-                # await must already see this child as known, not just the
-                # bulk `known_ids` update that used to run once after the
-                # entire fan-out loop.
-                self._work_ledger.register_known(item_work_item_id)
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=item_work_item_id,
-                    parent_work_item_id=parent_work_item_id,
-                    worker_id=worker_id,
-                    state="routing",
-                    origin_epoch=origin_epoch,
-                )
+                child_recorders[index] = delegation.child
+                worker_id = delegation.worker_id
                 runnable.append((worker_id, item_text))
                 runnable_indexes.append(index)
                 runnable_workers[index] = worker

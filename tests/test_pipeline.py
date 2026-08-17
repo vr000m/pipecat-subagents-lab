@@ -5996,6 +5996,129 @@ def test_multi_intent_whole_turn_cancel_between_children_reaches_the_already_ack
     asyncio.run(run())
 
 
+class _MultiIntentDispatchRouter:
+    """Like ``_FanInRouter``, but the decision it returns carries the routed
+    item's own text, so a coordinator's ``dispatch`` can vary its response
+    per fan-out item instead of returning one fixed worker for the whole
+    turn."""
+
+    @staticmethod
+    def route_envelope(text: str, _catalogue: object) -> object:
+        decision = type("Decision", (), {"action": "existing_worker", "text": text})()
+        return type("Envelope", (), {"decision": decision, "prose": None})()
+
+
+def test_multi_intent_missing_worker_and_missing_search_each_get_their_own_failed_status() -> None:
+    """Regression (Step 8, S3 delegation-helper conversion): before S3 adopted
+    ``_begin_delegation``, a multi-intent child that hit missing-worker or
+    missing-search never emitted a ``failed`` work-status (D-a) or a
+    ``_project_worker(running)`` projection (D-b) at all -- only the
+    single-intent and pending-dialogue call sites did. With three children
+    fanning out in one turn (missing worker, missing search, and one that
+    succeeds), each rejection must close *independently* for its own item,
+    and neither rejection may finalize the shared ``turn_recorder`` early and
+    swallow the sibling that still succeeds -- ``AppTurnRecorder.finalize``
+    is a one-shot latch, so ``_begin_delegation`` is called with
+    ``finalize_turn_on_failure=False`` for this call site."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        no_search_worker = type(
+            "NoSearchWorker",
+            (),
+            {
+                "metadata": type(
+                    "Metadata",
+                    (),
+                    {
+                        "worker_id": "worker-no-search",
+                        "topic": "no search topic",
+                        "model_policy": "deep",
+                    },
+                )()
+            },
+        )()
+        good_worker = ProjectedResultWorker()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=_FanInRegistry(), router=_MultiIntentDispatchRouter())
+
+            def dispatch(self, decision: object, **_: object) -> object:
+                text = getattr(decision, "text", None)
+                if text == "missing worker item":
+                    return None
+                if text == "missing search item":
+                    return no_search_worker
+                return good_worker
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                return _submitted(results=(_fan_in_result("turn-dab-2", "third answer"),))
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=Coordinator(),
+            measurement_sink=sink,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        turn_id = "turn-dab"
+
+        committed = await host._handle_multi_intent(
+            _multi_intent_outcome("missing worker item", "missing search item", "third item"),
+            "",
+            origin,
+            turn_id,
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+        )
+
+        def child_states() -> dict[str, str]:
+            return {
+                work_item_id: status.state
+                for kids in host.state._work_status_children.values()
+                for work_item_id, status in kids.items()
+            }
+
+        states = child_states()
+        # D-a: each rejected child gets its own terminal `failed` status --
+        # not just the first one, and not silently dropped.
+        assert states[f"work-{turn_id}-0"] == "failed"
+        assert states[f"work-{turn_id}-1"] == "failed"
+        # The surviving sibling still ran its full routing/searching sequence
+        # -- proof neither rejection finalized the shared turn_recorder and
+        # cut the fan-out short.
+        assert states[f"work-{turn_id}-2"] == "result_ready"
+
+        # D-b: `_project_worker(running)` only fires once a worker is
+        # actually present. Missing-worker (item 0) never resolves a worker,
+        # so it gets no projection at all; missing-search (item 1) resolves a
+        # worker before its search is found absent, so it *does* get
+        # projected; the surviving worker (item 2) does too.
+        assert host.state.workers[no_search_worker.metadata.worker_id].status == "running"
+        assert host.state.workers[good_worker.metadata.worker_id].status == "running"
+
+        # Every child's own outcome is accounted for on the shared
+        # turn_recorder -- further proof the turn was not latched early by
+        # the first rejection.
+        children = _events(sink, "work_item_foreground")
+        assert {c.fields["work_item_id"]: c.fields["outcome"] for c in children} == {
+            f"work-{turn_id}-0": "missing_worker",
+            f"work-{turn_id}-1": "missing_search",
+            f"work-{turn_id}-2": "completed",
+        }
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["child_count"] == 3
+        assert parent["outcome"] == "mixed"
+
+        assert [result.text for result in committed] == [
+            "I cannot access that capability here.",
+            "I cannot access that capability here.",
+            "third answer",
+        ]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_cancel_turn_or_child_sole_child_check_treats_a_known_only_sibling_as_live() -> None:
     """``cancel_turn_or_child``'s sole-child ack-retraction decision must see
     a sibling that is only in the ledger's ``known_ids`` (registered but not
