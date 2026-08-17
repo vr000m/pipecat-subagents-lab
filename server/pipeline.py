@@ -18,7 +18,6 @@ from pydantic import ValidationError
 from .config import Config, FeaturePolicy, PromotionManifest
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
-    WORK_STATUS_TERMINAL,
     GroundedResult,
     RoutingDecision,
     RoutingState,
@@ -75,6 +74,12 @@ from .work_item_coordinator import (
     LateResult,
     WorkItemFailure,
     coordinator_view,
+)
+from .work_status_publisher import (
+    WorkStatusPublisher,
+    _child_work_status_after_dispatch,
+    _work_status_after_commit_failure,
+    _work_status_for_outcome,
 )
 from .work_task_ledger import WorkTaskLedger
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
@@ -281,37 +286,6 @@ def _speech_role_for_child_outcome(outcome_label: str) -> SpeechRole:
     return ROLE_TIMEOUT_NOTICE if outcome_label == "retained" else ROLE_RESULT
 
 
-def _work_status_for_outcome(
-    outcome_label: str | None,
-    *,
-    cancelled: bool = False,
-    committed: bool = True,
-    terminal_kind: str | None = None,
-) -> tuple[WorkStatusState, TerminalReason | None] | None:
-    """The single outcome -> coarse work-status derivation for both sites.
-
-    Used by the foreground delegated-child finalization path and by
-    ``SessionHost.commit_late_result_once``'s finalization block, so the two
-    can never drift apart. Precedence mirrors the commit contract:
-    cancellation classifies the work item regardless of whether its result
-    additionally cleared the commit fences; otherwise an outcome that both
-    committed and delivered a real committed result -- ``completed``, or a
-    worker-raised ``clarify``/``declined`` (both commit and speak a canonical
-    result of their own, so the work item is just as done as a completed
-    search) -- is ``result_ready``, and everything else terminal is
-    ``failed``. ``None`` means "no status to emit" (no outcome was ever
-    assigned). ``terminal_reason`` is carried only for a retention-rejected
-    terminal, the sole reason either site can name.
-    """
-    if cancelled:
-        return "cancelled", None
-    if outcome_label is None:
-        return None
-    if outcome_label in {"completed", "clarify", "declined"} and committed:
-        return "result_ready", None
-    return "failed", ("retention_rejected" if terminal_kind == "retention_rejected" else None)
-
-
 def _late_commit_work_status(
     work_outcome: str | None,
     *,
@@ -340,40 +314,6 @@ def _late_commit_work_status(
         committed=commit_outcome == "committed",
         terminal_kind=terminal_kind,
     )
-
-
-def _work_status_after_commit_failure(
-    derived: tuple[WorkStatusState, TerminalReason | None] | None,
-) -> tuple[WorkStatusState, TerminalReason | None] | None:
-    """The status to publish when the canonical commit itself raised.
-
-    ``None`` means "publish nothing": either no status was derived at all, or
-    the derived state is non-terminal (a still-legitimately-running
-    ``background`` child, which must stay reachable by its own late result).
-    A cancellation still classifies the work item regardless of the commit
-    outcome -- the same precedence ``_work_status_for_outcome`` documents --
-    so it is published as ``cancelled``, not overridden to ``failed``.
-    """
-    if derived is None or derived[0] not in WORK_STATUS_TERMINAL:
-        return None
-    if derived[0] == "cancelled":
-        return derived
-    return "failed", None
-
-
-def _child_work_status_after_dispatch(
-    outcome_label: str | None,
-    *,
-    cancelled: bool,
-    terminal_kind: str | None = None,
-) -> tuple[WorkStatusState, TerminalReason | None] | None:
-    """Retained-and-not-cancelled work is not terminal: 'background' is its
-    truthful status until the late result terminalizes it. Every other case
-    defers to ``_work_status_for_outcome``.
-    """
-    if outcome_label == "retained" and not cancelled:
-        return "background", None
-    return _work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
 
 
 def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
@@ -626,6 +566,9 @@ class SessionHost:
             if comparable_coordinator_config != self.config:
                 raise ValueError("SessionHost config conflicts with the coordinator's Config")
         self.feature_policy = feature_policy or FeaturePolicy.from_config(self.config)
+        self._work_status_publisher = WorkStatusPublisher(
+            state=self.state, feature_policy=self.feature_policy
+        )
         # The immutable evidence-gate verdict handed in by _default_session_host
         # (via server.config.load_promotion_manifest); missing/None is treated
         # exactly like a manifest that failed to load -- fail-closed to
@@ -3506,14 +3449,13 @@ class SessionHost:
     ) -> None:
         """Record one delegated child's coarse status (Phase 3).
 
-        A no-op unless ``enable_background_status`` is on; the wire
-        emission itself is further capability-gated per connection inside
-        the observer, so this call site does not need to branch on client
-        capability -- only on whether the feature is enabled at all.
+        Thin delegator onto ``WorkStatusPublisher.emit`` -- kept as a
+        SessionHost method (rather than migrating every call site) because
+        this is a dozens-of-call-sites surface spanning single-intent,
+        pending-dialogue, multi-intent, and commit paths; see
+        ``WorkTaskLedger``'s precedent for the same call.
         """
-        if not self.feature_policy.enable_background_status:
-            return
-        self.state.set_child_work_status(
+        self._work_status_publisher.emit(
             turn_id=turn_id,
             work_item_id=work_item_id,
             parent_work_item_id=parent_work_item_id,
@@ -3535,34 +3477,17 @@ class SessionHost:
     ) -> None:
         """Terminalize every still-non-terminal delegated child as ``state``.
 
-        A turn that ends mid-flight -- cancelled *or* failed on an unexpected
-        exception after ``routing``/``searching`` was already emitted -- would
-        otherwise strand a capable client on a non-terminal record forever.
-        ``children`` maps each delegated child's ``work_item_id`` to its
-        worker id.
-
-        Idempotent against a child that already settled:
-        ``legal_work_status_transition`` rejects any move out of a terminal
-        child state, and ``_reaggregate_parent`` never regresses an
-        already-terminal parent. It does *not* reject every ``state`` as a
-        cold start -- only ``cancelled`` is excluded from
-        ``WORK_STATUS_COLD_START``; ``failed`` (used by
-        ``_finalize_turn_exception``'s non-cancelled branch) is legally
-        cold-startable. Safety for a child that never had a status therefore
-        rests on caller
-        discipline (every ``children`` entry already has a ``routing``
-        status by the time this runs), not on this mechanism.
+        Thin delegator onto ``WorkStatusPublisher.terminalize_children`` --
+        see that method's docstring for the idempotency/cold-start contract.
         """
-        for work_item_id, worker_id in children.items():
-            self._emit_work_status(
-                turn_id=turn_id,
-                work_item_id=work_item_id,
-                parent_work_item_id=parent_work_item_id,
-                worker_id=worker_id,
-                state=state,
-                origin_epoch=origin_epoch,
-                terminal_reason=terminal_reason,
-            )
+        self._work_status_publisher.terminalize_children(
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+            children=children,
+            state=state,
+            parent_work_item_id=parent_work_item_id,
+            terminal_reason=terminal_reason,
+        )
 
     def _finalize_turn_exception(
         self,
