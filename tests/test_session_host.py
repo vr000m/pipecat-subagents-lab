@@ -1109,7 +1109,7 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
 
         turn_id = "turn-5"
         ack_work_item_id = f"ack-{turn_id}"
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         origin.scheduler.enqueue(
             work_item_id=ack_work_item_id,
             run_id="run-ack",
@@ -1130,7 +1130,7 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
 
         assert ack_work_item_id not in origin.scheduler._queues
         assert "work-5-0" not in origin.scheduler._queues
-        assert turn_id not in host._ack_emitted_turns
+        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
         await host.shutdown()
 
     asyncio.run(run())

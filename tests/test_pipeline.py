@@ -5560,7 +5560,7 @@ def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
         async def register_and_accept_newer_turn(worker_arg: object) -> None:
             # Simulate a newer semantic turn being accepted concurrently,
             # during the exact yield _handle_pending suspends on.
-            host._turn_sequence += 1
+            host._turn_ack_ledger._turn_sequence += 1
             await original_register_runner_worker(worker_arg)
 
         host._runner_supervisor.register_worker = register_and_accept_newer_turn  # type: ignore[method-assign]
@@ -6162,7 +6162,7 @@ def test_cancel_turn_or_child_sole_child_check_treats_a_known_only_sibling_as_li
         connection = await host.connect(connection_handshake(host, 1))
         turn_id = "turn-known-sibling"
         ack_work_item_id = f"ack-{turn_id}"
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         connection.scheduler.enqueue(
             result_id=None,
             work_item_id=ack_work_item_id,
@@ -6186,7 +6186,7 @@ def test_cancel_turn_or_child_sole_child_check_treats_a_known_only_sibling_as_li
         # survive -- it must not be retracted just because the sibling has
         # no local or coordinator-tracked task yet.
         assert ack_work_item_id in connection.scheduler._queues
-        assert turn_id in host._ack_emitted_turns
+        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
         await host.shutdown()
 
     asyncio.run(run())
@@ -6669,7 +6669,7 @@ def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slo
             lease is not None and lease.item.work_item_id == f"ack-{turn_id}"
             for lease in (connection.scheduler.active,)
         )
-        assert turn_id in host._ack_emitted_turns
+        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
 
         slow.cancel()
         await host.shutdown()
@@ -6708,7 +6708,7 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
         connection.worker = QueueingPipelineWorker()
         turn_id = "turn-cancel"
         ack_work_item_id = f"ack-{turn_id}"
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         connection.scheduler.enqueue(
             result_id=None,
             work_item_id=ack_work_item_id,
@@ -6737,7 +6737,7 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
         coordinator.target = f"work-{turn_id}-0"
         await host._handle_transcript(f"cancel work-{turn_id}-0")
         assert ack_work_item_id in connection.scheduler._queues
-        assert turn_id in host._ack_emitted_turns
+        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
 
         # Let the first control confirmation finish speaking, so the second
         # cancel really does target the turn's sole remaining delegated child.
@@ -6749,13 +6749,13 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
         coordinator.target = f"work-{turn_id}-1"
         await host._handle_transcript(f"cancel work-{turn_id}-1")
         assert ack_work_item_id not in connection.scheduler._queues
-        assert turn_id not in host._ack_emitted_turns
+        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
 
         # A whole-turn cancel removes an earlier turn's live ack and its latch
         # too: nothing may speak an ack for work the user just cancelled.
         other_turn = "turn-swept"
         other_ack = f"ack-{other_turn}"
-        host._ack_emitted_turns.add(other_turn)
+        host._turn_ack_ledger._ack_emitted_turns.add(other_turn)
         connection.scheduler.enqueue(
             result_id=None,
             work_item_id=other_ack,
@@ -6770,7 +6770,7 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
         frames_before_sweep = len(connection.worker.frames)
         await host._handle_transcript("cancel")
         assert other_ack not in connection.scheduler._queues
-        assert other_turn not in host._ack_emitted_turns
+        assert other_turn not in host._turn_ack_ledger._ack_emitted_turns
         assert all(
             not isinstance(frame, TTSSpeakFrame) or frame.text != "One moment."
             for frame in connection.worker.frames[frames_before_sweep:]
@@ -6811,7 +6811,7 @@ def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_liv
         connection = await host.connect(connection_handshake(host, 1))
         turn_id = "turn-h"
         ack_work_item_id = f"ack-{turn_id}"
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         connection.scheduler.enqueue(
             result_id=None,
             work_item_id=ack_work_item_id,
@@ -6830,7 +6830,7 @@ def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_liv
         assert ack_work_item_id in connection.scheduler._queues, (
             "the ack must survive: a coordinator-retained sibling is still live"
         )
-        assert turn_id in host._ack_emitted_turns
+        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
 
         await host.shutdown()
 
@@ -7174,7 +7174,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
     ack-eligible turn shapes -- direct-delegated, pending-continuation, and
     mixed multi-intent. ``_emit_early_ack`` returns at its very first line
     when the flag is off, so this asserts the turn-scoped latch
-    (``host._ack_emitted_turns``), the scheduler's ack queue/active lease
+    (``host._turn_ack_ledger._ack_emitted_turns``), the scheduler's ack queue/active lease
     (``_ack_items``, matching the enabled-ack tests above) all stay empty
     even though every path here is otherwise ack-eligible (a real TTS
     connection, a genuinely in-flight delegated child)."""
@@ -7198,7 +7198,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
             await asyncio.wait_for(search.started.wait(), timeout=1)
 
             assert _ack_items(origin.scheduler) == []
-            assert host._ack_emitted_turns == set()
+            assert host._turn_ack_ledger._ack_emitted_turns == set()
 
             search.release.set()
             result = await asyncio.wait_for(pending, timeout=1)
@@ -7239,7 +7239,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
             )
 
             assert _ack_items(origin.scheduler) == []
-            assert host._ack_emitted_turns == set()
+            assert host._turn_ack_ledger._ack_emitted_turns == set()
 
         else:
             assert path == "mixed_multi_intent"
@@ -7312,7 +7312,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
             await asyncio.wait_for(search.started.wait(), timeout=1)
 
             assert _ack_items(origin.scheduler) == []
-            assert host._ack_emitted_turns == set()
+            assert host._turn_ack_ledger._ack_emitted_turns == set()
 
             search.release.set()
             await asyncio.wait_for(pending, timeout=1)
@@ -7321,7 +7321,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
         # (or, for the direct-delegated path, its release) must not have
         # left any deferred ack admission task or index entry behind either.
         assert _ack_items(origin.scheduler) == []
-        assert host._ack_emitted_turns == set()
+        assert host._turn_ack_ledger._ack_emitted_turns == set()
         await host.shutdown()
 
     asyncio.run(run())
@@ -7906,7 +7906,7 @@ def test_capacity_rejected_dispatch_emits_no_ack_and_never_dispatches_twice() ->
 
         assert "search service is busy" in result.text
         assert _ack_items(origin.scheduler) == []
-        assert host._ack_emitted_turns == set()
+        assert host._turn_ack_ledger._ack_emitted_turns == set()
         # Exactly one dispatch attempt: the refused one.
         assert worker.creations == 1
         await host.shutdown()
@@ -8329,7 +8329,7 @@ def test_sole_child_cancel_ignores_another_turns_speech_when_settling_the_ack() 
 
         turn_id = "turn-a"
         ack_work_item_id = f"ack-{turn_id}"
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         host._register_turn_work_item(turn_id, "work-turn-a")
         origin.scheduler.enqueue(
             result_id=None,
@@ -8360,7 +8360,7 @@ def test_sole_child_cancel_ignores_another_turns_speech_when_settling_the_ack() 
         await host.cancel_turn_or_child(turn_id, "work-turn-a", origin=origin)
 
         assert ack_work_item_id not in origin.scheduler._queues
-        assert turn_id not in host._ack_emitted_turns
+        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
         # The unrelated turn's own speech is untouched.
         assert "work-turn-b" in origin.scheduler._queues
         await host.shutdown()
@@ -8385,7 +8385,7 @@ def test_ack_admission_retry_is_discarded_when_the_turn_is_no_longer_live() -> N
 
         # The turn's latch was already cleared (cancellation/reconnect), so the
         # ack is no longer live and must not be re-queued.
-        host._schedule_ack_admission(
+        host._turn_ack_ledger._schedule_ack_admission(
             origin,
             "ack-turn-dead",
             lambda: requeued.append(1),
@@ -8397,8 +8397,8 @@ def test_ack_admission_retry_is_discarded_when_the_turn_is_no_longer_live() -> N
         assert requeued == []
 
         # A still-latched, still-current turn keeps the existing retry.
-        host._ack_emitted_turns.add("turn-live")
-        host._schedule_ack_admission(
+        host._turn_ack_ledger._ack_emitted_turns.add("turn-live")
+        host._turn_ack_ledger._schedule_ack_admission(
             origin,
             "ack-turn-live",
             lambda: requeued.append(1),
@@ -8422,10 +8422,10 @@ def test_ack_admission_retries_after_a_transient_start_next_failure(
     unless an unrelated speech admission happened to call ``start_next``
     again. Now a delayed retry is scheduled automatically and actually
     admits the ack once the transient failure clears."""
-    import server.pipeline as pipeline_module
+    import server.turn_ack_ledger as turn_ack_ledger_module
     from server.speech_scheduler import ROLE_ACK
 
-    monkeypatch.setattr(pipeline_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(turn_ack_ledger_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.001)
 
     async def run() -> None:
         host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
@@ -8457,9 +8457,9 @@ def test_ack_admission_retries_after_a_transient_start_next_failure(
                 turn_id=turn_id,
             )
 
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         enqueue_ack()
-        host._schedule_ack_admission(
+        host._turn_ack_ledger._schedule_ack_admission(
             origin,
             ack_work_item_id,
             enqueue_ack,
@@ -8490,11 +8490,11 @@ def test_ack_admission_retry_gives_up_after_max_attempts_instead_of_forever(
     attempt count. Past ``_ACK_ADMISSION_MAX_ATTEMPTS`` the ack must be
     abandoned instead: its queued item discarded and the turn's ack latch
     cleared, so retries stop and the turn's ack slot is freed."""
-    import server.pipeline as pipeline_module
+    import server.turn_ack_ledger as turn_ack_ledger_module
     from server.speech_scheduler import ROLE_ACK
 
-    monkeypatch.setattr(pipeline_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.001)
-    monkeypatch.setattr(pipeline_module, "_ACK_ADMISSION_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(turn_ack_ledger_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(turn_ack_ledger_module, "_ACK_ADMISSION_MAX_ATTEMPTS", 3)
 
     async def run() -> None:
         host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
@@ -8522,9 +8522,9 @@ def test_ack_admission_retry_gives_up_after_max_attempts_instead_of_forever(
                 turn_id=turn_id,
             )
 
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         enqueue_ack()
-        host._schedule_ack_admission(
+        host._turn_ack_ledger._schedule_ack_admission(
             origin,
             ack_work_item_id,
             enqueue_ack,
@@ -8533,11 +8533,11 @@ def test_ack_admission_retry_gives_up_after_max_attempts_instead_of_forever(
         )
 
         for _ in range(200):
-            if turn_id not in host._ack_emitted_turns:
+            if turn_id not in host._turn_ack_ledger._ack_emitted_turns:
                 break
             await asyncio.sleep(0.01)
 
-        assert turn_id not in host._ack_emitted_turns, (
+        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns, (
             "the ack latch must be cleared after giving up"
         )
         assert len(attempts) == 3, "retries must stop at the attempt cap, not continue forever"
@@ -8643,7 +8643,7 @@ def test_ack_owner_lookup_is_unambiguous_for_hyphenated_turn_ids() -> None:
     async def run() -> None:
         host = SessionHost(runner_factory=LifecycleRunner)
         await host.connect(connection_handshake(host, 1))
-        host._ack_emitted_turns.update({"turn-a", "turn-a-b"})
+        host._turn_ack_ledger._ack_emitted_turns.update({"turn-a", "turn-a-b"})
         host._register_turn_work_item("turn-a", "work-turn-a")
         host._register_turn_work_item("turn-a-b", "work-turn-a-b")
 
@@ -8679,8 +8679,10 @@ def test_ack_work_item_id_accessor_matches_every_call_site() -> None:
     import inspect
 
     from server.speech_scheduler import ROLE_ACK
+    from server.turn_ack_ledger import TurnAckLedger
 
-    assert inspect.getsource(SessionHost).count('f"ack-{turn_id}"') == 1
+    assert inspect.getsource(TurnAckLedger).count('f"ack-{turn_id}"') == 1
+    assert inspect.getsource(SessionHost).count('f"ack-{turn_id}"') == 0
 
     async def run() -> None:
         from unittest.mock import patch
@@ -8695,7 +8697,12 @@ def test_ack_work_item_id_accessor_matches_every_call_site() -> None:
             calls.append(spied_turn_id)
             return f"spy-ack-{spied_turn_id}"
 
-        with patch.object(SessionHost, "_ack_work_item_id", staticmethod(spy)):
+        # Patched on TurnAckLedger, not SessionHost: SessionHost._ack_work_item_id
+        # is a thin delegator to TurnAckLedger.ack_work_item_id, and
+        # TurnAckLedger.emit_early_ack calls its own class's accessor
+        # internally, so patching the ledger's is the single interception
+        # point that covers both the emission and cancellation call sites.
+        with patch.object(TurnAckLedger, "ack_work_item_id", staticmethod(spy)):
             # Emission: the enqueued key is the accessor's, not a literal.
             await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
             assert f"spy-ack-{turn_id}" in origin.scheduler._queues
@@ -8705,7 +8712,7 @@ def test_ack_work_item_id_accessor_matches_every_call_site() -> None:
             host._register_turn_work_item(turn_id, "work-turn-accessor")
             await host.cancel_turn_or_child(turn_id, "work-turn-accessor", origin=origin)
             assert f"spy-ack-{turn_id}" not in origin.scheduler._queues
-            assert turn_id not in host._ack_emitted_turns
+            assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
 
             # A turn handler's post-commit discard reaches the same key.
             await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
@@ -8731,7 +8738,7 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
         origin = await host.connect(_capable_handshake(host, 1))
         turn_id = "turn-pending"
         ack_work_item_id = host._ack_work_item_id(turn_id)
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         origin.scheduler.enqueue(
             result_id=None,
             work_item_id=ack_work_item_id,
@@ -8757,7 +8764,7 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
         )
 
         # The child is still running, so its ack ownership outlives the handler.
-        assert host._turn_work_items.get(turn_id) == {"work-turn-pending"}
+        assert host._turn_ack_ledger._turn_work_items.get(turn_id) == {"work-turn-pending"}
         assert host._ack_turn_for_work_item("work-turn-pending") == turn_id
 
         await host.cancel_turn_or_child(
@@ -8767,7 +8774,7 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
         )
 
         assert ack_work_item_id not in origin.scheduler._queues
-        assert turn_id not in host._ack_emitted_turns
+        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
         await host.shutdown()
 
     asyncio.run(run())
@@ -8789,7 +8796,7 @@ def test_multi_intent_rejection_retracts_an_already_admitted_ack() -> None:
         origin.worker = QueueingPipelineWorker()
         turn_id = "turn-fan"
         ack_work_item_id = host._ack_work_item_id(turn_id)
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         origin.scheduler.enqueue(
             result_id=None,
             work_item_id=ack_work_item_id,
@@ -8855,7 +8862,7 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
         # cancelling an unowned target may touch it.
         other_turn = "turn-other"
         other_ack = host._ack_work_item_id(other_turn)
-        host._ack_emitted_turns.add(other_turn)
+        host._turn_ack_ledger._ack_emitted_turns.add(other_turn)
         host._register_turn_work_item(other_turn, "work-turn-other")
         origin.scheduler.enqueue(
             result_id=None,
@@ -8884,8 +8891,8 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
         assert "work-orphan" not in origin.scheduler._queues
         # ...and the unrelated turn's ack and latch are untouched.
         assert other_ack in origin.scheduler._queues
-        assert other_turn in host._ack_emitted_turns
-        assert host._turn_work_items.get(other_turn) == {"work-turn-other"}
+        assert other_turn in host._turn_ack_ledger._ack_emitted_turns
+        assert host._turn_ack_ledger._turn_work_items.get(other_turn) == {"work-turn-other"}
         await host.shutdown()
 
     asyncio.run(run())
@@ -9060,7 +9067,7 @@ def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_p
             ack_id=ack_work_item_id,
             turn_id="turn-b",
         )
-        host._ack_emitted_turns.add("turn-b")
+        host._turn_ack_ledger._ack_emitted_turns.add("turn-b")
         host._register_turn_work_item("turn-b", "work-b")
 
         final = GroundedResult(
@@ -9207,7 +9214,7 @@ def test_pending_turn_retracts_its_ack_when_submit_accepts_nothing() -> None:
         )
 
         assert _ack_items(origin.scheduler) == []
-        assert host._ack_emitted_turns == set()
+        assert host._turn_ack_ledger._ack_emitted_turns == set()
         await host.shutdown()
 
     asyncio.run(run())
@@ -9242,7 +9249,7 @@ def test_ack_admission_failure_after_the_turn_settled_does_not_requeue_it() -> N
             )
 
         enqueue_ack()
-        host._ack_emitted_turns.add(turn_id)
+        host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
 
         # The turn reaches its canonical commit and settles the ack.
         host._settle_turn_ack(origin.scheduler, turn_id)
@@ -9252,7 +9259,7 @@ def test_ack_admission_failure_after_the_turn_settled_does_not_requeue_it() -> N
             raise RuntimeError("transport not attached")
 
         origin.scheduler.start_next = failing_start_next  # type: ignore[method-assign]
-        host._schedule_ack_admission(
+        host._turn_ack_ledger._schedule_ack_admission(
             origin,
             ack_work_item_id,
             enqueue_ack,
