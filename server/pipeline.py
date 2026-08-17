@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
-from uuid import uuid4
 
 from loguru import logger
 from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
@@ -23,7 +22,6 @@ from .contracts import (
     RoutingState,
     TerminalReason,
     TranscriptEntry,
-    WorkerState,
     WorkStatusState,
 )
 from .frames import CONNECTION_LOCAL_FRAMES
@@ -43,6 +41,7 @@ from .perf_metrics import (
     WorkItemRecorder,
     WorkOutcome,
 )
+from .recorder_factory import RecorderFactory
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
@@ -82,6 +81,7 @@ from .work_status_publisher import (
     _work_status_for_outcome,
 )
 from .work_task_ledger import WorkTaskLedger
+from .worker_projection import WorkerProjection
 from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
 
 _ACK_ADMISSION_RETRY_DELAY_SECONDS = 0.25
@@ -585,9 +585,9 @@ class SessionHost:
         self._handshake_gate = HandshakeGate()
         self._turn_sequence = 0
         self._work_ledger = WorkTaskLedger()
-        self._clarification_candidates: dict[str, dict[str, str]] = {}
-        self._retained_recorders: dict[str, RetainedRecorder] = {}
+        self._worker_projection = WorkerProjection(state=self.state)
         self._measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
+        self._recorder_factory = RecorderFactory(sink=self._measurement_sink, state=self.state)
         self._closing = False
         self.started = False
         # Turn-scoped acknowledgement latch (Requirements: one ephemeral ack
@@ -845,54 +845,6 @@ class SessionHost:
         self._turn_sequence += 1
         return f"turn-{self._turn_sequence}"
 
-    def _new_app_turn_recorder(self, *, origin_epoch: int, turn_id: str) -> AppTurnRecorder:
-        return AppTurnRecorder(
-            self.measurement_sink,
-            session_id=self.state.session_id,
-            origin_epoch=origin_epoch,
-            turn_id=turn_id,
-        )
-
-    def _new_retained_recorder(
-        self, *, origin_epoch: int, turn_id: str, work_item_id: str, app_worker_id: str
-    ) -> RetainedRecorder:
-        return RetainedRecorder(
-            self.measurement_sink,
-            session_id=self.state.session_id,
-            origin_epoch=origin_epoch,
-            turn_id=turn_id,
-            work_item_id=work_item_id,
-            app_worker_id=app_worker_id,
-        )
-
-    def _register_retained_recorder_if_open(
-        self, work_item_id: str, recorder: RetainedRecorder
-    ) -> None:
-        """Register a provisional retained recorder only if it has not already
-        raced to completion between dispatch and accepted retention."""
-        if not recorder.finalized:
-            self._retained_recorders[work_item_id] = recorder
-
-    @staticmethod
-    def _make_late_terminal_handler(
-        recorders: Mapping[str, RetainedRecorder],
-    ) -> Callable[[str, WorkOutcome], None]:
-        """Build a coordinator ``on_late_terminal`` callback that claims the
-        matching retained recorder, if any, for a late-completing work item.
-
-        Typed against the wider ``WorkOutcome`` rather than the coordinator's
-        narrower ``TerminalKind``: by contravariance this still satisfies the
-        coordinator's hook type, while remaining assignable wherever a full
-        work outcome (including ``invalid_result``) is claimed.
-        """
-
-        def on_late_terminal(item_id: str, terminal_kind: WorkOutcome) -> None:
-            recorder = recorders.get(item_id)
-            if recorder is not None:
-                recorder.claim(terminal_kind)
-
-        return on_late_terminal
-
     @staticmethod
     def _failure_child_outcome(failure: WorkItemFailure) -> WorkItemOutcome:
         """Classify a work-item failure from its structured ``failure_kind``.
@@ -1021,7 +973,7 @@ class SessionHost:
                 terminal_reason="missing_worker",
             )
             return None
-        self._project_worker(worker, origin_epoch=request.origin_epoch, status="running")
+        self._worker_projection.project(worker, origin_epoch=request.origin_epoch, status="running")
         search = getattr(worker, "search", None)
         worker_id: str = request.worker_id_override or str(
             getattr(getattr(worker, "metadata", None), "worker_id", "main")
@@ -1479,7 +1431,9 @@ class SessionHost:
         origin_epoch = origin.epoch
         turn_id = self._next_turn_id()
         work_item_id = f"work-{turn_id}"
-        turn_recorder = self._new_app_turn_recorder(origin_epoch=origin_epoch, turn_id=turn_id)
+        turn_recorder = self._recorder_factory.new_app_turn_recorder(
+            origin_epoch=origin_epoch, turn_id=turn_id
+        )
         # Delegated children that have had a work_status emitted, so a
         # cancellation of this turn can terminalize whichever are still open.
         delegated_children: dict[str, str | None] = {}
@@ -1796,7 +1750,7 @@ class SessionHost:
                     )
             except WorkerClarify as exc:
                 search_ms = (time.perf_counter() - search_started) * 1000
-                result = self._worker_clarification_result(
+                result = self._worker_projection.clarification_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
                     question=exc.question,
@@ -1883,7 +1837,7 @@ class SessionHost:
             )
             turn_recorder.record_commit(commit_ms)
             turn_recorder.finalize()
-            self._project_worker(
+            self._worker_projection.project(
                 worker,
                 origin_epoch=origin_epoch,
                 status="idle",
@@ -1972,7 +1926,7 @@ class SessionHost:
             # doesn't build one for any caller, so it's built here and stashed
             # on the returned ``DelegatedChild`` (not frozen) for callers that
             # inspect ``delegation.retained_recorder`` later.
-            retained_recorder = self._new_retained_recorder(
+            retained_recorder = self._recorder_factory.new_retained_recorder(
                 origin_epoch=origin.epoch,
                 turn_id=turn_id,
                 work_item_id=work_item_id,
@@ -1985,9 +1939,13 @@ class SessionHost:
             await self._emit_early_ack(
                 origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
             )
-            clarification_context = self._clarification_context(pending, transcript)
+            clarification_context = self._worker_projection.clarification_context(
+                pending, transcript
+            )
             outcome_label: WorkItemOutcome = "completed"
-            on_late_terminal = self._make_late_terminal_handler({work_item_id: retained_recorder})
+            on_late_terminal = self._recorder_factory.make_late_terminal_handler(
+                {work_item_id: retained_recorder}
+            )
 
             async def execute(_worker_id: str, query: str) -> GroundedResult:
                 nonlocal outcome_label
@@ -2003,7 +1961,7 @@ class SessionHost:
                     return result
                 except WorkerClarify as exc:
                     outcome_label = "clarify"
-                    return self._worker_clarification_result(
+                    return self._worker_projection.clarification_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
                         question=exc.question,
@@ -2044,7 +2002,7 @@ class SessionHost:
                 child_outcome_label = "retained"
                 retained_still_open = True
                 child.finalize(outcome="retained", app_worker_id=worker_id)
-                self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+                self._recorder_factory.register_if_open(work_item_id, retained_recorder)
                 # A retained work item is still working, so `background` is
                 # its truthful status on every connection -- the observer,
                 # not this call site, decides which connections may see it
@@ -2307,7 +2265,7 @@ class SessionHost:
                 runnable_indexes.append(index)
                 runnable_workers[index] = worker
                 contexts[index] = (
-                    self._clarification_context(pending, item_text)
+                    self._worker_projection.clarification_context(pending, item_text)
                     if index == 0 and pending is not None
                     else None
                 )
@@ -2362,7 +2320,7 @@ class SessionHost:
                     outcome_labels[item_index] = "clarify"
                     context = contexts[item_index]
                     original_query = context.original_query if context is not None else query
-                    return self._worker_clarification_result(
+                    return self._worker_projection.clarification_result(
                         worker_id=worker_id,
                         turn_id=item_turn_id,
                         question=exc.question,
@@ -2383,7 +2341,7 @@ class SessionHost:
             # list is still needed below for `coordinator.submit`.
             work_item_ids = [f"work-{turn_id}-{index}" for index in runnable_indexes]
             retained_recorders: dict[str, RetainedRecorder] = {
-                f"work-{turn_id}-{index}": self._new_retained_recorder(
+                f"work-{turn_id}-{index}": self._recorder_factory.new_retained_recorder(
                     origin_epoch=origin.epoch,
                     turn_id=turn_id,
                     work_item_id=f"work-{turn_id}-{index}",
@@ -2391,7 +2349,7 @@ class SessionHost:
                 )
                 for index in runnable_indexes
             }
-            on_late_terminal = self._make_late_terminal_handler(retained_recorders)
+            on_late_terminal = self._recorder_factory.make_late_terminal_handler(retained_recorders)
 
             def _multi_intent_late_context(late: LateResult) -> LateDeliveryContext:
                 return self._new_late_delivery_context(
@@ -2543,7 +2501,7 @@ class SessionHost:
                     )
                 recorder = retained_recorders.get(work_item_id)
                 if recorder is not None:
-                    self._register_retained_recorder_if_open(work_item_id, recorder)
+                    self._recorder_factory.register_if_open(work_item_id, recorder)
             for failure in submitted.failures:
                 matched = index_for_work_item_id.get(failure.work_item_id)
                 if matched is None:
@@ -2764,41 +2722,6 @@ class SessionHost:
             else:
                 self._release_all_turn_work_items(turn_id)
 
-    def _worker_clarification_result(
-        self,
-        *,
-        worker_id: str,
-        turn_id: str,
-        question: str,
-        original_query: str,
-        origin_epoch: int | None,
-    ) -> GroundedResult:
-        """Record a worker's clarifying question as the next turn's pending candidate."""
-        result_id = f"result-{uuid4().hex}"
-        self._clarification_candidates[result_id] = {
-            "worker_id": worker_id,
-            "turn_id": turn_id,
-            "original_query": original_query,
-            "question": question,
-        }
-        return canonical_result(
-            worker_id=worker_id,
-            turn_id=turn_id,
-            text=question,
-            result_id=result_id,
-            origin_epoch=origin_epoch,
-        )
-
-    @staticmethod
-    def _clarification_context(pending: Any, transcript: str) -> ClarificationContext | None:
-        if pending is None or not pending.original_query:
-            return None
-        return ClarificationContext(
-            original_query=pending.original_query,
-            question=pending.question,
-            answer=transcript,
-        )
-
     def _dispatch_search_task(
         self,
         search: Callable[..., Any],
@@ -2868,7 +2791,7 @@ class SessionHost:
         # before the foreground wait -- not only if it later times out -- so
         # background_ms always starts at work dispatch (Timing Boundaries).
         # It is discarded unregistered if the foreground wait completes first.
-        retained_recorder = self._new_retained_recorder(
+        retained_recorder = self._recorder_factory.new_retained_recorder(
             origin_epoch=origin_epoch,
             turn_id=turn_id,
             work_item_id=work_item_id,
@@ -2886,7 +2809,7 @@ class SessionHost:
         # callback to the coordinator, so it is always in the registry by the
         # time that callback could possibly run -- regardless of whether a
         # future refactor inserts an await between the two calls.
-        self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+        self._recorder_factory.register_if_open(work_item_id, retained_recorder)
         late_context = self._new_late_delivery_context(
             turn_id=turn_id,
             work_item_id=work_item_id,
@@ -2898,10 +2821,12 @@ class SessionHost:
             work_item_id=work_item_id,
             worker_id=worker_id,
             on_complete=lambda late: self.commit_late_result_once(late_context, late),
-            on_late_terminal=self._make_late_terminal_handler({work_item_id: retained_recorder}),
+            on_late_terminal=self._recorder_factory.make_late_terminal_handler(
+                {work_item_id: retained_recorder}
+            ),
         )
         if not accepted:
-            self._retained_recorders.pop(work_item_id, None)
+            self._recorder_factory.pop(work_item_id)
             return SearchExecution("retention_rejected")
         return SearchExecution("retained")
 
@@ -3000,7 +2925,7 @@ class SessionHost:
         # remainder of this method stays telemetry-silent rather than opening a
         # replacement recorder, whose start instant would be completion time
         # and whose `background_ms` would therefore be near zero.
-        recorder = self._retained_recorders.pop(late.work_item_id, None)
+        recorder = self._recorder_factory.pop(late.work_item_id)
         if recorder is not None and late.terminal_kind is not None:
             recorder.claim(late.terminal_kind)
 
@@ -3022,7 +2947,7 @@ class SessionHost:
         if was_cancelled:
             self._cancelled_work_items.discard(late.work_item_id)
             if isinstance(late.result, GroundedResult):
-                self._clarification_candidates.pop(late.result.result_id, None)
+                self._worker_projection.pop_clarification_candidate(late.result.result_id)
 
         # The recorder was already popped above, so it is only reachable from
         # this stack frame from here on. A CancelledError delivered during the
@@ -3267,7 +3192,7 @@ class SessionHost:
             )
         )
         self.state.append_result(result, origin_epoch=result.origin_epoch)
-        candidate = self._clarification_candidates.pop(result.result_id, None)
+        candidate = self._worker_projection.pop_clarification_candidate(result.result_id)
         if candidate is not None and self.accepts(result.origin_epoch):
             self._require_coordinator().add_worker_clarification(
                 session_id=self.state.session_id,
@@ -3305,7 +3230,7 @@ class SessionHost:
         if work_item_id in self._cancelled_work_items:
             self._cancelled_work_items.discard(work_item_id)
             self._known_work_items.discard(work_item_id)
-            self._clarification_candidates.pop(result.result_id, None)
+            self._worker_projection.pop_clarification_candidate(result.result_id)
             if suppressed_out is not None:
                 suppressed_out.add(work_item_id)
             return result
@@ -3397,44 +3322,6 @@ class SessionHost:
         selected = tuple(item for item in selected if item != exclude_work_item_id)
         self._work_ledger.cancel_selected(selected)
         return selected
-
-    def _project_worker(
-        self,
-        worker: Any,
-        *,
-        origin_epoch: int,
-        status: str,
-        latest_result_id: str | None = None,
-    ) -> None:
-        metadata = getattr(worker, "metadata", None)
-        if metadata is None:
-            return
-        worker_id = getattr(metadata, "worker_id", None)
-        topic = getattr(metadata, "topic", None)
-        model_policy = getattr(metadata, "model_policy", None)
-        if (
-            not (isinstance(worker_id, str) and worker_id)
-            or not (isinstance(topic, str) and topic)
-            or not (isinstance(model_policy, str) and model_policy)
-        ):
-            return
-        previous = self.state.workers.get(worker_id)
-        self.state.set_worker(
-            WorkerState(
-                worker_id=worker_id,
-                topic=topic,
-                model_policy=model_policy,
-                status=status,
-                latest_result_id=(
-                    latest_result_id
-                    if latest_result_id is not None
-                    else previous.latest_result_id
-                    if previous is not None
-                    else None
-                ),
-                origin_epoch=origin_epoch,
-            )
-        )
 
     def _emit_work_status(
         self,
@@ -3591,9 +3478,7 @@ class SessionHost:
         # retained recorder still open: unclaimed work is shutdown-cancelled,
         # while claimed work uses its recorded terminal kind and whatever
         # commit/speech stage it had already reached.
-        for work_item_id, recorder in tuple(self._retained_recorders.items()):
-            recorder.finalize()
-            self._retained_recorders.pop(work_item_id, None)
+        self._recorder_factory.finalize_all()
         # A retained child's ack ownership is released by its late-result
         # callback, which shutdown suppresses. Drop what is left rather than
         # carrying it for the process's remaining lifetime.

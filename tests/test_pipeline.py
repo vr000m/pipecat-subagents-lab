@@ -840,7 +840,7 @@ def test_stale_worker_clarification_cannot_take_pending_dialogue_after_reconnect
         await pending
 
         assert coordinator.clarifications == []
-        assert host._clarification_candidates == {}
+        assert host._worker_projection._clarification_candidates == {}
         await host.shutdown()
 
     asyncio.run(run())
@@ -1985,7 +1985,9 @@ def test_multi_intent_preserves_envelope_fallbacks_and_uses_submit() -> None:
             "",
             origin,
             "turn-compound",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-compound"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-compound"
+            ),
         )
 
         assert [result.text for result in results] == [
@@ -2043,7 +2045,9 @@ def test_multi_intent_reclarification_preserves_the_original_pending_query() -> 
             "",
             origin,
             "turn-compound",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-compound"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-compound"
+            ),
         )
 
         next_pending = coordinator.pending(host.state.session_id)
@@ -3730,7 +3734,9 @@ def test_multi_intent_mixed_outcomes_emit_one_child_per_item_and_mixed_parent() 
             "",
             origin,
             "turn-compound",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-compound"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-compound"
+            ),
         )
 
         assert [result.text for result in results] == [
@@ -3819,7 +3825,9 @@ def test_multi_intent_execute_called_more_times_than_dispatched_raises_cleanly()
             "",
             origin,
             "turn-extra",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-extra"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-extra"
+            ),
         )
 
         execute = captured["execute"]
@@ -3874,7 +3882,9 @@ def test_multi_intent_all_completed_emits_completed_parent_and_all_completed_chi
             "",
             origin,
             "turn-all-complete",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-all-complete"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-all-complete"
+            ),
         )
 
         parent = _events(sink, "app_turn_foreground")[0].fields
@@ -3936,7 +3946,9 @@ def test_pending_search_submit_exception_still_emits_failed_parent() -> None:
                 "continue please",
                 origin,
                 "turn-pending-fail",
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending-fail"),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending-fail"
+                ),
             )
 
         parent = _events(sink, "app_turn_foreground")[0].fields
@@ -4015,7 +4027,7 @@ def test_multi_intent_commit_failure_does_not_drop_sibling_results() -> None:
                 "",
                 origin,
                 "turn-multi-commit-partial-fail",
-                host._new_app_turn_recorder(
+                host._recorder_factory.new_app_turn_recorder(
                     origin_epoch=origin.epoch, turn_id="turn-multi-commit-partial-fail"
                 ),
             )
@@ -4077,7 +4089,7 @@ def test_multi_intent_commit_exception_still_emits_failed_parent() -> None:
                 "",
                 origin,
                 "turn-multi-commit-fail",
-                host._new_app_turn_recorder(
+                host._recorder_factory.new_app_turn_recorder(
                     origin_epoch=origin.epoch, turn_id="turn-multi-commit-fail"
                 ),
             )
@@ -4149,13 +4161,13 @@ def _register_dispatch_recorder(
 ) -> object:
     """Stand in for the dispatch-time provisional recorder registration that
     every retained work item goes through before its late callback can run."""
-    recorder = host._new_retained_recorder(
+    recorder = host._recorder_factory.new_retained_recorder(
         origin_epoch=origin_epoch,
         turn_id=turn_id,
         work_item_id=work_item_id,
         app_worker_id=worker_id,
     )
-    host._retained_recorders[work_item_id] = recorder
+    host._recorder_factory._retained_recorders[work_item_id] = recorder
     return recorder
 
 
@@ -4279,7 +4291,7 @@ def test_retained_late_result_cancelled_during_speech_start_still_emits_backgrou
         # start_next raised before it could set "queued"; finalize's own
         # terminal default fills the still-unset speech axis.
         assert fields["speech_outcome"] == "cancelled"
-        assert "work-cancel-during-start" not in host._retained_recorders
+        assert "work-cancel-during-start" not in host._recorder_factory._retained_recorders
         await host.shutdown()
 
     asyncio.run(run())
@@ -4834,7 +4846,7 @@ def test_search_with_timeout_registers_recorder_before_retention_captures_eager_
         await host.coordinator._callback
         await asyncio.gather(host.coordinator.search_task, return_exceptions=True)
 
-        assert "work-eager" not in host._retained_recorders
+        assert "work-eager" not in host._recorder_factory._retained_recorders
         fields = _background_records(sink)[0].fields
         assert fields["work_item_id"] == "work-eager"
         assert fields["work_outcome"] == "completed"
@@ -5579,7 +5591,9 @@ def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
             "continue please",
             origin,
             "turn-pending-snapshot",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending-snapshot"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending-snapshot"
+            ),
         )
 
         assert len(captured_contexts) == 1
@@ -5642,7 +5656,7 @@ def test_pending_turn_cancelled_mid_submit_sweeps_the_child_as_cancelled() -> No
                 "continue please",
                 origin,
                 "turn-pending-cancel",
-                host._new_app_turn_recorder(
+                host._recorder_factory.new_app_turn_recorder(
                     origin_epoch=origin.epoch, turn_id="turn-pending-cancel"
                 ),
             )
@@ -5766,7 +5780,9 @@ def test_multi_intent_unmatched_result_turn_id_is_dropped_without_losing_the_tur
             "",
             origin,
             "turn-fan",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-fan"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-fan"
+            ),
         )
 
         assert [result.text for result in committed] == ["first answer"]
@@ -5807,7 +5823,9 @@ def test_multi_intent_duplicate_result_turn_ids_keep_last_content_and_one_child_
             "",
             origin,
             "turn-dup",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-dup"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-dup"
+            ),
         )
 
         assert [result.text for result in committed] == ["second answer"]
@@ -5857,7 +5875,9 @@ def test_multi_intent_malformed_pending_and_failure_ids_warn_instead_of_raising(
             "",
             origin,
             "turn-bad",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-bad"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-bad"
+            ),
         )
 
         assert [result.text for result in committed] == ["first answer"]
@@ -5899,7 +5919,9 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_subsequent_w
             "",
             origin,
             "turn-orphan",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-orphan"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-orphan"
+            ),
         )
 
         # Still reachable after reconcile -- not yet cancelled.
@@ -5988,7 +6010,9 @@ def test_multi_intent_whole_turn_cancel_between_children_reaches_the_already_ack
             "first item and second item",
             origin,
             turn_id,
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id=turn_id
+            ),
         )
 
         assert f"work-{turn_id}-0" in captured_cancelled_work
@@ -6070,7 +6094,9 @@ def test_multi_intent_missing_worker_and_missing_search_each_get_their_own_faile
             "",
             origin,
             turn_id,
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id=turn_id
+            ),
         )
 
         def child_states() -> dict[str, str]:
@@ -6195,7 +6221,9 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_
             "",
             origin,
             "turn-orphan",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-orphan"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-orphan"
+            ),
         )
 
         assert "work-turn-orphan-0" in host._known_work_items
@@ -6257,7 +6285,9 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
             "",
             origin,
             "turn-role",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-role"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-role"
+            ),
         )
 
         assert [result.text for result in committed] == [
@@ -6468,7 +6498,9 @@ def test_multi_intent_turn_emits_exactly_one_parent_ack_for_its_sole_delegated_c
                 "",
                 origin,
                 "turn-mixed-ack",
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-mixed-ack"),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-mixed-ack"
+                ),
             )
         )
         await asyncio.wait_for(search.started.wait(), timeout=1)
@@ -6539,7 +6571,9 @@ def test_multi_intent_turn_with_only_non_delegated_children_gets_no_ack() -> Non
             "",
             origin,
             "turn-no-ack",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-no-ack"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-no-ack"
+            ),
         )
 
         assert _ack_items(origin.scheduler) == []
@@ -6967,7 +7001,9 @@ def test_pending_continuation_turn_emits_routing_through_terminal_work_status() 
             "continue please",
             origin,
             "turn-pending",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending"
+            ),
         )
 
         assert _work_status_states(host) == ["routing", "searching", "result_ready"]
@@ -6991,7 +7027,9 @@ def test_pending_continuation_retained_child_reports_background_not_failed() -> 
             "continue please",
             origin,
             "turn-pending",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending"
+            ),
         )
 
         states = _work_status_states(host)
@@ -7033,7 +7071,7 @@ def test_pending_missing_worker_emits_failed_work_status() -> None:
             "continue please",
             origin,
             "turn-pending-missing-worker",
-            host._new_app_turn_recorder(
+            host._recorder_factory.new_app_turn_recorder(
                 origin_epoch=origin.epoch, turn_id="turn-pending-missing-worker"
             ),
         )
@@ -7077,7 +7115,7 @@ def test_pending_missing_search_emits_failed_work_status() -> None:
             "continue please",
             origin,
             "turn-pending-missing-search",
-            host._new_app_turn_recorder(
+            host._recorder_factory.new_app_turn_recorder(
                 origin_epoch=origin.epoch, turn_id="turn-pending-missing-search"
             ),
         )
@@ -7115,7 +7153,9 @@ def test_pending_delegation_projects_worker_running_before_terminal() -> None:
             "continue please",
             origin,
             "turn-pending",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending"
+            ),
         )
 
         worker_statuses = [
@@ -7193,7 +7233,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
                 "continue please",
                 origin,
                 "turn-pending-noack",
-                host._new_app_turn_recorder(
+                host._recorder_factory.new_app_turn_recorder(
                     origin_epoch=origin.epoch, turn_id="turn-pending-noack"
                 ),
             )
@@ -7264,7 +7304,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
                     "",
                     origin,
                     "turn-mixed-noack",
-                    host._new_app_turn_recorder(
+                    host._recorder_factory.new_app_turn_recorder(
                         origin_epoch=origin.epoch, turn_id="turn-mixed-noack"
                     ),
                 )
@@ -7309,7 +7349,9 @@ def test_multi_intent_parent_aggregate_progresses_through_its_children() -> None
             "",
             origin,
             "turn-multi",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-multi"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-multi"
+            ),
         )
 
         assert _work_status_states(host) == ["routing", "searching", "result_ready"]
@@ -7351,7 +7393,9 @@ def test_multi_intent_mixed_terminal_children_aggregate_to_failed_parent() -> No
             "",
             origin,
             "turn-mix",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-mix"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-mix"
+            ),
         )
 
         assert _work_status_states(host) == ["routing", "searching", "failed"]
@@ -7409,7 +7453,9 @@ def test_multi_intent_declined_child_still_terminates_the_parent_aggregate() -> 
             "",
             origin,
             "turn-declined",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-declined"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-declined"
+            ),
         )
 
         assert _work_status_states(host) == ["routing", "searching", "result_ready"]
@@ -7576,7 +7622,9 @@ def test_cancelled_pending_turn_terminalizes_its_non_terminal_child_status() -> 
                 "continue please",
                 origin,
                 "turn-cancel",
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-cancel"),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-cancel"
+                ),
             )
         )
         await asyncio.wait_for(coordinator.submitting.wait(), 1)
@@ -7624,7 +7672,9 @@ def test_cancelled_multi_intent_turn_terminalizes_every_non_terminal_child() -> 
                 "",
                 origin,
                 "turn-multi-cancel",
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-multi-cancel"),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-multi-cancel"
+                ),
             )
         )
         await asyncio.wait_for(coordinator.submitting.wait(), 1)
@@ -7724,14 +7774,16 @@ def test_cancel_of_retained_child_after_turn_task_returns_emits_terminal_status(
                 "",
                 origin,
                 turn_id,
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id=turn_id
+                ),
             )
         )
         await asyncio.wait_for(worker.started.wait(), 1)
         await turn  # the owning multi-intent turn task fully returns; the sole
         # child stays retained as background work
 
-        assert child_work_item_id in host._retained_recorders
+        assert child_work_item_id in host._recorder_factory._retained_recorders
         statuses = {s.work_item_id: s.state for s in host.state.work_status_snapshot()}
         assert statuses[parent_work_item_id] == "background"
 
@@ -7987,7 +8039,9 @@ def test_pending_retained_child_on_capable_connection_stays_status_only() -> Non
             "continue please",
             origin,
             "turn-pending",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending"
+            ),
         )
 
         assert returned is None
@@ -8022,7 +8076,9 @@ def test_multi_intent_retained_child_on_capable_connection_stays_status_only() -
             "first and second",
             origin,
             "turn-fan",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-fan"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-fan"
+            ),
         )
 
         assert [result.text for result in committed] == ["first answer"]
@@ -8096,7 +8152,9 @@ def test_submit_failure_terminalizes_every_registered_child_as_failed() -> None:
                 "continue please",
                 origin,
                 "turn-pending",
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending"
+                ),
             )
 
         assert _work_status_states(host) == ["routing", "searching", "failed"]
@@ -8123,7 +8181,9 @@ def test_multi_intent_child_never_returned_by_fan_in_is_reconciled_to_failed() -
             "first and second",
             origin,
             "turn-fan",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-fan"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-fan"
+            ),
         )
 
         # Only the parent aggregate is client-visible. With one child completed
@@ -8237,7 +8297,9 @@ def test_multi_intent_cancel_racing_the_commit_downgrades_the_pre_derived_status
             "only item",
             origin,
             "turn-race",
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-race"),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-race"
+            ),
         )
 
         # The turn's sole child was suppressed, so the parent aggregate is that
@@ -8687,7 +8749,9 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
                 "continue please",
                 origin,
                 turn_id,
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id=turn_id
+                ),
             )
             is None
         )
@@ -8745,7 +8809,9 @@ def test_multi_intent_rejection_retracts_an_already_admitted_ack() -> None:
             "first and second",
             origin,
             turn_id,
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id=turn_id
+            ),
         )
 
         assert committed == ()
@@ -8863,7 +8929,9 @@ def test_multi_intent_sibling_commit_exception_does_not_fail_a_retained_child() 
                 "",
                 origin,
                 "turn-fan",
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-fan"),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-fan"
+                ),
             )
 
         def child_states() -> dict[str, str]:
@@ -8878,7 +8946,7 @@ def test_multi_intent_sibling_commit_exception_does_not_fail_a_retained_child() 
         # The retained sibling must stay non-terminal, not be swept to
         # "failed" by the outer exception handler.
         assert states["work-turn-fan-1"] == "background"
-        assert "work-turn-fan-1" in host._retained_recorders
+        assert "work-turn-fan-1" in host._recorder_factory._retained_recorders
 
         # The late result for the retained child now lands and succeeds; it
         # must still be able to terminalize the child to "result_ready".
@@ -9059,7 +9127,9 @@ def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
                 "continue please",
                 origin,
                 "turn-pending",
-                host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending"
+                ),
             )
 
         # The ack must have actually been queued before the exception, or
@@ -9131,7 +9201,9 @@ def test_pending_turn_retracts_its_ack_when_submit_accepts_nothing() -> None:
             "continue please",
             origin,
             turn_id,
-            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id=turn_id),
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id=turn_id
+            ),
         )
 
         assert _ack_items(origin.scheduler) == []

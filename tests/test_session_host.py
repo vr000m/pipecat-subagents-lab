@@ -890,13 +890,13 @@ def _register_late_recorder(
     origin_epoch: int = 1,
     worker_id: str = "worker-weather",
 ) -> object:
-    recorder = host._new_retained_recorder(
+    recorder = host._recorder_factory.new_retained_recorder(
         origin_epoch=origin_epoch,
         turn_id=turn_id,
         work_item_id=work_item_id,
         app_worker_id=worker_id,
     )
-    host._retained_recorders[work_item_id] = recorder
+    host._recorder_factory._retained_recorders[work_item_id] = recorder
     return recorder
 
 
