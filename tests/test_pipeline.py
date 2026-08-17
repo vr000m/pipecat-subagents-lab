@@ -1,6 +1,7 @@
 """Connection pipelines expose authoritative state through a fakeable observer."""
 
 import asyncio
+import dataclasses
 import threading
 import time
 
@@ -32,7 +33,7 @@ from server.pipeline import (
     CanonicalResultAdapter,
     LateDeliveryContext,
     SessionHost,
-    _work_status_after_commit_failure,
+    work_status_after_commit_failure,
     build_pipeline,
     framework_bridge,
 )
@@ -1872,7 +1873,6 @@ def test_concurrent_registration_of_one_worker_uses_one_runner_operation() -> No
         await asyncio.gather(first, second)
 
         assert runner.calls == 1
-        assert host._runner_supervisor._runner_handles == {"worker-1": worker}
         assert host._runner_supervisor._runner_registered == {"worker-1"}
 
     asyncio.run(run())
@@ -2079,7 +2079,7 @@ def test_new_dynamic_worker_is_registered_before_search_dispatch() -> None:
 
         assert result.text == "Answer for historical capitals"
         assert runner.added == [worker]
-        assert host._runner_supervisor._runner_handles["worker-search"] is worker
+        assert host._runner_supervisor._runner_registered == {"worker-search"}
         await host.shutdown()
 
     asyncio.run(run())
@@ -2412,6 +2412,59 @@ def test_canonical_adapter_rejects_raw_frames_and_only_admits_downstream_results
     }
     assert adapter.accepts(frame) is True
     assert adapter._normalized_result(frame)["spoken_text"] == "A short answer."
+
+
+def test_canonical_adapter_preserves_work_status_wire_absence() -> None:
+    """Regression: the adapter re-serialized every RTVI envelope with a bare
+    ``model_dump``, which re-materialized ``work_status`` at its ``[]`` model
+    default even for a snapshot whose payload deliberately omitted the field
+    (a connection that never negotiated ``work_status_v1`` -- see
+    ``RuntimeSnapshot.wire_payload``). The pinned pre-Phase-3 runtime-snapshot
+    schema is ``additionalProperties: false``, so a legacy client rejects the
+    frame. Wire presence out must mirror wire presence in."""
+
+    async def run() -> None:
+        adapter = CanonicalResultAdapter()
+        forwarded: list[object] = []
+
+        async def push(frame: object, _direction: object) -> None:
+            forwarded.append(frame)
+
+        adapter.push_frame = push  # type: ignore[method-assign]
+
+        def envelope(payload_extra: dict[str, object]) -> RTVIServerMessageFrame:
+            payload = {
+                "contract_version": "v1.0",
+                "session_id": "wire-session",
+                "snapshot_sequence": 9,
+                "workers": [],
+                "results": [],
+                "speech_progress": [],
+                "routing": None,
+                "transcript": [],
+                "origin_epoch": 3,
+            }
+            payload.update(payload_extra)
+            return RTVIServerMessageFrame(
+                data={
+                    "contract_version": "v1.0",
+                    "session_id": "wire-session",
+                    "sequence": 9,
+                    "kind": "runtime_snapshot",
+                    "data": payload,
+                    "origin_epoch": 3,
+                }
+            )
+
+        omitted = envelope({})
+        await adapter.process_frame(omitted, FrameDirection.DOWNSTREAM)
+        assert "work_status" not in omitted.data["data"]
+
+        present = envelope({"work_status": []})
+        await adapter.process_frame(present, FrameDirection.DOWNSTREAM)
+        assert present.data["data"]["work_status"] == []
+
+    asyncio.run(run())
 
 
 def test_canonical_adapter_forwards_versioned_rtvi_runtime_envelopes() -> None:
@@ -6841,7 +6894,7 @@ def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_liv
 #
 # Both status-deriving call sites (the delegated-child finalization path and
 # ``commit_late_result_once``'s finally block) must route through
-# ``_work_status_for_outcome``. These references reimplement the two former
+# ``work_status_for_outcome``. These references reimplement the two former
 # inline derivations; the parametrised tables below lock them to the shared
 # helper so the two sites can never drift apart again.
 
@@ -6896,7 +6949,7 @@ _CHILD_OUTCOME_LABELS = (
 def test_work_status_helper_matches_the_delegated_child_derivation(
     label: str, was_cancelled: bool
 ) -> None:
-    assert pipeline_module._work_status_for_outcome(
+    assert pipeline_module.work_status_for_outcome(
         label, cancelled=was_cancelled, terminal_kind=label
     ) == _reference_delegated_child_site(label, was_cancelled)
 
@@ -8413,6 +8466,89 @@ def test_ack_admission_retry_is_discarded_when_the_turn_is_no_longer_live() -> N
     asyncio.run(run())
 
 
+def test_ack_admission_retry_clears_the_latch_when_the_epoch_is_no_longer_live() -> None:
+    """Regression (#25): ``_retry_or_abandon``'s "no longer live" arm returned
+    without clearing the turn's ack latch. On the ``needs_requeue=True``
+    (exception) path ``start_next`` has already discarded the item from
+    scheduler bookkeeping, so nothing is left queued for
+    ``SpeechScheduler.interrupt``'s reconnect sweep to route through
+    ``on_ack_terminal`` -- the latch survived until the turn handler's
+    ``finally``. Within that window a later eligible multi-intent sibling
+    calling ``emit_early_ack`` short-circuits on the latch and the turn loses
+    its only remaining chance at an ack. The abandon branch two lines below
+    always settled, so the asymmetry was unintentional.
+    """
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        ledger = host._turn_ack_ledger
+
+        async def failing_start_next(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("worker not attached")
+
+        origin.scheduler.start_next = failing_start_next  # type: ignore[method-assign]
+
+        ledger._ack_emitted_turns.add("turn-stale-epoch")
+        # Latched turn, live connection, but a stale origin_epoch: the
+        # not-live arm, reached with needs_requeue=True.
+        ledger._schedule_ack_admission(
+            origin,
+            ledger.ack_work_item_id("turn-stale-epoch"),
+            lambda: None,
+            turn_id="turn-stale-epoch",
+            origin_epoch=origin.epoch + 7,
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert "turn-stale-epoch" not in ledger._ack_emitted_turns
+        # ...so a later eligible sibling of the same turn can still claim the
+        # turn's one ack instead of being short-circuited by a dead latch.
+        await ledger.emit_early_ack(
+            origin,
+            turn_id="turn-stale-epoch",
+            origin_epoch=origin.epoch,
+            dispatched=False,
+        )
+        assert "turn-stale-epoch" in ledger._ack_emitted_turns
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_turn_ack_ledger_reads_feature_policy_and_ack_text_live() -> None:
+    """Regression (#24): the ledger snapshotted ``feature_policy`` and
+    ``early_ack_text`` at construction, while the pre-extraction code read
+    both live off SessionHost on every ack. ``scripts/smoke_conversation.py``
+    reassigns ``host.config`` after construction, so a snapshot would silently
+    serve stale values -- the same reason ``connection``/``accepts`` were
+    already passed as live callables."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        ledger = host._turn_ack_ledger
+
+        host.config = dataclasses.replace(host.config, early_ack_text="Reassigned wording.")
+        await ledger.emit_early_ack(
+            origin, turn_id="turn-live-text", origin_epoch=origin.epoch, dispatched=False
+        )
+        queued = origin.scheduler._queues[ledger.ack_work_item_id("turn-live-text")]
+        assert [item.text for item in queued] == ["Reassigned wording."]
+
+        # The feature-policy gate is read live too: flipping the kill switch
+        # after construction must suppress the next turn's ack.
+        host.feature_policy = dataclasses.replace(host.feature_policy, enable_early_ack=False)
+        await ledger.emit_early_ack(
+            origin, turn_id="turn-flag-off", origin_epoch=origin.epoch, dispatched=False
+        )
+        assert "turn-flag-off" not in ledger._ack_emitted_turns
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_ack_admission_retries_after_a_transient_start_next_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9290,13 +9426,13 @@ def test_session_host_accepts_a_non_default_config_without_a_registry() -> None:
 def test_cancelled_child_whose_commit_raises_is_reported_cancelled_not_failed() -> None:
     """Round 7 (deep-review/logic): cancellation classifies a work item
     regardless of whether its result additionally cleared the commit fences
-    (``_work_status_for_outcome``). The commit-failure epilogue published
+    (``work_status_for_outcome``). The commit-failure epilogue published
     ``failed`` unconditionally instead, and a terminal parent never
     regresses, so nothing could correct it afterwards."""
-    assert _work_status_after_commit_failure(("cancelled", None)) == ("cancelled", None)
-    assert _work_status_after_commit_failure(("result_ready", None)) == ("failed", None)
-    assert _work_status_after_commit_failure(("background", None)) is None
-    assert _work_status_after_commit_failure(None) is None
+    assert work_status_after_commit_failure(("cancelled", None)) == ("cancelled", None)
+    assert work_status_after_commit_failure(("result_ready", None)) == ("failed", None)
+    assert work_status_after_commit_failure(("background", None)) is None
+    assert work_status_after_commit_failure(None) is None
 
 
 def test_multi_intent_fan_in_guard_never_logs_the_spoken_query() -> None:

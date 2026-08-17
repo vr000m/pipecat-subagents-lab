@@ -205,11 +205,14 @@ def build_analysis(
             matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
             quality_score=record["quality_score"],
             scorer_version=record["scorer_version"],
+            record=record,
         )
         if record["scorer_hash"] != expected_scorer_hash:
             raise EvidenceGateError(
-                f"{where}: scorer_hash does not match its record's matched IDs/quality_score "
-                "-- internally inconsistent scorer provenance"
+                f"{where}: scorer_hash does not match this record's own fields "
+                "-- internally inconsistent scorer provenance (the digest binds every "
+                "field except scorer_hash/fixture_sha256, so any post-scoring edit "
+                "invalidates it)"
             )
         # A keyless self-hash proves only that scorer_hash agrees with the
         # record's OWN fields -- it cannot detect an editor who invents

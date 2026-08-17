@@ -48,6 +48,18 @@ class WorkTaskLedger:
     known ids were explicitly cancelled, independent of whether their task
     is still running, so late callbacks and status reconciliation can still
     see the cancellation after the task itself is gone.
+
+    ``known_ids`` retirement has exactly one owner outside this class, by
+    design: ``register_turn_task``'s done callback retires an id only when no
+    work task for it is still running, which is precisely *not* the
+    retained/background case this branch is built around. For a work item that
+    outlives its turn task, every terminal branch of
+    ``SessionHost.commit_late_result_once`` (and ``_commit_result_state``)
+    calls :meth:`retire`. Retiring from ``register_work_task``'s own done
+    callback instead would be wrong: the coordinator can still hold a retained
+    late task for that id after the host's local task finishes, and dropping
+    it from ``known_ids`` there would put it out of reach of a
+    whole-connection ``_cancel_work(None)``.
     """
 
     def __init__(self) -> None:
@@ -91,21 +103,23 @@ class WorkTaskLedger:
         self.known_ids.add(work_item_id)
 
     def retire(self, work_item_id: str) -> None:
-        """Drop a work item from the known set once its fate is settled."""
+        """Drop a work item from the known set once its fate is settled.
+
+        The retirement entry point for ``SessionHost.commit_late_result_once``
+        and ``_commit_result_state``, which own ``known_ids`` retirement for
+        every work item that outlives its turn task (see the class docstring).
+        """
         self.known_ids.discard(work_item_id)
 
-    def mark_cancelled(self, work_item_id: str) -> None:
-        self.cancelled_ids.add(work_item_id)
-
-    def is_cancelled(self, work_item_id: str) -> bool:
-        return work_item_id in self.cancelled_ids
+    def clear_cancelled(self, work_item_id: str) -> None:
+        """Consume a work item's cancellation marker once it has classified a
+        commit attempt, so a later unrelated write for the same id is not
+        re-read as cancelled."""
+        self.cancelled_ids.discard(work_item_id)
 
     def live_ids(self) -> set[str]:
         """Union of every work item this ledger currently knows is live or known."""
         return set(self.turn_tasks) | set(self.work_tasks) | self.known_ids
-
-    def known_ids_snapshot(self) -> frozenset[str]:
-        return frozenset(self.known_ids)
 
     def local_ids(self) -> tuple[str, ...]:
         """Ids with a locally tracked turn and/or work task, dedup-ordered."""

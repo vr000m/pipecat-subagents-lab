@@ -77,9 +77,9 @@ from .work_item_coordinator import (
 )
 from .work_status_publisher import (
     WorkStatusPublisher,
-    _child_work_status_after_dispatch,
-    _work_status_after_commit_failure,
-    _work_status_for_outcome,
+    child_work_status_after_dispatch,
+    work_status_after_commit_failure,
+    work_status_for_outcome,
 )
 from .work_task_ledger import WorkTaskLedger
 from .worker_projection import WorkerProjection
@@ -228,7 +228,23 @@ class CanonicalResultAdapter(FrameProcessor):
         if not self.accepts(frame):
             return
         if isinstance(frame, RTVIServerMessageFrame):
-            frame.data = RTVIMessage.model_validate(data).model_dump(mode="json")
+            # Re-serialize through ``RTVIMessage.wire_payload``, not
+            # ``model_dump``: a runtime-snapshot envelope whose payload
+            # deliberately omitted ``work_status`` (a connection that never
+            # negotiated ``work_status_v1`` -- see
+            # ``RuntimeSnapshot.wire_payload``) would otherwise have the
+            # field re-materialized here at its ``[]`` model default, and the
+            # pinned pre-Phase-3 runtime-snapshot schema is
+            # ``additionalProperties: false``, so a legacy client rejects the
+            # frame. Wire presence on the way out mirrors wire presence on the
+            # way in; this adapter normalizes envelopes, it does not decide
+            # capability projection.
+            inbound_payload = data.get("data")
+            frame.data = RTVIMessage.model_validate(data).wire_payload(
+                include_work_status=(
+                    "work_status" in inbound_payload if isinstance(inbound_payload, dict) else True
+                )
+            )
         if isinstance(getattr(frame, "data", frame), dict) and (
             getattr(frame, "data", frame).get("kind") == "canonical_result"
             or all(
@@ -290,12 +306,12 @@ def _late_commit_work_status(
     which means no copy committed under this key at all. Emitting nothing
     there strands the child at its non-terminal dispatch-time status, and the
     parent aggregate with it, for the life of the session. Every other case
-    defers to ``_work_status_for_outcome`` so the late and foreground sites
+    defers to ``work_status_for_outcome`` so the late and foreground sites
     cannot drift.
     """
     if commit_outcome == "suppressed_duplicate":
         return None
-    return _work_status_for_outcome(
+    return work_status_for_outcome(
         work_outcome,
         cancelled=work_outcome == "cancelled",
         committed=commit_outcome == "committed",
@@ -581,8 +597,8 @@ class SessionHost:
         # the live connection/acceptance through callables since both are
         # swapped out from under this ledger on every reconnect/promotion.
         self._turn_ack_ledger = TurnAckLedger(
-            feature_policy=self.feature_policy,
-            early_ack_text=self.config.early_ack_text,
+            feature_policy=lambda: self.feature_policy,
+            early_ack_text=lambda: self.config.early_ack_text,
             connection=lambda: self.connection,
             accepts=self.accepts,
         )
@@ -668,9 +684,9 @@ class SessionHost:
                 await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
 
         def schedule_pipeline_shutdown(reason: str) -> None:
-            task = asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
-            self._background_shutdowns.add(task)
-            task.add_done_callback(self._background_shutdowns.discard)
+            self.track_background_shutdown(
+                asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
+            )
 
         async def on_lifecycle_terminal(
             token: str, identity: GenerationIdentity, disposition: DeliveryDisposition
@@ -807,11 +823,11 @@ class SessionHost:
         self.connection = pipeline
         if old_connection is not None:
             old_connection.deactivate()
-            task = asyncio.create_task(
-                old_connection.shutdown(reason="connection replaced", reconnect=True)
+            self.track_background_shutdown(
+                asyncio.create_task(
+                    old_connection.shutdown(reason="connection replaced", reconnect=True)
+                )
             )
-            self._background_shutdowns.add(task)
-            task.add_done_callback(self._background_shutdowns.discard)
         await self._runner_supervisor.register_persistent_workers(lambda: self.registry.workers)
         return pipeline
 
@@ -852,6 +868,21 @@ class SessionHost:
             f"failure_kind={kind!r}; recording outcome=failed"
         )
         return "failed"
+
+    def track_background_shutdown(self, task: asyncio.Task[None]) -> asyncio.Task[None]:
+        """Retain a fire-and-forget connection-shutdown task until it finishes.
+
+        The single entry point for scheduling a shutdown nobody awaits
+        inline. Without a strong reference the task can be garbage collected
+        mid-flight (the loop holds only a weak one), and ``shutdown()`` has no
+        way to drain it -- ``SessionHost.shutdown`` awaits exactly this set.
+        Callers outside this module (``server/app.py``'s Small-WebRTC
+        worker-failure handler) route through here rather than reaching into
+        ``_background_shutdowns``.
+        """
+        self._background_shutdowns.add(task)
+        task.add_done_callback(self._background_shutdowns.discard)
+        return task
 
     def abort_connection(self, pipeline: ConnectionPipeline, *, reconnect: bool = True) -> None:
         """Fence a promoted connection whose transport setup did not complete.
@@ -1550,7 +1581,7 @@ class SessionHost:
             derived = (
                 None
                 if retained_still_open
-                else _work_status_for_outcome(
+                else work_status_for_outcome(
                     child_outcome_label,
                     cancelled=was_cancelled,
                     terminal_kind=child_outcome_label,
@@ -1564,7 +1595,7 @@ class SessionHost:
             try:
                 committed = await self._commit_and_speak(result, origin, role=speech_role)
             except Exception:
-                failure_status = _work_status_after_commit_failure(derived)
+                failure_status = work_status_after_commit_failure(derived)
                 if failure_status is not None:
                     self._emit_work_status(
                         turn_id=turn_id,
@@ -1820,7 +1851,7 @@ class SessionHost:
             # A cancelled child is settled here and now, so its ack ownership
             # does not have to survive for a late result that will not speak.
             retained_still_open = retained_still_open and not was_cancelled
-            derived = _child_work_status_after_dispatch(
+            derived = child_work_status_after_dispatch(
                 child_outcome_label,
                 cancelled=was_cancelled,
                 terminal_kind=child_outcome_label,
@@ -1830,7 +1861,7 @@ class SessionHost:
             try:
                 committed = await self._commit_and_speak(result, origin, role=speech_role)
             except Exception:
-                failure_status = _work_status_after_commit_failure(derived)
+                failure_status = work_status_after_commit_failure(derived)
                 if failure_status is not None:
                     self._emit_work_status(
                         turn_id=turn_id,
@@ -2193,7 +2224,7 @@ class SessionHost:
                 )
                 item_work_item_id = f"work-{turn_id}-{index}"
                 attributed_indexes.add(index)
-                derived = _work_status_for_outcome(
+                derived = work_status_for_outcome(
                     item_outcome,
                     cancelled=item_work_item_id in self._cancelled_work_items,
                     terminal_kind=item_outcome,
@@ -2242,7 +2273,7 @@ class SessionHost:
                 # Retained is not terminal: `background` is the truthful state
                 # until the late result lands (same rule as the single-intent
                 # path); a `failed` here could never be flipped back.
-                derived = _child_work_status_after_dispatch(
+                derived = child_work_status_after_dispatch(
                     "retained",
                     cancelled=work_item_id in self._cancelled_work_items,
                 )
@@ -2281,7 +2312,7 @@ class SessionHost:
                     outcome=failure_outcome,
                     app_worker_id=failure.worker_id,
                 )
-                derived = _work_status_for_outcome(
+                derived = work_status_for_outcome(
                     failure_outcome,
                     cancelled=failure.work_item_id in self._cancelled_work_items,
                     terminal_kind=failure_outcome,
@@ -2703,7 +2734,7 @@ class SessionHost:
         # untouched.
         was_cancelled = late.error is None and late.work_item_id in self._cancelled_work_items
         if was_cancelled:
-            self._cancelled_work_items.discard(late.work_item_id)
+            self._work_ledger.clear_cancelled(late.work_item_id)
             if isinstance(late.result, GroundedResult):
                 self._worker_projection.pop_clarification_candidate(late.result.result_id)
 
@@ -2719,7 +2750,7 @@ class SessionHost:
         # defaults for any outcome field still unset at that point.
         try:
             if late.error is not None:
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 # A worker task cancellation reaching this normal completion path
                 # is always a live "suppressed_cancelled" outcome. Pure
                 # shutdown-triggered cancellation never reaches here: the
@@ -2738,7 +2769,7 @@ class SessionHost:
                     f"worker={late.worker_id}"
                 )
             elif not isinstance(late.result, GroundedResult):
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 if was_cancelled:
                     work_outcome, commit_outcome, speech_outcome = (
                         "cancelled",
@@ -2754,7 +2785,7 @@ class SessionHost:
                     )
                     delivery_disposition = "not_applicable"
             elif late.result.origin_epoch != origin_epoch:
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
                     "cancelled" if was_cancelled else "completed",
                     "suppressed_stale",
@@ -2764,7 +2795,7 @@ class SessionHost:
             elif any(
                 item.result_id == late.result.result_id for item in self.state.results.results
             ):
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
                     "cancelled" if was_cancelled else "completed",
                     "suppressed_duplicate",
@@ -2779,7 +2810,7 @@ class SessionHost:
                 # result is otherwise valid *and past every structural fence
                 # above* is still committed exactly once, display-only, with
                 # no speech attempt.
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 cancelled_result = late.result
                 try:
                     self._commit_result_state(cancelled_result)
@@ -2814,7 +2845,7 @@ class SessionHost:
                 try:
                     self._commit_result_state(result)
                 except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
-                    self._known_work_items.discard(late.work_item_id)
+                    self._work_ledger.retire(late.work_item_id)
                     work_outcome, commit_outcome, speech_outcome = (
                         "completed",
                         "failed",
@@ -2823,7 +2854,7 @@ class SessionHost:
                     delivery_disposition = "not_applicable"
                     pending_exception = exc
                 else:
-                    self._known_work_items.discard(late.work_item_id)
+                    self._work_ledger.retire(late.work_item_id)
                     worker = self.state.workers.get(result.worker_id)
                     if worker is not None and worker.origin_epoch == origin_epoch:
                         self.state.set_worker(
@@ -2986,14 +3017,14 @@ class SessionHost:
         origin_epoch = result.origin_epoch
         work_item_id = f"work-{result.turn_id}"
         if work_item_id in self._cancelled_work_items:
-            self._cancelled_work_items.discard(work_item_id)
-            self._known_work_items.discard(work_item_id)
+            self._work_ledger.clear_cancelled(work_item_id)
+            self._work_ledger.retire(work_item_id)
             self._worker_projection.pop_clarification_candidate(result.result_id)
             if suppressed_out is not None:
                 suppressed_out.add(work_item_id)
             return result
         self._commit_result_state(result)
-        self._known_work_items.discard(work_item_id)
+        self._work_ledger.retire(work_item_id)
         if (
             (require_tts and origin.tts is None)
             or self.connection is not origin
@@ -3241,6 +3272,10 @@ class SessionHost:
         # callback, which shutdown suppresses. Drop what is left rather than
         # carrying it for the process's remaining lifetime.
         self._turn_ack_ledger.clear_all()
+        # Same reasoning for clarification candidates: a candidate is consumed
+        # on the commit path, and shutdown suppresses the commits that would
+        # have consumed them.
+        self._worker_projection.clear_all()
         await self._runner_supervisor.shutdown()
         self.started = False
         self.state.active_epoch = None

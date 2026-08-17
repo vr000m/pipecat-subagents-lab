@@ -21,6 +21,7 @@ that previously lived directly on SessionHost.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -41,9 +42,18 @@ class WorkerProjection:
     object SessionHost and its other slices read and mutate.
     """
 
+    #: Cap on retained clarification candidates. A candidate is normally
+    #: consumed by ``pop_clarification_candidate`` on the commit path, but a
+    #: clarification whose turn is cancelled, whose connection drops, or whose
+    #: result never reaches ``_commit_result_state`` is never popped, so the
+    #: map needs a bound of its own rather than relying on every turn ending
+    #: in a commit. Mirrors the handshake-token cap in ``HandshakeGate`` and
+    #: the work-status key cap in ``SessionState``: evict oldest first.
+    MAX_CLARIFICATION_CANDIDATES = 32
+
     def __init__(self, *, state: SessionState) -> None:
         self.state = state
-        self._clarification_candidates: dict[str, dict[str, str]] = {}
+        self._clarification_candidates: OrderedDict[str, dict[str, str]] = OrderedDict()
 
     def project(
         self,
@@ -100,6 +110,8 @@ class WorkerProjection:
             "original_query": original_query,
             "question": question,
         }
+        while len(self._clarification_candidates) > self.MAX_CLARIFICATION_CANDIDATES:
+            self._clarification_candidates.popitem(last=False)
         return canonical_result(
             worker_id=worker_id,
             turn_id=turn_id,
@@ -110,6 +122,17 @@ class WorkerProjection:
 
     def pop_clarification_candidate(self, result_id: str) -> dict[str, str] | None:
         return self._clarification_candidates.pop(result_id, None)
+
+    def clear_all(self) -> None:
+        """Drop every retained clarification candidate.
+
+        Called from ``SessionHost.shutdown`` alongside
+        ``TurnAckLedger.clear_all()`` and ``RecorderFactory.finalize_all()``:
+        candidates whose turn never reached a commit have no other exit, and
+        a slice extracted in this pass should not be the one component
+        without a teardown hook.
+        """
+        self._clarification_candidates.clear()
 
     @staticmethod
     def clarification_context(pending: Any, transcript: str) -> ClarificationContext | None:

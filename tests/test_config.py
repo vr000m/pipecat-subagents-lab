@@ -1478,3 +1478,29 @@ def test_load_promotion_manifest_rejects_a_manifest_path_naming_a_directory(
 
     assert verdict.promotion_eligible is False
     assert verdict.reason == "manifest_missing"
+
+
+def test_toml_features_release_version_reaches_config(tmp_path) -> None:
+    """Regression: ``[features].release_version`` is documented in README
+    alongside ``WEBSEARCH_RELEASE_VERSION``, but ``_load_toml_values`` never
+    copied it, so an operator's override was silently dropped and
+    ``load_config`` fell back to the packaged default -- making the promotion
+    manifest's ``release_version`` bind check compare against the wrong
+    identity."""
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[features]\nrelease_version = "0.1.3-rc4"\n')
+
+    config = load_config(config_file=config_file, env={})
+
+    assert config.release_version == "0.1.3-rc4"
+
+
+def test_environment_release_version_overrides_the_toml_value(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[features]\nrelease_version = "0.1.3-from-toml"\n')
+
+    config = load_config(
+        config_file=config_file, env={"WEBSEARCH_RELEASE_VERSION": "0.1.3-from-env"}
+    )
+
+    assert config.release_version == "0.1.3-from-env"

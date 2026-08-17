@@ -1069,6 +1069,94 @@ def test_commit_late_result_once_active_generation_is_never_interrupted() -> Non
         assert any(
             r.result_id == "result-late-1" for r in host.state.result_history("worker-weather")
         )
+
+        # Review Focus bullet 7 requires the coordinator token to stay the
+        # oracle *through* synthesis end, cleanup, transport stop and
+        # teardown -- not only at admission. Drive each stage and re-assert.
+        lifecycle.mark_handed_to_tts(held.token)
+        # The context id is the scheduler utterance id, by contract.
+        assert lifecycle.bind_context(held.token, "held-utt") is True
+        assert lifecycle.on_tts_started("held-utt") is True
+        assert (
+            lifecycle.on_tts_audio(
+                "held-utt", audio=b"\x00\x00" * 800, sample_rate=16_000, num_channels=1
+            )
+            is True
+        )
+        assert lifecycle.on_tts_stopped("held-utt") is True
+        # Synthesis end is explicitly non-terminal: the slot is still held.
+        assert lifecycle.occupied is True
+        assert lifecycle.slot_token == held.token
+
+        lifecycle.on_transport_bot_started()
+        assert lifecycle.slot_token == held.token
+
+        stop = lifecycle.on_transport_bot_stopped()
+        if stop is not None:
+            await stop
+        await asyncio.sleep(0)
+        # Only now, after transport stop drove the one terminal transition, is
+        # the held generation released. The slot may be immediately reclaimed
+        # by the late result that was queued behind it -- that is the point of
+        # ``on_terminal``'s queue re-probe -- so the assertion is that the
+        # *held* generation no longer owns it, not that the slot is idle.
+        assert lifecycle.slot_token != held.token
+        assert lifecycle.generation_for_token(held.token) is None
+
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_lifecycle_slot_is_re_evaluated_after_release_for_each_supersession_trigger() -> None:
+    """Review Focus bullet 7's second half: "post-release re-evaluation when a
+    newer turn, pause, cancellation, or reconnect occurs while queued". The
+    existing coverage stopped at admission and drove none of the four
+    triggers. The coordinator's occupied-generation token stays the oracle at
+    every step; scheduler mirrors and connection flags are not authoritative.
+    """
+
+    async def run() -> None:
+        from server.speech_lifecycle import GenerationIdentity
+
+        host, origin = await _connected_host(speakable=True)
+        lifecycle = origin.lifecycle
+        assert lifecycle is not None
+
+        # (1) A newer turn cannot displace the held slot while it is occupied.
+        held = lifecycle.try_admit(GenerationIdentity("held-utt", "held-work", origin_epoch=1))
+        assert held is not None
+        newer = lifecycle.try_admit(GenerationIdentity("newer-utt", "newer-work", origin_epoch=1))
+        assert newer is None
+        assert lifecycle.slot_token == held.token
+
+        # (2) Pause records a disposition without freeing the slot: a paused
+        # generation still owns the transport.
+        lifecycle.record_interruption(held.token, pause=True)
+        assert lifecycle.slot_token == held.token
+
+        # (3) Cancellation (release) frees it, and only then...
+        lifecycle.release_generation(held.token)
+        await asyncio.sleep(0)
+        assert lifecycle.occupied is False
+        assert lifecycle.slot_token is None
+
+        # ...does the previously-refused newer turn become admissible.
+        readmitted = lifecycle.try_admit(
+            GenerationIdentity("newer-utt", "newer-work", origin_epoch=1)
+        )
+        assert readmitted is not None
+        assert lifecycle.slot_token == readmitted.token
+
+        # (4) Reconnect/teardown: a closed connection refuses admission
+        # outright rather than reporting a merely-busy slot.
+        lifecycle.connection_closed()
+        assert lifecycle.occupied is False
+        assert (
+            lifecycle.try_admit(GenerationIdentity("post-close", "post-work", origin_epoch=2))
+            is None
+        )
+
         await host.shutdown()
 
     asyncio.run(run())
@@ -1156,5 +1244,75 @@ def test_late_result_disposition_reads_only_the_cached_promotion_eligible_boolea
         disposition = host._late_result_disposition(context, origin=origin)
         assert disposition == "autoplay"
         await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_clarification_candidates_are_bounded_and_cleared_at_shutdown() -> None:
+    """Regression (#21/#27): ``WorkerProjection._clarification_candidates``
+    grew without bound and had no lifecycle hook. Entries are inserted on
+    every worker-raised ``WorkerClarify`` and removed only by
+    ``pop_clarification_candidate`` on the commit path, so a clarification
+    whose turn is cancelled, whose connection drops, or whose result never
+    reaches ``_commit_result_state`` left its entry for the process lifetime
+    -- with no cap, TTL, or shutdown sweep, unlike the handshake-token cap and
+    the work-status ledger's cap plus TTL the branch already applies
+    elsewhere."""
+
+    async def run() -> None:
+        host = SessionHost()
+        projection = host._worker_projection
+        cap = projection.MAX_CLARIFICATION_CANDIDATES
+
+        first_result_id = ""
+        for index in range(cap + 10):
+            result = projection.clarification_result(
+                worker_id=f"worker-{index}",
+                turn_id=f"turn-{index}",
+                question="which one?",
+                original_query="ambiguous",
+                origin_epoch=1,
+            )
+            if index == 0:
+                first_result_id = result.result_id
+
+        assert len(projection._clarification_candidates) <= cap
+        # Oldest-first eviction, matching the sibling bounded maps.
+        assert projection.pop_clarification_candidate(first_result_id) is None
+
+        await host.shutdown()
+        assert projection._clarification_candidates == {}
+
+    asyncio.run(run())
+
+
+def test_track_background_shutdown_is_retained_and_drained_by_shutdown() -> None:
+    """Regression (#23): ``server/app.py``'s Small-WebRTC ``worker_finished``
+    handler created its shutdown task with a bare ``asyncio.create_task`` and
+    discarded the handle, bypassing the ``_background_shutdowns`` set every
+    other background shutdown in the codebase uses. An untracked task can be
+    collected mid-flight, and ``SessionHost.shutdown`` -- which awaits exactly
+    that set -- had no way to drain it. This pins the seam the app now routes
+    through."""
+
+    async def run() -> None:
+        host = SessionHost()
+        finished: list[str] = []
+        release = asyncio.Event()
+
+        async def slow_shutdown() -> None:
+            await release.wait()
+            finished.append("done")
+
+        task = host.track_background_shutdown(asyncio.create_task(slow_shutdown()))
+        await asyncio.sleep(0)
+        assert task in host._background_shutdowns
+
+        release.set()
+        await host.shutdown()
+        # shutdown() drained it rather than leaving it in flight...
+        assert finished == ["done"]
+        # ...and the done-callback keeps the set from growing unboundedly.
+        assert host._background_shutdowns == set()
 
     asyncio.run(run())

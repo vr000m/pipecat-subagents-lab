@@ -41,7 +41,6 @@ class RunnerSupervisor:
     def __init__(self, runner_factory: Callable[[], Any] | None = None) -> None:
         self.runner_factory = runner_factory
         self.runner: Any = None
-        self._runner_handles: dict[str, Any] = {}
         self._runner_registered: set[str] = set()
         self._runner_registrations: dict[str, asyncio.Task[None]] = {}
         self._runner_task: asyncio.Task[Any] | None = None
@@ -110,7 +109,6 @@ class RunnerSupervisor:
                 result = add_workers(worker)
                 if inspect.isawaitable(result):
                     await result
-                self._runner_handles[worker_id] = worker
                 self._runner_registered.add(worker_id)
 
             registration = asyncio.create_task(register())

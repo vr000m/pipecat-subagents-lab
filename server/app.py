@@ -623,8 +623,13 @@ async def _attach_connection(
                 except asyncio.CancelledError:
                     return
                 if error is not None:
-                    asyncio.create_task(
-                        runtime.shutdown(reason="Small WebRTC worker failed", reconnect=False)
+                    # Tracked, not fire-and-forget: an untracked task can be
+                    # collected mid-shutdown, and SessionHost.shutdown drains
+                    # exactly this set.
+                    host.track_background_shutdown(
+                        asyncio.create_task(
+                            runtime.shutdown(reason="Small WebRTC worker failed", reconnect=False)
+                        )
                     )
 
             runtime.worker_task.add_done_callback(worker_finished)

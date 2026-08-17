@@ -18,6 +18,16 @@ This module is a pure extraction of SessionHost's existing work-status
 logic -- semantics, including transition/gating/precedence rules, are
 unchanged from the code that previously lived directly on SessionHost and
 at module scope in ``pipeline.py``.
+
+The three derivation helpers are deliberately *public* names
+(``work_status_for_outcome``, ``work_status_after_commit_failure``,
+``child_work_status_after_dispatch``). They carried a leading underscore
+while they lived in ``pipeline.py`` alongside their only callers; once
+``pipeline.py`` had to import them across a module boundary the underscore
+became a false signal, since this codebase treats it as a hard "do not reach
+in" marker elsewhere (cf. ``SpeechScheduler``'s "callers must not inspect
+``_queues`` directly" contract). They are a deliberate shared derivation used
+by both the foreground turn handlers and the late-commit path.
 """
 
 from __future__ import annotations
@@ -32,7 +42,7 @@ if TYPE_CHECKING:
     from .session_state import SessionState
 
 
-def _work_status_for_outcome(
+def work_status_for_outcome(
     outcome_label: str | None,
     *,
     cancelled: bool = False,
@@ -63,7 +73,7 @@ def _work_status_for_outcome(
     return "failed", ("retention_rejected" if terminal_kind == "retention_rejected" else None)
 
 
-def _work_status_after_commit_failure(
+def work_status_after_commit_failure(
     derived: tuple[WorkStatusState, TerminalReason | None] | None,
 ) -> tuple[WorkStatusState, TerminalReason | None] | None:
     """The status to publish when the canonical commit itself raised.
@@ -72,7 +82,7 @@ def _work_status_after_commit_failure(
     the derived state is non-terminal (a still-legitimately-running
     ``background`` child, which must stay reachable by its own late result).
     A cancellation still classifies the work item regardless of the commit
-    outcome -- the same precedence ``_work_status_for_outcome`` documents --
+    outcome -- the same precedence ``work_status_for_outcome`` documents --
     so it is published as ``cancelled``, not overridden to ``failed``.
     """
     if derived is None or derived[0] not in WORK_STATUS_TERMINAL:
@@ -82,7 +92,7 @@ def _work_status_after_commit_failure(
     return "failed", None
 
 
-def _child_work_status_after_dispatch(
+def child_work_status_after_dispatch(
     outcome_label: str | None,
     *,
     cancelled: bool,
@@ -90,11 +100,11 @@ def _child_work_status_after_dispatch(
 ) -> tuple[WorkStatusState, TerminalReason | None] | None:
     """Retained-and-not-cancelled work is not terminal: 'background' is its
     truthful status until the late result terminalizes it. Every other case
-    defers to ``_work_status_for_outcome``.
+    defers to ``work_status_for_outcome``.
     """
     if outcome_label == "retained" and not cancelled:
         return "background", None
-    return _work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
+    return work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
 
 
 class WorkStatusPublisher:

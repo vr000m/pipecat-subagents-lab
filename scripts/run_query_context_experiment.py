@@ -26,6 +26,38 @@ Two modes:
     blocked outcome, not a fabricated sample: the runner writes nothing and
     exits non-zero with a ``BLOCKED: provider_unavailable`` message so the
     caller does not mistake an empty run for an empty-but-successful one.
+
+Control-field source audit (Phase 4A, required before freezing
+``shared/schemas/v013-query-context-raw.json``). For each control field, where
+the value comes from:
+
+``cache_status``
+    Client-side collector bookkeeping. The OpenAI Responses API exposes no
+    per-request search-cache indicator, so no provider response metadata can
+    populate this. The dry run hardcodes ``"unknown"``; a live collection can
+    only ever set ``hit``/``miss`` from a collector-owned cache it operates
+    itself. Treat a non-``unknown`` value as a claim about the *collector's*
+    cache, never the provider's.
+``retrieval_snapshot_id``
+    Client-side collector bookkeeping. There is no provider-returned
+    retrieval/corpus snapshot identifier on the Responses API, so this is an
+    operator-supplied label identifying the retrieval corpus state a batch was
+    collected against. The dry run leaves it ``None``. Because it is
+    collector-declared, the analyzer must not treat its presence as evidence
+    of a real provider call -- that is what the ``SYNTHETIC_STRATA``
+    provider/model gate is for.
+``attempt_count`` / ``retry_count``
+    Client-side collector bookkeeping. Counted by the collector's own retry
+    loop; the provider reports nothing equivalent.
+``rate_limit_count``
+    Client-side collector bookkeeping, *derived from* provider signals: the
+    collector increments it when a request returns HTTP 429. The count is the
+    collector's; the trigger is the provider's.
+
+All five are therefore collector-owned. None is provider response metadata,
+so none is independently attestable, which is precisely why ``scorer_hash``
+binds the whole record (see :func:`scorer_hash`) rather than trusting these
+fields to be self-describing.
 """
 
 from __future__ import annotations
@@ -36,6 +68,7 @@ import json
 import os
 import random
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -90,6 +123,12 @@ RAW_REQUIRED = frozenset(
 # against), not by the runner's raw output, so it is allowed but not
 # required -- an artifact predating this field is still valid raw shape.
 RAW_ALLOWED = RAW_REQUIRED | frozenset({"fixture_sha256"})
+
+# Fields deliberately excluded from `scorer_hash`'s whole-record binding.
+# `scorer_hash` is the digest itself; `fixture_sha256` is stamped by the
+# collector *after* the runner has scored and hashed the record, and has its
+# own binding path (compared against `sha256_file(fixture_path)`).
+_UNBOUND_RECORD_FIELDS = frozenset({"scorer_hash", "fixture_sha256"})
 
 
 OUTCOMES = frozenset({"success", "error", "timeout"})
@@ -209,6 +248,7 @@ def scorer_hash(
     matched_disallowed_claim_ids: list[str] | None = None,
     quality_score: float | None = None,
     scorer_version: str = SCORER_VERSION,
+    record: Mapping[str, Any] | None = None,
 ) -> str:
     """Provenance hash binding a scorer identity to a fixture (and, when the
     per-record fields are supplied, to one record's exact matched-ID sets and
@@ -230,11 +270,42 @@ def scorer_hash(
     ``record["scorer_version"]`` explicitly -- otherwise recomputing with the
     constant regardless of what the record declares lets a uniformly forged
     ``scorer_version`` produce a matching digest for every record in a batch.
+
+    ``record`` binds the *whole* raw record, not just the scoring fields. The
+    scoring-field-only payload authenticated exactly the values the scorer
+    produced and nothing else, which left the measurement and stratum-identity
+    fields the promotion decision actually rests on -- ``latency_ms``,
+    ``condition``, ``selected_value``, ``provider``, ``model``, ``outcome``,
+    ``cache_status``, ``retrieval_snapshot_id``, the attempt/retry/rate-limit
+    counters -- entirely unauthenticated. Since the analyzer's synthetic guard
+    is a name denylist over those same unbound strings
+    (``SYNTHETIC_STRATA``), a dry-run artifact could be relabelled into the
+    paid stratum with any chosen latency and still satisfy every ID, quality,
+    fixture-digest, and hash check. Binding the full record closes that: any
+    post-scoring edit to any field invalidates the digest.
+
+    ``scorer_hash`` itself is excluded (it is the digest being computed) and
+    so is ``fixture_sha256``, which the *collector* stamps onto a record after
+    the runner has already scored and hashed it; including it would make the
+    runner's stamp and every verifier's recomputation disagree by
+    construction. ``fixture_sha256`` has its own binding path -- it is
+    compared against ``sha256_file(fixture_path)``.
+
+    This remains a keyless self-hash: it detects edits to a runner-produced
+    artifact, not a wholly regenerated one. Fixture resolution
+    (``validate_against_fixture``) is the anti-fabrication layer on top. A
+    threat model that includes regeneration needs an HMAC stamped with a
+    collection-time key, or a signed artifact, not a bare SHA-256.
     """
     fixture_turn_id = fixture_turn_id or ""
     matched_fact_ids = matched_fact_ids or []
     matched_citation_ids = matched_citation_ids or []
     matched_disallowed_claim_ids = matched_disallowed_claim_ids or []
+    bound_record = (
+        {key: value for key, value in sorted(record.items()) if key not in _UNBOUND_RECORD_FIELDS}
+        if record is not None
+        else None
+    )
     payload = json.dumps(
         {
             "scorer_version": scorer_version,
@@ -244,6 +315,7 @@ def scorer_hash(
             "matched_citation_ids": sorted(matched_citation_ids),
             "matched_disallowed_claim_ids": sorted(matched_disallowed_claim_ids),
             "quality_score": round(float(quality_score), 6) if quality_score is not None else None,
+            "record": bound_record,
         },
         sort_keys=True,
     )
@@ -401,14 +473,6 @@ def build_dry_run_artifact(
                 base_latency = 400.0 + 0.05 * context_chars
                 jitter = rng.uniform(-15.0, 15.0)
                 latency_ms = round(base_latency + jitter, 3)
-                scorer_digest = scorer_hash(
-                    fixture_version,
-                    fixture_turn_id,
-                    matched_fact_ids=facts,
-                    matched_citation_ids=cites,
-                    matched_disallowed_claim_ids=disallowed,
-                    quality_score=quality_score,
-                )
                 record = {
                     "run_id": run_id,
                     "run_block": run_order // len(CONDITIONS),
@@ -429,7 +493,6 @@ def build_dry_run_artifact(
                     "matched_citation_ids": cites,
                     "matched_disallowed_claim_ids": disallowed,
                     "scorer_version": SCORER_VERSION,
-                    "scorer_hash": scorer_digest,
                     "attempt_count": 1,
                     "retry_count": 0,
                     "rate_limit_count": 0,
@@ -437,6 +500,19 @@ def build_dry_run_artifact(
                     "retrieval_snapshot_id": None,
                     "recorded_at_utc": generated_at,
                 }
+                # Stamped after the record is fully built: the digest binds
+                # every measurement and stratum-identity field, not just the
+                # scoring fields, so `scorer_hash` cannot be present in the
+                # payload it authenticates.
+                record["scorer_hash"] = scorer_hash(
+                    fixture_version,
+                    fixture_turn_id,
+                    matched_fact_ids=facts,
+                    matched_citation_ids=cites,
+                    matched_disallowed_claim_ids=disallowed,
+                    quality_score=quality_score,
+                    record=record,
+                )
                 closed_object(record, required=RAW_REQUIRED, allowed=RAW_ALLOWED)
                 records.append(record)
                 run_order += 1

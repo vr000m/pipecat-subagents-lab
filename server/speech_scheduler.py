@@ -98,10 +98,11 @@ class SpeechScheduler:
 
         ``_emit_progress`` is a deliberate no-op for acks (they are
         wire-invisible), so without this an ack swept here would vanish
-        silently instead of reaching ``_on_ack_terminal`` -- the codebase's
-        stated sole mutator for the pre-admission-terminal ack path
-        (``server/pipeline.py``'s ``ConnectionPipelineHost.on_ack_terminal``,
-        which clears the owning turn's ack latch). ``CONNECTION_CLOSED`` is
+        silently instead of reaching ``_on_ack_terminal`` -- the pre-admission
+        terminal ack path's latch clear (``server/turn_ack_ledger.py``'s
+        ``TurnAckLedger.on_ack_terminal``, wired in via
+        ``SessionHost.on_ack_terminal``, which clears the owning turn's ack
+        latch). ``CONNECTION_CLOSED`` is
         reused here rather than adding a new enum member: this sweep only
         runs when the scheduler itself is being discarded for good
         (``reconnect``/``full_stop``), the same "this connection is gone"

@@ -1144,7 +1144,12 @@ def test_coordinator_defaults_matches_pipeline_getattr_fallbacks() -> None:
     defaults = CoordinatorDefaults()
     assert defaults.registry is None
     assert defaults.config is None
-    assert defaults.OWNED_CONFIG_FIELDS == frozenset()
+    # Single-sourced with WorkItemCoordinator's own declaration and with
+    # coordinator_view's fallback: an empty frozenset here would silently
+    # widen SessionHost's config-conflict check for any coordinator that
+    # followed this class's documented advice and subclassed it.
+    assert defaults.OWNED_CONFIG_FIELDS == WorkItemCoordinator.OWNED_CONFIG_FIELDS
+    assert coordinator_view(object()).OWNED_CONFIG_FIELDS == defaults.OWNED_CONFIG_FIELDS
     assert defaults.live_work_item_ids() == frozenset()
     assert defaults.cancel() == ()
     assert defaults.cancel("work-1") == ()

@@ -101,6 +101,11 @@ class WorkStatusKey(NamedTuple):
 class _WorkStatusRecord:
     status: WorkStatus
     terminal_at: float | None = None
+    # False only for a record rehydrated by ``from_snapshot``: the wire
+    # carries the parent aggregate but never the child set it was derived
+    # from, so the restored record's children map starts empty and is *not*
+    # authoritative. See ``_reaggregate_parent``.
+    children_authoritative: bool = True
 
 
 class SessionState:
@@ -145,7 +150,11 @@ class SessionState:
         # as stale. Unlike the records, this counter is never bounded: a
         # NamedTuple key plus one int is cheap enough that unbounded growth
         # for the process lifetime is preferable to any eviction policy that
-        # could resurrect a key at sequence 1.
+        # could resurrect a key at sequence 1. Round-8 review re-raised the
+        # growth of this map and of _work_status_terminal_keys as a
+        # resource bound; it is a knowingly accepted trade, pinned by
+        # tests/test_session_state.py::
+        # test_work_status_sequence_survives_high_volume_eviction_and_never_restarts_at_one.
         self._work_status_children: dict[WorkStatusKey, dict[str, WorkStatus]] = {}
         self._work_status_parents: dict[WorkStatusKey, _WorkStatusRecord] = {}
         self._work_status_sequence: dict[WorkStatusKey, int] = {}
@@ -413,6 +422,22 @@ class SessionState:
         # that a terminal parent state never regresses.
         if record is not None and record.status.state in WORK_STATUS_TERMINAL:
             return None
+        if (
+            record is not None
+            and not record.children_authoritative
+            and parent_state in WORK_STATUS_TERMINAL
+        ):
+            # A restored record's children map holds only the children that
+            # have reported *since* the restore, not the set the restored
+            # aggregate was computed over (child records are server-internal
+            # and never cross the wire). Terminalizing off that partial set
+            # would announce ``result_ready`` for a turn whose siblings are
+            # still searching. There is no way to prove completeness from the
+            # wire, so the conservative reading wins: a restored parent keeps
+            # its restored non-terminal state and expires by TTL rather than
+            # claiming a result that may not exist. Non-terminal
+            # re-aggregation still flows through normally.
+            return None
         next_sequence = self._work_status_sequence.get(key, 0) + 1
         self._work_status_sequence[key] = next_sequence
         status = WorkStatus(
@@ -425,7 +450,16 @@ class SessionState:
             origin_epoch=key.origin_epoch,
         )
         terminal_at = time.monotonic() if parent_state in WORK_STATUS_TERMINAL else None
-        self._work_status_parents[key] = _WorkStatusRecord(status=status, terminal_at=terminal_at)
+        self._work_status_parents[key] = _WorkStatusRecord(
+            status=status,
+            terminal_at=terminal_at,
+            # Non-authoritativeness is a property of the *key*, not of one
+            # record: re-aggregating over a still-partial child set does not
+            # make that set complete, so the flag must survive every rewrite
+            # of this key rather than resetting to the default on the first
+            # non-terminal update.
+            children_authoritative=record.children_authoritative if record is not None else True,
+        )
         self._evict_work_status_overflow(protect=key)
         return self._emit("work_status", status.model_dump(mode="json"))
 
@@ -526,9 +560,11 @@ class SessionState:
         state.transcript.extend(snapshot.transcript)
         # Rehydrate the work-status ledger. The wire carries only the parent
         # aggregate per WorkStatusKey (children are server-internal), so the
-        # children map stays empty and a later child record simply
-        # re-aggregates against the restored parent, which still cannot
-        # regress a terminal state. The per-key event_sequence MUST be
+        # children map starts empty and the restored record is marked
+        # ``children_authoritative=False``: a later child record re-aggregates
+        # against a set that is known to be incomplete, so it may refine the
+        # parent's non-terminal state but may never terminalize it (see
+        # ``_reaggregate_parent``). The per-key event_sequence MUST be
         # restored too: restarting it at 1 would make every post-restore
         # record look stale to the browser reducer and be dropped.
         for status in snapshot.work_status:
@@ -542,6 +578,7 @@ class SessionState:
                 # five-minute TTL restarts from the restore point rather than
                 # being silently treated as already expired.
                 terminal_at=time.monotonic() if status.state in WORK_STATUS_TERMINAL else None,
+                children_authoritative=False,
             )
         return state
 

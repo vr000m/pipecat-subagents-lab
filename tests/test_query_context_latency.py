@@ -104,10 +104,12 @@ def _dry_run_records(
     return payload["records"]
 
 
-def _real_scorer_hash(**kwargs: Any) -> str:
+def _real_scorer_hash(record: dict[str, Any]) -> str:
     """Compute a collector-acceptable scorer_hash via the runner's own
     provenance-binding function, so synthetic collector-facing fixtures in
-    this module don't have to guess at its exact hash formula. Falls back to
+    this module don't have to guess at its exact hash formula. The digest
+    binds the *whole* record (minus scorer_hash/fixture_sha256), so the
+    record must already be fully built before this is called. Falls back to
     a fixed placeholder if the runner (or its current signature) is
     unavailable -- callers that only need collector rejection paths that
     fail *before* the hash check (schema/condition/outcome/range) don't
@@ -115,20 +117,34 @@ def _real_scorer_hash(**kwargs: Any) -> str:
     try:
         module = _runner()
         return module.scorer_hash(
-            kwargs.get("fixture_version", "qcl-test-v1"),
-            kwargs.get("fixture_turn_id", "turn-1"),
-            matched_fact_ids=kwargs.get("matched_fact_ids", ["fact-1"]),
-            matched_citation_ids=kwargs.get("matched_citation_ids", ["cite-1"]),
-            matched_disallowed_claim_ids=kwargs.get("matched_disallowed_claim_ids", []),
-            quality_score=kwargs.get("quality_score", 1.0),
-            scorer_version=kwargs.get("scorer_version", module.SCORER_VERSION),
+            record["fixture_version"],
+            record["fixture_turn_id"],
+            matched_fact_ids=record["matched_fact_ids"],
+            matched_citation_ids=record["matched_citation_ids"],
+            matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
+            quality_score=record["quality_score"],
+            scorer_version=record["scorer_version"],
+            record=record,
         )
-    except (TypeError, AttributeError):
+    except (TypeError, AttributeError, KeyError):
         return "0" * 64
 
 
+def _restamped(record: dict[str, Any]) -> dict[str, Any]:
+    """Re-stamp a record's scorer_hash after a test mutated one of its fields.
+
+    The digest binds the whole record, so any edit invalidates it. A test that
+    wants to exercise a *later* gate (stratum coverage, mixed dimension, mixed
+    fixture version) has to re-stamp, or it fails at the hash check instead
+    and stops testing what it claims to test.
+    """
+    stamped = {key: value for key, value in record.items() if key != "scorer_hash"}
+    stamped["scorer_hash"] = _real_scorer_hash(stamped)
+    return stamped
+
+
 def _valid_raw_record(**overrides: Any) -> dict[str, Any]:
-    scorer_hash = overrides.pop("scorer_hash", None) or _real_scorer_hash(**overrides)
+    explicit_hash = overrides.pop("scorer_hash", None)
     module = _runner()
     payload = {
         "run_id": "run-0001",
@@ -150,7 +166,6 @@ def _valid_raw_record(**overrides: Any) -> dict[str, Any]:
         "matched_citation_ids": ["cite-1"],
         "matched_disallowed_claim_ids": [],
         "scorer_version": module.SCORER_VERSION,
-        "scorer_hash": scorer_hash,
         "attempt_count": 1,
         "retry_count": 0,
         "rate_limit_count": 0,
@@ -159,6 +174,10 @@ def _valid_raw_record(**overrides: Any) -> dict[str, Any]:
         "recorded_at_utc": "2026-08-05T00:00:00Z",
     }
     payload.update(overrides)
+    # Stamped last, over the finished record: the digest authenticates every
+    # measurement and stratum-identity field, so an override of latency_ms /
+    # provider / condition must change it.
+    payload["scorer_hash"] = explicit_hash or _real_scorer_hash(payload)
     return payload
 
 
@@ -277,6 +296,70 @@ def test_runner_scorer_hash_changes_when_fixture_version_changes(tmp_path: Path)
     hash_a = module.scorer_hash("v1")
     hash_b = module.scorer_hash("v2")
     assert hash_a != hash_b
+
+
+@pytest.mark.parametrize(
+    "field, forged_value",
+    [
+        ("latency_ms", 1),
+        ("condition", "narrowed"),
+        ("selected_value", 2),
+        ("provider", "synthetic"),
+        ("model", "gpt-4o-search-preview"),
+        ("outcome", "timeout"),
+        ("cache_status", "hit"),
+        ("retrieval_snapshot_id", "snap-forged"),
+        ("attempt_count", 3),
+        ("retry_count", 2),
+        ("rate_limit_count", 1),
+        ("run_id", "run-forged"),
+        ("context_chars", 4096),
+    ],
+)
+def test_runner_scorer_hash_binds_every_measurement_and_stratum_field(
+    field: str, forged_value: Any
+) -> None:
+    """Regression: scorer_hash bound only the scoring fields, so the
+    measurement and stratum-identity fields the promotion decision actually
+    rests on were unauthenticated. A dry-run artifact could be relabelled into
+    the paid stratum (provider/model), given any chosen latency_ms, and still
+    satisfy every ID, quality, fixture-digest and hash check -- the analyzer's
+    synthetic guard is only a name denylist over exactly those unbound
+    strings. Every one of these fields must now change the digest."""
+    record = _valid_raw_record()
+    assert record[field] != forged_value, f"{field} fixture value must differ from the forgery"
+    forged = {key: value for key, value in record.items() if key != "scorer_hash"}
+    forged[field] = forged_value
+    assert _real_scorer_hash(forged) != record["scorer_hash"]
+
+
+@pytest.mark.parametrize(
+    "field, forged_value",
+    [("latency_ms", 1), ("provider", "synthetic"), ("retrieval_snapshot_id", "snap-forged")],
+)
+def test_collector_rejects_a_record_edited_after_scoring(
+    tmp_path: Path, field: str, forged_value: Any
+) -> None:
+    """The end-to-end half of the binding: a record whose measurement or
+    stratum field was edited after scoring keeps a now-stale scorer_hash, and
+    the collector must refuse it rather than normalizing it onward to the
+    analyzer."""
+    module = _collector()
+    record = {**_valid_raw_record(), field: forged_value}
+    raw_input = tmp_path / "raw.jsonl"
+    _write_jsonl(raw_input, [record])
+    output = tmp_path / "normalized.jsonl"
+    assert module.main(_collector_argv(raw_input, output, tmp_path)) != 0
+
+
+def test_runner_scorer_hash_excludes_the_collector_stamped_fixture_digest() -> None:
+    """`fixture_sha256` is stamped by the collector *after* the runner scores
+    and hashes a record, and has its own binding path, so including it in the
+    digest would make the runner's stamp and every verifier's recomputation
+    disagree by construction."""
+    record = _valid_raw_record()
+    with_digest = {**record, "fixture_sha256": "a" * 64}
+    assert _real_scorer_hash(with_digest) == _real_scorer_hash(record)
 
 
 def test_runner_scorer_rejects_a_zero_denominator_turn() -> None:
@@ -1278,7 +1361,9 @@ def test_analyzer_blocks_promotion_when_one_stratum_is_undersized_and_another_is
     common = _evidence_common()
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
     for record in _paired_cells(n=5, baseline_latency=1000, narrowed_latency=600):
-        records.append({**record, "model": "gpt-undersized", "run_id": f"under-{record['run_id']}"})
+        records.append(
+            _restamped({**record, "model": "gpt-undersized", "run_id": f"under-{record['run_id']}"})
+        )
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
     assert module.main(_analyzer_argv(input_path, output, tmp_path)) == 0
@@ -1294,7 +1379,7 @@ def test_analyzer_rejects_mixed_selected_dimension_values(tmp_path: Path) -> Non
     them would attribute one dimension's latency change to the other."""
     module = _analyzer()
     records = _paired_cells(n=30, baseline_latency=1000, narrowed_latency=600)
-    records[0]["selected_dimension"] = "answer_chars"
+    records[0] = _restamped({**records[0], "selected_dimension": "answer_chars"})
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
     exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))
@@ -1304,7 +1389,7 @@ def test_analyzer_rejects_mixed_selected_dimension_values(tmp_path: Path) -> Non
 def test_analyzer_rejects_mixed_fixture_versions(tmp_path: Path) -> None:
     module = _analyzer()
     records = _paired_cells(n=5, baseline_latency=1000, narrowed_latency=600)
-    records[0]["fixture_version"] = "some-other-version"
+    records[0] = _restamped({**records[0], "fixture_version": "some-other-version"})
     input_path = _analysis_input(tmp_path, records)
     output = tmp_path / "analysis.json"
     exit_code = module.main(_analyzer_argv(input_path, output, tmp_path))

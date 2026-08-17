@@ -843,6 +843,13 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
             values[f"WEBSEARCH_{key.upper()}"] = features[key]
     if "early_ack_text" in features:
         values["WEBSEARCH_EARLY_ACK_TEXT"] = features["early_ack_text"]
+    if "release_version" in features:
+        # Documented in README alongside WEBSEARCH_RELEASE_VERSION. Without
+        # this copy an operator's [features].release_version was silently
+        # dropped and load_config fell back to the packaged default, so the
+        # promotion manifest's release_version bind check compared against the
+        # wrong identity.
+        values["WEBSEARCH_RELEASE_VERSION"] = features["release_version"]
     if "promotion_manifest_path" in features:
         values["WEBSEARCH_PROMOTION_MANIFEST_PATH"] = features["promotion_manifest_path"]
     if "phase4c_artifact_path" in features:

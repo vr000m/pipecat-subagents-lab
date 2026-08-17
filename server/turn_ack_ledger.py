@@ -11,17 +11,19 @@ This is the most heavily interconnected slice in the whole SessionHost
 decomposition -- ``_settle_turn_ack``, ``_emit_early_ack``, and
 ``_schedule_ack_admission`` call each other -- and it has a real external
 dependency: ``on_ack_terminal`` is wired as a callback straight into
-``SpeechScheduler`` from ``SessionHost.connect()`` (server/pipeline.py), not
-just called internally. That wiring now points at
-``TurnAckLedger.on_ack_terminal`` directly.
+``SpeechScheduler`` from ``SessionHost.connect()`` (server/pipeline.py). That
+wiring passes ``SessionHost.on_ack_terminal``, a one-line forwarder onto this
+method, rather than the bound ledger method itself; the forwarder is retained
+so a test that patches the host's method still intercepts the callback.
 
-``SessionHost.connection``/``accepts()`` are read through narrow callables
-(``connection``, ``accepts``) rather than a full host reference, mirroring
-``RunnerSupervisor``'s ``Callable[[], Iterable[Any]]`` pattern: this ledger
-observes the live connection at call time, it never owns it, and the
-connection is swapped out from under it on every reconnect/promotion.
-``feature_policy`` and ``early_ack_text`` are narrow references, mirroring
-``WorkStatusPublisher``/``WorkerProjection``.
+``SessionHost.connection``/``accepts()``/``feature_policy``/``early_ack_text``
+are all read through narrow callables rather than a full host reference,
+mirroring ``RunnerSupervisor``'s ``Callable[[], Iterable[Any]]`` pattern: this
+ledger observes them at call time and never owns them. ``connection`` is
+swapped out on every reconnect/promotion, and ``config``/``feature_policy``
+are reassigned on the host after construction (``scripts/smoke_conversation.py``
+replaces ``host.config`` with a tuned copy), so a construction-time snapshot
+would silently serve stale values.
 
 ``cancel_turn_or_child`` (SessionHost's atomic ack+work cancellation) and the
 turn handlers stay on SessionHost -- both out of scope for this branch's
@@ -84,11 +86,14 @@ class TurnAckLedger:
     def __init__(
         self,
         *,
-        feature_policy: FeaturePolicy,
-        early_ack_text: str,
+        feature_policy: Callable[[], FeaturePolicy],
+        early_ack_text: Callable[[], str],
         connection: Callable[[], ConnectionPipeline | None],
         accepts: Callable[[int | None], bool],
     ) -> None:
+        # Thunks, not snapshots: ``host.config``/``host.feature_policy`` are
+        # reassignable after this ledger is constructed, and the pre-extraction
+        # code read both live off SessionHost on every ack.
         self._feature_policy = feature_policy
         self._early_ack_text = early_ack_text
         self._connection = connection
@@ -209,11 +214,25 @@ class TurnAckLedger:
     def on_ack_terminal(
         self, identity: GenerationIdentity, reason: PreAdmissionTerminalReason
     ) -> None:
-        """Idempotent sole mutator for the pre-admission-terminal ack path.
+        """Idempotent latch clear for acks terminalized before admission.
 
         Injected into ``SpeechScheduler`` at connection setup; invoked only
         when an ack is terminalized before admission (``no_tts`` /
-        ``unavailable_transport``), never for a normal admitted completion.
+        ``unavailable_transport`` / ``connection_closed``), never for a normal
+        admitted completion.
+
+        Scope note: this is the sole mutator for *this* path, not for the ack
+        latch as a whole. The latch is also cleared by ``settle_turn_ack``
+        (every turn-handler retraction site), by ``clear_ack_latch`` /
+        ``release_turn_work_item`` / ``release_all_turn_work_items`` (turn
+        cleanup), and by the retry chain's not-live and abandon branches.
+        Terminal notifications likewise have two producers, only one of which
+        originates in the lifecycle: ``SpeechScheduler.start_next`` forwards
+        ``SpeechLifecycleCoordinator.pre_admission_disposition``'s reason,
+        while ``SpeechScheduler._notify_ack_swept`` synthesizes its own for
+        the interrupt sweep. Collapsing those into a single settling entry
+        point that names the cause is recorded as a follow-up in the dev plan,
+        not claimed here.
         """
         del reason
         if identity.turn_id is not None:
@@ -263,7 +282,7 @@ class TurnAckLedger:
             return
         if not dispatched and search_task is not None:
             raise ValueError("search_task may only be supplied on an already-dispatched path")
-        if not self._feature_policy.enable_early_ack or turn_id in self._ack_emitted_turns:
+        if not self._feature_policy().enable_early_ack or turn_id in self._ack_emitted_turns:
             return
         if (
             origin.tts is None
@@ -283,7 +302,7 @@ class TurnAckLedger:
                 result_id=None,
                 work_item_id=ack_work_item_id,
                 run_id=f"run-{ack_work_item_id}",
-                text=self._early_ack_text,
+                text=self._early_ack_text(),
                 origin_epoch=origin_epoch,
                 role=ROLE_ACK,
                 ack_id=ack_work_item_id,
@@ -368,6 +387,17 @@ class TurnAckLedger:
                     "discarding it instead of re-queueing",
                     log_reason,
                 )
+                # Both terminal exits of the retry chain must leave the latch
+                # in the same state. The abandon branch below settles it; this
+                # one used to return with the latch still set, and on the
+                # ``needs_requeue=True`` path there is nothing queued for
+                # ``SpeechScheduler.interrupt``'s reconnect sweep to find and
+                # route through ``on_ack_terminal``, so the latch survived
+                # until the owning turn handler's ``finally``. Inside that
+                # window a later eligible multi-intent sibling calling
+                # ``emit_early_ack`` short-circuits on the latch and the turn
+                # loses its only remaining chance at an ack.
+                self.clear_ack_latch(turn_id)
                 return
             if attempt >= _ACK_ADMISSION_MAX_ATTEMPTS:
                 logger.debug(

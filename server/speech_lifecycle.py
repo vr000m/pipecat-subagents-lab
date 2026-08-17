@@ -270,6 +270,10 @@ class SpeechLifecycleCoordinator:
         self._context_tokens: dict[str, str] = {}
         self._context_tombstones: OrderedDict[str, None] = OrderedDict()
         self._timer_handles: dict[str, TimerHandle] = {}
+        # Strong references to in-flight internal transitions scheduled by
+        # ``_schedule``; see that method for why the loop's own weak
+        # references are not enough.
+        self._transition_tasks: set[asyncio.Future[Any]] = set()
         self._connection_closed = False
         # Counts completed teardowns, not a "connection epoch" -- that concept
         # is already owned by ConnectionArbiter/ConnectionPipeline.epoch/
@@ -636,18 +640,34 @@ class SpeechLifecycleCoordinator:
         if handle is not None:
             handle.cancel()
 
-    @staticmethod
-    def _schedule(coroutine: Any) -> asyncio.Future[Any] | None:
-        """Fire-and-forget one internal transition, returning the scheduled
-        future so a caller that can await still observes completion.
-        Callers that cannot await (no event loop, or a synchronous call
-        site) yield to the loop once instead, e.g. `await
-        asyncio.sleep(0)`."""
+    def _schedule(self, coroutine: Any) -> asyncio.Future[Any] | None:
+        """Schedule one internal transition, returning the scheduled future so
+        a caller that can await still observes completion. Callers that cannot
+        await (no event loop, or a synchronous call site) yield to the loop
+        once instead, e.g. `await asyncio.sleep(0)`.
+
+        The future is retained in ``_transition_tasks`` until it completes.
+        CPython's event loop holds only a weak reference to a running task, so
+        an un-referenced transition suspended at an await can be garbage
+        collected and silently never finish -- which for these transitions
+        means the transport slot is never freed (``_terminalize_state`` never
+        runs) and ``on_terminal``'s queue re-probe never fires, stalling the
+        scheduler for the rest of the connection. Three of this method's call
+        sites discard the returned future entirely (the uncontexted-generation
+        interruption branch, ``release_generation``'s notify path, and the
+        timer arm), so the retention has to live here rather than at each
+        caller. Mirrors ``SpeechScheduler._advance_tasks``,
+        ``TurnAckLedger._ack_admission_tasks``, and
+        ``RuntimeObserver._emit_tasks``.
+        """
         try:
-            return asyncio.ensure_future(coroutine)
+            future = asyncio.ensure_future(coroutine)
         except RuntimeError:
             coroutine.close()
             return None
+        self._transition_tasks.add(future)
+        future.add_done_callback(self._transition_tasks.discard)
+        return future
 
     async def _on_start_timeout(self, token: str) -> None:
         await self._begin_delivery_unknown(token)

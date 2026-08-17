@@ -128,6 +128,19 @@ class Result:
     citations: tuple[Any, ...] = ()
 
 
+_OWNED_CONFIG_FIELDS: frozenset[str] = frozenset(
+    {"max_work_items_per_turn", "multi_intent_wait_timeout_ms"}
+)
+"""The one declaration of the ``Config`` fields a coordinator constructor may
+override onto whatever ``Config`` it was handed.
+
+Read by ``WorkItemCoordinator.OWNED_CONFIG_FIELDS`` (the canonical public
+name), by ``CoordinatorDefaults``, and by ``coordinator_view``'s fallback, so
+the three cannot drift. Declared at module scope because ``CoordinatorDefaults``
+is defined before ``WorkItemCoordinator`` and cannot reference it at class-body
+evaluation time."""
+
+
 class Coordinator(Protocol):
     """The SessionHost <-> coordinator boundary, declared explicitly.
 
@@ -255,7 +268,14 @@ class CoordinatorDefaults:
 
     registry: WorkerRegistry | None = None
     config: Config | None = None
-    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = frozenset()
+    #: Single-sourced with ``WorkItemCoordinator.OWNED_CONFIG_FIELDS`` and
+    #: with ``coordinator_view``'s fallback. These three previously declared
+    #: the same default twice over and had already drifted: an empty frozenset
+    #: here versus the coordinator's real field set in ``coordinator_view``
+    #: meant a coordinator that followed this class's documented advice and
+    #: subclassed it would silently change ``SessionHost``'s config-conflict
+    #: check.
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = _OWNED_CONFIG_FIELDS
 
     def live_work_item_ids(self) -> frozenset[str]:
         return frozenset()
@@ -274,10 +294,19 @@ class CoordinatorDefaults:
 class CoordinatorView:
     """The 7 optional ``Coordinator`` members, resolved to concrete values.
 
-    Built once by ``coordinator_view`` so a caller reads plain attributes
-    and calls plain methods instead of repeating ``getattr(coordinator,
-    ..., default)`` at each of the ``server/pipeline.py`` call sites
-    documented on ``Coordinator``.
+    Built by ``coordinator_view`` so a caller reads plain attributes and
+    calls plain methods instead of repeating ``getattr(coordinator, ...,
+    default)`` at each of the ``server/pipeline.py`` call sites documented on
+    ``Coordinator``.
+
+    Deliberately *not* cached: ``SessionHost._coordinator_view`` is a plain
+    property that rebuilds this view from ``self.coordinator`` on every
+    access, because tests reassign ``host.coordinator`` after construction and
+    a view captured at construction time would keep serving the replaced one.
+    The rebuild is seven ``getattr`` calls plus a frozen-dataclass
+    construction; it is on the per-search dispatch and cancel paths, which is
+    a knowingly accepted cost, not an oversight. Caching it would require
+    making ``coordinator`` a property whose setter rebuilds the view.
     """
 
     registry: WorkerRegistry | None
@@ -293,26 +322,27 @@ def coordinator_view(coordinator: Any) -> CoordinatorView:
     """Resolve ``coordinator``'s 7 optional members, applying today's fallbacks.
 
     Mirrors each ``getattr(coordinator, "<member>", <default>)`` call site
-    documented on ``Coordinator`` exactly once. Not wired into
-    ``server/pipeline.py`` yet -- those call sites still do their own
-    ``getattr`` probing until they are migrated to read through this view.
+    documented on ``Coordinator`` exactly once. This is the only one of the
+    four boundary declarations in this module that production reads:
+    ``SessionHost`` resolves all seven optional members through it
+    (``server/pipeline.py``) and has no remaining ``getattr(coordinator, ...)``
+    probes of its own. Every fallback below is taken from
+    ``CoordinatorDefaults`` rather than restated, so the concrete class a
+    coordinator implementer is told to subclass and the fallbacks a
+    non-conforming coordinator actually gets cannot disagree.
     """
+    defaults = CoordinatorDefaults()
     return CoordinatorView(
-        registry=getattr(coordinator, "registry", None),
-        config=getattr(coordinator, "config", None),
+        registry=getattr(coordinator, "registry", defaults.registry),
+        config=getattr(coordinator, "config", defaults.config),
         OWNED_CONFIG_FIELDS=getattr(
-            coordinator, "OWNED_CONFIG_FIELDS", WorkItemCoordinator.OWNED_CONFIG_FIELDS
+            coordinator, "OWNED_CONFIG_FIELDS", CoordinatorDefaults.OWNED_CONFIG_FIELDS
         ),
-        live_work_item_ids=getattr(coordinator, "live_work_item_ids", lambda: frozenset()),
-        start_task=getattr(coordinator, "start_task", None)
-        or (lambda operation: asyncio.create_task(operation)),
-        cancel=getattr(coordinator, "cancel", None) or (lambda work_item_id=None: ()),
-        shutdown=getattr(coordinator, "shutdown", None) or _noop_shutdown,
+        live_work_item_ids=getattr(coordinator, "live_work_item_ids", defaults.live_work_item_ids),
+        start_task=getattr(coordinator, "start_task", None) or defaults.start_task,
+        cancel=getattr(coordinator, "cancel", None) or defaults.cancel,
+        shutdown=getattr(coordinator, "shutdown", None) or defaults.shutdown,
     )
-
-
-async def _noop_shutdown() -> None:
-    return None
 
 
 class WorkItemCoordinator:
@@ -322,9 +352,7 @@ class WorkItemCoordinator:
     #: coordinator's by excluding exactly these fields, so the two components
     #: read one declaration instead of duplicating a literal list that can
     #: silently drift when a field is added or removed here.
-    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = frozenset(
-        {"max_work_items_per_turn", "multi_intent_wait_timeout_ms"}
-    )
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = _OWNED_CONFIG_FIELDS
 
     def __init__(
         self,

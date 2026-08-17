@@ -1711,3 +1711,58 @@ def test_snapshot_barrier_flush_frame_defaults_are_empty_token_and_no_handle() -
 
     assert frame.token == ""
     assert frame.acknowledge is None
+
+
+def test_schedule_retains_a_strong_reference_to_every_in_flight_transition() -> None:
+    """Regression (#10): ``_schedule`` was a staticmethod that returned
+    ``asyncio.ensure_future(...)`` and kept no reference. Three of its five
+    call sites discard the returned future entirely (``record_interruption``'s
+    uncontexted-generation branch, ``release_generation``'s notify path, and
+    the timer arm). CPython's event loop holds only a weak reference to a
+    running task, so an unreferenced transition suspended at an await can be
+    collected and silently never finish -- leaving the transport slot never
+    freed (``_terminalize_state`` never runs) and ``on_terminal``'s queue
+    re-probe never fired, stalling the scheduler for the rest of the
+    connection. Every sibling in this codebase (``SpeechScheduler``'s
+    ``_advance_tasks``, ``TurnAckLedger._ack_admission_tasks``,
+    ``RuntimeObserver._emit_tasks``) already retains its tasks this way.
+    """
+
+    async def run() -> None:
+        coordinator, _clock = make_coordinator()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_transition() -> None:
+            started.set()
+            await release.wait()
+
+        future = coordinator._schedule(slow_transition())
+        await started.wait()
+
+        assert future in coordinator._transition_tasks
+        # The set is the only strong reference: dropping the local one must
+        # not make the transition collectable.
+        del future
+        assert len(coordinator._transition_tasks) == 1
+
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # The done-callback drains the set, so retention is bounded by
+        # in-flight transitions, not by connection lifetime.
+        assert coordinator._transition_tasks == set()
+
+    asyncio.run(run())
+
+
+def test_schedule_without_a_running_loop_still_closes_the_coroutine() -> None:
+    """The no-event-loop branch must stay a clean no-op: it returns ``None``
+    and leaves nothing retained."""
+    coordinator, _clock = make_coordinator()
+
+    async def never_runs() -> None:  # pragma: no cover - deliberately not awaited
+        return None
+
+    assert coordinator._schedule(never_runs()) is None
+    assert coordinator._transition_tasks == set()

@@ -686,3 +686,92 @@ def test_prune_expired_work_status_is_the_named_mutating_step() -> None:
     effect of a read-shaped ``work_status_snapshot()``. It is now its own
     named step."""
     assert callable(SessionState.prune_expired_work_status)
+
+
+def test_restored_parent_never_terminalizes_from_a_partial_child_set() -> None:
+    """Regression (#8): ``from_snapshot`` restores a multi-intent parent's
+    aggregate but not its children (child records are server-internal and
+    never cross the wire), so the restored record's children map starts empty.
+    A single child reporting ``result_ready`` after the restore was then
+    treated as the *complete* aggregate and emitted ``result_ready`` while a
+    sibling was still searching."""
+    state = SessionState(session_id="session-restore")
+    state.active_epoch = 2
+    state.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-0",
+        parent_work_item_id="work-mi",
+        state="searching",
+        origin_epoch=2,
+    )
+    state.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-1",
+        parent_work_item_id="work-mi",
+        state="searching",
+        origin_epoch=2,
+    )
+    snapshot = state.snapshot(origin_epoch=2, include_work_status=True)
+    assert [status.state for status in snapshot.work_status] == ["searching"]
+
+    restored = SessionState.from_snapshot(snapshot)
+    restored.active_epoch = 2
+    key = WorkStatusKey(2, "turn-mi", "work-mi")
+    assert restored._work_status_children[key] == {}
+    assert restored._work_status_parents[key].children_authoritative is False
+
+    # Only ONE of the two children reports; the other is still searching.
+    event = restored.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-0",
+        parent_work_item_id="work-mi",
+        state="result_ready",
+        origin_epoch=2,
+    )
+    assert event is None
+    assert restored._work_status_parents[key].status.state == "searching"
+    assert [status.state for status in restored.work_status_snapshot()] == ["searching"]
+
+
+def test_restored_parent_stays_non_authoritative_across_a_non_terminal_update() -> None:
+    """The incompleteness is a property of the key, not of one record: a
+    non-terminal re-aggregation must not reset the flag and re-open the
+    premature-terminalization hole."""
+    state = SessionState(session_id="session-restore-2")
+    state.active_epoch = 3
+    state.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-0",
+        parent_work_item_id="work-mi",
+        state="routing",
+        origin_epoch=3,
+    )
+    restored = SessionState.from_snapshot(state.snapshot(origin_epoch=3, include_work_status=True))
+    restored.active_epoch = 3
+    key = WorkStatusKey(3, "turn-mi", "work-mi")
+
+    # A legal non-terminal refinement still flows through.
+    assert (
+        restored.set_child_work_status(
+            turn_id="turn-mi",
+            work_item_id="work-mi-0",
+            parent_work_item_id="work-mi",
+            state="searching",
+            origin_epoch=3,
+        )
+        is not None
+    )
+    assert restored._work_status_parents[key].status.state == "searching"
+    assert restored._work_status_parents[key].children_authoritative is False
+
+    assert (
+        restored.set_child_work_status(
+            turn_id="turn-mi",
+            work_item_id="work-mi-0",
+            parent_work_item_id="work-mi",
+            state="result_ready",
+            origin_epoch=3,
+        )
+        is None
+    )
+    assert restored._work_status_parents[key].status.state == "searching"

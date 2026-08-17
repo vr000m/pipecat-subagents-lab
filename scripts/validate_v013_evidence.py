@@ -20,6 +20,7 @@ rewrite the manifest as ``final`` before autoplay can ever activate.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -677,6 +678,41 @@ def _write_bytes_no_follow(path: Path, payload: bytes) -> None:
         os.close(fd)
 
 
+def _read_bytes_no_follow(path: Path) -> bytes | None:
+    """Read `path`, refusing to read *through* a symlink.
+
+    The write side is already ``O_NOFOLLOW``-hardened, but the `.previous`
+    copy first has to read the destination, and ``Path.exists()`` /
+    ``Path.read_bytes()`` both follow links. A symlink planted at the manifest
+    path -- a predictable, repo-relative location CI also writes -- would
+    otherwise copy the link target's contents into a world-readable
+    `<output>.previous` just before the rename replaced the link. ``ELOOP`` is
+    a hard failure here, not a "treat as absent": something is at the manifest
+    path that must not be, and silently proceeding would write the real
+    manifest over it.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise EvidenceGateError(
+                f"{path}: refusing to read the existing manifest through a symlink"
+            ) from exc
+        raise
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _fsync_directory(directory: Path) -> None:
     dir_fd = os.open(str(directory), os.O_RDONLY)
     try:
@@ -706,14 +742,16 @@ def _atomic_write_manifest(output: Path, manifest: dict[str, Any]) -> None:
       `<output>.tmp` path opened without ``O_EXCL``/``O_NOFOLLOW``, so a
       planted symlink there would have received the manifest bytes. The temp
       file is now created by `tempfile.mkstemp` (random name, ``O_EXCL``) and
-      the `.previous` copy is opened ``O_NOFOLLOW``.
+      the `.previous` copy is both read (`_read_bytes_no_follow`) and written
+      (`_write_bytes_no_follow`) ``O_NOFOLLOW``. The read side matters as much
+      as the write side: it is what stops a symlink at the manifest path from
+      leaking its target's contents into `<output>.previous`.
     """
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     previous_path = output.with_suffix(output.suffix + ".previous")
-    previous_bytes: bytes | None = None
-    if output.exists():
-        previous_bytes = output.read_bytes()
+    previous_bytes = _read_bytes_no_follow(output)
+    if previous_bytes is not None:
         _write_bytes_no_follow(previous_path, previous_bytes)
 
     fd, tmp_name = tempfile.mkstemp(

@@ -739,6 +739,27 @@ def test_atomic_write_does_not_write_through_a_planted_previous_symlink(tmp_path
     assert victim.read_text(encoding="utf-8") == "untouched"
 
 
+def test_atomic_write_does_not_read_the_destination_through_a_symlink(tmp_path: Path) -> None:
+    """Regression (#29): the write side was O_NOFOLLOW-hardened but the
+    `.previous` copy first *read* the destination via `Path.exists()` /
+    `Path.read_bytes()`, both of which follow symlinks. A symlink planted at
+    the manifest path -- a predictable, repo-relative location CI also writes
+    -- therefore copied the link target's contents into a 0o644
+    `<output>.previous` before the rename replaced the link, leaking arbitrary
+    file contents. ELOOP is a hard failure, not a "treat as absent"."""
+    module = _validator()
+    output = tmp_path / "manifest.json"
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SUPER-SECRET", encoding="utf-8")
+    output.symlink_to(secret)
+
+    with pytest.raises(module.EvidenceGateError):
+        module._atomic_write_manifest(output, {"manifest_phase": "new"})
+
+    assert not (tmp_path / "manifest.json.previous").exists()
+    assert secret.read_text(encoding="utf-8") == "SUPER-SECRET"
+
+
 def test_atomic_write_ignores_a_planted_predictable_temp_file(tmp_path: Path) -> None:
     """The temp file is now created via `tempfile.mkstemp` (random name,
     O_EXCL), so a symlink planted at the previously-predictable
