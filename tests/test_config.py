@@ -222,6 +222,124 @@ def test_operator_models_load_from_toml_and_environment_wins(tmp_path) -> None:
     assert config.resolve_worker_model("deep") == "toml-worker"
 
 
+def test_reasoning_effort_resolver_unknown_model_policy_label_raises_config_error() -> None:
+    config = Config(
+        router_model_policy={"fast": "verified-router-model"},
+        worker_model_policy={"deep": "verified-worker-model"},
+    )
+
+    with pytest.raises(ConfigError):
+        config.resolve_router_reasoning_effort("model-emitted-id")
+    with pytest.raises(ConfigError):
+        config.resolve_worker_reasoning_effort("model-emitted-id")
+
+
+def test_reasoning_effort_resolver_registered_label_without_effort_entry_resolves_to_none() -> None:
+    config = Config(
+        router_model_policy={"fast": "verified-router-model"},
+        worker_model_policy={
+            "deep": "verified-worker-model",
+            "custom-worker-label": "verified-custom-worker-model",
+        },
+    )
+
+    assert config.resolve_router_reasoning_effort("fast") is None
+    assert config.resolve_worker_reasoning_effort("deep") is None
+    assert config.resolve_worker_reasoning_effort("custom-worker-label") is None
+
+
+def test_reasoning_effort_resolver_explicit_override_is_honored_end_to_end() -> None:
+    config = Config(
+        router_model_policy={"fast": "non-gpt-5-router-model"},
+        worker_model_policy={"deep": "verified-worker-model"},
+        router_reasoning_effort_policy={"fast": "high"},
+        worker_reasoning_effort_policy={"deep": "low"},
+    )
+
+    assert config.resolve_router_reasoning_effort("fast") == "high"
+    assert config.resolve_worker_reasoning_effort("deep") == "low"
+
+
+def test_reasoning_effort_policy_rejects_value_outside_sdk_documented_literal() -> None:
+    with pytest.raises(ConfigError):
+        Config(router_reasoning_effort_policy={"fast": "extreme"})
+    with pytest.raises(ConfigError):
+        Config(worker_reasoning_effort_policy={"deep": "extreme"})
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_reasoning_effort_policy_accepts_the_full_sdk_documented_literal(effort: str) -> None:
+    """The OpenAI SDK's ``ReasoningEffort`` literal is broader than the four
+    values named in the plan's Objective; validation must accept all of it,
+    not a hardcoded subset."""
+    config = Config(router_reasoning_effort_policy={"fast": effort})
+
+    assert config.resolve_router_reasoning_effort("fast") == effort
+
+
+def test_config_constructed_positionally_with_pre_existing_field_order_still_works() -> None:
+    """Regression: the reasoning-effort policy fields must be appended after
+    every pre-existing field (including the diagnostic fields at the very
+    end), not inserted mid-dataclass -- otherwise this positional
+    construction, which mirrors the field order Phase 1 found in place,
+    would silently shift arguments instead of raising or behaving
+    identically to the default construction below."""
+    import dataclasses
+
+    import server.config as _config_module
+
+    config = Config(
+        None,  # openai_api_key
+        "OPENAI_API_KEY",  # openai_api_key_env
+        None,  # deepgram_api_key
+        None,  # cartesia_api_key
+        None,  # cartesia_voice_id
+        {"fast": "gpt-5-mini"},  # router_model_policy
+        {"deep": "gpt-5"},  # worker_model_policy
+        2,  # max_work_items_per_turn
+        10_000,  # multi_intent_wait_timeout_ms
+        15.0,  # foreground_search_timeout_seconds
+        12.0,  # router_timeout_seconds
+        75.0,  # provider_timeout_seconds
+        2.0,  # shutdown_grace_seconds
+        12,  # max_citations
+        30.0,  # pending_dialogue_timeout_seconds
+        "websocket",  # stt_service
+        "local",  # stt_provider
+        "nova-3-general",  # stt_model
+        "en",  # stt_language
+        None,  # stt_endpoint
+        5.0,  # smart_turn_timeout_seconds
+        1.5,  # smart_turn_complete_grace_seconds
+        10.0,  # speech_start_timeout_seconds
+        1.0,  # speech_transport_grace_seconds
+        None,  # tts_endpoint
+        "local",  # tts_provider
+        "sonic-3.5",  # tts_model
+        "azelma",  # tts_voice_id
+        "127.0.0.1",  # bind_host
+        7860,  # bind_port
+        "http://127.0.0.1:7860",  # known_client_url
+        True,  # enable_early_ack
+        True,  # enable_background_status
+        True,  # enable_autoplay_policy
+        "One moment while I look into that.",  # early_ack_text
+        "docs/benchmarks/v0.1.3-promotion-manifest.json",  # promotion_manifest_path
+        None,  # phase4c_artifact_path
+        _config_module._DEFAULT_RELEASE_VERSION,  # release_version
+        None,  # source_commit
+        None,  # source_tree_hash
+        None,  # deployed_at_utc
+    )
+
+    assert config == Config()
+
+    field_names = [f.name for f in dataclasses.fields(Config)]
+    deployed_at_utc_index = field_names.index("deployed_at_utc")
+    for new_field in ("router_reasoning_effort_policy", "worker_reasoning_effort_policy"):
+        assert field_names.index(new_field) > deployed_at_utc_index
+
+
 def test_bind_and_known_client_settings_load_from_environment() -> None:
     config = load_config(
         env={

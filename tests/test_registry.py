@@ -1,14 +1,52 @@
 """The registry owns persistent context identities and immutable catalogues."""
 
+import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier, Event, Lock
 
 import pytest
 
+from server.config import Config
 from server.registry import UnsupportedWorkerType, WorkerRegistry
 from server.workers.base import ContextWorker, WorkerMetadata
 from server.workers.web_search import WebSearchWorker
+
+
+def _worker_answer_payload() -> dict[str, str]:
+    return {"output_text": json.dumps({"display_text": "answer", "spoken_text": "answer"})}
+
+
+class _RecordingResponses:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs: object) -> dict:
+        self.calls.append(kwargs)
+        return self.payload
+
+
+def test_registry_threads_resolved_worker_reasoning_effort_into_the_created_worker() -> None:
+    provider = _RecordingResponses(_worker_answer_payload())
+    config = Config(worker_reasoning_effort_policy={"deep": "low"})
+    registry = WorkerRegistry(config=config, responses=provider)
+
+    item = registry.get_or_create(topic="news", worker_type="web_search", model_policy="deep")
+    asyncio.run(item.worker.run("What is the weather in Riga?"))
+
+    assert provider.calls[0]["reasoning"] == {"effort": "low"}
+
+
+def test_registry_omits_reasoning_for_worker_model_policy_label_without_effort_entry() -> None:
+    provider = _RecordingResponses(_worker_answer_payload())
+    registry = WorkerRegistry(responses=provider)  # default Config: no effort override for "deep"
+
+    item = registry.get_or_create(topic="news", worker_type="web_search", model_policy="deep")
+    asyncio.run(item.worker.run("What is the weather in Riga?"))
+
+    assert "reasoning" not in provider.calls[0]
 
 
 class FakeContextWorker:

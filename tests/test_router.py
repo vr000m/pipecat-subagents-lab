@@ -104,6 +104,63 @@ def test_lazy_router_provider_defers_credentials_and_provider_creation_until_rou
     assert_strict_objects(schema)
 
 
+class _RecordingResponses:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs: object) -> dict[str, str]:
+        self.calls.append(kwargs)
+        return {"output_text": json.dumps({"decision": decision_payload()})}
+
+
+def test_lazy_router_provider_omits_reasoning_for_non_gpt5_model_without_override() -> None:
+    """Default behavior unchanged: a router model that does not start with
+    'gpt-5' never gets a `reasoning` kwarg when no effort override is set."""
+    responses = _RecordingResponses()
+    config = Config(router_model_policy={"fast": "non-gpt-5-router-model"})
+    provider = LazyRouterProvider(config, lambda: responses)
+    router = Router(call=provider)
+
+    router.route("What is the weather in Riga?", catalogue())
+
+    assert responses.calls[0]["model"] == "non-gpt-5-router-model"
+    assert "reasoning" not in responses.calls[0]
+
+
+def test_lazy_router_provider_explicit_override_applies_unconditionally_for_non_gpt5_model() -> (
+    None
+):
+    """An explicit effort override is not gated by the `startswith("gpt-5")`
+    check -- it must apply even to a router model the conditional would
+    otherwise never touch."""
+    responses = _RecordingResponses()
+    config = Config(
+        router_model_policy={"fast": "non-gpt-5-router-model"},
+        router_reasoning_effort_policy={"fast": "high"},
+    )
+    provider = LazyRouterProvider(config, lambda: responses)
+    router = Router(call=provider)
+
+    router.route("What is the weather in Riga?", catalogue())
+
+    assert responses.calls[0]["model"] == "non-gpt-5-router-model"
+    assert responses.calls[0]["reasoning"] == {"effort": "high"}
+
+
+def test_lazy_router_provider_explicit_override_replaces_the_gpt5_default() -> None:
+    """A gpt-5* model with an explicit override gets the override value, not
+    the hardcoded 'minimal' default."""
+    responses = _RecordingResponses()
+    config = Config(router_reasoning_effort_policy={"fast": "xhigh"})
+    provider = LazyRouterProvider(config, lambda: responses)
+    router = Router(call=provider)
+
+    router.route("What is the weather in Riga?", catalogue())
+
+    assert responses.calls[0]["model"] == "gpt-5-mini"
+    assert responses.calls[0]["reasoning"] == {"effort": "xhigh"}
+
+
 def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validation() -> None:
     model = FakeRouterModel(decision_payload())
     router = Router(model=model)

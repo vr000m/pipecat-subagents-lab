@@ -300,6 +300,7 @@ class WebSearchWorker(ContextWorker):
         model: str,
         responses: Any,
         model_policy: str | None = None,
+        reasoning_effort: str | None = None,
         decline: Callable[[str], bool] | None = None,
         can_satisfy: Callable[[str], bool] | None = None,
         needs_clarification: Callable[[str], str | None] | None = None,
@@ -316,6 +317,7 @@ class WebSearchWorker(ContextWorker):
         )
         super().__init__(metadata)
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.responses = responses
         self.decline = decline or (
             lambda query: can_satisfy(query) is False if can_satisfy else False
@@ -374,6 +376,8 @@ class WebSearchWorker(ContextWorker):
                 "text": structured_text_format(WebSearchAnswer, "web_search_answer"),
                 "store": False,
             }
+            if self.reasoning_effort is not None:
+                kwargs["reasoning"] = {"effort": self.reasoning_effort}
             create = self.responses.create
             async with asyncio.timeout(self.provider_timeout_seconds):
                 if inspect.iscoroutinefunction(create):

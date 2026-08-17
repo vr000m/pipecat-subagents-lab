@@ -89,7 +89,10 @@ class LazyRouterProvider:
             "timeout": self._config.router_timeout_seconds,
             "text": structured_text_format(RouterEnvelope, "router_envelope"),
         }
-        if model.startswith("gpt-5"):
+        effort = self._config.resolve_router_reasoning_effort("fast")
+        if effort is not None:
+            kwargs["reasoning"] = {"effort": effort}
+        elif model.startswith("gpt-5"):
             kwargs["reasoning"] = {"effort": "minimal"}
         response = self._get_responses().create(**kwargs)
         try:

@@ -71,6 +71,39 @@ def test_worker_sanitizes_query_and_requests_store_false_before_normalizing_resu
     assert result.citations[0].url == "https://example.com/a"
 
 
+def test_worker_omits_reasoning_kwarg_by_default() -> None:
+    """Default behavior unchanged: no reasoning-effort override means the
+    worker never sends a `reasoning` kwarg, same as before Phase 1."""
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    asyncio.run(worker.run("What is the weather in Riga?"))
+
+    assert "reasoning" not in provider.calls[0]
+
+
+def test_worker_applies_explicit_reasoning_effort_override() -> None:
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(
+        responses=provider, model="verified-worker-model", reasoning_effort="medium"
+    )
+
+    asyncio.run(worker.run("What is the weather in Riga?"))
+
+    assert provider.calls[0]["reasoning"] == {"effort": "medium"}
+
+
+def test_worker_can_be_constructed_without_the_reasoning_effort_keyword_argument() -> None:
+    """Regression: `reasoning_effort` must stay keyword-only with a `None`
+    default so every pre-existing direct-construction call site (including
+    every other test in this module) keeps working unmodified."""
+    provider = FakeResponses(answer_payload())
+
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    assert worker.model == "verified-worker-model"
+
+
 def test_worker_collects_object_sources_from_web_search_call_actions() -> None:
     class Value:
         def __init__(self, **kwargs: object) -> None:

@@ -20,6 +20,11 @@ from urllib.parse import urlparse
 
 _FALLBACK_RELEASE_VERSION = "0.1.3"
 
+# Mirrors openai.types.shared.reasoning_effort.ReasoningEffort's Literal args
+# (the SDK's own alias is Optional[Literal[...]], which is not itself usable
+# as a plain membership set).
+_VALID_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+
 
 def _installed_release_version() -> str:
     """The packaged project version, or a pinned literal when unavailable.
@@ -56,6 +61,16 @@ def _models(value: Mapping[str, str]) -> dict[str, str]:
     result = dict(value)
     if not result or any(not label or not model for label, model in result.items()):
         raise ConfigError("model policies must contain non-empty labels and model IDs")
+    return result
+
+
+def _reasoning_efforts(value: Mapping[str, str]) -> dict[str, str]:
+    result = dict(value)
+    for label, effort in result.items():
+        if not label:
+            raise ConfigError("reasoning-effort policies must contain non-empty labels")
+        if effort not in _VALID_REASONING_EFFORTS:
+            raise ConfigError(f"unsupported reasoning effort: {effort!r}")
     return result
 
 
@@ -102,6 +117,8 @@ class Config:
     source_commit: str | None = None
     source_tree_hash: str | None = None
     deployed_at_utc: str | None = None
+    router_reasoning_effort_policy: Mapping[str, str] = field(default_factory=dict)
+    worker_reasoning_effort_policy: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.max_work_items_per_turn not in (2, 3, 4):
@@ -180,6 +197,16 @@ class Config:
                 raise ConfigError("deployed_at_utc must be an ISO-8601 UTC timestamp") from exc
         object.__setattr__(self, "router_model_policy", _models(self.router_model_policy))
         object.__setattr__(self, "worker_model_policy", _models(self.worker_model_policy))
+        object.__setattr__(
+            self,
+            "router_reasoning_effort_policy",
+            _reasoning_efforts(self.router_reasoning_effort_policy),
+        )
+        object.__setattr__(
+            self,
+            "worker_reasoning_effort_policy",
+            _reasoning_efforts(self.worker_reasoning_effort_policy),
+        )
 
     def resolve_router_model(self, policy_label: str) -> str:
         try:
@@ -192,6 +219,16 @@ class Config:
             return self.worker_model_policy[policy_label]
         except KeyError as exc:
             raise ConfigError(f"unknown worker model policy: {policy_label}") from exc
+
+    def resolve_router_reasoning_effort(self, policy_label: str) -> str | None:
+        if policy_label not in self.router_model_policy:
+            raise ConfigError(f"unknown router model policy: {policy_label}")
+        return self.router_reasoning_effort_policy.get(policy_label)
+
+    def resolve_worker_reasoning_effort(self, policy_label: str) -> str | None:
+        if policy_label not in self.worker_model_policy:
+            raise ConfigError(f"unknown worker model policy: {policy_label}")
+        return self.worker_reasoning_effort_policy.get(policy_label)
 
     def with_discovered_endpoint(self, service: str, transport: str, address: str) -> Config:
         if service not in {"stt", "tts"}:
@@ -850,6 +887,14 @@ def load_config(
         kwargs["router_model_policy"] = {"fast": str(raw)}
     if raw := values.get("WEBSEARCH_WORKER_MODEL"):
         kwargs["worker_model_policy"] = {"deep": str(raw)}
+    if "WEBSEARCH_ROUTER_REASONING_EFFORT" in values:
+        kwargs["router_reasoning_effort_policy"] = {
+            "fast": str(values["WEBSEARCH_ROUTER_REASONING_EFFORT"])
+        }
+    if "WEBSEARCH_WORKER_REASONING_EFFORT" in values:
+        kwargs["worker_reasoning_effort_policy"] = {
+            "deep": str(values["WEBSEARCH_WORKER_REASONING_EFFORT"])
+        }
     stt_endpoint = values.get("WEBSEARCH_STT_ENDPOINT")
     if stt_endpoint:
         kwargs["stt_endpoint"] = parse_endpoint(str(stt_endpoint))

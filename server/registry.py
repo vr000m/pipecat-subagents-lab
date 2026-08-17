@@ -150,6 +150,7 @@ class WorkerRegistry:
         return WebSearchWorker(
             model=self.config.resolve_worker_model(metadata.model_policy),
             model_policy=metadata.model_policy,
+            reasoning_effort=self.config.resolve_worker_reasoning_effort(metadata.model_policy),
             responses=self.responses,
             worker_id=metadata.worker_id,
             topic=metadata.topic,
