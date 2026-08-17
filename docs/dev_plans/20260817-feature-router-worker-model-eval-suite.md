@@ -223,7 +223,7 @@ _To be filled in on completion._
 
 Per-phase completion tracked here so ticking a box during a run does not bust the review marker. `/conduct` reads this section to skip already-done phases.
 
-- [ ] Phase 0: Candidate & Effort Verification Gate
+- [x] Phase 0: Candidate & Effort Verification Gate
 - [ ] Phase 1: Reasoning-effort config knob
 - [ ] Phase 2: Eval-suite runner
 
@@ -233,3 +233,4 @@ Durable notes that survive after the run: diagnostic query results, decision rat
 
 - 2026-08-17: Claude-side `/review-plan` five-lens pass — 30 findings (1 Critical structural: router config-capture defect), all addressed in-plan.
 - 2026-08-18: Codex second-opinion review — 1 Critical (`_handle_transcript()` no-op without a connected host) + 12 High + 3 Medium + 2 Low findings, all addressed in-plan.
+- 2026-08-18: Phase 0 complete (commit `d5ea38a`). `scripts/verify_eval_candidates.py` live-probed all 12 (model, effort, tools) tuples named in the Objective's candidate matrix, using production-equivalent request kwargs cross-checked against `server/router.py`/`server/workers/web_search.py` by an advisory mid-phase reviewer. **12/12 accepted** — `gpt-5.6-luna`@high, `gpt-5.6-terra`@low(router)/medium(worker), and `gpt-5.6-sol`@low are all real, callable model IDs that accept their named effort level with the `web_search` tool attached where applicable. Manifest: `docs/dev_plans/artifacts/eval-candidates-manifest.json` (tracked in git, not `.review-plan/` — the mid-phase reviewer caught that the original default path was gitignored, which would have made Phase 2's manifest-presence gate unsatisfiable on a fresh checkout). The reviewer also caught the script reading `OPENAI_API_KEY` directly from `os.environ` instead of going through `load_config()`'s TOML → env-file → process-env precedence and `WEBSEARCH_OPENAI_API_KEY` override — fixed before commit. Judge path (`gpt-5-mini` via `openai_service`) also confirmed live.
