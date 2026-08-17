@@ -2099,16 +2099,42 @@ class SessionHost:
                 else None
             )
             worker = registered.worker if registered is not None else None
-            search = getattr(worker, "search", None)
             work_item_id = f"work-{turn_id}"
-            if search is None:
-                child = turn_recorder.new_child(work_item_id=work_item_id)
-                child.finalize(outcome="missing_search", app_worker_id=owner_id)
-                turn_recorder.finalize(outcome="failed")
+            if worker is not None:
+                await self._register_runner_worker(worker)
+            # S2 never derives the worker id from ``worker.metadata`` the way
+            # the single-intent path does -- it is always the pending
+            # dialogue's owner (or "main"), even when a worker is present.
+            # ``worker_id_override`` carries that so ``_begin_delegation``
+            # doesn't fall back to metadata for this call site.
+            delegation = self._begin_delegation(
+                DelegationRequest(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker=worker,
+                    origin_epoch=origin_epoch,
+                    worker_id_override=owner_id or "main",
+                ),
+                turn_recorder=turn_recorder,
+                delegated_children=delegated_children,
+            )
+            if delegation is None:
                 return outcome
-            await self._register_runner_worker(worker)
-            worker_id = owner_id or "main"
-            self._known_work_items.add(work_item_id)
+            child = delegation.child
+            worker_id = delegation.worker_id
+            search = delegation.search
+            # Unlike the single-intent path, pending-dialogue builds its
+            # retained recorder eagerly, before submit -- ``_begin_delegation``
+            # doesn't build one for any caller, so it's built here and stashed
+            # on the returned ``DelegatedChild`` (not frozen) for callers that
+            # inspect ``delegation.retained_recorder`` later.
+            retained_recorder = self._new_retained_recorder(
+                origin_epoch=origin.epoch,
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                app_worker_id=worker_id,
+            )
+            delegation.retained_recorder = retained_recorder
             # Dispatch happens inside ``coordinator.submit`` below, so there is
             # no handle to inspect here; the plan requires the ack at the
             # delegation decision, not after submission returns.
@@ -2116,24 +2142,6 @@ class SessionHost:
                 origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
             )
             clarification_context = self._clarification_context(pending, transcript)
-            child = turn_recorder.new_child(work_item_id=work_item_id)
-            # A continuation turn delegates genuine worker work, so it owns a
-            # client-visible parent status exactly like a single-intent turn.
-            delegated_children[work_item_id] = worker_id
-            self._register_turn_work_item(turn_id, work_item_id)
-            self._emit_work_status(
-                turn_id=turn_id,
-                work_item_id=work_item_id,
-                worker_id=worker_id,
-                state="routing",
-                origin_epoch=origin_epoch,
-            )
-            retained_recorder = self._new_retained_recorder(
-                origin_epoch=origin.epoch,
-                turn_id=turn_id,
-                work_item_id=work_item_id,
-                app_worker_id=worker_id,
-            )
             outcome_label: WorkItemOutcome = "completed"
             on_late_terminal = self._make_late_terminal_handler({work_item_id: retained_recorder})
 
@@ -2173,13 +2181,7 @@ class SessionHost:
                 origin_epoch=origin.epoch,
                 accepted_turn_sequence=dispatch_turn_sequence,
             )
-            self._emit_work_status(
-                turn_id=turn_id,
-                work_item_id=work_item_id,
-                worker_id=worker_id,
-                state="searching",
-                origin_epoch=origin_epoch,
-            )
+            self._mark_delegation_searching(delegation, turn_id=turn_id, origin_epoch=origin_epoch)
             submitted = await coordinator.submit(
                 work_item_id,
                 [(worker_id, transcript)],

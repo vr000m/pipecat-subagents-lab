@@ -6798,10 +6798,15 @@ def _pending_outcome() -> object:
     return type("Outcome", (), {"pending_dialogue": pending, "work_items": ()})()
 
 
-def _pending_host(submitted: object, sink: CollectingMeasurementSink) -> SessionHost:
+def _pending_host(
+    submitted: object, sink: CollectingMeasurementSink, *, worker: object | None = None
+) -> SessionHost:
     """A host whose coordinator returns a hand-built ``submit`` outcome for the
-    ``continue_pending`` path."""
-    worker = ResultWorker()
+    ``continue_pending`` path. ``worker`` defaults to a plain ``ResultWorker``;
+    pass one with ``metadata`` (e.g. ``ProjectedResultWorker``) to observe
+    ``_project_worker`` projections."""
+    if worker is None:
+        worker = ResultWorker()
 
     class Registry:
         config = Config(max_work_items_per_turn=2)
@@ -6867,6 +6872,131 @@ def test_pending_continuation_retained_child_reports_background_not_failed() -> 
         states = _work_status_states(host)
         assert states == ["routing", "searching", "background"]
         assert "failed" not in states
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_missing_worker_emits_failed_work_status() -> None:
+    """D-a: converting ``_handle_pending`` to ``_begin_delegation`` must close
+    the gap where a missing worker finalized the child silently, with no
+    terminal ``work_status`` emitted at all (pre-conversion the child was
+    simply finalized and the outcome returned -- ``_work_status_states``
+    stayed empty)."""
+
+    async def run() -> None:
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return None
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = _pending_outcome()
+
+        result = await host._handle_pending(
+            outcome,
+            "continue please",
+            origin,
+            "turn-pending-missing-worker",
+            host._new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending-missing-worker"
+            ),
+        )
+
+        assert result is outcome
+        assert _work_status_states(host) == ["failed"]
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "missing_worker"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_missing_search_emits_failed_work_status() -> None:
+    """D-a: the same gap for a registered worker with no ``search`` callable."""
+
+    async def run() -> None:
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": object()})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        outcome = _pending_outcome()
+
+        result = await host._handle_pending(
+            outcome,
+            "continue please",
+            origin,
+            "turn-pending-missing-search",
+            host._new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending-missing-search"
+            ),
+        )
+
+        assert result is outcome
+        assert _work_status_states(host) == ["failed"]
+        parent = _events(sink, "app_turn_foreground")[0].fields
+        assert parent["outcome"] == "failed"
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "missing_search"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_delegation_projects_worker_running_before_terminal() -> None:
+    """D-b: converting to ``_begin_delegation`` must close the gap where the
+    ``continue_pending`` path never called ``_project_worker(status="running")``
+    -- a capable client saw the worker jump straight from absent to its
+    terminal ``idle`` projection with no ``running`` state in between."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        worker = ProjectedResultWorker()
+        host = _pending_host(
+            _submitted(results=(_fan_in_result("turn-pending", "answer"),)),
+            sink,
+            worker=worker,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_pending(
+            _pending_outcome(),
+            "continue please",
+            origin,
+            "turn-pending",
+            host._new_app_turn_recorder(origin_epoch=origin.epoch, turn_id="turn-pending"),
+        )
+
+        worker_statuses = [
+            event.payload["status"] for event in host.state.events if event.kind == "worker"
+        ]
+        assert worker_statuses[0] == "running"
         await host.shutdown()
 
     asyncio.run(run())
