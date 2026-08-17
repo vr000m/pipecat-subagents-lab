@@ -15,11 +15,12 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
 from .config import Config, FeaturePolicy, PromotionManifest
-from .connection_arbiter import ConnectionArbiter
+from .connection_arbiter import Connection, ConnectionArbiter
 from .contracts import (
     GroundedResult,
     RoutingDecision,
     RoutingState,
+    SnapshotHandshake,
     TerminalReason,
     TranscriptEntry,
     WorkStatusState,
@@ -41,7 +42,7 @@ from .perf_metrics import (
     WorkItemRecorder,
     WorkOutcome,
 )
-from .recorder_factory import RecorderFactory
+from .recorder_factory import RecorderFactory, make_late_terminal_handler
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
@@ -569,8 +570,12 @@ class SessionHost:
             if comparable_coordinator_config != self.config:
                 raise ValueError("SessionHost config conflicts with the coordinator's Config")
         self.feature_policy = feature_policy or FeaturePolicy.from_config(self.config)
+        # ``feature_policy`` goes in as a thunk, not the object: it is a frozen
+        # dataclass this host replaces wholesale, so a snapshot taken here
+        # would diverge from what TurnAckLedger (below) enforces the moment a
+        # kill switch is flipped after construction.
         self._work_status_publisher = WorkStatusPublisher(
-            state=self.state, feature_policy=self.feature_policy
+            state=self.state, feature_policy=lambda: self.feature_policy
         )
         # The immutable evidence-gate verdict handed in by _default_session_host
         # (via server.config.load_promotion_manifest); missing/None is treated
@@ -611,6 +616,46 @@ class SessionHost:
         Sink Contract in the latency observability dev plan.
         """
         return self._measurement_sink
+
+    # ------------------------------------------------------------------
+    # Forwarders onto the extracted collaborators.
+    #
+    # The RunnerSupervisor/HandshakeGate extractions moved the state, not the
+    # public surface: ``runner``, ``runner_factory``,
+    # ``validate_handshake_token`` and ``validate_patch_handshake`` were part
+    # of SessionHost's API before the extraction and out-of-package callers
+    # (``server/app.py``) use them. Keeping them here as thin forwarders --
+    # the same strategy every other extraction on this branch used -- is what
+    # stops app.py from doing a two-level private reach-through
+    # (``host._runner_supervisor.runner``) into a collaborator that is an
+    # implementation detail of this class.
+    # ------------------------------------------------------------------
+
+    @property
+    def runner(self) -> Any:
+        return self._runner_supervisor.runner
+
+    @runner.setter
+    def runner(self, value: Any) -> None:
+        self._runner_supervisor.runner = value
+
+    @property
+    def runner_factory(self) -> Callable[[], Any] | None:
+        return self._runner_supervisor.runner_factory
+
+    @runner_factory.setter
+    def runner_factory(self, value: Callable[[], Any] | None) -> None:
+        self._runner_supervisor.runner_factory = value
+
+    def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
+        return self._handshake_gate.validate_handshake_token(token, proposed_epoch, redeem=redeem)
+
+    def validate_patch_handshake(
+        self,
+        connection: Connection | ConnectionPipeline | None,
+        handshake: SnapshotHandshake,
+    ) -> None:
+        self._handshake_gate.validate_patch_handshake(connection, handshake)
 
     async def start(self) -> None:
         if self.started:
@@ -1732,9 +1777,7 @@ class SessionHost:
                 pending, transcript
             )
             outcome_label: WorkItemOutcome = "completed"
-            on_late_terminal = self._recorder_factory.make_late_terminal_handler(
-                {work_item_id: retained_recorder}
-            )
+            on_late_terminal = make_late_terminal_handler({work_item_id: retained_recorder})
 
             async def execute(_worker_id: str, query: str) -> GroundedResult:
                 nonlocal outcome_label
@@ -2138,7 +2181,7 @@ class SessionHost:
                 )
                 for index in runnable_indexes
             }
-            on_late_terminal = self._recorder_factory.make_late_terminal_handler(retained_recorders)
+            on_late_terminal = make_late_terminal_handler(retained_recorders)
 
             def _multi_intent_late_context(late: LateResult) -> LateDeliveryContext:
                 return self._new_late_delivery_context(
@@ -2387,13 +2430,25 @@ class SessionHost:
                 # `shared/protocol.md` already documents for reconnect
                 # snapshot terminal records, which is a larger, separately
                 # scoped change.
-            if not results and not retained_work_items:
-                # Nothing will be spoken and nothing is still running: every
-                # dispatched item was rejected or never accounted for. An ack
-                # already admitted to the transport would then be this turn's
-                # only utterance -- a promise of a result that is never
-                # coming -- and a plain queued-ack discard cannot reach it, so
-                # retract it in whatever state it is in.
+            if not attributed_indexes and not retained_work_items:
+                # No *delegated* child was accepted or retained: every one was
+                # rejected before dispatch or never accounted for by the
+                # coordinator. The ack was enqueued at the delegation decision
+                # and promises a search result that is never coming, so retract
+                # it in whatever state it is in -- a plain queued-ack discard
+                # cannot reach one already admitted to the transport.
+                #
+                # The test is deliberately ``attributed_indexes``, not
+                # ``results``: a mixed multi-intent turn whose direct half
+                # produced a result and whose delegated half was
+                # capacity-rejected has a non-empty ``results`` while nothing
+                # was delegated at all, which left the false-progress ack
+                # speakable. ``attributed_indexes`` holds exactly the runnable
+                # (delegated) indexes the coordinator accounted for in some
+                # fan-in bucket -- result, pending, or failure -- so it is the
+                # accepted/retained-delegated-work signal this decision needs.
+                # ``retained_work_items`` is a subset of it and is kept only to
+                # state the "still running" half of the condition explicitly.
                 self._settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=True)
             else:
                 self._settle_turn_ack(origin.scheduler, turn_id)
@@ -2610,9 +2665,7 @@ class SessionHost:
             work_item_id=work_item_id,
             worker_id=worker_id,
             on_complete=lambda late: self.commit_late_result_once(late_context, late),
-            on_late_terminal=self._recorder_factory.make_late_terminal_handler(
-                {work_item_id: retained_recorder}
-            ),
+            on_late_terminal=make_late_terminal_handler({work_item_id: retained_recorder}),
         )
         if not accepted:
             self._recorder_factory.pop(work_item_id)

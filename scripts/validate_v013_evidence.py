@@ -661,6 +661,32 @@ def write_manifest(
     return manifest
 
 
+# Mirrors ``server.config._MAX_EVIDENCE_INPUT_BYTES``: the manifest path is
+# repo-relative and predictable, so the bytes found there are attacker-
+# steerable under the same threat model. Cap the read well above any real
+# manifest rather than letting a planted large file be slurped into memory.
+_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+
+
+def _require_regular_fd(fd: int, path: Path, verb: str) -> None:
+    """Reject anything that is not a regular file, from the *open fd*.
+
+    ``O_NOFOLLOW`` covers symlinks and nothing else. An attacker who can plant
+    a symlink at this predictable, repo-relative path can equally ``mkfifo``
+    it, and opening a FIFO blocks forever (which ``O_NONBLOCK`` at the open
+    turns into a non-blocking open, not into a safe read) -- or plant a device
+    node. ``fstat`` on the fd we actually hold, rather than a ``stat`` before
+    the open, is what closes the TOCTOU window between the check and the use.
+    """
+    from stat import S_ISREG
+
+    st = os.fstat(fd)
+    if not S_ISREG(st.st_mode):
+        raise EvidenceGateError(
+            f"{path}: refusing to {verb} the existing manifest -- not a regular file"
+        )
+
+
 def _write_bytes_no_follow(path: Path, payload: bytes) -> None:
     """Write `payload` to `path`, refusing to write *through* a symlink.
 
@@ -669,9 +695,30 @@ def _write_bytes_no_follow(path: Path, payload: bytes) -> None:
     link's target. The path may legitimately already exist as a regular file
     (a `.previous` copy from an earlier run), so ``O_EXCL`` is not usable
     here -- ``O_NOFOLLOW`` is the check that matters.
+
+    ``O_NONBLOCK`` plus the ``_require_regular_fd`` check closes the sibling
+    gap ``O_NOFOLLOW`` does not cover: a FIFO planted at this path would
+    otherwise make the open (and then the write) block indefinitely. The flag
+    is cleared implicitly by closing the fd; nothing here needs it beyond the
+    open.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
     try:
+        fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644
+        )
+    except OSError as exc:
+        # ELOOP/EMLINK deliberately propagates as the raw OSError it always
+        # has here -- callers already pin that -- and only the newly-covered
+        # non-regular-file cases become an EvidenceGateError.
+        if exc.errno == errno.ENXIO:
+            # Write-opening a reader-less FIFO with O_NONBLOCK fails here
+            # rather than blocking; same verdict as the fstat check below.
+            raise EvidenceGateError(
+                f"{path}: refusing to overwrite the existing manifest -- not a regular file"
+            ) from exc
+        raise
+    try:
+        _require_regular_fd(fd, path, "overwrite")
         os.write(fd, payload)
         os.fsync(fd)
     finally:
@@ -690,9 +737,16 @@ def _read_bytes_no_follow(path: Path) -> bytes | None:
     a hard failure here, not a "treat as absent": something is at the manifest
     path that must not be, and silently proceeding would write the real
     manifest over it.
+
+    ``O_NOFOLLOW`` is only half the story, though: the same attacker can
+    ``mkfifo`` this path instead, and a blocking read on a writer-less FIFO
+    hangs the gate forever. ``O_NONBLOCK`` plus the ``_require_regular_fd``
+    ``fstat`` rejects that (and device nodes) from the fd actually held, and
+    the read loop is capped at ``_MAX_MANIFEST_BYTES`` so an oversized planted
+    file cannot be slurped into memory either.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -702,11 +756,19 @@ def _read_bytes_no_follow(path: Path) -> bytes | None:
             ) from exc
         raise
     try:
+        _require_regular_fd(fd, path, "read")
         chunks: list[bytes] = []
+        total = 0
         while True:
             chunk = os.read(fd, 1 << 20)
             if not chunk:
                 break
+            total += len(chunk)
+            if total > _MAX_MANIFEST_BYTES:
+                raise EvidenceGateError(
+                    f"{path}: refusing to read the existing manifest -- "
+                    f"exceeds {_MAX_MANIFEST_BYTES} bytes"
+                )
             chunks.append(chunk)
         return b"".join(chunks)
     finally:

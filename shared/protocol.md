@@ -148,6 +148,28 @@ aggregate non-terminal forever, so eviction is refused while every retained
 record is live, and the 256-key bound is a soft cap that a live-record-heavy
 ledger may deliberately exceed. Removal is pruned lazily at projection time.
 
+A parent record **restored from a reconnect snapshot is non-authoritative
+over its child set**, and aggregation above is conditional on that. The wire
+carries the parent aggregate but never the child records it was derived from
+(children are server-internal), so a restored record's children map starts
+empty and a child reporting after the restore is not evidence that the child
+set is complete. Such a record may therefore be *refined non-terminally* by
+later child reports -- the `routing`/`searching`/`background` rules apply
+normally -- but may **never be terminalized** while non-authoritative,
+however complete its visible children look. Terminalizing off a partial set
+would announce `result_ready` for a turn whose siblings are still searching,
+and completeness cannot be proven from the wire.
+
+Because it can never become terminal, a non-authoritative record has no
+`terminal_at`, so its retention clock is the **restore instant** instead:
+the same five-minute TTL, measured from the reconnect, and it is an
+overflow-eviction candidate on the same terms a terminal record is. (The
+usual reason to protect a non-terminal record from eviction -- its children
+map is the sole memory of which children exist -- does not apply here, since
+that map is empty by construction.) Non-authoritativeness is a property of
+the *key*, not of any one record, so it survives every non-terminal rewrite
+until the key is forgotten.
+
 Capability negotiation carries one URL-encoded JSON array of capability names
 in a single `capabilities` query parameter on both the `POST /api/rtc` offer
 and the `PATCH /api/rtc` ICE-candidate request. The server normalizes,

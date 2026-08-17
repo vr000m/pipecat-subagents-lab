@@ -276,7 +276,16 @@ result:
 uv run python scripts/smoke_conversation.py --ack-ordering
 ```
 
-Unlike the other scenarios above, this one wires a recording TTS/worker into
+Prerequisites are the same as the paid smokes above and no more: an OpenAI
+credential in the environment (`set -a; source ~/.secrets/ai.env; set +a`) for
+the live router and search worker. It needs **no** browser media, no WebRTC
+transport, and no local or hosted STT/TTS service — the "recording TTS/worker"
+mentioned below are in-process test doubles the script installs itself
+(`scripts/smoke_conversation.py::_run_ack_ordering`), which record the frames
+handed to them and synthesize no audio, so the scenario adds no TTS cost beyond
+the router/worker calls.
+
+Unlike the other scenarios above, this one wires that recording TTS/worker into
 the connection so the scheduler actually admits speech, then drives a real
 delegated search and asserts the early ack is admitted before the delegated
 result — proving the externally observable early-ack behavior against a live

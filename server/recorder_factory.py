@@ -32,6 +32,32 @@ if TYPE_CHECKING:
     from .session_state import SessionState
 
 
+def make_late_terminal_handler(
+    recorders: Mapping[str, RetainedRecorder],
+) -> Callable[[str, WorkOutcome], None]:
+    """Build a coordinator ``on_late_terminal`` callback that claims the
+    matching retained recorder, if any, for a late-completing work item.
+
+    A module-level function, not a ``RecorderFactory`` member: it never reads
+    ``self._retained_recorders`` (every call site passes its own turn-scoped
+    map, two of the three a one-element dict built purely for this call), so
+    hanging it off the factory implied an ownership relationship that does not
+    exist.
+
+    Typed against the wider ``WorkOutcome`` rather than the coordinator's
+    narrower ``TerminalKind``: by contravariance this still satisfies the
+    coordinator's hook type, while remaining assignable wherever a full work
+    outcome (including ``invalid_result``) is claimed.
+    """
+
+    def on_late_terminal(item_id: str, terminal_kind: WorkOutcome) -> None:
+        recorder = recorders.get(item_id)
+        if recorder is not None:
+            recorder.claim(terminal_kind)
+
+    return on_late_terminal
+
+
 class RecorderFactory:
     """Creates and tracks a SessionHost's telemetry recorders.
 
@@ -80,26 +106,6 @@ class RecorderFactory:
         ``SessionHost.commit_late_result_once``'s use of this call.
         """
         return self._retained_recorders.pop(work_item_id, None)
-
-    @staticmethod
-    def make_late_terminal_handler(
-        recorders: Mapping[str, RetainedRecorder],
-    ) -> Callable[[str, WorkOutcome], None]:
-        """Build a coordinator ``on_late_terminal`` callback that claims the
-        matching retained recorder, if any, for a late-completing work item.
-
-        Typed against the wider ``WorkOutcome`` rather than the coordinator's
-        narrower ``TerminalKind``: by contravariance this still satisfies the
-        coordinator's hook type, while remaining assignable wherever a full
-        work outcome (including ``invalid_result``) is claimed.
-        """
-
-        def on_late_terminal(item_id: str, terminal_kind: WorkOutcome) -> None:
-            recorder = recorders.get(item_id)
-            if recorder is not None:
-                recorder.claim(terminal_kind)
-
-        return on_late_terminal
 
     def finalize_all(self) -> None:
         """Finalize every retained recorder still open and drop it.

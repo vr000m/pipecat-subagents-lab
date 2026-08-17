@@ -397,7 +397,18 @@ class TurnAckLedger:
                 # window a later eligible multi-intent sibling calling
                 # ``emit_early_ack`` short-circuits on the latch and the turn
                 # loses its only remaining chance at an ack.
-                self.clear_ack_latch(turn_id)
+                #
+                # Clearing the latch alone is not enough, though: on the
+                # ``needs_requeue=False`` (busy-slot) path the item was never
+                # dequeued, so a bare latch clear would leave the turn with a
+                # queued ack AND a free latch -- the same asymmetry in the
+                # opposite direction, letting a sibling enqueue a second ack
+                # under the same ``ack_work_item_id`` on a scheduler that
+                # still holds the first. ``settle_turn_ack`` does both halves,
+                # mirroring the abandon branch below, and its
+                # ``discard_queued_ack`` is idempotent so it is a no-op on the
+                # ``needs_requeue=True`` path where nothing is queued.
+                self.settle_turn_ack(origin.scheduler, turn_id)
                 return
             if attempt >= _ACK_ADMISSION_MAX_ATTEMPTS:
                 logger.debug(

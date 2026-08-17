@@ -225,13 +225,10 @@ def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandsh
         )
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
-    if (
-        value.session_id != host.state.session_id
-        or not host._handshake_gate.validate_handshake_token(
-            value.resume_token,
-            value.proposed_epoch,
-            redeem=request.method == "POST",
-        )
+    if value.session_id != host.state.session_id or not host.validate_handshake_token(
+        value.resume_token,
+        value.proposed_epoch,
+        redeem=request.method == "POST",
     ):
         raise HTTPException(status_code=401, detail="invalid Small WebRTC session identity")
     # The URL token is deliberately not the process-lifetime resume bearer. The
@@ -321,7 +318,7 @@ async def _attach_connection(
             audio_out_sample_rate=output_sample_rate,
         )
         transport = SmallWebRTCTransport(connection, params)
-        bus = getattr(host._runner_supervisor.runner, "bus", None)
+        bus = getattr(host.runner, "bus", None)
         if bus is None:
             from .pipeline import _ProbeBus
 
@@ -610,7 +607,7 @@ async def _attach_connection(
         # replacement can cancel and await it without leaking runner registry
         # entries. Lightweight test runners retain their documented add_workers
         # registration seam.
-        if type(host._runner_supervisor.runner).__module__.startswith("pipecat."):
+        if type(host.runner).__module__.startswith("pipecat."):
             runtime.worker_task = asyncio.create_task(
                 worker.run(WorkerParams(task_manager=task_manager))
             )
@@ -634,7 +631,7 @@ async def _attach_connection(
 
             runtime.worker_task.add_done_callback(worker_finished)
         else:
-            add_workers = getattr(host._runner_supervisor.runner, "add_workers", None)
+            add_workers = getattr(host.runner, "add_workers", None)
             if add_workers is None:
                 raise RuntimeError("the configured runner cannot attach a Small WebRTC worker")
             attached = add_workers(worker)
@@ -763,9 +760,7 @@ def create_app(
         if not session_host.accepts(handshake.proposed_epoch):
             raise HTTPException(status_code=409, detail="stale Small WebRTC connection epoch")
         try:
-            session_host._handshake_gate.validate_patch_handshake(
-                session_host.connection, handshake
-            )
+            session_host.validate_patch_handshake(session_host.connection, handshake)
         except ValueError:
             raise HTTPException(
                 status_code=400, detail="capabilities cannot change after connection promotion"

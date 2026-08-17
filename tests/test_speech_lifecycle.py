@@ -1766,3 +1766,44 @@ def test_schedule_without_a_running_loop_still_closes_the_coroutine() -> None:
 
     assert coordinator._schedule(never_runs()) is None
     assert coordinator._transition_tasks == set()
+
+
+def test_connection_closed_cancels_and_clears_in_flight_transitions() -> None:
+    """Regression (Round 9, #17): round 8 added ``_transition_tasks`` and
+    documented it as mirroring ``SpeechScheduler._advance_tasks``, but
+    ``connection_closed()`` cleared every other connection-scoped container
+    (``_timer_handles``, ``_context_tokens``, ``_context_tombstones``,
+    ``_generations``, ``_slot_token``) and left this one untouched.
+
+    It is the only container holding *running* work, so the omission was the
+    consequential one: an in-flight transition survived the close, kept the
+    coordinator reachable, and resumed against the wiped state. The sibling it
+    claims to mirror cancels its tasks on teardown.
+    """
+
+    async def run() -> None:
+        coordinator, _clock = make_coordinator()
+        started = asyncio.Event()
+        resumed: list[str] = []
+
+        async def slow_transition() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise
+            resumed.append("ran-past-close")
+
+        future = coordinator._schedule(slow_transition())
+        assert future is not None
+        await started.wait()
+        assert future in coordinator._transition_tasks
+
+        coordinator.connection_closed()
+
+        assert coordinator._transition_tasks == set()
+        await asyncio.sleep(0)
+        assert future.cancelled()
+        assert resumed == []
+
+    asyncio.run(run())

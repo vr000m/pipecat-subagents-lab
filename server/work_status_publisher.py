@@ -9,8 +9,10 @@ share.
 
 ``state`` (the session's ``SessionState``, which owns the work-status
 ledger) and ``feature_policy`` (the ``enable_background_status`` gate) stay
-owned by SessionHost -- this class holds *references* to the same objects,
-not copies, since both are read by many other SessionHost slices too. This
+owned by SessionHost -- this class holds a *reference* to the same
+``SessionState`` object and reads ``feature_policy`` through a thunk (it is
+a frozen dataclass the host replaces wholesale), never a copy of either,
+since both are read by many other SessionHost slices too. This
 mirrors ``HandshakeGate``/``RunnerSupervisor``: a focused API surface over
 state SessionHost still keeps for itself.
 
@@ -32,7 +34,7 @@ by both the foreground turn handlers and the late-commit path.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from .contracts import WORK_STATUS_TERMINAL, TerminalReason, WorkStatusState
@@ -110,13 +112,20 @@ def child_work_status_after_dispatch(
 class WorkStatusPublisher:
     """Records and sweeps delegated-child work-status for one SessionHost.
 
-    Holds references to the owning SessionHost's ``state`` (the work-status
-    ledger) and ``feature_policy`` (the ``enable_background_status`` gate) --
-    not copies -- so this class stays in lockstep with the same objects
-    SessionHost and its other slices read and mutate.
+    Holds a reference to the owning SessionHost's ``state`` (the work-status
+    ledger) -- not a copy -- so this class stays in lockstep with the same
+    object SessionHost and its other slices read and mutate.
+
+    ``feature_policy`` is taken as a *thunk*, not as the object, matching the
+    liveness contract ``TurnAckLedger`` uses for the same host attribute.
+    ``FeaturePolicy`` is a frozen dataclass that is replaced wholesale
+    (``dataclasses.replace``) rather than mutated, so capturing the object at
+    construction would pin the policy this publisher enforces to whatever was
+    current when the host was built -- a kill switch flipped afterwards would
+    be honoured by the ledger and silently ignored here.
     """
 
-    def __init__(self, *, state: SessionState, feature_policy: FeaturePolicy) -> None:
+    def __init__(self, *, state: SessionState, feature_policy: Callable[[], FeaturePolicy]) -> None:
         self.state = state
         self.feature_policy = feature_policy
 
@@ -138,7 +147,7 @@ class WorkStatusPublisher:
         the observer, so this call site does not need to branch on client
         capability -- only on whether the feature is enabled at all.
         """
-        if not self.feature_policy.enable_background_status:
+        if not self.feature_policy().enable_background_status:
             return
         self.state.set_child_work_status(
             turn_id=turn_id,

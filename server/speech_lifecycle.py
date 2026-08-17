@@ -608,6 +608,17 @@ class SpeechLifecycleCoordinator:
         for handle in self._timer_handles.values():
             handle.cancel()
         self._timer_handles.clear()
+        # ``_transition_tasks`` is connection-scoped like everything else this
+        # method clears, and it is the only container that holds *running*
+        # work. Leaving it alone kept in-flight transitions alive past close,
+        # to resume against the wiped ``_generations``/``_context_tokens``
+        # below and keep the coordinator reachable with them. Cancel-then-drop
+        # mirrors ``SpeechScheduler.interrupt``'s handling of its own
+        # ``_advance_tasks``. Iterating a copy: a task that is already done
+        # runs its ``discard`` done-callback during this loop.
+        for task in tuple(self._transition_tasks):
+            task.cancel()
+        self._transition_tasks.clear()
         self._context_tokens.clear()
         self._context_tombstones.clear()
         self._generations.clear()

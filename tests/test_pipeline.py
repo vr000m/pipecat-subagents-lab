@@ -33,9 +33,9 @@ from server.pipeline import (
     CanonicalResultAdapter,
     LateDeliveryContext,
     SessionHost,
-    work_status_after_commit_failure,
     build_pipeline,
     framework_bridge,
+    work_status_after_commit_failure,
 )
 from server.registry import UnsupportedWorkerType, WorkerRegistry
 from server.services.tts import CorrelatedTTSSpeakFrame
@@ -8517,6 +8517,68 @@ def test_ack_admission_retry_clears_the_latch_when_the_epoch_is_no_longer_live()
     asyncio.run(run())
 
 
+def test_ack_admission_not_live_arm_discards_the_still_queued_ack_on_the_busy_slot_path() -> None:
+    """Regression (Round 9, #6/#19): round 8's not-live arm cleared the latch
+    with a bare ``clear_ack_latch``, which is only half of what the sibling
+    abandon branch does.
+
+    On the ``needs_requeue=False`` (busy-slot) path ``start_next`` returns
+    ``None`` *before* popping, so the ack item is still queued when this arm
+    runs. Clearing only the latch therefore left the turn with a queued ack
+    AND a free latch -- the same asymmetry round 8 fixed, in the opposite
+    direction: a later eligible multi-intent sibling no longer short-circuits
+    on the latch and enqueues a *second* ack under the same
+    ``ack_work_item_id``, on a scheduler that still holds the first. Round 8's
+    own regression test only exercised the ``needs_requeue=True`` path, where
+    nothing is queued, so it could not see this.
+    """
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        ledger = host._turn_ack_ledger
+        turn_id = "turn-busy-not-live"
+        ack_id = ledger.ack_work_item_id(turn_id)
+
+        async def busy_start_next(*_args: object, **_kwargs: object) -> None:
+            # The transport slot is occupied: start_next returns None without
+            # ever popping the queued ack.
+            return None
+
+        origin.scheduler.start_next = busy_start_next  # type: ignore[method-assign]
+
+        await ledger.emit_early_ack(
+            origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
+        )
+        assert len(origin.scheduler._queues[ack_id]) == 1
+
+        # Drive the busy-slot admission against a stale epoch so it lands in
+        # the not-live arm with needs_requeue=False.
+        ledger._schedule_ack_admission(
+            origin,
+            ack_id,
+            lambda: None,
+            turn_id=turn_id,
+            origin_epoch=origin.epoch + 7,
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert turn_id not in ledger._ack_emitted_turns
+        assert not origin.scheduler._queues.get(ack_id)
+
+        # A later eligible sibling may still claim the turn's one ack -- and
+        # ends up with exactly one queued item, not two.
+        await ledger.emit_early_ack(
+            origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
+        )
+        assert turn_id in ledger._ack_emitted_turns
+        assert len(origin.scheduler._queues[ack_id]) == 1
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_turn_ack_ledger_reads_feature_policy_and_ack_text_live() -> None:
     """Regression (#24): the ledger snapshotted ``feature_policy`` and
     ``early_ack_text`` at construction, while the pre-extraction code read
@@ -9446,3 +9508,168 @@ def test_multi_intent_fan_in_guard_never_logs_the_spoken_query() -> None:
     guard = source[source.index("no matching") - 400 : source.index("no matching") + 200]
     assert "query={query!r}" not in guard
     assert 'raise KeyError(f"no dispatched work item for {worker_id!r}/{query!r}")' in source
+
+
+def test_session_host_keeps_public_forwarders_for_the_extracted_collaborators() -> None:
+    """Regression (Round 9, #1): the RunnerSupervisor/HandshakeGate
+    extractions deleted SessionHost's public ``runner`` /
+    ``validate_handshake_token`` / ``validate_patch_handshake`` members
+    without leaving forwarders, so the out-of-package caller ``server/app.py``
+    had to two-level reach into ``host._runner_supervisor`` and
+    ``host._handshake_gate``. Every other extraction on this branch left a
+    forwarder; these must too, and the forwarders must actually be wired to
+    the collaborator rather than shadowing it."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+
+        assert host.runner_factory is LifecycleRunner
+        assert host.runner is host._runner_supervisor.runner
+
+        sentinel = object()
+        host.runner = sentinel
+        assert host._runner_supervisor.runner is sentinel
+
+        host.runner_factory = None
+        assert host._runner_supervisor.runner_factory is None
+
+        handshake = host.session_handshake()
+        token, epoch = handshake["resume_token"], handshake["proposed_epoch"]
+        assert not host.validate_handshake_token("not-a-token", epoch, redeem=False)
+        # Not yet redeemed.
+        assert not host.validate_handshake_token(token, epoch, redeem=False)
+        assert host.validate_handshake_token(token, epoch, redeem=True)
+        # Delegation, not a reimplementation: redeeming through the public
+        # forwarder consumed the gate's own token, so the gate now reports it
+        # redeemed and refuses a second redemption.
+        assert host._handshake_gate.validate_handshake_token(token, epoch, redeem=False)
+        assert not host._handshake_gate.validate_handshake_token(token, epoch, redeem=True)
+
+        with pytest.raises(AttributeError):
+            host.validate_patch_handshake(None, object())  # type: ignore[arg-type]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_work_status_publisher_reads_feature_policy_live() -> None:
+    """Regression (Round 9, #2): round 8 gave ``TurnAckLedger`` a live thunk
+    for ``feature_policy`` but left ``WorkStatusPublisher`` holding the object
+    captured at construction, so the two extracted collaborators had opposite
+    liveness contracts for the *same* host attribute. ``FeaturePolicy`` is a
+    frozen dataclass replaced wholesale, so flipping
+    ``enable_background_status`` after construction was honoured by the ledger
+    and silently ignored by the publisher."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        host.state.active_epoch = 1
+        publisher = host._work_status_publisher
+
+        host.feature_policy = dataclasses.replace(
+            host.feature_policy, enable_background_status=True
+        )
+        publisher.emit(
+            turn_id="turn-live-policy",
+            work_item_id="work-live-policy",
+            state="routing",
+            origin_epoch=1,
+        )
+        assert [status.turn_id for status in host.state.work_status_snapshot()] == [
+            "turn-live-policy"
+        ]
+
+        # Kill switch flipped after construction must suppress the next write.
+        host.feature_policy = dataclasses.replace(
+            host.feature_policy, enable_background_status=False
+        )
+        publisher.emit(
+            turn_id="turn-after-kill",
+            work_item_id="work-after-kill",
+            state="routing",
+            origin_epoch=1,
+        )
+        assert [status.turn_id for status in host.state.work_status_snapshot()] == [
+            "turn-live-policy"
+        ]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_multi_intent_retracts_an_admitted_ack_when_no_delegated_child_was_accepted() -> None:
+    """Regression (Round 9, #16): the multi-intent "nothing accepted" branch
+    tested ``not results``, but ``results`` also holds the direct half of a
+    mixed turn and the "I cannot access that capability here." fallback a
+    pre-dispatch rejection writes.
+
+    So a turn that mixes a spoken non-delegated result with a delegated child
+    the coordinator accepts nothing for had a non-empty ``results`` while no
+    search was ever delegated -- the branch fell through to the plain
+    queued-ack discard, which cannot reach an ack that already reached the
+    transport, leaving a false-progress "let me look that up" speakable for a
+    turn with no search behind it. The decision must be based on accepted or
+    retained *delegated* work (``attributed_indexes``), not on any result.
+    """
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        searching = ResultWorker()
+        # No ``search`` attribute -> ``_begin_delegation`` rejects this item
+        # before dispatch and writes the capability fallback into ``results``.
+        no_search = type("NoSearchWorker", (), {"metadata": None})()
+        dispatched: list[object] = []
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=_FanInRegistry(), router=_FanInRouter())
+
+            def dispatch(self, _decision: object, **_: object) -> object:
+                dispatched.append(_decision)
+                return searching if len(dispatched) == 1 else no_search
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                # Capacity rejection: nothing accepted, nothing pending,
+                # nothing failed.
+                return _submitted()
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=FakeTTS(),
+            coordinator=Coordinator(),
+            measurement_sink=sink,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+
+        turn_id = "turn-mixed-capacity"
+        ack_id = host._ack_work_item_id(turn_id)
+        cancelled: list[str] = []
+        real_cancel = origin.scheduler.cancel
+
+        def spying_cancel(work_item_id: str | None = None) -> object:
+            cancelled.append(work_item_id or "")
+            return real_cancel(work_item_id)
+
+        origin.scheduler.cancel = spying_cancel  # type: ignore[method-assign]
+
+        committed = await host._handle_multi_intent(
+            _multi_intent_outcome("look this up", "do the impossible"),
+            "",
+            origin,
+            turn_id,
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id=turn_id
+            ),
+        )
+
+        # The turn does speak something -- the non-delegated fallback -- which
+        # is exactly why the old ``not results`` test never fired.
+        assert [result.text for result in committed] == ["I cannot access that capability here."]
+        # ...and the ack is retracted in whatever state it reached, not merely
+        # discarded from the queue.
+        assert ack_id in cancelled
+        assert _ack_items(origin.scheduler) == []
+        await host.shutdown()
+
+    asyncio.run(run())

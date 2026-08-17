@@ -1316,3 +1316,72 @@ def test_track_background_shutdown_is_retained_and_drained_by_shutdown() -> None
         assert host._background_shutdowns == set()
 
     asyncio.run(run())
+
+
+def test_active_speech_oracle_holds_through_cleanup_and_teardown() -> None:
+    """Regression (Round 9, #20): Review Focus bullet 7 names four stages the
+    coordinator's occupied-generation token must remain the oracle through --
+    synthesis end, cleanup, transport stop, and *teardown*. Round 8's extended
+    test drove synthesis-end and transport-stop signals only, so
+    ``SpeechLifecycleCoordinator._begin_cleanup`` and ``teardown_complete``
+    were never reached by it at all.
+
+    This drives the other two: an interruption that goes through cleanup
+    dispatch, then teardown completion, re-asserting ``slot_token`` /
+    ``generation_for_token`` at each stage. The point of the assertions is
+    that cleanup does *not* release the slot on its own -- only the terminal
+    transition teardown drives does.
+    """
+
+    async def run() -> None:
+        if not _has_commit_late_result_once():
+            pytest.skip("commit_late_result_once not yet implemented")
+        from server.config import PromotionManifest
+        from server.speech_lifecycle import GenerationIdentity
+
+        host, origin = await _connected_host(
+            promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
+        )
+        lifecycle = origin.lifecycle
+        assert lifecycle is not None
+        held = lifecycle.try_admit(GenerationIdentity("held-utt", "held-work", origin_epoch=1))
+        assert held is not None
+        lifecycle.mark_handed_to_tts(held.token)
+        assert lifecycle.bind_context(held.token, "held-utt") is True
+        assert lifecycle.on_tts_started("held-utt") is True
+        assert (
+            lifecycle.on_tts_audio(
+                "held-utt", audio=b"\x00\x00" * 800, sample_rate=16_000, num_channels=1
+            )
+            is True
+        )
+        assert lifecycle.slot_token == held.token
+
+        # Stage: interruption. Tombstones and arms the cleanup deadline; the
+        # slot is deliberately *not* released here.
+        lifecycle.record_interruption(held.token)
+        await asyncio.sleep(0)
+        assert lifecycle.slot_token == held.token
+        generation = lifecycle.generation_for_token(held.token)
+        assert generation is not None
+        assert generation.tombstoned is True
+        assert generation.terminalized is False
+
+        # Stage: cleanup. Audio already crossed into output, so cleanup
+        # escalates to teardown -- and still holds the slot until the
+        # connection lane confirms.
+        await lifecycle._begin_cleanup(generation)
+        assert generation.cleanup_pending is True
+        assert lifecycle.slot_token == held.token
+        assert lifecycle.generation_for_token(held.token) is not None
+
+        # Stage: teardown. This is the one terminal transition, and only now
+        # does the held generation stop owning the slot.
+        await lifecycle.teardown_complete(held.token)
+        await asyncio.sleep(0)
+        assert lifecycle.slot_token != held.token
+        assert lifecycle.generation_for_token(held.token) is None
+
+        await host.shutdown()
+
+    asyncio.run(run())

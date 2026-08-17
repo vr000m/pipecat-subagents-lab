@@ -112,7 +112,7 @@ def test_default_host_dispatches_through_an_injected_router(monkeypatch) -> None
         host = app_module._default_session_host(router=Router(model=FakeRouterModel()))
         worker = FakeSearchWorker("worker-1")
         host.registry.worker_factory = lambda _worker_id: worker
-        host._runner_supervisor.runner_factory = FakeRunner
+        host.runner_factory = FakeRunner
         await host.connect(
             {
                 "session_id": host.state.session_id,
@@ -1148,7 +1148,7 @@ def test_validate_patch_handshake_omitted_field_inherits_the_post_bound_set() ->
     )
 
     # Omission must not raise and must not mutate the bound connection.
-    host._handshake_gate.validate_patch_handshake(promoted, patch_handshake)
+    host.validate_patch_handshake(promoted, patch_handshake)
 
     assert promoted.capabilities == ("work_status_v1",)
 
@@ -1175,7 +1175,7 @@ def test_validate_patch_handshake_present_mismatch_is_rejected() -> None:
     )
 
     with pytest.raises(ValueError):
-        host._handshake_gate.validate_patch_handshake(promoted, mismatched_patch)
+        host.validate_patch_handshake(promoted, mismatched_patch)
     # Rejecting the mismatch must not mutate the bound connection/entitlement.
     assert promoted.capabilities == ("work_status_v1",)
 
@@ -1201,7 +1201,7 @@ def test_validate_patch_handshake_exact_matching_set_is_accepted() -> None:
         capabilities_present=True,
     )
 
-    host._handshake_gate.validate_patch_handshake(promoted, matching_patch)  # must not raise
+    host.validate_patch_handshake(promoted, matching_patch)  # must not raise
 
 
 # --- Phase 3: mixed-version client/server compatibility fixture -----------
@@ -1954,7 +1954,7 @@ def test_patch_with_correct_capabilities_and_no_connection_is_409_not_400() -> N
         }
     )
     # Redeem the one-shot URL token the way a completed POST would have.
-    assert host._handshake_gate.validate_handshake_token(
+    assert host.validate_handshake_token(
         discovery["resume_token"], discovery["proposed_epoch"], redeem=True
     )
     assert host.connection is None

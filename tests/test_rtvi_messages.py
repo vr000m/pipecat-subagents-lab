@@ -464,3 +464,42 @@ def test_snapshot_is_the_sole_allocator_and_reads_the_sequence_provider() -> Non
     assert message.sequence == 42
     assert message.data["snapshot_sequence"] == 42
     assert publisher._watermark == 42
+
+
+def test_rtvi_message_wire_payload_requires_an_explicit_work_status_projection() -> None:
+    """Regression (Round 9, #3): the envelope wrapper declared
+    ``include_work_status: bool = True`` while the model it delegates to
+    (``RuntimeSnapshot.wire_payload``) deliberately has no default.
+
+    The choke point exists to force every caller to decide; a defaulted
+    wrapper meant a caller that simply omitted the kwarg silently
+    re-materialized ``work_status: []`` for a legacy client that never
+    negotiated the capability -- the schema break round 8 fixed at one call
+    site while leaving the mechanism that produced it in place. Omission must
+    be a type error, not a default.
+    """
+    import inspect
+
+    from server.contracts import RuntimeSnapshot
+    from server.rtvi_messages import RTVIMessage
+
+    wrapper = inspect.signature(RTVIMessage.wire_payload).parameters["include_work_status"]
+    model = inspect.signature(RuntimeSnapshot.wire_payload).parameters["include_work_status"]
+    assert model.default is inspect.Parameter.empty
+    assert wrapper.default is inspect.Parameter.empty
+
+    envelope = RTVIMessage(
+        kind="worker",
+        session_id="session-1",
+        sequence=1,
+        origin_epoch=1,
+        data=WorkerState(
+            worker_id="worker-1",
+            topic="weather",
+            model_policy="deep",
+            status="idle",
+            origin_epoch=1,
+        ).model_dump(mode="json"),
+    )
+    with pytest.raises(TypeError):
+        envelope.wire_payload()  # type: ignore[call-arg]

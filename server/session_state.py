@@ -101,11 +101,6 @@ class WorkStatusKey(NamedTuple):
 class _WorkStatusRecord:
     status: WorkStatus
     terminal_at: float | None = None
-    # False only for a record rehydrated by ``from_snapshot``: the wire
-    # carries the parent aggregate but never the child set it was derived
-    # from, so the restored record's children map starts empty and is *not*
-    # authoritative. See ``_reaggregate_parent``.
-    children_authoritative: bool = True
 
 
 class SessionState:
@@ -165,6 +160,27 @@ class SessionState:
         # cold-starts the key and re-derives a parent state from a single
         # child, resurrecting a record clients already applied as terminal.
         self._work_status_terminal_keys: set[WorkStatusKey] = set()
+        # Keys whose parent aggregate was rehydrated by ``from_snapshot``,
+        # mapped to the monotonic instant of that restore. The wire carries
+        # the parent aggregate but never the child set it was derived from,
+        # so such a key's children map is known-incomplete and may never be
+        # terminalized from (see ``_reaggregate_parent``).
+        #
+        # Non-authoritativeness is a property of the *key*, not of one record
+        # -- re-aggregating over a still-partial child set does not make that
+        # set complete -- so it lives here, alongside _work_status_sequence
+        # and _work_status_terminal_keys, which already have exactly this
+        # key-outlives-record lifetime, rather than being hand-copied onto
+        # each successive _WorkStatusRecord.
+        #
+        # The stamp is the record's own expiry clock. A non-authoritative
+        # record can never reach a terminal state, so it never gets a
+        # ``terminal_at`` -- the TTL-prune and overflow-eviction paths both
+        # key off ``terminal_at``, and without this it would be retained and
+        # re-shipped on every snapshot for the process lifetime. Both paths
+        # consult this map so the record expires on the same five-minute TTL
+        # a terminal one does, measured from the restore.
+        self._work_status_nonauthoritative_at: dict[WorkStatusKey, float] = {}
 
     @property
     def events(self) -> tuple[StateEvent, ...]:
@@ -424,7 +440,7 @@ class SessionState:
             return None
         if (
             record is not None
-            and not record.children_authoritative
+            and key in self._work_status_nonauthoritative_at
             and parent_state in WORK_STATUS_TERMINAL
         ):
             # A restored record's children map holds only the children that
@@ -434,9 +450,12 @@ class SessionState:
             # would announce ``result_ready`` for a turn whose siblings are
             # still searching. There is no way to prove completeness from the
             # wire, so the conservative reading wins: a restored parent keeps
-            # its restored non-terminal state and expires by TTL rather than
-            # claiming a result that may not exist. Non-terminal
-            # re-aggregation still flows through normally.
+            # its restored non-terminal state and expires on the TTL measured
+            # from its restore instant (``_work_status_nonauthoritative_at``,
+            # honoured by both ``prune_expired_work_status`` and
+            # ``_evict_work_status_overflow``) rather than claiming a result
+            # that may not exist. Non-terminal re-aggregation still flows
+            # through normally.
             return None
         next_sequence = self._work_status_sequence.get(key, 0) + 1
         self._work_status_sequence[key] = next_sequence
@@ -450,16 +469,10 @@ class SessionState:
             origin_epoch=key.origin_epoch,
         )
         terminal_at = time.monotonic() if parent_state in WORK_STATUS_TERMINAL else None
-        self._work_status_parents[key] = _WorkStatusRecord(
-            status=status,
-            terminal_at=terminal_at,
-            # Non-authoritativeness is a property of the *key*, not of one
-            # record: re-aggregating over a still-partial child set does not
-            # make that set complete, so the flag must survive every rewrite
-            # of this key rather than resetting to the default on the first
-            # non-terminal update.
-            children_authoritative=record.children_authoritative if record is not None else True,
-        )
+        # Non-authoritativeness needs no re-threading here: it lives on the
+        # key in ``_work_status_nonauthoritative_at`` and so survives every
+        # rewrite of the record by construction.
+        self._work_status_parents[key] = _WorkStatusRecord(status=status, terminal_at=terminal_at)
         self._evict_work_status_overflow(protect=key)
         return self._emit("work_status", status.model_dump(mode="json"))
 
@@ -473,33 +486,51 @@ class SessionState:
         cold-start the key back below the terminal state clients applied.
         """
         self._work_status_children.pop(key, None)
+        self._work_status_nonauthoritative_at.pop(key, None)
         record = self._work_status_parents.pop(key, None)
         if record is not None and record.status.state in WORK_STATUS_TERMINAL:
             self._work_status_terminal_keys.add(key)
 
-    def _evict_work_status_overflow(self, *, protect: WorkStatusKey) -> None:
-        """Bound the ledger, evicting the oldest terminal record first.
+    def _work_status_expiry_stamp(self, key: WorkStatusKey) -> float | None:
+        """When ``key``'s retention clock started, or None while it is live.
 
-        Only terminal records are evictable. A non-terminal record
-        (``terminal_at is None``) is a live parent aggregate whose children
-        map is the sole memory of which children exist; dropping it makes the
-        next ``set_child_work_status`` for that key a cold start, which turns
-        a whole-child-set cancel sweep into a no-op and strands the parent
-        non-terminal forever. When every retained record is live the ledger
-        deliberately exceeds the cap instead. ``protect`` is the key just
-        written and is never the eviction victim.
+        Two records are subject to expiry: a terminal one (clock starts when
+        it went terminal) and a non-authoritative restored one, which can
+        never *become* terminal (``_reaggregate_parent``) and so would
+        otherwise have no clock at all -- its clock starts at the restore.
+        """
+        record = self._work_status_parents.get(key)
+        if record is None:
+            return None
+        if record.terminal_at is not None:
+            return record.terminal_at
+        return self._work_status_nonauthoritative_at.get(key)
+
+    def _evict_work_status_overflow(self, *, protect: WorkStatusKey) -> None:
+        """Bound the ledger, evicting the oldest expiry-eligible record first.
+
+        Only terminal records and non-authoritative restored ones are
+        evictable. A live authoritative non-terminal record is a parent
+        aggregate whose children map is the sole memory of which children
+        exist; dropping it makes the next ``set_child_work_status`` for that
+        key a cold start, which turns a whole-child-set cancel sweep into a
+        no-op and strands the parent non-terminal forever. A restored record
+        carries no such memory -- its children map is empty by construction --
+        so there is nothing to lose by evicting it, and it must be evictable
+        or it would pin a ledger slot for the process lifetime. When every
+        retained record is live the ledger deliberately exceeds the cap
+        instead. ``protect`` is the key just written and is never the
+        eviction victim.
         """
         while len(self._work_status_parents) > self._MAX_WORK_STATUS_KEYS:
             candidates = [
-                item
-                for item, record in self._work_status_parents.items()
-                if item != protect and record.terminal_at is not None
+                (item, stamp)
+                for item in self._work_status_parents
+                if item != protect and (stamp := self._work_status_expiry_stamp(item)) is not None
             ]
             if not candidates:
                 return
-            oldest = min(
-                candidates, key=lambda item: self._work_status_parents[item].terminal_at or 0.0
-            )
+            oldest = min(candidates, key=lambda pair: pair[1])[0]
             self._forget_work_status(oldest)
 
     @staticmethod
@@ -521,19 +552,25 @@ class SessionState:
         return "result_ready", None
 
     def prune_expired_work_status(self) -> None:
-        """Forget every terminal record past the five-minute TTL.
+        """Forget every expiry-eligible record past the five-minute TTL.
 
         Split out of ``work_status_snapshot`` so the projection stays a pure
         read: expiry is inclusive at the boundary, and an expired record is
         forgotten entirely (leaving only its tombstone and event_sequence) so
         the ledger does not grow for the process lifetime.
+
+        Eligibility is ``_work_status_expiry_stamp``: a terminal record's
+        ``terminal_at``, or a non-authoritative restored record's restore
+        instant. The latter matters because such a record can never become
+        terminal, so keying purely off ``terminal_at`` would retain it -- and
+        re-ship it on every snapshot -- forever.
         """
         now = time.monotonic()
         expired = [
             key
-            for key, record in self._work_status_parents.items()
-            if record.terminal_at is not None
-            and (now - record.terminal_at) >= WORK_STATUS_TTL_SECONDS
+            for key in self._work_status_parents
+            if (stamp := self._work_status_expiry_stamp(key)) is not None
+            and (now - stamp) >= WORK_STATUS_TTL_SECONDS
         ]
         for key in expired:
             # Collected first: deleting during iteration would mutate the
@@ -567,6 +604,7 @@ class SessionState:
         # ``_reaggregate_parent``). The per-key event_sequence MUST be
         # restored too: restarting it at 1 would make every post-restore
         # record look stale to the browser reducer and be dropped.
+        restored_at = time.monotonic()
         for status in snapshot.work_status:
             key = WorkStatusKey(status.origin_epoch, status.turn_id, status.work_item_id or "")
             state._work_status_children.setdefault(key, {})
@@ -577,9 +615,12 @@ class SessionState:
                 # clocks are not comparable across processes anyway), so the
                 # five-minute TTL restarts from the restore point rather than
                 # being silently treated as already expired.
-                terminal_at=time.monotonic() if status.state in WORK_STATUS_TERMINAL else None,
-                children_authoritative=False,
+                terminal_at=restored_at if status.state in WORK_STATUS_TERMINAL else None,
             )
+            # A non-terminal restored record never gets a ``terminal_at``, so
+            # this stamp is its only retention clock -- same TTL, measured
+            # from the same instant.
+            state._work_status_nonauthoritative_at[key] = restored_at
         return state
 
     def snapshot(

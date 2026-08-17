@@ -394,6 +394,9 @@ def assert_ledger_lockstep(state: SessionState) -> None:
     children, parents, sequence = _ledger_keysets(state)
     assert children == parents
     assert parents <= sequence
+    # The non-authoritative stamp is per-key state on a *live* record, so
+    # unlike the counter map it must never outlive the record it clocks.
+    assert set(state._work_status_nonauthoritative_at) <= parents
 
 
 def test_expired_terminal_work_status_record_is_deleted_but_its_sequence_survives(
@@ -718,7 +721,7 @@ def test_restored_parent_never_terminalizes_from_a_partial_child_set() -> None:
     restored.active_epoch = 2
     key = WorkStatusKey(2, "turn-mi", "work-mi")
     assert restored._work_status_children[key] == {}
-    assert restored._work_status_parents[key].children_authoritative is False
+    assert key in restored._work_status_nonauthoritative_at
 
     # Only ONE of the two children reports; the other is still searching.
     event = restored.set_child_work_status(
@@ -762,7 +765,7 @@ def test_restored_parent_stays_non_authoritative_across_a_non_terminal_update() 
         is not None
     )
     assert restored._work_status_parents[key].status.state == "searching"
-    assert restored._work_status_parents[key].children_authoritative is False
+    assert key in restored._work_status_nonauthoritative_at
 
     assert (
         restored.set_child_work_status(
@@ -775,3 +778,92 @@ def test_restored_parent_stays_non_authoritative_across_a_non_terminal_update() 
         is None
     )
     assert restored._work_status_parents[key].status.state == "searching"
+
+
+def test_restored_non_terminal_parent_is_pruned_by_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (Round 9, #5/#9): round 8's non-terminalization guard made a
+    restored NON-terminal parent immortal.
+
+    Such a record can never reach a terminal state, so ``terminal_at`` stayed
+    ``None`` forever -- and both removal paths (``prune_expired_work_status``
+    and ``_evict_work_status_overflow``) filtered on ``terminal_at is not
+    None``. The record was therefore never pruned, never evicted, and
+    re-shipped to the client on every snapshot for the process lifetime, which
+    is exactly the "expires by TTL" escape hatch round 8's own comment claimed
+    but did not provide. Round 8's tests only checked the accuracy half (no
+    premature terminalization), not the retention half.
+    """
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-restore-ttl")
+    state.active_epoch = 4
+    state.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-0",
+        parent_work_item_id="work-mi",
+        state="searching",
+        origin_epoch=4,
+    )
+    snapshot = state.snapshot(origin_epoch=4, include_work_status=True)
+
+    clock[0] = 100.0
+    restored = SessionState.from_snapshot(snapshot)
+    key = WorkStatusKey(4, "turn-mi", "work-mi")
+    assert restored._work_status_parents[key].terminal_at is None
+    assert [status.state for status in restored.work_status_snapshot()] == ["searching"]
+
+    # One tick short of the TTL measured from the restore instant: retained.
+    clock[0] = 100.0 + WORK_STATUS_TTL_SECONDS - 1.0
+    assert [status.state for status in restored.work_status_snapshot()] == ["searching"]
+
+    clock[0] = 100.0 + WORK_STATUS_TTL_SECONDS
+    assert restored.work_status_snapshot() == ()
+    assert key not in restored._work_status_parents
+    assert key not in restored._work_status_children
+    assert key not in restored._work_status_nonauthoritative_at
+    # The counter still survives, as for any other forgotten key.
+    assert restored._work_status_sequence[key] >= 1
+    assert_ledger_lockstep(restored)
+
+
+def test_restored_non_terminal_parent_is_evictable_on_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the TTL case (#5/#9): a restored non-terminal parent must
+    also be an overflow-eviction candidate.
+
+    The usual reason to protect a non-terminal record -- its children map is
+    the sole memory of which children exist -- does not apply to a restored
+    one, whose children map is empty by construction. Without this it would
+    pin a ledger slot for the process lifetime even under cap pressure.
+    """
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    seed = SessionState(session_id="session-restore-evict")
+    seed.active_epoch = 5
+    seed.set_child_work_status(
+        turn_id="turn-restored",
+        work_item_id="work-restored-0",
+        parent_work_item_id="work-restored",
+        state="searching",
+        origin_epoch=5,
+    )
+    restored = SessionState.from_snapshot(seed.snapshot(origin_epoch=5, include_work_status=True))
+    restored.active_epoch = 5
+    restored_key = WorkStatusKey(5, "turn-restored", "work-restored")
+    assert restored_key in restored._work_status_parents
+
+    for index in range(SessionState._MAX_WORK_STATUS_KEYS + 1):
+        clock[0] = float(index + 10)
+        restored.set_child_work_status(
+            turn_id=f"filler-{index}",
+            work_item_id=f"work-{index}",
+            state="result_ready",
+            origin_epoch=5,
+        )
+
+    assert restored_key not in restored._work_status_parents
+    assert len(restored._work_status_parents) <= SessionState._MAX_WORK_STATUS_KEYS
+    assert_ledger_lockstep(restored)

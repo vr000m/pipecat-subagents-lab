@@ -82,13 +82,19 @@ class RTVIMessage(BaseModel):
         self._payload = payload
         return self
 
-    def wire_payload(self, *, include_work_status: bool = True) -> dict[str, Any]:
+    def wire_payload(self, *, include_work_status: bool) -> dict[str, Any]:
         """Serialize the envelope for the wire.
 
         Payload-level field projection is delegated to the validated payload
         model -- see :meth:`RuntimeSnapshot.wire_payload` -- so the decision
         about which fields reach the wire lives on the typed model and never
         as an ad-hoc key removal at the call site.
+
+        ``include_work_status`` deliberately has no default, mirroring the
+        model it delegates to: the choke point exists to force every caller to
+        *decide*, and a default of ``True`` would silently re-materialize
+        ``work_status: []`` for a legacy client that never negotiated the
+        capability -- a schema break, not a harmless extra key.
         """
         frame = self.model_dump(mode="json")
         if isinstance(self._payload, RuntimeSnapshot):

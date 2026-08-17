@@ -336,7 +336,7 @@ def coordinator_view(coordinator: Any) -> CoordinatorView:
         registry=getattr(coordinator, "registry", defaults.registry),
         config=getattr(coordinator, "config", defaults.config),
         OWNED_CONFIG_FIELDS=getattr(
-            coordinator, "OWNED_CONFIG_FIELDS", CoordinatorDefaults.OWNED_CONFIG_FIELDS
+            coordinator, "OWNED_CONFIG_FIELDS", defaults.OWNED_CONFIG_FIELDS
         ),
         live_work_item_ids=getattr(coordinator, "live_work_item_ids", defaults.live_work_item_ids),
         start_task=getattr(coordinator, "start_task", None) or defaults.start_task,

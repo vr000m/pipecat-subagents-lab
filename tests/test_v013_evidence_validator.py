@@ -760,6 +760,55 @@ def test_atomic_write_does_not_read_the_destination_through_a_symlink(tmp_path: 
     assert secret.read_text(encoding="utf-8") == "SUPER-SECRET"
 
 
+def test_atomic_write_refuses_a_fifo_planted_at_the_manifest_path(tmp_path: Path) -> None:
+    """Regression (Round 9, #7): round 8's O_NOFOLLOW hardening stops symlinks
+    and nothing else. An attacker who can plant a symlink at this predictable,
+    repo-relative path can equally ``mkfifo`` it -- O_NOFOLLOW does not cover
+    FIFOs, so ``_read_bytes_no_follow``'s open blocked forever, hanging the
+    evidence gate. The fix is O_NONBLOCK plus an ``fstat`` on the fd actually
+    held (not a pre-open ``stat``, which would be a TOCTOU).
+
+    Run on a daemon thread with a join timeout because the pre-fix failure
+    mode is a hang, not an assertion failure: a blocking ``os.open`` on a
+    FIFO cannot be interrupted from the test thread.
+    """
+    import os as _os
+    import threading
+
+    module = _validator()
+    output = tmp_path / "manifest.json"
+    _os.mkfifo(output)
+    verdict: list[object] = []
+
+    def _attempt() -> None:
+        try:
+            module._atomic_write_manifest(output, {"manifest_phase": "new"})
+        except BaseException as exc:  # noqa: BLE001 - the type is the assertion
+            verdict.append(exc)
+        else:
+            verdict.append(None)
+
+    worker = threading.Thread(target=_attempt, daemon=True)
+    worker.start()
+    worker.join(timeout=20)
+    assert not worker.is_alive(), "_atomic_write_manifest blocked on a FIFO at the manifest path"
+    assert isinstance(verdict[0], module.EvidenceGateError), verdict[0]
+
+
+def test_read_bytes_no_follow_caps_an_oversized_manifest(tmp_path: Path) -> None:
+    """Companion to the FIFO case (#7): the `.previous` read loop had no size
+    cap, so a large file planted at the predictable manifest path was read
+    unbounded into memory. It is now capped at ``_MAX_MANIFEST_BYTES``,
+    mirroring ``server.config._MAX_EVIDENCE_INPUT_BYTES``."""
+    module = _validator()
+    output = tmp_path / "manifest.json"
+    assert module._MAX_MANIFEST_BYTES == 8 * 1024 * 1024
+    output.write_bytes(b"x" * (module._MAX_MANIFEST_BYTES + 1))
+
+    with pytest.raises(module.EvidenceGateError):
+        module._read_bytes_no_follow(output)
+
+
 def test_atomic_write_ignores_a_planted_predictable_temp_file(tmp_path: Path) -> None:
     """The temp file is now created via `tempfile.mkstemp` (random name,
     O_EXCL), so a symlink planted at the previously-predictable
