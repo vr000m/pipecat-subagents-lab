@@ -526,6 +526,41 @@ class LateDeliveryContext:
     parent_work_item_id: str | None = None
 
 
+@dataclass(frozen=True)
+class DelegationRequest:
+    """Input to ``SessionHost._begin_delegation``.
+
+    ``worker_id_override`` and ``parent_work_item_id`` are unused by the
+    single-intent call site (``_handle_transcript_impl``) but are defined
+    now so the pending-dialogue and multi-intent call sites can adopt the
+    same shared surface in later steps without changing it again.
+    """
+
+    turn_id: str
+    work_item_id: str
+    worker: Any
+    origin_epoch: int
+    worker_id_override: str | None = None
+    parent_work_item_id: str | None = None
+
+
+@dataclass
+class DelegatedChild:
+    """A work item that has been fully set up for delegation.
+
+    Returned by ``SessionHost._begin_delegation`` once a worker and its
+    search callable are confirmed present, the child recorder is created,
+    and the item is registered as both a known work item and a member of
+    its owning turn -- all before any ack for it is admitted.
+    """
+
+    work_item_id: str
+    worker_id: str
+    search: Callable[..., Any]
+    child: WorkItemRecorder
+    retained_recorder: RetainedRecorder | None = None
+
+
 class SessionHost:
     """Process-lifetime host; persistent workers outlive connection pipelines."""
 
@@ -1107,6 +1142,103 @@ class SessionHost:
         hyphen can never make a prefix match ambiguous.
         """
         self._turn_work_items.setdefault(turn_id, set()).add(work_item_id)
+
+    def _begin_delegation(
+        self,
+        request: DelegationRequest,
+        *,
+        turn_recorder: AppTurnRecorder,
+        delegated_children: dict[str, str | None],
+    ) -> DelegatedChild | None:
+        """Set up one child work item for delegation to a worker's search.
+
+        Shared by every "delegate to a child work item" call site
+        (single-intent, pending-dialogue, multi-intent-per-item). Runs, in
+        order: missing-worker rejection, missing-search rejection,
+        ``_project_worker(running)``, child-recorder creation, registration
+        in both ``delegated_children`` and the work ledger's known-ids (the
+        latter alongside ``_register_turn_work_item``, before any ack for
+        this item can be admitted), and the ``routing`` status emit.
+
+        Returns ``None`` after fully handling a rejection -- the caller
+        should return/continue without further processing that item -- or a
+        ``DelegatedChild`` on success.
+        """
+        worker = request.worker
+        if worker is None:
+            child = turn_recorder.new_child(work_item_id=request.work_item_id)
+            child.finalize(outcome="missing_worker")
+            turn_recorder.finalize(outcome="failed")
+            self._emit_work_status(
+                turn_id=request.turn_id,
+                work_item_id=request.work_item_id,
+                parent_work_item_id=request.parent_work_item_id,
+                state="failed",
+                origin_epoch=request.origin_epoch,
+                terminal_reason="missing_worker",
+            )
+            return None
+        self._project_worker(worker, origin_epoch=request.origin_epoch, status="running")
+        search = getattr(worker, "search", None)
+        worker_id: str = request.worker_id_override or str(
+            getattr(getattr(worker, "metadata", None), "worker_id", "main")
+        )
+        if search is None:
+            child = turn_recorder.new_child(work_item_id=request.work_item_id)
+            child.finalize(outcome="missing_search", app_worker_id=worker_id)
+            turn_recorder.finalize(outcome="failed")
+            self._emit_work_status(
+                turn_id=request.turn_id,
+                work_item_id=request.work_item_id,
+                parent_work_item_id=request.parent_work_item_id,
+                worker_id=worker_id,
+                state="failed",
+                origin_epoch=request.origin_epoch,
+            )
+            return None
+        child = turn_recorder.new_child(work_item_id=request.work_item_id)
+        delegated_children[request.work_item_id] = worker_id
+        self._register_turn_work_item(request.turn_id, request.work_item_id)
+        # Registered in the ledger before this item's routing status/ack, so
+        # a whole-turn/whole-connection cancel racing in before the ack is
+        # admitted still sees this child as known.
+        self._work_ledger.register_known(request.work_item_id)
+        self._emit_work_status(
+            turn_id=request.turn_id,
+            work_item_id=request.work_item_id,
+            parent_work_item_id=request.parent_work_item_id,
+            worker_id=worker_id,
+            state="routing",
+            origin_epoch=request.origin_epoch,
+        )
+        return DelegatedChild(
+            work_item_id=request.work_item_id,
+            worker_id=worker_id,
+            search=search,
+            child=child,
+        )
+
+    def _mark_delegation_searching(
+        self,
+        child: DelegatedChild,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        parent_work_item_id: str | None = None,
+    ) -> None:
+        """Emit the ``searching`` status for a delegated child.
+
+        Kept separate from ``_begin_delegation`` since callers differ on
+        exact timing relative to search-task creation.
+        """
+        self._emit_work_status(
+            turn_id=turn_id,
+            work_item_id=child.work_item_id,
+            parent_work_item_id=parent_work_item_id,
+            worker_id=child.worker_id,
+            state="searching",
+            origin_epoch=origin_epoch,
+        )
 
     def _release_all_turn_work_items(self, turn_id: str) -> None:
         """Release every delegated child of ``turn_id`` and settle its ack latch.
@@ -1703,43 +1835,21 @@ class SessionHost:
                 )
                 turn_recorder.finalize(outcome="failed")
                 return result
-            if worker is None:
-                child = turn_recorder.new_child(work_item_id=work_item_id)
-                child.finalize(outcome="missing_worker")
-                turn_recorder.finalize(outcome="failed")
-                self._emit_work_status(
+            delegation = self._begin_delegation(
+                DelegationRequest(
                     turn_id=turn_id,
                     work_item_id=work_item_id,
-                    state="failed",
+                    worker=worker,
                     origin_epoch=origin_epoch,
-                    terminal_reason="missing_worker",
-                )
-                return outcome
-            self._project_worker(worker, origin_epoch=origin_epoch, status="running")
-            search = getattr(worker, "search", None)
-            worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
-            if search is None:
-                child = turn_recorder.new_child(work_item_id=work_item_id)
-                child.finalize(outcome="missing_search", app_worker_id=worker_id)
-                turn_recorder.finalize(outcome="failed")
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=work_item_id,
-                    worker_id=worker_id,
-                    state="failed",
-                    origin_epoch=origin_epoch,
-                )
-                return outcome
-            child = turn_recorder.new_child(work_item_id=work_item_id)
-            delegated_children[work_item_id] = worker_id
-            self._register_turn_work_item(turn_id, work_item_id)
-            self._emit_work_status(
-                turn_id=turn_id,
-                work_item_id=work_item_id,
-                worker_id=worker_id,
-                state="routing",
-                origin_epoch=origin_epoch,
+                ),
+                turn_recorder=turn_recorder,
+                delegated_children=delegated_children,
             )
+            if delegation is None:
+                return outcome
+            child = delegation.child
+            search = delegation.search
+            worker_id = delegation.worker_id
             try:
                 search_started = time.perf_counter()
                 search_task = self._dispatch_search_task(
@@ -1754,12 +1864,8 @@ class SessionHost:
                     # ever touching an untracked search task, which would keep
                     # running with its result discarded.
                     self._track_work_task(work_item_id, search_task)
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=work_item_id,
-                    worker_id=worker_id,
-                    state="searching",
-                    origin_epoch=origin_epoch,
+                self._mark_delegation_searching(
+                    delegation, turn_id=turn_id, origin_epoch=origin_epoch
                 )
                 # Dispatch before the ack: a search that resolves within the
                 # same tick (no real delegation latency) never gets an ack at
