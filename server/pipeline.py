@@ -16,19 +16,19 @@ from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
 from .config import Config, FeaturePolicy, PromotionManifest
-from .connection_arbiter import Connection, ConnectionArbiter
+from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     WORK_STATUS_TERMINAL,
     GroundedResult,
     RoutingDecision,
     RoutingState,
-    SnapshotHandshake,
     TerminalReason,
     TranscriptEntry,
     WorkerState,
     WorkStatusState,
 )
 from .frames import CONNECTION_LOCAL_FRAMES
+from .handshake_gate import HandshakeGate
 from .observers import RuntimeObserver
 from .perf_metrics import (
     AppTurnRecorder,
@@ -564,8 +564,6 @@ class DelegatedChild:
 class SessionHost:
     """Process-lifetime host; persistent workers outlive connection pipelines."""
 
-    _MAX_HANDSHAKE_TOKENS = 32
-
     def __init__(
         self,
         registry: WorkerRegistry | None = None,
@@ -645,7 +643,7 @@ class SessionHost:
         self._runner_task: asyncio.Task[Any] | None = None
         self.connection: ConnectionPipeline | None = None
         self._background_shutdowns: set[asyncio.Task[None]] = set()
-        self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
+        self._handshake_gate = HandshakeGate()
         self._turn_sequence = 0
         self._work_ledger = WorkTaskLedger()
         self._clarification_candidates: dict[str, dict[str, str]] = {}
@@ -1043,52 +1041,6 @@ class SessionHost:
             f"failure_kind={kind!r}; recording outcome=failed"
         )
         return "failed"
-
-    def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
-        self._prune_handshake_tokens()
-        entry = self._handshake_tokens.get(token)
-        if entry is None:
-            return False
-        epoch, expires_at, redeemed = entry
-        if expires_at <= time.monotonic() or epoch != proposed_epoch:
-            self._handshake_tokens.pop(token, None)
-            return False
-        if redeem:
-            if redeemed:
-                return False
-            self._handshake_tokens[token] = (epoch, expires_at, True)
-            return True
-        return redeemed
-
-    def validate_patch_handshake(
-        self,
-        connection: Connection | ConnectionPipeline | None,
-        handshake: SnapshotHandshake,
-    ) -> None:
-        """Enforce immutable capability binding for a PATCH ICE-candidate request.
-
-        An omitted ``capabilities`` field inherits the POST-bound set; a
-        present field must match it exactly (post-normalization) or the
-        request is rejected. Neither branch mutates ``connection`` or its
-        already-constructed ``RuntimeObserver``: capability entitlement is
-        immutable for the life of a promoted epoch (Requirements).
-
-        Both concrete carriers are accepted because both real call sites are
-        typed: ``server.app`` passes the live ``ConnectionPipeline`` (whose
-        ``capabilities`` property reads straight off its ``RuntimeObserver``)
-        while the arbiter-level tests pass the promoted ``Connection``. A
-        ``None`` connection means nothing was promoted, so the bound set is
-        empty and any presented capability is a mismatch. Attributes are read
-        directly rather than via ``getattr`` defaults, so a wrong argument or
-        a future field rename raises instead of silently degrading to "no
-        capabilities presented".
-        """
-        if not handshake.capabilities_present:
-            return
-        bound = frozenset(connection.capabilities) if connection is not None else frozenset()
-        presented = frozenset(handshake.capabilities)
-        if presented != bound:
-            raise ValueError("capabilities cannot change after connection promotion")
 
     def abort_connection(self, pipeline: ConnectionPipeline, *, reconnect: bool = True) -> None:
         """Fence a promoted connection whose transport setup did not complete.
@@ -3504,33 +3456,15 @@ class SessionHost:
 
     def session_handshake(self) -> dict[str, Any]:
         """Return the next browser handshake without mutating session state."""
-        self._prune_handshake_tokens()
-        token = uuid4().hex
-        self._handshake_tokens[token] = (
-            self.arbiter.epoch + 1,
-            time.monotonic() + 60,
-            False,
-        )
-        while len(self._handshake_tokens) > self._MAX_HANDSHAKE_TOKENS:
-            oldest = min(self._handshake_tokens, key=lambda item: self._handshake_tokens[item][1])
-            self._handshake_tokens.pop(oldest, None)
+        proposed_epoch = self.arbiter.epoch + 1
+        token = self._handshake_gate.issue_token(proposed_epoch)
         return {
             "contract_version": "v1.0",
             "session_id": self.state.session_id,
             "resume_token": token,
-            "proposed_epoch": self.arbiter.epoch + 1,
+            "proposed_epoch": proposed_epoch,
             "snapshot_sequence": self.state.sequence,
         }
-
-    def _prune_handshake_tokens(self) -> None:
-        now = time.monotonic()
-        expired = [
-            token
-            for token, (_epoch, expires_at, _redeemed) in self._handshake_tokens.items()
-            if expires_at <= now
-        ]
-        for token in expired:
-            self._handshake_tokens.pop(token, None)
 
     def _dispatch(self, decision: Any, catalogue: Any = None) -> Any:
         coordinator = self._require_coordinator()

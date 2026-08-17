@@ -225,10 +225,13 @@ def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandsh
         )
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
-    if value.session_id != host.state.session_id or not host.validate_handshake_token(
-        value.resume_token,
-        value.proposed_epoch,
-        redeem=request.method == "POST",
+    if (
+        value.session_id != host.state.session_id
+        or not host._handshake_gate.validate_handshake_token(
+            value.resume_token,
+            value.proposed_epoch,
+            redeem=request.method == "POST",
+        )
     ):
         raise HTTPException(status_code=401, detail="invalid Small WebRTC session identity")
     # The URL token is deliberately not the process-lifetime resume bearer. The
@@ -755,7 +758,9 @@ def create_app(
         if not session_host.accepts(handshake.proposed_epoch):
             raise HTTPException(status_code=409, detail="stale Small WebRTC connection epoch")
         try:
-            session_host.validate_patch_handshake(session_host.connection, handshake)
+            session_host._handshake_gate.validate_patch_handshake(
+                session_host.connection, handshake
+            )
         except ValueError:
             raise HTTPException(
                 status_code=400, detail="capabilities cannot change after connection promotion"
