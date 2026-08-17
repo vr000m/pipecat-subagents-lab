@@ -1862,18 +1862,18 @@ def test_concurrent_registration_of_one_worker_uses_one_runner_operation() -> No
         )()
         runner = BlockingRunner()
         host = SessionHost(runner_factory=LifecycleRunner)
-        host.runner = runner
+        host._runner_supervisor.runner = runner
 
-        first = asyncio.create_task(host._register_runner_worker(worker))
+        first = asyncio.create_task(host._runner_supervisor.register_worker(worker))
         await runner.started.wait()
-        second = asyncio.create_task(host._register_runner_worker(worker))
+        second = asyncio.create_task(host._runner_supervisor.register_worker(worker))
         await asyncio.sleep(0)
         runner.release.set()
         await asyncio.gather(first, second)
 
         assert runner.calls == 1
-        assert host._runner_handles == {"worker-1": worker}
-        assert host._runner_registered == {"worker-1"}
+        assert host._runner_supervisor._runner_handles == {"worker-1": worker}
+        assert host._runner_supervisor._runner_registered == {"worker-1"}
 
     asyncio.run(run())
 
@@ -2075,7 +2075,7 @@ def test_new_dynamic_worker_is_registered_before_search_dispatch() -> None:
 
         assert result.text == "Answer for historical capitals"
         assert runner.added == [worker]
-        assert host._runner_handles["worker-search"] is worker
+        assert host._runner_supervisor._runner_handles["worker-search"] is worker
         await host.shutdown()
 
     asyncio.run(run())
@@ -5498,7 +5498,7 @@ def test_commit_and_speak_no_tts_short_circuit_completes_without_raising() -> No
 
 def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
     """``_handle_pending`` must snapshot ``_turn_sequence`` before its first
-    await (``_register_runner_worker``), matching ``_search_with_timeout``/
+    await (``RunnerSupervisor.register_worker``), matching ``_search_with_timeout``/
     ``_handle_multi_intent``. If a newer turn is accepted during that yield
     and the snapshot were instead taken after it (the bug), the late
     delivery context would wrongly believe its own dispatch was the latest
@@ -5543,7 +5543,7 @@ def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
         )
         origin = await host.connect(connection_handshake(host, 1))
 
-        original_register_runner_worker = host._register_runner_worker
+        original_register_runner_worker = host._runner_supervisor.register_worker
 
         async def register_and_accept_newer_turn(worker_arg: object) -> None:
             # Simulate a newer semantic turn being accepted concurrently,
@@ -5551,7 +5551,7 @@ def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
             host._turn_sequence += 1
             await original_register_runner_worker(worker_arg)
 
-        host._register_runner_worker = register_and_accept_newer_turn  # type: ignore[method-assign]
+        host._runner_supervisor.register_worker = register_and_accept_newer_turn  # type: ignore[method-assign]
 
         captured_contexts: list[LateDeliveryContext] = []
         original_new_late_delivery_context = host._new_late_delivery_context

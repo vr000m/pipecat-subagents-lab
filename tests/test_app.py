@@ -112,7 +112,7 @@ def test_default_host_dispatches_through_an_injected_router(monkeypatch) -> None
         host = app_module._default_session_host(router=Router(model=FakeRouterModel()))
         worker = FakeSearchWorker("worker-1")
         host.registry.worker_factory = lambda _worker_id: worker
-        host.runner_factory = FakeRunner
+        host._runner_supervisor.runner_factory = FakeRunner
         await host.connect(
             {
                 "session_id": host.state.session_id,

@@ -48,6 +48,7 @@ from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
+from .runner_supervisor import RunnerSupervisor
 from .session_state import SessionState
 from .speech_lifecycle import (
     DeliveryDisposition,
@@ -633,14 +634,9 @@ class SessionHost:
         self._promotion_eligible: bool = bool(
             promotion_manifest is not None and promotion_manifest.promotion_eligible
         )
-        self.runner_factory = runner_factory
+        self._runner_supervisor = RunnerSupervisor(runner_factory=runner_factory)
         self.stt, self.tts = stt, tts
         self._tts_on_event = getattr(tts, "on_event", None)
-        self.runner: Any = None
-        self._runner_handles: dict[str, Any] = {}
-        self._runner_registered: set[str] = set()
-        self._runner_registrations: dict[str, asyncio.Task[None]] = {}
-        self._runner_task: asyncio.Task[Any] | None = None
         self.connection: ConnectionPipeline | None = None
         self._background_shutdowns: set[asyncio.Task[None]] = set()
         self._handshake_gate = HandshakeGate()
@@ -680,73 +676,9 @@ class SessionHost:
         if self.started:
             return
         self._closing = False
-        if self.runner_factory is not None:
-            self.runner = self.runner_factory()
-        else:
-            from pipecat.pipeline.runner import WorkerRunner
-
-            self.runner = WorkerRunner(name="websearch-session", handle_sigint=False)
-        await self._register_persistent_workers()
-        start = getattr(self.runner, "start", None)
-        if start is not None:
-            result = start()
-            if hasattr(result, "__await__"):
-                await result
-        else:
-            run = getattr(self.runner, "run", None)
-            if run is not None:
-                self._runner_task = asyncio.create_task(run(auto_end=False))
+        await self._runner_supervisor.start(lambda: self.registry.workers)
         self.state.active_epoch = None
         self.started = True
-
-    async def _register_persistent_workers(self) -> None:
-        """Register durable contexts with the runner when the API can accept them.
-
-        Pipecat 1.6.0 does not expose the planned ``LLMContextWorker`` module;
-        the lab's ContextWorker uses the pinned BaseWorker bus lifecycle instead.
-        Test registries and runners without ``add_workers`` are left untouched.
-        """
-        add_workers = getattr(self.runner, "add_workers", None)
-        if add_workers is None:
-            return
-        try:
-            from pipecat.workers.base_worker import BaseWorker
-        except ImportError:
-            return
-
-        for registered in self.registry.workers:
-            if isinstance(registered.worker, BaseWorker):
-                await self._register_runner_worker(registered.worker)
-
-    async def _register_runner_worker(self, worker: Any) -> None:
-        metadata = getattr(worker, "metadata", None)
-        worker_id = getattr(metadata, "worker_id", None) or getattr(worker, "name", None)
-        if not isinstance(worker_id, str) or not worker_id:
-            return
-        if worker_id in self._runner_registered:
-            return
-        add_workers = getattr(self.runner, "add_workers", None)
-        if add_workers is None:
-            return
-        registration = self._runner_registrations.get(worker_id)
-        if registration is None:
-
-            async def register() -> None:
-                result = add_workers(worker)
-                if inspect.isawaitable(result):
-                    await result
-                self._runner_handles[worker_id] = worker
-                self._runner_registered.add(worker_id)
-
-            registration = asyncio.create_task(register())
-            self._runner_registrations[worker_id] = registration
-
-            def completed(completed_task: asyncio.Task[Any]) -> None:
-                if self._runner_registrations.get(worker_id) is completed_task:
-                    self._runner_registrations.pop(worker_id, None)
-
-            registration.add_done_callback(completed)
-        await asyncio.shield(registration)
 
     async def connect(self, handshake: Any) -> ConnectionPipeline:
         if self._closing:
@@ -956,7 +888,7 @@ class SessionHost:
             )
             self._background_shutdowns.add(task)
             task.add_done_callback(self._background_shutdowns.discard)
-        await self._register_persistent_workers()
+        await self._runner_supervisor.register_persistent_workers(lambda: self.registry.workers)
         return pipeline
 
     @staticmethod
@@ -1791,7 +1723,7 @@ class SessionHost:
                 return result
             try:
                 worker = self._dispatch(outcome.decision, getattr(outcome, "catalogue", None))
-                await self._register_runner_worker(worker)
+                await self._runner_supervisor.register_worker(worker)
             except (RoutingValidationError, UnsupportedWorkerType):
                 result = await self._commit_and_speak(
                     canonical_result(
@@ -2070,7 +2002,7 @@ class SessionHost:
             worker = registered.worker if registered is not None else None
             work_item_id = f"work-{turn_id}"
             if worker is not None:
-                await self._register_runner_worker(worker)
+                await self._runner_supervisor.register_worker(worker)
             # S2 never derives the worker id from ``worker.metadata`` the way
             # the single-intent path does -- it is always the pending
             # dialogue's owner (or "main"), even when a worker is present.
@@ -2379,7 +2311,7 @@ class SessionHost:
                         continue
                     try:
                         worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
-                        await self._register_runner_worker(worker)
+                        await self._runner_supervisor.register_worker(worker)
                     except (RoutingValidationError, UnsupportedWorkerType):
                         results[index] = canonical_result(
                             worker_id="main",
@@ -3695,11 +3627,7 @@ class SessionHost:
             task.cancel()
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
-        registrations = tuple(self._runner_registrations.values())
-        for task in registrations:
-            task.cancel()
-        if registrations:
-            await asyncio.gather(*registrations, return_exceptions=True)
+        await self._runner_supervisor.cancel_registrations()
         ack_admission_tasks = tuple(self._ack_admission_tasks)
         for task in ack_admission_tasks:
             task.cancel()
@@ -3746,24 +3674,6 @@ class SessionHost:
         # carrying it for the process's remaining lifetime.
         self._turn_work_items.clear()
         self._ack_emitted_turns.clear()
-        stop = getattr(self.runner, "stop", None)
-        if stop is not None:
-            result = stop()
-            if hasattr(result, "__await__"):
-                await result
-        elif self.runner is not None:
-            cancel = getattr(self.runner, "cancel", None)
-            if cancel is not None:
-                result = cancel("session shutdown")
-                if hasattr(result, "__await__"):
-                    await result
-        if self._runner_task is not None:
-            self._runner_task.cancel()
-            try:
-                await self._runner_task
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._runner_task = None
+        await self._runner_supervisor.shutdown()
         self.started = False
         self.state.active_epoch = None

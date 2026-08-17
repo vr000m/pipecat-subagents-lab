@@ -321,7 +321,7 @@ async def _attach_connection(
             audio_out_sample_rate=output_sample_rate,
         )
         transport = SmallWebRTCTransport(connection, params)
-        bus = getattr(host.runner, "bus", None)
+        bus = getattr(host._runner_supervisor.runner, "bus", None)
         if bus is None:
             from .pipeline import _ProbeBus
 
@@ -610,7 +610,7 @@ async def _attach_connection(
         # replacement can cancel and await it without leaking runner registry
         # entries. Lightweight test runners retain their documented add_workers
         # registration seam.
-        if type(host.runner).__module__.startswith("pipecat."):
+        if type(host._runner_supervisor.runner).__module__.startswith("pipecat."):
             runtime.worker_task = asyncio.create_task(
                 worker.run(WorkerParams(task_manager=task_manager))
             )
@@ -629,7 +629,7 @@ async def _attach_connection(
 
             runtime.worker_task.add_done_callback(worker_finished)
         else:
-            add_workers = getattr(host.runner, "add_workers", None)
+            add_workers = getattr(host._runner_supervisor.runner, "add_workers", None)
             if add_workers is None:
                 raise RuntimeError("the configured runner cannot attach a Small WebRTC worker")
             attached = add_workers(worker)
