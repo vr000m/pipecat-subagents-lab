@@ -141,12 +141,13 @@ numbers are defined once in `shared/work-status-retention.json`, which
 `server/session_state.py` and `web/src/state.js` both load rather than
 hardcoding independently -- so this section's "five minutes" and "256" are
 descriptive of that file's current values, not a second place to edit when
-they change. Only
-terminal records are eviction candidates -- evicting a live (non-terminal)
-record would erase the sole record of its children and strand the parent
-aggregate non-terminal forever, so eviction is refused while every retained
-record is live, and the 256-key bound is a soft cap that a live-record-heavy
-ledger may deliberately exceed. Removal is pruned lazily at projection time.
+they change. Terminal records and non-authoritative restored records (see
+below) are the eviction candidates -- evicting a live *authoritative*
+non-terminal record would erase the sole record of its children and strand
+the parent aggregate non-terminal forever, so eviction is refused while
+every retained record is live and authoritative, and the 256-key bound is a
+soft cap that a live-record-heavy ledger may deliberately exceed. Removal is
+pruned lazily at projection time.
 
 A parent record **restored from a reconnect snapshot is non-authoritative
 over its child set**, and aggregation above is conditional on that. The wire
@@ -261,6 +262,9 @@ boundary closes; browser SDK transcript callbacks are not authoritative state.
   `v013-transport-browser-contract.json` are Phase 4 evidence-gate
   artifacts, validated by `scripts/validate_v013_evidence.py` and
   siblings; they are internal analysis inputs, not a wire boundary.
+- `work-status-retention.json` defines the shared TTL and max-keys retention
+  bounds for the "Progressive work status" section above; `server/session_state.py`
+  and `web/src/state.js` both load it rather than hardcoding independently.
 
 Reconnect uses `session_id`, a resume token/known-process identity, proposed
 epoch, and the last snapshot sequence. The new epoch is fenced before the

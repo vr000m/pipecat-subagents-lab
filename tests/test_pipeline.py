@@ -25,6 +25,7 @@ from pipecat.turns.user_turn_processor import UserTurnProcessor
 import server.app as app_module
 import server.pipeline as pipeline_module
 import server.speech_lifecycle
+from server import work_status_publisher
 from server.config import Config, PromotionManifest
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.frames import CONNECTION_LOCAL_FRAMES, SnapshotBarrierFlushFrame
@@ -6974,7 +6975,7 @@ def test_work_status_helper_matches_the_delegated_child_derivation(
 def test_work_status_helper_matches_the_late_commit_derivation(
     work_outcome: str | None, commit_outcome: str | None, terminal_kind: str | None
 ) -> None:
-    assert pipeline_module._late_commit_work_status(
+    assert work_status_publisher.late_commit_work_status(
         work_outcome,
         commit_outcome=commit_outcome,
         terminal_kind=terminal_kind,

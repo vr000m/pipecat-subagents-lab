@@ -25,6 +25,7 @@ import pytest
 from server.frames import CONNECTION_LOCAL_FRAMES, SnapshotBarrierFlushFrame
 from server.speech_lifecycle import (
     DeliveryDisposition,
+    EventLoopTimerScheduler,
     GenerationIdentity,
     GenerationPhase,
     ManualTimerScheduler,
@@ -1805,5 +1806,78 @@ def test_connection_closed_cancels_and_clears_in_flight_transitions() -> None:
         await asyncio.sleep(0)
         assert future.cancelled()
         assert resumed == []
+
+    asyncio.run(run())
+
+
+def test_event_loop_scheduler_reads_its_delay_off_the_injected_clock() -> None:
+    """Regression (Round 10, #20): ``EventLoopTimerScheduler.call_at`` computed
+    its wall delay against ``time.monotonic()`` while every deadline handed to
+    it comes from the coordinator's injectable ``Clock``.
+
+    The two only share a time base when the injected clock *is* a
+    ``MonotonicClock``. A fake clock starting near zero made ``when -
+    time.monotonic()`` hugely negative, ``max(0.0, ...)`` clamped it to a zero
+    delay, and every timer fired on the next loop tick -- so a coordinator
+    built with a fake clock but the default scheduler had no working timeouts
+    at all.
+    """
+
+    async def run() -> None:
+        clock = ManualTimerScheduler(start=0.0)
+        scheduler = EventLoopTimerScheduler(clock)
+        fired: list[str] = []
+
+        # Ten seconds out on the injected clock, which has not advanced.
+        scheduler.call_at(clock.now() + 10.0, lambda: fired.append("early"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert fired == []
+
+    asyncio.run(run())
+
+
+def test_coordinator_default_scheduler_shares_the_injected_clock() -> None:
+    """Companion to #20: the coordinator must hand its own clock to the
+    scheduler it constructs by default, or the two desynchronise exactly as
+    above the moment a caller injects a clock without also injecting timers."""
+    clock = ManualTimerScheduler(start=0.0)
+    coordinator = SpeechLifecycleCoordinator(clock=clock)
+
+    assert isinstance(coordinator._timers, EventLoopTimerScheduler)
+    assert coordinator._timers._clock is clock
+
+
+def test_mark_handed_to_tts_refuses_a_tombstoned_generation() -> None:
+    """Regression (Round 10, #21): ``mark_handed_to_tts`` did not reject a
+    tombstoned generation, unlike its sibling transitions.
+
+    On the race where a cancel tombstones the generation between admission and
+    the TTS hand-off, it advanced the phase anyway and armed the ten-second
+    start timeout -- holding the global transport slot for ten seconds instead
+    of the one-second transport grace the teardown path uses, roughly a
+    tenfold extension of slot occupancy.
+    """
+
+    async def run() -> None:
+        coordinator, clock = make_coordinator(auto_ack_cleanup=False)
+        generation = coordinator.try_admit(identity())
+        assert generation is not None
+
+        coordinator.record_interruption(generation.token)
+        assert coordinator.generation_for_token(generation.token).tombstoned
+
+        coordinator.mark_handed_to_tts(generation.token)
+
+        assert coordinator.generation_for_token(generation.token).phase != (
+            GenerationPhase.HANDED_TO_TTS
+        )
+        # No ten-second start timeout was armed on top of the cleanup deadline:
+        # the slot resolves on the one-second grace, not at t=10.
+        await tick(clock, 1.0)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not coordinator.occupied
 
     asyncio.run(run())

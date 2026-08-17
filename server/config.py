@@ -341,45 +341,85 @@ _EVIDENCE_SCHEMA_PATH = _PACKAGE_ROOT / "shared/schemas/v013-evidence.json"
 _MAX_EVIDENCE_INPUT_BYTES = 8 * 1024 * 1024
 
 
-def _regular_file_within_evidence_size_cap(path: Path) -> bool:
-    """True iff `path` names a regular file at or under `_MAX_EVIDENCE_INPUT_BYTES`.
+def _read_regular_file_no_follow(path: Path, *, max_bytes: int) -> bytes | None:
+    """Open, fstat-verify, and read `path`, returning `None` for anything that
+    is not a size-bounded regular file -- or is unreadable at all.
 
-    A single `os.stat()`/`Path.stat()` call backs both checks: `Path.is_file()`
-    is itself a `stat()` call, so testing it and `Path.stat().st_size`
-    separately would double the syscall for every evidence-file read this
-    gates. `stat.S_ISREG` reads the file-type bits off that one call's result
-    instead.
+    Runtime evidence paths here are either attacker-steerable (a manifest's
+    own declared `inputs[*].path`) or operator-controllable (env/TOML
+    settings) but still read on the server-boot path, so both threat models
+    get the same treatment: a prior `Path.stat()`/`Path.is_file()` check
+    followed by a *separate* `read_text()`/`read_bytes()` call leaves a
+    TOCTOU window between the check and the read -- the path can be swapped
+    (e.g. a regular file replaced by a symlink or FIFO) in between. Opening
+    once with `O_NONBLOCK` and then `fstat`-ing the *held fd* closes that
+    window: the type/size decision and the read happen against the exact
+    same file, not against whatever now sits at the path's name.
+
+    `O_NOFOLLOW` additionally rejects a symlink planted at the path outright
+    (`ELOOP`) rather than silently resolving it, and `O_NONBLOCK` means
+    opening (and, since the type check runs before any read, never reading)
+    a FIFO or character device does not block or hang server boot the way a
+    plain `open()`/`read_bytes()` would (`/dev/zero` never reaches EOF). The
+    read loop is additionally capped at `max_bytes` so an oversized regular
+    file is not slurped into memory either.
+
+    Every failure mode here -- missing path, permission denied, symlinked,
+    not a regular file, oversized -- collapses to `None`; callers already
+    treat every evidence-read failure as one fail-closed outcome (e.g.
+    `evidence_unresolvable`/`manifest_missing`/`phase4c_unresolvable`), so
+    there is nothing for a caller to do differently per failure kind.
     """
-    from stat import S_ISREG
-
     try:
-        st = path.stat()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
-        return False
-    return S_ISREG(st.st_mode) and st.st_size <= _MAX_EVIDENCE_INPUT_BYTES
+        return None
+    try:
+        from stat import S_ISREG
+
+        st = os.fstat(fd)
+        if not S_ISREG(st.st_mode):
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            try:
+                chunk = os.read(fd, 1 << 20)
+            except OSError:
+                return None
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
-    """Resolve a manifest-declared evidence path, confined to the repo tree
-    and bounded in size.
+    """Resolve a manifest-declared evidence path, confined to the repo tree.
 
     `raw_path` comes from `manifest["inputs"][phase]["path"]`, a value the
     artifact under validation declares about itself -- not an operator
     setting. Accepting it as a runtime read target without containment would
     be an attacker-steerable arbitrary-file-read primitive (absolute paths,
-    `..` traversal, devices, FIFOs). Returns `None` when the path is absolute,
-    escapes the repo root after resolution, does not name a regular file, or
-    exceeds `_MAX_EVIDENCE_INPUT_BYTES` -- the size cap lives here, not at the
-    call site, so every caller inherits both the confinement and the read-size
-    bound together rather than having to remember to apply the cap itself.
+    `..` traversal). Returns `None` when the path is absolute or escapes the
+    repo root after resolution.
+
+    Deliberately does *not* also check "is a regular file within the size
+    cap" here: doing that with a `stat()` call and then reading the path
+    separately at the caller is exactly the TOCTOU gap
+    `_read_regular_file_no_follow` exists to close, so every caller must
+    route the actual read through that helper, which re-derives both facts
+    from the fd it opens for the read.
     """
     candidate = Path(raw_path)
     if candidate.is_absolute():
         return None
     resolved = (_PACKAGE_ROOT / candidate).resolve()
     if not resolved.is_relative_to(_PACKAGE_ROOT):
-        return None
-    if not _regular_file_within_evidence_size_cap(resolved):
         return None
     return resolved
 
@@ -454,13 +494,17 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # Same guard `phase4c_artifact_path` takes, and for the same reason: this
     # is operator config, and a path that names a device or FIFO would hang or
     # OOM-kill server boot on read_text(). This is the first evidence read the
-    # boot path takes, so it is the one that must fail closed.
-    if not _regular_file_within_evidence_size_cap(path):
+    # boot path takes, so it is the one that must fail closed. Routed through
+    # `_read_regular_file_no_follow` (a single open+fstat+read, not a
+    # `stat()`-then-`read_text()` pair) so the type/size decision and the
+    # bytes actually read cannot be split across a TOCTOU window.
+    content = _read_regular_file_no_follow(path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
+    if content is None:
         return _unavailable("manifest_missing")
     try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return _unavailable("manifest_missing")
+        raw = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return _unavailable("manifest_malformed")
     try:
         manifest = json.loads(raw)
     except json.JSONDecodeError:
@@ -556,10 +600,15 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         _phase_path = _resolve_confined_evidence_path(_phase_entry["path"])
         if _phase_path is None:
             return replace(identity, reason="evidence_unresolvable")
-        try:
-            _actual_phase_hash = hashlib.sha256(_phase_path.read_bytes()).hexdigest()
-        except OSError:
+        # `_read_regular_file_no_follow`, not `_phase_path.read_bytes()`: a
+        # single open+fstat+read closes the TOCTOU window a separate
+        # regular-file/size check followed by a read would leave open.
+        _phase_content = _read_regular_file_no_follow(
+            _phase_path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES
+        )
+        if _phase_content is None:
             return replace(identity, reason="evidence_unresolvable")
+        _actual_phase_hash = hashlib.sha256(_phase_content).hexdigest()
         if _actual_phase_hash != _phase_entry["sha256"]:
             return replace(identity, reason="evidence_mismatch")
 
@@ -613,23 +662,25 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         phase4c_path = Path(phase4c_artifact_path)
         if not phase4c_path.is_absolute():
             phase4c_path = _PACKAGE_ROOT / phase4c_path
-        try:
-            # phase4c_artifact_path is operator config (env/TOML), not
-            # manifest-declared, so it is not attacker-steerable the way the
-            # phase0-3 `inputs[*].path` entries are -- but it is still an
-            # operator-controllable path read on the server-boot path, and
-            # `_resolve_confined_evidence_path`'s sibling reads apply the
-            # same size/regular-file bound for exactly that reason: an
-            # accidental device-file or FIFO path would otherwise make
-            # `read_bytes()` block indefinitely (`/dev/zero` never reaches
-            # EOF), hanging or OOM-killing server boot instead of degrading
-            # to `phase4c_unresolvable` like every other unreadable-path
-            # case here.
-            if not _regular_file_within_evidence_size_cap(phase4c_path):
-                return replace(identity, reason="phase4c_unresolvable")
-            actual_hash = hashlib.sha256(phase4c_path.read_bytes()).hexdigest()
-        except OSError:
+        # phase4c_artifact_path is operator config (env/TOML), not
+        # manifest-declared, so it is not attacker-steerable the way the
+        # phase0-3 `inputs[*].path` entries are -- but it is still an
+        # operator-controllable path read on the server-boot path, and
+        # `_read_regular_file_no_follow` applies the same size/regular-file
+        # bound, from one held fd, for exactly that reason: an accidental
+        # device-file or FIFO path would otherwise make `read_bytes()` block
+        # indefinitely (`/dev/zero` never reaches EOF), and a separate
+        # `stat()`-then-`read_bytes()` pair would leave a TOCTOU window
+        # between the check and the read -- hanging or OOM-killing server
+        # boot, or reading through a swapped-in symlink, instead of
+        # degrading to `phase4c_unresolvable` like every other
+        # unreadable-path case here.
+        phase4c_content = _read_regular_file_no_follow(
+            phase4c_path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES
+        )
+        if phase4c_content is None:
             return replace(identity, reason="phase4c_unresolvable")
+        actual_hash = hashlib.sha256(phase4c_content).hexdigest()
         if actual_hash != phase4c_hash:
             return replace(identity, reason="phase4c_mismatch")
         # The declared top-level hash and the `inputs.phase4c` binding are two

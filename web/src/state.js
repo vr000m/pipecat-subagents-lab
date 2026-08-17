@@ -184,6 +184,13 @@ export const WORK_STATUS_MAX_KEYS = workStatusRetention.max_keys;
 export const WORK_STATUS_TERMINAL_TTL_MS = workStatusRetention.ttl_seconds * 1000;
 const WORK_STATUS_TERMINAL_STATES = new Set(["result_ready", "failed", "cancelled"]);
 
+// `_restoredAt` mirrors the server's `_work_status_nonauthoritative_at`: a
+// non-terminal record restored from a snapshot can never be terminalized
+// client-side either (the client, like the server post-restore, has no
+// children map to re-aggregate from), so without a clock of its own it
+// would never satisfy the `_terminalSince` check below and would be
+// retained forever. Stamping it at the restore instant gives it the same
+// five-minute TTL a terminal record gets, measured from the same instant.
 function pruneExpiredWorkStatus(workStatus, now) {
   let changed = false;
   const next = {};
@@ -192,35 +199,45 @@ function pruneExpiredWorkStatus(workStatus, now) {
       changed = true;
       continue;
     }
+    if (
+      record._terminalSince === undefined &&
+      record._restoredAt !== undefined &&
+      now - record._restoredAt >= WORK_STATUS_TERMINAL_TTL_MS
+    ) {
+      changed = true;
+      continue;
+    }
     next[key] = record;
   }
   return changed ? next : workStatus;
 }
 
-// Terminal-first eviction, oldest terminal first, mirroring
-// _evict_work_status_overflow's ordering; `protectKey` is the record just
-// written and is never the eviction victim.
+// Oldest-eligible-first eviction, mirroring _evict_work_status_overflow's
+// ordering (which picks the single oldest expiry stamp across both terminal
+// and restored-non-authoritative candidates, not terminal-before-restored);
+// `protectKey` is the record just written and is never the eviction victim.
 function evictOldestWorkStatus(workStatus, protectKey) {
   if (Object.keys(workStatus).length <= WORK_STATUS_MAX_KEYS) return workStatus;
   const next = { ...workStatus };
+  const expiryStamp = (key) => next[key]._terminalSince ?? next[key]._restoredAt;
   while (Object.keys(next).length > WORK_STATUS_MAX_KEYS) {
-    // Only terminal records are evictable, matching the server's
-    // _evict_work_status_overflow: a non-terminal record is a live parent
-    // aggregate, and dropping it would strand it non-terminal forever. When
-    // every retained record is live, the ledger deliberately exceeds the cap
-    // instead of evicting one.
-    const candidates = Object.keys(next).filter((key) => key !== protectKey && next[key]._terminalSince !== undefined);
+    // Terminal and restored-non-authoritative records are evictable,
+    // matching the server's _evict_work_status_overflow. A live authoritative
+    // non-terminal record is not: dropping it would strand it non-terminal
+    // forever. When every retained record is live, the ledger deliberately
+    // exceeds the cap instead of evicting one.
+    const candidates = Object.keys(next).filter((key) => key !== protectKey && expiryStamp(key) !== undefined);
     if (candidates.length === 0) break;
     let oldestKey = candidates[0];
     for (const key of candidates) {
-      if (next[key]._terminalSince < next[oldestKey]._terminalSince) oldestKey = key;
+      if (expiryStamp(key) < expiryStamp(oldestKey)) oldestKey = key;
     }
     delete next[oldestKey];
   }
   return next;
 }
 
-function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previousRecord = workStatus[key]) {
+function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previousRecord = workStatus[key], isRestore = false) {
   // Preserve an already-terminal key's original `_terminalSince` (e.g. a
   // reconnect snapshot re-delivering the same terminal record) instead of
   // restamping it to `now`: within this serving process, the server's
@@ -236,9 +253,22 @@ function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previous
   // grants a fresh five-minute window -- bounded today only because the
   // server also prunes at projection and stops sending it, not because
   // this function independently enforces the TTL.
+  //
+  // A non-terminal record only gets `_restoredAt` when `isRestore` is set
+  // (i.e. this upsert comes from `snapshotState`, not a live increment),
+  // preserving a prior restore's stamp the same way `_terminalSince` is
+  // preserved above. A live increment for a key already carrying
+  // `_restoredAt` keeps that stamp -- it still traces back to a snapshot
+  // restore -- so the clock survives every subsequent non-terminal rewrite
+  // of the record, same as the server's key-scoped tombstone outliving each
+  // record it clocks.
   const record = WORK_STATUS_TERMINAL_STATES.has(projected.state)
     ? { ...projected, _terminalSince: previousRecord?._terminalSince ?? now }
-    : projected;
+    : isRestore
+      ? { ...projected, _restoredAt: previousRecord?._restoredAt ?? now }
+      : previousRecord?._restoredAt !== undefined
+        ? { ...projected, _restoredAt: previousRecord._restoredAt }
+        : projected;
   const withEntry = { ...workStatus, [key]: record };
   return evictOldestWorkStatus(pruneExpiredWorkStatus(withEntry, now), key);
 }
@@ -282,7 +312,7 @@ function snapshotState(state, snapshot, sequence) {
       // since a snapshot carries at most one parent record per key, but
       // would make this non-idempotent under a hypothetical future
       // duplicate-key-within-one-snapshot case.
-      return upsertWorkStatus(acc, key, item, now, state.workStatus[key]);
+      return upsertWorkStatus(acc, key, item, now, state.workStatus[key], true);
     }, {});
   const diagnostics = {
     ...state.localDiagnostics,

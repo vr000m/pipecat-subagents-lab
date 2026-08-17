@@ -160,26 +160,36 @@ class SessionState:
         # cold-starts the key and re-derives a parent state from a single
         # child, resurrecting a record clients already applied as terminal.
         self._work_status_terminal_keys: set[WorkStatusKey] = set()
-        # Keys whose parent aggregate was rehydrated by ``from_snapshot``,
-        # mapped to the monotonic instant of that restore. The wire carries
-        # the parent aggregate but never the child set it was derived from,
-        # so such a key's children map is known-incomplete and may never be
-        # terminalized from (see ``_reaggregate_parent``).
+        # Keys whose parent aggregate was rehydrated by ``from_snapshot``. The
+        # wire carries the parent aggregate but never the child set it was
+        # derived from, so such a key's children map is known-incomplete and
+        # may never be terminalized from (see ``_reaggregate_parent``).
         #
         # Non-authoritativeness is a property of the *key*, not of one record
         # -- re-aggregating over a still-partial child set does not make that
-        # set complete -- so it lives here, alongside _work_status_sequence
-        # and _work_status_terminal_keys, which already have exactly this
-        # key-outlives-record lifetime, rather than being hand-copied onto
-        # each successive _WorkStatusRecord.
-        #
-        # The stamp is the record's own expiry clock. A non-authoritative
-        # record can never reach a terminal state, so it never gets a
-        # ``terminal_at`` -- the TTL-prune and overflow-eviction paths both
-        # key off ``terminal_at``, and without this it would be retained and
-        # re-shipped on every snapshot for the process lifetime. Both paths
-        # consult this map so the record expires on the same five-minute TTL
-        # a terminal one does, measured from the restore.
+        # set complete, and neither does dropping the record. So it lives
+        # here, alongside _work_status_sequence and _work_status_terminal_keys,
+        # which already have exactly this key-outlives-record lifetime, rather
+        # than being hand-copied onto each successive _WorkStatusRecord. It is
+        # a tombstone in the same sense _work_status_terminal_keys is: once a
+        # key has been restored from the wire, no later child write can prove
+        # its child set complete, so a record TTL-pruned and then cold-started
+        # by a fresh child report is still non-authoritative and still must
+        # not terminalize. Bounded by the same accepted trade as the other two
+        # key-scoped maps.
+        self._work_status_nonauthoritative_keys: set[WorkStatusKey] = set()
+        # The *record-scoped* expiry clock for those keys: the monotonic
+        # instant the current record for a non-authoritative key started
+        # being retained. A non-authoritative record can never reach a
+        # terminal state, so it never gets a ``terminal_at`` -- the TTL-prune
+        # and overflow-eviction paths both key off ``terminal_at``, and
+        # without this it would be retained and re-shipped on every snapshot
+        # for the process lifetime. Both paths consult this map (via
+        # ``_work_status_expiry_stamp``) so the record expires on the same
+        # five-minute TTL a terminal one does. Unlike the key set above, this
+        # is dropped with the record it clocks and re-stamped when a new
+        # record is written for the key, so a cold-started record gets a full
+        # fresh TTL instead of inheriting an already-expired one.
         self._work_status_nonauthoritative_at: dict[WorkStatusKey, float] = {}
 
     @property
@@ -438,11 +448,7 @@ class SessionState:
         # that a terminal parent state never regresses.
         if record is not None and record.status.state in WORK_STATUS_TERMINAL:
             return None
-        if (
-            record is not None
-            and key in self._work_status_nonauthoritative_at
-            and parent_state in WORK_STATUS_TERMINAL
-        ):
+        if key in self._work_status_nonauthoritative_keys and parent_state in WORK_STATUS_TERMINAL:
             # A restored record's children map holds only the children that
             # have reported *since* the restore, not the set the restored
             # aggregate was computed over (child records are server-internal
@@ -456,6 +462,17 @@ class SessionState:
             # ``_evict_work_status_overflow``) rather than claiming a result
             # that may not exist. Non-terminal re-aggregation still flows
             # through normally.
+            #
+            # This holds whether or not a record is currently live: the key's
+            # non-authoritativeness is a tombstone, so a record already
+            # TTL-pruned and now cold-started by a fresh child report is just
+            # as unable to prove its child set complete. With no record to
+            # write, that cold-started children entry would never be visited
+            # by TTL pruning or overflow eviction (both scan only
+            # _work_status_parents), so drop it here for the same reason the
+            # terminal-tombstone branch above does.
+            if record is None:
+                self._work_status_children.pop(key, None)
             return None
         next_sequence = self._work_status_sequence.get(key, 0) + 1
         self._work_status_sequence[key] = next_sequence
@@ -468,10 +485,17 @@ class SessionState:
             terminal_reason=parent_reason,
             origin_epoch=key.origin_epoch,
         )
-        terminal_at = time.monotonic() if parent_state in WORK_STATUS_TERMINAL else None
-        # Non-authoritativeness needs no re-threading here: it lives on the
-        # key in ``_work_status_nonauthoritative_at`` and so survives every
-        # rewrite of the record by construction.
+        now = time.monotonic()
+        terminal_at = now if parent_state in WORK_STATUS_TERMINAL else None
+        # Non-authoritativeness itself needs no re-threading: it lives on the
+        # key in ``_work_status_nonauthoritative_keys`` and so survives every
+        # rewrite -- and every drop -- of the record by construction. Its
+        # *retention clock* is record-scoped, though: ``setdefault`` leaves a
+        # live restored record clocked from its original restore instant while
+        # giving a record cold-started after a prune a full fresh TTL rather
+        # than an already-expired one.
+        if key in self._work_status_nonauthoritative_keys:
+            self._work_status_nonauthoritative_at.setdefault(key, now)
         self._work_status_parents[key] = _WorkStatusRecord(status=status, terminal_at=terminal_at)
         self._evict_work_status_overflow(protect=key)
         return self._emit("work_status", status.model_dump(mode="json"))
@@ -484,6 +508,13 @@ class SessionState:
         restarting at 1. It is never pruned, by design. A terminal record
         additionally leaves a tombstone so a later child write cannot
         cold-start the key back below the terminal state clients applied.
+
+        Only the *record-scoped* non-authoritative clock is dropped here. The
+        key-scoped ``_work_status_nonauthoritative_keys`` tombstone survives,
+        exactly like the counter and the terminal-key tombstone: dropping a
+        record does not make a restored key's child set any more complete, so
+        a record cold-started after this prune must still refuse to
+        terminalize.
         """
         self._work_status_children.pop(key, None)
         self._work_status_nonauthoritative_at.pop(key, None)
@@ -617,9 +648,11 @@ class SessionState:
                 # being silently treated as already expired.
                 terminal_at=restored_at if status.state in WORK_STATUS_TERMINAL else None,
             )
-            # A non-terminal restored record never gets a ``terminal_at``, so
-            # this stamp is its only retention clock -- same TTL, measured
-            # from the same instant.
+            # The key is non-authoritative for the process lifetime; the stamp
+            # is this record's retention clock. A non-terminal restored record
+            # never gets a ``terminal_at``, so the stamp is its only clock --
+            # same TTL, measured from the same instant.
+            state._work_status_nonauthoritative_keys.add(key)
             state._work_status_nonauthoritative_at[key] = restored_at
         return state
 

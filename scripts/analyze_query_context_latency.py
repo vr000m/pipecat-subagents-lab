@@ -35,6 +35,7 @@ from scripts._evidence_common import (
     load_jsonl,
     sha256_file,
     validate_against_fixture,
+    write_bytes_no_follow,
 )
 from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
 
@@ -564,12 +565,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         records = load_jsonl(args.input)
         result = analyze(records, fixture_path=args.fixture)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        # `write_bytes_no_follow` (scripts/_evidence_common.py) rather than
+        # `Path.write_text` -- this predictable, repo-relative output path is
+        # exactly the kind of target the promotion-manifest writer's symlink
+        # hardening exists for, and every evidence-gate writer routes through
+        # the same shared primitive so none of them silently regresses. Kept
+        # inside this try block, not after it, so a symlinked --output fails
+        # closed with the same FAIL/exit-1 contract as every other gate error
+        # here, instead of an uncaught traceback.
+        write_bytes_no_follow(
+            args.output, (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
     except (EvidenceGateError, OSError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
         f"OK: wrote status={result['status']} promotion_eligible={result['promotion_eligible']} "
         f"to {args.output}"

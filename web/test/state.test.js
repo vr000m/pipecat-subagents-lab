@@ -651,6 +651,82 @@ if (hasWorkStatusField) {
       expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
       expect(state.workStatus["1::turn-2::work-2"]).toBeDefined();
     });
+
+    // Regression: a non-terminal work_status record restored from a
+    // snapshot mirrors server/session_state.py's non-authoritative
+    // records -- its children map is known-incomplete, so it can never be
+    // terminalized from and would otherwise have no retention clock at all.
+    // The server gives such a record a clock stamped at the restore instant
+    // (_work_status_nonauthoritative_at); the client previously keyed
+    // pruning only off `_terminalSince`, so a restored non-terminal record
+    // was retained forever.
+    test("a restored non-terminal work_status record is pruned once the TTL window elapses from the restore instant", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, {
+        ...snapshot(1),
+        data: {
+          ...snapshot(1).data,
+          work_status: [
+            {
+              turn_id: "turn-1",
+              work_item_id: "work-1",
+              worker_id: null,
+              state: "searching",
+              event_sequence: 1,
+              terminal_reason: null,
+              origin_epoch: 1,
+            },
+          ],
+        },
+      });
+      expect(state.workStatus["1::turn-1::work-1"]).toBeDefined();
+
+      const realNow = Date.now;
+      Date.now = () => realNow() + 6 * 60 * 1000;
+      try {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 2,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: { turn_id: "turn-2", work_item_id: "work-2", state: "routing", event_sequence: 0, origin_epoch: 1 },
+        });
+      } finally {
+        Date.now = realNow;
+      }
+
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+      expect(state.workStatus["1::turn-2::work-2"]).toBeDefined();
+    });
+
+    // Regression: the same restore-instant clock also makes a restored
+    // non-terminal record an eviction candidate on overflow, matching the
+    // server's _evict_work_status_overflow (which evicts terminal and
+    // non-authoritative-restored records alike). Previously only terminal
+    // records were evictable, so a snapshot full of restored non-terminal
+    // records blew straight past WORK_STATUS_MAX_KEYS with nothing eligible
+    // to evict.
+    test("a restored non-terminal work_status record is an eviction candidate on overflow", () => {
+      let state = createInitialState();
+      const workStatusItems = Array.from({ length: 300 }, (_, index) => ({
+        turn_id: `turn-${index}`,
+        work_item_id: `work-${index}`,
+        worker_id: null,
+        state: "searching",
+        event_sequence: 0,
+        terminal_reason: null,
+        origin_epoch: 1,
+      }));
+      state = applyServerMessage(state, {
+        ...snapshot(1),
+        data: { ...snapshot(1).data, work_status: workStatusItems },
+      });
+
+      const keys = Object.keys(state.workStatus);
+      expect(keys.length).toBeLessThanOrEqual(256);
+      expect(state.workStatus["1::turn-299::work-299"]).toBeDefined();
+      expect(state.workStatus["1::turn-0::work-0"]).toBeUndefined();
+    });
   });
 } else {
   test.skip("Phase 3 work_status reducer not implemented yet (state.js has no workStatus field)", () => {});

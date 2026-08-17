@@ -35,6 +35,7 @@ from scripts._evidence_common import (
     require_nonempty_str,
     sha256_file,
     validate_against_fixture,
+    write_bytes_no_follow,
 )
 from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
 
@@ -216,16 +217,24 @@ def main(argv: list[str] | None = None) -> int:
                 data_records = [
                     {**record, "fixture_sha256": fixture_digest} for record in data_records
                 ]
+
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        if status_record is not None:
+            lines.append(json.dumps(status_record, sort_keys=True) + "\n")
+        for record in data_records:
+            lines.append(json.dumps(record, sort_keys=True) + "\n")
+        # write_bytes_no_follow (scripts/_evidence_common.py): this
+        # predictable, repo-relative output path gets the same symlink/FIFO
+        # hardening as the promotion-manifest writer, instead of a plain
+        # open("w") that would follow a planted symlink. Kept inside this
+        # try block, not after it, so a symlinked --output fails closed with
+        # the same FAIL/exit-1 contract as every other gate error here,
+        # instead of an uncaught traceback.
+        write_bytes_no_follow(args.output, "".join(lines).encode("utf-8"))
     except (EvidenceGateError, OSError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        if status_record is not None:
-            handle.write(json.dumps(status_record, sort_keys=True) + "\n")
-        for record in data_records:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
 
     if status_record is not None:
         print(

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,26 @@ STATUSES = frozenset(
 )
 
 
+def _require_utc_timestamp(value: str, field: str) -> None:
+    """Require ``value`` to parse as an ISO-8601 timestamp.
+
+    The schema (``shared/schemas/v013-transport-browser-contract.json``)
+    declares ``checked_at_utc`` as ``format: date-time``, but this validator
+    hand-checks the artifact instead of running a JSON Schema library (see
+    module docstring), and the hand-check previously only asked whether the
+    field was *present* -- not whether its value meant anything. A string
+    with no relation to a timestamp (``"not-a-timestamp"``) satisfied that
+    presence check and reached a promotion-eligible manifest.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise EvidenceGateError(f"{field} must be an ISO-8601 timestamp, got {value!r}") from exc
+
+
 def _lockfile_dependency_anchor() -> tuple[str, str]:
     """Read the pinned package version/integrity from web/bun.lock.
 
@@ -190,6 +211,30 @@ def validate_artifact(record: dict[str, Any]) -> None:
         missing = AUDIBILITY_VERIFIED_REQUIRED - set(audibility)
         if missing:
             raise EvidenceGateError(f"audibility_verified requires field(s) {sorted(missing)}")
+        # Presence alone is not a claim: an empty string, the wrong type, or
+        # (for `checked_at_utc`) a value with no relation to a timestamp all
+        # satisfied the `missing` check above while carrying no real evidence.
+        # Match the schema's per-field type/format so a malformed claim can't
+        # flow into a promotion-eligible manifest.
+        for field in (
+            "browser_name",
+            "browser_version",
+            "os_device_name",
+            "output_route",
+            "check_method",
+            "runner_identity",
+            "checked_source_commit",
+            "checked_source_tree_hash",
+            "route_artifact_sha256",
+            "package_version",
+            "package_integrity",
+        ):
+            require_nonempty_str(audibility[field], f"audibility.{field}")
+        require_type(audibility["prior_user_gesture"], (bool,), "audibility.prior_user_gesture")
+        checked_at_utc = require_nonempty_str(
+            audibility["checked_at_utc"], "audibility.checked_at_utc"
+        )
+        _require_utc_timestamp(checked_at_utc, "audibility.checked_at_utc")
         if audibility["play_result"] != "resolved":
             raise EvidenceGateError("audibility_verified requires play_result == 'resolved'")
         if audibility["checked_source_commit"] != record["source_commit"]:
@@ -243,9 +288,19 @@ def validate_artifact(record: dict[str, Any]) -> None:
     # is deliberately free-form (a lockfile reference or an upstream source
     # URL are both legitimate), so this binds the two identifying substrings
     # rather than one fixed format.
+    #
+    # Matching only the bare leaf name (`"small-webrtc-transport"`) let an
+    # anchor for a completely unrelated repository that merely happens to
+    # share that leaf segment -- e.g. `https://evil.example/
+    # small-webrtc-transport/tree/v1.10.6` -- pass as if it named the real
+    # `@pipecat-ai/small-webrtc-transport` package. Require the scoped
+    # org/leaf pair together, which both the npm-scoped spelling
+    # (`@pipecat-ai/small-webrtc-transport`) and the GitHub org/repo URL
+    # spelling (`.../pipecat-ai/small-webrtc-transport/...`) satisfy, but an
+    # anchor naming only the leaf does not.
     anchor = record["source_anchor"]
-    package_leaf = PACKAGE_NAME.rsplit("/", 1)[-1]
-    if package_leaf not in anchor or locked_version not in anchor:
+    package_org_leaf = PACKAGE_NAME.lstrip("@")
+    if package_org_leaf not in anchor or locked_version not in anchor:
         raise EvidenceGateError(
             f"source_anchor {anchor!r} does not name the pinned package "
             f"{PACKAGE_NAME!r} at the locked version {locked_version!r}"

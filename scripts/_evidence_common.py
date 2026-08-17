@@ -9,11 +9,14 @@ primitives live, so the three scripts cannot silently drift from each other.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
 from collections.abc import Callable, Mapping
 from enum import Enum
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 
@@ -285,3 +288,67 @@ def validate_against_fixture(record: dict[str, Any], *, index: FixtureIndex, whe
             f"{where}: quality_score {record['quality_score']!r} is not the fixture-derived "
             f"score {expected_score!r} for its matched IDs"
         )
+
+
+# Mirrors the manifest writer's own predictable-path threat model (see
+# ``validate_v013_evidence.py``'s ``_MAX_MANIFEST_BYTES``): every evidence
+# artifact these scripts write lives at a repo-relative, predictable path, so
+# an attacker who can plant a symlink or FIFO there is a threat this module
+# must close for every writer, not just the promotion-manifest one.
+_MAX_EVIDENCE_OUTPUT_BYTES = 8 * 1024 * 1024
+
+
+def require_regular_fd(fd: int, path: Path, verb: str) -> None:
+    """Reject anything that is not a regular file, from the *open fd*.
+
+    ``O_NOFOLLOW`` covers symlinks and nothing else. An attacker who can plant
+    a symlink at this predictable, repo-relative path can equally ``mkfifo``
+    it, and opening a FIFO blocks forever (which ``O_NONBLOCK`` at the open
+    turns into a non-blocking open, not into a safe read) -- or plant a device
+    node. ``fstat`` on the fd we actually hold, rather than a ``stat`` before
+    the open, is what closes the TOCTOU window between the check and the use.
+    """
+    st = os.fstat(fd)
+    if not S_ISREG(st.st_mode):
+        raise EvidenceGateError(f"{path}: refusing to {verb} -- not a regular file")
+
+
+def write_bytes_no_follow(path: Path, payload: bytes) -> None:
+    """Write `payload` to `path`, refusing to write *through* a symlink.
+
+    ``O_NOFOLLOW`` makes an attacker-planted symlink at this predictable path
+    fail with ``ELOOP`` instead of silently redirecting evidence bytes to the
+    link's target. The path may legitimately already exist as a regular file
+    (a prior run's output), so ``O_EXCL`` is not usable here -- ``O_NOFOLLOW``
+    is the check that matters.
+
+    ``O_NONBLOCK`` plus the ``require_regular_fd`` check closes the sibling
+    gap ``O_NOFOLLOW`` does not cover: a FIFO planted at this path would
+    otherwise make the open (and then the write) block indefinitely. The flag
+    is cleared implicitly by closing the fd; nothing here needs it beyond the
+    open.
+
+    Every evidence-gate script that writes to a predictable, repo-relative
+    path routes through this one function -- see
+    ``validate_v013_evidence.py``'s promotion-manifest writer, which this was
+    lifted from, for the same hardening applied to that path.
+    """
+    try:
+        fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644
+        )
+    except OSError as exc:
+        # ELOOP/EMLINK deliberately propagates as the raw OSError it always
+        # has here -- callers already pin that -- and only the newly-covered
+        # non-regular-file cases become an EvidenceGateError.
+        if exc.errno == errno.ENXIO:
+            # Write-opening a reader-less FIFO with O_NONBLOCK fails here
+            # rather than blocking; same verdict as the fstat check below.
+            raise EvidenceGateError(f"{path}: refusing to write -- not a regular file") from exc
+        raise
+    try:
+        require_regular_fd(fd, path, "write")
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)

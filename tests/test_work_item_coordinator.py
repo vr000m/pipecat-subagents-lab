@@ -3,6 +3,7 @@
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pytest
 
@@ -1196,3 +1197,65 @@ def test_coordinator_view_prefers_a_conforming_coordinators_own_members() -> Non
     assert view.registry is coordinator.registry
     assert view.OWNED_CONFIG_FIELDS == coordinator.OWNED_CONFIG_FIELDS
     assert view.cancel() == coordinator.cancel()
+
+
+def test_wait_timeout_ms_override_applies_independently_of_max_work_items() -> None:
+    """``wait_timeout_ms`` must take effect on its own, and must never
+    clobber a caller-supplied ``Config.multi_intent_wait_timeout_ms`` just
+    because a *different* constructor override (``max_work_items_per_turn``)
+    was also passed."""
+    only_wait_timeout = WorkItemCoordinator(wait_timeout_ms=5)
+    assert only_wait_timeout.config.multi_intent_wait_timeout_ms == 5
+
+    preserves_caller_config = WorkItemCoordinator(
+        config=Config(multi_intent_wait_timeout_ms=7_000),
+        max_work_items_per_turn=3,
+    )
+    assert preserves_caller_config.config.multi_intent_wait_timeout_ms == 7_000
+
+
+def test_retain_late_task_delivers_result_to_polling_queue_when_callback_scheduling_is_rejected() -> (
+    None
+):
+    """When an async ``on_complete`` callback is scheduled via ``start_task``
+    and the coordinator refuses it (background capacity exhausted or shut
+    down), ``start_task`` closes the coroutine and returns ``None``. The
+    completed ``LateResult`` must still reach a caller -- via the same
+    polling queue used when no ``on_complete`` is registered -- rather than
+    vanish silently, which would break the at-least-once late-delivery
+    guarantee."""
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator()
+
+        async def worker() -> dict:
+            return {"text": "hi", "citations": []}
+
+        async def on_complete(_late: object) -> None:
+            return None
+
+        def rejecting_start_task(operation: Any) -> asyncio.Task[Any] | None:
+            # Mirrors the real start_task's rejection contract exactly: close
+            # the coroutine it refuses to run, then return None.
+            operation.close()
+            return None
+
+        coordinator.start_task = rejecting_start_task  # type: ignore[method-assign]
+
+        task = asyncio.create_task(worker())
+        assert coordinator.retain_late_task(
+            task,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=on_complete,
+        )
+        await task
+        await asyncio.sleep(0)
+
+        results = coordinator.drain_late_results()
+        assert [late.work_item_id for late in results] == ["work-1"]
+
+        coordinator.start_task = WorkItemCoordinator.start_task.__get__(coordinator)
+        await coordinator.shutdown()
+
+    asyncio.run(run())

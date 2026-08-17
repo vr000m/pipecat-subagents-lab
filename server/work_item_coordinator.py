@@ -373,12 +373,21 @@ class WorkItemCoordinator:
             clock,
         )
         max_work_items = max_work_items if max_work_items is not None else max_work_items_per_turn
+        # Each override is applied independently, keyed only by "was this
+        # constructor param passed at all" (``is not None``). Nesting
+        # ``wait_timeout_ms`` inside the ``max_work_items`` branch previously
+        # meant it was silently dropped unless a work-item-count override was
+        # *also* passed, and ``wait_timeout_ms or 10_000`` treated an explicit
+        # ``wait_timeout_ms=0`` the same as "unset" and clobbered a
+        # caller-supplied ``Config.multi_intent_wait_timeout_ms`` even when
+        # only a work-item-count override was requested.
+        overrides: dict[str, Any] = {}
         if max_work_items is not None:
-            self.config = replace(
-                self.config,
-                max_work_items_per_turn=max_work_items,
-                multi_intent_wait_timeout_ms=wait_timeout_ms or 10_000,
-            )
+            overrides["max_work_items_per_turn"] = max_work_items
+        if wait_timeout_ms is not None:
+            overrides["multi_intent_wait_timeout_ms"] = wait_timeout_ms
+        if overrides:
+            self.config = replace(self.config, **overrides)
         self.speech_scheduler = speech_scheduler
         self._pending: dict[str, PendingDialogue] = {}
         self._pending_lock = threading.RLock()
@@ -584,6 +593,20 @@ class WorkItemCoordinator:
                 callback_task = self.start_task(callback_result)
                 if callback_task is not None:
                     self._track_callback_task(callback_task)
+                else:
+                    # start_task refused the coroutine for capacity or
+                    # shutdown and already closed it, so on_complete will
+                    # never run. Without this fallback ``late`` reaches
+                    # neither the caller's async callback nor the polling
+                    # queue, silently breaking the at-least-once late-delivery
+                    # guarantee. Deliver it through the same queue used when
+                    # no on_complete is registered at all.
+                    logger.warning(
+                        f"on_complete callback for {work_item_id} could not be "
+                        "scheduled (background capacity exhausted or coordinator "
+                        "shut down); falling back to late-result polling queue"
+                    )
+                    self._late_results.append(late)
 
         task.add_done_callback(completed)
         return True

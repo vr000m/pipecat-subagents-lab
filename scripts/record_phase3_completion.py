@@ -15,7 +15,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts._evidence_common import EvidenceGateError, require_nonempty_str
+from scripts._evidence_common import EvidenceGateError, require_nonempty_str, write_bytes_no_follow
 
 
 def build_record(
@@ -40,20 +40,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
+    import json
+
     try:
         record = build_record(
             source_commit=args.source_commit,
             source_tree_hash=args.source_tree_hash,
             command_digest=args.command_digest,
         )
-    except EvidenceGateError as exc:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        # write_bytes_no_follow (scripts/_evidence_common.py): this predictable,
+        # repo-relative output path gets the same symlink/FIFO hardening as the
+        # promotion-manifest writer, instead of a plain write_text that would
+        # follow a planted symlink. Kept inside this try block, not after it,
+        # so a symlinked --output fails closed with the same FAIL/exit-1
+        # contract as every other gate error here, instead of an uncaught
+        # traceback.
+        write_bytes_no_follow(
+            args.output, (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
+    except (EvidenceGateError, OSError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 
-    import json
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"OK: wrote {args.output}")
     return 0
 

@@ -828,6 +828,74 @@ def test_restored_non_terminal_parent_is_pruned_by_ttl(
     assert_ledger_lockstep(restored)
 
 
+def test_pruned_restored_key_still_refuses_to_terminalize_from_a_partial_child_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (Round 10, #3/#19): round 9 moved the non-authoritative marker
+    off the record and onto the key precisely so it would outlive record pops --
+    then had ``_forget_work_status`` pop it anyway.
+
+    A restored record that survives a TTL prune therefore lost the only evidence
+    that its child set was known-incomplete. The next child report cold-started
+    the key with no live record and no terminal tombstone (the restored record
+    was non-terminal), so ``_reaggregate_parent``'s guard did not fire and a
+    single child's ``result_ready`` terminalized the whole parent -- announcing
+    a result for a turn whose siblings may still be searching, which is the
+    exact failure the guard exists to prevent.
+    """
+    clock = [0.0]
+    monkeypatch.setattr("server.session_state.time.monotonic", lambda: clock[0])
+    state = SessionState(session_id="session-prune-then-report")
+    state.active_epoch = 7
+    state.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-0",
+        parent_work_item_id="work-mi",
+        state="searching",
+        origin_epoch=7,
+    )
+    snapshot = state.snapshot(origin_epoch=7, include_work_status=True)
+
+    restored = SessionState.from_snapshot(snapshot)
+    restored.active_epoch = 7
+    key = WorkStatusKey(7, "turn-mi", "work-mi")
+
+    # TTL-prune the restored record. The key-scoped tombstone must survive it.
+    clock[0] = WORK_STATUS_TTL_SECONDS
+    assert restored.work_status_snapshot() == ()
+    assert key not in restored._work_status_parents
+    assert key in restored._work_status_nonauthoritative_keys
+
+    # A late sibling reports terminal. The parent must NOT be resurrected at a
+    # terminal state off this one child.
+    event = restored.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-1",
+        parent_work_item_id="work-mi",
+        state="result_ready",
+        origin_epoch=7,
+    )
+    assert event is None
+    assert key not in restored._work_status_parents
+    assert restored.work_status_snapshot() == ()
+    assert_ledger_lockstep(restored)
+
+    # A non-terminal report still flows through, and gets a *fresh* TTL rather
+    # than inheriting the already-expired restore instant.
+    event = restored.set_child_work_status(
+        turn_id="turn-mi",
+        work_item_id="work-mi-2",
+        parent_work_item_id="work-mi",
+        state="searching",
+        origin_epoch=7,
+    )
+    assert event is not None
+    assert restored._work_status_parents[key].status.state == "searching"
+    assert restored._work_status_nonauthoritative_at[key] == WORK_STATUS_TTL_SECONDS
+    assert [status.state for status in restored.work_status_snapshot()] == ["searching"]
+    assert_ledger_lockstep(restored)
+
+
 def test_restored_non_terminal_parent_is_evictable_on_overflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -109,6 +109,36 @@ def child_work_status_after_dispatch(
     return work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
 
 
+def late_commit_work_status(
+    work_outcome: str | None,
+    *,
+    commit_outcome: str | None,
+    terminal_kind: str | None = None,
+) -> tuple[WorkStatusState, TerminalReason | None] | None:
+    """The coarse work-status for one late-result commit attempt.
+
+    A suppressed *duplicate* emits no status at all: some other copy of this
+    exact ``result_id`` already committed and drove the work item to its
+    terminal state, so reporting the redundant copy as ``failed`` would tell a
+    capable client that successful work had failed. ``suppressed_stale`` is
+    *not* in that position -- it fires when the late result's own
+    ``origin_epoch`` differs from the one its ledger key was dispatched under,
+    which means no copy committed under this key at all. Emitting nothing
+    there strands the child at its non-terminal dispatch-time status, and the
+    parent aggregate with it, for the life of the session. Every other case
+    defers to ``work_status_for_outcome`` so the late and foreground sites
+    cannot drift.
+    """
+    if commit_outcome == "suppressed_duplicate":
+        return None
+    return work_status_for_outcome(
+        work_outcome,
+        cancelled=work_outcome == "cancelled",
+        committed=commit_outcome == "committed",
+        terminal_kind=terminal_kind,
+    )
+
+
 class WorkStatusPublisher:
     """Records and sweeps delegated-child work-status for one SessionHost.
 

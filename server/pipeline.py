@@ -79,6 +79,7 @@ from .work_item_coordinator import (
 from .work_status_publisher import (
     WorkStatusPublisher,
     child_work_status_after_dispatch,
+    late_commit_work_status,
     work_status_after_commit_failure,
     work_status_for_outcome,
 )
@@ -288,36 +289,6 @@ def _speech_role_for_child_outcome(outcome_label: str) -> SpeechRole:
     """A retained/still-pending outcome must be spoken as a timeout notice so
     it stays supersedable; every other outcome speaks as a normal result."""
     return ROLE_TIMEOUT_NOTICE if outcome_label == "retained" else ROLE_RESULT
-
-
-def _late_commit_work_status(
-    work_outcome: str | None,
-    *,
-    commit_outcome: str | None,
-    terminal_kind: str | None = None,
-) -> tuple[WorkStatusState, TerminalReason | None] | None:
-    """The coarse work-status for one late-result commit attempt.
-
-    A suppressed *duplicate* emits no status at all: some other copy of this
-    exact ``result_id`` already committed and drove the work item to its
-    terminal state, so reporting the redundant copy as ``failed`` would tell a
-    capable client that successful work had failed. ``suppressed_stale`` is
-    *not* in that position -- it fires when the late result's own
-    ``origin_epoch`` differs from the one its ledger key was dispatched under,
-    which means no copy committed under this key at all. Emitting nothing
-    there strands the child at its non-terminal dispatch-time status, and the
-    parent aggregate with it, for the life of the session. Every other case
-    defers to ``work_status_for_outcome`` so the late and foreground sites
-    cannot drift.
-    """
-    if commit_outcome == "suppressed_duplicate":
-        return None
-    return work_status_for_outcome(
-        work_outcome,
-        cancelled=work_outcome == "cancelled",
-        committed=commit_outcome == "committed",
-        terminal_kind=terminal_kind,
-    )
 
 
 def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
@@ -3006,7 +2977,7 @@ class SessionHost:
                     delivery_disposition=delivery_disposition,
                     result_id=result_id,
                 )
-            derived = _late_commit_work_status(
+            derived = late_commit_work_status(
                 work_outcome,
                 commit_outcome=commit_outcome,
                 terminal_kind=late.terminal_kind,

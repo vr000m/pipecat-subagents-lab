@@ -235,6 +235,59 @@ def test_validator_rejects_a_source_anchor_naming_a_different_version(tmp_path: 
         module.validate_artifact(json.loads(path.read_text()))
 
 
+def test_validator_rejects_an_empty_browser_name_in_a_verified_claim(tmp_path: Path) -> None:
+    """Regression: ``audibility_verified`` required-field checking only
+    checked *presence* (``AUDIBILITY_VERIFIED_REQUIRED - set(audibility)``),
+    so an empty ``browser_name`` -- present but content-free -- satisfied the
+    check and reached a promotion-eligible manifest."""
+    module = _load_validator()
+    audibility = _valid_audibility(browser_name="")
+    path = _write(tmp_path, _valid_artifact(audibility=audibility))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_non_bool_prior_user_gesture_in_a_verified_claim(
+    tmp_path: Path,
+) -> None:
+    """Regression: ``prior_user_gesture`` is documented/schema'd as a
+    boolean, but only its presence was checked, so the string ``"true"``
+    (truthy, but not the boolean the schema requires) passed."""
+    module = _load_validator()
+    audibility = _valid_audibility(prior_user_gesture="true")
+    path = _write(tmp_path, _valid_artifact(audibility=audibility))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_an_unparseable_checked_at_utc_in_a_verified_claim(
+    tmp_path: Path,
+) -> None:
+    """Regression: ``checked_at_utc`` is schema'd as ``format: date-time``,
+    but the Python validator never parsed it, so any non-empty string --
+    including a value with no relation to a timestamp -- passed."""
+    module = _load_validator()
+    audibility = _valid_audibility(checked_at_utc="not-a-timestamp")
+    path = _write(tmp_path, _valid_artifact(audibility=audibility))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_source_anchor_matching_only_the_bare_leaf_name(
+    tmp_path: Path,
+) -> None:
+    """Regression: the source-anchor check matched an unscoped substring of
+    the package leaf name (``"small-webrtc-transport" in anchor``), so a
+    lookalike URL for a completely different, unrelated repository that
+    merely contains the leaf name and the locked version passed as if it
+    named the real ``@pipecat-ai/small-webrtc-transport`` source."""
+    module = _load_validator()
+    forged_anchor = f"https://evil.example/small-webrtc-transport/tree/v{PINNED_PACKAGE_VERSION}"
+    path = _write(tmp_path, _valid_artifact(source_anchor=forged_anchor))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
 def test_validator_rejects_a_verified_claim_missing_the_checked_source_tree_hash(
     tmp_path: Path,
 ) -> None:

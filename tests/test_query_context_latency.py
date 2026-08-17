@@ -1793,3 +1793,90 @@ def test_analyzer_blocks_a_synthetic_stratum_that_looks_fully_controlled(
     assert result["status"] == common.EvidenceStatus.BLOCKED.value
     assert result["reason"] == "synthetic_dry_run_input"
     assert result["promotion_eligible"] is False
+
+
+# --- Security: symlink-hardened evidence writers (round 9 gap) -------------
+
+
+def test_evidence_common_write_bytes_no_follow_refuses_a_planted_symlink(
+    tmp_path: Path,
+) -> None:
+    """``write_bytes_no_follow`` (scripts/_evidence_common.py) is the shared
+    primitive every evidence-gate writer must route through so a symlink
+    planted at a predictable, repo-relative output path cannot redirect the
+    write to the link's target. Exercised directly against the shared
+    helper, independent of any one script."""
+    common = _evidence_common()
+    target = tmp_path / "attacker-target.txt"
+    target.write_text("do not touch")
+    link = tmp_path / "evidence-output.json"
+    link.symlink_to(target)
+
+    # ELOOP/EMLINK from the O_NOFOLLOW open deliberately propagates as the
+    # raw OSError, not a wrapped EvidenceGateError -- matching the promotion
+    # manifest writer's own documented contract (every caller here already
+    # pins that raw OSError).
+    with pytest.raises(OSError):
+        common.write_bytes_no_follow(link, b'{"malicious": true}')
+
+    assert target.read_text() == "do not touch", (
+        "a symlinked output path must never receive the write -- the target "
+        "file's contents must be untouched"
+    )
+
+
+def test_runner_dry_run_refuses_to_write_through_a_symlinked_output(
+    tmp_path: Path,
+) -> None:
+    """``run_query_context_experiment.py --dry-run`` writes its artifact to a
+    predictable, repo-relative ``--output`` path. A symlink planted there
+    must not be followed -- this reproduces the same threat the promotion
+    manifest writer's ``O_NOFOLLOW`` hardening was built for, applied here to
+    one of the four writers that round 9 left unhardened (finding 24)."""
+    module = _runner()
+    target = tmp_path / "attacker-target.json"
+    target.write_text("do not touch")
+    link = tmp_path / "dry-run-output.json"
+    link.symlink_to(target)
+
+    exit_code = module.main(
+        [
+            "--dry-run",
+            "--fixture",
+            str(_fixture_path()),
+            "--output",
+            str(link),
+        ]
+    )
+
+    assert exit_code == 1, "a symlinked --output must be refused, not followed"
+    assert target.read_text() == "do not touch"
+
+
+def test_record_phase3_completion_refuses_to_write_through_a_symlinked_output(
+    tmp_path: Path,
+) -> None:
+    """``record_phase3_completion.py`` writes its completion record to a
+    predictable, repo-relative ``--output`` path (finding 24: one of the four
+    writers round 9 left unhardened)."""
+    module = pytest.importorskip("scripts.record_phase3_completion")
+    target = tmp_path / "attacker-target.json"
+    target.write_text("do not touch")
+    link = tmp_path / "phase3-output.json"
+    link.symlink_to(target)
+
+    exit_code = module.main(
+        [
+            "--source-commit",
+            "a" * 40,
+            "--source-tree-hash",
+            "b" * 40,
+            "--command-digest",
+            "c" * 64,
+            "--output",
+            str(link),
+        ]
+    )
+
+    assert exit_code == 1, "a symlinked --output must be refused, not followed"
+    assert target.read_text() == "do not touch"

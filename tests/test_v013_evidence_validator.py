@@ -426,6 +426,28 @@ def test_write_manifest_embeds_source_and_policy_fingerprint_identity(tmp_path: 
     assert "generated_at_utc" in manifest
 
 
+def test_write_manifest_stamps_the_effective_configured_release_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the manifest writer stamped ``Config()``'s package-default
+    release version (the installed-package fallback) instead of the
+    effective configured one -- ``WEBSEARCH_RELEASE_VERSION``/
+    ``[features].release_version`` -- so a configured non-default release
+    always mismatched at server load time and fell closed to
+    ``source_mismatch``, regardless of the writer's own inputs."""
+    module = _validator()
+    phase0, phase1, phase2 = _full_valid_inputs(tmp_path)
+    monkeypatch.setenv("WEBSEARCH_RELEASE_VERSION", "9.9.9-configured-release")
+
+    exit_code = module.main(
+        _write_manifest_argv(tmp_path, phase0=phase0, phase1=phase1, phase2=phase2)
+    )
+
+    assert exit_code == 0
+    manifest = json.loads((tmp_path / "promotion-manifest.json").read_text())
+    assert manifest["release_version"] == "9.9.9-configured-release"
+
+
 def test_write_manifest_embeds_artifact_hashes_for_all_three_inputs(tmp_path: Path) -> None:
     """Plan: 'binds release/source/source-tree/schema/Phase-0/1/2/3-artifact
     hashes.'"""

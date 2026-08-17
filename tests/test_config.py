@@ -1504,3 +1504,107 @@ def test_environment_release_version_overrides_the_toml_value(tmp_path) -> None:
     )
 
     assert config.release_version == "0.1.3-from-env"
+
+
+# --- Security: TOCTOU-hardened runtime evidence reads (round 9 gap) --------
+#
+# Finding 25: `_regular_file_within_evidence_size_cap` used a pre-open
+# `Path.stat()` check, then a *separate* `read_text()`/`read_bytes()` call at
+# the actual read site -- a symlink (or FIFO/device) can be swapped in
+# between the two, so the stat-checked path and the bytes actually read are
+# not guaranteed to be the same file. `_read_regular_file_no_follow` closes
+# that window with a single open(O_NOFOLLOW|O_NONBLOCK)+fstat+read.
+
+
+def test_load_promotion_manifest_refuses_a_symlinked_manifest_path(tmp_path: Path) -> None:
+    """The manifest path itself -- the first evidence read boot takes --
+    must not be followed through a symlink planted at that predictable,
+    operator-configured location."""
+    load_promotion_manifest = _load_promotion_manifest()
+    target = tmp_path / "attacker-target.json"
+    target.write_text("do not touch", encoding="utf-8")
+    manifest_link = tmp_path / "manifest.json"
+    manifest_link.symlink_to(target)
+    config = _bound_config(manifest_link)
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_missing"
+    assert target.read_text(encoding="utf-8") == "do not touch"
+
+
+def test_read_regular_file_no_follow_refuses_a_planted_symlink(tmp_path: Path) -> None:
+    """Direct unit test of the shared primitive every runtime evidence read
+    in this module now routes through: a symlink at the checked/read path
+    must never be followed, regardless of which caller opened it."""
+    from server import config as _config_module
+
+    target = tmp_path / "attacker-target.txt"
+    target.write_text("do not touch", encoding="utf-8")
+    link = tmp_path / "evidence-input.json"
+    link.symlink_to(target)
+
+    result = _config_module._read_regular_file_no_follow(
+        link, max_bytes=_config_module._MAX_EVIDENCE_INPUT_BYTES
+    )
+
+    assert result is None
+    assert target.read_text(encoding="utf-8") == "do not touch"
+
+
+def test_load_promotion_manifest_refuses_a_fifo_phase_input_path(tmp_path: Path) -> None:
+    """A `final` manifest's `inputs[phase0].path` is attacker-steerable (the
+    artifact under validation declares it about itself), and
+    `_resolve_confined_evidence_path`'s repo-confinement `.resolve()`
+    legitimately dereferences an in-repo symlink before the read -- so a
+    FIFO, not a symlink, is what exercises this call site's regular-file
+    check without a real device file in CI. Reading a writer-less FIFO with
+    a blocking open/read would hang server boot; the `O_NONBLOCK` open plus
+    the `fstat`-based `S_ISREG` check must reject it before any read is
+    attempted."""
+    import hashlib
+    import json
+    import os
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest = _final_manifest(tmp_path=tmp_path, config=config)
+    fifo_path = tmp_path / "phase0-fifo.jsonl"
+    os.mkfifo(fifo_path)
+    manifest["inputs"]["phase0"] = {
+        "path": fifo_path.name,
+        "sha256": hashlib.sha256(b"whatever").hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "evidence_unresolvable"
+
+
+def test_load_promotion_manifest_refuses_a_symlinked_phase4c_artifact_path(
+    tmp_path: Path,
+) -> None:
+    """`phase4c_artifact_path` is operator config (env/TOML), not
+    manifest-declared, but is still read on the server-boot path; a symlink
+    planted there must not be followed either."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    target = tmp_path / "attacker-target.json"
+    target.write_text("do not touch", encoding="utf-8")
+    phase4c_link = tmp_path / "phase4c-link.json"
+    phase4c_link.symlink_to(target)
+    config = _bound_config(manifest_path, phase4c_artifact_path=str(phase4c_link))
+    manifest = _final_manifest(tmp_path=tmp_path, config=config, phase4c_artifact_sha256="f" * 64)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "phase4c_unresolvable"
+    assert target.read_text(encoding="utf-8") == "do not touch"

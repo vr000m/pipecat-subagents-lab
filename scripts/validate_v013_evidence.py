@@ -41,7 +41,7 @@ from scripts._evidence_common import (
 from scripts.validate_phase2_transport_browser_contract import (
     validate_artifact as validate_transport_browser_artifact,
 )
-from server.config import Config
+from server.config import load_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
@@ -641,7 +641,14 @@ def write_manifest(
         "schema_hash": schema_hash,
         "source_commit": source_commit,
         "source_tree_hash": source_tree_hash,
-        "release_version": Config().release_version,
+        # `Config()` alone only ever yields the package-installed default --
+        # it never reads `WEBSEARCH_RELEASE_VERSION`/`[features].release_version`,
+        # so a configured non-default release was silently overwritten with
+        # the default here and then failed closed as a source mismatch when
+        # `load_promotion_manifest` compared it against the running server's
+        # own `load_config()`-resolved release version. Resolve the same
+        # effective config the server itself loads at boot.
+        "release_version": load_config().release_version,
         "feature_policy_fingerprint": feature_policy_fingerprint,
         "deployed_at_utc": deployed_at_utc,
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),

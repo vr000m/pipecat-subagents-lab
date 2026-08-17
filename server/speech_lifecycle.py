@@ -176,11 +176,25 @@ class MonotonicClock:
 
 
 class EventLoopTimerScheduler:
-    """Production timer scheduler backed by the running asyncio event loop."""
+    """Production timer scheduler backed by the running asyncio event loop.
+
+    ``when`` is an instant on the coordinator's ``Clock``, never necessarily on
+    ``time.monotonic``: every deadline the coordinator computes is
+    ``self._clock.now() + timeout``. Reading the wall delay off
+    ``time.monotonic`` therefore only happens to work while the injected clock
+    *is* ``MonotonicClock``. Injecting a fake clock (which starts near zero)
+    while leaving this scheduler in place made ``when - time.monotonic()``
+    hugely negative, clamped to a zero delay, and every timer fired on the next
+    loop tick. The scheduler takes the same clock the deadlines came from so
+    the two are always the same time base.
+    """
+
+    def __init__(self, clock: Clock | None = None) -> None:
+        self._clock: Clock = clock or MonotonicClock()
 
     def call_at(self, when: float, callback: Callable[[], Any]) -> TimerHandle:
         loop = asyncio.get_event_loop()
-        delay = max(0.0, when - time.monotonic())
+        delay = max(0.0, when - self._clock.now())
         return loop.call_later(delay, callback)
 
 
@@ -255,7 +269,11 @@ class SpeechLifecycleCoordinator:
         transport_acceptance: Callable[[], bool] | None = None,
     ) -> None:
         self._clock = clock or MonotonicClock()
-        self._timers = timers or EventLoopTimerScheduler()
+        # The default scheduler is handed *this* clock: deadlines are computed
+        # as ``self._clock.now() + timeout``, so the scheduler must read its
+        # wall delay off the same time base or an injected clock desynchronises
+        # every timer.
+        self._timers = timers or EventLoopTimerScheduler(self._clock)
         self._start_timeout = speech_start_timeout_seconds
         self._grace = speech_transport_grace_seconds
         self._on_terminal = on_terminal
@@ -365,8 +383,16 @@ class SpeechLifecycleCoordinator:
         return PreAdmissionAdmit(generation)
 
     def mark_handed_to_tts(self, token: str) -> None:
+        # Tombstoned is rejected here for the same reason its sibling
+        # transitions (`bind_context`, `mark_synthesis_*`) reject it: a
+        # tombstoned generation is already on its way out, and advancing its
+        # phase arms the ten-second start timeout on it. That timeout then
+        # holds the global transport slot for its full duration instead of the
+        # one-second transport grace the teardown path would have used --
+        # roughly a tenfold extension of slot occupancy on the race where a
+        # cancel tombstones the generation between admission and the hand-off.
         generation = self._live(token)
-        if generation is None:
+        if generation is None or generation.tombstoned:
             return
         generation.phase = GenerationPhase.HANDED_TO_TTS
         self._arm(token, self._clock.now() + self._start_timeout, self._on_start_timeout)
