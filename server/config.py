@@ -20,10 +20,35 @@ from urllib.parse import urlparse
 
 _FALLBACK_RELEASE_VERSION = "0.1.3"
 
-# Mirrors openai.types.shared.reasoning_effort.ReasoningEffort's Literal args
-# (the SDK's own alias is Optional[Literal[...]], which is not itself usable
-# as a plain membership set).
-_VALID_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+
+def _reasoning_effort_literal_values() -> frozenset[str]:
+    """Derive the valid ``reasoning.effort`` values from the installed OpenAI
+    SDK's own ``ReasoningEffort`` alias, rather than hand-copying its Literal
+    args -- a hand-copy silently desyncs on the next SDK bump (round 7
+    gauntlet finding 13). ``ReasoningEffort`` is
+    ``Optional[Literal["none", "minimal", ...]]``, i.e.
+    ``Literal[...] | None`` -- not itself usable as a plain membership set --
+    so this unwraps one level of ``get_args`` to reach the ``Literal``, then a
+    second to reach its string args. Falls back to a pinned literal copy if
+    the SDK ever restructures this alias in a way that breaks the two-level
+    unwrap (e.g. drops the ``| None``), so a future SDK refactor degrades to
+    stale-but-correct-at-time-of-writing rather than crashing config load.
+    """
+    try:
+        from typing import get_args
+
+        from openai.types.shared.reasoning_effort import ReasoningEffort
+
+        literal_args = get_args(ReasoningEffort)
+        values = frozenset(get_args(literal_args[0]))
+        if not values or not all(isinstance(v, str) for v in values):
+            raise TypeError("unexpected ReasoningEffort shape")
+        return values
+    except Exception:
+        return frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+
+
+_VALID_REASONING_EFFORTS = _reasoning_effort_literal_values()
 
 
 def _installed_release_version() -> str:
@@ -911,14 +936,15 @@ def load_config(
         kwargs["router_model_policy"] = {"fast": str(raw)}
     if raw := values.get("WEBSEARCH_WORKER_MODEL"):
         kwargs["worker_model_policy"] = {"deep": str(raw)}
-    if "WEBSEARCH_ROUTER_REASONING_EFFORT" in values:
-        kwargs["router_reasoning_effort_policy"] = {
-            "fast": str(values["WEBSEARCH_ROUTER_REASONING_EFFORT"])
-        }
-    if "WEBSEARCH_WORKER_REASONING_EFFORT" in values:
-        kwargs["worker_reasoning_effort_policy"] = {
-            "deep": str(values["WEBSEARCH_WORKER_REASONING_EFFORT"])
-        }
+    # Truthiness walrus, matching the sibling WEBSEARCH_ROUTER_MODEL/
+    # WEBSEARCH_WORKER_MODEL pattern just above -- not a presence check
+    # (`"X" in values`), which treated an explicitly-empty override as a
+    # request to hard-fail config validation instead of "absent" (round 7
+    # gauntlet finding 7).
+    if raw := values.get("WEBSEARCH_ROUTER_REASONING_EFFORT"):
+        kwargs["router_reasoning_effort_policy"] = {"fast": str(raw)}
+    if raw := values.get("WEBSEARCH_WORKER_REASONING_EFFORT"):
+        kwargs["worker_reasoning_effort_policy"] = {"deep": str(raw)}
     stt_endpoint = values.get("WEBSEARCH_STT_ENDPOINT")
     if stt_endpoint:
         kwargs["stt_endpoint"] = parse_endpoint(str(stt_endpoint))

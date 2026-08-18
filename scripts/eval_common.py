@@ -17,41 +17,64 @@ This module lives at ``scripts/eval_common.py`` (not the leading-underscore
 gauntlet) -- three separate consumers (``scripts/smoke_conversation.py``,
 ``scripts/eval_model_comparison.py``, ``scripts/verify_eval_candidates.py``)
 import it as a shared public seam, which a package-private-by-convention name
-contradicted. ``scripts/_eval_common.py`` still exists as a one-line
-backward-compatibility re-export shim for any caller (chiefly existing tests)
-still importing the old path; new code should import from here directly.
+contradicted. ``scripts/_eval_common.py`` (the round-5 backward-compat
+re-export shim) was deleted in round 7 -- it had no real external consumers
+(all three of the module's own tests were its only importers); new code
+imports from here directly.
+
+Also hosts the ``Candidate`` dataclass and the router/worker
+baseline+candidate matrix (round 7, Architecture finding 11):
+``scripts/eval_model_comparison.py`` (the Phase 2 runner) and
+``scripts/verify_eval_candidates.py`` (the Phase 0 verifier) both need this
+same candidate matrix -- the runner to build/execute the comparison matrix,
+the verifier to know what to probe -- and previously maintained it as two
+independently-shaped copies (a ``tuple[Candidate, ...]`` here vs. a
+``tuple[tuple[str, str | None], ...]`` there), reconciled only by convention.
+One definition here now backs both.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from evals.queries import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
 from server.composition import build_session_host
 from server.config import Config, PromotionManifest
 from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import SAFE_FALLBACK_TEXTS, TIMEOUT_FALLBACK_TEXTS, SessionHost
+from server.router import effective_router_reasoning_effort
 
 __all__ = [
     "DEFAULT_JUDGE_MODEL",
     "DEFAULT_MANIFEST_RELATIVE_PATH",
     "DEFAULT_QUERY",
     "MANIFEST_VERSION",
+    "REPO_ROOT",
+    "ROUTER_BASELINE",
+    "ROUTER_CANDIDATES",
     "ROUTER_MANIFEST_TOOLS",
     "ROUTING_REGRESSION_QUERIES",
     "SAFE_FALLBACKS",
     "TIMEOUT_FALLBACKS",
+    "WORKER_BASELINE",
+    "WORKER_CANDIDATES",
     "WORKER_MANIFEST_TOOLS",
+    "Candidate",
     "CollectingMeasurementSink",
     "build_judge_llm_service",
     "build_session_for_run",
     "confined_output_path",
+    "effective_effort_for_manifest_lookup",
     "error_text",
+    "git_head",
     "latest_turn_stage_metrics",
+    "sanitize_reason",
     "strip_control_chars",
     "write_no_follow",
 ]
@@ -93,11 +116,21 @@ _API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{10,}")
 # Unicode bidirectional-override code points (U+202A-U+202E, U+2066-U+2069):
 # mainstream terminals honor both, and either could visually reorder an
 # operator-facing error/report line sourced from a provider error body.
-_CONTROL_CHAR_PATTERN = re.compile(
-    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]"
-)
+#
+# \x0d (CR) added in round 7 (Codex adversarial gate finding 4): the prior
+# ranges (\x00-\x08, \x0b-\x0c, \x0e-\x1f) skip over \x09 (tab) and \x0a (LF)
+# deliberately, since both are legitimate in multi-line text -- but that same
+# gap also skipped \x0d (CR), which is not legitimate here and lets
+# provider-controlled exception text overwrite an operator's terminal line via
+# a bare CR, despite this module's docstring promising "all ASCII controls
+# except newline/tab" are stripped.
+_CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# Backward-compatible alias -- existing call sites in this module used the
+# leading-underscore name before round 7 hoisted REPO_ROOT into the public
+# surface (gauntlet finding 12).
+_REPO_ROOT = REPO_ROOT
 
 # Manifest producer/consumer contract, hoisted here (round 5, Architecture
 # lens finding 2) so scripts/verify_eval_candidates.py (the producer) and
@@ -136,6 +169,60 @@ SAFE_FALLBACKS = SAFE_FALLBACK_TEXTS
 # mode ("too slow", not "broken") a caller wants to score separately. See
 # round-4 gauntlet finding 2.
 TIMEOUT_FALLBACKS = TIMEOUT_FALLBACK_TEXTS
+
+
+# --------------------------------------------------------------------------
+# Candidate matrix (Objective's candidate matrix, verified live by Phase 0).
+#
+# Hoisted here (round 7 gauntlet, Architecture finding 11) so
+# scripts/eval_model_comparison.py (the Phase 2 runner) and
+# scripts/verify_eval_candidates.py (the Phase 0 verifier) share one
+# definition -- previously two independently-shaped, hand-synchronized
+# copies (a ``tuple[Candidate, ...]`` in the runner vs. a
+# ``tuple[tuple[str, str | None], ...]`` in the verifier), a silent
+# authoring-drift risk: adding a candidate to one without the other surfaced
+# only at live-run time as a misleading "absent from manifest" error.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Candidate:
+    label: str
+    role: Literal["router", "worker"]
+    model: str
+    effort: str | None  # None means "unset" (today's model-conditional default)
+
+
+ROUTER_BASELINE = Candidate(label="baseline", role="router", model="gpt-5-mini", effort=None)
+ROUTER_CANDIDATES: tuple[Candidate, ...] = (
+    Candidate(label="luna-high", role="router", model="gpt-5.6-luna", effort="high"),
+    Candidate(label="terra-low", role="router", model="gpt-5.6-terra", effort="low"),
+)
+
+WORKER_BASELINE = Candidate(label="baseline", role="worker", model="gpt-5", effort=None)
+WORKER_CANDIDATES: tuple[Candidate, ...] = (
+    Candidate(label="terra-medium", role="worker", model="gpt-5.6-terra", effort="medium"),
+    Candidate(label="sol-low", role="worker", model="gpt-5.6-sol", effort="low"),
+)
+
+
+def effective_effort_for_manifest_lookup(candidate: Candidate) -> str | None:
+    """The effort this candidate's request will actually carry on the wire.
+
+    Delegates to ``server.router.effective_router_reasoning_effort`` -- the
+    single hoisted source of truth for the "unset effort + a gpt-5* model
+    defaults to minimal" rule -- rather than hand-duplicating
+    ``LazyRouterProvider.__call__``'s conditional here. Phase 0's manifest
+    records the *effective* request shape for the baseline (``gpt-5-mini`` @
+    ``minimal``), not the policy-label state, so both the verifier (building
+    its probe plan) and the runner (looking a candidate up in the manifest)
+    have to resolve the same way, or the router baseline would spuriously
+    read as unprobed/absent. The worker has no such conditional -- an unset
+    worker effort genuinely omits the ``reasoning`` key.
+    """
+    if candidate.role == "router":
+        return effective_router_reasoning_effort(candidate.model, candidate.effort)
+    return candidate.effort
 
 
 def latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
@@ -188,39 +275,12 @@ def build_session_for_run(
 
     Thin wrapper around ``server.composition.build_session_host()`` -- the
     single composition root also used by ``server.app._default_session_host()``
-    (round 5, Architecture lens finding 1; see that module's docstring for
-    the full rationale). Deliberately does **not** go through
-    ``server.app._default_session_host()`` itself (which internally calls
-    ``load_config()`` from the environment) or a post-hoc
-    ``host.config = tuned`` reassignment: the router provider
-    (``LazyRouterProvider``) captures its ``Config`` reference at construction
-    and resolves the model/effort from that captured reference at call time,
-    so a post-hoc reassignment of ``host.config`` never reaches it. Every
-    caller that needs to vary the router/worker model+effort per run
-    therefore needs its own ``Router``/``LazyRouterProvider`` constructed from
-    *this* run's ``Config`` -- see the dev plan's "Architecture & Call Flow /
-    Injection seam" note. ``scripts/smoke_conversation.py``'s ``_run_child``
-    is migrated onto this same seam (rather than keeping its own now-obsolete
-    post-hoc reassignment idiom) so the two callers never drift apart.
-
-    ``promotion_manifest`` mirrors ``server.app._default_session_host()``'s own
-    ``load_promotion_manifest(config)`` -> ``SessionHost(..., promotion_manifest=...)``
-    wiring: omitting it leaves ``SessionHost._promotion_eligible`` permanently
-    ``False`` (fail-closed to the ``"display_only"`` late-delivery disposition
-    regardless of the caller's actual manifest), which is correct for a caller
-    that has no manifest to give but silently wrong for one that does -- a
-    caller exercising the promotion-eligible path (e.g. the ack-ordering
-    smoke) must pass its own resolved manifest through explicitly.
-
-    Text-only by default: ``host.stt``/``host.tts`` default to ``None`` here,
-    since every eval/smoke scenario built on this helper drives turns
-    directly through ``_handle_transcript`` with no audio in or out. A caller
-    that needs real STT/TTS (e.g. the ack-ordering smoke's recording TTS)
-    passes it through the ``stt``/``tts`` keywords -- bound here, at
-    construction, rather than via a post-hoc ``host.tts = ...`` reassignment,
-    since ``SessionHost.__init__`` derives ``self._tts_on_event`` from the
-    constructor's ``tts`` argument only; a reassignment after construction
-    leaves that derived state stale.
+    (round 5, Architecture lens finding 1) -- see that function's own
+    docstring for the load-bearing rationale (router config-capture, why a
+    post-hoc ``host.config = tuned`` reassignment can't vary it, and the
+    promotion-manifest fail-closed behavior); this wrapper adds no behavior of
+    its own beyond forwarding these eval/smoke-only parameters (round 7
+    gauntlet, Architecture finding 16).
     """
     return build_session_host(
         config,
@@ -253,23 +313,23 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
 
 
 def strip_control_chars(text: str) -> str:
-    """Strip ASCII control characters (other than newline/tab) from ``text``.
+    """Strip ASCII control characters (other than newline/tab), the C1 range,
+    and Unicode bidirectional-override code points from ``text``.
 
-    Shared by ``error_text`` below and
-    ``scripts/eval_model_comparison.py``'s ``_sanitize_for_judge`` -- both
-    sinks receive raw, externally-sourced (provider/exception) text and need
-    the same bound on control-character content, so the filter lives here
-    once rather than as two independently-maintained copies. See round-4
-    gauntlet finding 7.
+    Shared by ``error_text``/``sanitize_reason`` below and
+    ``scripts/eval_model_comparison.py``'s ``_sanitize_for_judge`` -- all
+    three sinks receive raw, externally-sourced (provider/exception/judge)
+    text and need the same bound on control-character content, so the filter
+    lives here once rather than as independently-maintained copies. See
+    round-4 gauntlet finding 7 and round-5 gauntlet (Security lens finding 8)
+    for the C1/bidi-override widening this summary line previously omitted
+    (round-7 gauntlet Architecture finding 15).
     """
     return _CONTROL_CHAR_PATTERN.sub("", text)
 
 
-def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 2000) -> str:
-    """Redact-then-truncate an exception's text before it reaches a git-tracked
-    manifest/report or stdout.
-
-    Two redaction passes, in this order: (1) an exact substring replace on
+def _redact(text: str, credential: str | None) -> str:
+    """Two redaction passes, in this order: (1) an exact substring replace on
     ``credential`` -- the actual resolved API key/token, when the caller has
     it in scope -- which is shape-independent and catches any configured
     credential form (an Azure OpenAI key, a gateway/proxy token, etc.), not
@@ -277,10 +337,24 @@ def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 
     the ``sk-...`` shape, in case ``credential`` wasn't available at the call
     site or the leaked text names a *different* credential than the one this
     call resolved (e.g. a proxy's own upstream key echoed back in an error).
+    Control characters (e.g. ANSI escape sequences a provider/judge response
+    body could carry) are stripped in the same pass. Shared by ``error_text``
+    and ``sanitize_reason`` below, which differ only in whether the input is
+    an exception object or already a plain string (round 7 gauntlet finding
+    5).
+    """
+    if credential:
+        text = text.replace(credential, "***REDACTED***")
+    text = _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
+    return strip_control_chars(text)
+
+
+def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 2000) -> str:
+    """Redact-then-truncate an exception's text before it reaches a git-tracked
+    manifest/report or stdout.
+
     Redaction runs before truncation, not after, so a credential split across
-    the truncation boundary can't leave a redactable fragment behind. Control
-    characters (e.g. ANSI escape sequences a provider error body could carry)
-    are stripped in the same pass, before truncation, for the same reason --
+    the truncation boundary can't leave a redactable fragment behind --
     every other sink already escapes/represents these safely
     (``compute_pass_fail`` via ``!r``, ``json.dumps``), but this function's
     two callers (``eval_model_comparison.py``'s summary print,
@@ -288,11 +362,21 @@ def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 
     straight to a terminal.
     """
     text = f"{type(exc).__name__}: {exc}"
-    if credential:
-        text = text.replace(credential, "***REDACTED***")
-    text = _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
-    text = strip_control_chars(text)
-    return text[:max_len]
+    return _redact(text, credential)[:max_len]
+
+
+def sanitize_reason(text: str, *, credential: str | None = None, max_len: int = 2000) -> str:
+    """Redact-then-truncate provider/judge-sourced free text before it is
+    persisted verbatim to a report or manifest.
+
+    Shares ``error_text``'s redaction pipeline (``_redact``) but takes an
+    already-plain string rather than an exception -- for a caller like
+    ``scripts/eval_model_comparison.py``'s judge-verdict scoring, whose
+    ``verdict.reason`` is provider-controlled free text with no exception
+    object wrapping it, and which was previously stored/serialized verbatim
+    with none of ``error_text``'s protections (round 7 gauntlet finding 5).
+    """
+    return _redact(text, credential)[:max_len]
 
 
 def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = None) -> Path:
@@ -338,3 +422,32 @@ def write_no_follow(path: Path, content: str) -> None:
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(content)
+
+
+def git_head(*, cwd: Path | None = None) -> str | None:
+    """The current commit hash, or ``None`` if it can't be resolved.
+
+    Hoisted here (round 7 gauntlet finding 12) so
+    ``scripts/eval_model_comparison.py``'s manifest-freshness check and
+    ``scripts/verify_eval_candidates.py``'s manifest writer share one
+    implementation instead of two near-identical ``subprocess.run(["git",
+    "rev-parse", "HEAD"], ...)`` copies that cross-referenced each other in
+    comments. Defaults to :data:`REPO_ROOT` so a caller running from a
+    different working directory can't pick up a foreign repo's HEAD. ``None``
+    -- not the string ``"unknown"`` -- signals failure, the convention every
+    consumer of this value already expects for ``source_commit``.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd or REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None

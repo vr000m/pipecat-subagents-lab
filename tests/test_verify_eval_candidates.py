@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import scripts.verify_eval_candidates as verify_module
-from scripts._eval_common import error_text
+from scripts.eval_common import error_text
 
 
 def _fake_results() -> list[verify_module.ProbeResult]:
@@ -62,7 +62,7 @@ class TestManifestWriteOSErrorHandling:
         # The underlying write path write_manifest() delegates to -- a
         # direct-call regression proving the OSError main() now catches is
         # real, independent of main()'s argv wiring.
-        from scripts._eval_common import write_no_follow
+        from scripts.eval_common import write_no_follow
 
         out_dir = tmp_path / "another-directory"
         out_dir.mkdir()

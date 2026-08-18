@@ -40,27 +40,36 @@ from scripts.eval_common import (
     DEFAULT_JUDGE_MODEL,
     DEFAULT_MANIFEST_RELATIVE_PATH,
     MANIFEST_VERSION,
+    REPO_ROOT,
+    ROUTER_BASELINE,
+    ROUTER_CANDIDATES,
     ROUTER_MANIFEST_TOOLS,
     SAFE_FALLBACKS,
     TIMEOUT_FALLBACKS,
+    WORKER_BASELINE,
+    WORKER_CANDIDATES,
     WORKER_MANIFEST_TOOLS,
+    Candidate,
     CollectingMeasurementSink,
     _latest_turn_stage_metrics,
     build_judge_llm_service,
     build_session_for_run,
     confined_output_path,
+    effective_effort_for_manifest_lookup,
     error_text,
+    git_head,
+    sanitize_reason,
     strip_control_chars,
     write_no_follow,
 )
 from server.config import Config, load_config
-from server.router import effective_router_reasoning_effort
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-# DEFAULT_JUDGE_MODEL/DEFAULT_MANIFEST_RELATIVE_PATH/MANIFEST_VERSION hoisted
-# from scripts/eval_common.py (round 5, Architecture lens finding 2): this
-# consumer and scripts/verify_eval_candidates.py's producer reference the
-# same objects, not two independently-maintained "must match" copies.
+# REPO_ROOT/DEFAULT_JUDGE_MODEL/DEFAULT_MANIFEST_RELATIVE_PATH/MANIFEST_VERSION
+# hoisted from scripts/eval_common.py (round 5, Architecture lens finding 2;
+# REPO_ROOT hoisted in round 7, Architecture finding 12): this consumer and
+# scripts/verify_eval_candidates.py's producer reference the same objects,
+# not two independently-maintained "must match" copies.
+_REPO_ROOT = REPO_ROOT
 DEFAULT_MANIFEST_PATH = _REPO_ROOT / DEFAULT_MANIFEST_RELATIVE_PATH
 DEFAULT_MAX_ROUTING_SECONDS = 15.0
 DEFAULT_MAX_LATENCY_SECONDS = 60.0
@@ -97,30 +106,25 @@ _RETRY_WORST_CASE_MULTIPLIER = 1 + _OPENAI_SDK_DEFAULT_MAX_RETRIES
 
 # --------------------------------------------------------------------------
 # Candidate matrix (Objective's candidate matrix, verified live by Phase 0).
+#
+# Candidate/ROUTER_BASELINE/ROUTER_CANDIDATES/WORKER_BASELINE/WORKER_CANDIDATES
+# and effective_effort_for_manifest_lookup() are hoisted to
+# scripts/eval_common.py (round 7, Architecture finding 11) -- this runner and
+# scripts/verify_eval_candidates.py's Phase 0 verifier both need the same
+# candidate matrix, and previously kept it as two independently-shaped
+# copies. Only the *_SELECTABLE_BY_LABEL dicts below are specific to this
+# runner's --router/--worker label lookup, so they stay local.
 # --------------------------------------------------------------------------
 
-
-@dataclass(frozen=True)
-class Candidate:
-    label: str
-    role: str  # "router" | "worker"
-    model: str
-    effort: str | None  # None means "unset" (today's model-conditional default)
-
-
-ROUTER_BASELINE = Candidate(label="baseline", role="router", model="gpt-5-mini", effort=None)
-ROUTER_CANDIDATES = (
-    Candidate(label="luna-high", role="router", model="gpt-5.6-luna", effort="high"),
-    Candidate(label="terra-low", role="router", model="gpt-5.6-terra", effort="low"),
-)
-ROUTER_CANDIDATES_BY_LABEL = {c.label: c for c in (ROUTER_BASELINE, *ROUTER_CANDIDATES)}
-
-WORKER_BASELINE = Candidate(label="baseline", role="worker", model="gpt-5", effort=None)
-WORKER_CANDIDATES = (
-    Candidate(label="terra-medium", role="worker", model="gpt-5.6-terra", effort="medium"),
-    Candidate(label="sol-low", role="worker", model="gpt-5.6-sol", effort="low"),
-)
-WORKER_CANDIDATES_BY_LABEL = {c.label: c for c in (WORKER_BASELINE, *WORKER_CANDIDATES)}
+# Includes the baseline, unlike ROUTER_CANDIDATES/WORKER_CANDIDATES -- the
+# stem-only naming difference (CANDIDATES vs CANDIDATES_BY_LABEL, same
+# "CANDIDATES" stem) was a load-bearing-but-undocumented membership
+# difference (round 7 gauntlet, Architecture finding 18); SELECTABLE names
+# what --router/--worker actually accept (any label a candidate is
+# registered under, baseline included), not just the non-baseline sweep
+# candidates.
+ROUTER_SELECTABLE_BY_LABEL = {c.label: c for c in (ROUTER_BASELINE, *ROUTER_CANDIDATES)}
+WORKER_SELECTABLE_BY_LABEL = {c.label: c for c in (WORKER_BASELINE, *WORKER_CANDIDATES)}
 
 
 @dataclass(frozen=True)
@@ -182,33 +186,35 @@ class ManifestStatus:
     accepted: frozenset[tuple[str, str, str | None]]
 
 
-def _current_source_commit() -> str | None:
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    return completed.stdout.strip() or None
+# _current_source_commit() hoisted to scripts/eval_common.py's git_head()
+# (round 7 gauntlet finding 12) -- was a near-identical copy of
+# scripts/verify_eval_candidates.py's own _git_head(), cross-referencing it in
+# comments instead of sharing code. Call sites below use git_head() directly.
 
 
 # The manifest's source_commit attests to the request shape these specific
-# files produce (router policy, worker tool wiring, config defaults) -- the
-# files scripts/verify_eval_candidates.py's probes actually exercise. A
-# commit match alone is not enough: if any of these carry uncommitted edits,
-# `git rev-parse HEAD` still matches the manifest even though the tree it
-# describes is no longer the tree in front of the runner.
+# files produce (router policy, worker tool wiring, config defaults, router
+# structured-output schema, worker/registry construction) -- the files
+# scripts/verify_eval_candidates.py's probes actually exercise, directly or
+# via what they import. A commit match alone is not enough: if any of these
+# carry uncommitted edits, `git rev-parse HEAD` still matches the manifest
+# even though the tree it describes is no longer the tree in front of the
+# runner.
+#
+# server/registry.py and server/structured_outputs.py added in round 7
+# (Codex adversarial gate finding 2): registry.py threads the resolved
+# worker model/effort through WebSearchWorker construction (the shape
+# _build_worker_kwargs()/_build_router_kwargs() in
+# scripts/verify_eval_candidates.py reproduce), and structured_outputs.py
+# builds the router/worker's `text` structured-output format -- editing
+# either after Phase 0 verified a request shape would silently invalidate
+# that verification without tripping staleness.
 _MANIFEST_ATTESTED_PATHS = (
     "server/router.py",
     "server/workers/web_search.py",
     "server/config.py",
+    "server/registry.py",
+    "server/structured_outputs.py",
 )
 
 
@@ -216,8 +222,8 @@ def _source_tree_dirty() -> bool | None:
     """True if any manifest-attested source file has uncommitted changes.
 
     Returns ``None`` (unverifiable) rather than ``False`` when the git
-    invocation itself fails -- mirrors ``_current_source_commit()``'s
-    fail-closed contract, so a broken git toolchain can't be read as "clean".
+    invocation itself fails -- mirrors ``git_head()``'s fail-closed contract,
+    so a broken git toolchain can't be read as "clean".
     """
     try:
         completed = subprocess.run(
@@ -235,6 +241,53 @@ def _source_tree_dirty() -> bool | None:
     return bool(completed.stdout.strip())
 
 
+def _request_kwargs_shape_ok(kind: str, request_kwargs: dict[str, Any]) -> bool:
+    """Confirm ``request_kwargs`` actually carries the production-equivalent
+    shape Phase 0's probe for this role established -- not just that *some*
+    dict is present (round 7 gauntlet, Codex adversarial gate finding 1).
+
+    An accepted manifest entry only proves what it can be shown to have
+    probed: a hand-edited or faulty-verifier-produced entry could carry
+    ``request_kwargs={"model": model}`` and pass the pre-existing
+    ``isinstance(..., dict)``-only check while never having exercised
+    ``store=False``, the structured-output ``text`` format, the worker's
+    ``tool_choice``, or the judge's message shape at all. Mirrors
+    ``scripts/verify_eval_candidates.py``'s ``_build_router_kwargs``/
+    ``_build_worker_kwargs``/``_judge_kwargs`` -- checking presence and
+    load-bearing values of the keys those builders always set, not every key
+    (``timeout``/``instructions``/``include`` vary in ways that don't change
+    what "this candidate is callable" means).
+    """
+    if kind == "router":
+        return (
+            request_kwargs.get("store") is False
+            and isinstance(request_kwargs.get("text"), dict)
+            and isinstance(request_kwargs.get("input"), str)
+            and bool(request_kwargs.get("input"))
+        )
+    if kind == "worker":
+        tools = request_kwargs.get("tools")
+        return (
+            request_kwargs.get("store") is False
+            and request_kwargs.get("tool_choice") == "required"
+            and isinstance(request_kwargs.get("text"), dict)
+            and isinstance(tools, list)
+            and any(isinstance(t, dict) and t.get("type") == "web_search" for t in tools)
+        )
+    if kind == "judge":
+        messages = request_kwargs.get("messages")
+        return (
+            isinstance(messages, list)
+            and len(messages) >= 1
+            and all(isinstance(m, dict) and "role" in m and "content" in m for m in messages)
+        )
+    # "model_existence" (and any future kind) carries no request-shape
+    # contract to validate -- scripts/verify_eval_candidates.py's own
+    # build_plan() never attaches request_kwargs beyond {"model": model} for
+    # it.
+    return True
+
+
 def load_manifest_status(manifest_path: Path) -> ManifestStatus:
     """Load Phase 0's manifest and index the (kind, model, effort) tuples it accepted.
 
@@ -243,7 +296,7 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
     caller's job to decide whether that is fatal (it is, for any live cell;
     it is a printed warning for ``--dry-run``).
     """
-    current_commit = _current_source_commit()
+    current_commit = git_head()
     if not manifest_path.exists():
         return ManifestStatus(
             path=manifest_path,
@@ -326,6 +379,11 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
         # entirely). Reject rather than accept-with-no-evidence.
         if not isinstance(entry.get("request_kwargs"), dict):
             continue
+        # Beyond "some dict is present": the dict's actual keys/values must
+        # match the production request shape Phase 0's probe for this role
+        # established (round 7 gauntlet, Codex adversarial gate finding 1).
+        if not _request_kwargs_shape_ok(kind, entry["request_kwargs"]):
+            continue
         # Each role's manifest entry must declare the specific request-shape
         # element Phase 0's probe for that role actually established --
         # kind/model/effort alone would authorize a shape Phase 0 never
@@ -360,31 +418,12 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
     )
 
 
-def candidate_manifest_kind(candidate: Candidate) -> str:
-    return candidate.role
-
-
-def _effective_effort_for_manifest_lookup(candidate: Candidate) -> str | None:
-    """The effort this candidate's request will actually carry on the wire.
-
-    Delegates to ``server.router.effective_router_reasoning_effort`` -- the
-    single hoisted source of truth for the "unset effort + gpt-5* model
-    defaults to minimal" rule -- rather than hand-duplicating
-    ``LazyRouterProvider.__call__``'s conditional here. Phase 0's manifest
-    recorded the *effective* request shape for the baseline (``gpt-5-mini`` @
-    ``minimal``), not the policy-label state, so the lookup has to resolve
-    the same way or the router baseline would spuriously read as "absent from
-    the manifest". The worker has no such conditional -- an unset worker
-    effort genuinely omits the ``reasoning`` key.
-    """
-    if candidate.role == "router":
-        return effective_router_reasoning_effort(candidate.model, candidate.effort)
-    return candidate.effort
-
-
 def candidate_accepted(candidate: Candidate, status: ManifestStatus) -> bool:
-    effort = _effective_effort_for_manifest_lookup(candidate)
-    return (candidate_manifest_kind(candidate), candidate.model, effort) in status.accepted
+    effort = effective_effort_for_manifest_lookup(candidate)
+    # candidate.role IS the manifest's "kind" vocabulary ("router"/"worker")
+    # -- candidate_manifest_kind() was a one-line, single-call-site
+    # indirection over that fact (round 7 gauntlet, Architecture finding 18).
+    return (candidate.role, candidate.model, effort) in status.accepted
 
 
 def judge_accepted(judge_model: str, status: ManifestStatus) -> bool:
@@ -428,7 +467,7 @@ def require_manifest_ok_for_live_run(
         # the resolved "minimal" value; printing the raw None here would show
         # an operator a combination that isn't the one actually looked up.
         described = ", ".join(
-            f"{c.role}:{c.model}@{_effective_effort_for_manifest_lookup(c)}" for c in missing
+            f"{c.role}:{c.model}@{effective_effort_for_manifest_lookup(c)}" for c in missing
         )
         raise ManifestError(
             f"the following (model, effort) combinations are absent from the manifest and "
@@ -542,8 +581,8 @@ def print_matrix_preview(
         # require_manifest_ok_for_live_run()'s matching fix for why.
         print(
             f"  {pair.label}  "
-            f"[router={pair.router.model}@{_effective_effort_for_manifest_lookup(pair.router)}, "
-            f"worker={pair.worker.model}@{_effective_effort_for_manifest_lookup(pair.worker)}]"
+            f"[router={pair.router.model}@{effective_effort_for_manifest_lookup(pair.router)}, "
+            f"worker={pair.worker.model}@{effective_effort_for_manifest_lookup(pair.worker)}]"
             f"{flag}"
         )
     print()
@@ -581,7 +620,7 @@ _JUDGE_INFRA_ERROR_REASON_PREFIXES = (
 @dataclass
 class TurnOutcome:
     query: str
-    status: str  # "ok" | "provider-error" | "timeout" | "setup-error" | "skipped"
+    status: str  # "ok" | "provider-error" | "timeout" | "setup-error" | "turn-error" | "skipped"
     judge_verdict: str | None = None  # "yes" | "no" | "continue" | "judge-error" | None
     judge_reason: str | None = None
     deterministic_action_pass: bool | None = None
@@ -819,12 +858,27 @@ async def run_cell(
                 break
             elapsed_ms = (time.perf_counter() - started) * 1000
             results = value if isinstance(value, tuple) else (value,)
-            if len(results) != 1:
+            # A multi-item tuple is a genuine, successful outcome for a
+            # multi_intent turn (server/pipeline.py's `_handle_multi_intent`
+            # returns `tuple(committed)`, one entry per work item) -- not an
+            # infra failure. `len(results) != 1` previously misclassified
+            # every multi-intent turn as "provider-error" and aborted the
+            # cell (round 7 gauntlet, Logic lens finding 6). Only a truly
+            # empty result (nothing committed at all) has no result to score.
+            if not results:
                 outcome.status = "provider-error"
-                outcome.judge_reason = f"expected one result, received {len(results)}"
+                outcome.judge_reason = "expected at least one result, received none"
                 turns.append(outcome)
                 cell_status, cell_error = "provider-error", outcome.judge_reason
                 break
+            # Judge/citations scoring below is fed from the first committed
+            # result only -- a deliberate simplification, not full multi-item
+            # scoring (this eval suite's own scenarios never route to
+            # multi_intent; see evals/scenarios.py). worker_presence_pass
+            # below still inspects every committed result's worker_id, so a
+            # routing regression that fans a should-be-direct turn out to
+            # several workers is still caught even though only one worker's
+            # reply text reaches the judge.
             result = results[0]
             # _handle_transcript() has documented return paths that return
             # None (server/pipeline.py, when a capable connection's retained
@@ -911,8 +965,20 @@ async def run_cell(
             if cell_status != "ok":
                 break
 
+            # routing_action is None on two return paths that never reach
+            # server/pipeline.py's `isinstance(outcome.decision,
+            # RoutingDecision)` branch at all: multi_intent and
+            # continue_pending both `return` earlier, so `host.state.routing`
+            # is never set for these turns and the staleness guard above
+            # correctly resolves to None -- not "no delegation happened"
+            # (round 7 gauntlet, Logic lens finding 6). A
+            # routing_action-dependent assertion must therefore stay
+            # unevaluated (None), not silently score False, whenever
+            # routing_action is None.
             if turn.expect_action is not None:
-                outcome.deterministic_action_pass = routing_action == turn.expect_action
+                outcome.deterministic_action_pass = (
+                    None if routing_action is None else routing_action == turn.expect_action
+                )
 
             # Worker presence/absence assertion (round 5, Architecture lens
             # finding 12): a routing regression can produce a superficially
@@ -923,22 +989,51 @@ async def run_cell(
             # `existing_worker` are the only actions that select/create a
             # worker (server/pipeline.py's `_dispatch`); every other action
             # (direct/unsupported/clarify) never touches the registry.
-            delegated_action = routing_action in {"new_worker", "existing_worker"}
+            #
+            # Unlike deterministic_action_pass above, this assertion does NOT
+            # need routing_action to be non-None to evaluate: `result.worker_id`
+            # is a signal valid on every _handle_transcript() return path,
+            # including multi_intent/continue_pending -- the same reason
+            # scripts/smoke_conversation.py:368's `result.worker_id == "main"`
+            # check exists. Folding it into `delegated_action` via `or` means
+            # a multi_intent/continue_pending turn that genuinely delegated
+            # (any committed result's worker_id != "main") is still correctly
+            # scored, instead of routing_action's None collapsing this
+            # assertion to a spurious False (round 7 gauntlet, Logic lens
+            # finding 6).
+            delegated_action = routing_action in {"new_worker", "existing_worker"} or any(
+                r.worker_id != "main" for r in results
+            )
             outcome.worker_presence_pass = delegated_action == turn.expect_delegated
 
             if turn.expect_delegated:
-                outcome.citations_pass = bool(result.citations)
+                outcome.citations_pass = any(r.citations for r in results)
 
-            stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
-            outcome.routing_ms = round(stage_metrics["routing_ms"], 1)
-            outcome.search_ms = round(stage_metrics["search_ms"], 1)
-            outcome.total_ms = round(stage_metrics["total_ms"], 1)
-            outcome.latency_budget_enforced = pair.is_baseline
-            exceeded = (
-                stage_metrics["routing_ms"] > max_routing_seconds * 1000
-                or stage_metrics["total_ms"] > max_latency_seconds * 1000
-            )
-            outcome.latency_budget_exceeded = exceeded
+            try:
+                stage_metrics: dict[str, float] | None = _latest_turn_stage_metrics(
+                    sink, elapsed_ms, result.turn_id
+                )
+            except RuntimeError:
+                # A multi-intent commit labels each item's result with an
+                # item-suffixed turn_id (f"{turn_id}-{index}",
+                # server/pipeline.py's `_handle_multi_intent`), which never
+                # matches the parent `app_turn_foreground` metric record
+                # (keyed by the original turn_id) -- per-item latency is
+                # genuinely unavailable for a multi-intent turn's first
+                # result. Report as such rather than let a metrics-lookup
+                # mismatch escape to the outer handler and misclassify an
+                # otherwise-successful turn as "turn-error".
+                stage_metrics = None
+            if stage_metrics is not None:
+                outcome.routing_ms = round(stage_metrics["routing_ms"], 1)
+                outcome.search_ms = round(stage_metrics["search_ms"], 1)
+                outcome.total_ms = round(stage_metrics["total_ms"], 1)
+                outcome.latency_budget_enforced = pair.is_baseline
+                exceeded = (
+                    stage_metrics["routing_ms"] > max_routing_seconds * 1000
+                    or stage_metrics["total_ms"] > max_latency_seconds * 1000
+                )
+                outcome.latency_budget_exceeded = exceeded
 
             judge.add_user_message(turn.query)
             # result.ui_text is the display projection (GroundedResult.text,
@@ -965,15 +1060,37 @@ async def run_cell(
                     # unparsable response ("could not parse judge response: ...") all
                     # come back as verdict="no", indistinguishable from a genuine
                     # semantic "no" unless the reason text is checked. Any of these
-                    # three prefixes -- or an out-of-enum verdict value -- is an
-                    # infrastructure failure, not a real assertion result.
-                    if verdict.reason.startswith(_JUDGE_INFRA_ERROR_REASON_PREFIXES) or (
-                        verdict.verdict not in {"yes", "no", "continue"}
-                    ):
+                    # three prefixes is an infrastructure failure, not a real
+                    # assertion result.
+                    #
+                    # No `verdict.verdict not in {"yes", "no", "continue"}` guard
+                    # here (round 5 added one; round 7 gauntlet, Logic lens finding
+                    # 9 removed it): pipecat's own `_parse_verdict` unconditionally
+                    # coerces any out-of-enum value to "no" before ever returning a
+                    # JudgeVerdict (verified against the installed pipecat==1.6.0
+                    # source), so that comparison can never be true -- dead code
+                    # that read as a real safety net. `JudgeVerdict.raw_response`
+                    # does exist, but distinguishing "genuinely judged no" from
+                    # "coerced from a nonsense verdict value" from it would mean
+                    # re-parsing `raw_response` with a second copy of pipecat's own
+                    # tolerant-JSON/keyword-fallback parsing logic -- a
+                    # disproportionate, fragile coupling to pipecat internals for a
+                    # gap this eval suite's own reason-prefix check already covers
+                    # for every infra failure pipecat's `_parse_verdict` actually
+                    # signals distinctly.
+                    if verdict.reason.startswith(_JUDGE_INFRA_ERROR_REASON_PREFIXES):
                         outcome.judge_verdict = "judge-error"
                     else:
                         outcome.judge_verdict = verdict.verdict
-                    outcome.judge_reason = verdict.reason
+                    # Bounded/redacted before persisting to the report, matching
+                    # every other provider/judge-sourced text this runner stores
+                    # (error_text()'s callers) -- verdict.reason is
+                    # provider-controlled free text with no exception object
+                    # wrapping it, previously stored verbatim (round 7 gauntlet,
+                    # Codex adversarial gate finding 5).
+                    outcome.judge_reason = sanitize_reason(
+                        verdict.reason, credential=config.openai_api_key
+                    )
 
             turns.append(outcome)
     except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
@@ -1233,8 +1350,8 @@ def print_report_summary(report: dict[str, Any]) -> None:
 
 def _resolve_pairs(args: argparse.Namespace) -> tuple[RunPair, ...]:
     if args.router or args.worker:
-        router = ROUTER_CANDIDATES_BY_LABEL[args.router or "baseline"]
-        worker = WORKER_CANDIDATES_BY_LABEL[args.worker or "baseline"]
+        router = ROUTER_SELECTABLE_BY_LABEL[args.router or "baseline"]
+        worker = WORKER_SELECTABLE_BY_LABEL[args.worker or "baseline"]
         return (RunPair(router, worker),)
     return full_matrix_pairs() if args.full_matrix else default_sweep_pairs()
 
@@ -1337,8 +1454,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--full-matrix", action="store_true", help="run the full router x worker cross product"
     )
-    parser.add_argument("--router", choices=sorted(ROUTER_CANDIDATES_BY_LABEL), default=None)
-    parser.add_argument("--worker", choices=sorted(WORKER_CANDIDATES_BY_LABEL), default=None)
+    parser.add_argument("--router", choices=sorted(ROUTER_SELECTABLE_BY_LABEL), default=None)
+    parser.add_argument("--worker", choices=sorted(WORKER_SELECTABLE_BY_LABEL), default=None)
     parser.add_argument("--scenario", choices=sorted(SCENARIOS_BY_NAME), default=None)
     parser.add_argument("--max-calls", type=_finite_nonnegative_int, default=None)
     parser.add_argument("--max-cost", type=_finite_nonnegative_float, default=None)

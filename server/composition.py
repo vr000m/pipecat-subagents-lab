@@ -56,6 +56,22 @@ def build_session_host(
     router's resolved model/effort per run (the eval-suite runner) must go
     through this construction path -- a post-hoc ``host.config = tuned``
     reassignment never reaches the router provider's own captured reference.
+
+    ``promotion_manifest`` is threaded straight through to
+    ``SessionHost(..., promotion_manifest=...)``: omitting it leaves
+    ``SessionHost._promotion_eligible`` permanently ``False`` (fail-closed to
+    the ``"display_only"`` late-delivery disposition regardless of the
+    caller's actual manifest), which is correct for a caller that has no
+    manifest to give but silently wrong for one that does. Production's own
+    ``server.app._default_session_host()`` resolves one via
+    ``load_promotion_manifest(config)`` before calling here; a caller
+    exercising the promotion-eligible path (e.g. the ack-ordering smoke, or a
+    future eval scenario) must resolve and pass its own manifest through the
+    same way -- this composition root does not resolve one itself, since not
+    every caller (most eval/smoke scenarios) needs the promotion-eligible path
+    at all (round 7 gauntlet, Architecture finding 16 -- rationale moved here
+    from ``scripts/eval_common.py``'s ``build_session_for_run``, this
+    function's eval-only wrapper, which previously duplicated it).
     """
     registry = WorkerRegistry(config=config, responses=worker_responses)
     configured_router = router or Router(

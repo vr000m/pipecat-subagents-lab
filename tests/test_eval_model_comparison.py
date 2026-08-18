@@ -20,7 +20,7 @@ live call sneaking into ``--dry-run`` (or into the offline unit tests
 generally) fails loudly instead of passing quietly.
 
 Reconciled (round 1) against the real implementation
-(``scripts/eval_model_comparison.py``, ``scripts/_eval_common.py``,
+(``scripts/eval_model_comparison.py``, ``scripts/eval_common.py``,
 ``evals/scenarios.py``): the real API differs from the pre-implementation
 guesses this file originally shipped with (e.g. ``default_sweep_pairs()``/
 ``full_matrix_pairs()`` instead of a guessed ``build_matrix()``,
@@ -51,10 +51,10 @@ pytest.importorskip(
     reason="Phase 2 implementation not yet landed (offline test written against the plan's contract)",
 )
 
-import scripts._eval_common as eval_common
 import scripts.eval_model_comparison as eval_runner
 from evals import scenarios as eval_scenarios
 from evals.scenarios import Scenario, Turn
+from scripts import eval_common
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / fakes
@@ -74,12 +74,22 @@ def _write_manifest(tmp_path: Path, *, source_commit: str, results: list[dict[st
 
 
 def _accepted_router_entry(model: str, effort: str | None) -> dict[str, Any]:
+    # request_kwargs mirrors the shape _request_kwargs_shape_ok() (round 7
+    # gauntlet, Codex finding 1) requires for a router entry -- store=False,
+    # a structured-output `text` format, and a non-empty `input` -- so this
+    # fixture keeps passing the manifest's own shape gate, not just its
+    # (kind, model, effort) membership check.
     return {
         "kind": "router",
         "model": model,
         "effort": effort,
         "tools": ["text"],
-        "request_kwargs": {"model": model},
+        "request_kwargs": {
+            "model": model,
+            "store": False,
+            "text": {"format": {"type": "json_schema"}},
+            "input": "probe transcript",
+        },
         "accepted": True,
         "error": None,
         "response_id": "resp-1",
@@ -87,12 +97,21 @@ def _accepted_router_entry(model: str, effort: str | None) -> dict[str, Any]:
 
 
 def _accepted_worker_entry(model: str, effort: str | None) -> dict[str, Any]:
+    # See _accepted_router_entry(): shape must also satisfy
+    # _request_kwargs_shape_ok()'s worker branch -- store=False,
+    # tool_choice="required", a `text` format, and a `web_search` tool.
     return {
         "kind": "worker",
         "model": model,
         "effort": effort,
         "tools": ["web_search"],
-        "request_kwargs": {"model": model},
+        "request_kwargs": {
+            "model": model,
+            "store": False,
+            "tool_choice": "required",
+            "text": {"format": {"type": "json_schema"}},
+            "tools": [{"type": "web_search"}],
+        },
         "accepted": True,
         "error": None,
         "response_id": "resp-2",
@@ -100,12 +119,18 @@ def _accepted_worker_entry(model: str, effort: str | None) -> dict[str, Any]:
 
 
 def _accepted_judge_entry(model: str) -> dict[str, Any]:
+    # See _accepted_router_entry(): shape must also satisfy
+    # _request_kwargs_shape_ok()'s judge branch -- a non-empty `messages`
+    # list of role/content dicts.
     return {
         "kind": "judge",
         "model": model,
         "effort": None,
         "tools": [],
-        "request_kwargs": {"model": model},
+        "request_kwargs": {
+            "model": model,
+            "messages": [{"role": "user", "content": "probe"}],
+        },
         "accepted": True,
         "error": None,
     }
@@ -172,6 +197,11 @@ class _FakeResult:
     spoken_text: str
     citations: list[Any]
     turn_id: str
+    # Defaults to "main" (the direct-answer path's worker_id) so every
+    # existing single-result fixture is unaffected; a multi-intent test
+    # overrides this to exercise delegated_action's worker_id fallback
+    # (round 7 gauntlet, Logic lens finding 6).
+    worker_id: str = "main"
 
 
 class _FakeHost:
@@ -241,20 +271,30 @@ def _run_cell(
     judge_recorder: list[Any] | None = None,
     routing_action: str | None = None,
     routing_turn_id: str = "turn-1",
+    result_factory: Any | None = None,
 ) -> Any:
     from server.config import Config
 
     result_citations = citations if citations is not None else []
 
-    def _result_factory(_query: str) -> Any:
+    def _default_result_factory(_query: str) -> Any:
         return _FakeResult(
             ui_text=ui_text, spoken_text=spoken_text, citations=result_citations, turn_id="turn-1"
         )
 
+    # result_factory lets a caller return a tuple of _FakeResult (mirroring
+    # server/pipeline.py's `_handle_multi_intent` -> `tuple(committed)` shape)
+    # instead of the default single-result stand-in, so multi-intent
+    # regressions (round 7 gauntlet, Logic lens finding 6) can be exercised
+    # without a new, parallel harness.
+    active_result_factory = (
+        result_factory if result_factory is not None else _default_result_factory
+    )
+
     def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
         del measurement_sink
         return _FakeHost(
-            _result_factory, routing_action=routing_action, routing_turn_id=routing_turn_id
+            active_result_factory, routing_action=routing_action, routing_turn_id=routing_turn_id
         )
 
     def _fake_stage_metrics(_sink: Any, _elapsed_ms: float, _turn_id: str) -> dict[str, float]:
@@ -807,7 +847,7 @@ class TestManifestGate:
     ) -> None:
         monkeypatch.setattr(
             eval_runner,
-            "_current_source_commit",
+            "git_head",
             lambda: "ffffffffffffffffffffffffffffffffffffffff",
         )
         manifest_path = _write_manifest(
@@ -831,7 +871,7 @@ class TestManifestGate:
     ) -> None:
         monkeypatch.setattr(
             eval_runner,
-            "_current_source_commit",
+            "git_head",
             lambda: "ffffffffffffffffffffffffffffffffffffffff",
         )
         manifest_path = _write_manifest(
@@ -1199,6 +1239,106 @@ class TestWorkerPresenceAssertionCatchesRoutingRegressions:
         assert any("worker presence/absence assertion failed" in reason for reason in reasons)
 
 
+class TestMultiIntentRoutingSignalGap:
+    """Regression for round-7 gauntlet, Logic lens finding 6: multi_intent and
+    continue_pending turns return via server/pipeline.py's `_handle_multi_intent`/
+    `_handle_pending` and never reach the `isinstance(outcome.decision,
+    RoutingDecision)` branch that sets `host.state.routing` -- so `routing_action`
+    reads as None for these turns even though real delegation happened. Three
+    distinct bugs stemmed from that gap: (a) a multi-item result tuple was
+    misclassified as a provider error, (b) worker_presence_pass fell back to
+    routing_action alone and always failed a delegated multi-intent turn, and
+    (c) deterministic_action_pass was scored False (not left unevaluated) when
+    routing_action was None and turn.expect_action was set.
+    """
+
+    def test_multi_item_result_tuple_is_not_misclassified_as_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _multi_intent_result_factory(_query: str) -> Any:
+            return (
+                _FakeResult(
+                    ui_text="reply one",
+                    spoken_text="reply one",
+                    citations=["citation-1"],
+                    turn_id="turn-1-0",
+                    worker_id="worker-a",
+                ),
+                _FakeResult(
+                    ui_text="reply two",
+                    spoken_text="reply two",
+                    citations=["citation-2"],
+                    turn_id="turn-1-1",
+                    worker_id="worker-b",
+                ),
+            )
+
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga and Helsinki?", expect_delegated=True),),
+            verdicts=["yes"],
+            result_factory=_multi_intent_result_factory,
+        )
+
+        assert outcome.turns[0].status == "ok"
+
+    def test_empty_result_tuple_is_still_a_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            result_factory=lambda _query: (),
+        )
+        assert outcome.turns[0].status == "provider-error"
+
+    def test_worker_presence_pass_reflects_delegation_via_worker_id_when_routing_action_is_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _multi_intent_result_factory(_query: str) -> Any:
+            return (
+                _FakeResult(
+                    ui_text="reply one",
+                    spoken_text="reply one",
+                    citations=["citation-1"],
+                    turn_id="turn-1-0",
+                    worker_id="worker-a",
+                ),
+            )
+
+        # routing_action left at its default (None) -- host.state.routing is
+        # never set on the multi_intent/continue_pending return paths.
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            verdicts=["yes"],
+            result_factory=_multi_intent_result_factory,
+        )
+
+        assert outcome.turns[0].worker_presence_pass is True
+
+    def test_deterministic_action_pass_is_none_not_false_when_routing_action_is_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            verdicts=[],
+            # routing_action left at its default (None).
+        )
+        assert outcome.turns[0].deterministic_action_pass is None
+
+
 # ---------------------------------------------------------------------------
 # Scenario definitions
 # ---------------------------------------------------------------------------
@@ -1217,7 +1357,7 @@ class TestScenarioDefinitions:
 
     def test_evals_package_does_not_import_scripts(self) -> None:
         """Regression for round-2 gauntlet finding 8: evals/scenarios.py used
-        to import its query constants from scripts/_eval_common.py, making
+        to import its query constants from scripts/eval_common.py, making
         scripts <-> evals bidirectionally coupled at the package level (since
         scripts/eval_model_comparison.py already imports evals.scenarios).
         The constants now live in evals/queries.py, so evals/ has no
@@ -1398,13 +1538,20 @@ class TestTurnFailurePropagatesToCellAndReport:
 
 class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
     """Regression for round-2 gauntlet finding 12: an exception raised mid-loop
-    AFTER at least one turn already completed and was billed (e.g.
-    ``_latest_turn_stage_metrics()`` raising because no
-    ``app_turn_foreground`` record was emitted) previously landed in the
-    outer handler that unconditionally set ``cell_status = "setup-error"`` --
-    misreporting a mid-turn failure as if nothing had run yet. Fixed by
-    checking whether ``turns`` already has entries: "turn-error" if so,
-    "setup-error" only if the exception happened before any turn completed.
+    AFTER at least one turn already completed and was billed previously
+    landed in the outer handler that unconditionally set
+    ``cell_status = "setup-error"`` -- misreporting a mid-turn failure as if
+    nothing had run yet. Fixed by checking whether ``turns`` already has
+    entries: "turn-error" if so, "setup-error" only if the exception happened
+    before any turn completed.
+
+    The failure is injected via ``_latest_turn_stage_metrics()`` raising, but
+    NOT via ``RuntimeError`` -- round 7 gauntlet, Logic lens finding 6 made a
+    ``RuntimeError`` from that call site an expected, non-fatal "per-item
+    latency genuinely unavailable" signal (a multi-intent commit's item-
+    suffixed turn_id never matches the parent metric record), so these tests
+    use ``ValueError`` instead to keep exercising a genuine uncaught
+    mid-execution failure.
     """
 
     def test_failure_after_a_completed_turn_is_turn_error_not_setup_error(
@@ -1429,7 +1576,7 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
             calls["n"] += 1
             if calls["n"] == 1:
                 return {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0}
-            raise RuntimeError("no app_turn_foreground metric was emitted for turn_id='turn-1'")
+            raise ValueError("stage metrics lookup broke in a way that must not be swallowed")
 
         monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
         monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
@@ -1495,6 +1642,11 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
         ``turn_started`` flag set immediately before the paid call, used to
         append an in-flight ``TurnOutcome(status="turn-error")`` for the turn
         that was mid-execution before the backfill runs.
+
+        Uses ``ValueError`` (not ``RuntimeError``) to inject the mid-execution
+        failure -- see class docstring: round 7 gauntlet, Logic lens finding 6
+        made a ``RuntimeError`` from ``_latest_turn_stage_metrics()`` an
+        expected, non-fatal signal.
         """
 
         def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
@@ -1511,7 +1663,7 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
         def _stage_metrics_always_fails(
             _sink: Any, _elapsed_ms: float, _turn_id: str
         ) -> dict[str, float]:
-            raise RuntimeError("no app_turn_foreground metric was emitted for turn_id='turn-1'")
+            raise ValueError("stage metrics lookup broke in a way that must not be swallowed")
 
         monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
         monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
@@ -1757,7 +1909,7 @@ class TestManifestStalenessFailsClosed:
     def test_missing_source_commit_is_treated_as_stale(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "abc123")
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "abc123")
         manifest_path = tmp_path / "manifest.json"
         manifest_path.write_text(
             json.dumps(
@@ -1776,7 +1928,7 @@ class TestManifestStalenessFailsClosed:
     def test_unresolvable_current_commit_is_treated_as_stale(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: None)
+        monkeypatch.setattr(eval_runner, "git_head", lambda: None)
         manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
 
         status = eval_runner.load_manifest_status(manifest_path)
@@ -1786,7 +1938,7 @@ class TestManifestStalenessFailsClosed:
     def test_matching_verifiable_identity_is_not_stale(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "deadbeef")
         monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: False)
         manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
 
@@ -1804,7 +1956,7 @@ class TestManifestStalenessFailsClosed:
         though the tree it describes is no longer the tree in front of the
         runner.
         """
-        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "deadbeef")
         monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: True)
         manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
 
@@ -1817,9 +1969,9 @@ class TestManifestStalenessFailsClosed:
     ) -> None:
         """Fail-closed: a broken git invocation for the dirty-tree check
         (``_source_tree_dirty()`` returning ``None``) must not be read as
-        "clean", mirroring ``_current_source_commit()`` returning ``None``.
+        "clean", mirroring ``git_head()`` returning ``None``.
         """
-        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "deadbeef")
         monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: None)
         manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
 

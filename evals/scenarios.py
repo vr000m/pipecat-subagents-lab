@@ -69,7 +69,7 @@ SINGLE_TURN_DEFAULT = Scenario(
 
 # Reuses ROUTING_REGRESSION_QUERIES verbatim from evals/queries.py (which
 # scripts/smoke_conversation.py's own routing-regression scenario also draws
-# from, via scripts/_eval_common.py's re-export) -- 3 turns, not 2 (a prior
+# from, via scripts/eval_common.py's re-export) -- 3 turns, not 2 (a prior
 # draft of this plan miscounted).
 ROUTING_REGRESSION = Scenario(
     name="routing-regression",

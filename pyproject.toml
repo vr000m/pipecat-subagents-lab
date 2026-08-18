@@ -58,8 +58,10 @@ ignore_errors = true
 
 # Legacy debt: pre-existing scripts that predate the eval-suite work and carry
 # pre-existing errors out of scope here. Do not add new entries; new scripts
-# (eval_common, eval_model_comparison, verify_eval_candidates, _eval_common,
-# etc.) must stay covered by the fail-closed default above.
+# (eval_common, eval_model_comparison, verify_eval_candidates, etc.) must stay
+# covered by the fail-closed default above. (scripts/_eval_common.py, the
+# round-5 backward-compat re-export shim, was deleted in round 7 of the
+# review gauntlet -- it had no real external consumers.)
 [[tool.mypy.overrides]]
 module = [
     "scripts.collect_query_context_latency",

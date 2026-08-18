@@ -410,7 +410,7 @@ SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "r
 # routing unavailable, worker search unavailable, no-reliable-result, plus
 # the busy/incomplete/unsupported-capability variants below -- hoisted to
 # named constants (referenced at every `text=` call site below) so
-# scripts/_eval_common.py's SAFE_FALLBACKS guard (used by the eval-suite
+# scripts/eval_common.py's SAFE_FALLBACKS guard (used by the eval-suite
 # runner and the live smoke CLI to detect a host that silently fell back
 # instead of producing a real result) can import SAFE_FALLBACK_TEXTS instead
 # of hand-duplicating the literals. A wording change here now updates that

@@ -1,4 +1,4 @@
-"""Regression tests for scripts/_eval_common.py's build_session_for_run().
+"""Regression tests for scripts/eval_common.py's build_session_for_run().
 
 Covers gauntlet round-2 finding 1 (promotion_manifest was never threaded
 through, silently disabling promotion eligibility for every host this helper
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import server.app as app_module
 import server.composition as composition_module
-from scripts._eval_common import SAFE_FALLBACKS, build_session_for_run
+from scripts.eval_common import SAFE_FALLBACKS, build_session_for_run
 from server.config import Config, PromotionManifest
 from server.pipeline import SAFE_FALLBACK_TEXTS
 

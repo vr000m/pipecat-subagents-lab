@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -41,22 +40,30 @@ from scripts.eval_common import (
     DEFAULT_JUDGE_MODEL,
     DEFAULT_MANIFEST_RELATIVE_PATH,
     MANIFEST_VERSION,
+    REPO_ROOT,
+    ROUTER_BASELINE,
+    ROUTER_CANDIDATES,
     ROUTER_MANIFEST_TOOLS,
+    WORKER_BASELINE,
+    WORKER_CANDIDATES,
     WORKER_MANIFEST_TOOLS,
     build_judge_llm_service,
     confined_output_path,
+    effective_effort_for_manifest_lookup,
     error_text,
+    git_head,
     write_no_follow,
 )
 
-# MANIFEST_VERSION/DEFAULT_JUDGE_MODEL hoisted from scripts/eval_common.py
-# (round 5, Architecture lens finding 2): this producer and
+# MANIFEST_VERSION/DEFAULT_JUDGE_MODEL/REPO_ROOT hoisted from
+# scripts/eval_common.py (round 5, Architecture lens finding 2; REPO_ROOT
+# hoisted in round 7, Architecture finding 12): this producer and
 # scripts/eval_model_comparison.py's consumer reference the same objects, not
 # two independently-maintained "must match" copies.
 # Tracked in git (not `.review-plan/`, which is gitignored) -- Phase 2's runner
 # and CI both need to read this manifest from a fresh checkout.
 DEFAULT_OUT = DEFAULT_MANIFEST_RELATIVE_PATH
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = REPO_ROOT
 
 # Renamed from ROUTER_CANDIDATES/WORKER_CANDIDATES (round 5, Architecture
 # lens finding 4): scripts/eval_model_comparison.py independently defines its
@@ -66,25 +73,25 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 # naming hazard on its own regardless of any sync risk between the two.
 # PHASE0_* makes clear these are this module's own probe-plan tuples.
 #
-# Router candidate matrix, per the plan's Objective. The baseline entry
-# (gpt-5-mini @ minimal) reproduces today's production behavior
-# (server/router.py: `if model.startswith("gpt-5"): reasoning={"effort":
-# "minimal"}`); the two others are the unverified user-named candidates.
-PHASE0_ROUTER_PROBES: tuple[tuple[str, str], ...] = (
-    ("gpt-5-mini", "minimal"),
-    ("gpt-5.6-luna", "high"),
-    ("gpt-5.6-terra", "low"),
+# Derived from scripts.eval_common's ROUTER_BASELINE/ROUTER_CANDIDATES/
+# WORKER_BASELINE/WORKER_CANDIDATES (round 7, Architecture finding 11) --
+# this producer and scripts/eval_model_comparison.py's Phase 2 runner both
+# need the same candidate matrix, and previously kept two independently-
+# authored copies (this module's flat (model, effort) tuples vs. the
+# runner's Candidate-based ones) reconciled only by convention. The
+# baseline entries (router: gpt-5-mini @ minimal; worker: gpt-5 @ no
+# reasoning param) still reproduce today's production behavior --
+# effective_effort_for_manifest_lookup() resolves the router's
+# "unset effort + gpt-5* model defaults to minimal" rule the same way
+# server/router.py's LazyRouterProvider.__call__ does. `None` worker effort
+# means "omit the `reasoning` kwarg entirely", not "resolve to a default".
+PHASE0_ROUTER_PROBES: tuple[tuple[str, str | None], ...] = tuple(
+    (c.model, effective_effort_for_manifest_lookup(c))
+    for c in (ROUTER_BASELINE, *ROUTER_CANDIDATES)
 )
-
-# Worker candidate matrix, per the plan's Objective. The baseline entry
-# (gpt-5 @ no reasoning param) reproduces today's production behavior
-# (server/workers/web_search.py never sets `reasoning`); the two others are
-# the unverified user-named candidates. `None` effort means "omit the
-# `reasoning` kwarg entirely", not "resolve to a default".
-PHASE0_WORKER_PROBES: tuple[tuple[str, str | None], ...] = (
-    ("gpt-5", None),
-    ("gpt-5.6-terra", "medium"),
-    ("gpt-5.6-sol", "low"),
+PHASE0_WORKER_PROBES: tuple[tuple[str, str | None], ...] = tuple(
+    (c.model, effective_effort_for_manifest_lookup(c))
+    for c in (WORKER_BASELINE, *WORKER_CANDIDATES)
 )
 
 
@@ -103,10 +110,6 @@ ROUTER_PROBE_TRANSCRIPT = "Hi."
 WORKER_PROBE_QUERY = "What is the current weather in London?"
 JUDGE_PROBE_MESSAGE = "Reply with exactly the single word: ok"
 
-# Production default for `Config.router_timeout_seconds` (server/config.py) --
-# the request-level `timeout` kwarg the router passes to `responses.create`.
-DEFAULT_ROUTER_TIMEOUT_SECONDS = 12.0
-
 
 @dataclass
 class ProbeResult:
@@ -123,13 +126,19 @@ class ProbeResult:
 
 
 def _router_timeout_seconds() -> float:
-    """Read the real production default without hardcoding a second copy."""
-    try:
-        from server.config import Config
+    """Read the real production default without hardcoding a second copy.
 
-        return float(Config().router_timeout_seconds)
-    except Exception:
-        return DEFAULT_ROUTER_TIMEOUT_SECONDS
+    ``Config()`` takes no required arguments and has no realistic failure
+    path -- the prior ``DEFAULT_ROUTER_TIMEOUT_SECONDS`` hardcoded fallback +
+    ``try/except Exception`` contradicted this function's own docstring
+    ("without hardcoding a second copy") by keeping exactly that second copy
+    on standby for a path that never runs; dropped, letting
+    ``Config().router_timeout_seconds`` be the single source of truth (round
+    7 gauntlet, Architecture finding 19b).
+    """
+    from server.config import Config
+
+    return float(Config().router_timeout_seconds)
 
 
 def _build_router_kwargs(
@@ -338,7 +347,22 @@ def probe_judge(judge_model: str, api_key: str | None) -> ProbeResult:
         # the WEBSEARCH_OPENAI_API_KEY(_ENV)-resolved credential this probe
         # already went to the trouble of resolving via load_config().
         service = build_judge_llm_service(judge_model, api_key)
-        return await service._client.chat.completions.create(**kwargs)
+        # `service._client` reaches into a private pipecat attribute -- a
+        # future pipecat rename would otherwise surface as a bare
+        # AttributeError that the generic `except Exception` below would
+        # misattribute to "judge model absent from manifest" (a rejected
+        # probe) rather than "probe plumbing broke" (this script needs a
+        # fix). Resolved separately, before the actual network call, so that
+        # distinction survives into the reported error text (round 7
+        # gauntlet, Architecture finding 19a).
+        try:
+            client = service._client
+        except AttributeError as exc:
+            raise RuntimeError(
+                "judge probe plumbing broke: OpenAILLMService no longer exposes the "
+                f"private `_client` attribute this probe relies on ({exc})"
+            ) from exc
+        return await client.chat.completions.create(**kwargs)
 
     try:
         response = asyncio.run(_call())
@@ -358,29 +382,11 @@ def probe_judge(judge_model: str, api_key: str | None) -> ProbeResult:
     )
 
 
-def _git_head() -> str | None:
-    """The current commit hash, or ``None`` if it can't be resolved.
-
-    Pinned to ``cwd=_REPO_ROOT`` (like ``_current_source_commit()`` in
-    scripts/eval_model_comparison.py) so running this script from a
-    different working directory can't pick up a foreign repo's HEAD.
-    ``None`` -- not the string ``"unknown"`` -- signals failure, matching
-    the same None-means-unresolved convention
-    scripts/eval_model_comparison.py's manifest consumer already expects for
-    ``source_commit``.
-    """
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-    except Exception:
-        return None
-    return completed.stdout.strip() or None
+# _git_head() hoisted to scripts/eval_common.py's git_head() (round 7
+# gauntlet finding 12) -- was a near-identical copy of
+# scripts/eval_model_comparison.py's own _current_source_commit(),
+# cross-referencing it in a comment instead of sharing code. Call sites below
+# use git_head() directly.
 
 
 def _resolve_openai_api_key() -> str | None:
@@ -429,12 +435,12 @@ def run_verification(*, judge_model: str) -> tuple[list[ProbeResult], float]:
 def write_manifest(out_path: Path, results: list[ProbeResult]) -> dict[str, Any]:
     manifest = {
         "manifest_version": MANIFEST_VERSION,
-        "source_commit": _git_head(),
+        "source_commit": git_head(),
         "verified_at_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "results": [asdict(result) for result in results],
     }
     # confined_output_path()/write_no_follow(): an operator-supplied --out
-    # value is still attacker-influenced surface (see scripts/_eval_common.py
+    # value is still attacker-influenced surface (see scripts/eval_common.py
     # for the rationale) -- reject `..` traversal escaping the repo tree and
     # refuse to follow an existing symlink at the target path.
     confined_path = confined_output_path(out_path, allowed_root=_REPO_ROOT)
@@ -508,6 +514,29 @@ def main() -> int:
         return 2
     print(f"\nmanifest written to {args.out} (source_commit={manifest['source_commit']})")
 
+    exit_code = 0
+    if manifest["source_commit"] is None:
+        # git_head() returning None (git unavailable, not a repo, or the
+        # rev-parse itself failed) still let write_manifest() write a real,
+        # already-billed manifest above -- that artifact must exist (the
+        # probe outcomes are real and worth keeping), but a manifest with no
+        # source_commit is unusable: scripts/eval_model_comparison.py's
+        # manifest consumer treats a null source_commit as unverifiable and
+        # therefore stale/rejected for any live run. Failing loudly here
+        # (nonzero exit), instead of returning 0 as if verification fully
+        # succeeded, is the only signal an operator gets that the manifest
+        # they just paid for needs re-verification from a working git
+        # checkout before Phase 2 can use it (round 7 gauntlet, Codex
+        # adversarial gate finding 3).
+        print(
+            "\nWARNING: source_commit could not be resolved (git unavailable or this is not "
+            "a git checkout) -- the manifest was written but is unusable until re-verified "
+            "from a working git checkout: scripts/eval_model_comparison.py treats a null "
+            "source_commit as stale/rejected for any live run.",
+            file=sys.stderr,
+        )
+        exit_code = 2
+
     if any(not result.accepted for result in results):
         print(
             "\nOne or more candidate/effort/tools combinations were rejected. "
@@ -515,8 +544,8 @@ def main() -> int:
             "combinations are accepted.",
             file=sys.stderr,
         )
-        return 1
-    return 0
+        exit_code = exit_code or 1
+    return exit_code
 
 
 if __name__ == "__main__":
