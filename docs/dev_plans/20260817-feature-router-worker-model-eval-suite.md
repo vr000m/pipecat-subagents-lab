@@ -1,6 +1,6 @@
 # Task: Reasoning-Effort Config Knob + Router/Worker Model Comparison Eval Suite
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: Pipecat subagents
 **Assigned to**: Unassigned
 **Priority**: Medium
@@ -213,7 +213,17 @@ _Phase 0's confirmed candidate model IDs, effort levels, and the manifest path w
 
 ## Final Results
 
-_To be filled in on completion._
+All 3 phases complete (`/conduct`, 2026-08-18):
+
+- **Phase 0** (`d5ea38a`): `scripts/verify_eval_candidates.py` live-verified all 12 (model, effort, tools) tuples in the candidate matrix against the live paid OpenAI API using production-equivalent request shapes — 12/12 accepted, confirming `gpt-5.6-luna`/`gpt-5.6-terra`/`gpt-5.6-sol` are real, callable model IDs that accept their named effort levels. Manifest: `docs/dev_plans/artifacts/eval-candidates-manifest.json` (tracked).
+- **Phase 1** (`f74a7d6`): Added `router_reasoning_effort_policy`/`worker_reasoning_effort_policy` to `Config`, `resolve_router_reasoning_effort`/`resolve_worker_reasoning_effort`, effort validated against the OpenAI SDK's full `ReasoningEffort` literal, `LazyRouterProvider`/`WebSearchWorker` wired through, `WEBSEARCH_ROUTER_REASONING_EFFORT`/`WEBSEARCH_WORKER_REASONING_EFFORT` env overrides. Zero behavior change confirmed; 235 tests pass.
+- **Phase 2** (`d2a3f91`): `evals/scenarios.py`, `scripts/_eval_common.py`, `scripts/eval_model_comparison.py` — the eval-suite CLI runner (manifest gate, spend-confirmation gate, per-cell driver against `SessionHost._handle_transcript()`, judge scoring, aggregate `overall_status`/`failure_reasons` pass/fail report). 44 tests pass.
+
+Bugs found and fixed during implementation (not just what was planned): a plan self-contradiction (Phase 2 scenario count), incomplete judge-error classification (2 of 3 pipecat `EvalJudge` infra-failure reason prefixes were unhandled), and the eval runner returning exit 0 unconditionally regardless of outcome. Full detail in `## Findings` above.
+
+Deferred, not blocking: manifest staleness heuristic (has a working `--i-know-the-manifest-is-stale` override), 3 Minor findings from Phase 1 (env-var test coverage, effort-label cross-validation, README env-var docs) and Phase 2 (policy-dict replacement semantics, effort-display-vs-effective-value, truncated-cell status reporting) mid-phase reviewers.
+
+Review gates (`/code-review`, Codex adversarial review, `/deep-review`, `/security-review`) not yet run — plan has no `**Review Gates:**` header so `/conduct` did not auto-chain them; run before merge.
 
 <!-- reviewed: 2026-08-18 @ 07ef1ced3c347b8c3129c94c20be58d55d4414c2 -->
 
