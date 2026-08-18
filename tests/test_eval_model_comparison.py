@@ -303,6 +303,34 @@ class TestMatrixBuilding:
         assert default_pairs != full_pairs
 
 
+class TestSpendEstimateIsWorstCase:
+    """Regression: scenario_call_counts() (the spend-confirmation gate's
+    estimate function) must count every turn as a potential worker call, not
+    just turns marked expect_delegated=True. ROUTING_REGRESSION's first turn
+    is expect_delegated=False (a greeting), but if the router actually
+    misroutes it -- a routing regression, the exact failure mode this
+    scenario exists to catch -- the run makes a billed worker call anyway.
+    An estimate that only counted expect_delegated=True turns would
+    under-count and could silently let a run exceed --max-calls/--max-cost
+    without triggering the confirmation prompt.
+    """
+
+    def test_worker_estimate_counts_every_turn_not_just_expect_delegated(self) -> None:
+        scenario = eval_scenarios.ROUTING_REGRESSION
+        assert scenario.turns[0].expect_delegated is False
+        router_calls, worker_calls, _judge_calls = eval_runner.scenario_call_counts(scenario)
+        assert router_calls == len(scenario.turns)
+        # Worst case: every turn, including the non-expect_delegated one,
+        # counts as a potential worker call.
+        assert worker_calls == len(scenario.turns)
+
+    def test_worker_estimate_exceeds_the_expect_delegated_only_count(self) -> None:
+        scenario = eval_scenarios.ROUTING_REGRESSION
+        expect_delegated_only = sum(1 for turn in scenario.turns if turn.expect_delegated)
+        _router_calls, worker_calls, _judge_calls = eval_runner.scenario_call_counts(scenario)
+        assert worker_calls > expect_delegated_only
+
+
 # ---------------------------------------------------------------------------
 # Budget-checking
 # ---------------------------------------------------------------------------
@@ -542,6 +570,44 @@ class TestSpendConfirmationGate:
         eval_runner.main(["--dry-run", "--max-calls", "1"])
 
 
+class TestSpendEstimateShownBeforeLiveRun:
+    """Regression: on a normal live invocation where no spend limit is
+    exceeded, the operator must still see the total-call-count/cost estimate
+    before any live call happens -- _confirm_spend() itself returns silently
+    when under budget, so main() must print the preview unconditionally on
+    the live-run path, not only when a limit would be exceeded.
+    """
+
+    def test_preview_is_printed_on_a_normal_live_run_within_limits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+
+        # No --max-calls/--max-cost passed at all -- nothing to exceed, so
+        # _confirm_spend() alone would print nothing.
+        eval_runner.main(
+            [
+                "--router",
+                "baseline",
+                "--worker",
+                "baseline",
+                "--scenario",
+                "single-turn-default",
+                "--i-know-the-manifest-is-stale",
+            ]
+        )
+
+        out = capsys.readouterr().out.lower()
+        assert "call" in out
+        assert "cost" in out or "$" in out
+
+
 # ---------------------------------------------------------------------------
 # Manifest-staleness / absence refusal
 # ---------------------------------------------------------------------------
@@ -578,6 +644,30 @@ class TestManifestGate:
         missing_path = tmp_path / "does-not-exist.json"
         status = eval_runner.load_manifest_status(missing_path)
         assert status.exists is False
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=False,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_undecodable_manifest_is_treated_as_malformed_not_raised(self, tmp_path: Path) -> None:
+        # Path.read_text() raises UnicodeDecodeError for a non-UTF-8 byte
+        # sequence -- this is NOT a subclass of json.JSONDecodeError, so a
+        # guard written as `except (OSError, json.JSONDecodeError)` misses
+        # it. main() calls load_manifest_status() before the guarded
+        # live-run path, so an uncaught UnicodeDecodeError here would
+        # surface as a raw traceback instead of the documented fail-closed
+        # status.
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_bytes(b"\xff\xfe\x00\x81not valid utf-8")
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.exists is True
+        assert status.stale is True
+        assert status.accepted == frozenset()
         with pytest.raises(eval_runner.ManifestError):
             eval_runner.require_manifest_ok_for_live_run(
                 status,
@@ -1611,6 +1701,37 @@ class TestSpendLimitValidation:
         parser = eval_runner.build_arg_parser()
         args = parser.parse_args(["--max-cost", "5.0"])
         assert args.max_cost == 5.0
+
+
+class TestRoutingBudgetRejectsNonFinite:
+    """Regression: --max-routing-seconds must reject NaN/inf the same way
+    --max-cost/--max-calls do. run_cell()'s blocking-budget check
+    (`routing_ms > max_routing_seconds * 1000`) is false for both nan and
+    inf, so an unvalidated NaN/inf value silently disables routing-budget
+    enforcement instead of erroring on bad input.
+    """
+
+    def test_rejects_nan(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "nan"])
+
+    def test_rejects_infinity(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "inf"])
+
+    def test_rejects_zero_or_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "0"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "-1.0"])
+
+    def test_accepts_a_normal_value(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        args = parser.parse_args(["--max-routing-seconds", "15.0"])
+        assert args.max_routing_seconds == 15.0
 
 
 class TestFullMatrixConflictsWithSingleCellSelection:

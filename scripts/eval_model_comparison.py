@@ -192,7 +192,7 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
         )
     try:
         manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return ManifestStatus(
             path=manifest_path,
             exists=True,
@@ -362,18 +362,21 @@ class CallAccounting:
 
 
 def scenario_call_counts(scenario: Scenario) -> tuple[int, int, int]:
-    """Router/worker/judge call counts for one scenario's preview accounting.
+    """Router/worker/judge call counts for one scenario's spend-confirmation estimate.
 
-    ``worker_calls`` is a *lower bound*, not a worst case: it only counts
-    turns the scenario definition marks ``expect_delegated=True``. If the
-    router actually misroutes a turn that wasn't marked as delegated (a
-    routing regression, not something this preview can predict), the real
-    run's worker calls -- and its billed cost -- will exceed this estimate.
-    The operator-facing preview labels this explicitly; do not read this
-    count as a hard ceiling on spend.
+    ``worker_calls`` is a *worst case*, not the expected count: it counts
+    every turn as a potential worker call, not just the turns the scenario
+    definition marks ``expect_delegated=True``. A turn marked
+    ``expect_delegated=False`` (e.g. a greeting) can still be misrouted to
+    the worker by a routing regression -- exactly the failure mode this
+    scenario type exists to catch -- and if the estimate only counted
+    ``expect_delegated=True`` turns, a run that hits that regression would
+    silently exceed an operator's ``--max-calls``/``--max-cost`` limit
+    without ever triggering the confirmation gate. This is a pre-run
+    estimate only; it does not change the actual runtime calls made.
     """
     router_calls = len(scenario.turns)
-    worker_calls = sum(1 for turn in scenario.turns if turn.expect_delegated)
+    worker_calls = len(scenario.turns)
     judge_calls = sum(1 for turn in scenario.turns if turn.judge_criterion)
     return router_calls, worker_calls, judge_calls
 
@@ -438,7 +441,7 @@ def print_matrix_preview(
         r, w, j = scenario_call_counts(scenario)
         print(
             f"  scenario={scenario.name}: {len(scenario.turns)} turn(s), router={r} "
-            f"worker(lower-bound, assumes only expect_delegated turns route to a worker)={w} judge={j}"
+            f"worker(worst-case, assumes every turn could route to a worker)={w} judge={j}"
         )
     print()
     accounting = matrix_call_accounting(pairs, scenarios)
@@ -1086,6 +1089,25 @@ def _finite_nonnegative_float(raw: str) -> float:
     return value
 
 
+def _finite_positive_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--max-routing-seconds must be a number: {raw!r}"
+        ) from exc
+    # Same rationale as _finite_nonnegative_float above: nan/inf both parse
+    # without raising, and the blocking-budget check in run_cell()
+    # (`routing_ms > max_routing_seconds * 1000`) is false for both --
+    # silently disabling routing-budget enforcement instead of rejecting the
+    # bad input up front.
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--max-routing-seconds must be finite and positive: {raw!r}"
+        )
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1105,7 +1127,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--i-know-the-manifest-is-stale", action="store_true", dest="allow_stale")
     parser.add_argument("--manifest-path", type=Path, default=DEFAULT_MANIFEST_PATH)
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
-    parser.add_argument("--max-routing-seconds", type=float, default=DEFAULT_MAX_ROUTING_SECONDS)
+    parser.add_argument(
+        "--max-routing-seconds", type=_finite_positive_float, default=DEFAULT_MAX_ROUTING_SECONDS
+    )
     parser.add_argument("--max-latency-seconds", type=float, default=DEFAULT_MAX_LATENCY_SECONDS)
     parser.add_argument(
         "--out", type=Path, default=None, help="report output path (default: printed only)"
@@ -1157,6 +1181,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     accounting = matrix_call_accounting(pairs, scenarios)
+    # Always shown before a live call is made -- not only when a limit would
+    # be exceeded -- per the dev plan's documented contract: "no live call
+    # happens without the operator seeing the total call count, cost
+    # estimate...". _confirm_spend() itself returns silently when under
+    # budget, so without this the operator could start paid cells having
+    # never seen the estimate.
+    print_matrix_preview(pairs, scenarios, judge_model=args.judge_model, status=manifest_status)
     if not _confirm_spend(
         accounting, max_calls=args.max_calls, max_cost=args.max_cost, assume_yes=args.yes
     ):
