@@ -12,6 +12,17 @@ import time
 from dataclasses import replace
 from typing import Any
 
+# Hoisted to scripts/_eval_common.py so scripts/eval_model_comparison.py can
+# reuse the same latency-measurement helper and in-memory sink without
+# importing this script module as a library; re-exported here so existing
+# imports (including tests/test_smoke_conversation.py) keep working unchanged.
+from scripts._eval_common import CollectingMeasurementSink, _latest_turn_stage_metrics
+
+__all__ = [
+    "CollectingMeasurementSink",
+    "_latest_turn_stage_metrics",
+]
+
 DEFAULT_QUERY = "What is the latest stable Pipecat release?"
 ROUTING_REGRESSION_QUERIES = (
     "Hi.",
@@ -19,35 +30,6 @@ ROUTING_REGRESSION_QUERIES = (
     "Could you tell me the weather in Helsinki today?",
 )
 RESULT_PREFIX = "SMOKE_RESULT="
-
-
-def _latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
-    """Read the given ``turn_id``'s correlated PERF_METRIC records.
-
-    Selecting by the caller's own ``turn_id`` (rather than the newest record
-    of each kind) is required so a turn that emits no ``work_item_foreground``
-    record -- any direct/unsupported/clarify router turn -- never silently
-    inherits a preceding delegated turn's ``search_ms``/``total_ms``.
-    """
-    turn_records = [
-        record
-        for record in sink.records
-        if record.event == "app_turn_foreground" and record.fields.get("turn_id") == turn_id
-    ]
-    if not turn_records:
-        raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
-    turn_record = turn_records[-1]
-    work_records = [
-        record
-        for record in sink.records
-        if record.event == "work_item_foreground" and record.fields.get("turn_id") == turn_id
-    ]
-    work_record = work_records[-1] if work_records else None
-    return {
-        "routing_ms": float(turn_record.fields.get("routing_ms", 0)),
-        "search_ms": float(work_record.fields.get("search_ms", 0)) if work_record else 0.0,
-        "total_ms": float(turn_record.fields.get("total_ms", elapsed_ms)),
-    }
 
 
 SAFE_FALLBACKS = {
