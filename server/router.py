@@ -38,6 +38,21 @@ def build_openai_async_responses_client(api_key: str, *, timeout: float = 75.0) 
     return AsyncOpenAI(api_key=api_key, timeout=timeout).responses
 
 
+def effective_router_reasoning_effort(model: str, resolved_effort: str | None) -> str | None:
+    """The reasoning-effort value ``LazyRouterProvider.__call__`` actually sends.
+
+    Single source of truth for the "unset effort + a gpt-5* model defaults to
+    minimal" rule, so a caller that needs to *predict* the wire-level effort
+    without making the call (e.g. the eval runner's manifest-lookup) never
+    hand-duplicates this conditional and risks drifting from it.
+    """
+    if resolved_effort is not None:
+        return resolved_effort
+    if model.startswith("gpt-5"):
+        return "minimal"
+    return None
+
+
 def _response_text(response: Any) -> str:
     if isinstance(response, Mapping):
         value = response.get("output_text")
@@ -90,10 +105,9 @@ class LazyRouterProvider:
             "text": structured_text_format(RouterEnvelope, "router_envelope"),
         }
         effort = self._config.resolve_router_reasoning_effort("fast")
-        if effort is not None:
-            kwargs["reasoning"] = {"effort": effort}
-        elif model.startswith("gpt-5"):
-            kwargs["reasoning"] = {"effort": "minimal"}
+        effective_effort = effective_router_reasoning_effort(model, effort)
+        if effective_effort is not None:
+            kwargs["reasoning"] = {"effort": effective_effort}
         response = self._get_responses().create(**kwargs)
         try:
             payload = json.loads(_response_text(response))

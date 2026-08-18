@@ -12,31 +12,29 @@ import time
 from dataclasses import replace
 from typing import Any
 
-# Hoisted to scripts/_eval_common.py so scripts/eval_model_comparison.py can
-# reuse the same latency-measurement helper and in-memory sink without
-# importing this script module as a library; re-exported here so existing
-# imports (including tests/test_smoke_conversation.py) keep working unchanged.
-from scripts._eval_common import CollectingMeasurementSink, _latest_turn_stage_metrics
+# Hoisted to scripts/_eval_common.py so scripts/eval_model_comparison.py and
+# evals/scenarios.py can reuse the same latency-measurement helper, in-memory
+# sink, and scenario constants without importing this script module as a
+# library; re-exported here so existing imports (including
+# tests/test_smoke_conversation.py) keep working unchanged.
+from scripts._eval_common import (
+    DEFAULT_QUERY,
+    ROUTING_REGRESSION_QUERIES,
+    SAFE_FALLBACKS,
+    CollectingMeasurementSink,
+    _latest_turn_stage_metrics,
+    build_session_for_run,
+)
 
 __all__ = [
+    "DEFAULT_QUERY",
+    "ROUTING_REGRESSION_QUERIES",
+    "SAFE_FALLBACKS",
     "CollectingMeasurementSink",
     "_latest_turn_stage_metrics",
 ]
 
-DEFAULT_QUERY = "What is the latest stable Pipecat release?"
-ROUTING_REGRESSION_QUERIES = (
-    "Hi.",
-    "Tell me the weather in Riga. For today.",
-    "Could you tell me the weather in Helsinki today?",
-)
 RESULT_PREFIX = "SMOKE_RESULT="
-
-
-SAFE_FALLBACKS = {
-    "Routing is temporarily unavailable. Please try that request again.",
-    "The web search is temporarily unavailable.",
-    "I could not find a reliable result for that request.",
-}
 
 
 async def _run_child(
@@ -48,29 +46,34 @@ async def _run_child(
     ack_ordering: bool,
     max_ack_seconds: float,
 ) -> dict[str, Any]:
-    from server.app import _default_session_host
+    from server.config import load_config
     from server.perf_metrics import CollectingMeasurementSink
 
     sink = CollectingMeasurementSink()
-    host = _default_session_host(measurement_sink=sink)
+    # Built via build_session_for_run(), not _default_session_host() + a
+    # post-hoc host.config reassignment: the router provider captures its
+    # Config reference at construction, so a later `host.config = tuned`
+    # never reaches it (see build_session_for_run's own docstring, and the
+    # dev plan's "Architecture & Call Flow / Injection seam" note). This
+    # smoke's model/effort is always the operator's configured default (no
+    # per-run candidate override the way the eval-suite runner has), but it
+    # shares the same construction seam so the two never drift apart.
+    base_config = load_config()
     # The semantic smoke waits longer than the interactive foreground path so
     # it validates the final provider result rather than the background-work
     # acknowledgement. The total latency budget remains independently enforced.
-    config = host.coordinator.config
     tuned = replace(
-        config,
+        base_config,
         foreground_search_timeout_seconds=max_latency_seconds,
         provider_timeout_seconds=max(
-            config.provider_timeout_seconds,
+            base_config.provider_timeout_seconds,
             max_latency_seconds + 15,
         ),
     )
-    host.config = tuned
-    host.coordinator.config = tuned
-    host.registry.config = tuned
-    # This smoke isolates the paid semantic path. Browser media and local speech
-    # have separate deterministic/live acceptance commands.
-    host.stt = None
+    host = build_session_for_run(tuned, measurement_sink=sink)
+    # This smoke isolates the paid semantic path. Browser media and local
+    # speech have separate deterministic/live acceptance commands.
+    # build_session_for_run() already sets host.stt/host.tts = None.
     await host.start()
     try:
         if ack_ordering:

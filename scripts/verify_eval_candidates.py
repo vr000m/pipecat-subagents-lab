@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -37,11 +38,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from scripts._eval_common import build_judge_llm_service, confined_output_path, write_no_follow
+
 MANIFEST_VERSION = 1
 # Tracked in git (not `.review-plan/`, which is gitignored) -- Phase 2's runner
 # and CI both need to read this manifest from a fresh checkout.
 DEFAULT_OUT = "docs/dev_plans/artifacts/eval-candidates-manifest.json"
 DEFAULT_JUDGE_MODEL = "gpt-5-mini"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Router candidate matrix, per the plan's Objective. The baseline entry
 # (gpt-5-mini @ minimal) reproduces today's production behavior
@@ -97,8 +101,18 @@ class ProbeResult:
     response_id: str | None = None
 
 
+# Light redaction for a low-severity but real risk: an OpenAI client
+# exception's str() can, under a misconfigured proxy or an unusual error
+# path, echo back request metadata -- including an Authorization header or
+# API key -- and this text is written verbatim into a git-tracked manifest.
+# Not a complete secrets scanner, just a defense-in-depth backstop for the
+# one credential shape this repo actually issues (OpenAI secret keys).
+_API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{10,}")
+
+
 def _error_text(exc: Exception) -> str:
-    return f"{type(exc).__name__}: {exc}"[:2000]
+    text = f"{type(exc).__name__}: {exc}"[:2000]
+    return _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
 
 
 def _router_timeout_seconds() -> float:
@@ -269,15 +283,18 @@ def probe_worker(responses_client: Any, model: str, effort: str | None) -> Probe
     )
 
 
-def probe_judge(judge_model: str) -> ProbeResult:
+def probe_judge(judge_model: str, api_key: str | None) -> ProbeResult:
     import asyncio
-
-    from pipecat.evals.services import openai_service
 
     kwargs = _judge_kwargs(judge_model)
 
     async def _call() -> Any:
-        service = openai_service({"model": judge_model})
+        # build_judge_llm_service(), not pipecat.evals.services.openai_service():
+        # that factory only reads config["model"] and otherwise relies on the
+        # OpenAI SDK's own OPENAI_API_KEY env-var lookup, silently ignoring
+        # the WEBSEARCH_OPENAI_API_KEY(_ENV)-resolved credential this probe
+        # already went to the trouble of resolving via load_config().
+        service = build_judge_llm_service(judge_model, api_key)
         return await service._client.chat.completions.create(**kwargs)
 
     try:
@@ -296,18 +313,29 @@ def probe_judge(judge_model: str) -> ProbeResult:
     )
 
 
-def _git_head() -> str:
+def _git_head() -> str | None:
+    """The current commit hash, or ``None`` if it can't be resolved.
+
+    Pinned to ``cwd=_REPO_ROOT`` (like ``_current_source_commit()`` in
+    scripts/eval_model_comparison.py) so running this script from a
+    different working directory can't pick up a foreign repo's HEAD.
+    ``None`` -- not the string ``"unknown"`` -- signals failure, matching
+    the same None-means-unresolved convention
+    scripts/eval_model_comparison.py's manifest consumer already expects for
+    ``source_commit``.
+    """
     try:
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"],
+            cwd=_REPO_ROOT,
             capture_output=True,
             text=True,
             check=True,
             timeout=10,
         )
     except Exception:
-        return "unknown"
-    return completed.stdout.strip() or "unknown"
+        return None
+    return completed.stdout.strip() or None
 
 
 def _resolve_openai_api_key() -> str | None:
@@ -345,7 +373,7 @@ def run_verification(*, judge_model: str) -> tuple[list[ProbeResult], float]:
         )
     for model, effort in WORKER_CANDIDATES:
         results.append(probe_worker(responses_client, model, effort))
-    results.append(probe_judge(judge_model))
+    results.append(probe_judge(judge_model, api_key))
     return results, router_timeout_seconds
 
 
@@ -356,8 +384,12 @@ def write_manifest(out_path: Path, results: list[ProbeResult]) -> dict[str, Any]
         "verified_at_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "results": [asdict(result) for result in results],
     }
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(manifest, indent=2, sort_keys=False) + "\n")
+    # confined_output_path()/write_no_follow(): an operator-supplied --out
+    # value is still attacker-influenced surface (see scripts/_eval_common.py
+    # for the rationale) -- reject `..` traversal escaping the repo tree and
+    # refuse to follow an existing symlink at the target path.
+    confined_path = confined_output_path(out_path, allowed_root=_REPO_ROOT)
+    write_no_follow(confined_path, json.dumps(manifest, indent=2, sort_keys=False) + "\n")
     return manifest
 
 
@@ -414,7 +446,11 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    manifest = write_manifest(Path(args.out), results)
+    try:
+        manifest = write_manifest(Path(args.out), results)
+    except ValueError as exc:
+        print(f"refusing to write manifest: {exc}", file=sys.stderr)
+        return 2
     _print_summary(results)
     print(f"\nmanifest written to {args.out} (source_commit={manifest['source_commit']})")
 

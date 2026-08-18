@@ -14,6 +14,7 @@ from server.router import (
     RoutingValidationError,
     WorkerCatalogue,
     WorkerCatalogueEntry,
+    effective_router_reasoning_effort,
 )
 
 
@@ -159,6 +160,25 @@ def test_lazy_router_provider_explicit_override_replaces_the_gpt5_default() -> N
 
     assert responses.calls[0]["model"] == "gpt-5-mini"
     assert responses.calls[0]["reasoning"] == {"effort": "xhigh"}
+
+
+class TestEffectiveRouterReasoningEffort:
+    """``effective_router_reasoning_effort`` is the single hoisted source of
+    truth for the "unset effort + gpt-5* model -> minimal" default -- both
+    ``LazyRouterProvider.__call__`` (exercised above via request-kwargs
+    assertions) and ``scripts/eval_model_comparison.py``'s manifest-lookup
+    call this same function rather than each hand-duplicating the rule."""
+
+    def test_explicit_effort_always_wins(self) -> None:
+        assert effective_router_reasoning_effort("gpt-5-mini", "high") == "high"
+        assert effective_router_reasoning_effort("claude-not-gpt5", "low") == "low"
+
+    def test_unset_effort_defaults_to_minimal_for_gpt5_models(self) -> None:
+        assert effective_router_reasoning_effort("gpt-5-mini", None) == "minimal"
+        assert effective_router_reasoning_effort("gpt-5.6-terra", None) == "minimal"
+
+    def test_unset_effort_omits_reasoning_for_non_gpt5_models(self) -> None:
+        assert effective_router_reasoning_effort("some-other-model", None) is None
 
 
 def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validation() -> None:

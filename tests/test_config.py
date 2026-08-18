@@ -267,6 +267,34 @@ def test_reasoning_effort_policy_rejects_value_outside_sdk_documented_literal() 
         Config(worker_reasoning_effort_policy={"deep": "extreme"})
 
 
+def test_reasoning_effort_policy_rejects_a_label_not_in_model_policy() -> None:
+    """A typo'd effort-policy label (e.g. "fastt" instead of "fast") would
+    otherwise be silently accepted and never read by
+    resolve_router_reasoning_effort -- the two dicts must agree on labels."""
+    with pytest.raises(ConfigError):
+        Config(
+            router_model_policy={"fast": "gpt-5-mini"},
+            router_reasoning_effort_policy={"fastt": "high"},
+        )
+    with pytest.raises(ConfigError):
+        Config(
+            worker_model_policy={"deep": "gpt-5"},
+            worker_reasoning_effort_policy={"deeep": "low"},
+        )
+
+
+def test_reasoning_effort_policy_allows_a_subset_of_model_policy_labels() -> None:
+    """A model-policy label with no matching effort-policy entry is fine (the
+    documented "resolves to None" case) -- only an effort-policy label absent
+    from the model policy is rejected."""
+    config = Config(
+        router_model_policy={"fast": "gpt-5-mini", "extra-label": "some-model"},
+        router_reasoning_effort_policy={"fast": "high"},
+    )
+    assert config.resolve_router_reasoning_effort("fast") == "high"
+    assert config.resolve_router_reasoning_effort("extra-label") is None
+
+
 @pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
 def test_reasoning_effort_policy_accepts_the_full_sdk_documented_literal(effort: str) -> None:
     """The OpenAI SDK's ``ReasoningEffort`` literal is broader than the four

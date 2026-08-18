@@ -207,6 +207,30 @@ class Config:
             "worker_reasoning_effort_policy",
             _reasoning_efforts(self.worker_reasoning_effort_policy),
         )
+        # An effort-policy label that isn't a registered model-policy label
+        # (a typo, e.g. "fastt" instead of "fast") would otherwise be silently
+        # accepted and never read -- resolve_*_reasoning_effort only raises
+        # for a *lookup* against an unregistered label, and nothing else in
+        # this dataclass ever iterates the effort-policy dict's keys against
+        # the model-policy dict's keys. Catching the mismatch here, at
+        # construction, surfaces the typo immediately instead of leaving a
+        # silently-inert config entry.
+        _unknown_router_effort_labels = set(self.router_reasoning_effort_policy) - set(
+            self.router_model_policy
+        )
+        if _unknown_router_effort_labels:
+            raise ConfigError(
+                "router_reasoning_effort_policy has labels not present in "
+                f"router_model_policy: {sorted(_unknown_router_effort_labels)}"
+            )
+        _unknown_worker_effort_labels = set(self.worker_reasoning_effort_policy) - set(
+            self.worker_model_policy
+        )
+        if _unknown_worker_effort_labels:
+            raise ConfigError(
+                "worker_reasoning_effort_policy has labels not present in "
+                f"worker_model_policy: {sorted(_unknown_worker_effort_labels)}"
+            )
 
     def resolve_router_model(self, policy_label: str) -> str:
         try:

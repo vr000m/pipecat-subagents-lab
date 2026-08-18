@@ -42,7 +42,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -136,7 +136,7 @@ class _FakeState:
 
 
 class _FakeRegistry:
-    workers: list[Any] = []
+    workers: ClassVar[list[Any]] = []
 
 
 @dataclass
@@ -228,7 +228,11 @@ def _run_cell(
     monkeypatch.setattr(
         "pipecat.evals.judge.EvalJudge", _make_stub_judge_class(verdicts or [], judge_recorder)
     )
-    monkeypatch.setattr("pipecat.evals.services.openai_service", lambda *_a, **_k: None)
+    # run_cell() builds the judge's LLM service via build_judge_llm_service()
+    # (threading the resolved credential through explicitly -- see its
+    # docstring), not the library's openai_service() factory -- patch the
+    # former so no real OpenAILLMService/credential check is reached.
+    monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
 
     scenario = Scenario(name="fixture-scenario", turns=turns)
     config = Config()
@@ -929,3 +933,460 @@ class TestScenarioDefinitions:
                 if turn.judge_criterion:
                     lowered = turn.judge_criterion.lower()
                     assert not any(marker in lowered for marker in placeholder_markers)
+
+
+# ---------------------------------------------------------------------------
+# Round-1 review-gauntlet regression tests.
+# ---------------------------------------------------------------------------
+
+
+class _RaisingOnFirstTurnHost:
+    """A ``SessionHost`` stand-in whose first turn times out (or errors) so a
+    cell that never gets a real result must not still report ``status="ok"``.
+    """
+
+    def __init__(self, *, failure: BaseException) -> None:
+        self.state = _FakeState()
+        self.registry = _FakeRegistry()
+        self._failure = failure
+        self.calls = 0
+
+    async def start(self) -> None:
+        pass
+
+    async def connect(self, _handshake: dict[str, Any]) -> str:
+        return "connection-1"
+
+    async def _handle_transcript(self, query: str, *, origin: Any) -> Any:
+        del origin, query
+        self.calls += 1
+        raise self._failure
+
+    async def shutdown(self) -> None:
+        pass
+
+
+class TestTurnFailurePropagatesToCellAndReport:
+    """Regression for finding 1: a turn that times out or raises must not
+    leave the cell reporting ``status="ok"`` -- and ``compute_pass_fail()``
+    must itself notice a non-"ok" turn status, not just a non-"ok" cell
+    status, since a fully-failed run's every symptom lives on its turns.
+    """
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, *, failure: BaseException) -> Any:
+        host = _RaisingOnFirstTurnHost(failure=failure)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return host
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(
+            name="two-turn-fixture",
+            turns=(Turn(query="turn one"), Turn(query="turn two")),
+        )
+        config = eval_runner.Config()
+        return asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                config,
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+    def test_a_timed_out_turn_marks_the_cell_status_non_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=TimeoutError())
+        assert outcome.status == "timeout"
+        assert outcome.turns[0].status == "timeout"
+
+    def test_a_provider_error_turn_marks_the_cell_status_non_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=RuntimeError("boom"))
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+
+    def test_the_unattempted_second_turn_is_recorded_as_skipped_not_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=TimeoutError())
+        assert len(outcome.turns) == 2
+        assert outcome.turns[1].query == "turn two"
+        assert outcome.turns[1].status == "skipped"
+
+    def test_compute_pass_fail_fails_the_run_and_names_the_turn_status(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=RuntimeError("boom"))
+        report = eval_runner.build_report([outcome], judge_model="gpt-5-mini")
+
+        assert report["overall_status"] == "FAIL"
+        assert any(
+            "turn one" in reason and "status='provider-error'" in reason
+            for reason in report["failure_reasons"]
+        )
+
+    def test_a_fully_failed_billed_run_never_reports_pass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact scenario finding 1 named: every turn errors, and the
+        report must not read PASS / exit 0 as a result."""
+        outcome = self._run(monkeypatch, failure=RuntimeError("every turn fails"))
+        report = eval_runner.build_report([outcome], judge_model="gpt-5-mini")
+        assert report["overall_status"] == "FAIL"
+
+
+class TestHostLifecycleExceptionsDontCrashTheMatrix:
+    """Regression for finding 2: an exception from host.start()/connect(), or
+    from judge.evaluate(), must be classified into a CellOutcome rather than
+    escaping run_cell() uncaught (which would abort run_matrix() and discard
+    every already-billed cell with no report ever written).
+    """
+
+    def test_host_start_failure_still_shuts_down_and_returns_a_cell_outcome(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        shutdown_calls: list[bool] = []
+
+        class _FailingStartHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            async def start(self) -> None:
+                raise RuntimeError("startup exploded")
+
+            async def connect(self, _h: Any) -> str:
+                raise AssertionError("connect() must not be reached if start() failed")
+
+            async def _handle_transcript(self, *_a: Any, **_k: Any) -> Any:
+                raise AssertionError("a turn must not run if start() failed")
+
+            async def shutdown(self) -> None:
+                shutdown_calls.append(True)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FailingStartHost()
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "startup exploded" in (outcome.error or "")
+        # The whole point of finding 2: shutdown() still runs even though
+        # start() never succeeded, so cached provider clients are released.
+        assert shutdown_calls == [True]
+
+    def test_judge_evaluate_raising_is_classified_as_judge_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _RaisingJudge:
+            def __init__(self, *_a: Any, **_k: Any) -> None:
+                pass
+
+            def add_user_message(self, _text: str) -> None:
+                pass
+
+            def add_assistant_message(self, _text: str) -> None:
+                pass
+
+            async def evaluate(self, _criterion: str) -> Any:
+                raise RuntimeError("judge backend unreachable")
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+        )
+        del outcome  # the _run_cell helper already queues a stub judge class
+
+        # Re-run with a judge whose evaluate() itself raises, proving
+        # run_cell() classifies that as judge-error for the turn instead of
+        # letting the exception propagate out of run_cell()/run_matrix().
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+
+            def _result_factory(_q: str) -> Any:
+                return _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+
+            return _FakeHost(_result_factory)
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(
+            eval_runner,
+            "_latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _RaisingJudge)
+
+        result = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="weather in Riga?", judge_criterion="x"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # The cell completed (run_cell did not raise) and the turn is
+        # classified as judge-error, not silently absent from the report.
+        assert result.status == "ok"
+        assert result.turns[0].judge_verdict == "judge-error"
+        assert "judge backend unreachable" in (result.turns[0].judge_reason or "")
+
+
+class TestManifestStalenessFailsClosed:
+    """Regression for finding 5: an unverifiable identity -- a manifest
+    missing source_commit, or a current-commit lookup that itself failed --
+    must be treated as stale (fail closed), not silently accepted as fresh.
+    """
+
+    def test_missing_source_commit_is_treated_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "abc123")
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "manifest_version": 1,
+                    "source_commit": None,
+                    "results": [],
+                }
+            )
+        )
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+
+    def test_unresolvable_current_commit_is_treated_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: None)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+
+    def test_matching_verifiable_identity_is_not_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "deadbeef")
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is False
+
+
+class TestManifestWorkerEntryRequiresWebSearchTool:
+    """Regression for finding 10: a worker candidate's manifest entry must
+    declare the web_search tool it was actually probed with -- a
+    hand-edited/future-schema manifest that marks a worker tuple accepted
+    without it must not be treated as covering a live worker run.
+    """
+
+    def test_worker_entry_missing_web_search_tool_is_not_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_worker_entry(
+            eval_runner.WORKER_CANDIDATES[0].model, eval_runner.WORKER_CANDIDATES[0].effort
+        )
+        entry["tools"] = []  # hand-edited: declares no tools at all
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.WORKER_CANDIDATES[0], status) is False
+
+    def test_wrong_manifest_version_is_rejected_wholesale(self, tmp_path: Path) -> None:
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "manifest_version": 999,
+                    "source_commit": "deadbeef",
+                    "results": [
+                        _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+                    ],
+                }
+            )
+        )
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.accepted == frozenset()
+
+
+class TestManifestGateRunMatrixDirectly:
+    """Regression for finding 15: run_matrix()'s own per-cell manifest check
+    is reachable independently of main()'s preflight -- a direct caller that
+    skips require_manifest_ok_for_live_run() still gets a manifest-rejected
+    cell instead of an unguarded live call.
+    """
+
+    def test_run_matrix_rejects_an_uncovered_candidate_without_a_preflight_call(
+        self, tmp_path: Path
+    ) -> None:
+        # Manifest only covers the baseline -- no preflight call was made.
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (Scenario(name="s", turns=(Turn(query="hi"),)),),
+                eval_runner.Config(),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+            )
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "manifest-rejected"
+
+
+class TestOutputPathConfinement:
+    """Regression for finding 6: a ``--out`` path must not escape the repo
+    tree via ``..`` traversal, and must not follow an existing symlink.
+    """
+
+    def test_traversal_outside_the_repo_root_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            eval_runner.confined_output_path("../../etc/passwd", allowed_root=tmp_path)
+
+    def test_absolute_path_outside_the_repo_root_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            eval_runner.confined_output_path(Path("/etc/passwd"), allowed_root=tmp_path)
+
+    def test_a_path_within_the_root_is_accepted(self, tmp_path: Path) -> None:
+        resolved = eval_runner.confined_output_path("reports/out.json", allowed_root=tmp_path)
+        assert resolved == (tmp_path / "reports/out.json").resolve()
+
+    def test_an_existing_symlink_at_the_target_is_rejected(self, tmp_path: Path) -> None:
+        real_target = tmp_path / "real-secret.txt"
+        real_target.write_text("do not overwrite me")
+        symlink_path = tmp_path / "out.json"
+        symlink_path.symlink_to(real_target)
+
+        with pytest.raises(ValueError):
+            eval_runner.confined_output_path(symlink_path, allowed_root=tmp_path)
+
+    def test_write_no_follow_refuses_an_existing_symlink(self, tmp_path: Path) -> None:
+        real_target = tmp_path / "real-secret.txt"
+        real_target.write_text("do not overwrite me")
+        symlink_path = tmp_path / "out.json"
+        symlink_path.symlink_to(real_target)
+
+        with pytest.raises(OSError):
+            eval_runner.write_no_follow(symlink_path, "clobbered")
+        assert real_target.read_text() == "do not overwrite me"
+
+
+class TestSpendLimitValidation:
+    """Regression for finding 12: --max-cost must reject non-finite (NaN/inf)
+    values -- a NaN spend limit makes every comparison in _confirm_spend's
+    `exceeds` check false, so it would otherwise be silently treated as an
+    unbounded budget instead of the intended cap. --max-calls must reject
+    negative values too.
+    """
+
+    def test_max_cost_rejects_nan(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-cost", "nan"])
+
+    def test_max_cost_rejects_infinity(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-cost", "inf"])
+
+    def test_max_cost_rejects_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-cost", "-1.0"])
+
+    def test_max_calls_rejects_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-calls", "-1"])
+
+    def test_max_cost_accepts_a_normal_value(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        args = parser.parse_args(["--max-cost", "5.0"])
+        assert args.max_cost == 5.0
+
+
+class TestFullMatrixConflictsWithSingleCellSelection:
+    """Regression for finding 14: --full-matrix silently losing to --router/
+    --worker (rather than erroring) would make a typo'd or copy-pasted
+    --full-matrix flag look accepted but have no effect."""
+
+    def test_full_matrix_with_router_flag_errors_explicitly(self) -> None:
+        with pytest.raises(SystemExit):
+            eval_runner.main(["--full-matrix", "--router", "baseline", "--dry-run"])
+
+    def test_full_matrix_with_worker_flag_errors_explicitly(self) -> None:
+        with pytest.raises(SystemExit):
+            eval_runner.main(["--full-matrix", "--worker", "baseline", "--dry-run"])
+
+    def test_full_matrix_alone_is_still_allowed(self) -> None:
+        # Must not raise: no --router/--worker present.
+        exit_code = eval_runner.main(["--full-matrix", "--dry-run"])
+        assert exit_code == 0
+
+
+class TestJudgeInputSanitization:
+    """Regression for finding 17: light defense-in-depth sanitization before
+    worker-sourced text reaches the judge's context."""
+
+    def test_control_characters_are_stripped(self) -> None:
+        dirty = "hello\x00\x07world"
+        assert eval_runner._sanitize_for_judge(dirty) == "helloworld"
+
+    def test_newlines_and_tabs_are_preserved(self) -> None:
+        text = "line one\nline two\ttabbed"
+        assert eval_runner._sanitize_for_judge(text) == text
+
+    def test_length_is_capped(self) -> None:
+        long_text = "a" * 10_000
+        assert len(eval_runner._sanitize_for_judge(long_text, max_len=100)) == 100

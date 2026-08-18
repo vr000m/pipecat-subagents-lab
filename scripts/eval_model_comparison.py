@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import subprocess
 import sys
 import time
@@ -35,18 +36,26 @@ from typing import Any
 
 from evals.scenarios import SCENARIOS, SCENARIOS_BY_NAME, Scenario
 from scripts._eval_common import (
+    SAFE_FALLBACKS,
     CollectingMeasurementSink,
     _latest_turn_stage_metrics,
+    build_judge_llm_service,
     build_session_for_run,
+    confined_output_path,
+    write_no_follow,
 )
-from scripts.smoke_conversation import SAFE_FALLBACKS
 from server.config import Config, load_config
+from server.router import effective_router_reasoning_effort
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST_PATH = _REPO_ROOT / "docs/dev_plans/artifacts/eval-candidates-manifest.json"
 DEFAULT_JUDGE_MODEL = "gpt-5-mini"
 DEFAULT_MAX_ROUTING_SECONDS = 15.0
 DEFAULT_MAX_LATENCY_SECONDS = 60.0
+# Additive margin between the report-only latency budget and the internal
+# provider-level foreground-search timeout, so a slow-but-successful
+# candidate isn't truncated into a safe fallback before it can be scored.
+_FOREGROUND_TIMEOUT_HEADROOM_SECONDS = 30.0
 
 # Rough, deliberately conservative per-call dollar estimates for the
 # --dry-run cost preview. These are not billed-price lookups -- just enough
@@ -126,6 +135,11 @@ def full_matrix_pairs() -> tuple[RunPair, ...]:
 # --------------------------------------------------------------------------
 
 
+# Must match scripts/verify_eval_candidates.py's MANIFEST_VERSION -- the
+# manifest producer and this consumer agree on one schema version constant.
+_SUPPORTED_MANIFEST_VERSION = 1
+
+
 class ManifestError(RuntimeError):
     """The manifest is missing, malformed, or doesn't cover a needed combination."""
 
@@ -195,10 +209,27 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
             stale=True,
             accepted=frozenset(),
         )
+    # A manifest whose declared schema version this loader doesn't recognize
+    # is treated the same as malformed: a future/hand-edited schema could
+    # change what "accepted" means for a given entry shape, and silently
+    # reading it under today's assumptions would be worse than refusing.
+    if manifest.get("manifest_version") != _SUPPORTED_MANIFEST_VERSION:
+        return ManifestStatus(
+            path=manifest_path,
+            exists=True,
+            source_commit=None,
+            current_commit=current_commit,
+            stale=True,
+            accepted=frozenset(),
+        )
     source_commit = manifest.get("source_commit")
-    stale = bool(
-        current_commit and isinstance(source_commit, str) and source_commit != current_commit
-    )
+    # Fail closed, not open: an unverifiable identity -- source_commit is
+    # missing from the manifest, or the current-commit lookup itself failed
+    # (e.g. git unavailable) -- must be treated as stale/rejected for a live
+    # run, not silently accepted just because there was nothing to compare
+    # against. Only a same-valued, both-resolved comparison counts as fresh.
+    identity_verifiable = current_commit is not None and isinstance(source_commit, str)
+    stale = not identity_verifiable or source_commit != current_commit
     accepted: set[tuple[str, str, str | None]] = set()
     for entry in manifest["results"]:
         if not isinstance(entry, dict) or entry.get("accepted") is not True:
@@ -206,8 +237,17 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
         kind = entry.get("kind")
         model = entry.get("model")
         effort = entry.get("effort")
-        if isinstance(kind, str) and isinstance(model, str):
-            accepted.add((kind, model, effort if isinstance(effort, str) else None))
+        if not isinstance(kind, str) or not isinstance(model, str):
+            continue
+        # A worker candidate's manifest entry must declare the web_search
+        # tool it was actually probed with -- a hand-edited or
+        # future-schema manifest that marks a worker tuple accepted without
+        # it must not be treated as covering a live worker run.
+        if kind == "worker":
+            tools = entry.get("tools")
+            if not isinstance(tools, list) or "web_search" not in tools:
+                continue
+        accepted.add((kind, model, effort if isinstance(effort, str) else None))
     return ManifestStatus(
         path=manifest_path,
         exists=True,
@@ -225,21 +265,19 @@ def candidate_manifest_kind(candidate: Candidate) -> str:
 def _effective_effort_for_manifest_lookup(candidate: Candidate) -> str | None:
     """The effort this candidate's request will actually carry on the wire.
 
-    Mirrors ``LazyRouterProvider.__call__``'s conditional exactly: an unset
-    effort-policy (``candidate.effort is None``) is not "no reasoning key" for
-    a ``gpt-5*`` router model -- it falls back to today's
-    ``if model.startswith("gpt-5"): kwargs["reasoning"] = {"effort": "minimal"}``
-    default. Phase 0's manifest recorded the *effective* request shape for the
-    baseline (``gpt-5-mini`` @ ``minimal``), not the policy-label state, so the
-    lookup has to resolve the same way or the router baseline would spuriously
-    read as "absent from the manifest". The worker has no such conditional --
-    an unset worker effort genuinely omits the ``reasoning`` key.
+    Delegates to ``server.router.effective_router_reasoning_effort`` -- the
+    single hoisted source of truth for the "unset effort + gpt-5* model
+    defaults to minimal" rule -- rather than hand-duplicating
+    ``LazyRouterProvider.__call__``'s conditional here. Phase 0's manifest
+    recorded the *effective* request shape for the baseline (``gpt-5-mini`` @
+    ``minimal``), not the policy-label state, so the lookup has to resolve
+    the same way or the router baseline would spuriously read as "absent from
+    the manifest". The worker has no such conditional -- an unset worker
+    effort genuinely omits the ``reasoning`` key.
     """
-    if candidate.effort is not None:
-        return candidate.effort
-    if candidate.role == "router" and candidate.model.startswith("gpt-5"):
-        return "minimal"
-    return None
+    if candidate.role == "router":
+        return effective_router_reasoning_effort(candidate.model, candidate.effort)
+    return candidate.effort
 
 
 def candidate_accepted(candidate: Candidate, status: ManifestStatus) -> bool:
@@ -258,7 +296,17 @@ def require_manifest_ok_for_live_run(
     candidates: tuple[Candidate, ...],
     judge_model: str,
 ) -> None:
-    """Fatal, pre-flight manifest check for a live run. Never called under --dry-run."""
+    """Fatal, pre-flight manifest check for a live run. Never called under --dry-run.
+
+    ``main()`` calls this once, for every candidate in the resolved matrix,
+    before ``run_matrix()`` starts -- so under the CLI's normal control flow
+    ``run_matrix()``'s own per-cell ``candidate_accepted()`` check (see its
+    docstring) can never actually trigger. That per-cell check is kept
+    anyway as defense-in-depth for any caller that invokes ``run_matrix()``
+    directly without going through this preflight (tests, or a future
+    embedding) -- both checks call the same ``candidate_accepted()``
+    predicate, so they can never disagree about what's accepted.
+    """
     if not status.exists:
         raise ManifestError(
             f"Phase 0 manifest not found at {status.path} -- run "
@@ -306,6 +354,16 @@ class CallAccounting:
 
 
 def scenario_call_counts(scenario: Scenario) -> tuple[int, int, int]:
+    """Router/worker/judge call counts for one scenario's preview accounting.
+
+    ``worker_calls`` is a *lower bound*, not a worst case: it only counts
+    turns the scenario definition marks ``expect_delegated=True``. If the
+    router actually misroutes a turn that wasn't marked as delegated (a
+    routing regression, not something this preview can predict), the real
+    run's worker calls -- and its billed cost -- will exceed this estimate.
+    The operator-facing preview labels this explicitly; do not read this
+    count as a hard ceiling on spend.
+    """
     router_calls = len(scenario.turns)
     worker_calls = sum(1 for turn in scenario.turns if turn.expect_delegated)
     judge_calls = sum(1 for turn in scenario.turns if turn.judge_criterion)
@@ -368,7 +426,8 @@ def print_matrix_preview(
     for scenario in scenarios:
         r, w, j = scenario_call_counts(scenario)
         print(
-            f"  scenario={scenario.name}: {len(scenario.turns)} turn(s), router={r} worker(worst-case)={w} judge={j}"
+            f"  scenario={scenario.name}: {len(scenario.turns)} turn(s), router={r} "
+            f"worker(lower-bound, assumes only expect_delegated turns route to a worker)={w} judge={j}"
         )
     print()
     accounting = matrix_call_accounting(pairs, scenarios)
@@ -398,7 +457,7 @@ _JUDGE_INFRA_ERROR_REASON_PREFIXES = (
 @dataclass
 class TurnOutcome:
     query: str
-    status: str  # "ok" | "provider-error" | "timeout" | "setup-error"
+    status: str  # "ok" | "provider-error" | "timeout" | "setup-error" | "skipped"
     judge_verdict: str | None = None  # "yes" | "no" | "continue" | "judge-error" | None
     judge_reason: str | None = None
     deterministic_action_pass: bool | None = None
@@ -414,11 +473,23 @@ class TurnOutcome:
 class CellOutcome:
     pair_label: str
     scenario_name: str
-    status: str  # "ok" | "setup-error" | "manifest-rejected"
+    status: str  # "ok" | "provider-error" | "timeout" | "setup-error" | "manifest-rejected"
     error: str | None = None
     turns: list[TurnOutcome] | None = None
     router_timeout_seconds: float | None = None
     foreground_search_timeout_seconds: float | None = None
+
+
+def _sanitize_for_judge(text: str, *, max_len: int = 4000) -> str:
+    """Light defense-in-depth before feeding worker-sourced (hosted web
+    search) text into the judge LLM's context: strips ASCII control
+    characters (other than newline/tab) and caps length. This is not a
+    prompt-injection defense -- the judge's own verdict schema constrains its
+    output regardless of what's in its context -- it just bounds how much raw,
+    externally-sourced content reaches the judge unmodified.
+    """
+    cleaned = "".join(ch for ch in text if ch >= " " or ch in "\n\t")
+    return cleaned[:max_len]
 
 
 def _connect_handshake(host: Any) -> dict[str, Any]:
@@ -439,7 +510,15 @@ def _per_run_config(
 ) -> Config:
     router_effort_policy = {"fast": pair.router.effort} if pair.router.effort is not None else {}
     worker_effort_policy = {"deep": pair.worker.effort} if pair.worker.effort is not None else {}
-    foreground_search_timeout_seconds = max_latency_seconds
+    # Headroom beyond the report-only latency budget, not equal to it: the
+    # foreground timeout is an internal provider-level cutoff, not the
+    # scoring budget. Setting them equal means a non-baseline worker that
+    # completes successfully just after max_latency_seconds gets hard-killed
+    # by this timeout before its result/citations arrive, instead of
+    # completing and being scored as a (separately, report-only) latency
+    # miss -- collapsing "too slow" and "never got an answer" into the same
+    # outcome for a candidate that was actually working.
+    foreground_search_timeout_seconds = max_latency_seconds + _FOREGROUND_TIMEOUT_HEADROOM_SECONDS
     provider_timeout_seconds = max(
         base_config.provider_timeout_seconds, foreground_search_timeout_seconds + 15
     )
@@ -469,7 +548,6 @@ async def run_cell(
     max_latency_seconds: float,
 ) -> CellOutcome:
     from pipecat.evals.judge import EvalJudge
-    from pipecat.evals.services import openai_service
 
     config = _per_run_config(
         base_config,
@@ -495,12 +573,24 @@ async def run_cell(
 
     sink = CollectingMeasurementSink()
     host = build_session_for_run(config, measurement_sink=sink)
-    judge = EvalJudge(openai_service({"model": judge_model}))
+    judge = EvalJudge(build_judge_llm_service(judge_model, config.openai_api_key))
     turns: list[TurnOutcome] = []
+    # Worker IDs are minted as f"worker-{len(self._workers)+1}"
+    # (server/registry.py) and can only repeat if a worker is evicted --
+    # WorkerRegistry.remove() unconditionally raises RuntimeError under this
+    # registry's first-slice no-eviction policy, so within one cell's
+    # lifetime every worker_id this loop sees is guaranteed unique. Tracked
+    # by raw ID rather than a synthetic identity for that reason.
     checked_worker_ids: set[str] = set()
+    # Tracks the cell-level status a turn-level break should propagate as --
+    # compute_pass_fail() also checks each turn's own status, so this exists
+    # so a reader of just the cell's top-level status (without inspecting
+    # every turn) still sees that the cell didn't complete cleanly.
+    cell_status = "ok"
+    cell_error: str | None = None
 
-    await host.start()
     try:
+        await host.start()
         connection = await host.connect(_connect_handshake(host))
         for turn in scenario.turns:
             outcome = TurnOutcome(query=turn.query, status="ok")
@@ -513,11 +603,13 @@ async def run_cell(
             except TimeoutError:
                 outcome.status = "timeout"
                 turns.append(outcome)
+                cell_status, cell_error = "timeout", f"turn {turn.query!r} timed out"
                 break
             except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
                 outcome.status = "provider-error"
                 outcome.judge_reason = f"{exc.__class__.__name__}: {exc}"
                 turns.append(outcome)
+                cell_status, cell_error = "provider-error", outcome.judge_reason
                 break
             elapsed_ms = (time.perf_counter() - started) * 1000
             results = value if isinstance(value, tuple) else (value,)
@@ -525,12 +617,14 @@ async def run_cell(
                 outcome.status = "provider-error"
                 outcome.judge_reason = f"expected one result, received {len(results)}"
                 turns.append(outcome)
+                cell_status, cell_error = "provider-error", outcome.judge_reason
                 break
             result = results[0]
             if result.ui_text in SAFE_FALLBACKS:
                 outcome.status = "provider-error"
                 outcome.judge_reason = "host returned a safe fallback"
                 turns.append(outcome)
+                cell_status, cell_error = "provider-error", outcome.judge_reason
                 break
 
             # Post-first-delegation worker model/effort assertion: check every
@@ -551,13 +645,10 @@ async def run_cell(
                         f"wanted {pair.worker.model}@{pair.worker.effort}"
                     )
                     turns.append(outcome)
-                    return CellOutcome(
-                        pair_label=pair.label,
-                        scenario_name=scenario.name,
-                        status="setup-error",
-                        error=outcome.judge_reason,
-                        turns=turns,
-                    )
+                    cell_status, cell_error = "setup-error", outcome.judge_reason
+                    break
+            if cell_status != "ok":
+                break
 
             if turn.expect_action is not None:
                 routing = getattr(host.state, "routing", None)
@@ -583,35 +674,61 @@ async def run_cell(
             # populated from the worker's structured display_text field, or
             # the router's own direct-response prose) -- never spoken_text,
             # whose contract forbids citation markers/URLs the judge would
-            # otherwise be evaluating against.
-            judge.add_assistant_message(result.ui_text)
+            # otherwise be evaluating against. Sanitized before it reaches the
+            # judge's context since it can carry raw hosted-web-search content.
+            judge.add_assistant_message(_sanitize_for_judge(result.ui_text))
             if turn.judge_criterion:
-                verdict = await judge.evaluate(turn.judge_criterion)
-                # pipecat's EvalJudge.evaluate() (pipecat/evals/judge.py) signals
-                # infra-style failures through `reason`, not a distinct verdict
-                # value -- a raised inference exception ("judge call failed: ..."),
-                # an empty LLM response ("judge returned empty response"), and an
-                # unparsable response ("could not parse judge response: ...") all
-                # come back as verdict="no", indistinguishable from a genuine
-                # semantic "no" unless the reason text is checked. Any of these
-                # three prefixes -- or an out-of-enum verdict value -- is an
-                # infrastructure failure, not a real assertion result.
-                if verdict.reason.startswith(_JUDGE_INFRA_ERROR_REASON_PREFIXES) or (
-                    verdict.verdict not in {"yes", "no", "continue"}
-                ):
+                try:
+                    verdict = await judge.evaluate(turn.judge_criterion)
+                except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
                     outcome.judge_verdict = "judge-error"
+                    outcome.judge_reason = (
+                        f"judge.evaluate() raised: {exc.__class__.__name__}: {exc}"
+                    )
                 else:
-                    outcome.judge_verdict = verdict.verdict
-                outcome.judge_reason = verdict.reason
+                    # pipecat's EvalJudge.evaluate() (pipecat/evals/judge.py) signals
+                    # infra-style failures through `reason`, not a distinct verdict
+                    # value -- a raised inference exception ("judge call failed: ..."),
+                    # an empty LLM response ("judge returned empty response"), and an
+                    # unparsable response ("could not parse judge response: ...") all
+                    # come back as verdict="no", indistinguishable from a genuine
+                    # semantic "no" unless the reason text is checked. Any of these
+                    # three prefixes -- or an out-of-enum verdict value -- is an
+                    # infrastructure failure, not a real assertion result.
+                    if verdict.reason.startswith(_JUDGE_INFRA_ERROR_REASON_PREFIXES) or (
+                        verdict.verdict not in {"yes", "no", "continue"}
+                    ):
+                        outcome.judge_verdict = "judge-error"
+                    else:
+                        outcome.judge_verdict = verdict.verdict
+                    outcome.judge_reason = verdict.reason
 
             turns.append(outcome)
+    except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
+        # host.start()/host.connect() (or any other unexpected exception that
+        # escaped the per-turn handling above) must not abort run_matrix
+        # uncaught -- that would discard every already-completed and
+        # already-billed cell with no report ever written, contradicting this
+        # function's own "classify, don't crash the matrix" contract.
+        cell_status = "setup-error"
+        cell_error = f"{exc.__class__.__name__}: {exc}"
     finally:
         await host.shutdown()
+
+    if cell_status != "ok":
+        # Record every turn the scenario defines but this cell never
+        # attempted, so a reader of the report can tell "ran and failed" from
+        # "never got here" instead of the turn silently being absent.
+        attempted_queries = {t.query for t in turns}
+        for remaining_turn in scenario.turns:
+            if remaining_turn.query not in attempted_queries:
+                turns.append(TurnOutcome(query=remaining_turn.query, status="skipped"))
 
     return CellOutcome(
         pair_label=pair.label,
         scenario_name=scenario.name,
-        status="ok",
+        status=cell_status,
+        error=cell_error,
         turns=turns,
         router_timeout_seconds=config.router_timeout_seconds,
         foreground_search_timeout_seconds=config.foreground_search_timeout_seconds,
@@ -631,6 +748,13 @@ async def run_matrix(
     outcomes: list[CellOutcome] = []
     for pair in pairs:
         for scenario in scenarios:
+            # Defense-in-depth, not the primary gate: main()'s call to
+            # require_manifest_ok_for_live_run() (see its docstring) already
+            # rejects any of these candidates before run_matrix() is ever
+            # invoked from the CLI, so under normal use this branch is
+            # unreachable. It stays reachable for a caller that invokes
+            # run_matrix() directly without that preflight -- see
+            # TestManifestGate.test_run_matrix_rejects_uncovered_candidate_directly.
             if not candidate_accepted(pair.router, manifest_status) or not candidate_accepted(
                 pair.worker, manifest_status
             ):
@@ -681,8 +805,21 @@ def compute_pass_fail(report: dict[str, Any]) -> tuple[str, list[str]]:
             reasons.append(f"infra: {label} cell status={cell['status']!r}")
         for turn in cell["turns"]:
             query = turn["query"]
+            # A turn whose own status isn't "ok" (provider-error, timeout,
+            # setup-error, skipped) never produced a real result -- its
+            # judge_verdict/deterministic_action_pass/citations_pass/latency
+            # fields are all None (see build_report), so nothing below this
+            # branch has a real signal to check. Without this check a fully
+            # failed, fully-billed run whose every turn timed out or errored
+            # had no per-turn reason recorded here at all (only the cell's
+            # own status, which run_cell previously always reported "ok"
+            # regardless of a turn breaking early -- see run_cell's
+            # cell_status tracking) and could silently read as passing.
+            if turn["status"] != "ok":
+                reasons.append(f"infra: {label} {query!r} turn status={turn['status']!r}")
+                continue
             if turn["judge_verdict"] == "judge-error":
-                reasons.append(f"infra: {label} {query!r} judge-error ({turn['judge_reason']})")
+                reasons.append(f"infra: {label} {query!r} judge-error ({turn['judge_reason']!r})")
             elif turn["judge_verdict"] == "no":
                 reasons.append(f"semantic: {label} {query!r} judge verdict=no")
             elif turn["judge_verdict"] == "continue":
@@ -802,6 +939,31 @@ def _confirm_spend(
     return reply in {"y", "yes"}
 
 
+def _finite_nonnegative_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--max-calls must be an integer: {raw!r}") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"--max-calls must be non-negative: {raw!r}")
+    return value
+
+
+def _finite_nonnegative_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--max-cost must be a number: {raw!r}") from exc
+    # float("nan")/float("inf") both parse without raising -- and a NaN
+    # spend limit makes every comparison in _confirm_spend's `exceeds` check
+    # false (NaN never compares > anything), so an operator who mistypes or
+    # scripts a NaN/inf --max-cost value would silently get an *unbounded*
+    # budget treated as "always within budget" instead of the intended cap.
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"--max-cost must be finite and non-negative: {raw!r}")
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -815,8 +977,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--router", choices=sorted(ROUTER_CANDIDATES_BY_LABEL), default=None)
     parser.add_argument("--worker", choices=sorted(WORKER_CANDIDATES_BY_LABEL), default=None)
     parser.add_argument("--scenario", choices=sorted(SCENARIOS_BY_NAME), default=None)
-    parser.add_argument("--max-calls", type=int, default=None)
-    parser.add_argument("--max-cost", type=float, default=None)
+    parser.add_argument("--max-calls", type=_finite_nonnegative_int, default=None)
+    parser.add_argument("--max-cost", type=_finite_nonnegative_float, default=None)
     parser.add_argument("--yes", action="store_true", help="skip the spend-confirmation prompt")
     parser.add_argument("--i-know-the-manifest-is-stale", action="store_true", dest="allow_stale")
     parser.add_argument("--manifest-path", type=Path, default=DEFAULT_MANIFEST_PATH)
@@ -832,6 +994,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.full_matrix and (args.router or args.worker):
+        # --router/--worker already select a single pair; --full-matrix
+        # asks for the entire cross product. Silently letting --router/
+        # --worker win (the prior behavior) means a typo'd or copy-pasted
+        # --full-matrix flag looks accepted but has no effect -- error out
+        # explicitly instead, per the dev plan's "read the plan for
+        # guidance; if ambiguous, error out explicitly" fallback.
+        parser.error(
+            "--full-matrix conflicts with --router/--worker (which already select one pair)"
+        )
 
     pairs = _resolve_pairs(args)
     scenarios = _resolve_scenarios(args)
@@ -881,9 +1054,13 @@ def main(argv: list[str] | None = None) -> int:
     report = build_report(outcomes, judge_model=args.judge_model)
     print_report_summary(report)
     if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(report, indent=2, sort_keys=True))
-        print(f"\nreport written to {args.out}")
+        try:
+            out_path = confined_output_path(args.out, allowed_root=_REPO_ROOT)
+        except ValueError as exc:
+            print(f"refusing to write report: {exc}", file=sys.stderr)
+            return 1
+        write_no_follow(out_path, json.dumps(report, indent=2, sort_keys=True))
+        print(f"\nreport written to {out_path}")
     return 0 if report["overall_status"] == "PASS" else 1
 
 

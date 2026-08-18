@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from scripts.smoke_conversation import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
+from scripts._eval_common import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
 
 
 @dataclass(frozen=True)
