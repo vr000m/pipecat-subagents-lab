@@ -11,13 +11,15 @@ layering this module exists for in the first place.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from server.config import Config
+from evals.queries import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
+from server.config import Config, PromotionManifest
 from server.perf_metrics import CollectingMeasurementSink
-from server.pipeline import SessionHost
+from server.pipeline import SAFE_FALLBACK_TEXTS, SessionHost
 from server.registry import WorkerRegistry
 from server.router import LazyRouterProvider, Router
 from server.work_item_coordinator import WorkItemCoordinator
@@ -31,29 +33,34 @@ __all__ = [
     "build_judge_llm_service",
     "build_session_for_run",
     "confined_output_path",
+    "error_text",
     "write_no_follow",
 ]
 
+# Light redaction for a low-severity but real risk: an OpenAI client
+# exception's str() can, under a misconfigured proxy or an unusual error
+# path, echo back request metadata -- including an Authorization header or
+# API key -- and this text can end up written verbatim into a git-tracked
+# manifest or report. Not a complete secrets scanner, just a defense-in-depth
+# backstop. Hoisted here (originally scripts/verify_eval_candidates.py-only)
+# so scripts/eval_model_comparison.py's parallel error paths get the same
+# protection -- see the dev plan's round-2 gauntlet findings 4/5.
+_API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{10,}")
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Shared scenario constants. Both scripts/smoke_conversation.py (the live
-# smoke CLI) and evals/scenarios.py (the eval-suite matrix) need the same
-# query text -- hoisted here, not left in scripts/smoke_conversation.py, so
-# evals/scenarios.py and scripts/eval_model_comparison.py don't have to import
-# a script module as a library to get them (the exact layering violation this
-# module's docstring already warns against). scripts/smoke_conversation.py
-# re-exports these names for backward compatibility with existing imports.
-DEFAULT_QUERY = "What is the latest stable Pipecat release?"
-ROUTING_REGRESSION_QUERIES = (
-    "Hi.",
-    "Tell me the weather in Riga. For today.",
-    "Could you tell me the weather in Helsinki today?",
-)
-SAFE_FALLBACKS = {
-    "Routing is temporarily unavailable. Please try that request again.",
-    "The web search is temporarily unavailable.",
-    "I could not find a reliable result for that request.",
-}
+# DEFAULT_QUERY/ROUTING_REGRESSION_QUERIES: re-exported from evals.queries
+# (not defined here) so the scripts <-> evals dependency stays
+# one-directional (scripts -> evals -> server), not the two-way coupling a
+# local definition here plus evals/scenarios.py importing it back would
+# create. scripts/smoke_conversation.py re-exports these names in turn, for
+# backward compatibility with existing imports (including
+# tests/test_smoke_conversation.py).
+# Re-exported (not re-typed) from server.pipeline.SAFE_FALLBACK_TEXTS -- see
+# round-2 gauntlet finding 9: a hand-duplicated copy here would silently
+# desync from a wording change at any of pipeline.py's safe-fallback
+# `text=` call sites, turning this guard into a no-op false PASS.
+SAFE_FALLBACKS = SAFE_FALLBACK_TEXTS
 
 
 def _latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
@@ -91,6 +98,9 @@ def build_session_for_run(
     measurement_sink: Any | None = None,
     router_responses_factory: Callable[[], Any] | None = None,
     worker_responses: Any = None,
+    promotion_manifest: PromotionManifest | None = None,
+    stt: Any | None = None,
+    tts: Any | None = None,
 ) -> SessionHost:
     """Construct a fresh Router/WorkerRegistry/WorkItemCoordinator/SessionHost,
     all bound to this exact per-run ``Config`` at construction time.
@@ -108,11 +118,24 @@ def build_session_for_run(
     is migrated onto this same seam (rather than keeping its own now-obsolete
     post-hoc reassignment idiom) so the two callers never drift apart.
 
-    Text-only by default: ``host.stt``/``host.tts`` are set to ``None`` here,
+    ``promotion_manifest`` mirrors ``server.app._default_session_host()``'s own
+    ``load_promotion_manifest(config)`` -> ``SessionHost(..., promotion_manifest=...)``
+    wiring: omitting it leaves ``SessionHost._promotion_eligible`` permanently
+    ``False`` (fail-closed to the ``"display_only"`` late-delivery disposition
+    regardless of the caller's actual manifest), which is correct for a caller
+    that has no manifest to give but silently wrong for one that does -- a
+    caller exercising the promotion-eligible path (e.g. the ack-ordering
+    smoke) must pass its own resolved manifest through explicitly.
+
+    Text-only by default: ``host.stt``/``host.tts`` default to ``None`` here,
     since every eval/smoke scenario built on this helper drives turns
     directly through ``_handle_transcript`` with no audio in or out. A caller
-    that needs real TTS (e.g. the ack-ordering smoke) reassigns
-    ``host.tts`` itself after construction.
+    that needs real STT/TTS (e.g. the ack-ordering smoke's recording TTS)
+    passes it through the ``stt``/``tts`` keywords -- bound here, at
+    construction, rather than via a post-hoc ``host.tts = ...`` reassignment,
+    since ``SessionHost.__init__`` derives ``self._tts_on_event`` from the
+    constructor's ``tts`` argument only; a reassignment after construction
+    leaves that derived state stale.
     """
     registry = WorkerRegistry(config=config, responses=worker_responses)
     router = Router(
@@ -122,12 +145,13 @@ def build_session_for_run(
     coordinator = WorkItemCoordinator(registry=registry, router=router, config=config)
     host = SessionHost(
         registry=registry,
+        stt=stt,
+        tts=tts,
         coordinator=coordinator,
         measurement_sink=measurement_sink,
         config=config,
+        promotion_manifest=promotion_manifest,
     )
-    host.stt = None
-    host.tts = None
     return host
 
 
@@ -148,6 +172,28 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     from pipecat.services.openai.llm import OpenAILLMService
 
     return OpenAILLMService(settings=OpenAILLMService.Settings(model=model), api_key=api_key)
+
+
+def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 2000) -> str:
+    """Redact-then-truncate an exception's text before it reaches a git-tracked
+    manifest/report or stdout.
+
+    Two redaction passes, in this order: (1) an exact substring replace on
+    ``credential`` -- the actual resolved API key/token, when the caller has
+    it in scope -- which is shape-independent and catches any configured
+    credential form (an Azure OpenAI key, a gateway/proxy token, etc.), not
+    just OpenAI's own ``sk-``-prefixed shape; (2) a fallback pattern match for
+    the ``sk-...`` shape, in case ``credential`` wasn't available at the call
+    site or the leaked text names a *different* credential than the one this
+    call resolved (e.g. a proxy's own upstream key echoed back in an error).
+    Redaction runs before truncation, not after, so a credential split across
+    the truncation boundary can't leave a redactable fragment behind.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    if credential:
+        text = text.replace(credential, "***REDACTED***")
+    text = _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
+    return text[:max_len]
 
 
 def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = None) -> Path:
@@ -180,7 +226,14 @@ def write_no_follow(path: Path, content: str) -> None:
     symlink already resolved by the time it runs its check, but a TOCTOU
     window remains between that check and the actual write unless the write
     itself also refuses to follow a symlink planted in between. ``O_NOFOLLOW``
-    closes that window at the syscall level.
+    closes that window for the final path component only: it guarantees this
+    call won't follow a symlink planted at ``path`` itself between the check
+    and this write, but does not protect against a *parent* directory being
+    swapped for a symlink in that same window (this would require walking
+    ``path.parent`` component-by-component with
+    ``os.open(..., O_DIRECTORY | O_NOFOLLOW)`` and a ``dir_fd``-relative
+    final open, which this function does not do). That residual window
+    requires local write access to the repo tree during the run to exploit.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)

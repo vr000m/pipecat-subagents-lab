@@ -406,6 +406,21 @@ class ConnectionPipeline:
 
 SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "retention_rejected"]
 
+# Every safe-fallback response `text=` this module ever sends -- routing
+# unavailable, worker search unavailable, and no-reliable-result -- hoisted
+# to named constants (referenced at every `text=` call site below) so
+# scripts/_eval_common.py's SAFE_FALLBACKS guard (used by the eval-suite
+# runner and the live smoke CLI to detect a host that silently fell back
+# instead of producing a real result) can import SAFE_FALLBACK_TEXTS instead
+# of hand-duplicating the literals. A wording change here now updates that
+# guard automatically instead of silently turning it into a no-op false PASS.
+_ROUTING_UNAVAILABLE_TEXT = "Routing is temporarily unavailable. Please try that request again."
+_SEARCH_UNAVAILABLE_TEXT = "The web search is temporarily unavailable."
+_NO_RELIABLE_RESULT_TEXT = "I could not find a reliable result for that request."
+SAFE_FALLBACK_TEXTS = frozenset(
+    {_ROUTING_UNAVAILABLE_TEXT, _SEARCH_UNAVAILABLE_TEXT, _NO_RELIABLE_RESULT_TEXT}
+)
+
 
 @dataclass(frozen=True)
 class SearchExecution:
@@ -1275,7 +1290,7 @@ class SessionHost:
                     canonical_result(
                         worker_id="main",
                         turn_id=turn_id,
-                        text="Routing is temporarily unavailable. Please try that request again.",
+                        text=_ROUTING_UNAVAILABLE_TEXT,
                         origin_epoch=origin_epoch,
                     ),
                     origin,
@@ -1568,7 +1583,7 @@ class SessionHost:
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="I could not find a reliable result for that request.",
+                    text=_NO_RELIABLE_RESULT_TEXT,
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "declined"
@@ -1581,7 +1596,7 @@ class SessionHost:
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="The web search is temporarily unavailable.",
+                    text=_SEARCH_UNAVAILABLE_TEXT,
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "failed"
@@ -1776,7 +1791,7 @@ class SessionHost:
                     return canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
-                        text="I could not find a reliable result for that request.",
+                        text=_NO_RELIABLE_RESULT_TEXT,
                         origin_epoch=origin.epoch,
                     )
 
@@ -1985,7 +2000,7 @@ class SessionHost:
                         results[index] = canonical_result(
                             worker_id="main",
                             turn_id=f"{turn_id}-{index}",
-                            text="Routing is temporarily unavailable. Please try that request again.",
+                            text=_ROUTING_UNAVAILABLE_TEXT,
                             origin_epoch=origin.epoch,
                         )
                         turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
@@ -2135,7 +2150,7 @@ class SessionHost:
                     return canonical_result(
                         worker_id=worker_id,
                         turn_id=item_turn_id,
-                        text="I could not find a reliable result for that request.",
+                        text=_NO_RELIABLE_RESULT_TEXT,
                         origin_epoch=origin.epoch,
                     )
 
@@ -2318,7 +2333,7 @@ class SessionHost:
                 results[item_index] = canonical_result(
                     worker_id=failure.worker_id,
                     turn_id=f"{turn_id}-{item_index}",
-                    text="The web search is temporarily unavailable.",
+                    text=_SEARCH_UNAVAILABLE_TEXT,
                     origin_epoch=origin.epoch,
                 )
                 failure_outcome = self._failure_child_outcome(failure)

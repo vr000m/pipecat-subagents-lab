@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -38,7 +37,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._eval_common import build_judge_llm_service, confined_output_path, write_no_follow
+from scripts._eval_common import (
+    build_judge_llm_service,
+    confined_output_path,
+    error_text,
+    write_no_follow,
+)
 
 MANIFEST_VERSION = 1
 # Tracked in git (not `.review-plan/`, which is gitignored) -- Phase 2's runner
@@ -99,20 +103,6 @@ class ProbeResult:
     accepted: bool
     error: str | None
     response_id: str | None = None
-
-
-# Light redaction for a low-severity but real risk: an OpenAI client
-# exception's str() can, under a misconfigured proxy or an unusual error
-# path, echo back request metadata -- including an Authorization header or
-# API key -- and this text is written verbatim into a git-tracked manifest.
-# Not a complete secrets scanner, just a defense-in-depth backstop for the
-# one credential shape this repo actually issues (OpenAI secret keys).
-_API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{10,}")
-
-
-def _error_text(exc: Exception) -> str:
-    text = f"{type(exc).__name__}: {exc}"[:2000]
-    return _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
 
 
 def _router_timeout_seconds() -> float:
@@ -235,24 +225,37 @@ def _sync_models_client(api_key: str) -> Any:
     return OpenAI(api_key=api_key).models
 
 
-def probe_model_existence(models_client: Any, model: str) -> ProbeResult:
+def probe_model_existence(models_client: Any, model: str, *, api_key: str | None) -> ProbeResult:
     try:
         models_client.retrieve(model)
     except Exception as exc:  # noqa: BLE001 - report every rejection reason, not just known types
         return ProbeResult(
-            "model_existence", model, None, [], {"model": model}, False, _error_text(exc)
+            "model_existence",
+            model,
+            None,
+            [],
+            {"model": model},
+            False,
+            error_text(exc, credential=api_key),
         )
     return ProbeResult("model_existence", model, None, [], {"model": model}, True, None)
 
 
 def probe_router(
-    responses_client: Any, model: str, effort: str | None, *, router_timeout_seconds: float
+    responses_client: Any,
+    model: str,
+    effort: str | None,
+    *,
+    router_timeout_seconds: float,
+    api_key: str | None,
 ) -> ProbeResult:
     kwargs = _build_router_kwargs(model, effort, router_timeout_seconds=router_timeout_seconds)
     try:
         response = responses_client.create(**kwargs)
     except Exception as exc:  # noqa: BLE001
-        return ProbeResult("router", model, effort, ["text"], kwargs, False, _error_text(exc))
+        return ProbeResult(
+            "router", model, effort, ["text"], kwargs, False, error_text(exc, credential=api_key)
+        )
     return ProbeResult(
         "router",
         model,
@@ -265,12 +268,22 @@ def probe_router(
     )
 
 
-def probe_worker(responses_client: Any, model: str, effort: str | None) -> ProbeResult:
+def probe_worker(
+    responses_client: Any, model: str, effort: str | None, *, api_key: str | None
+) -> ProbeResult:
     kwargs = _build_worker_kwargs(model, effort)
     try:
         response = responses_client.create(**kwargs)
     except Exception as exc:  # noqa: BLE001
-        return ProbeResult("worker", model, effort, ["web_search"], kwargs, False, _error_text(exc))
+        return ProbeResult(
+            "worker",
+            model,
+            effort,
+            ["web_search"],
+            kwargs,
+            False,
+            error_text(exc, credential=api_key),
+        )
     return ProbeResult(
         "worker",
         model,
@@ -300,7 +313,9 @@ def probe_judge(judge_model: str, api_key: str | None) -> ProbeResult:
     try:
         response = asyncio.run(_call())
     except Exception as exc:  # noqa: BLE001
-        return ProbeResult("judge", judge_model, None, [], kwargs, False, _error_text(exc))
+        return ProbeResult(
+            "judge", judge_model, None, [], kwargs, False, error_text(exc, credential=api_key)
+        )
     return ProbeResult(
         "judge",
         judge_model,
@@ -364,15 +379,19 @@ def run_verification(*, judge_model: str) -> tuple[list[ProbeResult], float]:
 
     results: list[ProbeResult] = []
     for model in _model_existence_ids(judge_model):
-        results.append(probe_model_existence(models_client, model))
+        results.append(probe_model_existence(models_client, model, api_key=api_key))
     for model, effort in ROUTER_CANDIDATES:
         results.append(
             probe_router(
-                responses_client, model, effort, router_timeout_seconds=router_timeout_seconds
+                responses_client,
+                model,
+                effort,
+                router_timeout_seconds=router_timeout_seconds,
+                api_key=api_key,
             )
         )
     for model, effort in WORKER_CANDIDATES:
-        results.append(probe_worker(responses_client, model, effort))
+        results.append(probe_worker(responses_client, model, effort, api_key=api_key))
     results.append(probe_judge(judge_model, api_key))
     return results, router_timeout_seconds
 
@@ -446,12 +465,17 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # Printed BEFORE the write, not after: write_manifest() can raise OSError
+    # (write_no_follow()'s target is a directory, unwritable, or a symlink --
+    # ELOOP) as well as ValueError, and every result above is already a real,
+    # billed probe outcome -- an operator must see it regardless of whether
+    # the manifest write itself then fails.
+    _print_summary(results)
     try:
         manifest = write_manifest(Path(args.out), results)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         print(f"refusing to write manifest: {exc}", file=sys.stderr)
         return 2
-    _print_summary(results)
     print(f"\nmanifest written to {args.out} (source_commit={manifest['source_commit']})")
 
     if any(not result.accepted for result in results):

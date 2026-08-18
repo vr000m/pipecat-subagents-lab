@@ -891,6 +891,33 @@ class TestScenarioDefinitions:
     def test_two_scenarios_are_defined(self) -> None:
         assert len(eval_scenarios.SCENARIOS) == 2
 
+    def test_evals_package_does_not_import_scripts(self) -> None:
+        """Regression for round-2 gauntlet finding 8: evals/scenarios.py used
+        to import its query constants from scripts/_eval_common.py, making
+        scripts <-> evals bidirectionally coupled at the package level (since
+        scripts/eval_model_comparison.py already imports evals.scenarios).
+        The constants now live in evals/queries.py, so evals/ has no
+        dependency on scripts/ at all.
+        """
+        import ast
+        from pathlib import Path
+
+        evals_dir = Path(eval_scenarios.__file__).parent
+        for py_file in evals_dir.glob("*.py"):
+            tree = ast.parse(py_file.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    assert not node.module.startswith("scripts"), (
+                        f"{py_file.name} imports from {node.module!r} -- "
+                        "evals/ must not depend on scripts/"
+                    )
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        assert not alias.name.startswith("scripts"), (
+                            f"{py_file.name} imports {alias.name!r} -- "
+                            "evals/ must not depend on scripts/"
+                        )
+
     def test_ack_ordering_scenario_is_excluded(self) -> None:
         names = [s.name for s in eval_scenarios.SCENARIOS]
         assert not any("ack" in name.lower() for name in names)
@@ -1043,6 +1070,175 @@ class TestTurnFailurePropagatesToCellAndReport:
         outcome = self._run(monkeypatch, failure=RuntimeError("every turn fails"))
         report = eval_runner.build_report([outcome], judge_model="gpt-5-mini")
         assert report["overall_status"] == "FAIL"
+
+
+class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
+    """Regression for round-2 gauntlet finding 12: an exception raised mid-loop
+    AFTER at least one turn already completed and was billed (e.g.
+    ``_latest_turn_stage_metrics()`` raising because no
+    ``app_turn_foreground`` record was emitted) previously landed in the
+    outer handler that unconditionally set ``cell_status = "setup-error"`` --
+    misreporting a mid-turn failure as if nothing had run yet. Fixed by
+    checking whether ``turns`` already has entries: "turn-error" if so,
+    "setup-error" only if the exception happened before any turn completed.
+    """
+
+    def test_failure_after_a_completed_turn_is_turn_error_not_setup_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        calls = {"n": 0}
+
+        def _stage_metrics_fails_on_second_turn(
+            _sink: Any, _elapsed_ms: float, _turn_id: str
+        ) -> dict[str, float]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0}
+            raise RuntimeError("no app_turn_foreground metric was emitted for turn_id='turn-1'")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner, "_latest_turn_stage_metrics", _stage_metrics_fails_on_second_turn
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "turn-error"
+        # The first turn actually ran and was billed -- it must be recorded
+        # as "ok", not swallowed into the failure.
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[0].query == "turn one"
+
+    def test_failure_before_any_turn_completes_is_still_setup_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            eval_runner,
+            "build_session_for_run",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no host for you")),
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+
+
+class TestSkippedTurnBackfillDedupesByIndexNotQueryText:
+    """Regression for round-2 gauntlet finding 11: the skipped-turn backfill
+    previously deduped on query TEXT (``{t.query for t in turns}``), so a
+    scenario with a repeated query string under-reported which turns were
+    skipped -- a trailing duplicate query was silently absent from the
+    backfill instead of being marked "skipped". Fixed by backfilling by
+    INDEX (``scenario.turns[len(turns):]``) since ``turns`` is appended
+    strictly in scenario order.
+    """
+
+    def test_a_repeated_query_after_the_failure_is_still_backfilled_as_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _FailsOnSecondCallHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def start(self) -> None:
+                pass
+
+            async def connect(self, _handshake: dict[str, Any]) -> str:
+                return "connection-1"
+
+            async def _handle_transcript(self, query: str, *, origin: Any) -> Any:
+                del origin, query
+                self.calls += 1
+                if self.calls == 1:
+                    return _FakeResult(
+                        ui_text="a distinctly non-fallback reply",
+                        spoken_text="a distinctly non-fallback spoken reply",
+                        citations=[],
+                        turn_id="turn-1",
+                    )
+                raise RuntimeError("second turn fails")
+
+            async def shutdown(self) -> None:
+                pass
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FailsOnSecondCallHost()
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner,
+            "_latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        # Turns 1 and 3 share the same query text -- a text-based dedup would
+        # wrongly treat turn 3 as "already attempted" (because turn 1's query
+        # matches it) and silently drop it from the backfill.
+        scenario = Scenario(
+            name="repeated-query-fixture",
+            turns=(
+                Turn(query="same query"),
+                Turn(query="a different query"),
+                Turn(query="same query"),
+            ),
+        )
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert len(outcome.turns) == 3
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[1].status == "provider-error"
+        assert outcome.turns[2].query == "same query"
+        assert outcome.turns[2].status == "skipped"
 
 
 class TestHostLifecycleExceptionsDontCrashTheMatrix:
@@ -1390,3 +1586,176 @@ class TestJudgeInputSanitization:
     def test_length_is_capped(self) -> None:
         long_text = "a" * 10_000
         assert len(eval_runner._sanitize_for_judge(long_text, max_len=100)) == 100
+
+
+class TestRunCellSetupExceptionsDontCrashTheMatrix:
+    """Regression for round-2 gauntlet finding 2: run_cell()'s own setup work
+    (config resolution, host/judge construction) previously sat OUTSIDE the
+    function's try/finally -- an exception there would propagate out of
+    run_cell() uncaught, and run_matrix() doesn't catch it either, so it
+    would abort the whole matrix and discard every already-billed cell with
+    no report ever written. Setup work is now inside the try, with a `host =
+    None` sentinel so the finally block only shuts down a host that was
+    actually constructed.
+    """
+
+    def test_per_run_config_raising_is_classified_setup_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            eval_runner,
+            "_per_run_config",
+            lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad config")),
+        )
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "bad config" in (outcome.error or "")
+
+    def test_judge_construction_raising_after_host_built_still_shuts_down_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Secondary bug in the same finding: host is constructed BEFORE the
+        # judge, so an exception during judge construction must not leak the
+        # already-constructed host -- shutdown() must still run.
+        shutdown_calls: list[bool] = []
+
+        class _TrackedHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            async def start(self) -> None:
+                raise AssertionError("start() must not be reached if judge construction failed")
+
+            async def connect(self, _h: Any) -> str:
+                raise AssertionError("connect() must not be reached")
+
+            async def _handle_transcript(self, *_a: Any, **_k: Any) -> Any:
+                raise AssertionError("a turn must not run")
+
+            async def shutdown(self) -> None:
+                shutdown_calls.append(True)
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", lambda *_a, **_k: _TrackedHost())
+        monkeypatch.setattr(
+            eval_runner,
+            "build_judge_llm_service",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("judge service unavailable")),
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "judge service unavailable" in (outcome.error or "")
+        assert shutdown_calls == [True]
+
+    def test_shutdown_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A shutdown() failure itself must not crash run_matrix or mask a
+        # genuinely "ok" cell's outcome by raising out of run_cell().
+        class _FailingShutdownHost(_FakeHost):
+            async def shutdown(self) -> None:
+                raise RuntimeError("shutdown exploded")
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FailingShutdownHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner,
+            "_latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "shutdown exploded" in (outcome.error or "")
+
+
+class TestManifestDiagnosticsPrintEffectiveEffort:
+    """Regression for round-2 gauntlet finding 13: the "absent from manifest"
+    error and the dry-run matrix preview must print the EFFECTIVE (resolved)
+    effort, not the raw candidate.effort -- for the router baseline,
+    candidate.effort is None but the manifest lookup actually resolved and
+    checked "minimal" (server.router.effective_router_reasoning_effort's
+    gpt-5* conditional). Printing the raw None would show an operator a
+    combination that isn't the one actually looked up.
+    """
+
+    def test_missing_baseline_error_names_the_effective_effort_not_none(
+        self, tmp_path: Path
+    ) -> None:
+        # Manifest exists but doesn't cover the router baseline at all.
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        with pytest.raises(eval_runner.ManifestError) as excinfo:
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=True,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+        message = str(excinfo.value)
+        assert "@minimal" in message
+        assert "@None" not in message
+
+    def test_dry_run_preview_prints_effective_effort_for_the_baseline_pair(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (Scenario(name="s", turns=(Turn(query="hi"),)),),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+        )
+
+        out = capsys.readouterr().out
+        assert "router=gpt-5-mini@minimal" in out
+        assert "router=gpt-5-mini@None" not in out

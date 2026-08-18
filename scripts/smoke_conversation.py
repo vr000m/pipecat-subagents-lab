@@ -37,6 +37,28 @@ __all__ = [
 RESULT_PREFIX = "SMOKE_RESULT="
 
 
+class _RecordingTTS:
+    """No-audio-synthesis TTS stand-in for the ack-ordering scenario -- lets
+    the scheduler treat the connection as TTS-capable (so it actually admits
+    the early ack) without paying for real speech synthesis. Module-level (not
+    nested in ``_run_ack_ordering``) so ``_run_child`` can construct it and
+    pass it into ``build_session_for_run(..., tts=...)`` at construction time,
+    rather than the post-hoc ``host.tts = ...`` reassignment
+    ``build_session_for_run``'s own docstring warns leaves
+    ``SessionHost._tts_on_event`` stale.
+    """
+
+    on_event = None
+
+    @staticmethod
+    def correlated_speak_frame(text: str, *, correlation_id: str, append_to_context: bool) -> Any:
+        from server.services.tts import CorrelatedTTSSpeakFrame
+
+        return CorrelatedTTSSpeakFrame(
+            text=text, correlation_id=correlation_id, append_to_context=append_to_context
+        )
+
+
 async def _run_child(
     query: str,
     *,
@@ -46,7 +68,7 @@ async def _run_child(
     ack_ordering: bool,
     max_ack_seconds: float,
 ) -> dict[str, Any]:
-    from server.config import load_config
+    from server.config import load_config, load_promotion_manifest
     from server.perf_metrics import CollectingMeasurementSink
 
     sink = CollectingMeasurementSink()
@@ -70,10 +92,26 @@ async def _run_child(
             max_latency_seconds + 15,
         ),
     )
-    host = build_session_for_run(tuned, measurement_sink=sink)
+    # Mirrors server/app.py's own _default_session_host() wiring: without this,
+    # SessionHost._promotion_eligible is permanently False for every host this
+    # helper builds (build_session_for_run()'s promotion_manifest defaults to
+    # None), which silently forces late_delivery_disposition() onto its
+    # "display_only" branch regardless of the real manifest -- this smoke's
+    # ack-ordering scenario is the live acceptance test for that predicate, so
+    # it must see the real disposition, not a hardcoded fallback.
+    promotion_manifest = load_promotion_manifest(tuned)
+    # The single-turn and routing-regression scenarios don't exercise speech
+    # at all, so they build with TTS disabled; only ack-ordering needs the
+    # recording TTS wired in (bound at construction -- see _RecordingTTS's
+    # own docstring for why a post-hoc reassignment isn't used instead).
+    host = build_session_for_run(
+        tuned,
+        measurement_sink=sink,
+        promotion_manifest=promotion_manifest,
+        tts=_RecordingTTS() if ack_ordering else None,
+    )
     # This smoke isolates the paid semantic path. Browser media and local
     # speech have separate deterministic/live acceptance commands.
-    # build_session_for_run() already sets host.stt/host.tts = None.
     await host.start()
     try:
         if ack_ordering:
@@ -85,10 +123,6 @@ async def _run_child(
                 sink=sink,
                 max_routing_seconds=max_routing_seconds,
             )
-        # The single-turn and routing-regression scenarios don't exercise
-        # speech at all, so they run with TTS disabled (see _run_ack_ordering
-        # for the scenario that needs it wired up).
-        host.tts = None
         connection = await host.connect(
             {
                 "session_id": host.state.session_id,
@@ -187,24 +221,13 @@ async def _run_ack_ordering(
     paid-provider delegated search is still in flight -- the externally
     observable contract ``tests/test_pipeline.py::
     test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch``
-    proves against a fake coordinator/worker. Uses a recording TTS/worker
-    (no audio synthesis, no extra cost) so the scheduler treats this
-    connection as TTS-capable and actually admits the ack, instead of the
-    ``host.tts = None`` isolation the other scenarios use.
+    proves against a fake coordinator/worker. Relies on the caller (see
+    ``_run_child``) having built ``host`` with the module-level
+    ``_RecordingTTS`` (no audio synthesis, no extra cost) so the scheduler
+    treats this connection as TTS-capable and actually admits the ack,
+    instead of the ``tts=None`` isolation the other scenarios use.
     """
-    from server.services.tts import CorrelatedTTSSpeakFrame
     from server.speech_scheduler import ROLE_ACK, ROLE_RESULT
-
-    class _RecordingTTS:
-        on_event = None
-
-        @staticmethod
-        def correlated_speak_frame(
-            text: str, *, correlation_id: str, append_to_context: bool
-        ) -> CorrelatedTTSSpeakFrame:
-            return CorrelatedTTSSpeakFrame(
-                text=text, correlation_id=correlation_id, append_to_context=append_to_context
-            )
 
     class _RecordingWorker:
         async def queue_frame(self, frame: object) -> None:
@@ -213,7 +236,6 @@ async def _run_ack_ordering(
         async def cancel(self, *, reason: str) -> None:
             del reason
 
-    host.tts = _RecordingTTS()
     connection = await host.connect(
         {
             "session_id": host.state.session_id,

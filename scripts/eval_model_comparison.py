@@ -42,6 +42,7 @@ from scripts._eval_common import (
     build_judge_llm_service,
     build_session_for_run,
     confined_output_path,
+    error_text,
     write_no_follow,
 )
 from server.config import Config, load_config
@@ -320,7 +321,14 @@ def require_manifest_ok_for_live_run(
         )
     missing = [c for c in candidates if not candidate_accepted(c, status)]
     if missing:
-        described = ", ".join(f"{c.role}:{c.model}@{c.effort}" for c in missing)
+        # Prints the effective (resolved) effort, not the raw candidate.effort
+        # -- for the baseline router candidate, .effort is None but the
+        # manifest lookup (candidate_accepted(), just above) actually checked
+        # the resolved "minimal" value; printing the raw None here would show
+        # an operator a combination that isn't the one actually looked up.
+        described = ", ".join(
+            f"{c.role}:{c.model}@{_effective_effort_for_manifest_lookup(c)}" for c in missing
+        )
         raise ManifestError(
             f"the following (model, effort) combinations are absent from the manifest and "
             f"cannot be run: {described}"
@@ -417,10 +425,13 @@ def print_matrix_preview(
         router_ok = candidate_accepted(pair.router, status)
         worker_ok = candidate_accepted(pair.worker, status)
         flag = "" if router_ok and worker_ok else "  <-- NOT in manifest, would refuse to run"
+        # Effective (resolved) effort, not the raw candidate.effort -- see
+        # require_manifest_ok_for_live_run()'s matching fix for why.
         print(
             f"  {pair.label}  "
-            f"[router={pair.router.model}@{pair.router.effort}, "
-            f"worker={pair.worker.model}@{pair.worker.effort}]{flag}"
+            f"[router={pair.router.model}@{_effective_effort_for_manifest_lookup(pair.router)}, "
+            f"worker={pair.worker.model}@{_effective_effort_for_manifest_lookup(pair.worker)}]"
+            f"{flag}"
         )
     print()
     for scenario in scenarios:
@@ -473,7 +484,7 @@ class TurnOutcome:
 class CellOutcome:
     pair_label: str
     scenario_name: str
-    status: str  # "ok" | "provider-error" | "timeout" | "setup-error" | "manifest-rejected"
+    status: str  # "ok" | "provider-error" | "timeout" | "setup-error" | "turn-error" | "manifest-rejected"
     error: str | None = None
     turns: list[TurnOutcome] | None = None
     router_timeout_seconds: float | None = None
@@ -547,33 +558,6 @@ async def run_cell(
     max_routing_seconds: float,
     max_latency_seconds: float,
 ) -> CellOutcome:
-    from pipecat.evals.judge import EvalJudge
-
-    config = _per_run_config(
-        base_config,
-        pair,
-        max_routing_seconds=max_routing_seconds,
-        max_latency_seconds=max_latency_seconds,
-    )
-    # Pre-call assertion: the per-run Config resolves to exactly this cell's
-    # candidate model/effort -- checkable before any paid call happens.
-    resolved_router_model = config.resolve_router_model("fast")
-    resolved_router_effort = config.resolve_router_reasoning_effort("fast")
-    if resolved_router_model != pair.router.model or resolved_router_effort != pair.router.effort:
-        return CellOutcome(
-            pair_label=pair.label,
-            scenario_name=scenario.name,
-            status="setup-error",
-            error=(
-                f"router config did not resolve to the candidate: "
-                f"got {resolved_router_model}@{resolved_router_effort}, "
-                f"wanted {pair.router.model}@{pair.router.effort}"
-            ),
-        )
-
-    sink = CollectingMeasurementSink()
-    host = build_session_for_run(config, measurement_sink=sink)
-    judge = EvalJudge(build_judge_llm_service(judge_model, config.openai_api_key))
     turns: list[TurnOutcome] = []
     # Worker IDs are minted as f"worker-{len(self._workers)+1}"
     # (server/registry.py) and can only repeat if a worker is evicted --
@@ -588,8 +572,48 @@ async def run_cell(
     # every turn) still sees that the cell didn't complete cleanly.
     cell_status = "ok"
     cell_error: str | None = None
+    # None until build_session_for_run() actually succeeds -- the finally
+    # block below only shuts a host down that was actually constructed, so an
+    # exception raised during setup (config resolution, judge construction)
+    # before the host exists can't call shutdown() on nothing.
+    host: Any | None = None
+    config: Config | None = None
 
     try:
+        from pipecat.evals.judge import EvalJudge
+
+        config = _per_run_config(
+            base_config,
+            pair,
+            max_routing_seconds=max_routing_seconds,
+            max_latency_seconds=max_latency_seconds,
+        )
+        # Pre-call assertion: the per-run Config resolves to exactly this
+        # cell's candidate model/effort -- checkable before any paid call
+        # happens.
+        resolved_router_model = config.resolve_router_model("fast")
+        resolved_router_effort = config.resolve_router_reasoning_effort("fast")
+        if (
+            resolved_router_model != pair.router.model
+            or resolved_router_effort != pair.router.effort
+        ):
+            return CellOutcome(
+                pair_label=pair.label,
+                scenario_name=scenario.name,
+                status="setup-error",
+                error=(
+                    f"router config did not resolve to the candidate: "
+                    f"got {resolved_router_model}@{resolved_router_effort}, "
+                    f"wanted {pair.router.model}@{pair.router.effort}"
+                ),
+            )
+
+        sink = CollectingMeasurementSink()
+        # Assigned to the outer `host` (not a local) as soon as it's
+        # constructed, before judge construction can raise and leak it.
+        host = build_session_for_run(config, measurement_sink=sink)
+        judge = EvalJudge(build_judge_llm_service(judge_model, config.openai_api_key))
+
         await host.start()
         connection = await host.connect(_connect_handshake(host))
         for turn in scenario.turns:
@@ -607,7 +631,7 @@ async def run_cell(
                 break
             except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
                 outcome.status = "provider-error"
-                outcome.judge_reason = f"{exc.__class__.__name__}: {exc}"
+                outcome.judge_reason = error_text(exc, credential=config.openai_api_key)
                 turns.append(outcome)
                 cell_status, cell_error = "provider-error", outcome.judge_reason
                 break
@@ -683,7 +707,8 @@ async def run_cell(
                 except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
                     outcome.judge_verdict = "judge-error"
                     outcome.judge_reason = (
-                        f"judge.evaluate() raised: {exc.__class__.__name__}: {exc}"
+                        f"judge.evaluate() raised: "
+                        f"{error_text(exc, credential=config.openai_api_key)}"
                     )
                 else:
                     # pipecat's EvalJudge.evaluate() (pipecat/evals/judge.py) signals
@@ -705,24 +730,48 @@ async def run_cell(
 
             turns.append(outcome)
     except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
+        # Setup work (config resolution, host/judge construction) or
         # host.start()/host.connect() (or any other unexpected exception that
         # escaped the per-turn handling above) must not abort run_matrix
         # uncaught -- that would discard every already-completed and
         # already-billed cell with no report ever written, contradicting this
         # function's own "classify, don't crash the matrix" contract.
-        cell_status = "setup-error"
-        cell_error = f"{exc.__class__.__name__}: {exc}"
+        #
+        # "setup-error" only if no turn ever completed -- if `turns` already
+        # has entries, the exception happened mid-loop, after at least one
+        # turn ran (and was billed) successfully, e.g. from
+        # _latest_turn_stage_metrics() raising (no app_turn_foreground
+        # record emitted for a turn) or a malformed _handle_transcript
+        # return value's attribute access failing. That in-flight turn
+        # actually ran; misattributing it to "setup" would misreport a
+        # mid-turn failure as if nothing had run yet.
+        cell_status = "turn-error" if turns else "setup-error"
+        cell_error = error_text(exc, credential=config.openai_api_key if config else None)
     finally:
-        await host.shutdown()
+        if host is not None:
+            try:
+                await host.shutdown()
+            except Exception as shutdown_exc:  # noqa: BLE001 -- never mask the original outcome
+                # A shutdown failure must not crash run_matrix or overwrite a
+                # real cell outcome/error above -- surface it only if nothing
+                # else already explains why this cell isn't "ok".
+                if cell_status == "ok":
+                    cell_status = "setup-error"
+                    cell_error = (
+                        "host.shutdown() raised: "
+                        f"{error_text(shutdown_exc, credential=config.openai_api_key if config else None)}"
+                    )
 
     if cell_status != "ok":
         # Record every turn the scenario defines but this cell never
         # attempted, so a reader of the report can tell "ran and failed" from
         # "never got here" instead of the turn silently being absent.
-        attempted_queries = {t.query for t in turns}
-        for remaining_turn in scenario.turns:
-            if remaining_turn.query not in attempted_queries:
-                turns.append(TurnOutcome(query=remaining_turn.query, status="skipped"))
+        # Backfilled by INDEX, not by deduping on query text: `turns` is
+        # appended strictly in scenario order, so a scenario with a repeated
+        # query string (a text-based dedup would under-report it) is still
+        # backfilled correctly this way.
+        for remaining_turn in scenario.turns[len(turns) :]:
+            turns.append(TurnOutcome(query=remaining_turn.query, status="skipped"))
 
     return CellOutcome(
         pair_label=pair.label,
@@ -730,8 +779,10 @@ async def run_cell(
         status=cell_status,
         error=cell_error,
         turns=turns,
-        router_timeout_seconds=config.router_timeout_seconds,
-        foreground_search_timeout_seconds=config.foreground_search_timeout_seconds,
+        router_timeout_seconds=config.router_timeout_seconds if config is not None else None,
+        foreground_search_timeout_seconds=(
+            config.foreground_search_timeout_seconds if config is not None else None
+        ),
     )
 
 
@@ -785,7 +836,13 @@ async def run_matrix(
 # --------------------------------------------------------------------------
 
 
-_CELL_INFRA_FAILURE_STATUSES = {"provider-error", "timeout", "setup-error", "manifest-rejected"}
+_CELL_INFRA_FAILURE_STATUSES = {
+    "provider-error",
+    "timeout",
+    "setup-error",
+    "turn-error",
+    "manifest-rejected",
+}
 
 
 def compute_pass_fail(report: dict[str, Any]) -> tuple[str, list[str]]:
@@ -1056,10 +1113,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.out:
         try:
             out_path = confined_output_path(args.out, allowed_root=_REPO_ROOT)
-        except ValueError as exc:
+            write_no_follow(out_path, json.dumps(report, indent=2, sort_keys=True))
+        except (ValueError, OSError) as exc:
             print(f"refusing to write report: {exc}", file=sys.stderr)
             return 1
-        write_no_follow(out_path, json.dumps(report, indent=2, sort_keys=True))
         print(f"\nreport written to {out_path}")
     return 0 if report["overall_status"] == "PASS" else 1
 
