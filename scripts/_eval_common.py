@@ -24,7 +24,7 @@ from typing import Any
 from evals.queries import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
 from server.config import Config, PromotionManifest
 from server.perf_metrics import CollectingMeasurementSink
-from server.pipeline import SAFE_FALLBACK_TEXTS, SessionHost
+from server.pipeline import SAFE_FALLBACK_TEXTS, TIMEOUT_FALLBACK_TEXTS, SessionHost
 from server.registry import WorkerRegistry
 from server.router import LazyRouterProvider, Router
 from server.work_item_coordinator import WorkItemCoordinator
@@ -33,12 +33,14 @@ __all__ = [
     "DEFAULT_QUERY",
     "ROUTING_REGRESSION_QUERIES",
     "SAFE_FALLBACKS",
+    "TIMEOUT_FALLBACKS",
     "CollectingMeasurementSink",
     "_latest_turn_stage_metrics",
     "build_judge_llm_service",
     "build_session_for_run",
     "confined_output_path",
     "error_text",
+    "strip_control_chars",
     "write_no_follow",
 ]
 
@@ -51,6 +53,17 @@ __all__ = [
 # so scripts/eval_model_comparison.py's parallel error paths get the same
 # protection -- see the dev plan's round-2 gauntlet findings 4/5.
 _API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{10,}")
+
+# ASCII control characters (excluding newline/tab, which are legitimate in
+# multi-line provider error text) that a raw provider-exception body could
+# carry -- e.g. ANSI escape sequences -- and that would otherwise reach an
+# operator's terminal unmodified via a raw ``print()`` sink. Defense-in-depth
+# only: this is not a prompt-injection defense (see
+# scripts/eval_model_comparison.py's ``_sanitize_for_judge``, which reuses
+# this same filter for the judge-context sink), just a bound on how much raw
+# control-character content reaches a terminal or git-tracked artifact
+# unmodified. See round-4 gauntlet finding 7.
+_CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,6 +79,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 # desync from a wording change at any of pipeline.py's safe-fallback
 # `text=` call sites, turning this guard into a no-op false PASS.
 SAFE_FALLBACKS = SAFE_FALLBACK_TEXTS
+# Re-exported (not re-typed) from server.pipeline.TIMEOUT_FALLBACK_TEXTS, for
+# the same reason as SAFE_FALLBACKS above -- kept as its own set (not folded
+# into SAFE_FALLBACKS) because a timeout placeholder is a distinct failure
+# mode ("too slow", not "broken") a caller wants to score separately. See
+# round-4 gauntlet finding 2.
+TIMEOUT_FALLBACKS = TIMEOUT_FALLBACK_TEXTS
 
 
 def _latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
@@ -179,6 +198,19 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     return OpenAILLMService(settings=OpenAILLMService.Settings(model=model), api_key=api_key)
 
 
+def strip_control_chars(text: str) -> str:
+    """Strip ASCII control characters (other than newline/tab) from ``text``.
+
+    Shared by ``error_text`` below and
+    ``scripts/eval_model_comparison.py``'s ``_sanitize_for_judge`` -- both
+    sinks receive raw, externally-sourced (provider/exception) text and need
+    the same bound on control-character content, so the filter lives here
+    once rather than as two independently-maintained copies. See round-4
+    gauntlet finding 7.
+    """
+    return _CONTROL_CHAR_PATTERN.sub("", text)
+
+
 def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 2000) -> str:
     """Redact-then-truncate an exception's text before it reaches a git-tracked
     manifest/report or stdout.
@@ -192,12 +224,20 @@ def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 
     site or the leaked text names a *different* credential than the one this
     call resolved (e.g. a proxy's own upstream key echoed back in an error).
     Redaction runs before truncation, not after, so a credential split across
-    the truncation boundary can't leave a redactable fragment behind.
+    the truncation boundary can't leave a redactable fragment behind. Control
+    characters (e.g. ANSI escape sequences a provider error body could carry)
+    are stripped in the same pass, before truncation, for the same reason --
+    every other sink already escapes/represents these safely
+    (``compute_pass_fail`` via ``!r``, ``json.dumps``), but this function's
+    two callers (``eval_model_comparison.py``'s summary print,
+    ``verify_eval_candidates.py``'s ``_print_summary``) write raw text
+    straight to a terminal.
     """
     text = f"{type(exc).__name__}: {exc}"
     if credential:
         text = text.replace(credential, "***REDACTED***")
     text = _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
+    text = strip_control_chars(text)
     return text[:max_len]
 
 

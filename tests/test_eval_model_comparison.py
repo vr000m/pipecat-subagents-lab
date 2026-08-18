@@ -2026,3 +2026,262 @@ class TestManifestDiagnosticsPrintEffectiveEffort:
         out = capsys.readouterr().out
         assert "router=gpt-5-mini@minimal" in out
         assert "router=gpt-5-mini@None" not in out
+
+
+# ---------------------------------------------------------------------------
+# Round 4 gauntlet regressions.
+# ---------------------------------------------------------------------------
+
+
+class TestLatencyBudgetRejectsNonFinite:
+    """Regression for round-4 finding 1: --max-latency-seconds must reject
+    NaN/inf/non-positive the same way --max-routing-seconds does. run_cell()'s
+    blocking-budget check (`total_ms > max_latency_seconds * 1000`) is false
+    for nan/inf, and even 0/-1 make every measured result exceed the limit.
+    """
+
+    def test_rejects_nan(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "nan"])
+
+    def test_rejects_infinity(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "inf"])
+
+    def test_rejects_zero_or_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "0"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "-1000"])
+
+    def test_accepts_a_normal_value(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        args = parser.parse_args(["--max-latency-seconds", "60.0"])
+        assert args.max_latency_seconds == 60.0
+
+    def test_error_message_names_the_correct_flag(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "not-a-number"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "not-a-number"])
+
+
+class TestForegroundTimeoutIsClassifiedAsTimeoutNotSemanticFailure:
+    """Regression for round-4 finding 2: the foreground-search-timeout
+    placeholder text must be classified as a "timeout" infra outcome, not
+    scored as a semantic judge/citations failure -- previously only 3 of 7
+    degraded/failure texts were covered by SAFE_FALLBACK_TEXTS.
+    """
+
+    def test_timeout_placeholder_marks_the_turn_status_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text=("That is taking longer than expected; I will continue in the background."),
+        )
+
+        assert outcome.status == "timeout"
+        assert outcome.turns[0].status == "timeout"
+
+    def test_timeout_placeholder_never_reaches_the_judge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text=("That is taking longer than expected; I will continue in the background."),
+            judge_recorder=recorder,
+        )
+
+        assert all(not judge.assistant_messages for judge in recorder)
+
+    def test_other_safe_fallback_texts_are_still_provider_error_not_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text="The search service is busy; please try again shortly.",
+        )
+
+        assert outcome.status == "provider-error"
+
+    def test_safe_fallbacks_and_timeout_fallbacks_are_re_exported_and_disjoint(self) -> None:
+        assert eval_common.SAFE_FALLBACKS.isdisjoint(eval_common.TIMEOUT_FALLBACKS)
+        assert (
+            "That is taking longer than expected; I will continue in the background."
+            in eval_common.TIMEOUT_FALLBACKS
+        )
+
+
+class TestManifestRouterEntryRequiresTextTool:
+    """Regression for round-4 finding 4: a router candidate's manifest entry
+    must declare the structured-output `text` shape it was actually probed
+    with -- kind/model/effort alone would authorize a request shape Phase 0
+    never verified for a hand-edited or faulty-verifier-produced manifest.
+    """
+
+    def test_router_entry_missing_text_tool_is_not_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        entry["tools"] = []  # hand-edited: declares no tools at all
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
+
+    def test_router_entry_with_text_tool_is_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is True
+
+
+class TestNoneOrBareStrResultIsDiagnosedNotAnUncaughtAttributeError:
+    """Regression for round-4 finding 5: _handle_transcript() has documented
+    return paths that return None (background-status-only retained work item)
+    or a bare str transcript -- neither carries .ui_text, and previously the
+    bare AttributeError from accessing it escaped to the outer handler as an
+    undiagnostic generic "turn-error".
+    """
+
+    def test_none_result_produces_a_diagnostic_provider_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(lambda _query: None)
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+
+        from server.config import Config
+
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+        assert "NoneType" in outcome.error
+
+    def test_bare_str_result_produces_a_diagnostic_provider_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(lambda _query: "a bare str transcript")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+
+        from server.config import Config
+
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "provider-error"
+        assert "str" in outcome.error
+
+
+class TestConfirmSpendHandlesEOFError:
+    """Regression for round-4 finding 6: a tty that receives EOF (Ctrl-D)
+    raises EOFError from input(), uncaught -- sys.stdin.isatty() doesn't rule
+    this out (it's a real tty, just one that got EOF). Must be treated as an
+    explicit decline, matching the "n" answer's return value.
+    """
+
+    def test_eof_error_is_treated_as_decline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        accounting = eval_runner.CallAccounting(router_calls=100, worker_calls=100, judge_calls=100)
+        monkeypatch.setattr(eval_runner.sys.stdin, "isatty", lambda: True)
+
+        def _raise_eof(_prompt: str) -> str:
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", _raise_eof)
+
+        result = eval_runner._confirm_spend(
+            accounting, max_calls=1, max_cost=None, assume_yes=False
+        )
+
+        assert result is False
+
+    def test_explicit_no_answer_returns_the_same_value_as_eof(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        accounting = eval_runner.CallAccounting(router_calls=100, worker_calls=100, judge_calls=100)
+        monkeypatch.setattr(eval_runner.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+        result = eval_runner._confirm_spend(
+            accounting, max_calls=1, max_cost=None, assume_yes=False
+        )
+
+        assert result is False
+
+
+class TestErrorTextStripsControlCharacters:
+    """Regression for round-4 finding 7: error_text() must strip ASCII
+    control characters (e.g. ANSI escape sequences a provider-exception body
+    could carry) before the text reaches a raw print() sink -- previously
+    only redaction/truncation were applied, and this filter existed only as
+    eval_model_comparison.py's local _sanitize_for_judge(), unused by
+    error_text()'s own raw-print call sites.
+    """
+
+    def test_ansi_escape_sequence_is_stripped(self) -> None:
+        exc = ValueError("bad response \x1b[31mRED\x1b[0m text")
+
+        text = eval_common.error_text(exc)
+
+        assert "\x1b" not in text
+        assert "RED" in text
+
+    def test_newline_and_tab_are_preserved(self) -> None:
+        exc = ValueError("line one\nline two\ttabbed")
+
+        text = eval_common.error_text(exc)
+
+        assert "\n" in text
+        assert "\t" in text
+
+    def test_strip_control_chars_is_shared_with_sanitize_for_judge(self) -> None:
+        raw = "clean\x07bell\x1b[2Jclear"
+
+        assert eval_common.strip_control_chars(raw) == eval_runner._sanitize_for_judge(raw)

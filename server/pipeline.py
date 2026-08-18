@@ -406,9 +406,10 @@ class ConnectionPipeline:
 
 SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "retention_rejected"]
 
-# Every safe-fallback response `text=` this module ever sends -- routing
-# unavailable, worker search unavailable, and no-reliable-result -- hoisted
-# to named constants (referenced at every `text=` call site below) so
+# Every degraded/placeholder response `text=` this module ever sends --
+# routing unavailable, worker search unavailable, no-reliable-result, plus
+# the busy/incomplete/unsupported-capability variants below -- hoisted to
+# named constants (referenced at every `text=` call site below) so
 # scripts/_eval_common.py's SAFE_FALLBACKS guard (used by the eval-suite
 # runner and the live smoke CLI to detect a host that silently fell back
 # instead of producing a real result) can import SAFE_FALLBACK_TEXTS instead
@@ -417,9 +418,31 @@ SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "r
 _ROUTING_UNAVAILABLE_TEXT = "Routing is temporarily unavailable. Please try that request again."
 _SEARCH_UNAVAILABLE_TEXT = "The web search is temporarily unavailable."
 _NO_RELIABLE_RESULT_TEXT = "I could not find a reliable result for that request."
+_SEARCH_BUSY_TEXT = "The search service is busy; please try again shortly."
+_PENDING_REQUEST_INCOMPLETE_TEXT = "The pending web request could not be completed."
+_CAPABILITY_UNAVAILABLE_TEXT = "I cannot access that capability here."
 SAFE_FALLBACK_TEXTS = frozenset(
-    {_ROUTING_UNAVAILABLE_TEXT, _SEARCH_UNAVAILABLE_TEXT, _NO_RELIABLE_RESULT_TEXT}
+    {
+        _ROUTING_UNAVAILABLE_TEXT,
+        _SEARCH_UNAVAILABLE_TEXT,
+        _NO_RELIABLE_RESULT_TEXT,
+        _SEARCH_BUSY_TEXT,
+        _PENDING_REQUEST_INCOMPLETE_TEXT,
+        _CAPABILITY_UNAVAILABLE_TEXT,
+    }
 )
+
+# The foreground-search-timeout placeholder is deliberately kept OUT of
+# SAFE_FALLBACK_TEXTS and given its own frozenset: unlike the
+# SAFE_FALLBACK_TEXTS members above (routing/worker infrastructure genuinely
+# unavailable), this text means a candidate's search was *still running* when
+# the foreground budget elapsed -- a distinct failure mode ("too slow", not
+# "broken") that a caller scoring latency/timeout separately from
+# infrastructure availability needs to tell apart. See
+# scripts/eval_model_comparison.py's run_cell(), which maps this to a
+# "timeout" TurnOutcome rather than "provider-error".
+_FOREGROUND_TIMEOUT_TEXT = "That is taking longer than expected; I will continue in the background."
+TIMEOUT_FALLBACK_TEXTS = frozenset({_FOREGROUND_TIMEOUT_TEXT})
 
 
 @dataclass(frozen=True)
@@ -1446,7 +1469,7 @@ class SessionHost:
                     canonical_result(
                         worker_id="main",
                         turn_id=turn_id,
-                        text="I cannot access that capability here.",
+                        text=_CAPABILITY_UNAVAILABLE_TEXT,
                         origin_epoch=origin_epoch,
                     ),
                     origin,
@@ -1552,7 +1575,7 @@ class SessionHost:
                     result = canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
-                        text="That is taking longer than expected; I will continue in the background.",
+                        text=_FOREGROUND_TIMEOUT_TEXT,
                         origin_epoch=origin_epoch,
                     )
                     child_outcome_label = "retained"
@@ -1560,7 +1583,7 @@ class SessionHost:
                     result = canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
-                        text="The search service is busy; please try again shortly.",
+                        text=_SEARCH_BUSY_TEXT,
                         origin_epoch=origin_epoch,
                     )
                     child_outcome_label = (
@@ -1847,7 +1870,7 @@ class SessionHost:
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="That is taking longer than expected; I will continue in the background.",
+                    text=_FOREGROUND_TIMEOUT_TEXT,
                     origin_epoch=origin.epoch,
                 )
             else:
@@ -1859,7 +1882,7 @@ class SessionHost:
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="The pending web request could not be completed.",
+                    text=_PENDING_REQUEST_INCOMPLETE_TEXT,
                     origin_epoch=origin.epoch,
                 )
                 child_outcome_label = failure_outcome
@@ -2035,7 +2058,7 @@ class SessionHost:
                         results[index] = canonical_result(
                             worker_id="main",
                             turn_id=f"{turn_id}-{index}",
-                            text="I cannot access that capability here.",
+                            text=_CAPABILITY_UNAVAILABLE_TEXT,
                             origin_epoch=origin.epoch,
                         )
                         turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
@@ -2073,7 +2096,7 @@ class SessionHost:
                     results[index] = canonical_result(
                         worker_id="main",
                         turn_id=f"{turn_id}-{index}",
-                        text="I cannot access that capability here.",
+                        text=_CAPABILITY_UNAVAILABLE_TEXT,
                         origin_epoch=origin.epoch,
                     )
                     continue

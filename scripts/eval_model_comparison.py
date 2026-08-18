@@ -29,6 +29,7 @@ import math
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,12 +38,14 @@ from typing import Any
 from evals.scenarios import SCENARIOS, SCENARIOS_BY_NAME, Scenario
 from scripts._eval_common import (
     SAFE_FALLBACKS,
+    TIMEOUT_FALLBACKS,
     CollectingMeasurementSink,
     _latest_turn_stage_metrics,
     build_judge_llm_service,
     build_session_for_run,
     confined_output_path,
     error_text,
+    strip_control_chars,
     write_no_follow,
 )
 from server.config import Config, load_config
@@ -240,13 +243,25 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
         effort = entry.get("effort")
         if not isinstance(kind, str) or not isinstance(model, str):
             continue
-        # A worker candidate's manifest entry must declare the web_search
-        # tool it was actually probed with -- a hand-edited or
-        # future-schema manifest that marks a worker tuple accepted without
-        # it must not be treated as covering a live worker run.
+        # Each role's manifest entry must declare the specific request-shape
+        # element Phase 0's probe for that role actually established --
+        # kind/model/effort alone would authorize a shape Phase 0 never
+        # verified for a hand-edited or faulty-verifier-produced manifest.
+        # Mirrors scripts/verify_eval_candidates.py's per-role probe:
+        # - worker: probed with the `web_search` tool attached
+        #   (`_build_worker_kwargs`);
+        # - router: probed with the structured-output `text` format attached
+        #   (`_build_router_kwargs`) -- recorded as `tools=["text"]`;
+        # - judge: probed via the Chat Completions path with no tools
+        #   attached at all (`_judge_kwargs`) -- kind/model already fully
+        #   describe what was verified, so no additional tools check applies.
         if kind == "worker":
             tools = entry.get("tools")
             if not isinstance(tools, list) or "web_search" not in tools:
+                continue
+        elif kind == "router":
+            tools = entry.get("tools")
+            if not isinstance(tools, list) or "text" not in tools:
                 continue
         accepted.add((kind, model, effort if isinstance(effort, str) else None))
     return ManifestStatus(
@@ -543,13 +558,13 @@ def _never_ran_cell(
 def _sanitize_for_judge(text: str, *, max_len: int = 4000) -> str:
     """Light defense-in-depth before feeding worker-sourced (hosted web
     search) text into the judge LLM's context: strips ASCII control
-    characters (other than newline/tab) and caps length. This is not a
+    characters (other than newline/tab, via ``strip_control_chars`` -- the
+    same filter ``error_text`` uses) and caps length. This is not a
     prompt-injection defense -- the judge's own verdict schema constrains its
     output regardless of what's in its context -- it just bounds how much raw,
     externally-sourced content reaches the judge unmodified.
     """
-    cleaned = "".join(ch for ch in text if ch >= " " or ch in "\n\t")
-    return cleaned[:max_len]
+    return strip_control_chars(text)[:max_len]
 
 
 def _connect_handshake(host: Any) -> dict[str, Any]:
@@ -708,6 +723,29 @@ async def run_cell(
                 cell_status, cell_error = "provider-error", outcome.judge_reason
                 break
             result = results[0]
+            # _handle_transcript() has documented return paths that return
+            # None (server/pipeline.py, when a capable connection's retained
+            # work item goes background-status-only) or a bare str transcript
+            # -- neither carries a .ui_text attribute, and a bare
+            # AttributeError from the access below would escape to the outer
+            # except handler as an undiagnostic "turn-error". Check
+            # explicitly so the report names what actually came back instead.
+            if result is None or not hasattr(result, "ui_text"):
+                outcome.status = "provider-error"
+                outcome.judge_reason = (
+                    f"_handle_transcript returned {type(result).__name__} instead of a "
+                    "result with .ui_text (e.g. the background-status no-op path, or a "
+                    "bare str transcript)"
+                )
+                turns.append(outcome)
+                cell_status, cell_error = "provider-error", outcome.judge_reason
+                break
+            if result.ui_text in TIMEOUT_FALLBACKS:
+                outcome.status = "timeout"
+                outcome.judge_reason = "host returned the foreground-search-timeout placeholder"
+                turns.append(outcome)
+                cell_status, cell_error = "timeout", outcome.judge_reason
+                break
             if result.ui_text in SAFE_FALLBACKS:
                 outcome.status = "provider-error"
                 outcome.judge_reason = "host returned a safe fallback"
@@ -1060,7 +1098,14 @@ def _confirm_spend(
             "refusing to proceed without confirmation (not an interactive terminal); pass --yes to override"
         )
         return False
-    reply = input("Proceed anyway? [y/N] ").strip().lower()
+    try:
+        reply = input("Proceed anyway? [y/N] ").strip().lower()
+    except EOFError:
+        # A tty that receives EOF (Ctrl-D) rather than piped input isn't
+        # caught by the isatty() check above -- treat it the same as an
+        # explicit decline rather than letting the exception propagate as an
+        # uncaught traceback.
+        return False
     return reply in {"y", "yes"}
 
 
@@ -1089,23 +1134,31 @@ def _finite_nonnegative_float(raw: str) -> float:
     return value
 
 
-def _finite_positive_float(raw: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"--max-routing-seconds must be a number: {raw!r}"
-        ) from exc
-    # Same rationale as _finite_nonnegative_float above: nan/inf both parse
-    # without raising, and the blocking-budget check in run_cell()
-    # (`routing_ms > max_routing_seconds * 1000`) is false for both --
-    # silently disabling routing-budget enforcement instead of rejecting the
-    # bad input up front.
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError(
-            f"--max-routing-seconds must be finite and positive: {raw!r}"
-        )
-    return value
+def _finite_positive_float(flag: str) -> Callable[[str], float]:
+    """Build an argparse ``type=`` validator for a finite, positive float flag.
+
+    Parameterized by ``flag`` (rather than hardcoding one flag's name in the
+    error text) so the same validator backs both ``--max-routing-seconds``
+    and ``--max-latency-seconds`` -- each budget flag's blocking-check
+    divides/compares against its own value (``routing_ms > max_routing_seconds
+    * 1000``, ``total_ms > max_latency_seconds * 1000``), and nan/inf both
+    parse via bare ``float()`` without raising, silently disabling that
+    budget's enforcement instead of rejecting the bad input up front. A
+    non-positive-but-finite value (0 or negative) is rejected too: it would
+    make every measured result exceed the configured limit. See round-4
+    gauntlet finding 1.
+    """
+
+    def _validate(raw: str) -> float:
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{flag} must be a number: {raw!r}") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise argparse.ArgumentTypeError(f"{flag} must be finite and positive: {raw!r}")
+        return value
+
+    return _validate
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1128,9 +1181,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-path", type=Path, default=DEFAULT_MANIFEST_PATH)
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
     parser.add_argument(
-        "--max-routing-seconds", type=_finite_positive_float, default=DEFAULT_MAX_ROUTING_SECONDS
+        "--max-routing-seconds",
+        type=_finite_positive_float("--max-routing-seconds"),
+        default=DEFAULT_MAX_ROUTING_SECONDS,
     )
-    parser.add_argument("--max-latency-seconds", type=float, default=DEFAULT_MAX_LATENCY_SECONDS)
+    parser.add_argument(
+        "--max-latency-seconds",
+        type=_finite_positive_float("--max-latency-seconds"),
+        default=DEFAULT_MAX_LATENCY_SECONDS,
+    )
     parser.add_argument(
         "--out", type=Path, default=None, help="report output path (default: printed only)"
     )
