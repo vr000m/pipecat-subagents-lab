@@ -56,6 +56,19 @@ module = [
 ]
 ignore_errors = true
 
+# Legacy debt: pre-existing scripts that predate the eval-suite work and carry
+# pre-existing errors out of scope here. Do not add new entries; new scripts
+# (eval_common, eval_model_comparison, verify_eval_candidates, _eval_common,
+# etc.) must stay covered by the fail-closed default above.
+[[tool.mypy.overrides]]
+module = [
+    "scripts.collect_query_context_latency",
+    "scripts.analyze_query_context_latency",
+    "scripts.benchmark_speech",
+    "scripts.smoke_conversation",
+]
+ignore_errors = true
+
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]
 build-backend = "uv_build"

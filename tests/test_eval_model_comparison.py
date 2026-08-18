@@ -138,19 +138,28 @@ def _raise_network_access(*_args: Any, **_kwargs: Any) -> Any:
 
 
 class _FakeRouting:
-    def __init__(self, action: str | None) -> None:
+    def __init__(self, action: str | None, turn_id: str = "turn-1") -> None:
         self.action = action
+        # Mirrors server/contracts.py's RoutingState, which is turn-scoped:
+        # run_cell()'s stale-routing-read guard compares this against the
+        # current turn's result.turn_id (also "turn-1" by default in
+        # _run_cell's _result_factory), so a fixture that omits it would
+        # always read as "prior turn's stale decision" and silently defeat
+        # every routing_action-driven assertion below.
+        self.turn_id = turn_id
 
 
 class _FakeState:
-    def __init__(self, routing_action: str | None = None) -> None:
+    def __init__(self, routing_action: str | None = None, routing_turn_id: str = "turn-1") -> None:
         self.session_id = "session-1"
         self.resume_token = "resume-1"
         # None reproduces the pre-finding-12 default (no `routing` signal at
         # all -- getattr(host.state, "routing", None) falls back to None
         # either way); a caller exercising the worker-presence assertion
         # passes the routing action it wants run_cell to observe.
-        self.routing = _FakeRouting(routing_action) if routing_action is not None else None
+        self.routing = (
+            _FakeRouting(routing_action, routing_turn_id) if routing_action is not None else None
+        )
 
 
 class _FakeRegistry:
@@ -166,8 +175,14 @@ class _FakeResult:
 
 
 class _FakeHost:
-    def __init__(self, result_factory: Any, *, routing_action: str | None = None) -> None:
-        self.state = _FakeState(routing_action)
+    def __init__(
+        self,
+        result_factory: Any,
+        *,
+        routing_action: str | None = None,
+        routing_turn_id: str = "turn-1",
+    ) -> None:
+        self.state = _FakeState(routing_action, routing_turn_id)
         self.registry = _FakeRegistry()
         self._result_factory = result_factory
 
@@ -225,6 +240,7 @@ def _run_cell(
     verdicts: list[Any] | None = None,
     judge_recorder: list[Any] | None = None,
     routing_action: str | None = None,
+    routing_turn_id: str = "turn-1",
 ) -> Any:
     from server.config import Config
 
@@ -237,7 +253,9 @@ def _run_cell(
 
     def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
         del measurement_sink
-        return _FakeHost(_result_factory, routing_action=routing_action)
+        return _FakeHost(
+            _result_factory, routing_action=routing_action, routing_turn_id=routing_turn_id
+        )
 
     def _fake_stage_metrics(_sink: Any, _elapsed_ms: float, _turn_id: str) -> dict[str, float]:
         return {"routing_ms": routing_ms, "search_ms": 0.0, "total_ms": total_ms}
@@ -1075,6 +1093,34 @@ class TestGenuineUnsupportedIsDistinctFromInfraFailure:
         assert outcome.status == "provider-error"
         assert outcome.turns[0].status == "provider-error"
 
+    def test_prior_turn_stale_unsupported_routing_is_not_trusted_for_this_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for round-6 gauntlet finding: host.state.routing can
+        still hold a PRIOR turn's decision if this turn's own routing/
+        dispatch call fails before ever assigning a new one (server/
+        pipeline.py only calls state.set_routing() after a successful
+        routed outcome). A stale action="unsupported" read from turn N-1
+        must not be trusted for turn N's genuine infra failure -- it must
+        still short-circuit as provider-error, not be misread as the
+        prior turn's semantic "unsupported" outcome.
+        """
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="what's the weather in Riga?", expect_delegated=True),),
+            ui_text=self._CAPABILITY_UNAVAILABLE_TEXT,
+            # host.state.routing carries action="unsupported", but for
+            # "turn-0" -- a stale read left over from a prior turn, not the
+            # current turn's result ("turn-1", _run_cell's default).
+            routing_action="unsupported",
+            routing_turn_id="turn-0",
+            verdicts=[],
+        )
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+
 
 class TestWorkerPresenceAssertionCatchesRoutingRegressions:
     """Regression for round-5 gauntlet finding 12: the routing-regression
@@ -1741,11 +1787,45 @@ class TestManifestStalenessFailsClosed:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: False)
         manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
 
         status = eval_runner.load_manifest_status(manifest_path)
 
         assert status.stale is False
+
+    def test_dirty_source_tree_is_treated_as_stale_despite_matching_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: a matching HEAD alone must not clear staleness if the
+        manifest-attested source files (server/router.py,
+        server/workers/web_search.py, server/config.py) carry uncommitted
+        edits -- ``git rev-parse HEAD`` would still match the manifest even
+        though the tree it describes is no longer the tree in front of the
+        runner.
+        """
+        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: True)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+
+    def test_unverifiable_dirty_check_is_treated_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail-closed: a broken git invocation for the dirty-tree check
+        (``_source_tree_dirty()`` returning ``None``) must not be read as
+        "clean", mirroring ``_current_source_commit()`` returning ``None``.
+        """
+        monkeypatch.setattr(eval_runner, "_current_source_commit", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: None)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
 
 
 class TestManifestWorkerEntryRequiresWebSearchTool:

@@ -199,6 +199,42 @@ def _current_source_commit() -> str | None:
     return completed.stdout.strip() or None
 
 
+# The manifest's source_commit attests to the request shape these specific
+# files produce (router policy, worker tool wiring, config defaults) -- the
+# files scripts/verify_eval_candidates.py's probes actually exercise. A
+# commit match alone is not enough: if any of these carry uncommitted edits,
+# `git rev-parse HEAD` still matches the manifest even though the tree it
+# describes is no longer the tree in front of the runner.
+_MANIFEST_ATTESTED_PATHS = (
+    "server/router.py",
+    "server/workers/web_search.py",
+    "server/config.py",
+)
+
+
+def _source_tree_dirty() -> bool | None:
+    """True if any manifest-attested source file has uncommitted changes.
+
+    Returns ``None`` (unverifiable) rather than ``False`` when the git
+    invocation itself fails -- mirrors ``_current_source_commit()``'s
+    fail-closed contract, so a broken git toolchain can't be read as "clean".
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--", *_MANIFEST_ATTESTED_PATHS],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return bool(completed.stdout.strip())
+
+
 def load_manifest_status(manifest_path: Path) -> ManifestStatus:
     """Load Phase 0's manifest and index the (kind, model, effort) tuples it accepted.
 
@@ -257,7 +293,14 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
     # run, not silently accepted just because there was nothing to compare
     # against. Only a same-valued, both-resolved comparison counts as fresh.
     identity_verifiable = current_commit is not None and isinstance(source_commit, str)
-    stale = not identity_verifiable or source_commit != current_commit
+    # A HEAD match alone doesn't mean the manifest still describes the
+    # checkout: uncommitted edits to the files it attests (router policy,
+    # worker tool wiring, config defaults) leave `git rev-parse HEAD`
+    # unchanged while the actual request shape has moved. Fail closed here
+    # too -- an unverifiable dirty-check (git failure) is treated as dirty,
+    # not clean.
+    tree_dirty = _source_tree_dirty()
+    stale = not identity_verifiable or source_commit != current_commit or tree_dirty is not False
     accepted: set[tuple[str, str, str | None]] = set()
     for entry in manifest["results"]:
         if not isinstance(entry, dict) or entry.get("accepted") is not True:
@@ -807,7 +850,21 @@ async def run_cell(
                 cell_status, cell_error = "timeout", outcome.judge_reason
                 break
             routing = getattr(host.state, "routing", None)
-            routing_action = getattr(routing, "action", None)
+            # RoutingState (server/contracts.py) carries the turn_id it was
+            # decided for. A stale read is possible: if this turn's own
+            # routing/dispatch call fails before ever assigning a new
+            # decision, host.state.routing still holds the PRIOR turn's
+            # object. Without this check, a genuine new infra failure on
+            # this turn could be misread as the previous turn's
+            # action="unsupported", misclassifying a real provider error as
+            # a semantic outcome and skipping infra-failure handling below.
+            # Only trust routing_action when it was actually decided for
+            # *this* turn's result.
+            routing_action = (
+                getattr(routing, "action", None)
+                if getattr(routing, "turn_id", None) == result.turn_id
+                else None
+            )
             # A genuine, on-topic `action="unsupported"` routing decision (the
             # model correctly reached the router but decided -- rightly or
             # wrongly -- that the request needed a capability it doesn't have)
