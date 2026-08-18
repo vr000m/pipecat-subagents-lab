@@ -61,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previous separate Connect/Disconnect buttons.
 - Structured browser-console diagnostics (`[HH:MM:SS.mmm][component]
   message`) for connection, track, mic, and speaker events.
+- Router/worker reasoning-effort config knob (`router_reasoning_effort_policy`
+  / `worker_reasoning_effort_policy` on `Config`, `WEBSEARCH_ROUTER_REASONING_EFFORT`
+  / `WEBSEARCH_WORKER_REASONING_EFFORT` env overrides) with zero behavior
+  change when unset, and a bespoke `evals/` + `scripts/eval_model_comparison.py`
+  runner that drives `SessionHost._handle_transcript()` directly to compare
+  candidate router/worker models and effort levels against the live paid
+  provider, scored via `pipecat.evals.judge.EvalJudge`. Candidate
+  verification (`scripts/verify_eval_candidates.py`) gates the runner behind
+  a versioned manifest of live-confirmed (model, effort, tools) tuples.
 
 ### Changed
 

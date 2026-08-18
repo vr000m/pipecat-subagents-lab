@@ -138,6 +138,13 @@ milliseconds. These two settings are environment-only and have no TOML
 equivalents.
 `WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
 OpenAI model IDs without allowing model output to select an arbitrary model.
+`WEBSEARCH_ROUTER_REASONING_EFFORT` and `WEBSEARCH_WORKER_REASONING_EFFORT`
+override the `reasoning.effort` value sent with router/worker requests
+(validated against the OpenAI SDK's `ReasoningEffort` literal: `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`); unset preserves current
+behavior (router keeps its `gpt-5*`-conditional `minimal` default, worker
+omits `reasoning` entirely), while an explicit override applies
+unconditionally regardless of model name.
 
 The v0.1.3 delivery behaviours are gated by feature flags whose TOML
 equivalents live under `[features]`. `WEBSEARCH_ENABLE_EARLY_ACK`
@@ -502,6 +509,18 @@ Smoke and benchmark:
 - `benchmark_speech.py` — local speech smoke (credential-free) or paid
   provider comparison over identical text and audio.
 
+Router/worker model evaluation (run in this order):
+
+- `verify_eval_candidates.py` — live-verifies every candidate (model, effort,
+  tools) tuple with production-equivalent request shapes and writes a
+  versioned manifest that gates the runner below.
+- `eval_model_comparison.py` — paid runner that drives `SessionHost` through
+  its real connect/turn lifecycle for each router/worker model+effort
+  candidate and scenario, scoring replies via `pipecat.evals.judge.EvalJudge`
+  and producing one aggregate pass/fail + latency report. Supports
+  `--dry-run` (zero live calls), `--router`/`--worker`/`--scenario` for a
+  single cheap smoke pair, and `--max-calls`/`--max-cost` spend gates.
+
 Phase 4 query-context narrowing experiment (run in this order):
 
 - `run_query_context_experiment.py` — bounded experiment runner producing raw
@@ -578,6 +597,7 @@ produce an eligible manifest.
 server/          Python and Pipecat runtime
 web/             Bun-managed plain HTML, JavaScript, and CSS RTVI client
 shared/          Shared message schemas and protocol documentation
+evals/           Router/worker model-comparison eval scenarios
 docs/architecture.md
                  Stable current-state architecture and design decisions
 docs/benchmarks/ Provider latency evidence
