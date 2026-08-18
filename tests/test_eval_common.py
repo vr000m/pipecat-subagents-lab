@@ -9,9 +9,42 @@ reassigns host.tts after the fact).
 
 from __future__ import annotations
 
+import server.app as app_module
+import server.composition as composition_module
 from scripts._eval_common import SAFE_FALLBACKS, build_session_for_run
 from server.config import Config, PromotionManifest
 from server.pipeline import SAFE_FALLBACK_TEXTS
+
+
+def test_build_session_for_run_delegates_to_the_one_composition_root(
+    monkeypatch,
+) -> None:
+    """Regression for round-5 gauntlet finding 1: scripts/eval_common.py's
+    build_session_for_run() and server/app.py's _default_session_host() used
+    to independently wire WorkerRegistry/Router/WorkItemCoordinator/
+    SessionHost, with nothing detecting divergence between the two. Both now
+    delegate to server.composition.build_session_host() -- asserted here by
+    identity (calls the same object), not just by re-verifying equal output,
+    so a future change that re-introduces a second, independent wiring call
+    site fails this test rather than silently drifting again.
+    """
+    calls: list[dict[str, object]] = []
+    real_build = composition_module.build_session_host
+
+    def _recording_build(config, **kwargs):
+        calls.append({"config": config, **kwargs})
+        return real_build(config, **kwargs)
+
+    import scripts.eval_common as eval_common_module
+
+    monkeypatch.setattr(eval_common_module, "build_session_host", _recording_build)
+    monkeypatch.setattr(app_module, "build_session_host", _recording_build)
+    monkeypatch.setattr(app_module, "load_config", lambda: Config())
+
+    build_session_for_run(Config())
+    app_module._default_session_host()
+
+    assert len(calls) == 2
 
 
 def test_safe_fallbacks_is_the_same_object_as_pipelines_shared_constant() -> None:

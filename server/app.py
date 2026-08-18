@@ -35,6 +35,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import WorkerParams
 
+from .composition import build_session_host
 from .config import Config, load_config, load_promotion_manifest
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .frames import SnapshotBarrierFlushFrame
@@ -42,8 +43,7 @@ from .observers import ProjectedEvent, SnapshotBarrier
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
 from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
-from .registry import WorkerRegistry
-from .router import LazyRouterProvider, Router
+from .router import Router
 from .rtvi_messages import RTVIMessagePublisher
 from .services.factory import create_stt, create_tts
 from .speech_lifecycle import (
@@ -51,7 +51,6 @@ from .speech_lifecycle import (
     TransportSpeechLifecycleProcessor,
 )
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
-from .work_item_coordinator import WorkItemCoordinator
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -650,31 +649,31 @@ def _default_session_host(
     router_responses_factory: Callable[[], Any] | None = None,
     measurement_sink: MeasurementSink | None = None,
 ) -> SessionHost:
-    """Build the default host while keeping credentialed providers lazy."""
+    """Build the default host while keeping credentialed providers lazy.
+
+    Delegates the registry/router/coordinator/host wiring to
+    ``server.composition.build_session_host()`` -- the single composition
+    root also used by ``scripts.eval_common.build_session_for_run()`` -- and
+    layers only this call site's own concerns (STT/TTS creation, the
+    promotion manifest load) on top. See ``server/composition.py``'s module
+    docstring for why this used to be two independently-maintained wiring
+    call sites (round 5, Architecture lens finding 1).
+    """
     config = load_config()
-    registry = WorkerRegistry(config=config)
-    configured_router = router or Router(
-        call=LazyRouterProvider(config, router_responses_factory),
-        config=config,
-    )
-    coordinator = WorkItemCoordinator(
-        registry=registry,
-        router=configured_router,
-        config=config,
-    )
     stt = create_stt(config)
     tts = create_tts(config)
     # Resolved once per host, exactly like FeaturePolicy.from_config: a
     # missing/unreadable/ineligible manifest degrades to display-only rather
     # than raising, so this never blocks server boot.
     promotion_manifest = load_promotion_manifest(config)
-    return SessionHost(
-        registry=registry,
-        stt=stt,
-        tts=tts,
-        coordinator=coordinator,
+    return build_session_host(
+        config,
+        router=router,
+        router_responses_factory=router_responses_factory,
         measurement_sink=measurement_sink,
         promotion_manifest=promotion_manifest,
+        stt=stt,
+        tts=tts,
     )
 
 

@@ -37,25 +37,40 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._eval_common import (
+from scripts.eval_common import (
+    DEFAULT_JUDGE_MODEL,
+    DEFAULT_MANIFEST_RELATIVE_PATH,
+    MANIFEST_VERSION,
+    ROUTER_MANIFEST_TOOLS,
+    WORKER_MANIFEST_TOOLS,
     build_judge_llm_service,
     confined_output_path,
     error_text,
     write_no_follow,
 )
 
-MANIFEST_VERSION = 1
+# MANIFEST_VERSION/DEFAULT_JUDGE_MODEL hoisted from scripts/eval_common.py
+# (round 5, Architecture lens finding 2): this producer and
+# scripts/eval_model_comparison.py's consumer reference the same objects, not
+# two independently-maintained "must match" copies.
 # Tracked in git (not `.review-plan/`, which is gitignored) -- Phase 2's runner
 # and CI both need to read this manifest from a fresh checkout.
-DEFAULT_OUT = "docs/dev_plans/artifacts/eval-candidates-manifest.json"
-DEFAULT_JUDGE_MODEL = "gpt-5-mini"
+DEFAULT_OUT = DEFAULT_MANIFEST_RELATIVE_PATH
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Renamed from ROUTER_CANDIDATES/WORKER_CANDIDATES (round 5, Architecture
+# lens finding 4): scripts/eval_model_comparison.py independently defines its
+# own same-named ROUTER_CANDIDATES/WORKER_CANDIDATES with a different shape
+# (tuple[Candidate, ...], baseline split out via ROUTER_BASELINE/
+# WORKER_BASELINE) -- same domain concept, different type, same name is a
+# naming hazard on its own regardless of any sync risk between the two.
+# PHASE0_* makes clear these are this module's own probe-plan tuples.
+#
 # Router candidate matrix, per the plan's Objective. The baseline entry
 # (gpt-5-mini @ minimal) reproduces today's production behavior
 # (server/router.py: `if model.startswith("gpt-5"): reasoning={"effort":
 # "minimal"}`); the two others are the unverified user-named candidates.
-ROUTER_CANDIDATES: tuple[tuple[str, str], ...] = (
+PHASE0_ROUTER_PROBES: tuple[tuple[str, str], ...] = (
     ("gpt-5-mini", "minimal"),
     ("gpt-5.6-luna", "high"),
     ("gpt-5.6-terra", "low"),
@@ -66,7 +81,7 @@ ROUTER_CANDIDATES: tuple[tuple[str, str], ...] = (
 # (server/workers/web_search.py never sets `reasoning`); the two others are
 # the unverified user-named candidates. `None` effort means "omit the
 # `reasoning` kwarg entirely", not "resolve to a default".
-WORKER_CANDIDATES: tuple[tuple[str, str | None], ...] = (
+PHASE0_WORKER_PROBES: tuple[tuple[str, str | None], ...] = (
     ("gpt-5", None),
     ("gpt-5.6-terra", "medium"),
     ("gpt-5.6-sol", "low"),
@@ -77,7 +92,9 @@ def _model_existence_ids(judge_model: str) -> tuple[str, ...]:
     """Every unique model ID appearing anywhere in either matrix, plus the judge
     model (which may be overridden via --judge-model), gets an existence check
     via `models.retrieve`."""
-    ids = {model for model, _ in ROUTER_CANDIDATES} | {model for model, _ in WORKER_CANDIDATES}
+    ids = {model for model, _ in PHASE0_ROUTER_PROBES} | {
+        model for model, _ in PHASE0_WORKER_PROBES
+    }
     ids.add(judge_model)
     return tuple(sorted(ids))
 
@@ -119,7 +136,7 @@ def _build_router_kwargs(
     model: str, effort: str | None, *, router_timeout_seconds: float
 ) -> dict[str, Any]:
     """Reproduce `LazyRouterProvider.__call__`'s request-kwargs shape exactly."""
-    from server.router import RouterEnvelope, WorkerCatalogue
+    from server.router import RouterEnvelope, WorkerCatalogue, effective_router_reasoning_effort
     from server.structured_outputs import structured_text_format
 
     catalogue = WorkerCatalogue(
@@ -136,8 +153,15 @@ def _build_router_kwargs(
         "timeout": router_timeout_seconds,
         "text": structured_text_format(RouterEnvelope, "router_envelope"),
     }
-    if effort is not None:
-        kwargs["reasoning"] = {"effort": effort}
+    # effective_router_reasoning_effort(), not a bare `if effort is not
+    # None`: the production call site (LazyRouterProvider.__call__) resolves
+    # the wire-level effort through that helper (its own "unset effort + a
+    # gpt-5* model defaults to minimal" rule), so a probe that bypassed it
+    # would be a latent shape mismatch for any future PHASE0_ROUTER_PROBES
+    # entry carrying an unset effort (round 5, Architecture lens finding 3).
+    effective_effort = effective_router_reasoning_effort(model, effort)
+    if effective_effort is not None:
+        kwargs["reasoning"] = {"effort": effective_effort}
     return kwargs
 
 
@@ -179,26 +203,26 @@ def build_plan(*, judge_model: str, router_timeout_seconds: float) -> list[dict[
     entries: list[dict[str, Any]] = []
     for model in _model_existence_ids(judge_model):
         entries.append({"kind": "model_existence", "model": model, "effort": None, "tools": []})
-    for model, effort in ROUTER_CANDIDATES:
+    for model, effort in PHASE0_ROUTER_PROBES:
         entries.append(
             {
                 "kind": "router",
                 "model": model,
                 "effort": effort,
-                "tools": ["text"],
+                "tools": list(ROUTER_MANIFEST_TOOLS),
                 "request_kwargs": _build_router_kwargs(
                     model, effort, router_timeout_seconds=router_timeout_seconds
                 ),
             }
         )
-    for model, effort in WORKER_CANDIDATES:
+    for model, worker_effort in PHASE0_WORKER_PROBES:
         entries.append(
             {
                 "kind": "worker",
                 "model": model,
-                "effort": effort,
-                "tools": ["web_search"],
-                "request_kwargs": _build_worker_kwargs(model, effort),
+                "effort": worker_effort,
+                "tools": list(WORKER_MANIFEST_TOOLS),
+                "request_kwargs": _build_worker_kwargs(model, worker_effort),
             }
         )
     entries.append(
@@ -254,13 +278,19 @@ def probe_router(
         response = responses_client.create(**kwargs)
     except Exception as exc:  # noqa: BLE001
         return ProbeResult(
-            "router", model, effort, ["text"], kwargs, False, error_text(exc, credential=api_key)
+            "router",
+            model,
+            effort,
+            list(ROUTER_MANIFEST_TOOLS),
+            kwargs,
+            False,
+            error_text(exc, credential=api_key),
         )
     return ProbeResult(
         "router",
         model,
         effort,
-        ["text"],
+        list(ROUTER_MANIFEST_TOOLS),
         kwargs,
         True,
         None,
@@ -279,7 +309,7 @@ def probe_worker(
             "worker",
             model,
             effort,
-            ["web_search"],
+            list(WORKER_MANIFEST_TOOLS),
             kwargs,
             False,
             error_text(exc, credential=api_key),
@@ -288,7 +318,7 @@ def probe_worker(
         "worker",
         model,
         effort,
-        ["web_search"],
+        list(WORKER_MANIFEST_TOOLS),
         kwargs,
         True,
         None,
@@ -380,7 +410,7 @@ def run_verification(*, judge_model: str) -> tuple[list[ProbeResult], float]:
     results: list[ProbeResult] = []
     for model in _model_existence_ids(judge_model):
         results.append(probe_model_existence(models_client, model, api_key=api_key))
-    for model, effort in ROUTER_CANDIDATES:
+    for model, effort in PHASE0_ROUTER_PROBES:
         results.append(
             probe_router(
                 responses_client,
@@ -390,8 +420,8 @@ def run_verification(*, judge_model: str) -> tuple[list[ProbeResult], float]:
                 api_key=api_key,
             )
         )
-    for model, effort in WORKER_CANDIDATES:
-        results.append(probe_worker(responses_client, model, effort, api_key=api_key))
+    for model, worker_effort in PHASE0_WORKER_PROBES:
+        results.append(probe_worker(responses_client, model, worker_effort, api_key=api_key))
     results.append(probe_judge(judge_model, api_key))
     return results, router_timeout_seconds
 

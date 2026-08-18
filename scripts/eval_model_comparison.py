@@ -36,9 +36,14 @@ from pathlib import Path
 from typing import Any
 
 from evals.scenarios import SCENARIOS, SCENARIOS_BY_NAME, Scenario
-from scripts._eval_common import (
+from scripts.eval_common import (
+    DEFAULT_JUDGE_MODEL,
+    DEFAULT_MANIFEST_RELATIVE_PATH,
+    MANIFEST_VERSION,
+    ROUTER_MANIFEST_TOOLS,
     SAFE_FALLBACKS,
     TIMEOUT_FALLBACKS,
+    WORKER_MANIFEST_TOOLS,
     CollectingMeasurementSink,
     _latest_turn_stage_metrics,
     build_judge_llm_service,
@@ -52,8 +57,11 @@ from server.config import Config, load_config
 from server.router import effective_router_reasoning_effort
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MANIFEST_PATH = _REPO_ROOT / "docs/dev_plans/artifacts/eval-candidates-manifest.json"
-DEFAULT_JUDGE_MODEL = "gpt-5-mini"
+# DEFAULT_JUDGE_MODEL/DEFAULT_MANIFEST_RELATIVE_PATH/MANIFEST_VERSION hoisted
+# from scripts/eval_common.py (round 5, Architecture lens finding 2): this
+# consumer and scripts/verify_eval_candidates.py's producer reference the
+# same objects, not two independently-maintained "must match" copies.
+DEFAULT_MANIFEST_PATH = _REPO_ROOT / DEFAULT_MANIFEST_RELATIVE_PATH
 DEFAULT_MAX_ROUTING_SECONDS = 15.0
 DEFAULT_MAX_LATENCY_SECONDS = 60.0
 # Additive margin between the report-only latency budget and the internal
@@ -72,6 +80,19 @@ _FOREGROUND_TIMEOUT_HEADROOM_SECONDS = 30.0
 # count).
 _ROUGH_COST_PER_CALL = {"router": 0.01, "worker": 0.03, "judge": 0.002}
 _WORKER_TOOL_CALL_COST_MULTIPLIER = 2.0
+
+# The OpenAI SDK clients this runner drives (via build_session_for_run() ->
+# LazyRouterProvider / WebSearchWorker, and the judge's OpenAILLMService) all
+# leave the SDK's client-level max_retries=2 default in place: a transient
+# 429/5xx/timeout is silently retried up to twice more, so a single logical
+# turn can issue up to 3 real HTTP requests to the provider while this
+# runner's own call-count/cost estimate -- and therefore the
+# --max-calls/--max-cost confirmation gate -- would otherwise only see 1.
+# Applied at the matrix-accounting layer (matrix_call_accounting()), not
+# inside scenario_call_counts() itself, which stays a pure per-scenario
+# nominal count. See round-5 gauntlet finding 11.
+_OPENAI_SDK_DEFAULT_MAX_RETRIES = 2
+_RETRY_WORST_CASE_MULTIPLIER = 1 + _OPENAI_SDK_DEFAULT_MAX_RETRIES
 
 
 # --------------------------------------------------------------------------
@@ -139,9 +160,12 @@ def full_matrix_pairs() -> tuple[RunPair, ...]:
 # --------------------------------------------------------------------------
 
 
-# Must match scripts/verify_eval_candidates.py's MANIFEST_VERSION -- the
-# manifest producer and this consumer agree on one schema version constant.
-_SUPPORTED_MANIFEST_VERSION = 1
+# scripts/eval_common.py's MANIFEST_VERSION -- the manifest producer
+# (scripts/verify_eval_candidates.py) and this consumer both import the same
+# object, an identity relationship a test enforces (see
+# tests/test_eval_model_comparison.py), rather than two independently
+# hand-maintained "must match" copies of the schema version constant.
+_SUPPORTED_MANIFEST_VERSION = MANIFEST_VERSION
 
 
 class ManifestError(RuntimeError):
@@ -243,11 +267,30 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
         effort = entry.get("effort")
         if not isinstance(kind, str) or not isinstance(model, str):
             continue
+        # A present-but-malformed `effort` (e.g. 0, [], a non-null non-string
+        # value) is rejected outright, not silently coerced to None -- a
+        # coercion here would make a manifest entry that never actually
+        # verified an unset-effort request read as if it had (round 5,
+        # Security lens finding 9). Fail-closed matches every other shape
+        # violation in this loop: reject just this entry, not the whole
+        # manifest.
+        if effort is not None and not isinstance(effort, str):
+            continue
+        # request_kwargs is Phase 0's actual evidence that a given request
+        # shape was probed at all -- an entry missing it, or carrying a
+        # non-dict value, asserts "accepted" with nothing behind it (a
+        # hand-edited or faulty-verifier-produced manifest could omit it
+        # entirely). Reject rather than accept-with-no-evidence.
+        if not isinstance(entry.get("request_kwargs"), dict):
+            continue
         # Each role's manifest entry must declare the specific request-shape
         # element Phase 0's probe for that role actually established --
         # kind/model/effort alone would authorize a shape Phase 0 never
         # verified for a hand-edited or faulty-verifier-produced manifest.
-        # Mirrors scripts/verify_eval_candidates.py's per-role probe:
+        # Mirrors scripts/verify_eval_candidates.py's per-role probe, using
+        # the same ROUTER_MANIFEST_TOOLS/WORKER_MANIFEST_TOOLS vocabulary the
+        # producer emits (scripts/eval_common.py -- round 5, Architecture
+        # lens finding 2):
         # - worker: probed with the `web_search` tool attached
         #   (`_build_worker_kwargs`);
         # - router: probed with the structured-output `text` format attached
@@ -257,13 +300,13 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
         #   describe what was verified, so no additional tools check applies.
         if kind == "worker":
             tools = entry.get("tools")
-            if not isinstance(tools, list) or "web_search" not in tools:
+            if not isinstance(tools, list) or not set(WORKER_MANIFEST_TOOLS).issubset(tools):
                 continue
         elif kind == "router":
             tools = entry.get("tools")
-            if not isinstance(tools, list) or "text" not in tools:
+            if not isinstance(tools, list) or not set(ROUTER_MANIFEST_TOOLS).issubset(tools):
                 continue
-        accepted.add((kind, model, effort if isinstance(effort, str) else None))
+        accepted.add((kind, model, effort))
     return ManifestStatus(
         path=manifest_path,
         exists=True,
@@ -399,6 +442,13 @@ def scenario_call_counts(scenario: Scenario) -> tuple[int, int, int]:
 def matrix_call_accounting(
     pairs: tuple[RunPair, ...], scenarios: tuple[Scenario, ...]
 ) -> CallAccounting:
+    """Worst-case call/cost accounting for the spend-confirmation gate.
+
+    Includes the SDK's default-retry worst case (``_RETRY_WORST_CASE_MULTIPLIER``)
+    on top of ``scenario_call_counts()``'s nominal one-request-per-turn count,
+    so an operator confirming ``--max-calls``/``--max-cost`` sees the true
+    worst-case exposure, not just the happy-path call count.
+    """
     router_calls = worker_calls = judge_calls = 0
     for _pair in pairs:
         for scenario in scenarios:
@@ -407,7 +457,9 @@ def matrix_call_accounting(
             worker_calls += w
             judge_calls += j
     return CallAccounting(
-        router_calls=router_calls, worker_calls=worker_calls, judge_calls=judge_calls
+        router_calls=router_calls * _RETRY_WORST_CASE_MULTIPLIER,
+        worker_calls=worker_calls * _RETRY_WORST_CASE_MULTIPLIER,
+        judge_calls=judge_calls * _RETRY_WORST_CASE_MULTIPLIER,
     )
 
 
@@ -491,6 +543,14 @@ class TurnOutcome:
     judge_reason: str | None = None
     deterministic_action_pass: bool | None = None
     citations_pass: bool | None = None
+    # Round 5, Architecture lens finding 12: whether the router's routing
+    # action for this turn (new_worker/existing_worker vs
+    # direct/unsupported/clarify) matched the scenario's own
+    # Turn.expect_delegated declaration -- a routing regression that produces
+    # a superficially valid final reply but takes the wrong path (e.g.
+    # answers directly instead of delegating, or vice versa) is caught here
+    # even when the reply text and judge verdict would otherwise look fine.
+    worker_presence_pass: bool | None = None
     routing_ms: float | None = None
     search_ms: float | None = None
     total_ms: float | None = None
@@ -746,7 +806,25 @@ async def run_cell(
                 turns.append(outcome)
                 cell_status, cell_error = "timeout", outcome.judge_reason
                 break
-            if result.ui_text in SAFE_FALLBACKS:
+            routing = getattr(host.state, "routing", None)
+            routing_action = getattr(routing, "action", None)
+            # A genuine, on-topic `action="unsupported"` routing decision (the
+            # model correctly reached the router but decided -- rightly or
+            # wrongly -- that the request needed a capability it doesn't have)
+            # renders through the exact same _CAPABILITY_UNAVAILABLE_TEXT
+            # fallback as a true infrastructure failure (RoutingValidationError/
+            # UnsupportedWorkerType raised during dispatch, server/pipeline.py).
+            # Text alone can't tell them apart, but the routing action can: the
+            # infra-failure path never sets action="unsupported" (it's only
+            # reached after a new_worker/existing_worker decision whose dispatch
+            # then failed). Round 5, Security/Architecture lens finding 10 --
+            # without this check, a genuine semantic routing miss (the model
+            # wrongly decided a real weather/release request was unsupported)
+            # was misattributed to "provider-error" and never reached judge
+            # scoring. When routing_action == "unsupported", fall through to
+            # the deterministic/judge scoring below instead of short-circuiting
+            # as infrastructure failure.
+            if result.ui_text in SAFE_FALLBACKS and routing_action != "unsupported":
                 outcome.status = "provider-error"
                 outcome.judge_reason = "host returned a safe fallback"
                 turns.append(outcome)
@@ -777,9 +855,19 @@ async def run_cell(
                 break
 
             if turn.expect_action is not None:
-                routing = getattr(host.state, "routing", None)
-                action = getattr(routing, "action", None)
-                outcome.deterministic_action_pass = action == turn.expect_action
+                outcome.deterministic_action_pass = routing_action == turn.expect_action
+
+            # Worker presence/absence assertion (round 5, Architecture lens
+            # finding 12): a routing regression can produce a superficially
+            # valid final reply while taking the wrong path -- e.g. a
+            # "should be direct" turn that actually delegates, or vice versa
+            # -- and neither the reply text nor (for a delegated turn) the
+            # citations check alone would catch that. `new_worker`/
+            # `existing_worker` are the only actions that select/create a
+            # worker (server/pipeline.py's `_dispatch`); every other action
+            # (direct/unsupported/clarify) never touches the registry.
+            delegated_action = routing_action in {"new_worker", "existing_worker"}
+            outcome.worker_presence_pass = delegated_action == turn.expect_delegated
 
             if turn.expect_delegated:
                 outcome.citations_pass = bool(result.citations)
@@ -848,7 +936,11 @@ async def run_cell(
         # billed. Append its in-flight outcome now, before the backfill below
         # runs, so it isn't mislabeled "skipped".
         if turn_started:
-            turns.append(TurnOutcome(query=in_flight_query, status="turn-error"))
+            # in_flight_query is only ever None before the first turn starts
+            # (turn_started gates this branch to "a turn's query was already
+            # assigned"); the `or ""` is a type-narrowing fallback for mypy,
+            # not a reachable runtime case.
+            turns.append(TurnOutcome(query=in_flight_query or "", status="turn-error"))
         cell_status = "turn-error" if turns else "setup-error"
         cell_error = error_text(exc, credential=config.openai_api_key if config else None)
     finally:
@@ -951,8 +1043,18 @@ _CELL_INFRA_FAILURE_STATUSES = {
 }
 
 
-def compute_pass_fail(report: dict[str, Any]) -> tuple[str, list[str]]:
-    """Aggregate the report's cells/turns into one pass/fail verdict.
+def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
+    """Aggregate the run's cells/turns into one pass/fail verdict.
+
+    Takes the typed ``list[CellOutcome]`` ``run_cell()``/``run_matrix()``
+    actually produce, not the ``dict[str, Any]`` ``build_report()`` later
+    serializes them into -- round 5's Architecture lens (finding 7) flagged
+    that re-reading the serialized dict by string key (``cell["status"]``,
+    ``turn["judge_verdict"]``, ...) meant a field rename in ``build_report()``
+    would surface as a runtime ``KeyError`` here with no static check
+    catching it first. Operating on ``CellOutcome``/``TurnOutcome`` attributes
+    directly closes that gap: a rename is now a mypy error at this call site,
+    not a runtime one.
 
     Distinguishes infrastructure failure (a cell/turn never produced a real
     result -- provider error, timeout, judge-error) from semantic failure (a
@@ -962,12 +1064,12 @@ def compute_pass_fail(report: dict[str, Any]) -> tuple[str, list[str]]:
     fails the run -- a judge-error is not evidence of correctness.
     """
     reasons: list[str] = []
-    for cell in report["cells"]:
-        label = f"{cell['pair']}/{cell['scenario']}"
-        if cell["status"] in _CELL_INFRA_FAILURE_STATUSES:
-            reasons.append(f"infra: {label} cell status={cell['status']!r}")
-        for turn in cell["turns"]:
-            query = turn["query"]
+    for cell in outcomes:
+        label = f"{cell.pair_label}/{cell.scenario_name}"
+        if cell.status in _CELL_INFRA_FAILURE_STATUSES:
+            reasons.append(f"infra: {label} cell status={cell.status!r}")
+        for turn in cell.turns or []:
+            query = turn.query
             # A turn whose own status isn't "ok" (provider-error, timeout,
             # setup-error, skipped) never produced a real result -- its
             # judge_verdict/deterministic_action_pass/citations_pass/latency
@@ -978,25 +1080,30 @@ def compute_pass_fail(report: dict[str, Any]) -> tuple[str, list[str]]:
             # own status, which run_cell previously always reported "ok"
             # regardless of a turn breaking early -- see run_cell's
             # cell_status tracking) and could silently read as passing.
-            if turn["status"] != "ok":
-                reasons.append(f"infra: {label} {query!r} turn status={turn['status']!r}")
+            if turn.status != "ok":
+                reasons.append(f"infra: {label} {query!r} turn status={turn.status!r}")
                 continue
-            if turn["judge_verdict"] == "judge-error":
-                reasons.append(f"infra: {label} {query!r} judge-error ({turn['judge_reason']!r})")
-            elif turn["judge_verdict"] == "no":
+            if turn.judge_verdict == "judge-error":
+                reasons.append(f"infra: {label} {query!r} judge-error ({turn.judge_reason!r})")
+            elif turn.judge_verdict == "no":
                 reasons.append(f"semantic: {label} {query!r} judge verdict=no")
-            elif turn["judge_verdict"] == "continue":
+            elif turn.judge_verdict == "continue":
                 reasons.append(f"semantic: {label} {query!r} judge verdict=continue")
-            if turn["deterministic_action_pass"] is False:
+            if turn.deterministic_action_pass is False:
                 reasons.append(f"semantic: {label} {query!r} deterministic action assertion failed")
-            if turn["citations_pass"] is False:
+            if turn.worker_presence_pass is False:
+                reasons.append(
+                    f"semantic: {label} {query!r} worker presence/absence assertion failed"
+                )
+            if turn.citations_pass is False:
                 reasons.append(f"semantic: {label} {query!r} citations assertion failed")
-            if turn["latency_budget_enforced"] and turn["latency_budget_exceeded"]:
+            if turn.latency_budget_enforced and turn.latency_budget_exceeded:
                 reasons.append(f"semantic: {label} {query!r} enforced latency budget exceeded")
     return ("FAIL" if reasons else "PASS"), reasons
 
 
 def build_report(outcomes: list[CellOutcome], *, judge_model: str) -> dict[str, Any]:
+    overall_status, failure_reasons = compute_pass_fail(outcomes)
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "judge_model": judge_model,
@@ -1017,6 +1124,7 @@ def build_report(outcomes: list[CellOutcome], *, judge_model: str) -> dict[str, 
                         "judge_verdict": turn.judge_verdict,
                         "judge_reason": turn.judge_reason,
                         "deterministic_action_pass": turn.deterministic_action_pass,
+                        "worker_presence_pass": turn.worker_presence_pass,
                         "citations_pass": turn.citations_pass,
                         "routing_ms": turn.routing_ms,
                         "search_ms": turn.search_ms,
@@ -1030,7 +1138,6 @@ def build_report(outcomes: list[CellOutcome], *, judge_model: str) -> dict[str, 
             for outcome in outcomes
         ],
     }
-    overall_status, failure_reasons = compute_pass_fail(report)
     report["overall_status"] = overall_status
     report["failure_reasons"] = failure_reasons
     return report
@@ -1047,6 +1154,8 @@ def print_report_summary(report: dict[str, Any]) -> None:
                 bits.append(f"judge={turn['judge_verdict']}")
             if turn["deterministic_action_pass"] is not None:
                 bits.append(f"action_pass={turn['deterministic_action_pass']}")
+            if turn["worker_presence_pass"] is not None:
+                bits.append(f"worker_presence_pass={turn['worker_presence_pass']}")
             if turn["citations_pass"] is not None:
                 bits.append(f"citations_pass={turn['citations_pass']}")
             if turn["total_ms"] is not None:

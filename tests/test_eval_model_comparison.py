@@ -100,7 +100,15 @@ def _accepted_worker_entry(model: str, effort: str | None) -> dict[str, Any]:
 
 
 def _accepted_judge_entry(model: str) -> dict[str, Any]:
-    return {"kind": "judge", "model": model, "effort": None, "accepted": True, "error": None}
+    return {
+        "kind": "judge",
+        "model": model,
+        "effort": None,
+        "tools": [],
+        "request_kwargs": {"model": model},
+        "accepted": True,
+        "error": None,
+    }
 
 
 class _NetworkAccessError(AssertionError):
@@ -129,10 +137,20 @@ def _raise_network_access(*_args: Any, **_kwargs: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+class _FakeRouting:
+    def __init__(self, action: str | None) -> None:
+        self.action = action
+
+
 class _FakeState:
-    def __init__(self) -> None:
+    def __init__(self, routing_action: str | None = None) -> None:
         self.session_id = "session-1"
         self.resume_token = "resume-1"
+        # None reproduces the pre-finding-12 default (no `routing` signal at
+        # all -- getattr(host.state, "routing", None) falls back to None
+        # either way); a caller exercising the worker-presence assertion
+        # passes the routing action it wants run_cell to observe.
+        self.routing = _FakeRouting(routing_action) if routing_action is not None else None
 
 
 class _FakeRegistry:
@@ -148,8 +166,8 @@ class _FakeResult:
 
 
 class _FakeHost:
-    def __init__(self, result_factory: Any) -> None:
-        self.state = _FakeState()
+    def __init__(self, result_factory: Any, *, routing_action: str | None = None) -> None:
+        self.state = _FakeState(routing_action)
         self.registry = _FakeRegistry()
         self._result_factory = result_factory
 
@@ -206,6 +224,7 @@ def _run_cell(
     total_ms: float = 100.0,
     verdicts: list[Any] | None = None,
     judge_recorder: list[Any] | None = None,
+    routing_action: str | None = None,
 ) -> Any:
     from server.config import Config
 
@@ -218,7 +237,7 @@ def _run_cell(
 
     def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
         del measurement_sink
-        return _FakeHost(_result_factory)
+        return _FakeHost(_result_factory, routing_action=routing_action)
 
     def _fake_stage_metrics(_sink: Any, _elapsed_ms: float, _turn_id: str) -> dict[str, float]:
         return {"routing_ms": routing_ms, "search_ms": 0.0, "total_ms": total_ms}
@@ -329,6 +348,38 @@ class TestSpendEstimateIsWorstCase:
         expect_delegated_only = sum(1 for turn in scenario.turns if turn.expect_delegated)
         _router_calls, worker_calls, _judge_calls = eval_runner.scenario_call_counts(scenario)
         assert worker_calls > expect_delegated_only
+
+
+class TestMatrixAccountingIncludesProviderRetryWorstCase:
+    """Regression for round-5 gauntlet finding 11: the OpenAI SDK clients
+    this runner drives leave the SDK's client-level max_retries=2 default in
+    place, so a transient 429/5xx/timeout can issue up to 3 real requests
+    for what this runner counts as 1 nominal call. matrix_call_accounting()
+    (not scenario_call_counts(), which stays a pure per-scenario nominal
+    count) must inflate the --max-calls/--max-cost estimate by the SDK's
+    retry worst case, or the confirmation gate can authorize a run that ends
+    up costing more than approved.
+    """
+
+    def test_accounting_multiplies_nominal_counts_by_the_retry_worst_case(self) -> None:
+        pairs = (eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),)
+        scenarios = (eval_scenarios.SINGLE_TURN_DEFAULT,)
+        nominal_router, nominal_worker, nominal_judge = eval_runner.scenario_call_counts(
+            scenarios[0]
+        )
+
+        accounting = eval_runner.matrix_call_accounting(pairs, scenarios)
+
+        assert accounting.router_calls == nominal_router * eval_runner._RETRY_WORST_CASE_MULTIPLIER
+        assert accounting.worker_calls == nominal_worker * eval_runner._RETRY_WORST_CASE_MULTIPLIER
+        assert accounting.judge_calls == nominal_judge * eval_runner._RETRY_WORST_CASE_MULTIPLIER
+
+    def test_retry_worst_case_multiplier_reflects_the_sdk_default(self) -> None:
+        assert (
+            eval_runner._RETRY_WORST_CASE_MULTIPLIER
+            == 1 + eval_runner._OPENAI_SDK_DEFAULT_MAX_RETRIES
+        )
+        assert eval_runner._RETRY_WORST_CASE_MULTIPLIER > 1
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +1016,143 @@ class TestJudgeScoringSemantics:
         assert outcome.turns[0].judge_verdict == "continue"
 
 
+class TestGenuineUnsupportedIsDistinctFromInfraFailure:
+    """Regression for round-5 gauntlet finding 10: a genuine, on-topic
+    `action="unsupported"` routing decision renders through the exact same
+    SAFE_FALLBACKS text (`_CAPABILITY_UNAVAILABLE_TEXT`) as a true
+    infrastructure failure (dispatch raising RoutingValidationError/
+    UnsupportedWorkerType) -- text alone can't tell them apart. Only the
+    latter should short-circuit as `provider-error`; the former must reach
+    judge scoring so the model is held accountable for the misrouting.
+    """
+
+    _CAPABILITY_UNAVAILABLE_TEXT = "I cannot access that capability here."
+
+    def test_genuine_unsupported_action_reaches_judge_scoring(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no", reason="wrongly declined an answerable request", raw_response="{}"
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(
+                Turn(
+                    query="what's the weather in Riga?",
+                    judge_criterion="names a specific weather condition or temperature",
+                ),
+            ),
+            ui_text=self._CAPABILITY_UNAVAILABLE_TEXT,
+            routing_action="unsupported",
+            verdicts=[verdict],
+        )
+        # Reached judge scoring (a real, non-infra outcome) rather than
+        # being short-circuited as a provider-error before the judge ever
+        # saw it.
+        assert outcome.status == "ok"
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[0].judge_verdict == "no"
+
+    def test_capability_unavailable_text_without_unsupported_action_is_still_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="what's the weather in Riga?", expect_delegated=True),),
+            ui_text=self._CAPABILITY_UNAVAILABLE_TEXT,
+            # A dispatch failure after a new_worker/existing_worker decision
+            # -- not "unsupported" -- still renders the same fallback text,
+            # and must still short-circuit as an infra failure.
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+
+
+class TestWorkerPresenceAssertionCatchesRoutingRegressions:
+    """Regression for round-5 gauntlet finding 12: the routing-regression
+    scenario previously only asserted `action == expect_action` for the
+    greeting turn and citations for delegated turns -- a turn that
+    delegates when it should have answered directly (or vice versa) could
+    still pass with a superficially valid reply. `worker_presence_pass` now
+    catches that directly from the routing action, independent of reply
+    text or judge verdict.
+    """
+
+    def test_should_be_direct_turn_that_actually_delegates_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            citations=["citation-1"],
+            # Routing regression: the router misrouted a plain greeting to
+            # the worker instead of answering directly.
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        assert outcome.turns[0].worker_presence_pass is False
+
+    def test_delegated_turn_that_actually_stays_direct_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            routing_action="direct",
+            verdicts=[],
+        )
+        assert outcome.turns[0].worker_presence_pass is False
+
+    def test_correctly_routed_turns_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        direct_outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            routing_action="direct",
+            verdicts=[],
+        )
+        assert direct_outcome.turns[0].worker_presence_pass is True
+
+        delegated_outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            citations=["citation-1"],
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        assert delegated_outcome.turns[0].worker_presence_pass is True
+
+    def test_worker_presence_failure_fails_the_matrix_via_compute_pass_fail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            citations=["citation-1"],
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        overall_status, reasons = eval_runner.compute_pass_fail([outcome])
+        assert overall_status == "FAIL"
+        assert any("worker presence/absence assertion failed" in reason for reason in reasons)
+
+
 # ---------------------------------------------------------------------------
 # Scenario definitions
 # ---------------------------------------------------------------------------
@@ -1595,6 +1783,45 @@ class TestManifestWorkerEntryRequiresWebSearchTool:
         status = eval_runner.load_manifest_status(manifest_path)
 
         assert status.accepted == frozenset()
+
+
+class TestManifestEntryRejectsMalformedEffortAndMissingRequestKwargs:
+    """Regression for round-5 gauntlet finding 9: a manifest entry whose
+    `effort` field is present but not a string/null must be rejected
+    outright, not silently coerced to None (which would make it read as the
+    verified unset-effort baseline); an entry missing `request_kwargs` (or
+    carrying a non-dict value) has no evidence Phase 0 actually probed it and
+    must also be rejected.
+    """
+
+    def test_malformed_effort_value_is_rejected_not_coerced_to_none(self, tmp_path: Path) -> None:
+        entry = _accepted_worker_entry(eval_runner.WORKER_CANDIDATES[0].model, None)
+        entry["effort"] = 0  # hand-edited: not a string, not null
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        # Must NOT be readable as the unset-effort (None) baseline entry.
+        assert ("worker", eval_runner.WORKER_CANDIDATES[0].model, None) not in status.accepted
+        assert status.accepted == frozenset()
+
+    def test_missing_request_kwargs_is_rejected(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        del entry["request_kwargs"]
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
+
+    def test_non_dict_request_kwargs_is_rejected(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        entry["request_kwargs"] = "not-a-dict"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
 
 
 class TestManifestGateRunMatrixDirectly:
@@ -2285,3 +2512,33 @@ class TestErrorTextStripsControlCharacters:
         raw = "clean\x07bell\x1b[2Jclear"
 
         assert eval_common.strip_control_chars(raw) == eval_runner._sanitize_for_judge(raw)
+
+    def test_c1_control_range_is_stripped(self) -> None:
+        # Regression for round-5 gauntlet finding 8: the original pattern
+        # only covered ASCII C0 + DEL, not the C1 range (U+0080-U+009F) --
+        # mainstream terminals honor some of these too.
+        raw = "before\x9bmiddle\x85after"
+
+        text = eval_common.strip_control_chars(raw)
+
+        assert "\x9b" not in text
+        assert "\x85" not in text
+        assert "before" in text and "middle" in text and "after" in text
+
+    def test_bidi_override_characters_are_stripped(self) -> None:
+        # Regression for round-5 gauntlet finding 8: Unicode bidirectional
+        # overrides (U+202A-U+202E, U+2066-U+2069) could visually reorder an
+        # operator-facing error/report line in a terminal that honors them.
+        # Expressed as \N{...} escapes, not literal characters, so this
+        # source file never itself embeds an invisible/control code point.
+        rle = "\N{RIGHT-TO-LEFT EMBEDDING}"
+        pdf = "\N{POP DIRECTIONAL FORMATTING}"
+        lri = "\N{LEFT-TO-RIGHT ISOLATE}"
+        pdi = "\N{POP DIRECTIONAL ISOLATE}"
+        raw = f"safe{rle}evil{pdf}reversed{lri}iso{pdi}end"
+
+        text = eval_common.strip_control_chars(raw)
+
+        for bidi_char in (rle, pdf, lri, pdi):
+            assert bidi_char not in text
+        assert "safe" in text and "evil" in text and "reversed" in text
