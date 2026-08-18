@@ -3,9 +3,14 @@
 Hoisted out of ``scripts/smoke_conversation.py`` (which now re-exports these
 names for backward compatibility with existing imports, including
 ``tests/test_smoke_conversation.py``) so ``scripts/eval_model_comparison.py``
-and ``evals/scenarios.py`` can reuse the same latency-measurement pattern and
-scenario constants without importing a script module as a library -- the
-layering this module exists for in the first place.
+and ``scripts/smoke_conversation.py`` can share the same session-construction
+(``build_session_for_run``) and latency-measurement (``CollectingMeasurementSink``,
+``_latest_turn_stage_metrics``) helpers without importing a script module as a
+library -- the layering this module exists for in the first place. The
+``DEFAULT_QUERY``/``ROUTING_REGRESSION_QUERIES`` scenario constants live in
+``evals/queries.py``; ``evals/scenarios.py`` imports them from there directly,
+and this module re-exports them only for the same script-import
+backward-compatibility reason as the rest of its ``__all__``.
 """
 
 from __future__ import annotations

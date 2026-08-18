@@ -13,10 +13,14 @@ from dataclasses import replace
 from typing import Any
 
 # Hoisted to scripts/_eval_common.py so scripts/eval_model_comparison.py and
-# evals/scenarios.py can reuse the same latency-measurement helper, in-memory
-# sink, and scenario constants without importing this script module as a
-# library; re-exported here so existing imports (including
+# this module can share the same session-construction helper and
+# latency-measurement pattern (in-memory sink) without either importing the
+# other as a library; re-exported here so existing imports (including
 # tests/test_smoke_conversation.py) keep working unchanged.
+# DEFAULT_QUERY/ROUTING_REGRESSION_QUERIES themselves live in
+# evals/queries.py -- _eval_common.py re-exports them, this module re-exports
+# that re-export, purely for backward compatibility with existing imports;
+# evals/scenarios.py imports them from evals/queries.py directly.
 from scripts._eval_common import (
     DEFAULT_QUERY,
     ROUTING_REGRESSION_QUERIES,

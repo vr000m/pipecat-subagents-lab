@@ -491,6 +491,52 @@ class CellOutcome:
     foreground_search_timeout_seconds: float | None = None
 
 
+def _skipped_turn_outcomes(scenario: Scenario, *, already_run: int) -> list[TurnOutcome]:
+    """``TurnOutcome`` placeholders, by index, for every turn a cell never attempted.
+
+    Shared by every "cell never ran (all or some of) its turns" producer --
+    ``run_cell()``'s pre-call config-mismatch return, ``run_matrix()``'s
+    manifest-rejected cell, and ``run_cell()``'s own end-of-function backfill
+    for a cell that raised partway through -- so a reader comparing two
+    "never ran" cells sees the same ``[skipped, skipped, ...]`` shape
+    regardless of which producer built them, instead of one producer
+    returning ``[]`` and another backfilling. Backfilled by index, not by
+    deduping on query text, so a scenario with a repeated query string is
+    still backfilled correctly.
+    """
+    return [TurnOutcome(query=t.query, status="skipped") for t in scenario.turns[already_run:]]
+
+
+def _never_ran_cell(
+    pair: RunPair,
+    scenario: Scenario,
+    status: str,
+    error: str,
+    *,
+    config: Config | None = None,
+) -> CellOutcome:
+    """Build a ``CellOutcome`` for a cell that never attempted any turn.
+
+    Applies the same turn-backfill logic as a cell that started but never
+    finished (``_skipped_turn_outcomes``), and threads through the per-run
+    provider timeouts when a resolved ``config`` is available (it is for a
+    router-config mismatch, caught after ``_per_run_config()`` has already
+    run; it isn't for a manifest rejection, caught before any per-run
+    ``Config`` exists).
+    """
+    return CellOutcome(
+        pair_label=pair.label,
+        scenario_name=scenario.name,
+        status=status,
+        error=error,
+        turns=_skipped_turn_outcomes(scenario, already_run=0),
+        router_timeout_seconds=config.router_timeout_seconds if config is not None else None,
+        foreground_search_timeout_seconds=(
+            config.foreground_search_timeout_seconds if config is not None else None
+        ),
+    )
+
+
 def _sanitize_for_judge(text: str, *, max_len: int = 4000) -> str:
     """Light defense-in-depth before feeding worker-sourced (hosted web
     search) text into the judge LLM's context: strips ASCII control
@@ -578,6 +624,18 @@ async def run_cell(
     # before the host exists can't call shutdown() on nothing.
     host: Any | None = None
     config: Config | None = None
+    # Set True immediately before the current turn's paid call, and stays
+    # True until that turn's TurnOutcome is appended to `turns` (every
+    # explicit break path below appends before breaking; the only way to
+    # reach the outer except handler with turn_started True is an exception
+    # that escaped from *after* the paid call but *before* that append --
+    # e.g. _latest_turn_stage_metrics() raising, or a malformed result's
+    # attribute access failing). Distinguishes "a turn actually ran (and was
+    # billed) but the code around it blew up" from "nothing was attempted
+    # yet", which `len(turns)` alone can't do for the turn that's mid-flight
+    # when the exception hits.
+    turn_started = False
+    in_flight_query: str | None = None
 
     try:
         from pipecat.evals.judge import EvalJudge
@@ -597,15 +655,16 @@ async def run_cell(
             resolved_router_model != pair.router.model
             or resolved_router_effort != pair.router.effort
         ):
-            return CellOutcome(
-                pair_label=pair.label,
-                scenario_name=scenario.name,
-                status="setup-error",
-                error=(
+            return _never_ran_cell(
+                pair,
+                scenario,
+                "setup-error",
+                (
                     f"router config did not resolve to the candidate: "
                     f"got {resolved_router_model}@{resolved_router_effort}, "
                     f"wanted {pair.router.model}@{pair.router.effort}"
                 ),
+                config=config,
             )
 
         sink = CollectingMeasurementSink()
@@ -619,6 +678,8 @@ async def run_cell(
         for turn in scenario.turns:
             outcome = TurnOutcome(query=turn.query, status="ok")
             started = time.perf_counter()
+            turn_started = True
+            in_flight_query = turn.query
             try:
                 value = await asyncio.wait_for(
                     host._handle_transcript(turn.query, origin=connection),
@@ -737,14 +798,16 @@ async def run_cell(
         # already-billed cell with no report ever written, contradicting this
         # function's own "classify, don't crash the matrix" contract.
         #
-        # "setup-error" only if no turn ever completed -- if `turns` already
-        # has entries, the exception happened mid-loop, after at least one
-        # turn ran (and was billed) successfully, e.g. from
-        # _latest_turn_stage_metrics() raising (no app_turn_foreground
-        # record emitted for a turn) or a malformed _handle_transcript
-        # return value's attribute access failing. That in-flight turn
-        # actually ran; misattributing it to "setup" would misreport a
-        # mid-turn failure as if nothing had run yet.
+        # turn_started (not len(turns)) decides "setup-error" vs
+        # "turn-error": a TurnOutcome is only appended to `turns` at the END
+        # of a turn's iteration, so if the FIRST turn fails mid-execution
+        # (e.g. _latest_turn_stage_metrics() raising, or a malformed
+        # _handle_transcript return value's attribute access failing), `turns`
+        # is still `[]` here even though that turn actually ran and was
+        # billed. Append its in-flight outcome now, before the backfill below
+        # runs, so it isn't mislabeled "skipped".
+        if turn_started:
+            turns.append(TurnOutcome(query=in_flight_query, status="turn-error"))
         cell_status = "turn-error" if turns else "setup-error"
         cell_error = error_text(exc, credential=config.openai_api_key if config else None)
     finally:
@@ -754,9 +817,16 @@ async def run_cell(
             except Exception as shutdown_exc:  # noqa: BLE001 -- never mask the original outcome
                 # A shutdown failure must not crash run_matrix or overwrite a
                 # real cell outcome/error above -- surface it only if nothing
-                # else already explains why this cell isn't "ok".
+                # else already explains why this cell isn't "ok". Reported as
+                # "turn-error", not "setup-error": this branch is only
+                # reachable when cell_status == "ok", i.e. every turn already
+                # ran and succeeded -- shutdown runs strictly after setup, so
+                # "setup-error" would be self-contradictory alongside N "ok"
+                # turns. Both statuses are already in
+                # _CELL_INFRA_FAILURE_STATUSES, so this is a reporting-only
+                # change, not a behavior change to the pass/fail gate.
                 if cell_status == "ok":
-                    cell_status = "setup-error"
+                    cell_status = "turn-error"
                     cell_error = (
                         "host.shutdown() raised: "
                         f"{error_text(shutdown_exc, credential=config.openai_api_key if config else None)}"
@@ -766,12 +836,7 @@ async def run_cell(
         # Record every turn the scenario defines but this cell never
         # attempted, so a reader of the report can tell "ran and failed" from
         # "never got here" instead of the turn silently being absent.
-        # Backfilled by INDEX, not by deduping on query text: `turns` is
-        # appended strictly in scenario order, so a scenario with a repeated
-        # query string (a text-based dedup would under-report it) is still
-        # backfilled correctly this way.
-        for remaining_turn in scenario.turns[len(turns) :]:
-            turns.append(TurnOutcome(query=remaining_turn.query, status="skipped"))
+        turns.extend(_skipped_turn_outcomes(scenario, already_run=len(turns)))
 
     return CellOutcome(
         pair_label=pair.label,
@@ -810,11 +875,11 @@ async def run_matrix(
                 pair.worker, manifest_status
             ):
                 outcomes.append(
-                    CellOutcome(
-                        pair_label=pair.label,
-                        scenario_name=scenario.name,
-                        status="manifest-rejected",
-                        error="one or both candidates are absent from the manifest",
+                    _never_ran_cell(
+                        pair,
+                        scenario,
+                        "manifest-rejected",
+                        "one or both candidates are absent from the manifest",
                     )
                 )
                 continue

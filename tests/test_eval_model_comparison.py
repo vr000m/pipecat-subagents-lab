@@ -1156,6 +1156,67 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
 
         assert outcome.status == "setup-error"
 
+    def test_failure_mid_execution_of_the_first_turn_is_turn_error_not_setup_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for round-3 gauntlet finding 1: ``cell_status = "turn-error"
+        if turns else "setup-error"`` previously inferred "did any turn
+        complete" from ``len(turns)`` -- but a ``TurnOutcome`` is only
+        appended at the END of a turn's iteration, so a turn that fails mid-
+        execution (paid call succeeded, something after it raised) on the
+        FIRST turn left ``turns == []`` even though that turn actually ran
+        and was billed. It was misclassified "setup-error" (implying nothing
+        was attempted) and the skipped-turn backfill mislabeled the
+        already-billed, already-run turn as "skipped". Fixed by a
+        ``turn_started`` flag set immediately before the paid call, used to
+        append an in-flight ``TurnOutcome(status="turn-error")`` for the turn
+        that was mid-execution before the backfill runs.
+        """
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        def _stage_metrics_always_fails(
+            _sink: Any, _elapsed_ms: float, _turn_id: str
+        ) -> dict[str, float]:
+            raise RuntimeError("no app_turn_foreground metric was emitted for turn_id='turn-1'")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "_latest_turn_stage_metrics", _stage_metrics_always_fails)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "turn-error"
+        # The first turn actually ran (and was billed) -- it must be recorded
+        # as "turn-error", not as "setup-error" and not silently dropped into
+        # the "skipped" backfill.
+        assert len(outcome.turns) == 2
+        assert outcome.turns[0].query == "turn one"
+        assert outcome.turns[0].status == "turn-error"
+        assert outcome.turns[1].query == "turn two"
+        assert outcome.turns[1].status == "skipped"
+
 
 class TestSkippedTurnBackfillDedupesByIndexNotQueryText:
     """Regression for round-2 gauntlet finding 11: the skipped-turn backfill
@@ -1673,6 +1734,13 @@ class TestRunCellSetupExceptionsDontCrashTheMatrix:
     def test_shutdown_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A shutdown() failure itself must not crash run_matrix or mask a
         # genuinely "ok" cell's outcome by raising out of run_cell().
+        #
+        # Regression for round-3 gauntlet finding 3: this branch is only
+        # reachable when every turn already ran and succeeded (cell_status ==
+        # "ok" going into the finally block) -- shutdown() runs strictly
+        # after every turn, so "setup-error" was self-contradictory alongside
+        # N "ok" turns. Fixed to report "turn-error" instead (both are
+        # already infra-failure statuses, so no pass/fail behavior change).
         class _FailingShutdownHost(_FakeHost):
             async def shutdown(self) -> None:
                 raise RuntimeError("shutdown exploded")
@@ -1709,8 +1777,86 @@ class TestRunCellSetupExceptionsDontCrashTheMatrix:
             )
         )
 
-        assert outcome.status == "setup-error"
+        assert outcome.status == "turn-error"
         assert "shutdown exploded" in (outcome.error or "")
+
+
+class TestNeverRanCellsAreBackfilledConsistently:
+    """Regression for round-3 gauntlet finding 2: cells that never ran any
+    turn were reported inconsistently depending on which code path produced
+    them. The router-config-mismatch early return and the manifest-rejected
+    early return in ``run_matrix()`` both left ``turns`` at its default
+    (rendering as ``[]`` in the report), while the exception-path fallback
+    backfilled ``N`` "skipped" ``TurnOutcome``s. Fixed by routing every
+    "never ran" producer through the shared ``_never_ran_cell()``/
+    ``_skipped_turn_outcomes()`` helpers.
+    """
+
+    def test_router_config_mismatch_backfills_all_turns_as_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Force the pre-call router assertion to fail by making the resolved
+        # model diverge from what the candidate claims -- no real Config
+        # subclassing needed, just monkeypatch resolve_router_model.
+        monkeypatch.setattr(
+            eval_runner.Config,
+            "resolve_router_model",
+            lambda self, _label: "some-other-model",
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert len(outcome.turns) == 2
+        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
+        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
+        # The per-run Config had already been resolved by the time the
+        # mismatch was caught -- its provider timeouts must still be threaded
+        # into the CellOutcome, not dropped.
+        assert outcome.router_timeout_seconds is not None
+        assert outcome.foreground_search_timeout_seconds is not None
+
+    def test_manifest_rejected_cell_backfills_all_turns_as_skipped(self) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        empty_status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (scenario,),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=empty_status,
+            )
+        )
+
+        assert len(outcomes) == 1
+        outcome = outcomes[0]
+        assert outcome.status == "manifest-rejected"
+        assert len(outcome.turns) == 2
+        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
+        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
 
 
 class TestManifestDiagnosticsPrintEffectiveEffort:

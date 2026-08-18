@@ -35,7 +35,7 @@ line-length = 100
 # clean; never extend it for new code.
 [tool.mypy]
 python_version = "3.12"
-files = ["server"]
+files = ["server", "evals"]
 ignore_missing_imports = true
 
 # Legacy debt: pre-existing errors, exempted until fixed. Do not add new entries.
