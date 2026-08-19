@@ -9674,3 +9674,35 @@ def test_multi_intent_retracts_an_admitted_ack_when_no_delegated_child_was_accep
         await host.shutdown()
 
     asyncio.run(run())
+
+
+class TestMultiIntentItemTurnIdRoundTrip:
+    """Regression for round 9 gauntlet, Architecture lens finding 14:
+    ``multi_intent_item_turn_id``/``split_multi_intent_turn_id`` are the
+    shared constructor/inverse pair for the ``f"{turn_id}-{index}"``
+    convention ``_handle_multi_intent`` mints -- previously re-derived via
+    ad hoc string parsing in ``scripts/eval_model_comparison.py`` with no
+    shared helper, so a turn-id format change here could silently desync
+    that eval-runner classification with no test catching it structurally.
+    """
+
+    def test_round_trips_through_construct_then_split(self) -> None:
+        item_id = pipeline_module.multi_intent_item_turn_id("turn-abc-123", 2)
+        assert item_id == "turn-abc-123-2"
+        assert pipeline_module.split_multi_intent_turn_id(item_id) == ("turn-abc-123", 2)
+
+    def test_split_rejects_a_turn_id_with_no_numeric_suffix(self) -> None:
+        assert pipeline_module.split_multi_intent_turn_id("turn-abc-x") is None
+
+    def test_split_rejects_a_turn_id_with_no_hyphen(self) -> None:
+        assert pipeline_module.split_multi_intent_turn_id("turn1") is None
+
+    def test_split_rejects_an_empty_prefix(self) -> None:
+        assert pipeline_module.split_multi_intent_turn_id("-0") is None
+
+    def test_split_accepts_a_hyphenated_parent_turn_id(self) -> None:
+        # The parent turn_id itself may legitimately contain hyphens (a
+        # scenario's own query-derived identifiers aren't guaranteed
+        # hyphen-free) -- rpartition("-") splits on the LAST hyphen only.
+        item_id = pipeline_module.multi_intent_item_turn_id("scenario-turn-1", 0)
+        assert pipeline_module.split_multi_intent_turn_id(item_id) == ("scenario-turn-1", 0)

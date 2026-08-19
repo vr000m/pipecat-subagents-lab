@@ -27,6 +27,7 @@ from scripts.eval_common import (
     CollectingMeasurementSink,
     build_session_for_run,
     latest_turn_stage_metrics,
+    turn_correlated_routing_action,
 )
 
 __all__ = [
@@ -38,24 +39,17 @@ __all__ = [
 
 RESULT_PREFIX = "SMOKE_RESULT="
 
-
-def _turn_correlated_routing_action(routing: Any, result_turn_id: str) -> str | None:
-    """``routing.action`` if ``routing`` was actually decided for this turn,
-    else ``None``.
-
-    Mirrors ``scripts/eval_model_comparison.py``'s ``run_cell()`` staleness
-    guard (round 6/7 gauntlet): ``host.state.routing`` still holds the PRIOR
-    turn's decision if this turn's own routing/dispatch call fails before
-    ever assigning a new one. This smoke script has no "unevaluated"
-    reporting channel (unlike the eval runner) -- callers here already treat
-    a ``None`` action as an explicit failure (round 8 gauntlet, Logic lens
-    finding 1).
-    """
-    return (
-        getattr(routing, "action", None)
-        if getattr(routing, "turn_id", None) == result_turn_id
-        else None
-    )
+# Backward-compatible alias for this module's own previously-local
+# definition, now hoisted to scripts/eval_common.py's
+# turn_correlated_routing_action() so this script and
+# scripts/eval_model_comparison.py share one implementation instead of two
+# independently-maintained copies (round 9 gauntlet, Architecture lens
+# finding 17). Kept under the old leading-underscore name -- not in
+# __all__ -- since tests/test_smoke_conversation.py imports it by this name
+# directly. This smoke script has no "unevaluated" reporting channel (unlike
+# the eval runner) -- callers here already treat a ``None`` action as an
+# explicit failure (round 8 gauntlet, Logic lens finding 1).
+_turn_correlated_routing_action = turn_correlated_routing_action
 
 
 class _RecordingTTS:

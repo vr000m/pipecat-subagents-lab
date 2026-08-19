@@ -660,6 +660,24 @@ class TestReportAggregation:
         assert report["repetition_count_per_cell"] == 1
         assert "repetition_note" in report
 
+    def test_call_accounting_is_persisted_into_the_report(self) -> None:
+        # Regression for round 9 gauntlet, Codex P2 finding 3: the
+        # spend-confirmation estimate was only printed to the console,
+        # unavailable to a caller auditing the persisted report file.
+        accounting = eval_runner.CallAccounting(router_calls=3, worker_calls=2, judge_calls=1)
+        report = eval_runner.build_report([], judge_model="gpt-5-mini", call_accounting=accounting)
+        assert report["call_accounting"] == {
+            "router_calls": 3,
+            "worker_calls": 2,
+            "judge_calls": 1,
+            "total_calls": 6,
+            "estimated_cost_usd": accounting.estimated_cost_usd,
+        }
+
+    def test_call_accounting_defaults_to_none_when_omitted(self) -> None:
+        report = eval_runner.build_report([], judge_model="gpt-5-mini")
+        assert report["call_accounting"] is None
+
 
 # ---------------------------------------------------------------------------
 # Dry-run: zero live calls invariant
@@ -1512,6 +1530,60 @@ class TestMultiIntentRoutingSignalGap:
         assert turn.deterministic_action_unevaluated_reason is None
 
 
+class TestUnevaluatedDeterministicActionFailsTheRun:
+    """Regression for round 9 gauntlet, merged Codex P1 + Logic lens
+    finding 3: ``deterministic_action_unevaluated_reason`` (round 8) made a
+    requested-but-never-run assertion visible in the per-turn report, but
+    ``compute_pass_fail()`` only rejected ``deterministic_action_pass is
+    False`` -- a ``None`` value (whether "not applicable" or "requested but
+    unevaluated") still aggregated to PASS, the exact class of gap round 8
+    fixed for the latency-budget gate.
+    """
+
+    def _cell_with_unevaluated_action(self) -> Any:
+        turn = eval_runner.TurnOutcome(
+            query="Hi.",
+            status="ok",
+            deterministic_action_pass=None,
+            deterministic_action_unevaluated_reason=(
+                "routing_action was unavailable for this turn"
+            ),
+        )
+        return eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="s",
+            status="ok",
+            turns=[turn],
+        )
+
+    def test_a_requested_but_unevaluated_action_assertion_fails_the_run(self) -> None:
+        overall_status, reasons = eval_runner.compute_pass_fail(
+            [self._cell_with_unevaluated_action()]
+        )
+        assert overall_status == "FAIL"
+        assert any("unevaluated" in reason for reason in reasons)
+
+    def test_reason_is_classified_infra_not_semantic(self) -> None:
+        _overall_status, reasons = eval_runner.compute_pass_fail(
+            [self._cell_with_unevaluated_action()]
+        )
+        assert any(reason.startswith("infra:") and "unevaluated" in reason for reason in reasons)
+
+    def test_a_not_applicable_none_action_still_passes(self) -> None:
+        # deterministic_action_pass=None with NO unevaluated_reason means "no
+        # assertion was requested" -- must still pass, not regress into a
+        # false failure for every turn without an expect_action.
+        turn = eval_runner.TurnOutcome(
+            query="Hi.",
+            status="ok",
+            deterministic_action_pass=None,
+            deterministic_action_unevaluated_reason=None,
+        )
+        cell = eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[turn])
+        overall_status, _reasons = eval_runner.compute_pass_fail([cell])
+        assert overall_status == "PASS"
+
+
 class TestMissingTurnMetricsIsNotSilentlySwallowed:
     """Regression for round 8 gauntlet, merged Codex P1 + Logic lens finding 4:
     round 7 added ``except RuntimeError: stage_metrics = None`` around
@@ -1564,11 +1636,19 @@ class TestMissingTurnMetricsIsNotSilentlySwallowed:
             )
         )
 
-        # Must NOT be a silent "ok" with latency_budget_enforced left False --
-        # that would let compute_pass_fail() report PASS with no latency
-        # evidence at all.
-        assert outcome.status == "turn-error"
+        # Must NOT be a silent "ok" turn with latency_budget_enforced left
+        # False -- that would let compute_pass_fail() report PASS with no
+        # latency evidence at all. THIS turn is classified turn-error; the
+        # cell itself stays "ok" (round 9 gauntlet, Logic lens finding 7 --
+        # see TestMissingMetricsDoesNotAbortTheCell below for why the cell
+        # must not abort over a single ordinary turn's metrics gap).
         assert outcome.turns[0].status == "turn-error"
+        assert outcome.turns[0].error is not None
+        assert "app_turn_foreground" in outcome.turns[0].error
+        # The cell itself completes ("ok") rather than aborting -- a single
+        # ordinary turn's metrics gap must not discard the rest of a paid
+        # scenario's turns (round 9 gauntlet, Logic lens finding 7).
+        assert outcome.status == "ok"
 
     def test_multi_intent_item_suffixed_turn_id_is_still_a_recognized_gap_not_a_turn_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1631,6 +1711,75 @@ class TestMissingTurnMetricsIsNotSilentlySwallowed:
         assert outcome.turns[0].status == "ok"
         assert outcome.turns[0].routing_ms is None
         assert outcome.turns[0].latency_budget_enforced is False
+
+
+class TestMissingMetricsDoesNotAbortTheCell:
+    """Regression for round 9 gauntlet, Logic lens finding 7: round 8's
+    ``raise`` (on a genuinely-missing, non-multi-intent metrics gap) escaped
+    the whole ``for turn in scenario.turns`` loop -- discarding the
+    already-computed ``outcome`` fields for that turn (worker_presence_pass/
+    citations_pass/routing data, overwritten by a fresh ``TurnOutcome`` in
+    the outer handler) and aborting the entire cell, marking every remaining
+    turn "skipped" even though this is an ordinary single-turn metrics gap,
+    not a real infrastructure failure. The fix marks THIS turn turn-error
+    and continues to the next turn.
+    """
+
+    def test_a_turn_after_the_missing_metrics_turn_still_runs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+
+            def _result_factory(query: str) -> Any:
+                calls.append(query)
+                return _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+
+            return _FakeHost(_result_factory)
+
+        def _stage_metrics_fails_once(
+            _sink: Any, _elapsed_ms: float, turn_id: str
+        ) -> dict[str, float]:
+            if len(calls) == 1:
+                raise RuntimeError(
+                    f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}"
+                )
+            return {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0}
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics_fails_once)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="first"), Turn(query="second")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # Both turns actually ran (were billed) -- the second was not
+        # skipped, and the cell completed rather than aborting.
+        assert calls == ["first", "second"]
+        assert outcome.status == "ok"
+        assert len(outcome.turns) == 2
+        assert outcome.turns[0].status == "turn-error"
+        assert outcome.turns[1].status == "ok"
+        # The second turn's own outcome data was not discarded/overwritten.
+        assert outcome.turns[1].routing_ms == 10.0
 
 
 class TestIsMultiIntentItemTurnId:
@@ -1826,6 +1975,12 @@ class TestTurnFailurePropagatesToCellAndReport:
         outcome = self._run(monkeypatch, failure=TimeoutError())
         assert outcome.status == "timeout"
         assert outcome.turns[0].status == "timeout"
+        # Regression for round 9 gauntlet, Logic lens finding 8: every
+        # sibling infra-failure break path sets outcome.error; the
+        # wait_for-TimeoutError path previously only set cell_error, leaving
+        # this turn's own `error` detail blank.
+        assert outcome.turns[0].error is not None
+        assert "wait_for budget" in outcome.turns[0].error
 
     def test_a_provider_error_turn_marks_the_cell_status_non_ok(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2228,6 +2383,69 @@ class TestHostLifecycleExceptionsDontCrashTheMatrix:
         assert "judge backend unreachable" in (result.turns[0].judge_reason or "")
 
 
+class TestJudgeEvaluateIsBoundedByATimeout:
+    """Regression for round 9 gauntlet, Codex P2 finding 1: a stalled/
+    unreachable judge endpoint previously had no bound at all and could hold
+    the whole matrix for minutes.
+    """
+
+    def test_a_hanging_judge_call_is_classified_as_judge_error_not_hung_forever(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _HangingJudge:
+            def __init__(self, *_a: Any, **_k: Any) -> None:
+                pass
+
+            def add_user_message(self, _text: str) -> None:
+                pass
+
+            def add_assistant_message(self, _text: str) -> None:
+                pass
+
+            async def evaluate(self, _criterion: str) -> Any:
+                await asyncio.sleep(10)
+                raise AssertionError("should have timed out before completing")
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(
+            eval_runner,
+            "latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _HangingJudge)
+        # Keep the test fast: the timeout mechanism, not the specific bound,
+        # is under test here.
+        monkeypatch.setattr(eval_runner, "_JUDGE_EVALUATE_TIMEOUT_SECONDS", 0.05)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        result = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="weather in Riga?", judge_criterion="x"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert result.status == "ok"
+        assert result.turns[0].judge_verdict == "judge-error"
+        assert "timeout" in (result.turns[0].judge_reason or "").lower()
+
+
 class TestManifestStalenessFailsClosed:
     """Regression for finding 5: an unverifiable identity -- a manifest
     missing source_commit, or a current-commit lookup that itself failed --
@@ -2308,6 +2526,45 @@ class TestManifestStalenessFailsClosed:
         assert status.stale is True
 
 
+class TestSourceTreeDirtyCheckIsWholeTreeAttested:
+    """Regression for round 9 gauntlet, Architecture lens finding 15: round
+    7, 8, and 9 of the review gauntlet each independently found one more
+    file a hand-enumerated ``_MANIFEST_ATTESTED_PATHS`` tuple was missing.
+    Replaced with whole-tree attestation over ``server/``,
+    ``scripts/eval_common.py``, and ``evals/`` -- a dirty file under any of
+    those, not just a previously-enumerated subset, must now be detected.
+    """
+
+    def test_attested_paths_cover_the_whole_server_tree_not_an_enumerated_subset(self) -> None:
+        assert eval_runner._MANIFEST_ATTESTED_PATHS == (
+            "server/",
+            "scripts/eval_common.py",
+            "evals/",
+        )
+
+    def test_git_status_is_invoked_with_the_broadened_attested_paths(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, list[str]] = {}
+        real_run = eval_runner.subprocess.run
+
+        def _capturing_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return real_run(["git", "status", "--porcelain"], **kwargs)
+
+        monkeypatch.setattr(eval_runner.subprocess, "run", _capturing_run)
+
+        eval_runner._source_tree_dirty()
+
+        for attested_path in eval_runner._MANIFEST_ATTESTED_PATHS:
+            assert attested_path in captured["cmd"]
+        # Previously-enumerated single files (e.g. server/registry.py) are no
+        # longer named individually -- the whole "server/" directory covers
+        # them instead, which is exactly the point: a file this list never
+        # enumerated (e.g. server/app.py) is covered too.
+        assert "server/registry.py" not in captured["cmd"]
+
+
 class TestManifestWorkerEntryRequiresWebSearchTool:
     """Regression for finding 10: a worker candidate's manifest entry must
     declare the web_search tool it was actually probed with -- a
@@ -2384,6 +2641,101 @@ class TestManifestEntryRejectsMalformedEffortAndMissingRequestKwargs:
         assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
 
 
+class TestRequestKwargsRequiredKeysAreDerivedFromProductionBuilders:
+    """Regression for round 9 gauntlet, Architecture lens finding 16: the
+    required-key set ``_request_kwargs_shape_ok()`` enforces must be DERIVED
+    from ``build_router_request_kwargs``/``build_worker_request_kwargs``
+    (the production builders), not a hand-written literal -- so a new
+    load-bearing kwarg added to a builder is automatically required here
+    too, instead of this validator silently staying behind the builder it's
+    supposed to mirror.
+    """
+
+    def test_a_new_key_added_to_the_router_builder_is_now_required(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_builder = eval_runner.build_router_request_kwargs
+
+        def _builder_with_extra_key(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            kwargs_out = real_builder(*args, **kwargs)
+            kwargs_out["a_new_load_bearing_kwarg"] = "x"
+            return kwargs_out
+
+        monkeypatch.setattr(eval_runner, "build_router_request_kwargs", _builder_with_extra_key)
+
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        # A previously-fully-valid entry, missing only the NEW key the
+        # builder now emits.
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "router", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is False
+        )
+
+        entry["request_kwargs"]["a_new_load_bearing_kwarg"] = "x"
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "router", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is True
+        )
+
+    def test_a_new_key_added_to_the_worker_builder_is_now_required(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_builder = eval_runner.build_worker_request_kwargs
+
+        def _builder_with_extra_key(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            kwargs_out = real_builder(*args, **kwargs)
+            kwargs_out["a_new_load_bearing_kwarg"] = "x"
+            return kwargs_out
+
+        monkeypatch.setattr(eval_runner, "build_worker_request_kwargs", _builder_with_extra_key)
+
+        entry = _accepted_worker_entry(eval_runner.WORKER_CANDIDATES[0].model, "medium")
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "worker", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is False
+        )
+
+        entry["request_kwargs"]["a_new_load_bearing_kwarg"] = "x"
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "worker", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is True
+        )
+
+    def test_existing_fixtures_still_pass_with_the_derived_required_set(self) -> None:
+        # The router/worker fixtures already used throughout this file must
+        # not regress -- confirms the derived required set didn't
+        # accidentally widen to include "timeout"/"instructions"/"include",
+        # which this function's own docstring documents as non-load-bearing.
+        router_entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "router",
+                router_entry["model"],
+                router_entry["effort"],
+                router_entry["request_kwargs"],
+            )
+            is True
+        )
+        worker_entry = _accepted_worker_entry(eval_runner.WORKER_CANDIDATES[0].model, "medium")
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "worker",
+                worker_entry["model"],
+                worker_entry["effort"],
+                worker_entry["request_kwargs"],
+            )
+            is True
+        )
+
+
 class TestManifestEntryRequestKwargsMustMatchItsOwnModelAndEffort:
     """Regression for round 8 gauntlet, Codex P1 finding 2: an entry's
     ``request_kwargs`` must actually name the same ``model``/effective
@@ -2455,6 +2807,31 @@ class TestManifestEntryRequestKwargsMustMatchItsOwnModelAndEffort:
         status = eval_runner.load_manifest_status(manifest_path)
 
         assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is True
+
+    def test_judge_entry_with_a_disagreeing_request_kwargs_model_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for round 9 gauntlet, Codex P2 finding 2: the router
+        and worker branches already cross-checked request_kwargs["model"]
+        against the entry's own recorded model (round 8); the judge branch
+        didn't, so a malformed/stale judge entry could carry a different
+        model's request_kwargs and still pass validation.
+        """
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        entry["request_kwargs"]["model"] = "some-other-judge-model"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is False
+
+    def test_a_correctly_matching_judge_entry_is_still_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is True
 
 
 class TestManifestGateRunMatrixDirectly:
@@ -2592,6 +2969,30 @@ class TestReportIsPersistedByDefault:
 
         assert explicit_path.exists()
         assert not report_dir.exists()
+
+    def test_two_runs_within_the_same_second_do_not_collide(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Regression for round 9 gauntlet, Codex P2 finding 4: a bare
+        seconds-resolution default filename let a second run finishing
+        within the same UTC second silently overwrite the first run's
+        report via write_no_follow()'s O_TRUNC.
+        """
+
+        class _FrozenDatetime(eval_runner.datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return cls(2026, 8, 19, 12, 0, 0, tzinfo=tz)
+
+        monkeypatch.setattr(eval_runner, "datetime", _FrozenDatetime)
+
+        self._run_to_completion(monkeypatch, tmp_path, extra_args=[])
+        self._run_to_completion(monkeypatch, tmp_path, extra_args=[])
+
+        report_dir = tmp_path / "eval-reports"
+        written = list(report_dir.glob("eval-report-*.json"))
+        assert len(written) == 2
+        assert written[0].name != written[1].name
 
 
 class TestSpendLimitValidation:

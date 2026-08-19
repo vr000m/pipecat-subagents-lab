@@ -74,20 +74,9 @@ __all__ = [
     "latest_turn_stage_metrics",
     "sanitize_reason",
     "strip_control_chars",
+    "turn_correlated_routing_action",
     "write_no_follow",
 ]
-# NOTE: ``_latest_turn_stage_metrics`` (leading underscore) is deliberately
-# NOT in ``__all__`` -- a "private by convention" name has no business in a
-# module's declared public-export list, which is the self-contradiction round
-# 5's Architecture lens flagged (finding 6). The canonical public name is
-# ``latest_turn_stage_metrics`` above; ``_latest_turn_stage_metrics`` remains
-# defined below as a plain backward-compatible alias (importable by explicit
-# name, just not via ``from scripts.eval_common import *``) since existing
-# call sites and tests (``scripts/smoke_conversation.py``,
-# ``scripts/eval_model_comparison.py``, ``tests/test_eval_model_comparison.py``,
-# ``tests/test_smoke_conversation.py``) already monkeypatch/import it under
-# the old name -- renaming every one of those call sites was judged
-# disproportionate churn for a Minor finding.
 
 # Light redaction for a low-severity but real risk: an OpenAI client
 # exception's str() can, under a misconfigured proxy or an unusual error
@@ -122,13 +111,23 @@ _API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{10,}")
 # provider-controlled exception text overwrite an operator's terminal line via
 # a bare CR, despite this module's docstring promising "all ASCII controls
 # except newline/tab" are stripped.
-_CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+#
+# Zero-width/invisible formatting characters added in round 9 (Security lens
+# finding 12): U+00AD (soft hyphen), U+200B (zero-width space), U+200C/U+200D
+# (ZWNJ/ZWJ), U+200E/U+200F (LRM/RLM -- direction marks, not the bidi
+# *override* pair already covered above), U+2060 (word joiner), and U+FEFF
+# (BOM / zero-width no-break space). A credential with one of these embedded
+# defeated redaction the same way the pre-round-7 control-char gap did --
+# invisible on a terminal, but present in the exact-substring/regex match
+# _redact() performs, so an untouched credential could slip through with the
+# offending character(s) simply not visible around it.
+_CONTROL_CHAR_PATTERN = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f"
+    r"\u202a-\u202e\u2066-\u2069"
+    r"\u00ad\u200b-\u200f\u2060\ufeff]"
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# Backward-compatible alias -- existing call sites in this module used the
-# leading-underscore name before round 7 hoisted REPO_ROOT into the public
-# surface (gauntlet finding 12).
-_REPO_ROOT = REPO_ROOT
 
 # Manifest producer/consumer contract, hoisted here (round 5, Architecture
 # lens finding 2) so scripts/verify_eval_candidates.py (the producer) and
@@ -216,6 +215,29 @@ def effective_effort_for_manifest_lookup(candidate: Candidate) -> str | None:
     return candidate.effort
 
 
+def turn_correlated_routing_action(routing: Any, result_turn_id: str) -> str | None:
+    """``routing.action`` if ``routing`` was actually decided for this turn,
+    else ``None``.
+
+    ``host.state.routing`` (``RoutingState``, ``server/contracts.py``) still
+    holds the PRIOR turn's decision if this turn's own routing/dispatch call
+    fails before ever assigning a new one -- a stale read that would
+    misattribute a genuine new infra failure to the previous turn's action.
+    Shared by ``scripts/eval_model_comparison.py``'s ``run_cell()`` and
+    ``scripts/smoke_conversation.py`` (both already import this module) --
+    previously two independently-maintained 3-line copies of the same guard
+    (round 9 gauntlet, Architecture lens finding 17). Each caller still
+    handles a ``None`` result itself: the eval runner leaves an
+    unevaluated-reason trail, the smoke script treats it as an explicit
+    failure.
+    """
+    return (
+        getattr(routing, "action", None)
+        if getattr(routing, "turn_id", None) == result_turn_id
+        else None
+    )
+
+
 def latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
     """Read the given ``turn_id``'s correlated PERF_METRIC records.
 
@@ -245,15 +267,10 @@ def latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dic
     }
 
 
-# Backward-compatible alias -- not in __all__ (see the note above it). Existing
-# call sites (scripts/smoke_conversation.py, scripts/eval_model_comparison.py)
-# and tests monkeypatch/import this old leading-underscore name directly.
-_latest_turn_stage_metrics = latest_turn_stage_metrics
-
-
 def build_session_for_run(
     config: Config,
     *,
+    router: Any | None = None,
     measurement_sink: Any | None = None,
     router_responses_factory: Callable[[], Any] | None = None,
     worker_responses: Any = None,
@@ -269,12 +286,22 @@ def build_session_for_run(
     (round 5, Architecture lens finding 1) -- see that function's own
     docstring for the load-bearing rationale (router config-capture, why a
     post-hoc ``host.config = tuned`` reassignment can't vary it, and the
-    promotion-manifest fail-closed behavior); this wrapper adds no behavior of
-    its own beyond forwarding these eval/smoke-only parameters (round 7
-    gauntlet, Architecture finding 16).
+    promotion-manifest fail-closed behavior).
+
+    Forwards ``router`` (round 9 gauntlet, Architecture lens finding 19) --
+    previously silently narrowed out of this wrapper's signature relative to
+    ``build_session_host``'s own, with no stated rationale, even though this
+    wrapper otherwise forwards every other parameter unchanged. This
+    function's continued justification for existing at all (rather than
+    callers importing ``build_session_host`` directly) is now genuinely the
+    test seam it provides: ``scripts/eval_model_comparison.py``/
+    ``scripts/smoke_conversation.py`` and their tests reference this one
+    name, not ``server.composition``'s, keeping the eval/smoke layer's
+    import surface decoupled from the production composition root's.
     """
     return build_session_host(
         config,
+        router=router,
         router_responses_factory=router_responses_factory,
         worker_responses=worker_responses,
         measurement_sink=measurement_sink,
@@ -337,10 +364,25 @@ def _redact(text: str, credential: str | None) -> str:
     exact-substring match and the ``sk-...`` regex, then have the control
     char stripped afterward, reassembling the intact credential in the output
     (round 8 gauntlet, Security lens finding 5).
+
+    The stripped credential is also required to be non-trivially long (>= 8
+    chars) before it's used as a ``str.replace`` needle. Two related gaps,
+    both closed by this floor together with stripping-before-truthiness-check
+    (round 9 gauntlet, Logic lens finding 5 + Security lens finding 4):
+    (1) the old ``if credential:`` guard tested the *unstripped* value, so a
+    credential that was entirely control/zero-width characters (stripping to
+    ``""``) still passed the guard, and ``text.replace("", "***REDACTED***")``
+    then shreds the entire output by inserting the replacement between every
+    character; (2) even a short-but-nonempty stripped credential (e.g. a
+    2-character leftover) risks matching coincidental substrings elsewhere in
+    the text and redacting unrelated content. Real API keys/tokens are always
+    well over 8 characters, so this floor costs no real-world redaction
+    coverage.
     """
     text = strip_control_chars(text)
-    if credential:
-        text = text.replace(strip_control_chars(credential), "***REDACTED***")
+    stripped_credential = strip_control_chars(credential) if credential else ""
+    if len(stripped_credential) >= 8:
+        text = text.replace(stripped_credential, "***REDACTED***")
     return _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
 
 
@@ -384,7 +426,7 @@ def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = No
     path cannot redirect the write to an arbitrary file. Raises ``ValueError``
     on either violation; callers decide how to surface that to the operator.
     """
-    root = (allowed_root or _REPO_ROOT).resolve()
+    root = (allowed_root or REPO_ROOT).resolve()
     candidate = Path(raw_path)
     resolved = candidate if candidate.is_absolute() else (root / candidate)
     if resolved.is_symlink():
@@ -394,12 +436,20 @@ def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = No
         raise ValueError(
             f"output path must stay within {root}: {raw_path!r} resolved to {resolved}"
         )
-    if ".git" in resolved.parts:
-        # Repo-tree containment alone doesn't exclude .git/ -- a write under
-        # it (e.g. .git/config, .git/hooks/pre-commit) is still "within the
-        # repo tree" but can rewrite repo metadata or plant a hook (round 8
-        # gauntlet, Security lens finding 6).
-        raise ValueError(f"output path must not write under .git/: {raw_path!r}")
+    # Case-insensitive comparison, not exact-case ``in`` membership: on a
+    # case-insensitive filesystem (macOS APFS default, Windows) ``.GIT``/
+    # ``.Git``/etc. name the exact same directory as ``.git`` but bypassed an
+    # exact-case check, letting a path like ``--out .GIT/hooks/pre-commit``
+    # plant a hook despite the check below intending to block exactly that
+    # (round 9 gauntlet, Security lens finding 10). ``.github`` is denylisted
+    # alongside ``.git`` for the same reason (round 9 gauntlet, Security lens
+    # finding 11): a write under ``.github/workflows/*.yml`` is the same
+    # class of risk this check already exists to close -- code execution
+    # triggered on push to a CI-connected repo -- not the git-hook mechanism,
+    # but an equivalent one.
+    denylisted_dirs = {".git", ".github"}
+    if any(part.lower() in denylisted_dirs for part in resolved.parts):
+        raise ValueError(f"output path must not write under .git/ or .github/: {raw_path!r}")
     return resolved
 
 

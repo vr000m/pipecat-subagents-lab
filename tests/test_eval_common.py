@@ -9,9 +9,20 @@ reassigns host.tts after the fact).
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
 import server.app as app_module
 import server.composition as composition_module
-from scripts.eval_common import SAFE_FALLBACKS, build_session_for_run
+from scripts.eval_common import (
+    SAFE_FALLBACKS,
+    _redact,
+    build_session_for_run,
+    confined_output_path,
+    turn_correlated_routing_action,
+)
 from server.config import Config, PromotionManifest
 from server.pipeline import SAFE_FALLBACK_TEXTS
 
@@ -95,3 +106,121 @@ def test_stt_tts_default_to_none() -> None:
     host = build_session_for_run(Config())
     assert host.stt is None
     assert host.tts is None
+
+
+def test_router_kwarg_is_forwarded(monkeypatch) -> None:
+    """Regression for round 9 gauntlet, Architecture lens finding 19:
+    ``router=`` was silently narrowed out of this wrapper's signature
+    relative to ``build_session_host``'s own -- confirm it's actually
+    forwarded, by identity, rather than a fresh router being built.
+    """
+    import scripts.eval_common as eval_common_module
+
+    captured: dict[str, object] = {}
+    real_build = composition_module.build_session_host
+
+    def _recording_build(config, **kwargs):
+        captured.update(kwargs)
+        return real_build(config, **kwargs)
+
+    monkeypatch.setattr(eval_common_module, "build_session_host", _recording_build)
+    sentinel_router = object()
+
+    build_session_for_run(Config(), router=sentinel_router)
+
+    assert captured["router"] is sentinel_router
+
+
+class TestRedactEmptyAfterStripCredential:
+    """Regression for round 9 gauntlet, Logic lens finding 5 + Security lens
+    finding 4: an unstripped-truthy-but-stripped-empty (or short) credential
+    must not be used as a ``str.replace`` needle -- an empty needle shreds
+    the entire output by inserting the replacement between every character.
+    """
+
+    def test_all_control_char_credential_does_not_shred_output(self) -> None:
+        # Strips to "" -- the old `if credential:` guard tested the
+        # unstripped (truthy) value and would have shredded this.
+        credential = "\x00\x01\x02"
+        text = "some perfectly normal log line"
+        assert _redact(text, credential) == text
+
+    def test_short_stripped_credential_below_the_floor_is_not_redacted(self) -> None:
+        # Stripped length 4, below the 8-char floor -- too short to safely
+        # use as an exact-substring needle without risking coincidental
+        # matches elsewhere in the text.
+        credential = "abcd"
+        text = "the word abcd appears here normally"
+        assert _redact(text, credential) == text
+
+    def test_real_length_credential_is_still_redacted(self) -> None:
+        credential = "a" * 32
+        text = f"leaked: {credential} in the output"
+        redacted = _redact(text, credential)
+        assert credential not in redacted
+        assert "***REDACTED***" in redacted
+
+
+class TestRedactZeroWidthCharacters:
+    """Regression for round 9 gauntlet, Security lens finding 12: a
+    credential with an embedded zero-width/invisible character must still be
+    fully redacted, and legitimate text containing these characters is
+    otherwise just stripped (matching the existing control-char contract),
+    not treated specially.
+    """
+
+    @pytest.mark.parametrize(
+        "invisible_char",
+        ["­", "\u200b", "‌", "‍", "‎", "‏", "⁠", "﻿"],
+    )
+    def test_credential_with_embedded_zero_width_char_is_fully_redacted(
+        self, invisible_char: str
+    ) -> None:
+        raw_credential = "sk-testcredential1234567890"
+        credential_with_zw = raw_credential[:10] + invisible_char + raw_credential[10:]
+        text = f"error talking to provider: {credential_with_zw}"
+        redacted = _redact(text, credential_with_zw)
+        assert raw_credential[:10] not in redacted or "***REDACTED***" in redacted
+        assert invisible_char not in redacted
+
+
+class TestConfinedOutputPathDenylist:
+    """Regression for round 9 gauntlet, Security lens findings 10 and 11."""
+
+    def test_mixed_case_git_directory_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            confined_output_path(".GIT/hooks/pre-commit", allowed_root=tmp_path)
+
+    def test_lowercase_git_directory_is_still_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            confined_output_path(".git/config", allowed_root=tmp_path)
+
+    def test_github_directory_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            confined_output_path(".github/workflows/pwn.yml", allowed_root=tmp_path)
+
+    def test_mixed_case_github_directory_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            confined_output_path(".GitHub/workflows/pwn.yml", allowed_root=tmp_path)
+
+    def test_ordinary_path_is_still_accepted(self, tmp_path: Path) -> None:
+        resolved = confined_output_path("reports/out.json", allowed_root=tmp_path)
+        assert resolved == (tmp_path / "reports/out.json").resolve()
+
+
+class TestTurnCorrelatedRoutingAction:
+    """Regression for round 9 gauntlet, Architecture lens finding 17: shared
+    implementation between scripts/eval_model_comparison.py and
+    scripts/smoke_conversation.py.
+    """
+
+    def test_matching_turn_id_returns_the_action(self) -> None:
+        routing = SimpleNamespace(action="existing_worker", turn_id="turn-1")
+        assert turn_correlated_routing_action(routing, "turn-1") == "existing_worker"
+
+    def test_stale_turn_id_returns_none(self) -> None:
+        routing = SimpleNamespace(action="direct", turn_id="turn-1")
+        assert turn_correlated_routing_action(routing, "turn-2") is None
+
+    def test_none_routing_returns_none(self) -> None:
+        assert turn_correlated_routing_action(None, "turn-1") is None

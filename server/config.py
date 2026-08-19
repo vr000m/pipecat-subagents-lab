@@ -788,6 +788,15 @@ def _registered_policy_labels(kwargs: dict[str, object], field_name: str) -> tup
     dataclass field's own default label(s). Lets a reasoning-effort env
     override apply to whatever label is actually in play instead of a
     hardcoded guess (round 8 gauntlet, Logic lens finding 4).
+
+    Forward-compatibility, not a currently-reachable path: today
+    ``load_config()``'s ``WEBSEARCH_ROUTER_MODEL``/``WEBSEARCH_WORKER_MODEL``
+    overrides always hardcode ``{"fast": ...}``/``{"deep": ...}`` (see the
+    call sites below), so this function's "``kwargs[field_name]``'s own
+    keys" branch never actually observes a custom label from a real
+    ``load_config()`` call -- it only guards against a future TOML/env
+    surface that lets an operator supply one (round 9 gauntlet, Logic lens
+    finding 9).
     """
     registered = kwargs.get(field_name)
     if isinstance(registered, Mapping):

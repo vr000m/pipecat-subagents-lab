@@ -445,6 +445,37 @@ _FOREGROUND_TIMEOUT_TEXT = "That is taking longer than expected; I will continue
 TIMEOUT_FALLBACK_TEXTS = frozenset({_FOREGROUND_TIMEOUT_TEXT})
 
 
+def multi_intent_item_turn_id(turn_id: str, index: int) -> str:
+    """The per-item turn/work-item id ``_handle_multi_intent`` mints for a
+    compound turn's ``index``-th work item: ``f"{turn_id}-{index}"``.
+
+    A thin, deliberately trivial wrapper -- its value is being the one
+    callable name both a producer (this module's own ``_handle_multi_intent``,
+    which is free to keep using the raw f-string at its ~12 call sites since
+    it's the one minting the convention) and a consumer that has to *parse*
+    the convention back out (``scripts/eval_model_comparison.py``'s
+    multi-intent-item classification) can reference, so a future format
+    change has exactly one round-trip pair to keep in sync (round 9 gauntlet,
+    Architecture lens finding 14).
+    """
+    return f"{turn_id}-{index}"
+
+
+def split_multi_intent_turn_id(candidate_turn_id: str) -> tuple[str, int] | None:
+    """Inverse of :func:`multi_intent_item_turn_id`.
+
+    Returns ``(parent_turn_id, index)`` if ``candidate_turn_id`` has the
+    ``f"{parent}-{index}"`` shape (a non-empty prefix, a literal ``-``, and a
+    digit-only suffix), else ``None``. Only confirms the *shape* -- callers
+    that need to confirm the parent turn actually exists (e.g. by checking
+    for a correlated metric record) still do that themselves.
+    """
+    base, sep, suffix = candidate_turn_id.rpartition("-")
+    if not sep or not base or not suffix.isdigit():
+        return None
+    return base, int(suffix)
+
+
 @dataclass(frozen=True)
 class SearchExecution:
     """Result of a foreground search and any ownership transfer."""
