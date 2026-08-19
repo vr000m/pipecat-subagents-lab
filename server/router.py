@@ -53,6 +53,32 @@ def effective_router_reasoning_effort(model: str, resolved_effort: str | None) -
     return None
 
 
+def build_router_request_kwargs(
+    model: str, effort: str | None, *, prompt: str, timeout: float
+) -> dict[str, Any]:
+    """The exact request-kwargs shape sent to the Responses API for a router
+    call.
+
+    Hoisted out of ``LazyRouterProvider.__call__`` (round 8 gauntlet,
+    Architecture finding 8) so ``scripts/verify_eval_candidates.py``'s probe
+    builder can call this SAME function instead of hand-mirroring the shape
+    independently -- a production kwarg change previously left the manifest
+    verifier free to keep reproducing the OLD shape and re-certify it as
+    still production-equivalent.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "input": prompt,
+        "store": False,
+        "timeout": timeout,
+        "text": structured_text_format(RouterEnvelope, "router_envelope"),
+    }
+    effective_effort = effective_router_reasoning_effort(model, effort)
+    if effective_effort is not None:
+        kwargs["reasoning"] = {"effort": effective_effort}
+    return kwargs
+
+
 def _response_text(response: Any) -> str:
     if isinstance(response, Mapping):
         value = response.get("output_text")
@@ -97,17 +123,10 @@ class LazyRouterProvider:
 
     def __call__(self, prompt: str) -> dict[str, Any]:
         model = self._config.resolve_router_model("fast")
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "input": prompt,
-            "store": False,
-            "timeout": self._config.router_timeout_seconds,
-            "text": structured_text_format(RouterEnvelope, "router_envelope"),
-        }
         effort = self._config.resolve_router_reasoning_effort("fast")
-        effective_effort = effective_router_reasoning_effort(model, effort)
-        if effective_effort is not None:
-            kwargs["reasoning"] = {"effort": effective_effort}
+        kwargs = build_router_request_kwargs(
+            model, effort, prompt=prompt, timeout=self._config.router_timeout_seconds
+        )
         response = self._get_responses().create(**kwargs)
         try:
             payload = json.loads(_response_text(response))

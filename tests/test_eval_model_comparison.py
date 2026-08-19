@@ -78,18 +78,26 @@ def _accepted_router_entry(model: str, effort: str | None) -> dict[str, Any]:
     # gauntlet, Codex finding 1) requires for a router entry -- store=False,
     # a structured-output `text` format, and a non-empty `input` -- so this
     # fixture keeps passing the manifest's own shape gate, not just its
-    # (kind, model, effort) membership check.
+    # (kind, model, effort) membership check. `model` and `reasoning` (round
+    # 8 gauntlet, Codex P1 finding 2) mirror the entry's own recorded
+    # (model, effort) -- using the EFFECTIVE effort
+    # (effective_router_reasoning_effort), matching what
+    # LazyRouterProvider.__call__ actually sends on the wire.
+    effective_effort = eval_runner.effective_router_reasoning_effort(model, effort)
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "store": False,
+        "text": {"format": {"type": "json_schema"}},
+        "input": "probe transcript",
+    }
+    if effective_effort is not None:
+        request_kwargs["reasoning"] = {"effort": effective_effort}
     return {
         "kind": "router",
         "model": model,
         "effort": effort,
         "tools": ["text"],
-        "request_kwargs": {
-            "model": model,
-            "store": False,
-            "text": {"format": {"type": "json_schema"}},
-            "input": "probe transcript",
-        },
+        "request_kwargs": request_kwargs,
         "accepted": True,
         "error": None,
         "response_id": "resp-1",
@@ -100,18 +108,24 @@ def _accepted_worker_entry(model: str, effort: str | None) -> dict[str, Any]:
     # See _accepted_router_entry(): shape must also satisfy
     # _request_kwargs_shape_ok()'s worker branch -- store=False,
     # tool_choice="required", a `text` format, and a `web_search` tool.
+    # `model`/`reasoning` (round 8 gauntlet, Codex P1 finding 2) mirror the
+    # entry's own recorded (model, effort) directly -- unlike the router, the
+    # worker has no "unset effort defaults to minimal" resolution rule.
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "store": False,
+        "tool_choice": "required",
+        "text": {"format": {"type": "json_schema"}},
+        "tools": [{"type": "web_search"}],
+    }
+    if effort is not None:
+        request_kwargs["reasoning"] = {"effort": effort}
     return {
         "kind": "worker",
         "model": model,
         "effort": effort,
         "tools": ["web_search"],
-        "request_kwargs": {
-            "model": model,
-            "store": False,
-            "tool_choice": "required",
-            "text": {"format": {"type": "json_schema"}},
-            "tools": [{"type": "web_search"}],
-        },
+        "request_kwargs": request_kwargs,
         "accepted": True,
         "error": None,
         "response_id": "resp-2",
@@ -301,7 +315,7 @@ def _run_cell(
         return {"routing_ms": routing_ms, "search_ms": 0.0, "total_ms": total_ms}
 
     monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
-    monkeypatch.setattr(eval_runner, "_latest_turn_stage_metrics", _fake_stage_metrics)
+    monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _fake_stage_metrics)
     monkeypatch.setattr(
         "pipecat.evals.judge.EvalJudge", _make_stub_judge_class(verdicts or [], judge_recorder)
     )
@@ -438,6 +452,71 @@ class TestMatrixAccountingIncludesProviderRetryWorstCase:
             == 1 + eval_runner._OPENAI_SDK_DEFAULT_MAX_RETRIES
         )
         assert eval_runner._RETRY_WORST_CASE_MULTIPLIER > 1
+
+
+class TestWaitForBudgetExceedsTheHostsOwnWorstCaseTimeout:
+    """Regression for round 8 gauntlet, Logic lens finding 3: run_cell()'s
+    per-turn ``asyncio.wait_for`` budget previously matched
+    ``config.provider_timeout_seconds + 5`` exactly (110s at defaults, the
+    same as the host's own worst-case internal timeout), so a boundary race
+    could abort the whole cell via this wait_for's ``TimeoutError`` instead
+    of letting the host's own graceful per-turn timeout fire first. The
+    budget is now derived from ``router_timeout_seconds +
+    foreground_search_timeout_seconds + margin``, which must always exceed
+    ``provider_timeout_seconds``.
+    """
+
+    def test_wait_for_timeout_strictly_exceeds_provider_timeout_seconds_at_cli_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, float] = {}
+        real_wait_for = asyncio.wait_for
+
+        async def _capturing_wait_for(coro: Any, *, timeout: float) -> Any:
+            captured["timeout"] = timeout
+            return await real_wait_for(coro, timeout=timeout)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner.asyncio, "wait_for", _capturing_wait_for)
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner,
+            "latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+                max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+            )
+        )
+
+        config = eval_runner._per_run_config(
+            eval_runner.Config(),
+            pair,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert "timeout" in captured
+        assert captured["timeout"] > config.provider_timeout_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +767,7 @@ class TestSpendEstimateShownBeforeLiveRun:
     """
 
     def test_preview_is_printed_on_a_normal_live_run_within_limits(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
         monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
         monkeypatch.setattr(
@@ -697,6 +776,10 @@ class TestSpendEstimateShownBeforeLiveRun:
         monkeypatch.setattr(
             eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
         )
+        # This run completes the full flow (through report persistence) --
+        # redirect the default report location into tmp_path so the test
+        # doesn't write into the real repo tree's .review-plan/.
+        monkeypatch.setattr(eval_runner, "DEFAULT_REPORT_DIR", tmp_path / "eval-reports")
 
         # No --max-calls/--max-cost passed at all -- nothing to exceed, so
         # _confirm_spend() alone would print nothing.
@@ -1162,6 +1245,53 @@ class TestGenuineUnsupportedIsDistinctFromInfraFailure:
         assert outcome.turns[0].status == "provider-error"
 
 
+class TestInfraFailureReasonIsSeparateFromJudgeReason:
+    """Regression for round 8 gauntlet, Architecture finding 9:
+    ``TurnOutcome.judge_reason`` previously doubled as a catch-all for every
+    non-judge infra failure (provider error, safe-fallback text, ...), so a
+    reader couldn't tell "the judge said this" from "the judge never ran,
+    this is why". Non-judge infra failures now write into the dedicated
+    ``error`` field, leaving ``judge_reason`` populated only by an actual
+    judge call.
+    """
+
+    def test_a_provider_error_populates_error_and_leaves_judge_reason_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="what's the weather in Riga?", expect_delegated=True),),
+            ui_text="I cannot access that capability here.",
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        turn = outcome.turns[0]
+        assert turn.error == "host returned a safe fallback"
+        assert turn.judge_reason is None
+
+    def test_a_judge_error_populates_judge_reason_and_leaves_error_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no", reason="judge call failed: RateLimitError", raw_response=""
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        turn = outcome.turns[0]
+        assert turn.judge_verdict == "judge-error"
+        assert "judge call failed" in (turn.judge_reason or "")
+        assert turn.error is None
+
+
 class TestWorkerPresenceAssertionCatchesRoutingRegressions:
     """Regression for round-5 gauntlet finding 12: the routing-regression
     scenario previously only asserted `action == expect_action` for the
@@ -1337,6 +1467,204 @@ class TestMultiIntentRoutingSignalGap:
             # routing_action left at its default (None).
         )
         assert outcome.turns[0].deterministic_action_pass is None
+
+    def test_unevaluated_reason_is_recorded_and_surfaced_distinctly_from_not_applicable(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Regression for round 8 gauntlet, Logic lens finding 2:
+        ``deterministic_action_pass=None`` alone can't distinguish "no
+        assertion was requested" from "the assertion was requested but never
+        ran" -- the latter must be visible in the report/summary.
+        """
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            verdicts=[],
+            # routing_action left at its default (None).
+        )
+        turn = outcome.turns[0]
+        assert turn.deterministic_action_pass is None
+        assert turn.deterministic_action_unevaluated_reason is not None
+
+        report = eval_runner.build_report([outcome], judge_model="gpt-5-mini")
+        report_turn = report["cells"][0]["turns"][0]
+        assert report_turn["deterministic_action_pass"] is None
+        assert report_turn["deterministic_action_unevaluated_reason"] is not None
+
+        eval_runner.print_report_summary(report)
+        captured = capsys.readouterr().out
+        assert "UNEVALUATED" in captured
+
+    def test_no_unevaluated_reason_when_no_action_assertion_was_requested(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi."),),  # no expect_action at all
+            verdicts=[],
+        )
+        turn = outcome.turns[0]
+        assert turn.deterministic_action_pass is None
+        assert turn.deterministic_action_unevaluated_reason is None
+
+
+class TestMissingTurnMetricsIsNotSilentlySwallowed:
+    """Regression for round 8 gauntlet, merged Codex P1 + Logic lens finding 4:
+    round 7 added ``except RuntimeError: stage_metrics = None`` around
+    ``latest_turn_stage_metrics()`` to handle a multi-intent item's
+    suffixed ``turn_id`` (``f"{turn_id}-{index}"``, which never matches the
+    parent ``app_turn_foreground`` record). But that same catch also
+    swallowed a genuinely-missing metrics record on an ordinary turn --
+    ``latency_budget_enforced``/``latency_budget_exceeded`` silently stayed
+    at their False/None defaults, so a baseline cell could report PASS with
+    no latency evidence at all. Fixed by positively identifying the
+    multi-intent item-suffix shape (``_is_multi_intent_item_turn_id``)
+    before swallowing; any other RuntimeError now re-raises and surfaces as
+    ``turn-error``.
+    """
+
+    def test_genuinely_missing_metrics_on_an_ordinary_turn_is_a_turn_error_not_a_silent_pass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        def _stage_metrics_never_recorded(
+            _sink: Any, _elapsed_ms: float, turn_id: str
+        ) -> dict[str, float]:
+            raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics_never_recorded)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # Must NOT be a silent "ok" with latency_budget_enforced left False --
+        # that would let compute_pass_fail() report PASS with no latency
+        # evidence at all.
+        assert outcome.status == "turn-error"
+        assert outcome.turns[0].status == "turn-error"
+
+    def test_multi_intent_item_suffixed_turn_id_is_still_a_recognized_gap_not_a_turn_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from server.perf_metrics import MeasurementRecord
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any) -> Any:
+            # Simulate the parent app_turn_foreground record production
+            # actually emits for the (unsuffixed) turn -- the shape
+            # _is_multi_intent_item_turn_id positively checks for. Appended
+            # directly to the sink's internal list (not via emit()/
+            # build_record(), which validate the full production field set
+            # this synthetic record doesn't need) since only .event/.fields
+            # matter to the helper under test.
+            measurement_sink._records.append(
+                MeasurementRecord(
+                    event="app_turn_foreground", fields={"turn_id": "turn-1"}, line=""
+                )
+            )
+            return _FakeHost(
+                lambda _q: (
+                    _FakeResult(
+                        ui_text="reply one",
+                        spoken_text="reply one",
+                        citations=["citation-1"],
+                        turn_id="turn-1-0",
+                        worker_id="worker-a",
+                    ),
+                )
+            )
+
+        def _stage_metrics_fails_for_item_suffix(
+            _sink: Any, _elapsed_ms: float, turn_id: str
+        ) -> dict[str, float]:
+            raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class(["yes"], None))
+        monkeypatch.setattr(
+            eval_runner, "latest_turn_stage_metrics", _stage_metrics_fails_for_item_suffix
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(
+            name="s", turns=(Turn(query="weather in Riga and Helsinki?", expect_delegated=True),)
+        )
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[0].routing_ms is None
+        assert outcome.turns[0].latency_budget_enforced is False
+
+
+class TestIsMultiIntentItemTurnId:
+    """Unit coverage for the positive-identification helper itself."""
+
+    def test_true_for_a_suffixed_id_with_a_matching_parent_record(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink, MeasurementRecord
+
+        sink = CollectingMeasurementSink()
+        sink._records.append(
+            MeasurementRecord(event="app_turn_foreground", fields={"turn_id": "turn-1"}, line="")
+        )
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn-1-0") is True
+
+    def test_false_when_no_matching_parent_record_exists(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink
+
+        sink = CollectingMeasurementSink()
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn-1-0") is False
+
+    def test_false_for_a_non_digit_suffix(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink, MeasurementRecord
+
+        sink = CollectingMeasurementSink()
+        sink._records.append(
+            MeasurementRecord(event="app_turn_foreground", fields={"turn_id": "turn-abc"}, line="")
+        )
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn-abc-x") is False
+
+    def test_false_when_there_is_no_hyphen_at_all(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink
+
+        sink = CollectingMeasurementSink()
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn1") is False
 
 
 # ---------------------------------------------------------------------------
@@ -1545,7 +1873,7 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
     entries: "turn-error" if so, "setup-error" only if the exception happened
     before any turn completed.
 
-    The failure is injected via ``_latest_turn_stage_metrics()`` raising, but
+    The failure is injected via ``latest_turn_stage_metrics()`` raising, but
     NOT via ``RuntimeError`` -- round 7 gauntlet, Logic lens finding 6 made a
     ``RuntimeError`` from that call site an expected, non-fatal "per-item
     latency genuinely unavailable" signal (a multi-intent commit's item-
@@ -1582,7 +1910,7 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
         monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
         monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
         monkeypatch.setattr(
-            eval_runner, "_latest_turn_stage_metrics", _stage_metrics_fails_on_second_turn
+            eval_runner, "latest_turn_stage_metrics", _stage_metrics_fails_on_second_turn
         )
 
         pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
@@ -1645,7 +1973,7 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
 
         Uses ``ValueError`` (not ``RuntimeError``) to inject the mid-execution
         failure -- see class docstring: round 7 gauntlet, Logic lens finding 6
-        made a ``RuntimeError`` from ``_latest_turn_stage_metrics()`` an
+        made a ``RuntimeError`` from ``latest_turn_stage_metrics()`` an
         expected, non-fatal signal.
         """
 
@@ -1668,7 +1996,7 @@ class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
         monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
         monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
         monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
-        monkeypatch.setattr(eval_runner, "_latest_turn_stage_metrics", _stage_metrics_always_fails)
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics_always_fails)
 
         pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
         scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
@@ -1744,7 +2072,7 @@ class TestSkippedTurnBackfillDedupesByIndexNotQueryText:
         monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
         monkeypatch.setattr(
             eval_runner,
-            "_latest_turn_stage_metrics",
+            "latest_turn_stage_metrics",
             lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
         )
 
@@ -1876,7 +2204,7 @@ class TestHostLifecycleExceptionsDontCrashTheMatrix:
         monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
         monkeypatch.setattr(
             eval_runner,
-            "_latest_turn_stage_metrics",
+            "latest_turn_stage_metrics",
             lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
         )
         monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
@@ -2056,6 +2384,79 @@ class TestManifestEntryRejectsMalformedEffortAndMissingRequestKwargs:
         assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
 
 
+class TestManifestEntryRequestKwargsMustMatchItsOwnModelAndEffort:
+    """Regression for round 8 gauntlet, Codex P1 finding 2: an entry's
+    ``request_kwargs`` must actually name the same ``model``/effective
+    ``reasoning.effort`` as the entry's own recorded ``(model, effort)``
+    fields -- not just satisfy the shape check with some other candidate's
+    values. Without this, a malformed/stale entry could claim acceptance for
+    one (model, effort) pair while its ``request_kwargs`` evidence actually
+    describes a different one (or omits ``reasoning`` entirely), authorizing
+    a live paid run against a request shape Phase 0 never actually probed
+    for that candidate.
+    """
+
+    def test_router_entry_with_a_disagreeing_request_kwargs_model_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_router_entry(
+            eval_runner.ROUTER_CANDIDATES[0].model, eval_runner.ROUTER_CANDIDATES[0].effort
+        )
+        entry["request_kwargs"]["model"] = "some-other-model"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is False
+
+    def test_router_entry_missing_reasoning_for_a_non_minimal_effort_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_router_entry(
+            eval_runner.ROUTER_CANDIDATES[0].model, eval_runner.ROUTER_CANDIDATES[0].effort
+        )
+        del entry["request_kwargs"]["reasoning"]
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is False
+
+    def test_worker_entry_with_a_disagreeing_request_kwargs_effort_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_worker_entry(
+            eval_runner.WORKER_CANDIDATES[0].model, eval_runner.WORKER_CANDIDATES[0].effort
+        )
+        entry["request_kwargs"]["reasoning"] = {"effort": "an-unrelated-effort"}
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.WORKER_CANDIDATES[0], status) is False
+
+    def test_worker_entry_with_an_unset_effort_but_a_reasoning_kwarg_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_worker_entry(eval_runner.WORKER_BASELINE.model, None)
+        entry["request_kwargs"]["reasoning"] = {"effort": "high"}
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.WORKER_BASELINE, status) is False
+
+    def test_a_correctly_matching_entry_is_still_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(
+            eval_runner.ROUTER_CANDIDATES[0].model, eval_runner.ROUTER_CANDIDATES[0].effort
+        )
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is True
+
+
 class TestManifestGateRunMatrixDirectly:
     """Regression for finding 15: run_matrix()'s own per-cell manifest check
     is reachable independently of main()'s preflight -- a direct caller that
@@ -2126,6 +2527,71 @@ class TestOutputPathConfinement:
         with pytest.raises(OSError):
             eval_runner.write_no_follow(symlink_path, "clobbered")
         assert real_target.read_text() == "do not overwrite me"
+
+
+class TestReportIsPersistedByDefault:
+    """Regression for round 8 gauntlet, Codex P2 finding 2: the dev plan's
+    Architecture & Call Flow table requires the aggregate report to persist
+    to a file, not just print a summary. A run with no ``--out`` must still
+    write a report file (to a timestamped default path), not silently
+    discard it.
+    """
+
+    def _run_to_completion(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, extra_args: list[str]
+    ) -> tuple[int, Path]:
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+        # confined_output_path() confines the write to REPO_ROOT -- patch it
+        # to tmp_path too, alongside DEFAULT_REPORT_DIR, so the default
+        # timestamped path passes confinement without writing into the real
+        # repo tree.
+        monkeypatch.setattr(eval_runner, "REPO_ROOT", tmp_path)
+        report_dir = tmp_path / "eval-reports"
+        monkeypatch.setattr(eval_runner, "DEFAULT_REPORT_DIR", report_dir)
+        exit_code = eval_runner.main(
+            [
+                "--router",
+                "baseline",
+                "--worker",
+                "baseline",
+                "--scenario",
+                "single-turn-default",
+                "--i-know-the-manifest-is-stale",
+                *extra_args,
+            ]
+        )
+        return exit_code, report_dir
+
+    def test_a_run_with_no_out_flag_still_writes_a_report_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _exit_code, report_dir = self._run_to_completion(monkeypatch, tmp_path, extra_args=[])
+
+        written = list(report_dir.glob("eval-report-*.json"))
+        assert len(written) == 1
+        report = json.loads(written[0].read_text())
+        assert "overall_status" in report
+
+    def test_an_explicit_out_flag_still_wins_over_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # confined_output_path() confines --out to REPO_ROOT -- patch it to
+        # tmp_path too so an explicit tmp_path-relative --out passes
+        # confinement without writing into the real repo tree.
+        monkeypatch.setattr(eval_runner, "REPO_ROOT", tmp_path)
+        explicit_path = tmp_path / "my-report.json"
+        _exit_code, report_dir = self._run_to_completion(
+            monkeypatch, tmp_path, extra_args=["--out", str(explicit_path)]
+        )
+
+        assert explicit_path.exists()
+        assert not report_dir.exists()
 
 
 class TestSpendLimitValidation:
@@ -2341,7 +2807,7 @@ class TestRunCellSetupExceptionsDontCrashTheMatrix:
         monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
         monkeypatch.setattr(
             eval_runner,
-            "_latest_turn_stage_metrics",
+            "latest_turn_stage_metrics",
             lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
         )
 

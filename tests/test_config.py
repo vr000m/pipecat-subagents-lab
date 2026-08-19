@@ -305,6 +305,56 @@ def test_reasoning_effort_policy_accepts_the_full_sdk_documented_literal(effort:
     assert config.resolve_router_reasoning_effort("fast") == effort
 
 
+def test_websearch_worker_reasoning_effort_env_applies_to_a_non_deep_registered_label() -> None:
+    """Regression for round 8 gauntlet, Logic lens finding 4:
+    WEBSEARCH_WORKER_REASONING_EFFORT previously replaced
+    worker_reasoning_effort_policy wholesale with {"deep": raw}, tripping
+    the label cross-validation ConfigError for any supported worker model
+    policy whose label isn't literally "deep". The override must apply to
+    whatever label(s) are actually registered.
+    """
+    config = load_config(
+        env={
+            "OPENAI_API_KEY": "test-key",
+            "WEBSEARCH_WORKER_MODEL": "custom-worker-model",
+            "WEBSEARCH_WORKER_REASONING_EFFORT": "high",
+        }
+    )
+    # WEBSEARCH_WORKER_MODEL registers {"deep": "custom-worker-model"} (its
+    # own env override also hardcodes the "deep" label), so this case still
+    # exercises "deep" -- the point is the two overrides now agree with each
+    # other via the shared registered-label lookup rather than by
+    # coincidence.
+    assert config.worker_model_policy == {"deep": "custom-worker-model"}
+    assert config.worker_reasoning_effort_policy == {"deep": "high"}
+    assert config.resolve_worker_reasoning_effort("deep") == "high"
+
+
+def test_websearch_router_reasoning_effort_env_applies_to_the_registered_label() -> None:
+    config = load_config(
+        env={
+            "OPENAI_API_KEY": "test-key",
+            "WEBSEARCH_ROUTER_REASONING_EFFORT": "low",
+        }
+    )
+    assert config.router_reasoning_effort_policy == {"fast": "low"}
+
+
+def test_registered_policy_labels_falls_back_to_the_field_default_when_kwargs_omit_it() -> None:
+    """Direct unit coverage of the lookup helper itself: with no
+    WEBSEARCH_WORKER_MODEL override present in kwargs, the effort override
+    must still target the dataclass field's own default label ("deep"), not
+    an empty/hardcoded guess.
+    """
+    from server.config import _registered_policy_labels
+
+    assert _registered_policy_labels({}, "worker_model_policy") == ("deep",)
+    assert _registered_policy_labels({}, "router_model_policy") == ("fast",)
+    assert _registered_policy_labels(
+        {"worker_model_policy": {"custom": "some-model"}}, "worker_model_policy"
+    ) == ("custom",)
+
+
 def test_config_constructed_positionally_with_pre_existing_field_order_still_works() -> None:
     """Regression: the reasoning-effort policy fields must be appended after
     every pre-existing field (including the diagnostic fields at the very

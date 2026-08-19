@@ -112,3 +112,46 @@ class TestNonOpenAIShapedCredentialRedaction:
 
         assert result.accepted is False
         assert fake_credential not in (result.error or "")
+
+
+class TestProbeBuildersCallProductionsOwnSharedBuilder:
+    """Regression for round 8 gauntlet, Architecture finding 8: the probe's
+    request-kwargs shape was previously a hand-mirrored second copy of
+    ``LazyRouterProvider.__call__``/``WebSearchWorker.search``'s payloads --
+    a production kwarg change left the manifest verifier free to keep
+    reproducing the OLD shape and re-certify it as still
+    production-equivalent. ``_build_router_kwargs``/``_build_worker_kwargs``
+    now call production's own ``build_router_request_kwargs``/
+    ``build_worker_request_kwargs`` directly, so this asserts identity with
+    what production would build for the same inputs -- not merely "the same
+    shape by inspection".
+    """
+
+    def test_router_probe_kwargs_are_identical_to_productions_own_builder_output(self) -> None:
+        from server.router import WorkerCatalogue, build_router_request_kwargs
+
+        catalogue = WorkerCatalogue(
+            version="verify-eval-candidates-1",
+            workers=(),
+            capability_labels=("public_web",),
+            model_policies=("deep",),
+        )
+        prompt = catalogue.prompt(verify_module.ROUTER_PROBE_TRANSCRIPT)
+        expected = build_router_request_kwargs("gpt-5-mini", "medium", prompt=prompt, timeout=7.5)
+
+        actual = verify_module._build_router_kwargs(
+            "gpt-5-mini", "medium", router_timeout_seconds=7.5
+        )
+
+        assert actual == expected
+
+    def test_worker_probe_kwargs_are_identical_to_productions_own_builder_output(self) -> None:
+        from server.workers.web_search import build_worker_request_kwargs
+
+        expected = build_worker_request_kwargs(
+            "gpt-5", "high", query=verify_module.WORKER_PROBE_QUERY
+        )
+
+        actual = verify_module._build_worker_kwargs("gpt-5", "high")
+
+        assert actual == expected

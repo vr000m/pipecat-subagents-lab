@@ -51,32 +51,50 @@ from scripts.eval_common import (
     WORKER_MANIFEST_TOOLS,
     Candidate,
     CollectingMeasurementSink,
-    _latest_turn_stage_metrics,
     build_judge_llm_service,
     build_session_for_run,
     confined_output_path,
     effective_effort_for_manifest_lookup,
     error_text,
     git_head,
+    latest_turn_stage_metrics,
     sanitize_reason,
     strip_control_chars,
     write_no_follow,
 )
 from server.config import Config, load_config
+from server.router import effective_router_reasoning_effort
 
 # REPO_ROOT/DEFAULT_JUDGE_MODEL/DEFAULT_MANIFEST_RELATIVE_PATH/MANIFEST_VERSION
 # hoisted from scripts/eval_common.py (round 5, Architecture lens finding 2;
 # REPO_ROOT hoisted in round 7, Architecture finding 12): this consumer and
 # scripts/verify_eval_candidates.py's producer reference the same objects,
-# not two independently-maintained "must match" copies.
-_REPO_ROOT = REPO_ROOT
-DEFAULT_MANIFEST_PATH = _REPO_ROOT / DEFAULT_MANIFEST_RELATIVE_PATH
+# not two independently-maintained "must match" copies. Used directly (no
+# local ``_REPO_ROOT`` alias) -- unlike eval_common.py's own alias, no
+# external caller depends on this file's private name, so the extra
+# indirection was pure churn (round 8 gauntlet, Architecture finding 11).
+DEFAULT_MANIFEST_PATH = REPO_ROOT / DEFAULT_MANIFEST_RELATIVE_PATH
+# The dev plan's Architecture & Call Flow table (step 6: "Runner aggregates"
+# -- "Persists to the final report file") requires the aggregate report be
+# written to a file, not just printed. Defaults under `.review-plan/` (round
+# 8 gauntlet, Codex P2 finding 2): already gitignored (see .gitignore),
+# exactly the "ephemeral run artifact" location Phase 0's own manifest
+# discussion (this dev plan) considered before settling on a git-tracked path
+# for that (different, checked-in) artifact -- a per-run report has no
+# fresh-checkout reason to be tracked. An operator who wants a specific/
+# tracked path still passes --out explicitly.
+DEFAULT_REPORT_DIR = REPO_ROOT / ".review-plan" / "eval-reports"
 DEFAULT_MAX_ROUTING_SECONDS = 15.0
 DEFAULT_MAX_LATENCY_SECONDS = 60.0
 # Additive margin between the report-only latency budget and the internal
 # provider-level foreground-search timeout, so a slow-but-successful
 # candidate isn't truncated into a safe fallback before it can be scored.
 _FOREGROUND_TIMEOUT_HEADROOM_SECONDS = 30.0
+# Margin added on top of router_timeout_seconds + foreground_search_timeout_
+# seconds for run_cell()'s per-turn asyncio.wait_for() budget, so that budget
+# always exceeds the host's own worst-case per-turn duration and never races
+# it (round 8 gauntlet, Logic lens finding 3).
+_WAIT_FOR_MARGIN_SECONDS = 10.0
 
 # Rough, deliberately conservative per-call dollar estimates for the
 # --dry-run cost preview. These are not billed-price lookups -- just enough
@@ -209,11 +227,21 @@ class ManifestStatus:
 # builds the router/worker's `text` structured-output format -- editing
 # either after Phase 0 verified a request shape would silently invalidate
 # that verification without tripping staleness.
+#
+# scripts/eval_common.py and server/composition.py added in round 8 gauntlet
+# (Codex P2 finding 1): eval_common.py hosts the candidate matrix and
+# effective_effort_for_manifest_lookup() (what "this candidate's effective
+# effort" even means for the manifest lookup), and server/composition.py
+# wires the router/worker/session construction the eval runner and
+# production both go through -- an uncommitted edit to either changes the
+# live request shape while HEAD/source_commit still match.
 _MANIFEST_ATTESTED_PATHS = (
     "server/router.py",
     "server/workers/web_search.py",
     "server/config.py",
     "server/registry.py",
+    "server/composition.py",
+    "scripts/eval_common.py",
     "server/structured_outputs.py",
 )
 
@@ -228,7 +256,7 @@ def _source_tree_dirty() -> bool | None:
     try:
         completed = subprocess.run(
             ["git", "status", "--porcelain", "--", *_MANIFEST_ATTESTED_PATHS],
-            cwd=_REPO_ROOT,
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
             timeout=10,
@@ -241,7 +269,9 @@ def _source_tree_dirty() -> bool | None:
     return bool(completed.stdout.strip())
 
 
-def _request_kwargs_shape_ok(kind: str, request_kwargs: dict[str, Any]) -> bool:
+def _request_kwargs_shape_ok(
+    kind: str, model: str, effort: str | None, request_kwargs: dict[str, Any]
+) -> bool:
     """Confirm ``request_kwargs`` actually carries the production-equivalent
     shape Phase 0's probe for this role established -- not just that *some*
     dict is present (round 7 gauntlet, Codex adversarial gate finding 1).
@@ -257,18 +287,44 @@ def _request_kwargs_shape_ok(kind: str, request_kwargs: dict[str, Any]) -> bool:
     load-bearing values of the keys those builders always set, not every key
     (``timeout``/``instructions``/``include`` vary in ways that don't change
     what "this candidate is callable" means).
+
+    Also cross-checks ``request_kwargs["model"]`` and the effective wire-level
+    reasoning effort against this entry's OWN recorded ``(model, effort)``
+    fields -- not just the shape's presence. Without this, a malformed/stale
+    entry claiming e.g. ``gpt-5.6-terra@medium`` could carry a different
+    candidate's ``request_kwargs`` (or omit ``reasoning`` entirely) and still
+    pass validation, authorizing a live paid run against a request shape that
+    was never actually probed for that candidate (round 8 gauntlet, Codex P1
+    finding 2).
     """
     if kind == "router":
+        effective_effort = effective_router_reasoning_effort(model, effort)
+        reasoning = request_kwargs.get("reasoning")
+        reasoning_ok = (
+            reasoning is None
+            if effective_effort is None
+            else isinstance(reasoning, dict) and reasoning.get("effort") == effective_effort
+        )
         return (
-            request_kwargs.get("store") is False
+            request_kwargs.get("model") == model
+            and reasoning_ok
+            and request_kwargs.get("store") is False
             and isinstance(request_kwargs.get("text"), dict)
             and isinstance(request_kwargs.get("input"), str)
             and bool(request_kwargs.get("input"))
         )
     if kind == "worker":
         tools = request_kwargs.get("tools")
+        reasoning = request_kwargs.get("reasoning")
+        reasoning_ok = (
+            reasoning is None
+            if effort is None
+            else isinstance(reasoning, dict) and reasoning.get("effort") == effort
+        )
         return (
-            request_kwargs.get("store") is False
+            request_kwargs.get("model") == model
+            and reasoning_ok
+            and request_kwargs.get("store") is False
             and request_kwargs.get("tool_choice") == "required"
             and isinstance(request_kwargs.get("text"), dict)
             and isinstance(tools, list)
@@ -382,7 +438,7 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
         # Beyond "some dict is present": the dict's actual keys/values must
         # match the production request shape Phase 0's probe for this role
         # established (round 7 gauntlet, Codex adversarial gate finding 1).
-        if not _request_kwargs_shape_ok(kind, entry["request_kwargs"]):
+        if not _request_kwargs_shape_ok(kind, model, effort, entry["request_kwargs"]):
             continue
         # Each role's manifest entry must declare the specific request-shape
         # element Phase 0's probe for that role actually established --
@@ -623,7 +679,25 @@ class TurnOutcome:
     status: str  # "ok" | "provider-error" | "timeout" | "setup-error" | "turn-error" | "skipped"
     judge_verdict: str | None = None  # "yes" | "no" | "continue" | "judge-error" | None
     judge_reason: str | None = None
+    # Populated only by an actual judge call (judge.evaluate() raising, or a
+    # returned verdict/reason) -- every non-judge infra failure (provider
+    # error, empty/malformed result, safe-fallback text, worker
+    # model/effort setup mismatch) previously also wrote into judge_reason,
+    # overloading a field named for the judge with reasons the judge never
+    # produced and never saw. Those now write into `error` instead, so
+    # `judge_reason` reliably means "what the judge said" (round 8 gauntlet,
+    # Architecture finding 9).
+    error: str | None = None
     deterministic_action_pass: bool | None = None
+    # Distinguishes "the assertion ran and there was nothing to check"
+    # (turn.expect_action is None -- this field stays None too) from "the
+    # assertion was REQUESTED but never actually ran because routing_action
+    # was unavailable" (a stale/missing routing read -- see
+    # deterministic_action_pass's own None branch below). Both leave
+    # deterministic_action_pass at None, which read identically as "not
+    # applicable" in the report/summary; this field makes the second case
+    # visible (round 8 gauntlet, Logic lens finding 2).
+    deterministic_action_unevaluated_reason: str | None = None
     citations_pass: bool | None = None
     # Round 5, Architecture lens finding 12: whether the router's routing
     # action for this turn (new_worker/existing_worker vs
@@ -755,6 +829,28 @@ def _per_run_config(
     )
 
 
+def _is_multi_intent_item_turn_id(sink: Any, result_turn_id: str) -> bool:
+    """True when ``result_turn_id`` is a multi-intent item's suffixed id.
+
+    ``server/pipeline.py``'s ``_handle_multi_intent`` labels each committed
+    item's result with ``f"{turn_id}-{index}"``, which never matches the
+    parent ``app_turn_foreground`` metric record (keyed by the unsuffixed
+    ``turn_id``). Positively confirms that shape -- the suffix is a bare
+    integer AND the unsuffixed prefix has its own ``app_turn_foreground``
+    record in ``sink`` -- rather than assuming any ``turn_id`` containing a
+    hyphen is a multi-intent item, since a scenario's own query-derived
+    identifiers are not guaranteed hyphen-free (round 8 gauntlet, merged
+    Codex P1 + Logic lens finding 4).
+    """
+    base, sep, suffix = result_turn_id.rpartition("-")
+    if not sep or not suffix.isdigit():
+        return False
+    return any(
+        record.event == "app_turn_foreground" and record.fields.get("turn_id") == base
+        for record in sink.records
+    )
+
+
 async def run_cell(
     pair: RunPair,
     scenario: Scenario,
@@ -789,7 +885,7 @@ async def run_cell(
     # explicit break path below appends before breaking; the only way to
     # reach the outer except handler with turn_started True is an exception
     # that escaped from *after* the paid call but *before* that append --
-    # e.g. _latest_turn_stage_metrics() raising, or a malformed result's
+    # e.g. latest_turn_stage_metrics() raising, or a malformed result's
     # attribute access failing). Distinguishes "a turn actually ran (and was
     # billed) but the code around it blew up" from "nothing was attempted
     # yet", which `len(turns)` alone can't do for the turn that's mid-flight
@@ -841,9 +937,23 @@ async def run_cell(
             turn_started = True
             in_flight_query = turn.query
             try:
+                # Derived from router_timeout_seconds + foreground_search_
+                # timeout_seconds + a margin, NOT from provider_timeout_
+                # seconds + 5 -- the latter exactly equals the host's own
+                # worst-case internal timeout at defaults (both 110s), so a
+                # boundary race could abort the whole cell via this
+                # wait_for's TimeoutError instead of letting the host's own
+                # graceful per-turn timeout fire first (which lets remaining
+                # turns continue rather than aborting the cell). This budget
+                # must always exceed the host's own worst-case per-turn
+                # duration (round 8 gauntlet, Logic lens finding 3).
                 value = await asyncio.wait_for(
                     host._handle_transcript(turn.query, origin=connection),
-                    timeout=config.provider_timeout_seconds + 5,
+                    timeout=(
+                        config.router_timeout_seconds
+                        + config.foreground_search_timeout_seconds
+                        + _WAIT_FOR_MARGIN_SECONDS
+                    ),
                 )
             except TimeoutError:
                 outcome.status = "timeout"
@@ -852,9 +962,9 @@ async def run_cell(
                 break
             except Exception as exc:  # noqa: BLE001 -- classify, don't crash the matrix
                 outcome.status = "provider-error"
-                outcome.judge_reason = error_text(exc, credential=config.openai_api_key)
+                outcome.error = error_text(exc, credential=config.openai_api_key)
                 turns.append(outcome)
-                cell_status, cell_error = "provider-error", outcome.judge_reason
+                cell_status, cell_error = "provider-error", outcome.error
                 break
             elapsed_ms = (time.perf_counter() - started) * 1000
             results = value if isinstance(value, tuple) else (value,)
@@ -867,9 +977,9 @@ async def run_cell(
             # empty result (nothing committed at all) has no result to score.
             if not results:
                 outcome.status = "provider-error"
-                outcome.judge_reason = "expected at least one result, received none"
+                outcome.error = "expected at least one result, received none"
                 turns.append(outcome)
-                cell_status, cell_error = "provider-error", outcome.judge_reason
+                cell_status, cell_error = "provider-error", outcome.error
                 break
             # Judge/citations scoring below is fed from the first committed
             # result only -- a deliberate simplification, not full multi-item
@@ -889,19 +999,19 @@ async def run_cell(
             # explicitly so the report names what actually came back instead.
             if result is None or not hasattr(result, "ui_text"):
                 outcome.status = "provider-error"
-                outcome.judge_reason = (
+                outcome.error = (
                     f"_handle_transcript returned {type(result).__name__} instead of a "
                     "result with .ui_text (e.g. the background-status no-op path, or a "
                     "bare str transcript)"
                 )
                 turns.append(outcome)
-                cell_status, cell_error = "provider-error", outcome.judge_reason
+                cell_status, cell_error = "provider-error", outcome.error
                 break
             if result.ui_text in TIMEOUT_FALLBACKS:
                 outcome.status = "timeout"
-                outcome.judge_reason = "host returned the foreground-search-timeout placeholder"
+                outcome.error = "host returned the foreground-search-timeout placeholder"
                 turns.append(outcome)
-                cell_status, cell_error = "timeout", outcome.judge_reason
+                cell_status, cell_error = "timeout", outcome.error
                 break
             routing = getattr(host.state, "routing", None)
             # RoutingState (server/contracts.py) carries the turn_id it was
@@ -937,9 +1047,9 @@ async def run_cell(
             # as infrastructure failure.
             if result.ui_text in SAFE_FALLBACKS and routing_action != "unsupported":
                 outcome.status = "provider-error"
-                outcome.judge_reason = "host returned a safe fallback"
+                outcome.error = "host returned a safe fallback"
                 turns.append(outcome)
-                cell_status, cell_error = "provider-error", outcome.judge_reason
+                cell_status, cell_error = "provider-error", outcome.error
                 break
 
             # Post-first-delegation worker model/effort assertion: check every
@@ -954,13 +1064,13 @@ async def run_cell(
                 worker_effort = getattr(registered.worker, "reasoning_effort", None)
                 if worker_model != pair.worker.model or worker_effort != pair.worker.effort:
                     outcome.status = "setup-error"
-                    outcome.judge_reason = (
+                    outcome.error = (
                         f"worker config did not resolve to the candidate: "
                         f"got {worker_model}@{worker_effort}, "
                         f"wanted {pair.worker.model}@{pair.worker.effort}"
                     )
                     turns.append(outcome)
-                    cell_status, cell_error = "setup-error", outcome.judge_reason
+                    cell_status, cell_error = "setup-error", outcome.error
                     break
             if cell_status != "ok":
                 break
@@ -976,9 +1086,13 @@ async def run_cell(
             # unevaluated (None), not silently score False, whenever
             # routing_action is None.
             if turn.expect_action is not None:
-                outcome.deterministic_action_pass = (
-                    None if routing_action is None else routing_action == turn.expect_action
-                )
+                if routing_action is None:
+                    outcome.deterministic_action_unevaluated_reason = (
+                        "routing_action was unavailable for this turn (stale or missing "
+                        "host.state.routing read); the deterministic action assertion never ran"
+                    )
+                else:
+                    outcome.deterministic_action_pass = routing_action == turn.expect_action
 
             # Worker presence/absence assertion (round 5, Architecture lens
             # finding 12): a routing regression can produce a superficially
@@ -1010,7 +1124,7 @@ async def run_cell(
                 outcome.citations_pass = any(r.citations for r in results)
 
             try:
-                stage_metrics: dict[str, float] | None = _latest_turn_stage_metrics(
+                stage_metrics: dict[str, float] | None = latest_turn_stage_metrics(
                     sink, elapsed_ms, result.turn_id
                 )
             except RuntimeError:
@@ -1020,9 +1134,21 @@ async def run_cell(
                 # matches the parent `app_turn_foreground` metric record
                 # (keyed by the original turn_id) -- per-item latency is
                 # genuinely unavailable for a multi-intent turn's first
-                # result. Report as such rather than let a metrics-lookup
-                # mismatch escape to the outer handler and misclassify an
-                # otherwise-successful turn as "turn-error".
+                # result. Positively identify that shape (rather than
+                # swallowing every RuntimeError here) before treating it as
+                # expected: a genuinely missing `app_turn_foreground` record
+                # on an ordinary single-item turn is a real infra gap, not a
+                # per-item lookup mismatch -- silently swallowing THAT left
+                # latency_budget_enforced/_exceeded at their False/None
+                # defaults, so compute_pass_fail()'s enforced-budget check
+                # never ran and a paid baseline cell could report PASS with
+                # no latency evidence at all (round 8 gauntlet, merged Codex
+                # P1 + Logic lens finding 4). Re-raise for that case so the
+                # outer `except Exception` handler (below) classifies the
+                # turn as "turn-error" -- visible in the report -- instead of
+                # silently disabling the gate.
+                if not _is_multi_intent_item_turn_id(sink, result.turn_id):
+                    raise
                 stage_metrics = None
             if stage_metrics is not None:
                 outcome.routing_ms = round(stage_metrics["routing_ms"], 1)
@@ -1104,7 +1230,7 @@ async def run_cell(
         # turn_started (not len(turns)) decides "setup-error" vs
         # "turn-error": a TurnOutcome is only appended to `turns` at the END
         # of a turn's iteration, so if the FIRST turn fails mid-execution
-        # (e.g. _latest_turn_stage_metrics() raising, or a malformed
+        # (e.g. latest_turn_stage_metrics() raising, or a malformed
         # _handle_transcript return value's attribute access failing), `turns`
         # is still `[]` here even though that turn actually ran and was
         # billed. Append its in-flight outcome now, before the backfill below
@@ -1255,7 +1381,8 @@ def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
             # regardless of a turn breaking early -- see run_cell's
             # cell_status tracking) and could silently read as passing.
             if turn.status != "ok":
-                reasons.append(f"infra: {label} {query!r} turn status={turn.status!r}")
+                detail = f" ({turn.error!r})" if turn.error else ""
+                reasons.append(f"infra: {label} {query!r} turn status={turn.status!r}{detail}")
                 continue
             if turn.judge_verdict == "judge-error":
                 reasons.append(f"infra: {label} {query!r} judge-error ({turn.judge_reason!r})")
@@ -1297,7 +1424,11 @@ def build_report(outcomes: list[CellOutcome], *, judge_model: str) -> dict[str, 
                         "status": turn.status,
                         "judge_verdict": turn.judge_verdict,
                         "judge_reason": turn.judge_reason,
+                        "error": turn.error,
                         "deterministic_action_pass": turn.deterministic_action_pass,
+                        "deterministic_action_unevaluated_reason": (
+                            turn.deterministic_action_unevaluated_reason
+                        ),
                         "worker_presence_pass": turn.worker_presence_pass,
                         "citations_pass": turn.citations_pass,
                         "routing_ms": turn.routing_ms,
@@ -1324,10 +1455,18 @@ def print_report_summary(report: dict[str, Any]) -> None:
             print(f"    error: {cell['error']}")
         for turn in cell["turns"]:
             bits = [f"status={turn['status']}"]
+            if turn["error"] is not None:
+                bits.append(f"error={turn['error']!r}")
             if turn["judge_verdict"] is not None:
                 bits.append(f"judge={turn['judge_verdict']}")
             if turn["deterministic_action_pass"] is not None:
                 bits.append(f"action_pass={turn['deterministic_action_pass']}")
+            elif turn["deterministic_action_unevaluated_reason"] is not None:
+                # Distinct from "no action assertion was requested" -- makes
+                # visible that this turn's routing-action check was
+                # requested but never actually ran (round 8 gauntlet, Logic
+                # lens finding 2).
+                bits.append("action_pass=UNEVALUATED (routing_action unavailable)")
             if turn["worker_presence_pass"] is not None:
                 bits.append(f"worker_presence_pass={turn['worker_presence_pass']}")
             if turn["citations_pass"] is not None:
@@ -1474,7 +1613,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_LATENCY_SECONDS,
     )
     parser.add_argument(
-        "--out", type=Path, default=None, help="report output path (default: printed only)"
+        "--out",
+        type=Path,
+        default=None,
+        help=f"report output path (default: a timestamped file under {DEFAULT_REPORT_DIR}/)",
     )
     return parser
 
@@ -1548,14 +1690,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     report = build_report(outcomes, judge_model=args.judge_model)
     print_report_summary(report)
-    if args.out:
-        try:
-            out_path = confined_output_path(args.out, allowed_root=_REPO_ROOT)
-            write_no_follow(out_path, json.dumps(report, indent=2, sort_keys=True))
-        except (ValueError, OSError) as exc:
-            print(f"refusing to write report: {exc}", file=sys.stderr)
-            return 1
-        print(f"\nreport written to {out_path}")
+    # The aggregate report is always persisted to a file, not only when
+    # --out is explicitly passed (round 8 gauntlet, Codex P2 finding 2) --
+    # the dev plan's Architecture & Call Flow table requires the run's
+    # verdicts/metrics/cost to persist, and print_report_summary()'s console
+    # output omits several per-turn latency/timeout fields the full report
+    # carries. A caller-supplied --out still wins; otherwise a fresh
+    # timestamped path under DEFAULT_REPORT_DIR is used so no two runs
+    # silently clobber each other's report.
+    out_target = args.out or (
+        DEFAULT_REPORT_DIR / f"eval-report-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    try:
+        out_path = confined_output_path(out_target, allowed_root=REPO_ROOT)
+        write_no_follow(out_path, json.dumps(report, indent=2, sort_keys=True))
+    except (ValueError, OSError) as exc:
+        print(f"refusing to write report: {exc}", file=sys.stderr)
+        return 1
+    print(f"\nreport written to {out_path}")
     return 0 if report["overall_status"] == "PASS" else 1
 
 

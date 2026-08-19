@@ -8,7 +8,7 @@ import os
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _package_version
@@ -779,6 +779,24 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     return replace(identity, promotion_eligible=True, reason=None)
 
 
+def _registered_policy_labels(kwargs: dict[str, object], field_name: str) -> tuple[str, ...]:
+    """The label(s) about to be registered for ``field_name`` (a
+    ``*_model_policy`` field) in the ``Config`` this ``kwargs`` dict will
+    construct -- ``kwargs[field_name]``'s own keys if this same
+    ``load_config()`` call already populated it (e.g. via
+    ``WEBSEARCH_ROUTER_MODEL``/``WEBSEARCH_WORKER_MODEL``), else the
+    dataclass field's own default label(s). Lets a reasoning-effort env
+    override apply to whatever label is actually in play instead of a
+    hardcoded guess (round 8 gauntlet, Logic lens finding 4).
+    """
+    registered = kwargs.get(field_name)
+    if isinstance(registered, Mapping):
+        return tuple(registered)
+    default_factory = next(f for f in fields(Config) if f.name == field_name).default_factory
+    assert callable(default_factory)
+    return tuple(default_factory())
+
+
 def _parse_strict_bool(raw: object, *, field: str) -> bool:
     if isinstance(raw, bool):
         return raw
@@ -941,10 +959,25 @@ def load_config(
     # (`"X" in values`), which treated an explicitly-empty override as a
     # request to hard-fail config validation instead of "absent" (round 7
     # gauntlet finding 7).
+    #
+    # Applied to whatever label(s) are actually registered in the
+    # corresponding model policy (kwargs["*_model_policy"] if this same
+    # load_config() call already set one via WEBSEARCH_ROUTER_MODEL/
+    # WEBSEARCH_WORKER_MODEL above, else the dataclass default's own
+    # label), not hardcoded to "fast"/"deep" -- replacing the whole
+    # effort-policy dict with a single hardcoded label previously tripped
+    # __post_init__'s label cross-validation (:243-258) for any supported
+    # non-default-label model-policy configuration, since that label would
+    # never appear in worker_model_policy's/router_model_policy's own keys
+    # (round 8 gauntlet, Logic lens finding 4).
     if raw := values.get("WEBSEARCH_ROUTER_REASONING_EFFORT"):
-        kwargs["router_reasoning_effort_policy"] = {"fast": str(raw)}
+        kwargs["router_reasoning_effort_policy"] = {
+            label: str(raw) for label in _registered_policy_labels(kwargs, "router_model_policy")
+        }
     if raw := values.get("WEBSEARCH_WORKER_REASONING_EFFORT"):
-        kwargs["worker_reasoning_effort_policy"] = {"deep": str(raw)}
+        kwargs["worker_reasoning_effort_policy"] = {
+            label: str(raw) for label in _registered_policy_labels(kwargs, "worker_model_policy")
+        }
     stt_endpoint = values.get("WEBSEARCH_STT_ENDPOINT")
     if stt_endpoint:
         kwargs["stt_endpoint"] = parse_endpoint(str(stt_endpoint))

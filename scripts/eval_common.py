@@ -8,9 +8,10 @@ and ``scripts/smoke_conversation.py`` can share the same session-construction
 ``latest_turn_stage_metrics``) helpers without importing a script module as a
 library -- the layering this module exists for in the first place. The
 ``DEFAULT_QUERY``/``ROUTING_REGRESSION_QUERIES`` scenario constants live in
-``evals/queries.py``; ``evals/scenarios.py`` imports them from there directly,
-and this module re-exports them only for the same script-import
-backward-compatibility reason as the rest of its ``__all__``.
+``evals/queries.py``; ``evals/scenarios.py`` and ``scripts/smoke_conversation.py``
+both import them from there directly (round 8 gauntlet, Architecture finding
+12 -- this module previously re-exported a re-export, a needless 3-hop chain
+with no consumer that actually needed the middle hop).
 
 This module lives at ``scripts/eval_common.py`` (not the leading-underscore
 ``scripts/_eval_common.py`` this repo used before round 5 of the review
@@ -43,7 +44,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from evals.queries import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
 from server.composition import build_session_host
 from server.config import Config, PromotionManifest
 from server.perf_metrics import CollectingMeasurementSink
@@ -53,13 +53,11 @@ from server.router import effective_router_reasoning_effort
 __all__ = [
     "DEFAULT_JUDGE_MODEL",
     "DEFAULT_MANIFEST_RELATIVE_PATH",
-    "DEFAULT_QUERY",
     "MANIFEST_VERSION",
     "REPO_ROOT",
     "ROUTER_BASELINE",
     "ROUTER_CANDIDATES",
     "ROUTER_MANIFEST_TOOLS",
-    "ROUTING_REGRESSION_QUERIES",
     "SAFE_FALLBACKS",
     "TIMEOUT_FALLBACKS",
     "WORKER_BASELINE",
@@ -151,13 +149,6 @@ DEFAULT_JUDGE_MODEL = "gpt-5-mini"
 ROUTER_MANIFEST_TOOLS: tuple[str, ...] = ("text",)
 WORKER_MANIFEST_TOOLS: tuple[str, ...] = ("web_search",)
 
-# DEFAULT_QUERY/ROUTING_REGRESSION_QUERIES: re-exported from evals.queries
-# (not defined here) so the scripts <-> evals dependency stays
-# one-directional (scripts -> evals -> server), not the two-way coupling a
-# local definition here plus evals/scenarios.py importing it back would
-# create. scripts/smoke_conversation.py re-exports these names in turn, for
-# backward compatibility with existing imports (including
-# tests/test_smoke_conversation.py).
 # Re-exported (not re-typed) from server.pipeline.SAFE_FALLBACK_TEXTS -- see
 # round-2 gauntlet finding 9: a hand-duplicated copy here would silently
 # desync from a wording change at any of pipeline.py's safe-fallback
@@ -329,24 +320,28 @@ def strip_control_chars(text: str) -> str:
 
 
 def _redact(text: str, credential: str | None) -> str:
-    """Two redaction passes, in this order: (1) an exact substring replace on
-    ``credential`` -- the actual resolved API key/token, when the caller has
-    it in scope -- which is shape-independent and catches any configured
-    credential form (an Azure OpenAI key, a gateway/proxy token, etc.), not
-    just OpenAI's own ``sk-``-prefixed shape; (2) a fallback pattern match for
-    the ``sk-...`` shape, in case ``credential`` wasn't available at the call
-    site or the leaked text names a *different* credential than the one this
-    call resolved (e.g. a proxy's own upstream key echoed back in an error).
-    Control characters (e.g. ANSI escape sequences a provider/judge response
-    body could carry) are stripped in the same pass. Shared by ``error_text``
-    and ``sanitize_reason`` below, which differ only in whether the input is
-    an exception object or already a plain string (round 7 gauntlet finding
-    5).
+    """Control-char strip, then two redaction passes: (1) an exact substring
+    replace on ``credential`` -- the actual resolved API key/token, when the
+    caller has it in scope -- which is shape-independent and catches any
+    configured credential form (an Azure OpenAI key, a gateway/proxy token,
+    etc.), not just OpenAI's own ``sk-``-prefixed shape; (2) a fallback
+    pattern match for the ``sk-...`` shape, in case ``credential`` wasn't
+    available at the call site or the leaked text names a *different*
+    credential than the one this call resolved (e.g. a proxy's own upstream
+    key echoed back in an error). Shared by ``error_text`` and
+    ``sanitize_reason`` below, which differ only in whether the input is an
+    exception object or already a plain string (round 7 gauntlet finding 5).
+
+    Control-char stripping runs FIRST, not last: a credential containing an
+    embedded control character (e.g. a NUL) would otherwise defeat both the
+    exact-substring match and the ``sk-...`` regex, then have the control
+    char stripped afterward, reassembling the intact credential in the output
+    (round 8 gauntlet, Security lens finding 5).
     """
+    text = strip_control_chars(text)
     if credential:
-        text = text.replace(credential, "***REDACTED***")
-    text = _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
-    return strip_control_chars(text)
+        text = text.replace(strip_control_chars(credential), "***REDACTED***")
+    return _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
 
 
 def error_text(exc: Exception, *, credential: str | None = None, max_len: int = 2000) -> str:
@@ -399,6 +394,12 @@ def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = No
         raise ValueError(
             f"output path must stay within {root}: {raw_path!r} resolved to {resolved}"
         )
+    if ".git" in resolved.parts:
+        # Repo-tree containment alone doesn't exclude .git/ -- a write under
+        # it (e.g. .git/config, .git/hooks/pre-commit) is still "within the
+        # repo tree" but can rewrite repo metadata or plant a hook (round 8
+        # gauntlet, Security lens finding 6).
+        raise ValueError(f"output path must not write under .git/: {raw_path!r}")
     return resolved
 
 

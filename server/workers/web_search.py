@@ -201,6 +201,33 @@ _WEB_SEARCH_INSTRUCTIONS = (
 )
 
 
+def build_worker_request_kwargs(
+    model: str, effort: str | None, *, query: str, instructions: str = _WEB_SEARCH_INSTRUCTIONS
+) -> dict[str, Any]:
+    """The exact request-kwargs shape sent to the Responses API for a worker
+    search call.
+
+    Hoisted out of ``WebSearchWorker.search``'s ``execute()`` closure (round
+    8 gauntlet, Architecture finding 8) so ``scripts/verify_eval_candidates.py``'s
+    probe builder can call this SAME function instead of hand-mirroring the
+    shape independently -- see ``build_router_request_kwargs`` in
+    ``server/router.py`` for the matching router-side rationale.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "required",
+        "include": ["web_search_call.action.sources"],
+        "instructions": instructions,
+        "input": query,
+        "text": structured_text_format(WebSearchAnswer, "web_search_answer"),
+        "store": False,
+    }
+    if effort is not None:
+        kwargs["reasoning"] = {"effort": effort}
+    return kwargs
+
+
 def _value(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
@@ -366,18 +393,9 @@ class WebSearchWorker(ContextWorker):
             # Build the contextual request inside the mailbox. This keeps a
             # same-worker turn from observing a history snapshot captured
             # before an earlier queued turn has committed its result.
-            kwargs = {
-                "model": self.model,
-                "tools": [{"type": "web_search"}],
-                "tool_choice": "required",
-                "include": ["web_search_call.action.sources"],
-                "instructions": _WEB_SEARCH_INSTRUCTIONS,
-                "input": self._contextual_input(refined),
-                "text": structured_text_format(WebSearchAnswer, "web_search_answer"),
-                "store": False,
-            }
-            if self.reasoning_effort is not None:
-                kwargs["reasoning"] = {"effort": self.reasoning_effort}
+            kwargs = build_worker_request_kwargs(
+                self.model, self.reasoning_effort, query=self._contextual_input(refined)
+            )
             create = self.responses.create
             async with asyncio.timeout(self.provider_timeout_seconds):
                 if inspect.iscoroutinefunction(create):

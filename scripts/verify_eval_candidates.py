@@ -63,7 +63,9 @@ from scripts.eval_common import (
 # Tracked in git (not `.review-plan/`, which is gitignored) -- Phase 2's runner
 # and CI both need to read this manifest from a fresh checkout.
 DEFAULT_OUT = DEFAULT_MANIFEST_RELATIVE_PATH
-_REPO_ROOT = REPO_ROOT
+# Used directly (no local ``_REPO_ROOT`` alias) -- unlike eval_common.py's own
+# alias, no external caller depends on this file's private name, so the extra
+# indirection was pure churn (round 8 gauntlet, Architecture finding 11).
 
 # Renamed from ROUTER_CANDIDATES/WORKER_CANDIDATES (round 5, Architecture
 # lens finding 4): scripts/eval_model_comparison.py independently defines its
@@ -144,9 +146,14 @@ def _router_timeout_seconds() -> float:
 def _build_router_kwargs(
     model: str, effort: str | None, *, router_timeout_seconds: float
 ) -> dict[str, Any]:
-    """Reproduce `LazyRouterProvider.__call__`'s request-kwargs shape exactly."""
-    from server.router import RouterEnvelope, WorkerCatalogue, effective_router_reasoning_effort
-    from server.structured_outputs import structured_text_format
+    """The probe's request-kwargs, built by calling production's own
+    ``build_router_request_kwargs`` (round 8 gauntlet, Architecture finding
+    8) instead of hand-mirroring ``LazyRouterProvider.__call__``'s shape a
+    second time -- a production kwarg change previously left this file free
+    to keep reproducing the OLD shape and re-certify it as still
+    production-equivalent.
+    """
+    from server.router import WorkerCatalogue, build_router_request_kwargs
 
     catalogue = WorkerCatalogue(
         version="verify-eval-candidates-1",
@@ -155,43 +162,18 @@ def _build_router_kwargs(
         model_policies=("deep",),
     )
     prompt = catalogue.prompt(ROUTER_PROBE_TRANSCRIPT)
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "input": prompt,
-        "store": False,
-        "timeout": router_timeout_seconds,
-        "text": structured_text_format(RouterEnvelope, "router_envelope"),
-    }
-    # effective_router_reasoning_effort(), not a bare `if effort is not
-    # None`: the production call site (LazyRouterProvider.__call__) resolves
-    # the wire-level effort through that helper (its own "unset effort + a
-    # gpt-5* model defaults to minimal" rule), so a probe that bypassed it
-    # would be a latent shape mismatch for any future PHASE0_ROUTER_PROBES
-    # entry carrying an unset effort (round 5, Architecture lens finding 3).
-    effective_effort = effective_router_reasoning_effort(model, effort)
-    if effective_effort is not None:
-        kwargs["reasoning"] = {"effort": effective_effort}
-    return kwargs
+    return build_router_request_kwargs(model, effort, prompt=prompt, timeout=router_timeout_seconds)
 
 
 def _build_worker_kwargs(model: str, effort: str | None) -> dict[str, Any]:
-    """Reproduce `WebSearchWorker.search`'s request-kwargs shape exactly."""
-    from server.structured_outputs import structured_text_format
-    from server.workers.web_search import _WEB_SEARCH_INSTRUCTIONS, WebSearchAnswer
+    """The probe's request-kwargs, built by calling production's own
+    ``build_worker_request_kwargs`` (round 8 gauntlet, Architecture finding
+    8) instead of hand-mirroring ``WebSearchWorker.search``'s shape a second
+    time -- see ``_build_router_kwargs`` above for the matching rationale.
+    """
+    from server.workers.web_search import build_worker_request_kwargs
 
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "tools": [{"type": "web_search"}],
-        "tool_choice": "required",
-        "include": ["web_search_call.action.sources"],
-        "instructions": _WEB_SEARCH_INSTRUCTIONS,
-        "input": WORKER_PROBE_QUERY,
-        "text": structured_text_format(WebSearchAnswer, "web_search_answer"),
-        "store": False,
-    }
-    if effort is not None:
-        kwargs["reasoning"] = {"effort": effort}
-    return kwargs
+    return build_worker_request_kwargs(model, effort, query=WORKER_PROBE_QUERY)
 
 
 def _judge_kwargs(judge_model: str) -> dict[str, Any]:
@@ -443,7 +425,7 @@ def write_manifest(out_path: Path, results: list[ProbeResult]) -> dict[str, Any]
     # value is still attacker-influenced surface (see scripts/eval_common.py
     # for the rationale) -- reject `..` traversal escaping the repo tree and
     # refuse to follow an existing symlink at the target path.
-    confined_path = confined_output_path(out_path, allowed_root=_REPO_ROOT)
+    confined_path = confined_output_path(out_path, allowed_root=REPO_ROOT)
     write_no_follow(confined_path, json.dumps(manifest, indent=2, sort_keys=False) + "\n")
     return manifest
 

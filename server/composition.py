@@ -72,6 +72,17 @@ def build_session_host(
     at all (round 7 gauntlet, Architecture finding 16 -- rationale moved here
     from ``scripts/eval_common.py``'s ``build_session_for_run``, this
     function's eval-only wrapper, which previously duplicated it).
+
+    ``tts``, like ``router`` above, is captured at construction time only:
+    ``SessionHost.__init__`` binds it into ``self._tts_on_event``, a
+    constructor-captured reference a post-hoc ``host.tts = ...``
+    reassignment can't reach -- the same failure shape as the router
+    config-capture note above. A caller that needs a specific TTS stand-in
+    (e.g. ``scripts/smoke_conversation.py``'s ``_RecordingTTS``, for the
+    ack-ordering scenario) must pass it through this constructor's ``tts=``
+    parameter, not assign it after the fact (round 8 gauntlet, Architecture
+    finding 13 -- restored here after round 7's doc-consolidation moved the
+    composition rationale into this docstring but dropped this note).
     """
     registry = WorkerRegistry(config=config, responses=worker_responses)
     configured_router = router or Router(

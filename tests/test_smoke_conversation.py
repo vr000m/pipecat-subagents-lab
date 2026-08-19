@@ -11,9 +11,9 @@ so they stay deterministic and credential-free.
 
 import asyncio
 
+from scripts.eval_common import latest_turn_stage_metrics
 from scripts.smoke_conversation import (
     ROUTING_REGRESSION_QUERIES,
-    _latest_turn_stage_metrics,
     _run_routing_regression,
 )
 from server.config import Config
@@ -213,7 +213,7 @@ def test_direct_turn_between_delegated_turns_does_not_inherit_delegated_worker_i
 
 
 def test_direct_turn_stage_metrics_do_not_inherit_a_preceding_delegated_turns_search_ms() -> None:
-    """``_latest_turn_stage_metrics`` must select records by the caller's own
+    """``latest_turn_stage_metrics`` must select records by the caller's own
     ``turn_id``, not the newest record of each kind, so a direct turn (which
     emits no ``work_item_foreground`` record) never inherits the preceding
     delegated turn's ``search_ms``/``total_ms``."""
@@ -265,8 +265,8 @@ def test_direct_turn_stage_metrics_do_not_inherit_a_preceding_delegated_turns_se
         slow = await host._handle_transcript("search slowly", origin=connection)
         fast = await host._handle_transcript("what is your name", origin=connection)
 
-        slow_metrics = _latest_turn_stage_metrics(sink, 0.0, slow.turn_id)
-        fast_metrics = _latest_turn_stage_metrics(sink, 0.0, fast.turn_id)
+        slow_metrics = latest_turn_stage_metrics(sink, 0.0, slow.turn_id)
+        fast_metrics = latest_turn_stage_metrics(sink, 0.0, fast.turn_id)
 
         # The slow delegated turn actually searched, so it must report a
         # nonzero search_ms; a leaking helper would make the direct turn
@@ -276,3 +276,29 @@ def test_direct_turn_stage_metrics_do_not_inherit_a_preceding_delegated_turns_se
         await host.shutdown()
 
     asyncio.run(run())
+
+
+class TestTurnCorrelatedRoutingAction:
+    """Regression for round 8 gauntlet, Logic lens finding 1:
+    ``_run_routing_regression`` previously read ``host.state.routing.action``
+    with no correlation against the current turn's ``turn_id`` -- a stale
+    prior-turn decision could be misread as this turn's own outcome. Mirrors
+    ``scripts/eval_model_comparison.py``'s ``run_cell()`` staleness guard.
+    """
+
+    def test_returns_the_action_when_turn_ids_match(self) -> None:
+        from scripts.smoke_conversation import _turn_correlated_routing_action
+
+        routing = type("Routing", (), {"action": "existing_worker", "turn_id": "turn-1"})()
+        assert _turn_correlated_routing_action(routing, "turn-1") == "existing_worker"
+
+    def test_returns_none_for_a_stale_prior_turns_decision(self) -> None:
+        from scripts.smoke_conversation import _turn_correlated_routing_action
+
+        routing = type("Routing", (), {"action": "existing_worker", "turn_id": "turn-1"})()
+        assert _turn_correlated_routing_action(routing, "turn-2") is None
+
+    def test_returns_none_when_routing_is_none(self) -> None:
+        from scripts.smoke_conversation import _turn_correlated_routing_action
+
+        assert _turn_correlated_routing_action(None, "turn-1") is None

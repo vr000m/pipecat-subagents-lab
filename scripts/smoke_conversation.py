@@ -18,16 +18,15 @@ from typing import Any
 # other as a library; re-exported here so existing imports (including
 # tests/test_smoke_conversation.py) keep working unchanged.
 # DEFAULT_QUERY/ROUTING_REGRESSION_QUERIES themselves live in
-# evals/queries.py -- eval_common.py re-exports them, this module re-exports
-# that re-export, purely for backward compatibility with existing imports;
-# evals/scenarios.py imports them from evals/queries.py directly.
+# evals/queries.py -- imported directly from there (not via eval_common.py's
+# re-export of a re-export, a needless 3-hop chain: round 8 gauntlet,
+# Architecture finding 12), same as evals/scenarios.py already does.
+from evals.queries import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
 from scripts.eval_common import (
-    DEFAULT_QUERY,
-    ROUTING_REGRESSION_QUERIES,
     SAFE_FALLBACKS,
     CollectingMeasurementSink,
-    _latest_turn_stage_metrics,
     build_session_for_run,
+    latest_turn_stage_metrics,
 )
 
 __all__ = [
@@ -35,10 +34,28 @@ __all__ = [
     "ROUTING_REGRESSION_QUERIES",
     "SAFE_FALLBACKS",
     "CollectingMeasurementSink",
-    "_latest_turn_stage_metrics",
 ]
 
 RESULT_PREFIX = "SMOKE_RESULT="
+
+
+def _turn_correlated_routing_action(routing: Any, result_turn_id: str) -> str | None:
+    """``routing.action`` if ``routing`` was actually decided for this turn,
+    else ``None``.
+
+    Mirrors ``scripts/eval_model_comparison.py``'s ``run_cell()`` staleness
+    guard (round 6/7 gauntlet): ``host.state.routing`` still holds the PRIOR
+    turn's decision if this turn's own routing/dispatch call fails before
+    ever assigning a new one. This smoke script has no "unevaluated"
+    reporting channel (unlike the eval runner) -- callers here already treat
+    a ``None`` action as an explicit failure (round 8 gauntlet, Logic lens
+    finding 1).
+    """
+    return (
+        getattr(routing, "action", None)
+        if getattr(routing, "turn_id", None) == result_turn_id
+        else None
+    )
 
 
 class _RecordingTTS:
@@ -48,7 +65,7 @@ class _RecordingTTS:
     nested in ``_run_ack_ordering``) so ``_run_child`` can construct it and
     pass it into ``build_session_for_run(..., tts=...)`` at construction time,
     rather than the post-hoc ``host.tts = ...`` reassignment
-    ``build_session_for_run``'s own docstring warns leaves
+    ``server.composition.build_session_host``'s own docstring warns leaves
     ``SessionHost._tts_on_event`` stale.
     """
 
@@ -158,7 +175,7 @@ async def _run_child(
             raise RuntimeError("public-web smoke returned an invalid spoken projection")
         if not result.citations:
             raise RuntimeError("public-web smoke returned no normalized citations")
-        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+        stage_metrics = latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
         routing_ms = stage_metrics["routing_ms"]
         search_ms = stage_metrics["search_ms"]
         total_ms = stage_metrics["total_ms"]
@@ -323,7 +340,7 @@ async def _run_ack_ordering(
     # instant this value was captured, on the same elapsed-vs-max_ack_seconds
     # comparison, so a second check on the same value can never fire.
     elapsed_ms = (time.perf_counter() - started) * 1000
-    stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+    stage_metrics = latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
     routing_ms = stage_metrics["routing_ms"]
     if routing_ms > max_routing_seconds * 1000:
         raise RuntimeError(
@@ -358,7 +375,7 @@ async def _run_routing_regression(
             )
         result = results[0]
         routing = getattr(host.state, "routing", None)
-        action = getattr(routing, "action", None)
+        action = _turn_correlated_routing_action(routing, result.turn_id)
         if index == 0:
             if action != "direct" or result.worker_id != "main":
                 raise RuntimeError("greeting was not handled as a direct main response")
@@ -369,7 +386,7 @@ async def _run_routing_regression(
                 raise RuntimeError("weather turn returned a routing/search fallback")
             if action not in {"new_worker", "existing_worker"}:
                 raise RuntimeError(f"weather turn used unexpected routing action: {action!r}")
-        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+        stage_metrics = latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
         routing_ms = stage_metrics["routing_ms"]
         total_ms = stage_metrics["total_ms"]
         if routing_ms > max_routing_seconds * 1000:
