@@ -122,6 +122,13 @@ _WAIT_FOR_MARGIN_SECONDS = 10.0
 # router_timeout_seconds/foreground_search_timeout_seconds to derive from.
 _JUDGE_EVALUATE_TIMEOUT_SECONDS = 60.0
 
+# EvalJudge's own library default (200) is sized for a non-reasoning judge
+# model's one-line JSON verdict. build_judge_llm_service() now pins a
+# reasoning-model judge to minimal effort (see its docstring), but "minimal"
+# still spends some tokens on hidden reasoning before the visible verdict --
+# raised as defense-in-depth alongside that fix, not as the fix itself.
+_JUDGE_MAX_TOKENS = 500
+
 # Rough, deliberately conservative per-call dollar estimates for the
 # --dry-run cost preview. These are not billed-price lookups -- just enough
 # to give an operator an order-of-magnitude sense of spend before confirming
@@ -1020,7 +1027,10 @@ async def run_cell(
         # Assigned to the outer `host` (not a local) as soon as it's
         # constructed, before judge construction can raise and leak it.
         host = build_session_for_run(config, measurement_sink=sink)
-        judge = EvalJudge(build_judge_llm_service(judge_model, config.openai_api_key))
+        judge = EvalJudge(
+            build_judge_llm_service(judge_model, config.openai_api_key),
+            max_tokens=_JUDGE_MAX_TOKENS,
+        )
 
         await host.start()
         connection = await host.connect(_connect_handshake(host))

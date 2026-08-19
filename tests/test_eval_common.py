@@ -19,6 +19,7 @@ import server.composition as composition_module
 from scripts.eval_common import (
     SAFE_FALLBACKS,
     _redact,
+    build_judge_llm_service,
     build_session_for_run,
     confined_output_path,
     turn_correlated_routing_action,
@@ -224,3 +225,26 @@ class TestTurnCorrelatedRoutingAction:
 
     def test_none_routing_returns_none(self) -> None:
         assert turn_correlated_routing_action(None, "turn-1") is None
+
+
+class TestBuildJudgeLlmServicePinsReasoningEffort:
+    """Regression: a live --full-matrix run's judge calls all returned
+    'judge returned empty response' -- gpt-5-mini (a reasoning model) had no
+    reasoning_effort override, so EvalJudge's 200-token completion cap could
+    be exhausted by hidden reasoning tokens before any visible JSON verdict
+    was emitted. build_judge_llm_service() now pins a gpt-5* judge model to
+    minimal reasoning effort via Settings.extra, the only way to set it on
+    pipecat's Chat Completions path (see the function's own docstring).
+    """
+
+    def test_gpt5_judge_model_gets_minimal_reasoning_effort(self) -> None:
+        service = build_judge_llm_service("gpt-5-mini", api_key="sk-test")
+        assert service._settings.extra == {"reasoning_effort": "minimal"}
+
+    def test_non_gpt5_judge_model_gets_no_reasoning_effort_override(self) -> None:
+        service = build_judge_llm_service("gpt-4.1-mini", api_key="sk-test")
+        assert service._settings.extra == {}
+
+    def test_credential_is_still_threaded_through(self) -> None:
+        service = build_judge_llm_service("gpt-5-mini", api_key="sk-test-credential")
+        assert service._client.api_key == "sk-test-credential"

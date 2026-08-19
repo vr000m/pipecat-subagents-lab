@@ -324,10 +324,35 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     the raw ``OPENAI_API_KEY`` env var. Constructing ``OpenAILLMService``
     directly, threading the already-resolved credential through explicitly,
     fixes that without needing to change the installed library.
+
+    Also pins a low reasoning effort for a gpt-5* judge model. Unlike the
+    router/worker paths (which build a raw Responses API request and set
+    ``reasoning={"effort": ...}`` themselves), this goes through pipecat's
+    ``BaseOpenAILLMService``, which issues a Chat Completions call with no
+    ``reasoning_effort`` set -- so a reasoning model defaults to the API's own
+    effort level. ``EvalJudge`` caps the completion at 200 tokens (its own
+    library default) for what is meant to be a one-line JSON verdict; with no
+    effort override, gpt-5-mini can spend that entire budget on hidden
+    reasoning tokens and emit no visible text at all -- observed live as
+    every judge call returning ``"judge returned empty response"`` across an
+    entire eval matrix (round 9 gauntlet follow-up). Reuse
+    ``effective_router_reasoning_effort``'s "gpt-5* defaults to minimal"
+    rule -- its own docstring already anticipates exactly this reuse -- and
+    thread it through ``Settings.extra``, which
+    ``build_chat_completion_params`` merges into the raw ``create()`` kwargs;
+    Chat Completions' ``reasoning_effort`` is a flat string parameter, unlike
+    the Responses API's nested ``reasoning.effort``.
     """
     from pipecat.services.openai.llm import OpenAILLMService
 
-    return OpenAILLMService(settings=OpenAILLMService.Settings(model=model), api_key=api_key)
+    extra: dict[str, Any] = {}
+    effort = effective_router_reasoning_effort(model, None)
+    if effort is not None:
+        extra["reasoning_effort"] = effort
+
+    return OpenAILLMService(
+        settings=OpenAILLMService.Settings(model=model, extra=extra), api_key=api_key
+    )
 
 
 def strip_control_chars(text: str) -> str:
