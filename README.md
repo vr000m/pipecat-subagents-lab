@@ -519,7 +519,13 @@ Router/worker model evaluation (run in this order):
   candidate and scenario, scoring replies via `pipecat.evals.judge.EvalJudge`
   and producing one aggregate pass/fail + latency report. Supports
   `--dry-run` (zero live calls), `--router`/`--worker`/`--scenario` for a
-  single cheap smoke pair, and `--max-calls`/`--max-cost` spend gates.
+  single cheap smoke pair, `--full-matrix` for the full router x worker cross
+  product, `--max-calls`/`--max-cost` spend gates, and
+  `--i-know-the-manifest-is-stale` to proceed against a manifest whose
+  recorded source commit no longer matches `HEAD`. Every run's aggregate
+  report is always persisted (default: a timestamped file under
+  `.review-plan/eval-reports/`; override with `--out`), not only when `--out`
+  is passed.
 
 Phase 4 query-context narrowing experiment (run in this order):
 
