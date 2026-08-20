@@ -1231,7 +1231,14 @@ async def run_cell(
             )
             outcome.worker_presence_pass = delegated_action == turn.expect_delegated
 
-            if turn.expect_delegated:
+            # Gated on expect_citations, not expect_delegated: a live probe
+            # of the hosted web_search tool showed a weather query is still
+            # genuinely delegated but answered via the tool's internal
+            # oai-weather sub-tool, whose sources carry url=null -- no
+            # citable URL exists to assert on even though delegation (and
+            # worker_presence_pass above) is correct. See evals/scenarios.py
+            # Turn's docstring.
+            if turn.expect_citations:
                 outcome.citations_pass = any(r.citations for r in results)
 
             try:

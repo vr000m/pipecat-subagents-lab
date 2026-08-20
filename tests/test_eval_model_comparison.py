@@ -1028,7 +1028,7 @@ class TestJudgeScoringSemantics:
         outcome = _run_cell(
             monkeypatch,
             pair=pair,
-            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            turns=(Turn(query="weather in Riga?", expect_delegated=True, expect_citations=True),),
             citations=["citation-1"],
             verdicts=[],
         )
@@ -1041,11 +1041,34 @@ class TestJudgeScoringSemantics:
         outcome = _run_cell(
             monkeypatch,
             pair=pair,
-            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            turns=(Turn(query="weather in Riga?", expect_delegated=True, expect_citations=True),),
             citations=[],
             verdicts=[],
         )
         assert outcome.turns[0].citations_pass is False
+
+    def test_delegated_turn_without_expect_citations_leaves_the_check_unevaluated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: citations_pass used to be driven by expect_delegated
+        alone, so a genuinely delegated turn whose hosted worker cannot
+        yield a citable URL (e.g. a weather query answered via the
+        web_search tool's internal oai-weather sub-tool, confirmed via a
+        live probe) always failed this check regardless of the reply's
+        actual quality. expect_citations now gates it independently --
+        expect_delegated=True with expect_citations left at its False
+        default must leave citations_pass unevaluated (None), not compute a
+        spurious False from empty citations.
+        """
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            citations=[],
+            verdicts=[],
+        )
+        assert outcome.turns[0].citations_pass is None
 
     def test_judge_is_fed_display_text_not_spoken_text(
         self, monkeypatch: pytest.MonkeyPatch

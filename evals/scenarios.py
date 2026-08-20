@@ -33,17 +33,30 @@ class Turn:
     ``host.state.routing.action`` after this turn, when set.
 
     ``expect_delegated`` marks a turn the runner expects to route to the
-    worker: it drives both the post-first-delegation worker
-    model/effort assertion and the deterministic non-empty-citations check
-    (never a judge criterion -- ``spoken_text``'s contract forbids citation
-    markers/URLs, so asking the judge to check for a citation would be
-    self-contradictory).
+    worker: it drives the post-first-delegation worker model/effort
+    assertion.
+
+    ``expect_citations`` separately marks a turn the runner expects the
+    hosted ``web_search`` tool to answer with citable URL sources, driving
+    the deterministic non-empty-citations check (never a judge criterion --
+    ``spoken_text``'s contract forbids citation markers/URLs, so asking the
+    judge to check for a citation would be self-contradictory). This is
+    deliberately independent of ``expect_delegated``: a live probe of
+    ``server/workers/web_search.py``'s ``build_worker_request_kwargs``
+    request against a real weather query showed the hosted ``web_search``
+    tool answers weather with its internal ``oai-weather`` sub-tool, whose
+    ``action.sources`` entries carry ``url: null`` -- the response is
+    genuinely delegated and genuinely sourced, but never yields a citable
+    URL. Coupling the citations check to ``expect_delegated`` alone made
+    every weather turn fail a check the worker cannot pass by design, not a
+    real per-candidate quality signal.
     """
 
     query: str
     judge_criterion: str | None = None
     expect_action: str | None = None
     expect_delegated: bool = False
+    expect_citations: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +75,11 @@ SINGLE_TURN_DEFAULT = Scenario(
                 "claim to be unable to answer or refuse the request."
             ),
             expect_delegated=True,
+            # An organic web-search query (not weather) -- the hosted tool
+            # answers this via a genuine browse, which does yield citable
+            # URLs. See the Turn docstring for why this is asserted
+            # independently of expect_delegated.
+            expect_citations=True,
         ),
     ),
 )
@@ -86,6 +104,13 @@ ROUTING_REGRESSION = Scenario(
         # temperature for the named city", not "gives the correct current
         # weather" (this runner has no ground truth for today's actual
         # weather, and the candidate models are evaluated on different days).
+        #
+        # No expect_citations here: a live probe confirmed the hosted
+        # web_search tool answers weather via its internal oai-weather
+        # sub-tool, whose sources carry url=null -- delegation still happens
+        # (expect_delegated=True) and is still covered by
+        # worker_presence_pass, but there is no citable URL to assert on.
+        # See the Turn docstring.
         Turn(
             query=ROUTING_REGRESSION_QUERIES[1],
             judge_criterion=(
