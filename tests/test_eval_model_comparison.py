@@ -680,6 +680,287 @@ class TestReportAggregation:
 
 
 # ---------------------------------------------------------------------------
+# --repeat: majority-vote aggregation across independent repetitions.
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixCallAccountingRepeatMultiplier:
+    """matrix_call_accounting()'s repeat_count must multiply the whole
+    worst-case estimate -- run_matrix() calls run_cell() repeat_count times
+    per (pair, scenario), and every one of those is a real, separately
+    billed live call. The spend-confirmation gate reads this estimate before
+    any call is made, so an under-counted --repeat run could blow past an
+    operator's --max-calls/--max-cost without ever tripping the gate.
+    """
+
+    def test_repeat_count_one_is_unchanged_from_the_pre_repeat_estimate(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        scenarios = eval_runner.SCENARIOS
+        default = eval_runner.matrix_call_accounting(pairs, scenarios)
+        explicit = eval_runner.matrix_call_accounting(pairs, scenarios, repeat_count=1)
+        assert explicit.total_calls == default.total_calls
+        assert explicit.estimated_cost_usd == default.estimated_cost_usd
+
+    def test_repeat_count_three_triples_every_call_count(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        scenarios = eval_runner.SCENARIOS
+        base = eval_runner.matrix_call_accounting(pairs, scenarios, repeat_count=1)
+        repeated = eval_runner.matrix_call_accounting(pairs, scenarios, repeat_count=3)
+        assert repeated.router_calls == base.router_calls * 3
+        assert repeated.worker_calls == base.worker_calls * 3
+        assert repeated.judge_calls == base.judge_calls * 3
+        assert repeated.estimated_cost_usd == pytest.approx(base.estimated_cost_usd * 3)
+
+
+class TestMajorityBool:
+    def test_strict_majority_true(self) -> None:
+        assert eval_runner._majority_bool([True, True, False]) is True
+
+    def test_strict_majority_false(self) -> None:
+        assert eval_runner._majority_bool([True, False, False]) is False
+
+    def test_tie_resolves_to_false(self) -> None:
+        assert eval_runner._majority_bool([True, False]) is False
+
+    def test_none_entries_are_ignored_not_counted(self) -> None:
+        # 2 real votes (both True) plus a never-evaluated repeat -- the
+        # never-evaluated repeat must not count as a "no" vote.
+        assert eval_runner._majority_bool([True, True, None]) is True
+
+    def test_all_none_is_none(self) -> None:
+        assert eval_runner._majority_bool([None, None]) is None
+
+
+class TestAggregateCellRepeats:
+    """_aggregate_cell_repeats() majority-votes N independent run_cell()
+    results for the SAME (pair, scenario) into one summary CellOutcome. The
+    len==1 case is a strict identity (round-trips the exact same object) so
+    the --repeat 1 default reproduces the pre-existing single-run report
+    shape byte-for-byte.
+    """
+
+    def _turn(self, **overrides: Any) -> Any:
+        base: dict[str, Any] = {"query": "q", "status": "ok", "judge_verdict": None}
+        base.update(overrides)
+        return eval_runner.TurnOutcome(**base)
+
+    def _cell(
+        self, *, status: eval_runner.CellStatus = "ok", turns: list[Any] | None = None
+    ) -> Any:
+        return eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="s",
+            status=status,
+            turns=turns if turns is not None else [self._turn()],
+        )
+
+    def test_single_repeat_returns_the_same_object_unchanged(self) -> None:
+        cell = self._cell()
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", [cell])
+        assert aggregated is cell
+        assert aggregated.repeats is None
+
+    def test_raw_repeats_are_attached_for_audit(self) -> None:
+        cells = [self._cell(), self._cell(), self._cell()]
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        assert aggregated.repeats == cells
+
+    def test_majority_yes_verdict_wins(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(judge_verdict="yes")]),
+            self._cell(turns=[self._turn(judge_verdict="yes")]),
+            self._cell(turns=[self._turn(judge_verdict="no")]),
+        ]
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].judge_verdict == "yes"
+        assert "2/3" in (aggregated.turns[0].judge_reason or "")
+
+    def test_tied_verdict_resolves_toward_the_failure_outcome(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(judge_verdict="yes")]),
+            self._cell(turns=[self._turn(judge_verdict="no")]),
+        ]
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].judge_verdict == "no"
+
+    def test_majority_ok_status_reports_ok(self) -> None:
+        cells = [self._cell(status="ok"), self._cell(status="ok"), self._cell(status="timeout")]
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        assert aggregated.status == "ok"
+        assert aggregated.error is None
+
+    def test_majority_infra_failure_reports_the_failure_with_a_summary(self) -> None:
+        cells = [
+            self._cell(status="timeout"),
+            self._cell(status="timeout"),
+            self._cell(status="ok"),
+        ]
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        assert aggregated.status == "timeout"
+        assert aggregated.error is not None
+        assert "2/3" in aggregated.error
+
+    def test_infra_failed_repeats_do_not_pollute_the_semantic_vote(self) -> None:
+        # A judge=no from a genuinely-ok repeat outvotes... but an
+        # infra-failed repeat's None judge_verdict must not count as a "no"
+        # vote at all -- only the 2 ok repeats' real verdicts matter.
+        cells = [
+            self._cell(turns=[self._turn(status="ok", judge_verdict="yes")]),
+            self._cell(turns=[self._turn(status="ok", judge_verdict="yes")]),
+            self._cell(status="provider-error", turns=[self._turn(status="provider-error")]),
+        ]
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].judge_verdict == "yes"
+        assert "2/2" in (aggregated.turns[0].judge_reason or "")
+
+    def test_latency_ms_fields_are_averaged_across_ok_repeats(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(total_ms=100.0)]),
+            self._cell(turns=[self._turn(total_ms=200.0)]),
+            self._cell(turns=[self._turn(total_ms=300.0)]),
+        ]
+        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].total_ms == pytest.approx(200.0)
+
+
+class TestRunMatrixRepeatWiring:
+    """run_matrix()'s repeat_count param must call run_cell() that many
+    times per (pair, scenario) and feed the results through
+    _aggregate_cell_repeats() -- not just the first result.
+    """
+
+    def test_repeat_count_default_calls_run_cell_once_per_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[Any] = []
+
+        async def _fake_run_cell(pair: Any, scenario: Any, *_a: Any, **_k: Any) -> Any:
+            calls.append((pair, scenario))
+            return eval_runner.CellOutcome(
+                pair_label=pair.label, scenario_name=scenario.name, status="ok", turns=[]
+            )
+
+        monkeypatch.setattr(eval_runner, "run_cell", _fake_run_cell)
+        monkeypatch.setattr(eval_runner, "candidate_accepted", lambda *_a, **_k: True)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (scenario,),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+            )
+        )
+
+        assert len(calls) == 1
+        assert outcomes[0].repeats is None
+
+    def test_repeat_count_three_calls_run_cell_three_times_and_aggregates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        call_count = 0
+
+        async def _fake_run_cell(pair: Any, scenario: Any, *_a: Any, **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            status: eval_runner.CellStatus = "ok" if call_count != 2 else "timeout"
+            return eval_runner.CellOutcome(
+                pair_label=pair.label, scenario_name=scenario.name, status=status, turns=[]
+            )
+
+        monkeypatch.setattr(eval_runner, "run_cell", _fake_run_cell)
+        monkeypatch.setattr(eval_runner, "candidate_accepted", lambda *_a, **_k: True)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (scenario,),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+                repeat_count=3,
+            )
+        )
+
+        assert call_count == 3
+        assert len(outcomes) == 1
+        # 2/3 ok -> majority is "ok" despite one timeout repeat.
+        assert outcomes[0].status == "ok"
+        assert outcomes[0].repeats is not None
+        assert len(outcomes[0].repeats) == 3
+
+
+class TestBuildReportRepeatCount:
+    def test_repeat_count_one_matches_the_pre_repeat_note(self) -> None:
+        report = eval_runner.build_report([], judge_model="gpt-5-mini")
+        assert report["repetition_count_per_cell"] == 1
+        assert "n=1 per cell" in report["repetition_note"]
+
+    def test_repeat_count_three_is_labeled_and_serializes_raw_repeats(self) -> None:
+        cell = eval_runner.CellOutcome(
+            pair_label="p",
+            scenario_name="s",
+            status="ok",
+            turns=[eval_runner.TurnOutcome(query="q", status="ok")],
+            repeats=[
+                eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[]),
+                eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[]),
+                eval_runner.CellOutcome(
+                    pair_label="p", scenario_name="s", status="timeout", turns=[]
+                ),
+            ],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=3)
+        assert report["repetition_count_per_cell"] == 3
+        assert "majority vote" in report["repetition_note"]
+        serialized_repeats = report["cells"][0]["repeats"]
+        assert serialized_repeats is not None
+        assert len(serialized_repeats) == 3
+        assert [r["status"] for r in serialized_repeats] == ["ok", "ok", "timeout"]
+
+    def test_a_cell_with_no_repeats_serializes_repeats_as_none(self) -> None:
+        cell = eval_runner.CellOutcome(
+            pair_label="p",
+            scenario_name="s",
+            status="ok",
+            turns=[eval_runner.TurnOutcome(query="q", status="ok")],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini")
+        assert report["cells"][0]["repeats"] is None
+
+
+# ---------------------------------------------------------------------------
 # Dry-run: zero live calls invariant
 # ---------------------------------------------------------------------------
 

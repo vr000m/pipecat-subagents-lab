@@ -30,11 +30,12 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from evals.scenarios import SCENARIOS, SCENARIOS_BY_NAME, Scenario
 from scripts.eval_common import (
@@ -658,14 +659,18 @@ def scenario_call_counts(scenario: Scenario) -> tuple[int, int, int]:
 
 
 def matrix_call_accounting(
-    pairs: tuple[RunPair, ...], scenarios: tuple[Scenario, ...]
+    pairs: tuple[RunPair, ...], scenarios: tuple[Scenario, ...], *, repeat_count: int = 1
 ) -> CallAccounting:
     """Worst-case call/cost accounting for the spend-confirmation gate.
 
     Includes the SDK's default-retry worst case (``_RETRY_WORST_CASE_MULTIPLIER``)
     on top of ``scenario_call_counts()``'s nominal one-request-per-turn count,
     so an operator confirming ``--max-calls``/``--max-cost`` sees the true
-    worst-case exposure, not just the happy-path call count.
+    worst-case exposure, not just the happy-path call count. ``repeat_count``
+    multiplies the whole estimate: run_matrix() calls run_cell() that many
+    times per (pair, scenario), and every one of those is a real, separately
+    billed live call -- an operator confirming spend for a --repeat run must
+    see the repeated total, not the single-run estimate.
     """
     router_calls = worker_calls = judge_calls = 0
     for _pair in pairs:
@@ -675,9 +680,9 @@ def matrix_call_accounting(
             worker_calls += w
             judge_calls += j
     return CallAccounting(
-        router_calls=router_calls * _RETRY_WORST_CASE_MULTIPLIER,
-        worker_calls=worker_calls * _RETRY_WORST_CASE_MULTIPLIER,
-        judge_calls=judge_calls * _RETRY_WORST_CASE_MULTIPLIER,
+        router_calls=router_calls * _RETRY_WORST_CASE_MULTIPLIER * repeat_count,
+        worker_calls=worker_calls * _RETRY_WORST_CASE_MULTIPLIER * repeat_count,
+        judge_calls=judge_calls * _RETRY_WORST_CASE_MULTIPLIER * repeat_count,
     )
 
 
@@ -693,6 +698,7 @@ def print_matrix_preview(
     *,
     judge_model: str,
     status: ManifestStatus,
+    repeat_count: int = 1,
 ) -> None:
     print(f"Manifest: {status.path}")
     if not status.exists:
@@ -708,6 +714,7 @@ def print_matrix_preview(
     print()
     print(
         f"Matrix: {len(pairs)} config pair(s) x {len(scenarios)} scenario(s) = {len(pairs) * len(scenarios)} cell(s)"
+        + (f" x {repeat_count} repeat(s)" if repeat_count != 1 else "")
     )
     for pair in pairs:
         router_ok = candidate_accepted(pair.router, status)
@@ -729,7 +736,7 @@ def print_matrix_preview(
             f"worker(worst-case, assumes every turn could route to a worker)={w} judge={j}"
         )
     print()
-    accounting = matrix_call_accounting(pairs, scenarios)
+    accounting = matrix_call_accounting(pairs, scenarios, repeat_count=repeat_count)
     print(
         f"Total calls: router={accounting.router_calls} worker={accounting.worker_calls} "
         f"judge={accounting.judge_calls} total={accounting.total_calls}"
@@ -818,6 +825,194 @@ class CellOutcome:
     turns: list[TurnOutcome] | None = None
     router_timeout_seconds: float | None = None
     foreground_search_timeout_seconds: float | None = None
+    # Populated only when --repeat > 1 (see _aggregate_cell_repeats): the raw
+    # per-repetition CellOutcomes this (majority-voted) cell was built from,
+    # kept for audit -- the aggregated fields above are a summary, not a
+    # replacement, for the individual live calls that produced them.
+    repeats: list[CellOutcome] | None = None
+
+
+# Tie-break priority for _majority_with_tiebreak(): when a repeat vote is
+# split exactly evenly, resolve toward the more "something went wrong"
+# outcome rather than the clean one -- a --repeat run exists to catch
+# flakiness, so a coin-flip tie must not silently read as a clean pass.
+_CELL_STATUS_TIE_PRIORITY: tuple[CellStatus, ...] = (
+    "timeout",
+    "provider-error",
+    "setup-error",
+    "turn-error",
+    "manifest-rejected",
+    "ok",
+)
+_TURN_STATUS_TIE_PRIORITY: tuple[TurnStatus, ...] = (
+    "provider-error",
+    "timeout",
+    "setup-error",
+    "turn-error",
+    "skipped",
+    "ok",
+)
+_JUDGE_VERDICT_TIE_PRIORITY: tuple[JudgeVerdict, ...] = ("judge-error", "no", "continue", "yes")
+
+_StrEnumT = TypeVar("_StrEnumT", bound=str)
+
+
+def _majority_with_tiebreak(
+    values: Sequence[_StrEnumT], priority: Sequence[_StrEnumT]
+) -> _StrEnumT:
+    """Mode of ``values``; a tied plurality resolves to the first matching
+    entry in ``priority`` rather than an arbitrary dict-iteration winner.
+    """
+    counts = Counter(values)
+    max_count = max(counts.values())
+    winners = {value for value, count in counts.items() if count == max_count}
+    for candidate in priority:
+        if candidate in winners:
+            return candidate
+    return next(iter(winners))  # pragma: no cover -- unreachable for a closed Literal vocabulary
+
+
+def _majority_bool(values: Sequence[bool | None]) -> bool | None:
+    """Strict-majority vote over optional booleans, ignoring None (never
+    evaluated in that repeat) entries. None if every entry is None (the
+    check never ran in any repeat). A tie resolves to False -- a repeated
+    assertion that only barely passes isn't confidently a pass.
+    """
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    true_count = sum(1 for value in present if value)
+    return true_count * 2 > len(present)
+
+
+def _average(values: Sequence[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return sum(present) / len(present) if present else None
+
+
+def _aggregate_turn_repeats(turn_repeats: list[TurnOutcome]) -> TurnOutcome:
+    """Majority-vote N repetitions of the SAME turn (same query, same
+    position in the scenario) into one summary TurnOutcome. See
+    _aggregate_cell_repeats for why this exists and the len==1 identity
+    contract it shares.
+    """
+    if len(turn_repeats) == 1:
+        return turn_repeats[0]
+
+    statuses: list[TurnStatus] = [turn.status for turn in turn_repeats]
+    agg_status = _majority_with_tiebreak(statuses, _TURN_STATUS_TIE_PRIORITY)
+
+    # Every semantic field below is only meaningful for a repeat that
+    # actually produced a real result -- a provider-error/timeout/skipped
+    # repeat's judge_verdict/citations_pass/etc. are already None (see
+    # compute_pass_fail's own "turn.status != 'ok'" gate), so folding them
+    # into the vote unweighted would let a run of infra failures silently
+    # outvote a minority of genuine semantic results.
+    ok_turns = [turn for turn in turn_repeats if turn.status == "ok"]
+    verdicts = [turn.judge_verdict for turn in ok_turns if turn.judge_verdict is not None]
+    agg_verdict = (
+        _majority_with_tiebreak(verdicts, _JUDGE_VERDICT_TIE_PRIORITY) if verdicts else None
+    )
+    reason_bits = [turn.judge_reason for turn in ok_turns if turn.judge_reason]
+    agg_reason = (
+        f"{sum(1 for v in verdicts if v == 'yes')}/{len(verdicts)} repeats judged yes"
+        + (f"; reasons: {' | '.join(reason_bits)}" if reason_bits else "")
+        if verdicts
+        else None
+    )
+
+    non_ok_turns = [turn for turn in turn_repeats if turn.status != "ok"]
+    agg_error = (
+        None
+        if not non_ok_turns
+        else f"{len(non_ok_turns)}/{len(turn_repeats)} repeats failed: "
+        + "; ".join(sorted({turn.error or turn.status for turn in non_ok_turns}))
+    )
+
+    unevaluated_reasons = [
+        turn.deterministic_action_unevaluated_reason
+        for turn in ok_turns
+        if turn.deterministic_action_unevaluated_reason is not None
+    ]
+
+    return TurnOutcome(
+        query=turn_repeats[0].query,
+        status=agg_status,
+        judge_verdict=agg_verdict,
+        judge_reason=agg_reason,
+        error=agg_error,
+        deterministic_action_pass=_majority_bool(
+            [turn.deterministic_action_pass for turn in ok_turns]
+        ),
+        deterministic_action_unevaluated_reason=(
+            unevaluated_reasons[0] if unevaluated_reasons else None
+        ),
+        citations_pass=_majority_bool([turn.citations_pass for turn in ok_turns]),
+        worker_presence_pass=_majority_bool([turn.worker_presence_pass for turn in ok_turns]),
+        routing_ms=_average([turn.routing_ms for turn in ok_turns]),
+        search_ms=_average([turn.search_ms for turn in ok_turns]),
+        total_ms=_average([turn.total_ms for turn in ok_turns]),
+        latency_budget_exceeded=_majority_bool([turn.latency_budget_exceeded for turn in ok_turns]),
+        # Config-derived, not outcome-derived -- every repeat runs the same
+        # candidate/scenario config, so this is identical across repeats;
+        # take it from the first rather than voting on it.
+        latency_budget_enforced=turn_repeats[0].latency_budget_enforced,
+    )
+
+
+def _aggregate_cell_repeats(
+    pair_label: str, scenario_name: str, repeats: list[CellOutcome]
+) -> CellOutcome:
+    """Majority-vote ``--repeat`` independent runs of the SAME (pair,
+    scenario) cell -- each a fresh ``run_cell()`` call against a fresh
+    session (see run_matrix) -- into one summary CellOutcome, with the raw
+    per-repetition results attached via ``repeats`` for audit.
+
+    ``len(repeats) == 1`` (the --repeat 1 default) returns that lone
+    CellOutcome unchanged: a strict identity, not just an equivalent
+    aggregation, so the default single-run report shape is byte-for-byte
+    what it was before --repeat existed.
+    """
+    if len(repeats) == 1:
+        return repeats[0]
+
+    statuses: list[CellStatus] = [cell.status for cell in repeats]
+    agg_status = _majority_with_tiebreak(statuses, _CELL_STATUS_TIE_PRIORITY)
+    non_ok = [status for status in statuses if status != "ok"]
+    agg_error = (
+        None
+        if agg_status == "ok"
+        else f"{len(non_ok)}/{len(repeats)} repeats did not complete cleanly: "
+        + ", ".join(sorted(set(non_ok)))
+    )
+
+    # _skipped_turn_outcomes()/run_cell()'s own end-of-function backfill (see
+    # TurnOutcome's status docstring) guarantee every repeat's turns list is
+    # padded to the scenario's full turn count -- but that invariant lives in
+    # run_cell(), not here, so this still degrades gracefully (via a
+    # skipped-turn placeholder) rather than crashing if a future change ever
+    # breaks it.
+    turn_count = max((len(cell.turns or []) for cell in repeats), default=0)
+    agg_turns = [
+        _aggregate_turn_repeats(
+            [cell.turns[i] for cell in repeats if cell.turns and i < len(cell.turns)]
+            or [TurnOutcome(query="", status="skipped")]
+        )
+        for i in range(turn_count)
+    ]
+
+    return CellOutcome(
+        pair_label=pair_label,
+        scenario_name=scenario_name,
+        status=agg_status,
+        error=agg_error,
+        turns=agg_turns,
+        # Config-derived (identical across repeats of the same cell), same
+        # rationale as TurnOutcome.latency_budget_enforced above.
+        router_timeout_seconds=repeats[0].router_timeout_seconds,
+        foreground_search_timeout_seconds=repeats[0].foreground_search_timeout_seconds,
+        repeats=repeats,
+    )
 
 
 def _skipped_turn_outcomes(scenario: Scenario, *, already_run: int) -> list[TurnOutcome]:
@@ -1448,7 +1643,19 @@ async def run_matrix(
     max_routing_seconds: float,
     max_latency_seconds: float,
     manifest_status: ManifestStatus,
+    repeat_count: int = 1,
 ) -> list[CellOutcome]:
+    """Run every (pair, scenario) cell, ``repeat_count`` times each.
+
+    Each repetition is an independent ``run_cell()`` call against a fresh
+    session (``run_cell`` calls ``build_session_for_run()`` itself) -- there
+    is no shared state between repetitions of the same cell, so the only
+    source of a differing result across repeats is the live provider's own
+    non-determinism, which is exactly what --repeat exists to sample.
+    Repeats run sequentially, not concurrently: this is a live paid run, and
+    the existing spend-confirmation gate/cost estimate (matrix_call_accounting)
+    already assumes sequential, worst-case-serial call volume.
+    """
     outcomes: list[CellOutcome] = []
     for pair in pairs:
         for scenario in scenarios:
@@ -1471,7 +1678,7 @@ async def run_matrix(
                     )
                 )
                 continue
-            outcomes.append(
+            repeats = [
                 await run_cell(
                     pair,
                     scenario,
@@ -1480,7 +1687,9 @@ async def run_matrix(
                     max_routing_seconds=max_routing_seconds,
                     max_latency_seconds=max_latency_seconds,
                 )
-            )
+                for _ in range(repeat_count)
+            ]
+            outcomes.append(_aggregate_cell_repeats(pair.label, scenario.name, repeats))
     return outcomes
 
 
@@ -1570,15 +1779,70 @@ def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
     return ("FAIL" if reasons else "PASS"), reasons
 
 
+def _serialize_turn(turn: TurnOutcome) -> dict[str, Any]:
+    return {
+        "query": turn.query,
+        "status": turn.status,
+        "judge_verdict": turn.judge_verdict,
+        "judge_reason": turn.judge_reason,
+        "error": turn.error,
+        "deterministic_action_pass": turn.deterministic_action_pass,
+        "deterministic_action_unevaluated_reason": (turn.deterministic_action_unevaluated_reason),
+        "worker_presence_pass": turn.worker_presence_pass,
+        "citations_pass": turn.citations_pass,
+        "routing_ms": turn.routing_ms,
+        "search_ms": turn.search_ms,
+        "total_ms": turn.total_ms,
+        "latency_budget_exceeded": turn.latency_budget_exceeded,
+        "latency_budget_enforced": turn.latency_budget_enforced,
+    }
+
+
+def _serialize_cell(outcome: CellOutcome) -> dict[str, Any]:
+    """Hoisted out of build_report() so the same turn/cell shape can be
+    reused recursively for ``outcome.repeats`` (--repeat > 1's raw
+    per-repetition results) without duplicating the field list -- a field
+    added to one and not the other would otherwise silently desync the
+    aggregated cell's shape from its own audit trail.
+    """
+    return {
+        "pair": outcome.pair_label,
+        "scenario": outcome.scenario_name,
+        "status": outcome.status,
+        "error": outcome.error,
+        "router_timeout_seconds": outcome.router_timeout_seconds,
+        "foreground_search_timeout_seconds": outcome.foreground_search_timeout_seconds,
+        "turns": [_serialize_turn(turn) for turn in (outcome.turns or [])],
+        "repeats": (
+            None
+            if outcome.repeats is None
+            else [_serialize_cell(repeat) for repeat in outcome.repeats]
+        ),
+    }
+
+
 def build_report(
-    outcomes: list[CellOutcome], *, judge_model: str, call_accounting: CallAccounting | None = None
+    outcomes: list[CellOutcome],
+    *,
+    judge_model: str,
+    call_accounting: CallAccounting | None = None,
+    repeat_count: int = 1,
 ) -> dict[str, Any]:
     overall_status, failure_reasons = compute_pass_fail(outcomes)
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "judge_model": judge_model,
-        "repetition_count_per_cell": 1,
-        "repetition_note": "n=1 per cell -- exploratory/noise-dominated given cost constraints",
+        "repetition_count_per_cell": repeat_count,
+        "repetition_note": (
+            "n=1 per cell -- exploratory/noise-dominated given cost constraints"
+            if repeat_count == 1
+            else (
+                f"n={repeat_count} per cell -- each cell's reported status/verdicts are a "
+                "majority vote across independent repetitions (see each cell's `repeats` "
+                "field for the raw per-repetition results); a tied vote resolves toward the "
+                "failure outcome, not the clean one"
+            )
+        ),
         # Threaded through from main()'s pre-flight matrix_call_accounting()
         # estimate (round 9 gauntlet, Codex P2 finding 3) -- previously only
         # printed to the console, so a caller auditing a persisted report file
@@ -1598,38 +1862,7 @@ def build_report(
                 "estimated_cost_usd": call_accounting.estimated_cost_usd,
             }
         ),
-        "cells": [
-            {
-                "pair": outcome.pair_label,
-                "scenario": outcome.scenario_name,
-                "status": outcome.status,
-                "error": outcome.error,
-                "router_timeout_seconds": outcome.router_timeout_seconds,
-                "foreground_search_timeout_seconds": outcome.foreground_search_timeout_seconds,
-                "turns": [
-                    {
-                        "query": turn.query,
-                        "status": turn.status,
-                        "judge_verdict": turn.judge_verdict,
-                        "judge_reason": turn.judge_reason,
-                        "error": turn.error,
-                        "deterministic_action_pass": turn.deterministic_action_pass,
-                        "deterministic_action_unevaluated_reason": (
-                            turn.deterministic_action_unevaluated_reason
-                        ),
-                        "worker_presence_pass": turn.worker_presence_pass,
-                        "citations_pass": turn.citations_pass,
-                        "routing_ms": turn.routing_ms,
-                        "search_ms": turn.search_ms,
-                        "total_ms": turn.total_ms,
-                        "latency_budget_exceeded": turn.latency_budget_exceeded,
-                        "latency_budget_enforced": turn.latency_budget_enforced,
-                    }
-                    for turn in (outcome.turns or [])
-                ],
-            }
-            for outcome in outcomes
-        ],
+        "cells": [_serialize_cell(outcome) for outcome in outcomes],
     }
     report["overall_status"] = overall_status
     report["failure_reasons"] = failure_reasons
@@ -1771,6 +2004,25 @@ def _finite_positive_float(flag: str) -> Callable[[str], float]:
     return _validate
 
 
+def _positive_int(flag: str) -> Callable[[str], int]:
+    """Build an argparse ``type=`` validator for a positive (>=1) int flag.
+
+    Backs ``--repeat``: 0 would silently run zero cells (not "don't
+    repeat"), and a negative value has no sane interpretation at all.
+    """
+
+    def _validate(raw: str) -> int:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{flag} must be an integer: {raw!r}") from exc
+        if value < 1:
+            raise argparse.ArgumentTypeError(f"{flag} must be at least 1: {raw!r}")
+        return value
+
+    return _validate
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1779,7 +2031,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="print the matrix/cost estimate; make zero live calls",
     )
     parser.add_argument(
-        "--full-matrix", action="store_true", help="run the full router x worker cross product"
+        "--full-matrix",
+        action="store_true",
+        help=(
+            "run the full router x worker cross product, in addition to the default "
+            "one-at-a-time sweep. Given the current architecture (the router never "
+            "influences the worker's request, and the worker's identity never influences "
+            "the routing decision -- see server/pipeline.py's dispatch path), a non-baseline "
+            "x non-baseline cell tests no interaction the one-at-a-time sweep didn't already "
+            "cover; it's a resampling of the same two independent axes under a joint label. "
+            "Use this to confirm two specific already-good candidates work together before "
+            "shipping that pairing, not as the default comparison tool -- prefer --repeat on "
+            "the default sweep for that."
+        ),
+    )
+    parser.add_argument(
+        "--repeat",
+        type=_positive_int("--repeat"),
+        default=1,
+        help=(
+            "run each cell this many times and report a majority-voted pass/fail plus the raw "
+            "per-repetition results (see each report cell's `repeats` field), instead of a "
+            "single noisy sample. The live worker call runs at temperature=1.0 against a live "
+            "search, so a single repetition cannot distinguish a real candidate difference from "
+            "one unlucky/lucky sample."
+        ),
     )
     parser.add_argument("--router", choices=sorted(ROUTER_SELECTABLE_BY_LABEL), default=None)
     parser.add_argument("--worker", choices=sorted(WORKER_SELECTABLE_BY_LABEL), default=None)
@@ -1829,7 +2105,13 @@ def main(argv: list[str] | None = None) -> int:
     manifest_status = load_manifest_status(args.manifest_path)
 
     if args.dry_run:
-        print_matrix_preview(pairs, scenarios, judge_model=args.judge_model, status=manifest_status)
+        print_matrix_preview(
+            pairs,
+            scenarios,
+            judge_model=args.judge_model,
+            status=manifest_status,
+            repeat_count=args.repeat,
+        )
         return 0
 
     candidates = tuple({c for pair in pairs for c in (pair.router, pair.worker)})
@@ -1852,14 +2134,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    accounting = matrix_call_accounting(pairs, scenarios)
+    accounting = matrix_call_accounting(pairs, scenarios, repeat_count=args.repeat)
     # Always shown before a live call is made -- not only when a limit would
     # be exceeded -- per the dev plan's documented contract: "no live call
     # happens without the operator seeing the total call count, cost
     # estimate...". _confirm_spend() itself returns silently when under
     # budget, so without this the operator could start paid cells having
     # never seen the estimate.
-    print_matrix_preview(pairs, scenarios, judge_model=args.judge_model, status=manifest_status)
+    print_matrix_preview(
+        pairs,
+        scenarios,
+        judge_model=args.judge_model,
+        status=manifest_status,
+        repeat_count=args.repeat,
+    )
     if not _confirm_spend(
         accounting, max_calls=args.max_calls, max_cost=args.max_cost, assume_yes=args.yes
     ):
@@ -1874,9 +2162,12 @@ def main(argv: list[str] | None = None) -> int:
             max_routing_seconds=args.max_routing_seconds,
             max_latency_seconds=args.max_latency_seconds,
             manifest_status=manifest_status,
+            repeat_count=args.repeat,
         )
     )
-    report = build_report(outcomes, judge_model=args.judge_model, call_accounting=accounting)
+    report = build_report(
+        outcomes, judge_model=args.judge_model, call_accounting=accounting, repeat_count=args.repeat
+    )
     print_report_summary(report)
     # The aggregate report is always persisted to a file, not only when
     # --out is explicitly passed (round 8 gauntlet, Codex P2 finding 2) --
