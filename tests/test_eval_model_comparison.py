@@ -354,9 +354,15 @@ class TestMatrixBuilding:
 
     def test_default_sweep_is_not_the_full_cross_product(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
-        # baseline x baseline (1) + 2 router candidates x baseline worker (2)
-        # + baseline router x 2 worker candidates (2) == 5, not 3*3==9.
-        assert len(pairs) == 5
+        # baseline x baseline (1) + N router candidates x baseline worker
+        # + baseline router x M worker candidates -- not the (N+1)*(M+1)
+        # full cross product full_matrix_pairs() would produce.
+        expected = 1 + len(eval_runner.ROUTER_CANDIDATES) + len(eval_runner.WORKER_CANDIDATES)
+        assert len(pairs) == expected
+        full_matrix_size = (1 + len(eval_runner.ROUTER_CANDIDATES)) * (
+            1 + len(eval_runner.WORKER_CANDIDATES)
+        )
+        assert len(pairs) < full_matrix_size
 
     def test_default_sweep_contains_baseline_by_baseline(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
@@ -380,9 +386,9 @@ class TestMatrixBuilding:
 
     def test_full_matrix_is_the_full_cross_product(self) -> None:
         pairs = eval_runner.full_matrix_pairs()
-        assert len(pairs) == 3 * 3
         routers = (eval_runner.ROUTER_BASELINE, *eval_runner.ROUTER_CANDIDATES)
         workers = (eval_runner.WORKER_BASELINE, *eval_runner.WORKER_CANDIDATES)
+        assert len(pairs) == len(routers) * len(workers)
         for router in routers:
             for worker in workers:
                 assert eval_runner.RunPair(router, worker) in pairs

@@ -186,6 +186,7 @@ class Candidate:
 ROUTER_BASELINE = Candidate(label="baseline", role="router", model="gpt-5-mini", effort=None)
 ROUTER_CANDIDATES: tuple[Candidate, ...] = (
     Candidate(label="luna-high", role="router", model="gpt-5.6-luna", effort="high"),
+    Candidate(label="luna-medium", role="router", model="gpt-5.6-luna", effort="medium"),
     Candidate(label="terra-low", role="router", model="gpt-5.6-terra", effort="low"),
 )
 
