@@ -222,6 +222,43 @@ def test_operator_models_load_from_toml_and_environment_wins(tmp_path) -> None:
     assert config.resolve_worker_model("deep") == "toml-worker"
 
 
+def test_operator_reasoning_effort_loads_from_toml_and_environment_wins(tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[models]\nrouter_reasoning_effort = "low"\nworker_reasoning_effort = "high"\n'
+    )
+
+    config = load_config(
+        config_file=config_file,
+        env={"WEBSEARCH_ROUTER_REASONING_EFFORT": "xhigh"},
+    )
+
+    assert config.resolve_router_reasoning_effort("fast") == "xhigh"
+    assert config.resolve_worker_reasoning_effort("deep") == "high"
+
+
+def test_toml_reasoning_effort_applies_to_a_toml_configured_model_label(tmp_path) -> None:
+    # The reasoning-effort TOML key must resolve against whatever label the
+    # same load_config() call registered for router_model/worker_model
+    # (via _registered_policy_labels), not a hardcoded "fast"/"deep" guess --
+    # same invariant WEBSEARCH_ROUTER_REASONING_EFFORT's env path already
+    # covers (test_websearch_router_reasoning_effort_env_applies_to_the_
+    # registered_label), mirrored here for the TOML source.
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "[models]\n"
+        'router_model = "toml-router"\n'
+        'router_reasoning_effort = "low"\n'
+        'worker_model = "toml-worker"\n'
+        'worker_reasoning_effort = "medium"\n'
+    )
+
+    config = load_config(config_file=config_file, env={})
+
+    assert config.resolve_router_reasoning_effort("fast") == "low"
+    assert config.resolve_worker_reasoning_effort("deep") == "medium"
+
+
 def test_reasoning_effort_resolver_unknown_model_policy_label_raises_config_error() -> None:
     config = Config(
         router_model_policy={"fast": "verified-router-model"},
@@ -615,8 +652,10 @@ def test_repository_config_contains_the_local_socket_defaults() -> None:
     assert config.tts_provider == "local"
     assert config.smart_turn_timeout_seconds == 5.0
     assert config.smart_turn_complete_grace_seconds == 1.5
-    assert config.resolve_router_model("fast") == "gpt-5-mini"
-    assert config.resolve_worker_model("deep") == "gpt-5"
+    assert config.resolve_router_model("fast") == "gpt-5.6-luna"
+    assert config.resolve_worker_model("deep") == "gpt-5.6-terra"
+    assert config.resolve_router_reasoning_effort("fast") == "medium"
+    assert config.resolve_worker_reasoning_effort("deep") == "medium"
 
 
 def test_environment_endpoint_overrides_toml_socket(tmp_path) -> None:

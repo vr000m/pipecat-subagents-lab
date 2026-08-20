@@ -1079,6 +1079,16 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         values["WEBSEARCH_ROUTER_MODEL"] = models["router_model"]
     if "worker_model" in models:
         values["WEBSEARCH_WORKER_MODEL"] = models["worker_model"]
+    # Mapped through the same WEBSEARCH_ROUTER_REASONING_EFFORT/
+    # WEBSEARCH_WORKER_REASONING_EFFORT keys the env-var path uses (see
+    # load_config()'s handling below) -- this dict is consulted before
+    # env-file/process-env values are merged in, so an explicit env
+    # override still wins over a TOML default, same precedence as
+    # router_model/worker_model above.
+    if "router_reasoning_effort" in models:
+        values["WEBSEARCH_ROUTER_REASONING_EFFORT"] = models["router_reasoning_effort"]
+    if "worker_reasoning_effort" in models:
+        values["WEBSEARCH_WORKER_REASONING_EFFORT"] = models["worker_reasoning_effort"]
     for key in ("tts_ws_uri", "tts_ws_socket", "tts_ws_host", "tts_ws_port"):
         if key in tts:
             values[f"WEBSEARCH_{key.upper()}"] = tts[key]

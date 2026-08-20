@@ -37,8 +37,12 @@ shutdown_grace_seconds = 2.0
 max_citations = 12
 
 [models]
-router_model = "gpt-5-mini"
-worker_model = "gpt-5"
+# Shortlist from the --repeat 3 live comparison (2026-08-20); see
+# docs/dev_plans/artifacts/router-worker-eval-shortlist-2026-08-20.md.
+router_model = "gpt-5.6-luna"
+router_reasoning_effort = "medium"
+worker_model = "gpt-5.6-terra"
+worker_reasoning_effort = "medium"
 
 [features]
 # v0.1.3 feature flags (see README.md); WEBSEARCH_* environment variables
