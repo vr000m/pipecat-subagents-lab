@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report for audit; a coin-flip tie always resolves toward the failing
   outcome. `--repeat 1` reproduces the prior single-run report shape
   exactly.
+- `luna-medium` (`gpt-5.6-luna` at `effort=medium`) as a router candidate in
+  the eval suite's `ROUTER_CANDIDATES` (`scripts/eval_common.py`).
+- `[models].router_reasoning_effort` / `[models].worker_reasoning_effort`
+  TOML keys (`config.toml`), mapped to the existing
+  `WEBSEARCH_ROUTER_REASONING_EFFORT`/`WEBSEARCH_WORKER_REASONING_EFFORT`
+  env-var path so reasoning effort can be set the same way model IDs
+  already are, with env vars still taking precedence over TOML.
 
 ### Fixed
 
@@ -33,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-baseline×non-baseline cells add no comparison signal beyond `--repeat`'s
   resampling — it remains available as an opt-in "confirm two already-good
   candidates pair well together" check, not the default comparison method.
+- `config.toml`'s `[models]` defaults changed to the shortlist from the
+  `--repeat 3` live comparison: router `gpt-5.6-luna`@medium (was
+  `gpt-5-mini`, no reasoning param), worker `gpt-5.6-terra`@medium (was
+  `gpt-5`, no reasoning param). See
+  `docs/dev_plans/artifacts/router-worker-eval-shortlist-2026-08-20.md` for
+  the comparison data. Override via `WEBSEARCH_ROUTER_MODEL`/
+  `WEBSEARCH_WORKER_MODEL`/`WEBSEARCH_ROUTER_REASONING_EFFORT`/
+  `WEBSEARCH_WORKER_REASONING_EFFORT` to keep the prior baseline.
 
 ## [0.1.3] - 2026-08-16
 

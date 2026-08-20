@@ -76,8 +76,10 @@ shutdown_grace_seconds = 2.0
 max_citations = 12
 
 [models]
-router_model = "gpt-5-mini"
-worker_model = "gpt-5"
+router_model = "gpt-5.6-luna"
+router_reasoning_effort = "medium"
+worker_model = "gpt-5.6-terra"
+worker_reasoning_effort = "medium"
 
 [tts]
 provider = "local"
@@ -138,13 +140,18 @@ milliseconds. These two settings are environment-only and have no TOML
 equivalents.
 `WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
 OpenAI model IDs without allowing model output to select an arbitrary model.
-`WEBSEARCH_ROUTER_REASONING_EFFORT` and `WEBSEARCH_WORKER_REASONING_EFFORT`
-override the `reasoning.effort` value sent with router/worker requests
-(validated against the OpenAI SDK's `ReasoningEffort` literal: `none`,
-`minimal`, `low`, `medium`, `high`, `xhigh`, `max`); unset preserves current
-behavior (router keeps its `gpt-5*`-conditional `minimal` default, worker
-omits `reasoning` entirely), while an explicit override applies
-unconditionally regardless of model name.
+Their TOML equivalents are `[models].router_model`/`[models].worker_model`
+(checked-in defaults above reflect the
+`docs/dev_plans/artifacts/router-worker-eval-shortlist-2026-08-20.md`
+comparison). `WEBSEARCH_ROUTER_REASONING_EFFORT` and
+`WEBSEARCH_WORKER_REASONING_EFFORT` override the `reasoning.effort` value
+sent with router/worker requests (validated against the OpenAI SDK's
+`ReasoningEffort` literal: `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`); unset preserves current behavior (router keeps its
+`gpt-5*`-conditional `minimal` default, worker omits `reasoning` entirely),
+while an explicit override applies unconditionally regardless of model name.
+Their TOML equivalents are `[models].router_reasoning_effort`/
+`[models].worker_reasoning_effort`.
 
 The v0.1.3 delivery behaviours are gated by feature flags whose TOML
 equivalents live under `[features]`. `WEBSEARCH_ENABLE_EARLY_ACK`

@@ -73,34 +73,50 @@ one data point, but enough to deprioritize it below `terra-medium`.
   `terra-low` (solid but not better than `luna-medium` on any axis measured),
   `sol-low` (faster than baseline but showed a semantic miss).
 
-## To apply as the new default
+## Applied as the new default (2026-08-21)
 
-No code change required — `server/config.py` already exposes this via
-environment variables (`WEBSEARCH_ROUTER_MODEL`/`WEBSEARCH_WORKER_MODEL` for
-the model, `WEBSEARCH_ROUTER_REASONING_EFFORT`/`WEBSEARCH_WORKER_REASONING_EFFORT`
-for effort):
+`config.toml`'s `[models]` section now ships this shortlist as the
+checked-in non-secret default:
 
-```bash
-WEBSEARCH_ROUTER_MODEL=gpt-5.6-luna
-WEBSEARCH_ROUTER_REASONING_EFFORT=medium
-WEBSEARCH_WORKER_MODEL=gpt-5.6-terra
-WEBSEARCH_WORKER_REASONING_EFFORT=medium
+```toml
+[models]
+router_model = "gpt-5.6-luna"
+router_reasoning_effort = "medium"
+worker_model = "gpt-5.6-terra"
+worker_reasoning_effort = "medium"
 ```
 
-These override `config.toml`'s `[models]` defaults (`router_model =
-"gpt-5-mini"`, `worker_model = "gpt-5"`) without touching the repo's
-checked-in non-secret defaults — set them in the deployment environment
-(or `~/.secrets/ai.env`-style env file for local runs).
+`server/config.py`'s `_load_toml_values` gained `router_reasoning_effort`/
+`worker_reasoning_effort` TOML keys (mapped through the same
+`WEBSEARCH_ROUTER_REASONING_EFFORT`/`WEBSEARCH_WORKER_REASONING_EFFORT`
+env-var path the CLI override already used, matching the existing
+`router_model`/`worker_model` TOML→env pattern) so effort is settable the
+same way model IDs already were — previously effort was env-var-only.
 
-`config.toml`'s `[models]` section has no TOML key for reasoning effort today
-(only the model ID); effort is env-var-only. If this shortlist is adopted
-as the checked-in default rather than an env override, `config.toml`'s
-`[models]` section would need a `router_reasoning_effort`/
-`worker_reasoning_effort` key added (mirroring the existing `router_model`/
-`worker_model` TOML→env mapping in `server/config.py`'s `_load_toml_values`)
-— not yet done, since this shortlist hasn't been confirmed as final.
+Override at deploy time (env vars still win over TOML, same precedence as
+before):
 
-## Caveats before locking this in
+```bash
+WEBSEARCH_ROUTER_MODEL=...
+WEBSEARCH_ROUTER_REASONING_EFFORT=...
+WEBSEARCH_WORKER_MODEL=...
+WEBSEARCH_WORKER_REASONING_EFFORT=...
+```
+
+To revert to the pre-shortlist baseline (`gpt-5-mini`@minimal router,
+`gpt-5`@unset worker), set:
+
+```bash
+WEBSEARCH_ROUTER_MODEL=gpt-5-mini
+WEBSEARCH_ROUTER_REASONING_EFFORT=minimal
+WEBSEARCH_WORKER_MODEL=gpt-5
+```
+
+(there is no baseline worker effort to set — the baseline never sends a
+`reasoning` param at all; leaving `WEBSEARCH_WORKER_REASONING_EFFORT` unset
+after overriding `WEBSEARCH_WORKER_MODEL=gpt-5` reproduces that exactly).
+
+## Caveats (still relevant after applying)
 
 - n=3 per cell. This is enough to wash out the single-sample judge-noise seen
   in earlier full-matrix runs, but is not a large sample — `luna-medium`'s
