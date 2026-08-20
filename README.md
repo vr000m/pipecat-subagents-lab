@@ -519,13 +519,28 @@ Router/worker model evaluation (run in this order):
   candidate and scenario, scoring replies via `pipecat.evals.judge.EvalJudge`
   and producing one aggregate pass/fail + latency report. Supports
   `--dry-run` (zero live calls), `--router`/`--worker`/`--scenario` for a
-  single cheap smoke pair, `--full-matrix` for the full router x worker cross
-  product, `--max-calls`/`--max-cost` spend gates, and
+  single cheap smoke pair, `--max-calls`/`--max-cost` spend gates, and
   `--i-know-the-manifest-is-stale` to proceed against a manifest whose
   recorded source commit no longer matches `HEAD`. Every run's aggregate
   report is always persisted (default: a timestamped file under
   `.review-plan/eval-reports/`; override with `--out`), not only when `--out`
   is passed.
+  - `--repeat N` (default 1) — run each (pair, scenario) cell N times live
+    and majority-vote the results into one summary, with every raw
+    repetition preserved on the report for audit. Live calls run at
+    `temperature=1.0`, so a single sample is noisy; this is the recommended
+    way to get a stable comparison signal for the default sweep. A
+    coin-flip tie always resolves toward the failing outcome, never a
+    silent pass.
+  - `--full-matrix` — opts into the full router x worker cross product
+    instead of the default one-at-a-time sweep (baseline x baseline, each
+    router candidate x baseline worker, baseline router x each worker
+    candidate). The router cannot influence worker output in this codebase
+    (no query/context flows from `RoutingDecision` into the worker
+    dispatch), so the cross product's non-baseline x non-baseline cells add
+    no comparison signal beyond `--repeat`'s resampling of the same
+    one-at-a-time cells — use it only to confirm two already-good
+    candidates work well together, not as the default comparison method.
 
 Phase 4 query-context narrowing experiment (run in this order):
 
