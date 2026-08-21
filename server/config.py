@@ -806,6 +806,42 @@ def _registered_policy_labels(kwargs: dict[str, object], field_name: str) -> tup
     return tuple(default_factory())
 
 
+_ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
+    ("WEBSEARCH_ROUTER_MODEL", "WEBSEARCH_ROUTER_REASONING_EFFORT"),
+    ("WEBSEARCH_WORKER_MODEL", "WEBSEARCH_WORKER_REASONING_EFFORT"),
+)
+_PROVENANCE_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
+
+
+def _effectively_set(value: object) -> bool:
+    """Match the truthiness-walrus consumers at ``load_config``'s model/effort
+    override block -- an explicitly empty override reads as "absent" there,
+    so it must not count as provenance here either."""
+    return value is not None and str(value).strip() != ""
+
+
+def _record_layer(values: Mapping[str, object], layers: dict[str, int], layer: int) -> None:
+    for key in _PROVENANCE_KEYS:
+        if key in values and _effectively_set(values[key]):
+            layers[key] = layer
+
+
+def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[str, int]) -> None:
+    """Drop a lower-precedence-layer reasoning effort when a HIGHER-precedence
+    layer overrode only that role's model.
+
+    Without this, ``WEBSEARCH_WORKER_MODEL=gpt-5`` (the documented revert-to-
+    baseline recipe) still inherited config.toml's ``worker_reasoning_effort =
+    "medium"``, so the "baseline" request carried a ``reasoning`` param the
+    real baseline never sends.
+    """
+    for model_key, effort_key in _ROLE_MODEL_EFFORT_KEYS:
+        if effort_key not in values:
+            continue
+        if layers.get(model_key, -1) > layers.get(effort_key, -1):
+            del values[effort_key]
+
+
 def _parse_strict_bool(raw: object, *, field: str) -> bool:
     if isinstance(raw, bool):
         return raw
@@ -837,15 +873,26 @@ def load_config(
             except tomllib.TOMLDecodeError as exc:
                 raise ConfigError(f"invalid TOML config: {path}") from exc
     _load_toml_values(values, toml_values)
+    layers: dict[str, int] = {}
+    _record_layer(values, layers, 0)
     if env_file:
         if isinstance(env_file, (str, Path)):
+            env_file_values: dict[str, object] = {}
             for line in Path(env_file).read_text().splitlines():
                 if line.strip() and not line.lstrip().startswith("#") and "=" in line:
                     key, value = line.split("=", 1)
-                    values[key.strip()] = value.strip().strip("\"'")
+                    env_file_values[key.strip()] = value.strip().strip("\"'")
         else:
-            values.update(env_file)
-    values.update(os.environ if env is None else env)
+            env_file_values = dict(env_file)
+        values.update(env_file_values)
+        _record_layer(env_file_values, layers, 1)
+    env_values = os.environ if env is None else env
+    values.update(env_values)
+    _record_layer(env_values, layers, 2)
+    # Overriding only a role's *model* at a higher-precedence layer than the
+    # one that set its *effort* must not silently carry that inherited
+    # effort along -- see _clear_inherited_reasoning_effort's docstring.
+    _clear_inherited_reasoning_effort(values, layers)
     kwargs: dict[str, object] = {}
     key_name = values.get("WEBSEARCH_OPENAI_API_KEY_ENV", "OPENAI_API_KEY")
     if key := values.get("WEBSEARCH_OPENAI_API_KEY") or values.get(key_name):
@@ -968,6 +1015,12 @@ def load_config(
     # (`"X" in values`), which treated an explicitly-empty override as a
     # request to hard-fail config validation instead of "absent" (round 7
     # gauntlet finding 7).
+    #
+    # If a higher-precedence layer overrode only this role's model,
+    # _clear_inherited_reasoning_effort() already deleted this role's effort
+    # key from `values` above, so `values.get(...)` here correctly sees it as
+    # absent instead of inheriting a lower-layer default (round 10 gauntlet
+    # finding 2).
     #
     # Applied to whatever label(s) are actually registered in the
     # corresponding model policy (kwargs["*_model_policy"] if this same

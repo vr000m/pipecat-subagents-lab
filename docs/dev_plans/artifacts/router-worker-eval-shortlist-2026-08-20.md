@@ -112,9 +112,14 @@ WEBSEARCH_ROUTER_REASONING_EFFORT=minimal
 WEBSEARCH_WORKER_MODEL=gpt-5
 ```
 
-(there is no baseline worker effort to set — the baseline never sends a
-`reasoning` param at all; leaving `WEBSEARCH_WORKER_REASONING_EFFORT` unset
-after overriding `WEBSEARCH_WORKER_MODEL=gpt-5` reproduces that exactly).
+Overriding a role's *model* at a higher-precedence layer than the one that
+supplied its *reasoning effort* clears that inherited effort for that role:
+`WEBSEARCH_WORKER_MODEL=gpt-5` alone drops `config.toml`'s
+`[models].worker_reasoning_effort = "medium"`, so the baseline worker sends
+no `reasoning` param at all — exactly the baseline's request shape. Setting
+both keys at the same layer keeps both (the router line above is therefore
+still required to pin `minimal`, since `gpt-5-mini` would otherwise fall back
+to the router's own `gpt-5*` → `minimal` default rather than to nothing).
 
 ## Caveats (still relevant after applying)
 

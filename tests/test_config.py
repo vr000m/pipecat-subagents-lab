@@ -1843,3 +1843,83 @@ def test_load_promotion_manifest_refuses_a_symlinked_phase4c_artifact_path(
     assert verdict.promotion_eligible is False
     assert verdict.reason == "phase4c_unresolvable"
     assert target.read_text(encoding="utf-8") == "do not touch"
+
+
+# --- Round 10 gauntlet finding 2: auto-clear inherited effort on a --------
+# model-only override at a higher-precedence layer.
+
+
+class TestReasoningEffortInheritance:
+    def test_env_model_override_clears_toml_effort(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5"\nworker_reasoning_effort = "medium"\n'
+            'router_model = "gpt-5-mini"\nrouter_reasoning_effort = "minimal"\n'
+        )
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "gpt-5"})
+
+        assert config.worker_reasoning_effort_policy == {}
+        assert config.resolve_worker_reasoning_effort("deep") is None
+        # The router pair is untouched by the worker-only override.
+        assert config.router_reasoning_effort_policy == {"fast": "minimal"}
+
+    def test_same_layer_model_and_effort_both_apply(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[models]\nworker_model = "gpt-5"\n')
+
+        config = load_config(
+            config_file=config_file,
+            env={
+                "WEBSEARCH_WORKER_MODEL": "gpt-5.1",
+                "WEBSEARCH_WORKER_REASONING_EFFORT": "high",
+            },
+        )
+
+        assert config.resolve_worker_reasoning_effort("deep") == "high"
+
+    def test_effort_only_override_applies_over_toml_model(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[models]\nworker_model = "gpt-5"\n')
+
+        config = load_config(
+            config_file=config_file, env={"WEBSEARCH_WORKER_REASONING_EFFORT": "low"}
+        )
+
+        assert config.resolve_worker_reasoning_effort("deep") == "low"
+
+    def test_env_file_model_override_clears_toml_effort(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(
+            config_file=config_file,
+            env_file={"WEBSEARCH_WORKER_MODEL": "gpt-5.1"},
+            env={},
+        )
+
+        assert config.resolve_worker_reasoning_effort("deep") is None
+
+    def test_explicitly_empty_model_override_does_not_clear_toml_effort(
+        self, tmp_path: Path
+    ) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": ""})
+
+        assert config.resolve_worker_reasoning_effort("deep") == "medium"
+
+    def test_no_overrides_toml_pair_applies_unchanged(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(config_file=config_file, env={})
+
+        assert config.resolve_worker_reasoning_effort("deep") == "medium"

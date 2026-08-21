@@ -150,6 +150,9 @@ sent with router/worker requests (validated against the OpenAI SDK's
 `xhigh`, `max`); unset preserves current behavior (router keeps its
 `gpt-5*`-conditional `minimal` default, worker omits `reasoning` entirely),
 while an explicit override applies unconditionally regardless of model name.
+Overriding only a role's model at a higher-precedence layer than the one that
+set its effort clears that inherited effort, so an env-only model override
+does not silently keep a TOML effort default.
 Their TOML equivalents are `[models].router_reasoning_effort`/
 `[models].worker_reasoning_effort`.
 
