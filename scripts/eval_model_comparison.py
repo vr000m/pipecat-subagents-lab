@@ -1200,8 +1200,17 @@ def _aggregate_turn_repeats(
         _majority_with_tiebreak(verdicts, _JUDGE_VERDICT_TIE_PRIORITY, "yes") if verdicts else None
     )
     reason_bits = [turn.judge_reason for turn in ok_turns if turn.judge_reason]
+    # Round 7 F10: this denominator (len(verdicts), judged repeats only)
+    # deliberately differs from agg_error's below (len(turn_repeats), ALL
+    # repeats) -- the vote genuinely only ran over the repeats that reached
+    # a judge verdict, so switching to len(turn_repeats) here would misreport
+    # the judge's actual agreement rate as if non-judged repeats had a "no"
+    # vote. Both denominators are numerically honest for what they count;
+    # naming both in the rendered string (rather than leaving the smaller,
+    # unlabeled one to be misread as "of all repeats") is the fix.
     agg_reason = (
-        f"{sum(1 for v in verdicts if v == 'yes')}/{len(verdicts)} repeats judged yes"
+        f"{sum(1 for v in verdicts if v == 'yes')}/{len(verdicts)} judged repeats "
+        f"(of {len(turn_repeats)}) judged yes"
         + (f"; reasons: {' | '.join(reason_bits)}" if reason_bits else "")
         if verdicts
         else None

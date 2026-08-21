@@ -1310,6 +1310,30 @@ class TestCleanOutcomeRequiresStrictMajority:
         overall_status, _reasons = eval_runner.compute_pass_fail([aggregated_cell])
         assert overall_status == "FAIL"
 
+    def test_agg_reason_names_both_the_judged_and_total_repeat_denominators(self) -> None:
+        """Round 7 F10: agg_reason's denominator (len(verdicts), judged
+        repeats only) deliberately differs from agg_error's sibling
+        denominator (len(turn_repeats), ALL repeats) -- one provider-error
+        repeat among 3 means only 2 repeats reached a judge verdict. The
+        unlabeled 2 in the old "1/2 repeats judged yes" string was easy to
+        misread as "1/2 of all repeats", when it actually meant "1/2 of the
+        2 that were judged, out of 3 total". Both denominators must now be
+        visible in the rendered string.
+        """
+        turn_repeats = [
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="yes"),
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="no"),
+            eval_runner.TurnOutcome(query="q", status="provider-error"),
+        ]
+        aggregated_turn = eval_runner._aggregate_turn_repeats(
+            turn_repeats,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated_turn.judge_reason is not None
+        assert "of 3" in aggregated_turn.judge_reason
+        assert "1/2" in aggregated_turn.judge_reason
+
 
 class TestTieBreakPrioritiesCoverTheirLiteralVocabulary:
     """Round 5 restart2, Logic L3: _majority_with_tiebreak()'s fallback loop
