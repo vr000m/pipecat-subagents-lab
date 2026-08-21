@@ -1162,6 +1162,26 @@ class TestShippedConfigCellsAnnotationMarksUnmatchedRoles:
         eval_runner.print_report_summary(report)
         assert "WARNING" in capsys.readouterr().err
 
+    def test_a_targeted_single_pair_run_does_not_mark_a_registered_role_unmatched(self) -> None:
+        """Round 9, Codex F1: `--router`/`--worker` returns ONE RunPair, so a
+        shipped role that IS registered can legitimately have no cell in
+        this run. Empty `cells` must not be reported as `unmatched_roles` (a
+        registry gap) -- that would conflate "not part of this targeted
+        run" with "not in the registry at all"."""
+        pair = eval_runner.RunPair(
+            router=eval_runner.ROUTER_SELECTABLE_BY_LABEL["terra-low"],
+            worker=eval_runner.WORKER_SELECTABLE_BY_LABEL["baseline"],
+        )
+        outcomes = [eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")]
+        shipped = eval_common.shipped_candidates()
+
+        annotation = eval_runner._shipped_config_cells_annotation(outcomes, shipped, (pair,))
+
+        assert "unmatched_roles" not in annotation
+        assert annotation["router"]["cells"] == []
+        assert annotation["worker"]["cells"] == []
+        assert "no registered eval candidate covers" not in annotation["note"]
+
 
 # ---------------------------------------------------------------------------
 # --repeat: majority-vote aggregation across independent repetitions.
@@ -1360,6 +1380,20 @@ class TestTieBreakPrioritiesCoverTheirLiteralVocabulary:
         assert set(priority) == set(get_args(literal))
         assert len(priority) == len(set(priority))  # no duplicate ranks
 
+    def test_cell_and_turn_tie_priorities_agree_on_shared_statuses(self) -> None:
+        """Round 9 gauntlet, Logic F13: a cell's status is DERIVED from its
+        turns' statuses, so `_CELL_STATUS_TIE_PRIORITY` must agree with
+        `_TURN_STATUS_TIE_PRIORITY` on the relative order of every status
+        they share -- previously `timeout` and `provider-error` were
+        swapped between the two, letting a cell report `timeout` on an
+        exact tie while its own turns reported `provider-error`."""
+        shared = set(eval_runner._CELL_STATUS_TIE_PRIORITY) & set(
+            eval_runner._TURN_STATUS_TIE_PRIORITY
+        )
+        cell_order = [s for s in eval_runner._CELL_STATUS_TIE_PRIORITY if s in shared]
+        turn_order = [s for s in eval_runner._TURN_STATUS_TIE_PRIORITY if s in shared]
+        assert cell_order == turn_order
+
 
 class TestAggregateCellRepeats:
     """_aggregate_cell_repeats() majority-votes N independent run_cell()
@@ -1429,6 +1463,40 @@ class TestAggregateCellRepeats:
         aggregated = self._aggregate(cells)
         assert aggregated.turns is not None
         assert aggregated.turns[0].judge_verdict == "no"
+
+    def test_a_partially_short_repeat_is_padded_not_returned_verbatim(self) -> None:
+        """Round 9 gauntlet, Logic F14: the padding invariant that keeps
+        every repeat's `turns` list the same length lives in run_cell(), not
+        here. This test deliberately violates it (one repeat's `turns` is
+        shorter than the others') to exercise the degrade path directly.
+        Unreachable under today's run_cell() invariant -- exists to keep the
+        documented degrade contract honest if that invariant ever breaks.
+
+        Before the fix, index 2's turn_repeats list came out as length 1
+        (only the two full-length cells contributed; the short cell was
+        skipped entirely rather than padded), and
+        `_aggregate_turn_repeats`'s `len == 1` identity shortcut returned
+        that lone turn VERBATIM -- a raw single repeat masquerading as an
+        N-repeat majority-voted summary, with no error and no marker. After
+        the fix, index 2 gets a skipped placeholder for the short cell, so
+        the list is full-width (length 3) and goes through the real
+        aggregation path instead.
+        """
+        full_a = self._cell(turns=[self._turn(), self._turn(), self._turn(query="q2")])
+        full_b = self._cell(turns=[self._turn(), self._turn(), self._turn(query="q2")])
+        short_c = self._cell(turns=[self._turn(), self._turn()])  # missing index 2
+
+        aggregated = self._aggregate([full_a, full_b, short_c])
+
+        assert aggregated.turns is not None
+        assert len(aggregated.turns) == 3
+        third = aggregated.turns[2]
+        # The verbatim-passthrough path (pre-fix) would have no `error` and
+        # no way to distinguish it from a genuine single-repeat aggregate.
+        # The real aggregation path names the padded-in failure explicitly.
+        assert third.error is not None
+        assert "1/3 repeats failed" in third.error
+        assert "skipped" in third.error
 
     def test_majority_ok_status_reports_ok(self) -> None:
         cells = [self._cell(status="ok"), self._cell(status="ok"), self._cell(status="timeout")]
@@ -3336,6 +3404,78 @@ class TestMissingTurnMetricsIsNotSilentlySwallowed:
         assert outcome.turns[0].status == "ok"
         assert outcome.turns[0].routing_ms is None
         assert outcome.turns[0].latency_budget_enforced is False
+
+
+class TestLatencyBudgetPredicateUsesPublishedRoundedValues:
+    """Round 9 gauntlet, Logic F12: run_cell() stored `round(stage_metrics[
+    ...], 1)` into the outcome but fed the RAW stage_metrics floats to
+    `_latency_budget_exceeded`, while `_aggregate_turn_repeats` recomputes
+    from the already-rounded stored means. At the exact boundary the two
+    paths could disagree by up to 0.05ms -- a persisted report could show
+    `routing_ms` at exactly the budget beside a contradictory
+    `latency_budget_exceeded=True`. Fixed by rounding once in run_cell()
+    and feeding the SAME rounded values to both the outcome and the
+    predicate."""
+
+    def test_a_raw_value_just_inside_the_rounding_window_does_not_exceed_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        def _stage_metrics(_sink: Any, _elapsed_ms: float, _turn_id: str) -> dict[str, float]:
+            # Raw routing_ms is strictly ABOVE the 1000.0ms budget
+            # (max_routing_seconds=1.0), but rounds DOWN to exactly 1000.0 --
+            # the published value must be what the predicate is judged
+            # against, not the raw one.
+            return {"routing_ms": 1000.04, "search_ms": 0.0, "total_ms": 1000.04}
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=1.0,
+                max_latency_seconds=60.0,
+            )
+        )
+
+        turn = outcome.turns[0]
+        assert turn.routing_ms == 1000.0
+        # The published (rounded) routing_ms is exactly the budget, not
+        # above it -- must not be reported as exceeded.
+        assert turn.latency_budget_exceeded is False
+
+        # The self-consistency invariant that matters: recomputing the
+        # predicate directly from the outcome's own published fields must
+        # reproduce the outcome's own verdict. This is what
+        # `_latency_budget_exceeded`'s "must stay identical" docstring
+        # contract promises.
+        assert (
+            eval_runner._latency_budget_exceeded(
+                turn.routing_ms,
+                turn.total_ms,
+                max_routing_seconds=1.0,
+                max_latency_seconds=60.0,
+            )
+            == turn.latency_budget_exceeded
+        )
 
 
 class TestMissingMetricsDoesNotAbortTheCell:

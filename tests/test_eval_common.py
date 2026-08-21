@@ -338,6 +338,20 @@ class TestShippedConfigHasAnEvalCandidateCell:
     silently name nothing rather than loudly erroring (see
     tests/test_eval_model_comparison.py's TestDefaultSweepAnchorsOnShippedConfig
     for the annotation's own coverage).
+
+    Round 9 gauntlet, Architecture F4 -- considered and declined: this test
+    makes CI go red on a config.toml router/worker change unless
+    ROUTER_CANDIDATES/WORKER_CANDIDATES (eval_common.py) is updated to match,
+    which inverts the usual "eval tooling depends on production config"
+    direction. That coupling is the INTENDED tripwire, not an accidental
+    inversion -- shipping a production router/worker the comparison matrix
+    cannot measure is exactly the condition this test exists to make loud.
+    Now that F1 (round 9) makes `unmatched_roles` a true registry-gap
+    detector rather than an inference from this run's `pairs`, a later round
+    may choose to demote this to a runner pre-flight warning instead of a
+    repo-wide failing test -- but that would be a deliberate loosening of a
+    CI guard, not a cleanup, and should be a decision made on its own merits
+    rather than folded into an unrelated round.
     """
 
     def test_shipped_router_and_worker_models_have_a_candidate_cell(self) -> None:

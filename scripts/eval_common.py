@@ -59,6 +59,7 @@ __all__ = [
     "DEFAULT_JUDGE_MODEL",
     "DEFAULT_MANIFEST_RELATIVE_PATH",
     "JUDGE_MAX_TOKENS",
+    "JUDGE_PROBE_MAX_TOKENS",
     "MANIFEST_VERSION",
     "REPO_ROOT",
     "ROUTER_BASELINE",
@@ -78,6 +79,7 @@ __all__ = [
     "effective_effort_for_manifest_lookup",
     "error_text",
     "git_head",
+    "is_registered_candidate",
     "judge_extra_kwargs",
     "latest_turn_stage_metrics",
     "sanitize_reason",
@@ -216,6 +218,24 @@ WORKER_CANDIDATES: tuple[Candidate, ...] = (
 )
 
 
+def is_registered_candidate(candidate: Candidate, registry: tuple[Candidate, ...]) -> bool:
+    """Whether any registered eval candidate is wire-identical to
+    ``candidate`` -- same (model, effective effort) key ``_registered_label``
+    matches on, exposed on its own so a caller that only needs the yes/no
+    registry question (not a label) doesn't have to string-compare against
+    the ``"shipped"`` sentinel.
+
+    Deliberately a registry predicate, not a ``candidate.label == "shipped"``
+    check: ``"shipped"`` is ``shipped_candidates()``'s own labelling
+    convention via ``_registered_label`` below, and this function must answer
+    the registry question for any ``Candidate`` handed to it -- including
+    hand-built ones in tests that never went through ``shipped_candidates()``
+    at all (round 9 gauntlet, Codex F1).
+    """
+    key = (candidate.model, effective_effort_for_manifest_lookup(candidate))
+    return any((c.model, effective_effort_for_manifest_lookup(c)) == key for c in registry)
+
+
 def _registered_label(candidate: Candidate, registry: tuple[Candidate, ...]) -> str:
     """The label of the registered eval candidate that is wire-identical to
     ``candidate``, or ``"shipped"`` if none is.
@@ -238,12 +258,11 @@ def _registered_label(candidate: Candidate, registry: tuple[Candidate, ...]) -> 
     should not re-raise this as a new finding (round 6 gauntlet,
     Architecture A4).
     """
+    if not is_registered_candidate(candidate, registry):
+        return "shipped"
     key = (candidate.model, effective_effort_for_manifest_lookup(candidate))
-    match = next(
-        (c for c in registry if (c.model, effective_effort_for_manifest_lookup(c)) == key),
-        None,
-    )
-    return match.label if match is not None else "shipped"
+    match = next(c for c in registry if (c.model, effective_effort_for_manifest_lookup(c)) == key)
+    return match.label
 
 
 def shipped_candidates(config_file: Path | None = None) -> tuple[Candidate, Candidate]:
@@ -422,6 +441,21 @@ def build_session_for_run(
 # build_judge_request_kwargs()'s default, so the two cannot drift (round 10
 # gauntlet, Logic finding 3).
 JUDGE_MAX_TOKENS = 500
+
+# The probe budget, deliberately NOT JUDGE_MAX_TOKENS: verify_eval_candidates.py's
+# judge probe (`_judge_kwargs`) is an existence/credential check, not a verdict
+# call. It was 16 until the round-10 gauntlet's judge-shape unification fix
+# made the probe start sending ``reasoning_effort`` (previously omitted --
+# that omission was the bug), and a live manifest-regeneration run then showed
+# 16 is too tight even at ``minimal`` effort: gpt-5-mini returned a 400 ("max_
+# tokens or model output limit was reached") because minimal-effort reasoning
+# still consumes some of the completion-token budget before any output token
+# is emitted. 32 verified live to pass with 0 reasoning tokens spent -- still
+# a small fraction of JUDGE_MAX_TOKENS (500). Named as its own constant (round
+# 9 gauntlet, Logic F6) so the bare `32` at its one call site doesn't read as
+# an accidental violation of the constant it imports -- the two budgets are
+# intentionally distinct and must stay so.
+JUDGE_PROBE_MAX_TOKENS = 32
 
 
 def judge_extra_kwargs(model: str) -> dict[str, Any]:

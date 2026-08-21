@@ -61,6 +61,7 @@ from scripts.eval_common import (
     effective_effort_for_manifest_lookup,
     error_text,
     git_head,
+    is_registered_candidate,
     judge_extra_kwargs,
     latest_turn_stage_metrics,
     sanitize_reason,
@@ -1067,6 +1068,44 @@ class CellOutcome:
     # Depth-1: entries here are always raw per-repetition results and never
     # themselves carry `repeats` -- enforced in _aggregate_cell_repeats
     # (round 10 gauntlet, Logic finding 10).
+    #
+    # Round 9 gauntlet, Architecture F2 -- considered and declined: this
+    # field discriminates "raw single-run result" vs "majority-voted
+    # aggregate" at runtime via `repeats is not None`, and several functions
+    # (`_aggregate_cell_repeats`, `compute_pass_fail`, `_serialize_cell`)
+    # branch on that same flag. The finding proposed wrapping instead of
+    # discriminating: `AggregatedCell(summary: CellOutcome, repeats:
+    # list[CellOutcome])` returned by `_aggregate_cell_repeats`, with
+    # `CellOutcome.repeats` removed. Declined for three reasons, in order of
+    # weight:
+    #   1. The wrapper does not remove the ambiguity, it relocates it one
+    #      level down. TurnOutcome's own docstring names `CellOutcome.repeats`
+    #      as the discriminator for whether a turn's latency fields are a
+    #      single measurement or a mean ("non-None means every latency field
+    #      on this record's turns is a mean"). Deleting that field leaves a
+    #      TurnOutcome reached through `AggregatedCell.summary.turns` with NO
+    #      reachable marker at all -- and the same docstring records that the
+    #      obvious replacement (`*_mean` fields) was already rejected because
+    #      it would change `_serialize_turn`'s schema and invalidate the
+    #      committed eval-report JSONs the shortlist artifact cites as
+    #      evidence. Trading one documented dual identity for an undocumented
+    #      one, whose natural fix is a previously-rejected schema break, is
+    #      not an improvement worth taking blind.
+    #   2. There is no live incorrect-behaviour bug this fixes: the illegal
+    #      depth-2 state is already prevented at its one entry point (the
+    #      `raise ValueError` in `_aggregate_cell_repeats`, with an existing
+    #      test), and round 7 F8 already made `compute_pass_fail`
+    #      non-recursive, so nesting is verdict-inert by construction. What
+    #      remains is a type-safety/readability concern, not a correctness
+    #      one.
+    #   3. Blast radius: `CellOutcome` is `compute_pass_fail`'s parameter
+    #      type, with roughly fifteen call sites in
+    #      tests/test_eval_model_comparison.py alone, plus `build_report`,
+    #      `run_matrix`, `_cell_failure_reasons`, `_serialize_cell`'s
+    #      recursion, and `_never_ran_cell` -- a structural fix here, this
+    #      late in the loop, is disproportionate for zero observable
+    #      behavioural gain.
+    # A later round should not re-raise this as new.
     repeats: list[CellOutcome] | None = None
 
 
@@ -1078,9 +1117,20 @@ class CellOutcome:
 # STRICT majority, not just a plurality -- anything less resolves to the
 # worst observed non-clean value in this priority order (round-4 restart,
 # Codex P2).
+# INVARIANT: the two tuples below must agree on the relative order of every
+# status they share -- a cell's status is DERIVED from its turns' statuses
+# inside run_cell() (e.g. the turn-level provider-error path sets
+# `cell_status, cell_error = "provider-error", outcome.error`), so the cell
+# tuple mirrors the turn tuple rather than defining its own order. They
+# previously disagreed on `timeout` vs `provider-error` (a transcription
+# slip, not intentional) -- on an exact tie that let a cell report `timeout`
+# while its own turns reported `provider-error`, a self-contradictory
+# artifact. `manifest-rejected` (cell-only) and `skipped` (turn-only) have no
+# counterpart to disagree with and are unaffected (round 9 gauntlet, Logic
+# F13).
 _CELL_STATUS_TIE_PRIORITY: tuple[CellStatus, ...] = (
-    "timeout",
     "provider-error",
+    "timeout",
     "setup-error",
     "turn-error",
     "manifest-rejected",
@@ -1176,6 +1226,11 @@ def _latency_budget_exceeded(
     check and _aggregate_turn_repeats()' recomputation from the aggregated
     means: both must stay identical or the aggregate would contradict the
     per-repeat values it summarises (round 10 gauntlet, Logic finding 6).
+    Both call sites pass ROUNDED (published, 1-decimal) values, never raw
+    stage-metric floats -- run_cell() rounds before calling this, not after,
+    so the predicate's verdict always matches the routing_ms/total_ms a
+    reader of the persisted report can actually see (round 9 gauntlet, Logic
+    F12).
     """
     if routing_ms is None and total_ms is None:
         return None
@@ -1379,12 +1434,26 @@ def _aggregate_cell_repeats(
     # padded to the scenario's full turn count -- but that invariant lives in
     # run_cell(), not here, so this still degrades gracefully (via a
     # skipped-turn placeholder) rather than crashing if a future change ever
-    # breaks it.
+    # breaks it. The pad below is per-repeat, not per-index: each index `i`
+    # always contributes exactly `len(repeats)` entries to
+    # `_aggregate_turn_repeats`, one placeholder per repeat that came up
+    # short at that index. Padding only the empty case (the old `or [...]`
+    # form) left `_aggregate_turn_repeats`'s `len(turn_repeats) == 1` identity
+    # shortcut reachable whenever the padding invariant broke PARTIALLY --
+    # some repeats short, not all -- returning that one surviving repeat's
+    # raw values verbatim as if it were an N-repeat majority-voted summary,
+    # with no error and no marker. Per-repeat padding means the shortcut can
+    # only fire for a genuine ``--repeat 1`` run (round 9 gauntlet, Logic
+    # F14).
     turn_count = max((len(cell.turns or []) for cell in repeats), default=0)
     agg_turns = [
         _aggregate_turn_repeats(
-            [cell.turns[i] for cell in repeats if cell.turns and i < len(cell.turns)]
-            or [TurnOutcome(query="", status="skipped")],
+            [
+                cell.turns[i]
+                if cell.turns and i < len(cell.turns)
+                else TurnOutcome(query="", status="skipped")
+                for cell in repeats
+            ],
             max_routing_seconds=max_routing_seconds,
             max_latency_seconds=max_latency_seconds,
         )
@@ -1893,13 +1962,29 @@ async def run_cell(
                     continue
                 stage_metrics = None
             if stage_metrics is not None:
-                outcome.routing_ms = round(stage_metrics["routing_ms"], 1)
-                outcome.search_ms = round(stage_metrics["search_ms"], 1)
-                outcome.total_ms = round(stage_metrics["total_ms"], 1)
+                # Bind the rounded (published) values once and feed the SAME
+                # values to both the outcome fields and the predicate -- not
+                # the raw stage_metrics floats. _latency_budget_exceeded's
+                # docstring documents a shared-predicate contract with
+                # _aggregate_turn_repeats' recomputation, which reads from
+                # already-rounded stored means; feeding it raw floats here
+                # let the two paths disagree by up to 0.05ms at the exact
+                # boundary, so a persisted report could show routing_ms at
+                # exactly the budget beside a contradictory
+                # latency_budget_exceeded. This also makes the predicate
+                # re-derivable by a reader of the persisted report from the
+                # routing_ms/total_ms they can actually see (round 9
+                # gauntlet, Logic F12).
+                routing_ms = round(stage_metrics["routing_ms"], 1)
+                search_ms = round(stage_metrics["search_ms"], 1)
+                total_ms = round(stage_metrics["total_ms"], 1)
+                outcome.routing_ms = routing_ms
+                outcome.search_ms = search_ms
+                outcome.total_ms = total_ms
                 outcome.latency_budget_enforced = pair.enforce_latency_budget
                 outcome.latency_budget_exceeded = _latency_budget_exceeded(
-                    stage_metrics["routing_ms"],
-                    stage_metrics["total_ms"],
+                    routing_ms,
+                    total_ms,
                     max_routing_seconds=max_routing_seconds,
                     max_latency_seconds=max_latency_seconds,
                 )
@@ -2400,22 +2485,34 @@ def _shipped_config_cells_annotation(
     # config.toml ships a (model, effort) no registered eval candidate covers
     # -- deliberately absent from *_SELECTABLE_BY_LABEL (see its docstring, and
     # the "sentinel rename: decline" note in round 6's fix record). In that
-    # state neither `router_key`/`worker_key` ever matches any pair here, so
-    # `router_cells`/`worker_cells` come back empty with no error and no
-    # marker -- while default_sweep_pairs()'s docstring and the README both
-    # tell the operator to "run --router <shipped-label> --worker
-    # <shipped-label> explicitly", which is unexecutable because no such
-    # selector key exists. `unmatched_roles` makes that degraded state visible
-    # in the persisted artifact instead of silently shipping an empty `cells`
-    # list an operator would misread as "config.toml's role isn't covered by
-    # any sweep pair" rather than "no candidate registers this role at all."
-    # This is a config/registry GAP, not a caller bug -- unlike build_report's
-    # ValueError degrade path (G3), it must not raise and must not flip
-    # overall_status: failing an otherwise-good paid run over one less-useful
-    # annotation would be disproportionate. Keep these two severities distinct
-    # (round 6 gauntlet, Architecture A4).
+    # state, default_sweep_pairs()'s docstring and the README both tell the
+    # operator to "run --router <shipped-label> --worker <shipped-label>
+    # explicitly", which is unexecutable because no such selector key exists.
+    # `unmatched_roles` makes that degraded state visible in the persisted
+    # artifact. This is a config/registry GAP, not a caller bug -- unlike
+    # build_report's ValueError degrade path (G3), it must not raise and must
+    # not flip overall_status: failing an otherwise-good paid run over one
+    # less-useful annotation would be disproportionate. Keep these two
+    # severities distinct (round 6 gauntlet, Architecture A4).
+    #
+    # `unmatched_roles` is read directly from the candidate registry
+    # (`is_registered_candidate`), NOT inferred from whether `router_cells`/
+    # `worker_cells` came back empty. Those two only coincide when `pairs`
+    # spans the whole registry (default_sweep_pairs()/full_matrix_pairs()).
+    # `_resolve_pairs` returns a single `RunPair` for a targeted
+    # `--router`/`--worker` run, where "no cell in this run" is the normal
+    # case for a shipped role that IS registered -- it just isn't part of
+    # this particular pair. The old pairs-scan inference conflated "not part
+    # of this run" with "not in the registry at all", misreporting a
+    # perfectly healthy targeted run as a registry gap (round 9 gauntlet,
+    # Codex F1).
     unmatched = [
-        role for role, cells in (("router", router_cells), ("worker", worker_cells)) if not cells
+        role
+        for role, candidate, registry in (
+            ("router", shipped_router, (ROUTER_BASELINE, *ROUTER_CANDIDATES)),
+            ("worker", shipped_worker, (WORKER_BASELINE, *WORKER_CANDIDATES)),
+        )
+        if not is_registered_candidate(candidate, registry)
     ]
     if unmatched:
         result["unmatched_roles"] = unmatched
@@ -2562,6 +2659,19 @@ def print_report_summary(report: dict[str, Any]) -> None:
     residual bug here can no longer cost the run its persisted report
     (round 8 gauntlet, Logic finding 1). This function must still never
     raise -- a crash here is still a bug, just no longer a data-loss bug.
+
+    Round 9 gauntlet, Architecture F7 -- considered and declined: this
+    function consumes the already-serialized ``report`` dict and shape-sniffs
+    it (``"router" in shipped_cells``) rather than taking domain objects (a
+    ``CellOutcome`` list, the shipped-cells annotation as a value object)
+    directly. That's deliberate, not an oversight: ``build_report`` is the
+    single authority on which of the two ``shipped_config_cells`` shapes
+    exists for a given run, and consuming its serialized output here
+    guarantees the console output and the persisted artifact are provably
+    the same thing and cannot diverge. A renderer fed domain objects would
+    have to re-derive that shape choice itself, reintroducing the
+    two-authorities divergence rounds 7 and 8 deliberately closed. Declined;
+    a later round should not re-raise this as new.
     """
     shipped_cells = report.get("shipped_config_cells")
     if shipped_cells and "router" in shipped_cells:
