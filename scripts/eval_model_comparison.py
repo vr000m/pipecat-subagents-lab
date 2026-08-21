@@ -1929,7 +1929,7 @@ def _serialize_cell(outcome: CellOutcome) -> dict[str, Any]:
     added to one and not the other would otherwise silently desync the
     aggregated cell's shape from its own audit trail.
     """
-    return {
+    cell: dict[str, Any] = {
         "pair": outcome.pair_label,
         "scenario": outcome.scenario_name,
         "status": outcome.status,
@@ -1937,12 +1937,16 @@ def _serialize_cell(outcome: CellOutcome) -> dict[str, Any]:
         "router_timeout_seconds": outcome.router_timeout_seconds,
         "foreground_search_timeout_seconds": outcome.foreground_search_timeout_seconds,
         "turns": [_serialize_turn(turn) for turn in (outcome.turns or [])],
-        "repeats": (
-            None
-            if outcome.repeats is None
-            else [_serialize_cell(repeat) for repeat in outcome.repeats]
-        ),
     }
+    # Round-10 gauntlet confirming pass, Codex P2: only add the key for an
+    # actual --repeat > 1 aggregate. A single-run (--repeat 1, the default)
+    # cell predates this field entirely -- always emitting "repeats": null
+    # changed the advertised-backward-compatible single-run schema by adding
+    # a key that never existed before, which a consumer doing strict schema
+    # validation or key-set comparison would see as a break.
+    if outcome.repeats is not None:
+        cell["repeats"] = [_serialize_cell(repeat) for repeat in outcome.repeats]
+    return cell
 
 
 def build_report(

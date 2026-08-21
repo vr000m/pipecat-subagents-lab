@@ -1332,7 +1332,12 @@ class TestBuildReportRepeatCount:
         assert len(serialized_repeats) == 3
         assert [r["status"] for r in serialized_repeats] == ["ok", "ok", "timeout"]
 
-    def test_a_cell_with_no_repeats_serializes_repeats_as_none(self) -> None:
+    def test_a_cell_with_no_repeats_omits_the_repeats_key(self) -> None:
+        # Round-10 gauntlet confirming pass, Codex P2: a single-run
+        # (--repeat 1, the default) cell must not gain a "repeats" key at
+        # all -- this predates the --repeat feature entirely, so a consumer
+        # doing strict schema/key-set comparison against the pre-feature
+        # shape must see no new key, not a new key holding None.
         cell = eval_runner.CellOutcome(
             pair_label="p",
             scenario_name="s",
@@ -1340,7 +1345,7 @@ class TestBuildReportRepeatCount:
             turns=[eval_runner.TurnOutcome(query="q", status="ok")],
         )
         report = eval_runner.build_report([cell], judge_model="gpt-5-mini")
-        assert report["cells"][0]["repeats"] is None
+        assert "repeats" not in report["cells"][0]
 
 
 # ---------------------------------------------------------------------------
