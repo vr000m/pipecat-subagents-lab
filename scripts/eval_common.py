@@ -225,6 +225,18 @@ def _registered_label(candidate: Candidate, registry: tuple[Candidate, ...]) -> 
     guarantees that cannot happen on this checkout, so this fallback exists
     only so a future config.toml edit degrades instead of crashing (round 5
     restart2, Architecture A5).
+
+    The "shipped" sentinel is deliberately excluded from
+    ``*_SELECTABLE_BY_LABEL``, so there is no ``--router shipped``/``--worker
+    shipped`` CLI selector to fall back on if this path is ever actually hit
+    in production -- README's documented remedy of selecting the shipped
+    config explicitly is unexecutable in that case. Considered renaming the
+    sentinel to avoid a future collision with a real registered label, but
+    declined: no registered candidate is named "shipped" today, the string
+    already appears in report artifacts and the README, and a rename would
+    just move the naming risk rather than remove it. Left as-is; round 7
+    should not re-raise this as a new finding (round 6 gauntlet,
+    Architecture A4).
     """
     key = (candidate.model, effective_effort_for_manifest_lookup(candidate))
     match = next(
