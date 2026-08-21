@@ -94,37 +94,87 @@ def _split_commands(line: str) -> list[str]:
     return [piece.strip() for piece in line.split("&&") if piece.strip()]
 
 
-def _just_check_command_closure() -> set[str]:
-    recipes = _parse_justfile(_JUSTFILE.read_text())
-    body_lines = _closure_body_lines(recipes, "check")
-    commands: set[str] = set()
-    for line in body_lines:
-        commands.update(_split_commands(line))
+_CD_RE = re.compile(r"^cd\s+(\S+)$")
+
+
+def _qualified_commands(line: str, cwd: str = ".") -> set[tuple[str, str]]:
+    """Split ``line`` on ``&&`` and pair each resulting command with the
+    working directory it actually runs in.
+
+    A piece matching ``cd <dir>`` updates ``cwd`` for the REST of this line's
+    pieces and is not itself emitted (it's a directory change, not a
+    command); every other piece is emitted as ``(cwd, piece)``. Threading
+    ``cwd`` through here -- instead of only applying ``_split_commands`` --
+    closes two holes in the parity check (round-4 restart, Architecture
+    Minor #4 / Logic finding #3): a CI ``run: cd web && bun test`` line
+    previously produced the single unsplit string ``"cd web && bun test"``,
+    which failed the ``_TRACKED_PREFIXES`` filter and was silently DROPPED
+    rather than reported missing; and a justfile ``cd web && ...`` command
+    compared equal (by bare command text) to an unrelated repo-root command
+    of the same name.
+    """
+    commands: set[tuple[str, str]] = set()
+    for piece in _split_commands(line):
+        match = _CD_RE.match(piece)
+        if match:
+            cwd = match.group(1)
+            continue
+        commands.add((cwd, piece))
     return commands
 
 
-def _ci_test_job_run_lines() -> list[str]:
-    data = yaml.safe_load(_CI_YML.read_text())
-    steps = data["jobs"]["test"]["steps"]
-    lines: list[str] = []
+def _just_check_command_closure() -> set[tuple[str, str]]:
+    recipes = _parse_justfile(_JUSTFILE.read_text())
+    body_lines = _closure_body_lines(recipes, "check")
+    commands: set[tuple[str, str]] = set()
+    for line in body_lines:
+        commands.update(_qualified_commands(line))
+    return commands
+
+
+def _qualified_commands_from_steps(steps: list[dict]) -> set[tuple[str, str]]:
+    """Extracted from ``_ci_test_job_commands`` so a test can feed it a
+    synthetic step list instead of only ever exercising the real ci.yml
+    (round-4 restart verification, closing a tautological-test gap)."""
+    commands: set[tuple[str, str]] = set()
     for step in steps:
         if step.get("name") in _CI_STEPS_WITHOUT_A_JUST_EQUIVALENT:
             continue
         run = step.get("run")
         if not run:
             continue
-        lines.extend(stripped for raw in run.splitlines() if (stripped := raw.strip()))
-    return lines
+        cwd = step.get("working-directory", ".")
+        for raw in run.splitlines():
+            if stripped := raw.strip():
+                commands.update(_qualified_commands(stripped, cwd))
+    return commands
+
+
+def _ci_test_job_commands() -> set[tuple[str, str]]:
+    data = yaml.safe_load(_CI_YML.read_text())
+    steps = data["jobs"]["test"]["steps"]
+    return _qualified_commands_from_steps(steps)
+
+
+# Follow-up (deliberately deferred, round-4 restart, architecture Minor #3):
+# inverting the relationship so CI does `run: just py-check` / `run: just
+# smoke` (one list consumed twice) instead of two lists kept equal by a
+# parser is the better long-term design, but it changes CI workflow
+# structure for a green invariant and is out of proportion to this round.
+# Same applies to exempting CI steps by an in-workflow marker instead of by
+# human-readable step name (`_CI_STEPS_WITHOUT_A_JUST_EQUIVALENT` above).
 
 
 def test_ci_test_job_commands_are_reachable_from_just_check() -> None:
     closure = _just_check_command_closure()
     assert closure, "`check`'s recipe closure resolved to zero commands -- parser likely broken"
 
-    tracked = [line for line in _ci_test_job_run_lines() if line.startswith(_TRACKED_PREFIXES)]
+    tracked = [
+        (cwd, cmd) for cwd, cmd in _ci_test_job_commands() if cmd.startswith(_TRACKED_PREFIXES)
+    ]
     assert tracked, "no `uv run`/`bun` commands found in ci.yml's test job -- parser likely broken"
 
-    missing = [line for line in tracked if line not in closure]
+    missing = [pair for pair in tracked if pair not in closure]
     assert not missing, (
         "CI's `test` job runs commands `just check` cannot reach: "
         f"{missing}. Add them to a recipe `check` depends on."
@@ -137,8 +187,26 @@ def test_uv_sync_flags_match() -> None:
     sync_body = recipes["sync"][1]
     assert "uv sync --frozen" in sync_body
 
-    ci_lines = _ci_test_job_run_lines()
-    assert "uv sync --frozen" in ci_lines
+    assert (".", "uv sync --frozen") in _ci_test_job_commands()
+
+
+def test_ci_run_lines_are_split_on_ampersands() -> None:
+    """Reproduction: pre-fix, a CI step written `run: cd web && bun test`
+    yielded the unsplit `"cd web && bun test"`, which `_TRACKED_PREFIXES`'
+    `.startswith()` filter dropped instead of reporting missing."""
+    assert _qualified_commands("cd web && bun test") == {("web", "bun test")}
+
+
+def test_working_directory_disambiguates_identical_commands() -> None:
+    """Reproduction: pre-fix, `working-directory:` was discarded, so a
+    `uv run pytest` step under `working-directory: web` matched the
+    justfile's repo-root `uv run pytest` -- a false parity match. Feeds a
+    synthetic step through the real extractor rather than hand-building a
+    set, so this actually exercises `_qualified_commands_from_steps`."""
+    steps = [{"working-directory": "web", "run": "uv run pytest"}]
+    commands = _qualified_commands_from_steps(steps)
+    assert commands == {("web", "uv run pytest")}
+    assert (".", "uv run pytest") not in commands
 
 
 class TestRunRecipeGuardsItsEnvFile:
@@ -202,3 +270,47 @@ class TestRunRecipeGuardsItsEnvFile:
 
         assert result.returncode == 0, result.stderr
         assert marker.exists()
+
+    def test_malformed_env_file_stops_the_recipe(self, tmp_path: Path) -> None:
+        """The reproduction: round-4 restart, Codex P2. `just` runs each
+        non-continued recipe line in its own shell, so line 60's old
+        `source "${AI_ENV_FILE:-...}"` -- a SEPARATE shell from the readable
+        guard above it -- discarded `source`'s exit status via the following
+        `;`. A malformed env file (unterminated quote) previously exited 0
+        with the server-boot command still running.
+        """
+        body = self._run_recipe_body()
+        stub_dir = self._stub_path(tmp_path)
+        marker = tmp_path / "marker"
+        env_file = tmp_path / "ai.env"
+        env_file.write_text('FOO="bar\n')  # unterminated quote -- malformed
+        env = {
+            "AI_ENV_FILE": str(env_file),
+            "PATH": f"{stub_dir}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+        }
+
+        result = subprocess.run(["bash", "-cu", body], env=env, capture_output=True, text=True)
+
+        assert result.returncode != 0
+        assert not marker.exists()
+
+    def test_directory_env_file_stops_the_recipe(self, tmp_path: Path) -> None:
+        """A directory passes the readability guard (`test -r` is true for a
+        readable directory) but `source` on it fails -- must still be fatal.
+        """
+        body = self._run_recipe_body()
+        stub_dir = self._stub_path(tmp_path)
+        marker = tmp_path / "marker"
+        env_file = tmp_path / "ai_env_dir"
+        env_file.mkdir()
+        env = {
+            "AI_ENV_FILE": str(env_file),
+            "PATH": f"{stub_dir}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+        }
+
+        result = subprocess.run(["bash", "-cu", body], env=env, capture_output=True, text=True)
+
+        assert result.returncode != 0
+        assert not marker.exists()

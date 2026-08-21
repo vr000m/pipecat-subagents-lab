@@ -53,11 +53,17 @@ smoke:
 # Re-examined and accepted at round 3's security gate (AI_ENV_FILE and the
 # file it names are developer-controlled; there is no attacker-controlled
 # input path). Do not read this recipe as a least-privilege boundary --
-# keep unrelated credentials out of the file it points at.
+# keep unrelated credentials out of the file it points at. A failed `source`
+# (malformed file, or a directory) is fatal, not silently ignored -- round-4
+# restart, Codex P2: `just` runs each non-continued line in its own shell, so
+# a guard on one line does not protect a `source` on the next.
 run:
     env_file="${AI_ENV_FILE:-$HOME/.secrets/ai.env}"; \
-      test -r "$env_file" || { echo "just run: env file not readable: $env_file (set AI_ENV_FILE to override)" >&2; exit 1; }
-    set -a; source "${AI_ENV_FILE:-$HOME/.secrets/ai.env}"; set +a; uv run python -m server.app
+      test -r "$env_file" || { echo "just run: env file not readable: $env_file (set AI_ENV_FILE to override)" >&2; exit 1; }; \
+      set -a; \
+      source "$env_file" || { echo "just run: failed to source env file: $env_file (malformed, or a directory?)" >&2; exit 1; }; \
+      set +a; \
+      uv run python -m server.app
 
 # One-shot: install, check (which builds as a dependency), then run
 all: sync check run
