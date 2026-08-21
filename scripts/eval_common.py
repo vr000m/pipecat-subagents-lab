@@ -185,6 +185,16 @@ class Candidate:
     effort: str | None  # None means "unset" (today's model-conditional default)
 
 
+# *_BASELINE names a fixed historical anchor point (the pre-shortlist
+# default this comparison matrix was originally built to beat), not "the
+# model config.toml ships today" -- those diverged when config.toml's
+# [models] defaults moved to the luna-medium/terra-medium shortlist (round
+# 10 gauntlet confirming pass, Architecture finding: this hardcoded
+# baseline vs. config.toml's live defaults is checked only by convention,
+# nothing asserts they still relate). A shipped pair going missing from
+# *_CANDIDATES entirely -- so a comparison run no longer has a cell for
+# what's actually in production -- is pinned by
+# TestShippedConfigHasAnEvalCandidateCell in tests/test_eval_common.py.
 ROUTER_BASELINE = Candidate(label="baseline", role="router", model="gpt-5-mini", effort=None)
 ROUTER_CANDIDATES: tuple[Candidate, ...] = (
     Candidate(label="luna-high", role="router", model="gpt-5.6-luna", effort="high"),

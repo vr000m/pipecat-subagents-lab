@@ -316,3 +316,51 @@ class TestJudgeEffortDecoupledFromRouterPolicy:
         service = build_judge_llm_service("gpt-5-mini", "sk-test")
 
         assert service._settings.extra["reasoning_effort"] == "minimal"
+
+
+class TestShippedConfigHasAnEvalCandidateCell:
+    """Round 10 gauntlet confirming pass, Architecture finding: ROUTER_BASELINE/
+    WORKER_BASELINE are a fixed historical anchor, not "whatever config.toml
+    ships today" -- those diverged when config.toml's [models] defaults moved
+    to the luna-medium/terra-medium shortlist. Nothing previously asserted the
+    two stay related, so a future default change could silently leave the
+    comparison matrix without a cell for what's actually in production: a
+    candidate that regresses against *current* production would read as a
+    pass, since the matrix would only be measuring against the stale
+    baseline and older candidates.
+    """
+
+    def test_shipped_router_and_worker_models_have_a_candidate_cell(self) -> None:
+        from server.config import load_config
+
+        repo_config_toml = Path(__file__).resolve().parents[1] / "config.toml"
+        config = load_config(env={}, config_file=repo_config_toml)
+
+        shipped_router = (
+            config.resolve_router_model("fast"),
+            config.resolve_router_reasoning_effort("fast"),
+        )
+        shipped_worker = (
+            config.resolve_worker_model("deep"),
+            config.resolve_worker_reasoning_effort("deep"),
+        )
+
+        router_pairs = {
+            (c.model, c.effort)
+            for c in (eval_common_module.ROUTER_BASELINE, *eval_common_module.ROUTER_CANDIDATES)
+        }
+        worker_pairs = {
+            (c.model, c.effort)
+            for c in (eval_common_module.WORKER_BASELINE, *eval_common_module.WORKER_CANDIDATES)
+        }
+
+        assert shipped_router in router_pairs, (
+            f"config.toml's shipped router (model, effort) {shipped_router} has no "
+            "cell in ROUTER_BASELINE/ROUTER_CANDIDATES -- a comparison run no longer "
+            "measures against current production; add a candidate for it."
+        )
+        assert shipped_worker in worker_pairs, (
+            f"config.toml's shipped worker (model, effort) {shipped_worker} has no "
+            "cell in WORKER_BASELINE/WORKER_CANDIDATES -- a comparison run no longer "
+            "measures against current production; add a candidate for it."
+        )
