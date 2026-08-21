@@ -803,6 +803,15 @@ class TurnOutcome:
     # answers directly instead of delegating, or vice versa) is caught here
     # even when the reply text and judge verdict would otherwise look fine.
     worker_presence_pass: bool | None = None
+    # total_ms/routing_ms/search_ms are the ONE measurement for a repeat_count
+    # == 1 run, and the arithmetic mean across the ok repeats for an
+    # aggregated (repeat_count > 1) record. The discriminator is the
+    # enclosing CellOutcome.repeats: non-None means every latency field on
+    # this record's turns is a mean, and the raw per-repetition values are in
+    # repeats[i]. Deliberately not split into separate *_mean fields: that
+    # would change the serialized report schema (_serialize_turn) and
+    # invalidate the committed eval-report JSONs the shortlist artifact cites
+    # as evidence (round 10 gauntlet, Logic finding 10 -- rejected rename).
     routing_ms: float | None = None
     search_ms: float | None = None
     total_ms: float | None = None
@@ -823,6 +832,9 @@ class CellOutcome:
     # per-repetition CellOutcomes this (majority-voted) cell was built from,
     # kept for audit -- the aggregated fields above are a summary, not a
     # replacement, for the individual live calls that produced them.
+    # Depth-1: entries here are always raw per-repetition results and never
+    # themselves carry `repeats` -- enforced in _aggregate_cell_repeats
+    # (round 10 gauntlet, Logic finding 10).
     repeats: list[CellOutcome] | None = None
 
 
@@ -857,6 +869,8 @@ def _majority_with_tiebreak(
     """Mode of ``values``; a tied plurality resolves to the first matching
     entry in ``priority`` rather than an arbitrary dict-iteration winner.
     """
+    if not values:
+        raise ValueError("_majority_with_tiebreak requires at least one value")
     counts = Counter(values)
     max_count = max(counts.values())
     winners = {value for value, count in counts.items() if count == max_count}
@@ -1019,6 +1033,12 @@ def _aggregate_cell_repeats(
     """
     if len(repeats) == 1:
         return repeats[0]
+
+    if any(cell.repeats is not None for cell in repeats):
+        raise ValueError(
+            "CellOutcome.repeats must be depth-1: _aggregate_cell_repeats received "
+            "an already-aggregated cell as an input repeat"
+        )
 
     statuses: list[CellStatus] = [cell.status for cell in repeats]
     agg_status = _majority_with_tiebreak(statuses, _CELL_STATUS_TIE_PRIORITY)
@@ -1709,6 +1729,14 @@ async def run_matrix(
     the existing spend-confirmation gate/cost estimate (matrix_call_accounting)
     already assumes sequential, worst-case-serial call volume.
     """
+    if repeat_count < 1:
+        # ValueError, not assert -- asserts vanish under -O, and run_matrix()
+        # is a public coroutine callable directly (bypassing the CLI's
+        # --repeat _positive_int() guard), as several tests already do. Left
+        # unguarded, repeat_count=0 built repeats=[] and reached
+        # _majority_with_tiebreak's max() on an empty Counter with a bare,
+        # unphraseable ValueError (round 10 gauntlet, Logic finding 9).
+        raise ValueError(f"repeat_count must be at least 1, got {repeat_count}")
     outcomes: list[CellOutcome] = []
     for pair in pairs:
         for scenario in scenarios:

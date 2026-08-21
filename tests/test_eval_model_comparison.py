@@ -1066,6 +1066,22 @@ class TestAggregateCellRepeats:
         assert aggregated.turns is not None
         assert aggregated.turns[0].deterministic_action_unevaluated_reason is None
 
+    # --- Round 10 gauntlet, Logic finding 10: CellOutcome.repeats is
+    # depth-1 -- an already-aggregated cell must never be fed back in as a
+    # raw input repeat.
+
+    def test_rejects_an_already_aggregated_cell_as_an_input_repeat(self) -> None:
+        already_aggregated = self._aggregate([self._cell(), self._cell()])
+        assert already_aggregated.repeats is not None
+
+        with pytest.raises(ValueError, match="depth-1"):
+            self._aggregate([already_aggregated, self._cell()])
+
+    def test_a_normal_aggregates_repeats_are_all_depth_one(self) -> None:
+        aggregated = self._aggregate([self._cell(), self._cell(), self._cell()])
+        assert aggregated.repeats is not None
+        assert all(repeat.repeats is None for repeat in aggregated.repeats)
+
 
 class TestRunMatrixRepeatWiring:
     """run_matrix()'s repeat_count param must call run_cell() that many
@@ -1159,6 +1175,70 @@ class TestRunMatrixRepeatWiring:
         assert outcomes[0].status == "ok"
         assert outcomes[0].repeats is not None
         assert len(outcomes[0].repeats) == 3
+
+
+class TestRunMatrixRejectsANonPositiveRepeatCount:
+    """Round 10 gauntlet, Logic finding 9: run_matrix(repeat_count=0) built
+    repeats=[], skipped _aggregate_cell_repeats' len==1 shortcut, and crashed
+    inside _majority_with_tiebreak's max() on an empty Counter with a bare,
+    unphraseable ValueError. run_matrix() is a public coroutine callable
+    directly, bypassing the CLI's --repeat _positive_int() guard -- as the
+    other tests in this file already do -- so it must validate itself.
+    """
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, *, repeat_count: int) -> list[Any]:
+        calls: list[Any] = []
+
+        async def _fake_run_cell(pair: Any, scenario: Any, *_a: Any, **_k: Any) -> Any:
+            calls.append((pair, scenario))
+            return eval_runner.CellOutcome(
+                pair_label=pair.label, scenario_name=scenario.name, status="ok", turns=[]
+            )
+
+        monkeypatch.setattr(eval_runner, "run_cell", _fake_run_cell)
+        monkeypatch.setattr(eval_runner, "candidate_accepted", lambda *_a, **_k: True)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        with pytest.raises(ValueError, match="repeat_count must be at least 1"):
+            asyncio.run(
+                eval_runner.run_matrix(
+                    (pair,),
+                    (scenario,),
+                    eval_runner.Config(),
+                    judge_model="gpt-5-mini",
+                    max_routing_seconds=15.0,
+                    max_latency_seconds=15.0,
+                    manifest_status=status,
+                    repeat_count=repeat_count,
+                )
+            )
+        return calls
+
+    def test_zero_repeat_count_raises_before_any_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._run(monkeypatch, repeat_count=0)
+        assert calls == []
+
+    def test_negative_repeat_count_raises_before_any_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._run(monkeypatch, repeat_count=-1)
+        assert calls == []
+
+    def test_majority_with_tiebreak_rejects_an_empty_sequence(self) -> None:
+        with pytest.raises(ValueError):
+            eval_runner._majority_with_tiebreak([], eval_runner._CELL_STATUS_TIE_PRIORITY)
 
 
 class TestBuildReportRepeatCount:
