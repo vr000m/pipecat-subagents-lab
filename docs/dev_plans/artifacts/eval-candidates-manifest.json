@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
-  "source_commit": "f1a16287e35a5454a130f278e0e554a6ce2fcd51",
-  "verified_at_utc": "2026-08-20T20:32:31Z",
+  "source_commit": "6cfd7e1cb96ba5c1301a1430e46e3cc1f387505c",
+  "verified_at_utc": "2026-08-21T13:59:26Z",
   "results": [
     {
       "kind": "model_existence",
@@ -227,7 +227,7 @@
       },
       "accepted": true,
       "error": null,
-      "response_id": "resp_0a9d5d4486976187016a87643cd31087d2945ca3e4086a1abe"
+      "response_id": "resp_0217b7abb7807f6d016a88598f172487d2b97ab623a80c2e65"
     },
     {
       "kind": "router",
@@ -393,7 +393,7 @@
       },
       "accepted": true,
       "error": null,
-      "response_id": "resp_0a74052e787f525c016a87643ea52887d2805491c12312888c"
+      "response_id": "resp_03feb2b5f98814da016a8859908fbc87d29e3976ae7328ce01"
     },
     {
       "kind": "router",
@@ -559,7 +559,7 @@
       },
       "accepted": true,
       "error": null,
-      "response_id": "resp_086d72fe31e91c11016a876440b44c87d2a5057157245ada82"
+      "response_id": "resp_01912af749e23e9b016a885993481887d28dbb63d2e3512c42"
     },
     {
       "kind": "router",
@@ -725,7 +725,7 @@
       },
       "accepted": true,
       "error": null,
-      "response_id": "resp_0f8239e4d3df8900016a876443591c87d280075fd1c8f1ff2c"
+      "response_id": "resp_05df8d0ba288bd03016a885995b5dc87d295229ea16cf87e61"
     },
     {
       "kind": "worker",
@@ -778,7 +778,7 @@
       },
       "accepted": true,
       "error": null,
-      "response_id": "resp_063f8515644d5e72016a876445213487d2a8a400244276917c"
+      "response_id": "resp_004458861d1bcea8016a885998522887d299a9e6d8abbd8626"
     },
     {
       "kind": "worker",
@@ -834,7 +834,7 @@
       },
       "accepted": true,
       "error": null,
-      "response_id": "resp_089474b138ae236c016a8764560d2887d2b04c9406a51ed7d5"
+      "response_id": "resp_0dfd8d5613790384016a8859b5cc2c87d2bd7f6f3e4991c444"
     },
     {
       "kind": "worker",
@@ -890,7 +890,7 @@
       },
       "accepted": true,
       "error": null,
-      "response_id": "resp_083a8f15123dcf7c016a87645974d887d2a2cc41b1a45b067a"
+      "response_id": "resp_08c084ba0614d110016a8859b8a54087d29ea1a381e1685243"
     },
     {
       "kind": "judge",
@@ -905,11 +905,12 @@
             "content": "Reply with exactly the single word: ok"
           }
         ],
-        "max_completion_tokens": 16
+        "max_completion_tokens": 32,
+        "reasoning_effort": "minimal"
       },
       "accepted": true,
       "error": null,
-      "response_id": "chatcmpl-EF3j4h17FnqAw8acz3BHHRLLA9jb7"
+      "response_id": "chatcmpl-EFK4EE9czPzeUrUm9EU5qiOK8ljru"
     }
   ]
 }
