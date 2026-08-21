@@ -4392,6 +4392,139 @@ class TestErrorTextStripsControlCharacters:
 # ---------------------------------------------------------------------------
 
 
+class TestMatrixPreviewLabelsPerScenarioScope:
+    """Regression for round-3 confirming pass, Logic finding 2:
+    print_matrix_preview()'s per-scenario breakdown printed raw per-cell,
+    pre-retry counts right above the grand "Total calls:" line with nothing
+    naming the scope difference -- an operator approving spend from this
+    output could read the per-scenario numbers as summing to the total.
+    matrix_call_accounting() actually multiplies by len(pairs), by
+    repeat_count, AND by _RETRY_WORST_CASE_MULTIPLIER, so no single-factor
+    rescale would have made them line up; the fix relabels rather than
+    rescaling.
+    """
+
+    def test_per_scenario_breakdown_is_labelled_with_its_scope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"), Turn(query="there")))
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (scenario,),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+            repeat_count=3,
+        )
+
+        out = capsys.readouterr().out
+        assert "one config pair, one repeat, before retry worst case" in out
+
+    def test_per_scenario_router_count_is_unscaled(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"), Turn(query="there")))
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (scenario,),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+            repeat_count=3,
+        )
+
+        out = capsys.readouterr().out
+        router_calls, _worker_calls, _judge_calls = eval_runner.scenario_call_counts(scenario)
+        assert f"router={router_calls} " in out
+        assert router_calls == len(scenario.turns)
+
+    def test_total_calls_line_still_matches_matrix_call_accounting(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"), Turn(query="there")))
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (scenario,),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+            repeat_count=3,
+        )
+
+        out = capsys.readouterr().out
+        accounting = eval_runner.matrix_call_accounting((pair,), (scenario,), repeat_count=3)
+        assert f"total={accounting.total_calls}" in out
+
+
+class TestLatencyBudgetExceededPredicate:
+    """Regression for round-3 confirming pass, Architecture finding 5:
+    run_cell()'s per-turn live budget check and _aggregate_turn_repeats()'
+    recomputation from the aggregated means duplicated the same boolean
+    expression at two call sites -- a future edit to one (e.g. a `>=` vs `>`
+    fix) could silently desync from the other, contradicting round 10's
+    Logic finding 6 invariant that both must agree.
+    """
+
+    def test_returns_none_when_nothing_measured(self) -> None:
+        result = eval_runner._latency_budget_exceeded(
+            None, None, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert result is None
+
+    def test_returns_false_when_only_one_side_measured_and_within_budget(self) -> None:
+        result = eval_runner._latency_budget_exceeded(
+            None, 100.0, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert result is False
+
+    def test_boundary_is_strictly_greater(self) -> None:
+        at_budget = eval_runner._latency_budget_exceeded(
+            None, 60_000.0, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+        over_budget = eval_runner._latency_budget_exceeded(
+            None, 60_000.1, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert at_budget is False
+        assert over_budget is True
+
+    def test_routing_alone_can_exceed(self) -> None:
+        result = eval_runner._latency_budget_exceeded(
+            20_000.0, 100.0, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert result is True
+
+    def test_run_cell_and_aggregate_use_the_same_predicate(self, monkeypatch: Any) -> None:
+        sentinel = object()
+        monkeypatch.setattr(
+            eval_runner, "_latency_budget_exceeded", lambda *args, **kwargs: sentinel
+        )
+        turn = eval_runner.TurnOutcome(
+            query="q",
+            status="ok",
+            routing_ms=10.0,
+            total_ms=20.0,
+        )
+
+        aggregated = eval_runner._aggregate_turn_repeats(
+            [turn, turn], max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert aggregated.latency_budget_exceeded is sentinel
+
+
 class TestDefaultSweepAnchorsOnShippedConfig:
     """Regression for round-3 confirming pass, Architecture finding 3:
     ROUTER_BASELINE/WORKER_BASELINE are a fixed HISTORICAL anchor

@@ -5,8 +5,9 @@
 # flags kept identical on purpose -- round-10 gauntlet confirming pass,
 # Architecture finding: a flag mismatch here let a lockfile-desyncing
 # dependency change pass `just check` locally while CI's `--frozen`
-# sync/install would reject it). Neither file consumes the other; keep
-# both in sync by hand if either's command list changes.
+# sync/install would reject it). Neither file consumes the other;
+# tests/test_justfile_ci_parity.py asserts CI's `test` job cannot run a
+# command `just check` does not reach.
 
 set shell := ["bash", "-cu"]
 
@@ -18,8 +19,8 @@ sync:
 build:
     cd web && bun install --frozen-lockfile && bun run build
 
-# Credential-free checks: formatting, lint, types, python tests
-test:
+# Credential-free Python gates: formatting, lint, types, tests
+py-check:
     uv run ruff format --check .
     uv run ruff check .
     uv run mypy
@@ -29,8 +30,8 @@ test:
 web-test:
     cd web && bun test && bun run lint
 
-# Full compile+test: python checks + web build + web checks
-check: test build web-test
+# Full compile+test: python checks + web build + web checks + real-process smoke
+check: py-check build web-test smoke
 
 # Values-redacted provider preflight (same probe backing /api/readyz)
 preflight:
@@ -45,9 +46,17 @@ smoke:
 # sockets up if config.toml still points at provider = "local"). AI_ENV_FILE
 # overrides the default path -- round-10 gauntlet confirming pass, Architecture
 # +Security findings: a hardcoded ~/.secrets/ai.env baked one developer's
-# machine layout into a repo-tracked file and exported the whole file into the
-# process env rather than just what the server needs.
+# machine layout into a repo-tracked file. Only the path half of that
+# finding was fixed. `set -a` + `source` remains a deliberate, accepted
+# tradeoff for a local-developer recipe: it executes the env file as bash
+# and exports EVERY variable in it, not just the keys the server reads.
+# Re-examined and accepted at round 3's security gate (AI_ENV_FILE and the
+# file it names are developer-controlled; there is no attacker-controlled
+# input path). Do not read this recipe as a least-privilege boundary --
+# keep unrelated credentials out of the file it points at.
 run:
+    env_file="${AI_ENV_FILE:-$HOME/.secrets/ai.env}"; \
+      test -r "$env_file" || { echo "just run: env file not readable: $env_file (set AI_ENV_FILE to override)" >&2; exit 1; }
     set -a; source "${AI_ENV_FILE:-$HOME/.secrets/ai.env}"; set +a; uv run python -m server.app
 
 # One-shot: install, check (which builds as a dependency), then run

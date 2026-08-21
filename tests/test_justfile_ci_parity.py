@@ -18,6 +18,8 @@ and `all`, which CI must never execute.
 from __future__ import annotations
 
 import re
+import stat
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -137,3 +139,66 @@ def test_uv_sync_flags_match() -> None:
 
     ci_lines = _ci_test_job_run_lines()
     assert "uv sync --frozen" in ci_lines
+
+
+class TestRunRecipeGuardsItsEnvFile:
+    """Round 3 confirming pass, Architecture finding 7.
+
+    `set shell := ["bash", "-cu"]` enables `-u` but not `-e`, and the `run`
+    recipe's body was one `;`-separated line, so a failed `source` fell
+    through to `uv run python -m server.app` and `just` reported success.
+    This exercises the recipe's actual body text (not a hand-copied stand-in)
+    through a real `bash -cu`, so a future edit to the guard is caught here
+    too.
+    """
+
+    @staticmethod
+    def _run_recipe_body() -> str:
+        recipes = _parse_justfile(_JUSTFILE.read_text())
+        assert "run" in recipes, "recipe `run` not found in justfile"
+        return "\n".join(recipes["run"][1])
+
+    @staticmethod
+    def _stub_path(tmp_path: Path) -> str:
+        """A `uv` stub on PATH that touches a marker file instead of booting a server."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        uv_stub = bin_dir / "uv"
+        uv_stub.write_text(f"#!/bin/bash\ntouch {tmp_path / 'marker'}\n")
+        uv_stub.chmod(uv_stub.stat().st_mode | stat.S_IEXEC)
+        return str(bin_dir)
+
+    def test_missing_env_file_is_a_hard_stop(self, tmp_path: Path) -> None:
+        body = self._run_recipe_body()
+        stub_dir = self._stub_path(tmp_path)
+        marker = tmp_path / "marker"
+        env = {
+            "AI_ENV_FILE": str(tmp_path / "does-not-exist.env"),
+            "PATH": f"{stub_dir}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+        }
+
+        result = subprocess.run(["bash", "-cu", body], env=env, capture_output=True, text=True)
+
+        # returncode alone is not load-bearing under `bash -cu`, which exits
+        # with the LAST command's status -- the marker's absence is the real
+        # assertion that the server-boot command never ran.
+        assert result.returncode != 0
+        assert not marker.exists()
+
+    def test_readable_env_file_still_boots(self, tmp_path: Path) -> None:
+        body = self._run_recipe_body()
+        stub_dir = self._stub_path(tmp_path)
+        marker = tmp_path / "marker"
+        env_file = tmp_path / "ai.env"
+        env_file.write_text("FOO=bar\n")
+        env = {
+            "AI_ENV_FILE": str(env_file),
+            "PATH": f"{stub_dir}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+        }
+
+        result = subprocess.run(["bash", "-cu", body], env=env, capture_output=True, text=True)
+
+        assert result.returncode == 0, result.stderr
+        assert marker.exists()

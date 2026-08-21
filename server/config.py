@@ -828,13 +828,40 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
     ("WEBSEARCH_ROUTER_MODEL", "WEBSEARCH_ROUTER_REASONING_EFFORT"),
     ("WEBSEARCH_WORKER_MODEL", "WEBSEARCH_WORKER_REASONING_EFFORT"),
 )
+# Two independently-motivated rules that happen to cover the same four keys
+# today. Kept as separate names so either can change membership without
+# silently changing the other's behaviour (round 3 confirming pass,
+# Architecture finding 4).
+#
+# _PROVENANCE_KEYS: which keys carry per-layer provenance, so
+# _clear_inherited_reasoning_effort can tell "a higher layer set the model"
+# from "the model came along with the effort".
 _PROVENANCE_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
+# _EMPTY_MEANS_ABSENT_KEYS: which keys treat an effectively-empty override as
+# "absent" rather than as a write that erases the lower layer. Justified by
+# these keys' consumers reading them with a truthiness walrus; a key whose
+# consumer does a plain `in values` presence check must NOT be listed here.
+#
+# Alias, not a copy: they are the same set today and a copy would invite them
+# to drift by accident rather than by decision. Changing membership means
+# giving this its own comprehension.
+_EMPTY_MEANS_ABSENT_KEYS = _PROVENANCE_KEYS
 
 
 def _effectively_set(value: object) -> bool:
-    """Match the truthiness-walrus consumers at ``load_config``'s model/effort
-    override block -- an explicitly empty override reads as "absent" there,
-    so it must not count as provenance here either."""
+    """Whether an override should count as a real value.
+
+    Deliberately STRICTER than the truthiness-walrus consumers at
+    ``load_config``'s model/effort override block: those read
+    ``if raw := values.get("WEBSEARCH_ROUTER_MODEL")``, for which a
+    whitespace-only ``"   "`` is truthy, whereas the ``.strip()`` here treats
+    it as absent. The divergence is intentional and one-directional -- a
+    whitespace-only model ID or reasoning effort is nonsense at every
+    consumer, so absorbing it here is better than propagating it. Everything
+    the consumers treat as absent (``None``, ``""``) is absent here too, so
+    the strictness can never resurrect a lower layer the consumers would have
+    used (round 3 confirming pass, Logic finding 3).
+    """
     return value is not None and str(value).strip() != ""
 
 
@@ -852,7 +879,7 @@ def _apply_layer(
 ) -> None:
     """Merge one precedence layer into ``values`` and record its provenance.
 
-    An effectively-empty override of a role model/effort key (_PROVENANCE_KEYS)
+    An effectively-empty override of a role model/effort key (_EMPTY_MEANS_ABSENT_KEYS)
     is a no-op, not a write. Every consumer of those four keys reads them with a
     truthiness walrus (load_config's model/effort block), so an empty value
     already means "absent" there -- but letting it land in ``values`` still
@@ -863,7 +890,7 @@ def _apply_layer(
     effort was configured against (round 11 gauntlet, Minor B).
     """
     for key, value in layer_values.items():
-        if key in _PROVENANCE_KEYS and not _effectively_set(value):
+        if key in _EMPTY_MEANS_ABSENT_KEYS and not _effectively_set(value):
             continue
         values[key] = value
     _record_layer(layer_values, layers, layer)

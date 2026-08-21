@@ -758,6 +758,12 @@ def print_matrix_preview(
             f"{flag}"
         )
     print()
+    # Per-CELL, pre-retry figures. Deliberately NOT scaled to the printed
+    # total: matrix_call_accounting() multiplies these by len(pairs), by
+    # repeat_count, AND by _RETRY_WORST_CASE_MULTIPLIER, so scaling by any
+    # subset would print a number that means nothing (round 3 confirming
+    # pass, Logic finding 2).
+    print("Per-scenario breakdown (one config pair, one repeat, before retry worst case):")
     for scenario in scenarios:
         r, w, j = scenario_call_counts(scenario)
         print(
@@ -938,6 +944,29 @@ def _average(values: Sequence[float | None]) -> float | None:
     return sum(present) / len(present) if present else None
 
 
+def _latency_budget_exceeded(
+    routing_ms: float | None,
+    total_ms: float | None,
+    *,
+    max_routing_seconds: float,
+    max_latency_seconds: float,
+) -> bool | None:
+    """Whether a turn's measured latency broke either budget.
+
+    ``None`` when nothing was measured -- distinct from ``False`` ("measured,
+    within budget"), which compute_pass_fail's `enforced and exceeded` gate at
+    :1901 relies on. Single source of truth for run_cell()'s per-turn live
+    check and _aggregate_turn_repeats()' recomputation from the aggregated
+    means: both must stay identical or the aggregate would contradict the
+    per-repeat values it summarises (round 10 gauntlet, Logic finding 6).
+    """
+    if routing_ms is None and total_ms is None:
+        return None
+    return (routing_ms is not None and routing_ms > max_routing_seconds * 1000) or (
+        total_ms is not None and total_ms > max_latency_seconds * 1000
+    )
+
+
 def _aggregate_turn_repeats(
     turn_repeats: list[TurnOutcome],
     *,
@@ -1022,7 +1051,7 @@ def _aggregate_turn_repeats(
     # repeat pulling the mean over budget while a 2/3 majority voted "not
     # exceeded" previously reported an aggregate total_ms over budget beside
     # latency_budget_exceeded=False (round 10 gauntlet, Logic finding 6).
-    # Same predicate as run_cell()'s own live-budget check.
+    # Shared predicate with run_cell()'s live-budget check (_latency_budget_exceeded).
     #
     # Accepted tradeoff (verify pass, round 10 gauntlet): recomputing from the
     # mean is *less* sensitive than the old majority vote in one direction. A
@@ -1032,13 +1061,11 @@ def _aggregate_turn_repeats(
     # the published mean (finding 6 above) -- it is not a bug, but a masked
     # high-variance repeat set will no longer flip this field. No test pins
     # this direction; add one if the masked case becomes a real incident.
-    agg_budget_exceeded = (
-        None
-        if agg_routing_ms is None and agg_total_ms is None
-        else (
-            (agg_routing_ms is not None and agg_routing_ms > max_routing_seconds * 1000)
-            or (agg_total_ms is not None and agg_total_ms > max_latency_seconds * 1000)
-        )
+    agg_budget_exceeded = _latency_budget_exceeded(
+        agg_routing_ms,
+        agg_total_ms,
+        max_routing_seconds=max_routing_seconds,
+        max_latency_seconds=max_latency_seconds,
     )
 
     return TurnOutcome(
@@ -1627,11 +1654,12 @@ async def run_cell(
                 outcome.search_ms = round(stage_metrics["search_ms"], 1)
                 outcome.total_ms = round(stage_metrics["total_ms"], 1)
                 outcome.latency_budget_enforced = pair.is_baseline
-                exceeded = (
-                    stage_metrics["routing_ms"] > max_routing_seconds * 1000
-                    or stage_metrics["total_ms"] > max_latency_seconds * 1000
+                outcome.latency_budget_exceeded = _latency_budget_exceeded(
+                    stage_metrics["routing_ms"],
+                    stage_metrics["total_ms"],
+                    max_routing_seconds=max_routing_seconds,
+                    max_latency_seconds=max_latency_seconds,
                 )
-                outcome.latency_budget_exceeded = exceeded
 
             judge.add_user_message(turn.query)
             # result.ui_text is the display projection (GroundedResult.text,

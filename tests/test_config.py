@@ -1925,6 +1925,23 @@ class TestReasoningEffortInheritance:
         # the TOML model it was configured against, not the dataclass default.
         assert config.resolve_worker_model("deep") == "gpt-5.2-orion"
 
+    def test_whitespace_only_model_override_does_not_erase_the_toml_layer(
+        self, tmp_path: Path
+    ) -> None:
+        # Round 3 confirming pass, Logic finding 3: _effectively_set() is
+        # deliberately stricter than the truthiness-walrus consumers (a
+        # whitespace-only string is truthy in Python), so a whitespace-only
+        # override must be treated as absent here too, not just an empty one.
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.2-orion"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "   "})
+
+        assert config.resolve_worker_reasoning_effort("deep") == "medium"
+        assert config.resolve_worker_model("deep") == "gpt-5.2-orion"
+
     def test_explicitly_empty_effort_override_does_not_clear_the_toml_effort(
         self, tmp_path: Path
     ) -> None:
