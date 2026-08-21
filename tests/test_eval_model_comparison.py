@@ -254,6 +254,7 @@ def _make_stub_judge_class(verdicts: list[Any], recorder: list[Any] | None) -> t
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.user_messages: list[str] = []
             self.assistant_messages: list[str] = []
+            self.init_kwargs = _kwargs
             if recorder is not None:
                 recorder.append(self)
 
@@ -1374,6 +1375,26 @@ class TestJudgeScoringSemantics:
         judge = recorder[0]
         assert judge.assistant_messages == ["display projection"]
         assert "spoken projection" not in judge.assistant_messages
+
+    def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 10 gauntlet, Logic finding 3: the EvalJudge cap and
+        ``build_judge_request_kwargs``'s default must be the same constant,
+        not two independently-maintained literals."""
+        from scripts import eval_common
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?"),),
+            verdicts=[],
+            judge_recorder=recorder,
+        )
+        judge = recorder[0]
+        assert judge.init_kwargs["max_tokens"] == eval_common.JUDGE_MAX_TOKENS
 
     def test_judge_call_failed_reason_is_classified_as_judge_error(
         self, monkeypatch: pytest.MonkeyPatch

@@ -48,6 +48,7 @@ from scripts.eval_common import (
     WORKER_CANDIDATES,
     WORKER_MANIFEST_TOOLS,
     build_judge_llm_service,
+    build_judge_request_kwargs,
     confined_output_path,
     effective_effort_for_manifest_lookup,
     error_text,
@@ -177,11 +178,16 @@ def _build_worker_kwargs(model: str, effort: str | None) -> dict[str, Any]:
 
 
 def _judge_kwargs(judge_model: str) -> dict[str, Any]:
-    return {
-        "model": judge_model,
-        "messages": [{"role": "user", "content": JUDGE_PROBE_MESSAGE}],
-        "max_completion_tokens": 16,
-    }
+    """Built from eval_common's shared judge-shape helper rather than
+    hand-listing kwargs -- same rationale as ``_build_router_kwargs`` above.
+    ``max_completion_tokens`` is deliberately 16, not ``JUDGE_MAX_TOKENS``:
+    this is an existence/credential probe, not a verdict call.
+    """
+    return build_judge_request_kwargs(
+        judge_model,
+        messages=[{"role": "user", "content": JUDGE_PROBE_MESSAGE}],
+        max_completion_tokens=16,
+    )
 
 
 def build_plan(*, judge_model: str, router_timeout_seconds: float) -> list[dict[str, Any]]:

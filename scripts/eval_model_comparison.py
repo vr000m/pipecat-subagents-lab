@@ -41,6 +41,7 @@ from evals.scenarios import SCENARIOS, SCENARIOS_BY_NAME, Scenario
 from scripts.eval_common import (
     DEFAULT_JUDGE_MODEL,
     DEFAULT_MANIFEST_RELATIVE_PATH,
+    JUDGE_MAX_TOKENS,
     MANIFEST_VERSION,
     REPO_ROOT,
     ROUTER_BASELINE,
@@ -122,13 +123,6 @@ _WAIT_FOR_MARGIN_SECONDS = 10.0
 # router/worker-shaped call, so it has no natural relationship to
 # router_timeout_seconds/foreground_search_timeout_seconds to derive from.
 _JUDGE_EVALUATE_TIMEOUT_SECONDS = 60.0
-
-# EvalJudge's own library default (200) is sized for a non-reasoning judge
-# model's one-line JSON verdict. build_judge_llm_service() now pins a
-# reasoning-model judge to minimal effort (see its docstring), but "minimal"
-# still spends some tokens on hidden reasoning before the visible verdict --
-# raised as defense-in-depth alongside that fix, not as the fix itself.
-_JUDGE_MAX_TOKENS = 500
 
 # Rough, deliberately conservative per-call dollar estimates for the
 # --dry-run cost preview. These are not billed-price lookups -- just enough
@@ -1224,7 +1218,7 @@ async def run_cell(
         host = build_session_for_run(config, measurement_sink=sink)
         judge = EvalJudge(
             build_judge_llm_service(judge_model, config.openai_api_key),
-            max_tokens=_JUDGE_MAX_TOKENS,
+            max_tokens=JUDGE_MAX_TOKENS,
         )
 
         await host.start()

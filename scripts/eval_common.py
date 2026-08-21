@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from server.composition import build_session_host
-from server.config import Config, PromotionManifest
+from server.config import Config, PromotionManifest, default_reasoning_effort_for_model
 from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import SAFE_FALLBACK_TEXTS, TIMEOUT_FALLBACK_TEXTS, SessionHost
 from server.router import effective_router_reasoning_effort
@@ -53,6 +53,7 @@ from server.router import effective_router_reasoning_effort
 __all__ = [
     "DEFAULT_JUDGE_MODEL",
     "DEFAULT_MANIFEST_RELATIVE_PATH",
+    "JUDGE_MAX_TOKENS",
     "MANIFEST_VERSION",
     "REPO_ROOT",
     "ROUTER_BASELINE",
@@ -66,6 +67,7 @@ __all__ = [
     "Candidate",
     "CollectingMeasurementSink",
     "build_judge_llm_service",
+    "build_judge_request_kwargs",
     "build_session_for_run",
     "confined_output_path",
     "effective_effort_for_manifest_lookup",
@@ -312,6 +314,45 @@ def build_session_for_run(
     )
 
 
+# EvalJudge's own library default (200) is sized for a non-reasoning judge
+# model's one-line JSON verdict. build_judge_llm_service() pins a
+# reasoning-model judge to minimal effort (see its docstring), but "minimal"
+# still spends some tokens on hidden reasoning before the visible verdict --
+# raised as defense-in-depth alongside that fix, not as the fix itself. The
+# single source of truth for the EvalJudge cap and
+# build_judge_request_kwargs()'s default, so the two cannot drift (round 10
+# gauntlet, Logic finding 3).
+JUDGE_MAX_TOKENS = 500
+
+
+def _judge_extra_kwargs(model: str) -> dict[str, Any]:
+    """The model-conditional Chat Completions extras every judge request
+    carries. Single source for ``build_judge_llm_service()``'s
+    ``Settings.extra`` and ``build_judge_request_kwargs()``'s flat kwargs, so
+    ``scripts/verify_eval_candidates.py``'s probe cannot attest to a request
+    shape production no longer sends (round 10 gauntlet, Logic finding 3).
+    """
+    effort = default_reasoning_effort_for_model(model)
+    return {"reasoning_effort": effort} if effort is not None else {}
+
+
+def build_judge_request_kwargs(
+    model: str, *, messages: list[dict[str, str]], max_completion_tokens: int = JUDGE_MAX_TOKENS
+) -> dict[str, Any]:
+    """The exact judge request-kwargs shape sent to the Chat Completions API,
+    shared by the real judge (via ``build_judge_llm_service``, indirectly)
+    and ``scripts/verify_eval_candidates.py``'s probe -- see
+    ``_judge_extra_kwargs`` for why the reasoning-effort piece is hoisted out
+    rather than duplicated at each call site.
+    """
+    return {
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": max_completion_tokens,
+        **_judge_extra_kwargs(model),
+    }
+
+
 def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     """Build the judge's Chat Completions LLM service with an explicit credential.
 
@@ -336,20 +377,20 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     effort override, gpt-5-mini can spend that entire budget on hidden
     reasoning tokens and emit no visible text at all -- observed live as
     every judge call returning ``"judge returned empty response"`` across an
-    entire eval matrix (round 9 gauntlet follow-up). Reuse
-    ``effective_router_reasoning_effort``'s "gpt-5* defaults to minimal"
-    rule -- its own docstring already anticipates exactly this reuse -- and
-    thread it through ``Settings.extra``, which
+    entire eval matrix (round 9 gauntlet follow-up). Shares the
+    ``gpt-5* -> minimal`` model-naming rule with the router via
+    ``default_reasoning_effort_for_model`` (through ``_judge_extra_kwargs``);
+    it does **not** go through ``effective_router_reasoning_effort``, whose
+    contract is the router's own wire-level prediction and whose policy must
+    stay retunable without moving the judge (round 10 gauntlet, Architecture
+    finding 4). Threaded through ``Settings.extra``, which
     ``build_chat_completion_params`` merges into the raw ``create()`` kwargs;
     Chat Completions' ``reasoning_effort`` is a flat string parameter, unlike
     the Responses API's nested ``reasoning.effort``.
     """
     from pipecat.services.openai.llm import OpenAILLMService
 
-    extra: dict[str, Any] = {}
-    effort = effective_router_reasoning_effort(model, None)
-    if effort is not None:
-        extra["reasoning_effort"] = effort
+    extra = _judge_extra_kwargs(model)
 
     return OpenAILLMService(
         settings=OpenAILLMService.Settings(model=model, extra=extra), api_key=api_key

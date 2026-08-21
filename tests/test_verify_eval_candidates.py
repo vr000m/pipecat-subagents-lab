@@ -155,3 +155,36 @@ class TestProbeBuildersCallProductionsOwnSharedBuilder:
         actual = verify_module._build_worker_kwargs("gpt-5", "high")
 
         assert actual == expected
+
+
+class TestJudgeProbeKwargsShareProductionsShape:
+    """Round 10 gauntlet, Logic finding 3: ``_judge_kwargs`` is now built
+    from ``eval_common.build_judge_request_kwargs`` -- the same helper
+    ``build_judge_llm_service`` derives its request shape from -- so the
+    probe cannot attest to a ``reasoning_effort`` shape production no longer
+    sends."""
+
+    def test_reasoning_model_probe_carries_reasoning_effort(self) -> None:
+        kwargs = verify_module._judge_kwargs("gpt-5-mini")
+
+        assert kwargs["reasoning_effort"] == "minimal"
+
+    def test_non_reasoning_model_probe_has_no_reasoning_effort_key(self) -> None:
+        kwargs = verify_module._judge_kwargs("gpt-4.1-mini")
+
+        assert "reasoning_effort" not in kwargs
+
+    def test_probe_token_cap_stays_16_not_judge_max_tokens(self) -> None:
+        kwargs = verify_module._judge_kwargs("gpt-5-mini")
+
+        assert kwargs["max_completion_tokens"] == 16
+
+    def test_parity_with_build_judge_llm_service(self) -> None:
+        from scripts.eval_common import build_judge_llm_service
+
+        for model in ("gpt-5-mini", "gpt-4.1-mini"):
+            probe_kwargs = verify_module._judge_kwargs(model)
+            service = build_judge_llm_service(model, "sk-test")
+            assert probe_kwargs.get("reasoning_effort") == service._settings.extra.get(
+                "reasoning_effort"
+            )

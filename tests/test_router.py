@@ -180,6 +180,12 @@ class TestEffectiveRouterReasoningEffort:
     def test_unset_effort_omits_reasoning_for_non_gpt5_models(self) -> None:
         assert effective_router_reasoning_effort("some-other-model", None) is None
 
+    def test_explicit_resolved_effort_still_wins_over_the_naming_default(self) -> None:
+        """Round 10 gauntlet, Architecture finding 4: after delegating the
+        naming rule to ``default_reasoning_effort_for_model``, the router's
+        own resolved-config precedence must still take priority over it."""
+        assert effective_router_reasoning_effort("gpt-5-mini", "high") == "high"
+
 
 def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validation() -> None:
     model = FakeRouterModel(decision_payload())

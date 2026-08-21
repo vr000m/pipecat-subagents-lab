@@ -14,12 +14,15 @@ from types import SimpleNamespace
 
 import pytest
 
+import scripts.eval_common as eval_common_module
 import server.app as app_module
 import server.composition as composition_module
 from scripts.eval_common import (
+    JUDGE_MAX_TOKENS,
     SAFE_FALLBACKS,
     _redact,
     build_judge_llm_service,
+    build_judge_request_kwargs,
     build_session_for_run,
     confined_output_path,
     turn_correlated_routing_action,
@@ -46,8 +49,6 @@ def test_build_session_for_run_delegates_to_the_one_composition_root(
     def _recording_build(config, **kwargs):
         calls.append({"config": config, **kwargs})
         return real_build(config, **kwargs)
-
-    import scripts.eval_common as eval_common_module
 
     monkeypatch.setattr(eval_common_module, "build_session_host", _recording_build)
     monkeypatch.setattr(app_module, "build_session_host", _recording_build)
@@ -115,7 +116,6 @@ def test_router_kwarg_is_forwarded(monkeypatch) -> None:
     relative to ``build_session_host``'s own -- confirm it's actually
     forwarded, by identity, rather than a fresh router being built.
     """
-    import scripts.eval_common as eval_common_module
 
     captured: dict[str, object] = {}
     real_build = composition_module.build_session_host
@@ -248,3 +248,71 @@ class TestBuildJudgeLlmServicePinsReasoningEffort:
     def test_credential_is_still_threaded_through(self) -> None:
         service = build_judge_llm_service("gpt-5-mini", api_key="sk-test-credential")
         assert service._client.api_key == "sk-test-credential"
+
+
+class TestBuildJudgeRequestKwargs:
+    """Round 10 gauntlet, Logic finding 3: build_judge_request_kwargs() is
+    the single source of truth for the judge request shape, shared with
+    build_judge_llm_service() via _judge_extra_kwargs(). Previously
+    scripts/verify_eval_candidates.py hand-listed its own kwargs, which could
+    silently drift from what build_judge_llm_service() actually sends.
+    """
+
+    def test_default_max_completion_tokens_is_judge_max_tokens(self) -> None:
+        kwargs = build_judge_request_kwargs(
+            "gpt-4.1-mini", messages=[{"role": "user", "content": "hi"}]
+        )
+        assert kwargs["max_completion_tokens"] == JUDGE_MAX_TOKENS
+
+    def test_explicit_max_completion_tokens_overrides_the_default(self) -> None:
+        kwargs = build_judge_request_kwargs(
+            "gpt-5-mini", messages=[{"role": "user", "content": "hi"}], max_completion_tokens=16
+        )
+        assert kwargs["max_completion_tokens"] == 16
+
+    def test_gpt5_model_carries_reasoning_effort(self) -> None:
+        kwargs = build_judge_request_kwargs(
+            "gpt-5-mini", messages=[{"role": "user", "content": "hi"}]
+        )
+        assert kwargs["reasoning_effort"] == "minimal"
+
+    def test_non_gpt5_model_has_no_reasoning_effort_key(self) -> None:
+        kwargs = build_judge_request_kwargs(
+            "gpt-4.1-mini", messages=[{"role": "user", "content": "hi"}]
+        )
+        assert "reasoning_effort" not in kwargs
+
+    def test_parity_with_build_judge_llm_service(self) -> None:
+        """The actual regression guard: the probe's declared shape and the
+        real judge client's request shape must never disagree."""
+        for model in ("gpt-5-mini", "gpt-4.1-mini"):
+            probe_kwargs = build_judge_request_kwargs(
+                model, messages=[{"role": "user", "content": "hi"}]
+            )
+            service = build_judge_llm_service(model, "sk-test")
+            assert probe_kwargs.get("reasoning_effort") == service._settings.extra.get(
+                "reasoning_effort"
+            )
+
+
+class TestJudgeEffortDecoupledFromRouterPolicy:
+    """Round 10 gauntlet, Architecture finding 4: the judge's reasoning
+    effort must not move when the router's own resolved-config policy is
+    retuned -- it shares only the gpt-5* naming rule, not the router's
+    contract.
+    """
+
+    def test_retuning_router_policy_does_not_move_the_judge(self, monkeypatch) -> None:
+        # Patched on eval_common_module, not server.router: build_judge_llm_service()
+        # no longer calls effective_router_reasoning_effort at all (it calls
+        # default_reasoning_effort_for_model via _judge_extra_kwargs), so this
+        # proves the decoupling regardless of which name is patched.
+        monkeypatch.setattr(
+            eval_common_module,
+            "effective_router_reasoning_effort",
+            lambda model, effort: "high",
+        )
+
+        service = build_judge_llm_service("gpt-5-mini", "sk-test")
+
+        assert service._settings.extra["reasoning_effort"] == "minimal"

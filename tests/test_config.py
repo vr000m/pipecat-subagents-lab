@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from server.config import Config, ConfigError, FeaturePolicy, load_config
+from server.config import (
+    Config,
+    ConfigError,
+    FeaturePolicy,
+    default_reasoning_effort_for_model,
+    load_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1923,3 +1929,17 @@ class TestReasoningEffortInheritance:
         config = load_config(config_file=config_file, env={})
 
         assert config.resolve_worker_reasoning_effort("deep") == "medium"
+
+
+class TestDefaultReasoningEffortForModel:
+    """Round 10 gauntlet, Architecture finding 4: the gpt-5*-naming rule,
+    hoisted out of ``server.router.effective_router_reasoning_effort`` so a
+    non-router caller (the eval judge) can share it without depending on the
+    router's own resolved-config precedence."""
+
+    def test_gpt5_family_defaults_to_minimal(self) -> None:
+        assert default_reasoning_effort_for_model("gpt-5.6-luna") == "minimal"
+        assert default_reasoning_effort_for_model("gpt-5-mini") == "minimal"
+
+    def test_non_gpt5_model_has_no_default(self) -> None:
+        assert default_reasoning_effort_for_model("gpt-4.1-mini") is None

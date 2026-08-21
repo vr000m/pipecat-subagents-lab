@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .config import Config
+from .config import Config, default_reasoning_effort_for_model
 from .contracts import RoutingDecision
 from .structured_outputs import structured_text_format
 
@@ -39,18 +39,20 @@ def build_openai_async_responses_client(api_key: str, *, timeout: float = 75.0) 
 
 
 def effective_router_reasoning_effort(model: str, resolved_effort: str | None) -> str | None:
-    """The reasoning-effort value ``LazyRouterProvider.__call__`` actually sends.
+    """The reasoning-effort value ``LazyRouterProvider.__call__`` actually sends
+    for the ROUTER.
 
-    Single source of truth for the "unset effort + a gpt-5* model defaults to
-    minimal" rule, so a caller that needs to *predict* the wire-level effort
-    without making the call (e.g. the eval runner's manifest-lookup) never
-    hand-duplicates this conditional and risks drifting from it.
+    Router-specific: it layers the router's resolved-config precedence over
+    the model-naming default. A caller that needs to *predict* the router's
+    wire-level effort without making the call (the eval runner's
+    manifest-lookup) uses this; a caller that only wants the model-naming
+    default for some OTHER role must call
+    ``default_reasoning_effort_for_model`` directly rather than borrowing this
+    function's router contract (round 10 gauntlet, Architecture finding 4).
     """
     if resolved_effort is not None:
         return resolved_effort
-    if model.startswith("gpt-5"):
-        return "minimal"
-    return None
+    return default_reasoning_effort_for_model(model)
 
 
 def build_router_request_kwargs(

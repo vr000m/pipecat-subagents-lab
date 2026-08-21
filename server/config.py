@@ -285,6 +285,24 @@ class Config:
         return replace(self, **{f"{service}_endpoint": (transport, address)})
 
 
+def default_reasoning_effort_for_model(model: str) -> str | None:
+    """The reasoning effort to send for ``model`` when no effort was configured.
+
+    Model-naming rule only, deliberately independent of any one caller's
+    policy: OpenAI's gpt-5* reasoning models otherwise default to a
+    provider-side effort that can consume a small completion budget entirely
+    on hidden reasoning tokens. Non-gpt-5* models get no effort param.
+
+    Kept separate from ``server.router.effective_router_reasoning_effort``
+    (which layers the ROUTER's resolved-config precedence on top of this) so
+    retuning the router's own default policy cannot silently change an
+    unrelated caller -- ``scripts/eval_common.py``'s judge builder shares this
+    naming rule, not the router's policy (round 10 gauntlet, Architecture
+    finding 4).
+    """
+    return "minimal" if model.startswith("gpt-5") else None
+
+
 @dataclass(frozen=True)
 class FeaturePolicy:
     """Immutable v0.1.3 kill-switch snapshot, resolved once from a `Config`.
