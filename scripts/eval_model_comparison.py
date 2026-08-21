@@ -2344,19 +2344,35 @@ def _shipped_config_cells_annotation(
     return result
 
 
+@dataclass(frozen=True)
+class ShippedCellsInput:
+    """`build_report()`'s shipped-annotation input, bundled.
+
+    Round 7 F3: `build_report(shipped=..., pairs=...)` used to take these as
+    two independently-optional keyword arguments whose legality was
+    correlated (`shipped` without `pairs` was a runtime `ValueError`,
+    `pairs` without `shipped` was silently ignored) rather than
+    structurally enforced. `pairs` only exists to resolve `shipped`'s
+    annotation (`_shipped_config_cells_annotation` needs both together, see
+    its own docstring) -- a caller that has one has the other, so
+    bundling them into one dataclass makes "shipped without pairs"
+    unrepresentable instead of runtime-checked, matching this module's
+    existing convention (`RunPair`, `CallAccounting`: things that travel
+    together are a dataclass).
+    """
+
+    shipped: tuple[Candidate, Candidate]
+    pairs: tuple[RunPair, ...]
+
+
 def build_report(
     outcomes: list[CellOutcome],
     *,
     judge_model: str,
     call_accounting: CallAccounting | None = None,
     repeat_count: int = 1,
-    shipped: tuple[Candidate, Candidate] | None = None,
-    pairs: Sequence[RunPair] | None = None,
+    shipped_cells: ShippedCellsInput | None = None,
 ) -> dict[str, Any]:
-    if shipped is not None and pairs is None:
-        raise ValueError(
-            "build_report(shipped=...) also requires pairs=... to resolve each cell's candidates"
-        )
     # Only `failure_reasons` is used directly -- the status itself is derived
     # once, from the FULL reason list (compute_pass_fail's plus any
     # annotation-failure reason appended below), via `_overall_status()`.
@@ -2406,13 +2422,13 @@ def build_report(
     # a key that never existed in the pre-`shipped` report shape is only added
     # when it carries a real value, so a strict-key-set consumer of an older
     # report is not broken by a null (round 5 restart2, Architecture A1).
-    if shipped is not None:
-        # pairs is guaranteed not None here: the top-of-function raise above
-        # covers the identical `shipped is not None and pairs is None`
-        # condition, so this second check would be provably unreachable
-        # (round 6 gauntlet, Architecture A5) -- dropped rather than kept
-        # as an assert, since this file's convention is ValueError for
-        # reachable invariants and no guard at all for unreachable ones.
+    if shipped_cells is not None:
+        # Round 7 F3: `shipped`/`pairs` used to be two correlated-optional
+        # keyword arguments with a runtime ValueError guarding the illegal
+        # combination (shipped without pairs). `ShippedCellsInput` makes
+        # that state unrepresentable, so the guard -- and the "provably
+        # unreachable" second check round 6's Architecture A5 already
+        # dropped -- are both gone; there is nothing left to check here.
         # A `pair_label` miss here is a caller bug (see
         # _shipped_config_cells_annotation's docstring: every outcome is
         # produced from `pairs` by construction), not a config/registry
@@ -2437,7 +2453,7 @@ def build_report(
         annotation_reasons: list[str] = []
         try:
             report["shipped_config_cells"] = _shipped_config_cells_annotation(
-                outcomes, shipped, pairs
+                outcomes, shipped_cells.shipped, shipped_cells.pairs
             )
         except ValueError as exc:
             report["shipped_config_cells"] = {"error": str(exc)}
@@ -2818,8 +2834,7 @@ def main(argv: list[str] | None = None) -> int:
         judge_model=args.judge_model,
         call_accounting=accounting,
         repeat_count=args.repeat,
-        shipped=shipped,
-        pairs=pairs,
+        shipped_cells=ShippedCellsInput(shipped=shipped, pairs=tuple(pairs)),
     )
     print_report_summary(report)
     # The aggregate report is always persisted to a file, not only when

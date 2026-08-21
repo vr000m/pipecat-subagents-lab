@@ -994,19 +994,18 @@ class TestReportAggregation:
         report = eval_runner.build_report(
             outcomes,
             judge_model="gpt-5-mini",
-            shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
-            pairs=pairs,
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE), pairs=pairs
+            ),
         )
         assert "shipped_config_cells" in report
         assert report["shipped_config_cells"] is not None
 
-    def test_build_report_rejects_shipped_without_pairs(self) -> None:
-        with pytest.raises(ValueError, match="pairs"):
-            eval_runner.build_report(
-                [],
-                judge_model="gpt-5-mini",
-                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
-            )
+    # test_build_report_rejects_shipped_without_pairs deleted (round 7 F3):
+    # `shipped`/`pairs` were two correlated-optional keyword arguments with a
+    # runtime ValueError guarding "shipped without pairs". They are now one
+    # ShippedCellsInput(shipped, pairs) value object, which makes that illegal
+    # state unrepresentable -- there is no longer a runtime check to pin.
 
     def test_annotation_helper_itself_still_raises_on_an_outcome_whose_pair_is_not_in_pairs(
         self,
@@ -1065,8 +1064,9 @@ class TestReportAggregation:
         report = eval_runner.build_report(
             outcomes,
             judge_model="gpt-5-mini",
-            shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
-            pairs=pairs,
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE), pairs=pairs
+            ),
         )
 
         assert "nonexistent" in report["shipped_config_cells"]["error"]
@@ -1153,8 +1153,9 @@ class TestShippedConfigCellsAnnotationMarksUnmatchedRoles:
         report = eval_runner.build_report(
             outcomes,
             judge_model="gpt-5-mini",
-            shipped=(no_match_router, eval_runner.WORKER_BASELINE),
-            pairs=pairs,
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(no_match_router, eval_runner.WORKER_BASELINE), pairs=pairs
+            ),
         )
         assert capsys.readouterr().err == ""
 
@@ -5507,8 +5508,9 @@ class TestDefaultSweepAnchorsOnShippedConfig:
         report = eval_runner.build_report(
             outcomes,
             judge_model="judge",
-            shipped=(shipped_router, shipped_worker),
-            pairs=pairs,
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(shipped_router, shipped_worker), pairs=pairs
+            ),
         )
 
         shipped_cells = report["shipped_config_cells"]
