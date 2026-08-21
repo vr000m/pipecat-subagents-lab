@@ -16,8 +16,9 @@
 - Stage explicit paths only; never use `git add .`, `git add -A`, or `git add --all`.
 - Run formatting, linting, tests, and a secret scan before pushing.
 - `just check` is the recommended local entrypoint (lint, types, tests, web
-  build, web tests in one command); see `README.md`'s "Verification commands"
-  section for the underlying `uv`/`bun` commands it wraps.
+  build, web tests, and a real-process smoke in one command); see
+  `README.md`'s "Verification commands" section for the underlying `uv`/`bun`
+  commands it wraps.
 
 ## Router/worker model evaluation
 

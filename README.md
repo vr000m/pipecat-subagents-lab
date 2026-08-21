@@ -230,8 +230,10 @@ the raw `uv`/`bun` commands above remain the reference for scripting or
 running a single check in isolation. Its `sync`/`build` recipes intentionally
 use the same `--frozen` / `--frozen-lockfile` flags as
 `.github/workflows/ci.yml` so a lockfile drift fails the same way locally and
-in CI — keep the two in sync by hand if either's command list changes;
-neither file reads the other.
+in CI. `tests/test_justfile_ci_parity.py` asserts every `uv run`/`bun`
+command CI's `test` job executes is reachable from `just check`'s recipe
+closure, so the two files drifting out of sync now fails a test rather than
+depending on a developer noticing by hand.
 
 `uv run mypy` checks every module under `server/` by default, so a newly added
 file is type-gated without anyone remembering to opt it in. The explicit
