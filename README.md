@@ -221,13 +221,17 @@ bun run lint
 ```
 
 A `justfile` at the repo root wraps the Python half of these into `just
-sync` / `just test` / `just build` / `just web-test` / `just check` (the
+sync` / `just py-check` / `just build` / `just web-test` / `just check` (the
 full compile+test pipeline) / `just run` (starts the real server, loading
 `~/.secrets/ai.env` or `$AI_ENV_FILE`) / `just all` (install, check, run).
-Its `sync`/`build` recipes intentionally use the same `--frozen` /
-`--frozen-lockfile` flags as `.github/workflows/ci.yml` so a lockfile
-drift fails the same way locally and in CI — keep the two in sync by hand
-if either's command list changes; neither file reads the other.
+`just check` is the recommended local entrypoint before opening or updating
+a PR — it runs everything `just py-check`/`build`/`web-test` do in one command;
+the raw `uv`/`bun` commands above remain the reference for scripting or
+running a single check in isolation. Its `sync`/`build` recipes intentionally
+use the same `--frozen` / `--frozen-lockfile` flags as
+`.github/workflows/ci.yml` so a lockfile drift fails the same way locally and
+in CI — keep the two in sync by hand if either's command list changes;
+neither file reads the other.
 
 `uv run mypy` checks every module under `server/` by default, so a newly added
 file is type-gated without anyone remembering to opt it in. The explicit
@@ -532,7 +536,14 @@ Router/worker model evaluation (run in this order):
 
 - `verify_eval_candidates.py` — live-verifies every candidate (model, effort,
   tools) tuple with production-equivalent request shapes and writes a
-  versioned manifest that gates the runner below.
+  versioned manifest that gates the runner below. Its judge probe pins
+  `reasoning_effort="minimal"` (`scripts/eval_common.py`'s
+  `build_judge_request_kwargs`/`_judge_extra_kwargs`) because the judge runs
+  the Chat Completions API on a `gpt-5*` reasoning model: without an explicit
+  low effort, hidden reasoning tokens can consume the entire
+  `max_completion_tokens` budget before any verdict text is emitted, unlike
+  the router/worker (Responses API), which already configures effort
+  explicitly per candidate.
 - `eval_model_comparison.py` — paid runner that drives `SessionHost` through
   its real connect/turn lifecycle for each router/worker model+effort
   candidate and scenario, scoring replies via `pipecat.evals.judge.EvalJudge`
@@ -540,7 +551,13 @@ Router/worker model evaluation (run in this order):
   `--dry-run` (zero live calls), `--router`/`--worker`/`--scenario` for a
   single cheap smoke pair, `--max-calls`/`--max-cost` spend gates, and
   `--i-know-the-manifest-is-stale` to proceed against a manifest whose
-  recorded source commit no longer matches `HEAD`. Every run's aggregate
+  recorded source commit no longer matches `HEAD` — the manifest's
+  `source_commit` is checked for exact equality, so any commit made after the
+  manifest was written trips staleness even when the commit is unrelated to
+  the OpenAI request shapes the manifest attests to; regenerate a fresh
+  manifest with `verify_eval_candidates.py` rather than reaching for the
+  override unless you've confirmed the intervening commits didn't touch
+  model IDs, effort values, or request-kwargs building. Every run's aggregate
   report is always persisted (default: a timestamped file under
   `.review-plan/eval-reports/`; override with `--out`), not only when `--out`
   is passed.
