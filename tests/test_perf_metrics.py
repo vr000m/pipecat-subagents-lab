@@ -785,6 +785,25 @@ class TestObserverCallbackFactories:
         assert record.fields["duration_ms"] == pytest.approx(duration_secs * 1000, abs=0.05)
         assert record.fields["duration_ms"] != pytest.approx(duration_secs, abs=0.05)
 
+    def test_turn_ended_clamps_negative_duration_secs_to_zero(self) -> None:
+        """TurnTrackingObserver can report a negative duration_secs when an
+        interruption's frame timestamp races a delayed turn-end timer
+        (frame-push timestamps come from independently-scheduled pipeline
+        tasks). The "ms" field validator rejects negative values outright, so
+        this handler must clamp rather than let build_record drop the whole
+        pipecat_turn_end record."""
+        sink = CollectingMeasurementSink()
+        ctx = PerfConnectionContext(
+            session_id="session-1", origin_epoch=1, connection_worker="browser-1"
+        )
+        _on_started, on_turn_ended = make_turn_tracking_handlers(ctx, sink)
+
+        asyncio.run(on_turn_ended(object(), 5, -1.383593833, False))
+
+        record = sink.records[0]
+        assert record.event == "pipecat_turn_end"
+        assert record.fields["duration_ms"] == 0.0
+
     def test_startup_report_total_ms_converts_from_total_duration_secs(self) -> None:
         sink = CollectingMeasurementSink()
         ctx = PerfConnectionContext(

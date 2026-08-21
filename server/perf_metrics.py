@@ -624,7 +624,20 @@ def make_turn_tracking_handlers(
     ) -> None:
         fields = context.base_fields()
         fields["pipecat_turn"] = turn_count
-        fields["duration_ms"] = duration_secs * 1000
+        duration_ms = duration_secs * 1000
+        # Pipecat's TurnTrackingObserver derives duration from frame push
+        # timestamps recorded by independently-scheduled pipeline tasks
+        # (e.g. an interruption's UserStartedSpeakingFrame racing a delayed
+        # turn-end timer); under that race the end timestamp can land before
+        # the recorded start timestamp, yielding a negative duration. Clamp
+        # rather than let the "ms" field validator drop the whole record.
+        if not math.isfinite(duration_ms) or duration_ms < 0:
+            logger.warning(
+                f"pipecat_turn_end: turn={turn_count} got a non-finite or negative "
+                f"duration_ms={duration_ms!r} from TurnTrackingObserver; clamping to 0.0"
+            )
+            duration_ms = 0.0
+        fields["duration_ms"] = duration_ms
         fields["interrupted"] = bool(was_interrupted)
         _safe_emit(sink, "pipecat_turn_end", fields)
 
