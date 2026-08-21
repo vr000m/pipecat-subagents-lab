@@ -42,7 +42,7 @@ import asyncio
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, get_args
 
 import pytest
 
@@ -141,7 +141,7 @@ def _accepted_judge_entry(model: str) -> dict[str, Any]:
     request_kwargs = {
         "model": model,
         "messages": [{"role": "user", "content": "probe"}],
-        **eval_runner._judge_extra_kwargs(model),
+        **eval_runner.judge_extra_kwargs(model),
     }
     return {
         "kind": "judge",
@@ -430,6 +430,49 @@ class TestMatrixBuilding:
         assert default_keys <= full_keys
         assert default_keys != full_keys
 
+    def test_full_matrix_dedupes_wire_identical_cells(self, monkeypatch: Any) -> None:
+        """Round 5 restart2, Logic L4: full_matrix_pairs() must route through
+        _dedupe_pairs() exactly like default_sweep_pairs() does, so a
+        wire-identical candidate cannot silently double-run and double-bill.
+
+        With enforcement derived from object identity and dedup keyed on wire
+        identity, a wire-identical CLONE OF THE BASELINE legitimately
+        disagrees on enforce_latency_budget with the real baseline cell
+        (baseline x baseline is enforced; clone x baseline is not, since the
+        clone `is not ROUTER_BASELINE`) -- that is the intended, documented
+        behavior of _dedupe_pairs's new ValueError guard (a wire-identical
+        cell disagreeing on enforcement is a real configuration bug), so this
+        case must raise. A clone that is wire-identical to another candidate
+        but involves neither baseline dedupes silently instead.
+        """
+        # Case 1: a router candidate wire-identical to ROUTER_BASELINE --
+        # baseline x baseline is enforced, clone x baseline is not, so the
+        # collision legitimately raises.
+        baseline_clone = eval_runner.Candidate(
+            label="baseline-clone",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        monkeypatch.setattr(
+            eval_runner, "ROUTER_CANDIDATES", (baseline_clone, *eval_runner.ROUTER_CANDIDATES)
+        )
+        with pytest.raises(ValueError, match="disagrees on enforce_latency_budget"):
+            eval_runner.full_matrix_pairs()
+        monkeypatch.undo()
+
+        # Case 2: two non-baseline candidates wire-identical to EACH OTHER --
+        # neither is the baseline, so enforcement agrees (both False) and the
+        # collision dedupes without raising.
+        twin_a = eval_runner.Candidate(label="twin-a", role="router", model="gpt-5", effort="low")
+        twin_b = eval_runner.Candidate(label="twin-b", role="router", model="gpt-5", effort="low")
+        monkeypatch.setattr(
+            eval_runner, "ROUTER_CANDIDATES", (twin_a, twin_b, *eval_runner.ROUTER_CANDIDATES)
+        )
+        pairs = eval_runner.full_matrix_pairs()
+        keys = [eval_runner._pair_cell_key(p) for p in pairs]
+        assert len(keys) == len(set(keys))
+
 
 class TestLatencyEnforcementIsExplicitNotLabelDerived:
     """Regression for round-4 restart, Architecture finding 1 / Logic finding
@@ -565,7 +608,7 @@ class TestDedupePairsGuardsEnforcementConsistency:
             eval_runner.RunPair(router_b, worker, enforce_latency_budget=False),
         ]
 
-        with pytest.raises(AssertionError, match="disagrees on enforce_latency_budget"):
+        with pytest.raises(ValueError, match="disagrees on enforce_latency_budget"):
             eval_runner._dedupe_pairs(pairs)
 
 
@@ -857,6 +900,58 @@ class TestReportAggregation:
         report = eval_runner.build_report([], judge_model="gpt-5-mini")
         assert report["call_accounting"] is None
 
+    def test_shipped_config_cells_key_is_absent_when_no_shipped_pair_is_supplied(self) -> None:
+        """Round 5 restart2, Architecture A1: `shipped_config_cells` follows
+        the same optional-key rule `_serialize_cell` already applies to
+        `repeats` -- a key that never existed in the pre-`shipped` report
+        shape must only be added when it carries a real value, not emitted
+        unconditionally as `None`."""
+        report = eval_runner.build_report([], judge_model="gpt-5-mini")
+        assert "shipped_config_cells" not in report
+
+    def test_shipped_config_cells_key_is_present_when_a_shipped_pair_is_supplied(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+        report = eval_runner.build_report(
+            outcomes,
+            judge_model="gpt-5-mini",
+            shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+            pairs=pairs,
+        )
+        assert "shipped_config_cells" in report
+        assert report["shipped_config_cells"] is not None
+
+    def test_build_report_rejects_shipped_without_pairs(self) -> None:
+        with pytest.raises(ValueError, match="pairs"):
+            eval_runner.build_report(
+                [],
+                judge_model="gpt-5-mini",
+                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+            )
+
+    def test_annotation_raises_on_an_outcome_whose_pair_is_not_in_pairs(self) -> None:
+        """Round 5 restart2, Architecture A2: the direct regression for the
+        silent-drop path _parse_pair_label's `.get()`-based lookup used to
+        take -- an outcome whose pair_label has no matching RunPair in
+        `pairs` is a caller bug and must raise loudly, not be dropped from
+        the annotation."""
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(
+                pair_label="router=nonexistent/worker=nonexistent", scenario_name="s", status="ok"
+            )
+        ]
+        with pytest.raises(ValueError, match="nonexistent"):
+            eval_runner.build_report(
+                outcomes,
+                judge_model="gpt-5-mini",
+                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+                pairs=pairs,
+            )
+
 
 # ---------------------------------------------------------------------------
 # --repeat: majority-vote aggregation across independent repetitions.
@@ -1004,6 +1099,32 @@ class TestCleanOutcomeRequiresStrictMajority:
         )
         overall_status, _reasons = eval_runner.compute_pass_fail([aggregated_cell])
         assert overall_status == "FAIL"
+
+
+class TestTieBreakPrioritiesCoverTheirLiteralVocabulary:
+    """Round 5 restart2, Logic L3: _majority_with_tiebreak()'s fallback loop
+    (`for candidate in priority: if candidate != clean and candidate in
+    counts: return candidate`) silently falls through to `return winner` --
+    the PLURALITY winner, inverting round-4 F4's strict-majority invariant --
+    if an observed non-clean value is missing from its priority tuple. All
+    three tuples are complete today (checked member-by-member), but nothing
+    enforced that a future literal addition keeps them that way. A module-
+    level `assert` would vanish under -O (see L2/A3, same file); a test
+    always runs under pytest and catches the omission at the only moment it
+    can be introduced: when a Literal alias gains a member.
+    """
+
+    @pytest.mark.parametrize(
+        ("priority", "literal"),
+        [
+            (eval_runner._CELL_STATUS_TIE_PRIORITY, eval_runner.CellStatus),
+            (eval_runner._TURN_STATUS_TIE_PRIORITY, eval_runner.TurnStatus),
+            (eval_runner._JUDGE_VERDICT_TIE_PRIORITY, eval_runner.JudgeVerdict),
+        ],
+    )
+    def test_every_literal_member_has_a_tie_break_rank(self, priority: Any, literal: Any) -> None:
+        assert set(priority) == set(get_args(literal))
+        assert len(priority) == len(set(priority))  # no duplicate ranks
 
 
 class TestAggregateCellRepeats:
@@ -1262,6 +1383,44 @@ class TestAggregateCellRepeats:
         assert overall_status == "FAIL"
         assert any("enforced latency budget exceeded" in r for r in reasons)
 
+    def test_timeouts_survive_a_setup_failed_first_repeat(self) -> None:
+        """Round 5 restart2, Logic L1: router_timeout_seconds/
+        foreground_search_timeout_seconds are config-derived and only
+        USUALLY uniform -- run_cell() returns both as None when setup raised
+        before _per_run_config() built a Config. Sampling repeats[0] reported
+        None for the whole aggregate whenever repeat 0 happened to be the one
+        that failed during setup, even though surviving repeats ran against a
+        real timeout."""
+        cells = [
+            eval_runner.CellOutcome(
+                pair_label="p",
+                scenario_name="s",
+                status="setup-error",
+                turns=[self._turn(status="setup-error")],
+                router_timeout_seconds=None,
+                foreground_search_timeout_seconds=None,
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p",
+                scenario_name="s",
+                status="ok",
+                turns=[self._turn()],
+                router_timeout_seconds=8.0,
+                foreground_search_timeout_seconds=8.0,
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p",
+                scenario_name="s",
+                status="ok",
+                turns=[self._turn()],
+                router_timeout_seconds=8.0,
+                foreground_search_timeout_seconds=8.0,
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.router_timeout_seconds == 8.0
+        assert aggregated.foreground_search_timeout_seconds == 8.0
+
     def test_a_non_baseline_pairs_budget_stays_report_only(self) -> None:
         """any() must not manufacture enforcement: no repeat of a non-baseline
         pair ever sets latency_budget_enforced, so the aggregate stays False and
@@ -1412,6 +1571,121 @@ class TestAggregateCellRepeats:
         assert nested.repeats is not None
         with pytest.raises(ValueError, match="depth-1"):
             self._aggregate([nested])
+
+
+class TestRepeatVerdictRequiresAWhollyCleanMajority:
+    """Round 5 restart2, Codex P1 / C1: compute_pass_fail() must gate an
+    aggregated cell's verdict on repeat-LEVEL cleanliness, not just on every
+    field independently having a clean majority. _aggregate_cell_repeats /
+    _aggregate_turn_repeats vote each field independently across repeats,
+    which is a cross-product: three repeats, each failing a DIFFERENT turn,
+    gives every field a 2/3 clean majority while 0/3 repeats were actually
+    clean end-to-end. Without this gate that aggregate silently read PASS.
+    """
+
+    def _turn(self, query: str, **overrides: Any) -> Any:
+        base: dict[str, Any] = {
+            "query": query,
+            "status": "ok",
+            "judge_verdict": "yes",
+            "deterministic_action_pass": True,
+        }
+        base.update(overrides)
+        return eval_runner.TurnOutcome(**base)
+
+    def _cell(self, turns: list[Any]) -> Any:
+        return eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="routing-regression",
+            status="ok",
+            turns=turns,
+        )
+
+    def _aggregate(self, cells: list[Any]) -> Any:
+        return eval_runner._aggregate_cell_repeats(
+            "router=baseline/worker=baseline",
+            "routing-regression",
+            cells,
+            max_routing_seconds=15,
+            max_latency_seconds=60,
+        )
+
+    def test_no_repeat_passing_all_turns_fails_even_when_every_field_has_a_majority(
+        self,
+    ) -> None:
+        # Repeat 1 fails "greeting" (deterministic action), repeat 2 fails
+        # "riga" (judge=no), repeat 3 fails "helsinki" (judge=no). Every
+        # single turn/field has a 2/3 clean majority across repeats, but NO
+        # repeat is clean end-to-end -- 0/3.
+        repeat_1 = self._cell(
+            [
+                self._turn("greeting", deterministic_action_pass=False),
+                self._turn("riga"),
+                self._turn("helsinki"),
+            ]
+        )
+        repeat_2 = self._cell(
+            [
+                self._turn("greeting"),
+                self._turn("riga", judge_verdict="no"),
+                self._turn("helsinki"),
+            ]
+        )
+        repeat_3 = self._cell(
+            [
+                self._turn("greeting"),
+                self._turn("riga"),
+                self._turn("helsinki", judge_verdict="no"),
+            ]
+        )
+        aggregated = self._aggregate([repeat_1, repeat_2, repeat_3])
+        assert aggregated.turns is not None
+
+        # (a) Per-field reporting is unchanged by the fix -- the aggregate's
+        # per-field summary is still the clean cross-product.
+        assert [t.judge_verdict for t in aggregated.turns] == ["yes", "yes", "yes"]
+        assert [t.deterministic_action_pass for t in aggregated.turns] == [True, True, True]
+
+        # (b) The VERDICT must be FAIL: this assertion fails on pre-fix HEAD
+        # (returns "PASS") and only passes after the fix.
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any("0/3" in reason for reason in reasons)
+
+    def test_a_strict_majority_of_wholly_clean_repeats_still_passes(self) -> None:
+        clean_1 = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        clean_2 = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        dirty = self._cell(
+            [
+                self._turn("greeting", deterministic_action_pass=False),
+                self._turn("riga"),
+                self._turn("helsinki"),
+            ]
+        )
+        aggregated = self._aggregate([clean_1, clean_2, dirty])
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "PASS"
+
+    def test_two_of_four_clean_repeats_is_not_a_strict_majority(self) -> None:
+        clean = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        dirty = self._cell(
+            [
+                self._turn("greeting", deterministic_action_pass=False),
+                self._turn("riga"),
+                self._turn("helsinki"),
+            ]
+        )
+        aggregated = self._aggregate([clean, clean, dirty, dirty])
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any("2/4" in reason for reason in reasons)
+
+    def test_single_run_cells_are_unaffected(self) -> None:
+        cell = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        assert cell.repeats is None
+        overall_status, reasons = eval_runner.compute_pass_fail([cell])
+        assert overall_status == "PASS"
+        assert not any(reason.startswith("repeat:") for reason in reasons)
 
 
 class TestRunMatrixRepeatWiring:
@@ -1753,6 +2027,48 @@ class TestSpendEstimateShownBeforeLiveRun:
         out = capsys.readouterr().out.lower()
         assert "call" in out
         assert "cost" in out or "$" in out
+
+    def test_shipped_candidates_resolved_before_any_paid_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 5 restart2, Logic L5: shipped_candidates() does its own
+        load_config() against the repo-tracked config.toml -- evaluating it
+        as a build_report() argument (its previous position, AFTER
+        asyncio.run(run_matrix(...)) completed) meant a raise there discarded
+        an already-paid-for matrix run. It must be resolved before any paid
+        call, so a raise here must prevent run_matrix from ever being
+        called."""
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+
+        def _raise_shipped() -> Any:
+            raise RuntimeError("shipped_candidates exploded")
+
+        monkeypatch.setattr(eval_runner, "shipped_candidates", _raise_shipped)
+
+        called = {"run_matrix": False}
+
+        async def _fake_run_matrix(*_args: Any, **_kwargs: Any) -> list[Any]:
+            called["run_matrix"] = True
+            return []
+
+        monkeypatch.setattr(eval_runner, "run_matrix", _fake_run_matrix)
+
+        with pytest.raises(RuntimeError, match="shipped_candidates exploded"):
+            eval_runner.main(
+                [
+                    "--router",
+                    "baseline",
+                    "--worker",
+                    "baseline",
+                    "--scenario",
+                    "single-turn-default",
+                    "--i-know-the-manifest-is-stale",
+                ]
+            )
+
+        assert called["run_matrix"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -4910,7 +5226,10 @@ class TestDefaultSweepAnchorsOnShippedConfig:
         ]
 
         report = eval_runner.build_report(
-            outcomes, judge_model="judge", shipped=(shipped_router, shipped_worker)
+            outcomes,
+            judge_model="judge",
+            shipped=(shipped_router, shipped_worker),
+            pairs=pairs,
         )
 
         shipped_cells = report["shipped_config_cells"]

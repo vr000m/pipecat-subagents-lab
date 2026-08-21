@@ -54,7 +54,6 @@ from scripts.eval_common import (
     WORKER_MANIFEST_TOOLS,
     Candidate,
     CollectingMeasurementSink,
-    _judge_extra_kwargs,
     build_judge_llm_service,
     build_judge_request_kwargs,
     build_session_for_run,
@@ -62,6 +61,7 @@ from scripts.eval_common import (
     effective_effort_for_manifest_lookup,
     error_text,
     git_head,
+    judge_extra_kwargs,
     latest_turn_stage_metrics,
     sanitize_reason,
     shipped_candidates,
@@ -209,8 +209,11 @@ class RunPair:
 
 def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
     """Identity by the request shape a cell actually sends, NOT by label --
-    the shipped pair carries label="shipped" but may be the same wire request
-    as an existing baseline/candidate cell.
+    a candidate carrying the shipped config.toml router/worker may be the
+    same wire request as an existing baseline/candidate cell even though its
+    label differs (round-5 restart, A5: shipped_candidates() now returns the
+    matching registered candidate's real label rather than label="shipped",
+    but two distinct labels can still collide on wire identity).
 
     Uses effective_effort_for_manifest_lookup(), NOT the raw declared effort:
     that resolver resolves "unset effort on a gpt-5* model" to "minimal", so
@@ -226,6 +229,18 @@ def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
     )
 
 
+def _is_historical_baseline_pair(router: Candidate, worker: Candidate) -> bool:
+    """Whether this is the ONE cell whose latency budget is blocking.
+
+    Single source for RunPair.enforce_latency_budget's decision -- see
+    RunPair.enforce_latency_budget's own comment for why only the historical
+    baseline x baseline cell is enforced. Extracted so a new RunPair
+    construction site cannot silently default to False by omission (round 5
+    restart2, Architecture A7).
+    """
+    return router is ROUTER_BASELINE and worker is WORKER_BASELINE
+
+
 def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
     seen: dict[tuple[str, str | None, str, str | None], bool] = {}
     unique: list[RunPair] = []
@@ -238,11 +253,16 @@ def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
             # for, or lose enforcement the baseline cell relies on (round-4
             # restart, F1 follow-up: this is unreachable today by
             # construction, since only one caller ever sets True, but it's
-            # a cheap guard against that changing silently).
-            assert seen[key] == pair.enforce_latency_budget, (
-                f"colliding cell key {key} disagrees on enforce_latency_budget "
-                f"({seen[key]} vs {pair.enforce_latency_budget})"
-            )
+            # a cheap guard against that changing silently). `raise
+            # ValueError`, not `assert`: asserts vanish under -O, and
+            # _dedupe_pairs is directly callable by tests and future callers,
+            # not only reached via the CLI (round 5 restart2, Logic L2 /
+            # Architecture A3).
+            if seen[key] != pair.enforce_latency_budget:
+                raise ValueError(
+                    f"colliding cell key {key} disagrees on enforce_latency_budget "
+                    f"({seen[key]} vs {pair.enforce_latency_budget})"
+                )
             continue
         seen[key] = pair.enforce_latency_budget
         unique.append(pair)
@@ -270,7 +290,14 @@ def default_sweep_pairs() -> tuple[RunPair, ...]:
 
     Pure by construction: no file I/O, so --dry-run stays a zero-I/O path.
     """
-    pairs = [RunPair(ROUTER_BASELINE, WORKER_BASELINE, enforce_latency_budget=True)]
+    pairs = [
+        RunPair(
+            ROUTER_BASELINE,
+            WORKER_BASELINE,
+            # True by construction -- _is_historical_baseline_pair(ROUTER_BASELINE, WORKER_BASELINE).
+            enforce_latency_budget=True,
+        )
+    ]
     pairs += [RunPair(candidate, WORKER_BASELINE) for candidate in ROUTER_CANDIDATES]
     pairs += [RunPair(ROUTER_BASELINE, candidate) for candidate in WORKER_CANDIDATES]
     return tuple(_dedupe_pairs(pairs))
@@ -279,10 +306,17 @@ def default_sweep_pairs() -> tuple[RunPair, ...]:
 def full_matrix_pairs() -> tuple[RunPair, ...]:
     routers = (ROUTER_BASELINE, *ROUTER_CANDIDATES)
     workers = (WORKER_BASELINE, *WORKER_CANDIDATES)
+    # Same enforcement-consistency guard as default_sweep_pairs: a
+    # wire-identical candidate must not be paid for (and run) twice (round 5
+    # restart2, Logic L4).
     return tuple(
-        RunPair(r, w, enforce_latency_budget=(r is ROUTER_BASELINE and w is WORKER_BASELINE))
-        for r in routers
-        for w in workers
+        _dedupe_pairs(
+            [
+                RunPair(r, w, enforce_latency_budget=_is_historical_baseline_pair(r, w))
+                for r in routers
+                for w in workers
+            ]
+        )
     )
 
 
@@ -494,13 +528,13 @@ def _request_kwargs_shape_ok(
             return False
         messages = request_kwargs.get("messages")
         # reasoning_effort is a load-bearing part of the judge request shape
-        # (see _judge_extra_kwargs's docstring): a manifest entry that omits
+        # (see judge_extra_kwargs's docstring): a manifest entry that omits
         # it, or carries a stale/wrong value, would authorize a live run
         # against a judge request Phase 0 never actually probed -- a
         # hand-edited manifest or the --i-know-the-manifest-is-stale override
         # could otherwise let a gpt-5* judge run with no reasoning_effort pin
         # at all (round 3 confirming pass, Codex P2 finding).
-        reasoning_effort_ok = request_kwargs.get("reasoning_effort") == _judge_extra_kwargs(
+        reasoning_effort_ok = request_kwargs.get("reasoning_effort") == judge_extra_kwargs(
             model
         ).get("reasoning_effort")
         return (
@@ -993,6 +1027,16 @@ def _majority_with_tiebreak(
     those only in `error`, which compute_pass_fail() never reads. Falling
     short of a strict majority resolves to the worst observed non-clean value
     in `priority` order (round-4 restart, Codex P2).
+
+    That fallback loop silently returns the plurality `winner` instead if an
+    observed non-clean value is missing from `priority` -- inverting the
+    strict-majority invariant above. All three `priority` tuples
+    (``_CELL_STATUS_TIE_PRIORITY``/``_TURN_STATUS_TIE_PRIORITY``/
+    ``_JUDGE_VERDICT_TIE_PRIORITY``) must stay complete against their
+    ``Literal`` alias's members -- pinned by
+    ``TestTieBreakPrioritiesCoverTheirLiteralVocabulary`` in
+    tests/test_eval_model_comparison.py, not a module-level assert (round 5
+    restart2, Logic L3).
     """
     if not values:
         raise ValueError("_majority_with_tiebreak requires at least one value")
@@ -1257,16 +1301,28 @@ def _aggregate_cell_repeats(
         status=agg_status,
         error=agg_error,
         turns=agg_turns,
-        # Config-derived and set unconditionally at every CellOutcome
-        # construction site (_never_ran_cell, run_cell's return, and this
-        # function), so it IS identical across repeats -- unlike
-        # TurnOutcome.latency_budget_enforced above, which is only written on
-        # run_cell()'s measured path and so must be folded with any(), not
-        # sampled. Manifest-rejected cells (the only construction site that can
-        # leave these None) are built in run_matrix() before the repeat loop and
-        # never reach this function.
-        router_timeout_seconds=repeats[0].router_timeout_seconds,
-        foreground_search_timeout_seconds=repeats[0].foreground_search_timeout_seconds,
+        # Config-derived and identical across every repeat that got as far as
+        # building a Config -- but run_cell() returns None for both fields
+        # when setup raised BEFORE _per_run_config() (e.g. the EvalJudge
+        # import, or _per_run_config() itself, raising), and config stays
+        # None on that path. Sampling repeats[0] would report None for the
+        # whole aggregate whenever repeat 0 happened to be the one that
+        # failed during setup, even though surviving repeats ran against a
+        # real timeout -- so take the first non-None instead of sampling
+        # index 0, same class as latency_budget_enforced's any()-fold above
+        # (round 5 restart2, Logic L1).
+        router_timeout_seconds=next(
+            (c.router_timeout_seconds for c in repeats if c.router_timeout_seconds is not None),
+            None,
+        ),
+        foreground_search_timeout_seconds=next(
+            (
+                c.foreground_search_timeout_seconds
+                for c in repeats
+                if c.foreground_search_timeout_seconds is not None
+            ),
+            None,
+        ),
         repeats=repeats,
     )
 
@@ -2004,10 +2060,37 @@ def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
     enforced baseline latency budget breach). Both are reported as reasons so
     the caller can tell FAIL-infra from FAIL-semantic apart, but either kind
     fails the run -- a judge-error is not evidence of correctness.
+
+    For a cell with ``repeats is not None``, the run may only read PASS on
+    that cell if a STRICT majority of its raw per-repetition ``CellOutcome``s
+    would themselves individually pass ``compute_pass_fail``. Per-field
+    majority voting (see ``_aggregate_turn_repeats``) is a cross-product
+    across repeats: every field can carry an independent clean majority while
+    no single repeat was clean end-to-end. The aggregate is a reporting
+    summary; the verdict is taken at the granularity the run actually
+    happened at.
     """
     reasons: list[str] = []
     for cell in outcomes:
         label = f"{cell.pair_label}/{cell.scenario_name}"
+        if cell.repeats is not None:
+            # Per-field majority voting (_aggregate_turn_repeats) is a
+            # cross-product across repeats: every field can carry an
+            # independent clean majority while NO single repeat was clean
+            # end-to-end (3 repeats each failing a different turn -> every
+            # field 2/3 clean, 0/3 repeats passed). The aggregate is a
+            # reporting summary; the VERDICT must be taken at the granularity
+            # the run actually happened at. Same strict-majority-for-clean
+            # rule as _majority_with_tiebreak, lifted from field to repeat
+            # level (round 5 restart2, Codex P1 / C1).
+            clean_repeats = sum(
+                1 for repeat in cell.repeats if compute_pass_fail([repeat])[0] == "PASS"
+            )
+            if clean_repeats * 2 <= len(cell.repeats):
+                reasons.append(
+                    f"repeat: {label} only {clean_repeats}/{len(cell.repeats)} repetitions "
+                    "passed every assertion end-to-end (no strict majority of clean repeats)"
+                )
         if cell.status in _CELL_INFRA_FAILURE_STATUSES:
             reasons.append(f"infra: {label} cell status={cell.status!r}")
         for turn in cell.turns or []:
@@ -2103,58 +2186,49 @@ def _serialize_cell(outcome: CellOutcome) -> dict[str, Any]:
     return cell
 
 
-def _parse_pair_label(pair_label: str) -> tuple[str, str]:
-    """Split a ``RunPair.label`` back into ``(router_label, worker_label)``.
-
-    Inverse of ``RunPair.label``'s ``f"router={...}/worker={...}"`` format --
-    ``build_report`` only receives ``CellOutcome.pair_label`` strings, not the
-    ``RunPair`` objects themselves, so annotating the shipped cells has to
-    recover the candidate labels this way rather than threading the pairs
-    list through as a second parameter.
-    """
-    router_part, worker_part = pair_label.split("/", 1)
-    return router_part.removeprefix("router="), worker_part.removeprefix("worker=")
-
-
 def _shipped_config_cells_annotation(
-    outcomes: list[CellOutcome], shipped: tuple[Candidate, Candidate]
+    outcomes: list[CellOutcome], shipped: tuple[Candidate, Candidate], pairs: Sequence[RunPair]
 ) -> dict[str, Any]:
     """Name which already-present sweep cells carry the (model, effort)
     config.toml ships -- see ``default_sweep_pairs()``'s docstring for why
     this replaces a live shipped x shipped cell (round-4 restart, Architecture
     finding 2).
 
-    Matches on ``(model, effective_effort_for_manifest_lookup(...))``, NOT on
-    label: the shipped candidate is registered under ``label="shipped"``,
-    never under a sweep cell's actual candidate label, so a label compare
-    would always come up empty.
+    ``pairs`` resolves each outcome's ``pair_label`` back to its structured
+    ``RunPair`` (round 5 restart2, Architecture A2) -- previously this
+    reverse-engineered ``(router_label, worker_label)`` out of the display
+    string via ``_parse_pair_label`` and looked each up in
+    ``*_SELECTABLE_BY_LABEL``, which cannot resolve a ``label="shipped"``
+    pair or any label not registered there, and silently dropped that cell
+    from the annotation rather than failing loudly. Threading the actual
+    ``RunPair`` objects removes both the reverse-parse and the silent-drop
+    path: every outcome is produced from these pairs by construction, so a
+    miss is a caller bug, not a data gap.
+
+    Matching itself is still on ``(model, effective_effort_for_manifest_
+    lookup(...))``, NOT on label, and this stays deliberate even now that the
+    candidates arrive structured: matching on label would now usually work
+    (each pair carries its real candidate label) but would silently break in
+    the ``"shipped"``-fallback case (see ``shipped_candidates()``'s
+    ``_registered_label`` helper in ``eval_common.py``), where a shipped
+    (model, effort) has no registered eval candidate at all.
     """
     shipped_router, shipped_worker = shipped
     router_key = (shipped_router.model, effective_effort_for_manifest_lookup(shipped_router))
     worker_key = (shipped_worker.model, effective_effort_for_manifest_lookup(shipped_worker))
+    by_label = {pair.label: pair for pair in pairs}
     router_cells: list[str] = []
     worker_cells: list[str] = []
     for pair_label in sorted({outcome.pair_label for outcome in outcomes}):
-        router_label, worker_label = _parse_pair_label(pair_label)
-        router_candidate = ROUTER_SELECTABLE_BY_LABEL.get(router_label)
-        worker_candidate = WORKER_SELECTABLE_BY_LABEL.get(worker_label)
-        if (
-            router_candidate is not None
-            and (
-                router_candidate.model,
-                effective_effort_for_manifest_lookup(router_candidate),
+        pair = by_label.get(pair_label)
+        if pair is None:
+            raise ValueError(
+                f"_shipped_config_cells_annotation: outcome pair_label {pair_label!r} has no "
+                "matching RunPair in `pairs` -- outcomes must be produced from these pairs"
             )
-            == router_key
-        ):
+        if (pair.router.model, effective_effort_for_manifest_lookup(pair.router)) == router_key:
             router_cells.append(pair_label)
-        if (
-            worker_candidate is not None
-            and (
-                worker_candidate.model,
-                effective_effort_for_manifest_lookup(worker_candidate),
-            )
-            == worker_key
-        ):
+        if (pair.worker.model, effective_effort_for_manifest_lookup(pair.worker)) == worker_key:
             worker_cells.append(pair_label)
     return {
         "router": {
@@ -2181,7 +2255,12 @@ def build_report(
     call_accounting: CallAccounting | None = None,
     repeat_count: int = 1,
     shipped: tuple[Candidate, Candidate] | None = None,
+    pairs: Sequence[RunPair] | None = None,
 ) -> dict[str, Any]:
+    if shipped is not None and pairs is None:
+        raise ValueError(
+            "build_report(shipped=...) also requires pairs=... to resolve each cell's candidates"
+        )
     overall_status, failure_reasons = compute_pass_fail(outcomes)
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -2195,7 +2274,12 @@ def build_report(
                 "majority vote across independent repetitions (see each cell's `repeats` "
                 "field for the raw per-repetition results); the clean outcome requires a "
                 "STRICT majority (more than half), not just a plurality -- anything less "
-                "resolves to the worst observed failure outcome, not the clean one"
+                "resolves to the worst observed failure outcome, not the clean one. The "
+                "overall run verdict additionally requires a STRICT majority of "
+                "end-to-end clean repetitions (a repeat that passed every assertion), not "
+                "just per-field majorities -- a cell can have a clean majority on every "
+                "field while zero individual repetitions were clean end-to-end, and that "
+                "does not pass"
             )
         ),
         # Threaded through from main()'s pre-flight matrix_call_accounting()
@@ -2218,10 +2302,19 @@ def build_report(
             }
         ),
         "cells": [_serialize_cell(outcome) for outcome in outcomes],
-        "shipped_config_cells": (
-            None if shipped is None else _shipped_config_cells_annotation(outcomes, shipped)
-        ),
     }
+    # Same optional-key rule as _serialize_cell's `repeats` (see its comment):
+    # a key that never existed in the pre-`shipped` report shape is only added
+    # when it carries a real value, so a strict-key-set consumer of an older
+    # report is not broken by a null (round 5 restart2, Architecture A1).
+    if shipped is not None:
+        if pairs is None:
+            # Unreachable: the same condition raises ValueError above. Kept as an
+            # explicit check rather than `assert` for consistency with
+            # _dedupe_pairs's guard (round-5 restart, L2/A3) -- asserts vanish
+            # under `-O`, so a real invariant guard should never be one.
+            raise ValueError("build_report(shipped=...) also requires pairs=...")
+        report["shipped_config_cells"] = _shipped_config_cells_annotation(outcomes, shipped, pairs)
     report["overall_status"] = overall_status
     report["failure_reasons"] = failure_reasons
     return report
@@ -2280,7 +2373,7 @@ def _resolve_pairs(args: argparse.Namespace) -> tuple[RunPair, ...]:
     if args.router or args.worker:
         router = ROUTER_SELECTABLE_BY_LABEL[args.router or "baseline"]
         worker = WORKER_SELECTABLE_BY_LABEL[args.worker or "baseline"]
-        enforce = router is ROUTER_BASELINE and worker is WORKER_BASELINE
+        enforce = _is_historical_baseline_pair(router, worker)
         return (RunPair(router, worker, enforce_latency_budget=enforce),)
     return full_matrix_pairs() if args.full_matrix else default_sweep_pairs()
 
@@ -2504,6 +2597,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     accounting = matrix_call_accounting(pairs, scenarios, repeat_count=args.repeat)
+    # Resolved BEFORE any paid call: this does its own load_config() against
+    # the repo-tracked config.toml, and evaluating it as a build_report()
+    # argument (its previous position, after asyncio.run(run_matrix(...)))
+    # meant a raise there discarded an already-paid-for matrix run (round 5
+    # restart2, Logic L5).
+    shipped = shipped_candidates()
     # Always shown before a live call is made -- not only when a limit would
     # be exceeded -- per the dev plan's documented contract: "no live call
     # happens without the operator seeing the total call count, cost
@@ -2539,7 +2638,8 @@ def main(argv: list[str] | None = None) -> int:
         judge_model=args.judge_model,
         call_accounting=accounting,
         repeat_count=args.repeat,
-        shipped=shipped_candidates(),
+        shipped=shipped,
+        pairs=pairs,
     )
     print_report_summary(report)
     # The aggregate report is always persisted to a file, not only when
