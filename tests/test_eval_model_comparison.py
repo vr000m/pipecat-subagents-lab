@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -356,9 +356,25 @@ class TestMatrixBuilding:
     def test_default_sweep_is_not_the_full_cross_product(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
         # baseline x baseline (1) + N router candidates x baseline worker
-        # + baseline router x M worker candidates -- not the (N+1)*(M+1)
-        # full cross product full_matrix_pairs() would produce.
-        expected = 1 + len(eval_runner.ROUTER_CANDIDATES) + len(eval_runner.WORKER_CANDIDATES)
+        # + baseline router x M worker candidates + the shipped anchor cell
+        # (round 3 confirming pass, Architecture finding 3; deduped if it
+        # happens to coincide with an already-emitted cell) -- not the
+        # (N+1)*(M+1) full cross product full_matrix_pairs() would produce.
+        shipped_router, shipped_worker = eval_common.shipped_candidates()
+        shipped_pair = eval_runner.RunPair(shipped_router, shipped_worker)
+        base_pairs = [eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)]
+        base_pairs += [
+            eval_runner.RunPair(c, eval_runner.WORKER_BASELINE)
+            for c in eval_runner.ROUTER_CANDIDATES
+        ]
+        base_pairs += [
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, c)
+            for c in eval_runner.WORKER_CANDIDATES
+        ]
+        base_keys = {eval_runner._pair_cell_key(p) for p in base_pairs}
+        expected = len(base_pairs) + (
+            0 if eval_runner._pair_cell_key(shipped_pair) in base_keys else 1
+        )
         assert len(pairs) == expected
         full_matrix_size = (1 + len(eval_runner.ROUTER_CANDIDATES)) * (
             1 + len(eval_runner.WORKER_CANDIDATES)
@@ -394,8 +410,24 @@ class TestMatrixBuilding:
             for worker in workers:
                 assert eval_runner.RunPair(router, worker) in pairs
 
-    def test_full_matrix_is_a_strict_superset_of_the_default_sweep(self) -> None:
-        default_pairs = set(eval_runner.default_sweep_pairs())
+    def test_full_matrix_is_a_strict_superset_of_the_default_sweep_minus_the_shipped_anchor(
+        self,
+    ) -> None:
+        # The shipped anchor cell (round 3 confirming pass, Architecture
+        # finding 3) is deliberately NOT added to ROUTER_SELECTABLE_BY_LABEL/
+        # WORKER_SELECTABLE_BY_LABEL, so full_matrix_pairs()'s baseline x
+        # candidates cross product does not include it -- it is an addition
+        # to the default sweep, not a subset relationship with the full
+        # matrix.
+        shipped_router, shipped_worker = eval_common.shipped_candidates()
+        shipped_key = eval_runner._pair_cell_key(
+            eval_runner.RunPair(shipped_router, shipped_worker)
+        )
+        default_pairs = {
+            p
+            for p in eval_runner.default_sweep_pairs()
+            if eval_runner._pair_cell_key(p) != shipped_key
+        }
         full_pairs = set(eval_runner.full_matrix_pairs())
         assert default_pairs <= full_pairs
         assert default_pairs != full_pairs
@@ -4353,3 +4385,99 @@ class TestErrorTextStripsControlCharacters:
         for bidi_char in (rle, pdf, lri, pdi):
             assert bidi_char not in text
         assert "safe" in text and "evil" in text and "reversed" in text
+
+
+# ---------------------------------------------------------------------------
+# Round 3 confirming pass regressions.
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultSweepAnchorsOnShippedConfig:
+    """Regression for round-3 confirming pass, Architecture finding 3:
+    ROUTER_BASELINE/WORKER_BASELINE are a fixed HISTORICAL anchor
+    (gpt-5-mini/gpt-5), not what config.toml ships today. Every
+    default_sweep_pairs() report previously answered "how does X compare to
+    the pre-shortlist default", so a candidate that beat the historical
+    baseline while regressing against current production read as a win.
+    default_sweep_pairs() now appends a deduped shipped x shipped anchor cell.
+    """
+
+    @staticmethod
+    def _shipped_pair() -> tuple[str, str | None, str, str | None]:
+        # Same construction as tests/test_eval_common.py's
+        # TestShippedConfigHasAnEvalCandidateCell -- the repo-tracked
+        # config.toml, loaded with env={} so the anchor is the same on every
+        # machine.
+        from server.config import load_config
+
+        repo_config_toml = Path(__file__).resolve().parents[1] / "config.toml"
+        config = load_config(env={}, config_file=repo_config_toml)
+        return (
+            config.resolve_router_model("fast"),
+            config.resolve_router_reasoning_effort("fast"),
+            config.resolve_worker_model("deep"),
+            config.resolve_worker_reasoning_effort("deep"),
+        )
+
+    def test_default_sweep_contains_the_shipped_cell(self) -> None:
+        shipped_router_model, shipped_router_effort, shipped_worker_model, shipped_worker_effort = (
+            self._shipped_pair()
+        )
+
+        pairs = eval_runner.default_sweep_pairs()
+
+        assert any(
+            pair.router.model == shipped_router_model
+            and pair.router.effort == shipped_router_effort
+            and pair.worker.model == shipped_worker_model
+            and pair.worker.effort == shipped_worker_effort
+            for pair in pairs
+        )
+
+    def test_shipped_cell_is_deduped_when_it_equals_the_historical_baseline(
+        self, monkeypatch: Any
+    ) -> None:
+        pre_fix_pairs = [
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        ]
+        pre_fix_pairs += [
+            eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE)
+            for candidate in eval_runner.ROUTER_CANDIDATES
+        ]
+        pre_fix_pairs += [
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, candidate)
+            for candidate in eval_runner.WORKER_CANDIDATES
+        ]
+        pre_fix_count = len(pre_fix_pairs)
+
+        shipped_as_historical = (
+            replace(eval_runner.ROUTER_BASELINE, label="shipped"),
+            replace(eval_runner.WORKER_BASELINE, label="shipped"),
+        )
+        monkeypatch.setattr(eval_runner, "shipped_candidates", lambda: shipped_as_historical)
+
+        pairs = eval_runner.default_sweep_pairs()
+
+        assert len(pairs) == pre_fix_count
+        keys = [eval_runner._pair_cell_key(pair) for pair in pairs]
+        assert len(keys) == len(set(keys))
+
+    def test_shipped_anchor_does_not_disturb_the_existing_sweep(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        expected_prefix_len = (
+            1 + len(eval_runner.ROUTER_CANDIDATES) + len(eval_runner.WORKER_CANDIDATES)
+        )
+
+        expected_prefix = [
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        ]
+        expected_prefix += [
+            eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE)
+            for candidate in eval_runner.ROUTER_CANDIDATES
+        ]
+        expected_prefix += [
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, candidate)
+            for candidate in eval_runner.WORKER_CANDIDATES
+        ]
+
+        assert list(pairs[:expected_prefix_len]) == expected_prefix

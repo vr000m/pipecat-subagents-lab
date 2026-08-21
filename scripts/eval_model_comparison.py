@@ -62,6 +62,7 @@ from scripts.eval_common import (
     git_head,
     latest_turn_stage_metrics,
     sanitize_reason,
+    shipped_candidates,
     strip_control_chars,
     turn_correlated_routing_action,
     write_no_follow,
@@ -169,6 +170,12 @@ _RETRY_WORST_CASE_MULTIPLIER = 1 + _OPENAI_SDK_DEFAULT_MAX_RETRIES
 # what --router/--worker actually accept (any label a candidate is
 # registered under, baseline included), not just the non-baseline sweep
 # candidates.
+#
+# Deliberately does NOT include "shipped": these are module-level dict
+# comprehensions, so adding it would force shipped_candidates()'s
+# load_config() to run at import time. The shipped cell is still reachable
+# today via `--router luna-medium --worker terra-medium` (round 3 confirming
+# pass, Architecture finding 3).
 ROUTER_SELECTABLE_BY_LABEL = {c.label: c for c in (ROUTER_BASELINE, *ROUTER_CANDIDATES)}
 WORKER_SELECTABLE_BY_LABEL = {c.label: c for c in (WORKER_BASELINE, *WORKER_CANDIDATES)}
 
@@ -187,16 +194,44 @@ class RunPair:
         return self.router.label == "baseline" and self.worker.label == "baseline"
 
 
+def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
+    """Identity by the request shape a cell actually sends, NOT by label --
+    the shipped pair carries label="shipped" but may be the same wire request
+    as an existing baseline/candidate cell."""
+    return (pair.router.model, pair.router.effort, pair.worker.model, pair.worker.effort)
+
+
+def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
+    seen: set[tuple[str, str | None, str, str | None]] = set()
+    unique: list[RunPair] = []
+    for pair in pairs:
+        key = _pair_cell_key(pair)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(pair)
+    return unique
+
+
 def default_sweep_pairs() -> tuple[RunPair, ...]:
-    """baseline x baseline, plus one-role-varied sweeps.
+    """baseline x baseline, one-role-varied sweeps, plus the shipped anchor.
 
     Not the full cross product -- proportionate to what "compare Codex's
     per-role recommendation" actually needs. See Requirements.
+
+    The trailing shipped x shipped cell exists because *_BASELINE is a fixed
+    HISTORICAL anchor (gpt-5-mini/gpt-5), not what config.toml ships. Without
+    this cell every sweep answered "how does X compare to the pre-shortlist
+    default", so a candidate that beat the historical baseline while
+    regressing against current production read as a win. Deduped, so a
+    config.toml reverted to the historical pair does not emit the cell twice.
     """
     pairs = [RunPair(ROUTER_BASELINE, WORKER_BASELINE)]
     pairs += [RunPair(candidate, WORKER_BASELINE) for candidate in ROUTER_CANDIDATES]
     pairs += [RunPair(ROUTER_BASELINE, candidate) for candidate in WORKER_CANDIDATES]
-    return tuple(pairs)
+    shipped_router, shipped_worker = shipped_candidates()
+    pairs.append(RunPair(shipped_router, shipped_worker))
+    return tuple(_dedupe_pairs(pairs))
 
 
 def full_matrix_pairs() -> tuple[RunPair, ...]:

@@ -45,7 +45,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from server.composition import build_session_host
-from server.config import Config, PromotionManifest, default_reasoning_effort_for_model
+from server.config import (
+    Config,
+    PromotionManifest,
+    default_reasoning_effort_for_model,
+    load_config,
+)
 from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import SAFE_FALLBACK_TEXTS, TIMEOUT_FALLBACK_TEXTS, SessionHost
 from server.router import effective_router_reasoning_effort
@@ -75,6 +80,7 @@ __all__ = [
     "git_head",
     "latest_turn_stage_metrics",
     "sanitize_reason",
+    "shipped_candidates",
     "strip_control_chars",
     "turn_correlated_routing_action",
     "write_no_follow",
@@ -207,6 +213,31 @@ WORKER_CANDIDATES: tuple[Candidate, ...] = (
     Candidate(label="terra-medium", role="worker", model="gpt-5.6-terra", effort="medium"),
     Candidate(label="sol-low", role="worker", model="gpt-5.6-sol", effort="low"),
 )
+
+
+def shipped_candidates() -> tuple[Candidate, Candidate]:
+    """The (model, effort) pair config.toml actually ships today, as Candidates.
+
+    Deliberately loaded from the repo-tracked config.toml with ``env={}``: the
+    sweep's production anchor must be what the repo ships, not what the
+    developer's process environment happens to override it to, or two runs on
+    two machines would anchor against different cells.
+    """
+    config = load_config(env={}, config_file=REPO_ROOT / "config.toml")
+    return (
+        Candidate(
+            label="shipped",
+            role="router",
+            model=config.resolve_router_model("fast"),
+            effort=config.resolve_router_reasoning_effort("fast"),
+        ),
+        Candidate(
+            label="shipped",
+            role="worker",
+            model=config.resolve_worker_model("deep"),
+            effort=config.resolve_worker_reasoning_effort("deep"),
+        ),
+    )
 
 
 def effective_effort_for_manifest_lookup(candidate: Candidate) -> str | None:

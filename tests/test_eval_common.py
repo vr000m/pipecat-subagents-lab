@@ -328,6 +328,12 @@ class TestShippedConfigHasAnEvalCandidateCell:
     candidate that regresses against *current* production would read as a
     pass, since the matrix would only be measuring against the stale
     baseline and older candidates.
+
+    Still guards the --router/--worker selectable path and --full-matrix,
+    which the shipped anchor cell added by round 3's
+    TestDefaultSweepAnchorsOnShippedConfig (tests/test_eval_model_comparison.py)
+    does not cover -- that class is the stronger sibling for the default
+    sweep specifically.
     """
 
     def test_shipped_router_and_worker_models_have_a_candidate_cell(self) -> None:
