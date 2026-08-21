@@ -1897,6 +1897,60 @@ class TestRepeatVerdictRequiresAWhollyCleanMajority:
         assert overall_status == "PASS"
         assert not any(reason.startswith("repeat:") for reason in reasons)
 
+    def test_clean_repeat_counting_does_not_recurse_into_nested_repeats(self) -> None:
+        """Round 7 F8: clean-repeat counting must be non-recursive BY
+        CONSTRUCTION. Before the fix, compute_pass_fail() scored each repeat
+        via `compute_pass_fail([repeat])[0] == "PASS"` -- a self-recursive
+        call that would, on a repeat carrying its OWN non-None `.repeats`,
+        re-enter the same "clean_repeats * 2 <= len(cell.repeats)" branch a
+        second time and let that nested repeat's own repeat-level verdict
+        leak into whether the OUTER repeat counts as clean. Today this is
+        unreachable (run_cell() never nests repeats past depth 1), but the
+        old code's correctness silently depended on that external invariant
+        rather than being true by its own structure. Construct exactly the
+        depth-2 shape run_cell() never produces -- a repeat whose own
+        `.repeats` holds only FAILING nested outcomes -- and assert the
+        OUTER verdict is governed solely by the repeat's own turns, entirely
+        unaffected by what its nested `.repeats` says.
+        """
+        clean_turns = [self._turn("greeting"), self._turn("riga"), self._turn("helsinki")]
+        # A repeat whose own turns are all clean, but whose `.repeats` field
+        # (never read by _cell_failure_reasons/compute_pass_fail's per-repeat
+        # scoring) holds only failing nested outcomes -- if the old
+        # self-recursion's dependency on "repeats is always None at depth 1"
+        # were ever violated, this nested failure would corrupt the count.
+        nested_failing = [
+            self._cell([self._turn("greeting", deterministic_action_pass=False)]),
+            self._cell([self._turn("greeting", deterministic_action_pass=False)]),
+        ]
+        clean_repeat_with_dirty_nesting = eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="routing-regression",
+            status="ok",
+            turns=clean_turns,
+            repeats=nested_failing,
+        )
+        another_clean_repeat = self._cell(clean_turns)
+        dirty_repeat = self._cell([self._turn("greeting", deterministic_action_pass=False)])
+
+        outer_cell = eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="routing-regression",
+            status="ok",
+            turns=clean_turns,
+            repeats=[clean_repeat_with_dirty_nesting, another_clean_repeat, dirty_repeat],
+        )
+
+        overall_status, reasons = eval_runner.compute_pass_fail([outer_cell])
+
+        # 2/3 repeats are clean (the third is genuinely dirty) -- a strict
+        # majority, so this passes. If the self-recursion's dependency on
+        # depth-1 had been reinstated and mis-scored the nested-repeats
+        # repeat as dirty too (because of its OWN nested failing repeats),
+        # this would read 1/3 -- not a strict majority -- and FAIL instead.
+        assert overall_status == "PASS"
+        assert not any(reason.startswith("repeat:") for reason in reasons)
+
 
 class TestRunMatrixRepeatWiring:
     """run_matrix()'s repeat_count param must call run_cell() that many

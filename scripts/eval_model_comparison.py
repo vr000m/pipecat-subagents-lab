@@ -2128,6 +2128,75 @@ def _overall_status(reasons: list[str]) -> str:
     return "FAIL" if reasons else "PASS"
 
 
+def _cell_failure_reasons(cell: CellOutcome) -> list[str]:
+    """The failure reasons a single cell's own status/turns carry, at THIS
+    cell's granularity only.
+
+    Round 7 F8: extracted out of `compute_pass_fail`, which previously
+    called itself recursively (``compute_pass_fail([repeat])``) to score a
+    ``--repeat`` cell's individual repetitions. That recursion happened to
+    be safe only because of an invariant enforced elsewhere (a repeat's own
+    ``CellOutcome.repeats`` is always ``None`` -- ``run_cell`` never nests
+    repeats more than one level deep), so `compute_pass_fail`'s correctness
+    silently depended on a cross-module contract it never checked itself: a
+    depth-2 nesting would have changed the aggregate's clean-repeat vote by
+    accident (the recursive call's own repeats-branch would fire again),
+    not by anyone's decision.
+
+    This function deliberately does NOT look at ``cell.repeats`` -- it is
+    the non-recursive, single-cell half of what `compute_pass_fail` used to
+    do in one recursive pass. `compute_pass_fail` now calls this directly on
+    each repeat to count clean ones, instead of calling itself.
+    """
+    label = f"{cell.pair_label}/{cell.scenario_name}"
+    reasons: list[str] = []
+    if cell.status in _CELL_INFRA_FAILURE_STATUSES:
+        reasons.append(f"infra: {label} cell status={cell.status!r}")
+    for turn in cell.turns or []:
+        query = turn.query
+        # A turn whose own status isn't "ok" (provider-error, timeout,
+        # setup-error, skipped) never produced a real result -- its
+        # judge_verdict/deterministic_action_pass/citations_pass/latency
+        # fields are all None (see build_report), so nothing below this
+        # branch has a real signal to check. Without this check a fully
+        # failed, fully-billed run whose every turn timed out or errored
+        # had no per-turn reason recorded here at all (only the cell's
+        # own status, which run_cell previously always reported "ok"
+        # regardless of a turn breaking early -- see run_cell's
+        # cell_status tracking) and could silently read as passing.
+        if turn.status != "ok":
+            detail = f" ({turn.error!r})" if turn.error else ""
+            reasons.append(f"infra: {label} {query!r} turn status={turn.status!r}{detail}")
+            continue
+        if turn.judge_verdict == "judge-error":
+            reasons.append(f"infra: {label} {query!r} judge-error ({turn.judge_reason!r})")
+        elif turn.judge_verdict == "no":
+            reasons.append(f"semantic: {label} {query!r} judge verdict=no")
+        elif turn.judge_verdict == "continue":
+            reasons.append(f"semantic: {label} {query!r} judge verdict=continue")
+        if turn.deterministic_action_pass is False:
+            reasons.append(f"semantic: {label} {query!r} deterministic action assertion failed")
+        if turn.deterministic_action_unevaluated_reason is not None:
+            # A requested (turn.expect_action is not None) but never-run
+            # assertion -- routing_action was unavailable -- must not
+            # silently aggregate to PASS just because
+            # deterministic_action_pass stayed at its "not applicable"
+            # None default. Same class of gap round 8 fixed for the
+            # latency-budget gate's `except RuntimeError: raise` (round 9
+            # gauntlet, merged Codex P1 + Logic lens finding 3).
+            reasons.append(
+                f"infra: {label} {query!r} deterministic action assertion requested but "
+                f"unevaluated ({turn.deterministic_action_unevaluated_reason!r})"
+            )
+        if turn.worker_presence_pass is False:
+            reasons.append(f"semantic: {label} {query!r} worker presence/absence assertion failed")
+        if turn.citations_pass is False:
+            reasons.append(f"semantic: {label} {query!r} citations assertion failed")
+        if turn.latency_budget_enforced and turn.latency_budget_exceeded:
+            reasons.append(f"semantic: {label} {query!r} enforced latency budget exceeded")
+    return reasons
+
+
 def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
     """Aggregate the run's cells/turns into one pass/fail verdict.
 
@@ -2150,12 +2219,19 @@ def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
 
     For a cell with ``repeats is not None``, the run may only read PASS on
     that cell if a STRICT majority of its raw per-repetition ``CellOutcome``s
-    would themselves individually pass ``compute_pass_fail``. Per-field
-    majority voting (see ``_aggregate_turn_repeats``) is a cross-product
-    across repeats: every field can carry an independent clean majority while
-    no single repeat was clean end-to-end. The aggregate is a reporting
-    summary; the verdict is taken at the granularity the run actually
-    happened at.
+    would themselves individually pass. Per-field majority voting (see
+    ``_aggregate_turn_repeats``) is a cross-product across repeats: every
+    field can carry an independent clean majority while no single repeat was
+    clean end-to-end. The aggregate is a reporting summary; the verdict is
+    taken at the granularity the run actually happened at.
+
+    Round 7 F8: clean-repeat counting is non-recursive BY CONSTRUCTION --
+    ``_cell_failure_reasons`` never reads ``.repeats``, so a depth-2 nesting
+    cannot change a verdict. This used to be `compute_pass_fail([repeat])`
+    calling itself, correct only because `CellOutcome.repeats` is always
+    `None` on an individual repeat (a cross-module invariant this function
+    never checked); the self-recursion is gone, and with it the silent
+    dependency on that invariant.
     """
     reasons: list[str] = []
     for cell in outcomes:
@@ -2170,60 +2246,13 @@ def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
             # the run actually happened at. Same strict-majority-for-clean
             # rule as _majority_with_tiebreak, lifted from field to repeat
             # level (round 5 restart2, Codex P1 / C1).
-            clean_repeats = sum(
-                1 for repeat in cell.repeats if compute_pass_fail([repeat])[0] == "PASS"
-            )
+            clean_repeats = sum(1 for repeat in cell.repeats if not _cell_failure_reasons(repeat))
             if clean_repeats * 2 <= len(cell.repeats):
                 reasons.append(
                     f"repeat: {label} only {clean_repeats}/{len(cell.repeats)} repetitions "
                     "passed every assertion end-to-end (no strict majority of clean repeats)"
                 )
-        if cell.status in _CELL_INFRA_FAILURE_STATUSES:
-            reasons.append(f"infra: {label} cell status={cell.status!r}")
-        for turn in cell.turns or []:
-            query = turn.query
-            # A turn whose own status isn't "ok" (provider-error, timeout,
-            # setup-error, skipped) never produced a real result -- its
-            # judge_verdict/deterministic_action_pass/citations_pass/latency
-            # fields are all None (see build_report), so nothing below this
-            # branch has a real signal to check. Without this check a fully
-            # failed, fully-billed run whose every turn timed out or errored
-            # had no per-turn reason recorded here at all (only the cell's
-            # own status, which run_cell previously always reported "ok"
-            # regardless of a turn breaking early -- see run_cell's
-            # cell_status tracking) and could silently read as passing.
-            if turn.status != "ok":
-                detail = f" ({turn.error!r})" if turn.error else ""
-                reasons.append(f"infra: {label} {query!r} turn status={turn.status!r}{detail}")
-                continue
-            if turn.judge_verdict == "judge-error":
-                reasons.append(f"infra: {label} {query!r} judge-error ({turn.judge_reason!r})")
-            elif turn.judge_verdict == "no":
-                reasons.append(f"semantic: {label} {query!r} judge verdict=no")
-            elif turn.judge_verdict == "continue":
-                reasons.append(f"semantic: {label} {query!r} judge verdict=continue")
-            if turn.deterministic_action_pass is False:
-                reasons.append(f"semantic: {label} {query!r} deterministic action assertion failed")
-            if turn.deterministic_action_unevaluated_reason is not None:
-                # A requested (turn.expect_action is not None) but never-run
-                # assertion -- routing_action was unavailable -- must not
-                # silently aggregate to PASS just because
-                # deterministic_action_pass stayed at its "not applicable"
-                # None default. Same class of gap round 8 fixed for the
-                # latency-budget gate's `except RuntimeError: raise` (round 9
-                # gauntlet, merged Codex P1 + Logic lens finding 3).
-                reasons.append(
-                    f"infra: {label} {query!r} deterministic action assertion requested but "
-                    f"unevaluated ({turn.deterministic_action_unevaluated_reason!r})"
-                )
-            if turn.worker_presence_pass is False:
-                reasons.append(
-                    f"semantic: {label} {query!r} worker presence/absence assertion failed"
-                )
-            if turn.citations_pass is False:
-                reasons.append(f"semantic: {label} {query!r} citations assertion failed")
-            if turn.latency_budget_enforced and turn.latency_budget_exceeded:
-                reasons.append(f"semantic: {label} {query!r} enforced latency budget exceeded")
+        reasons.extend(_cell_failure_reasons(cell))
     return _overall_status(reasons), reasons
 
 
