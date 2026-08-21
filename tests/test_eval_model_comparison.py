@@ -4783,7 +4783,12 @@ class TestMainPreflightsDuplicatePairLabels:
             # full_matrix_pairs()) actually raises on a colliding pair label
             # -- simulated here via monkeypatch rather than constructing a
             # real registry collision, matching the prior test's shape.
-            raise ValueError(
+            # Round 8 gauntlet (Architecture finding 2): _dedupe_pairs raises
+            # PairInvariantError, not a bare ValueError, so main()'s catch can
+            # tell a pair-invariant violation apart from an unrelated
+            # ValueError/ConfigError; this monkeypatch must match that type or
+            # it stops pinning the real catch-and-report contract.
+            raise eval_runner.PairInvariantError(
                 f"colliding pair label(s) ['{baseline.label}']: two wire-distinct "
                 "cells share a report identity"
             )

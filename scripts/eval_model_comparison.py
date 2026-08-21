@@ -275,6 +275,19 @@ def _is_historical_baseline_pair(router: Candidate, worker: Candidate) -> bool:
     ) and _candidate_wire_key(worker) == _candidate_wire_key(WORKER_BASELINE)
 
 
+class PairInvariantError(ValueError):
+    """A caller-bug-class violation of `_dedupe_pairs`'s pair invariants
+    (wire-key/enforcement agreement, pair-label uniqueness) -- always
+    pre-flightable before any paid call. Subclasses `ValueError` (matching
+    this file's existing convention of raising, not asserting, for
+    reachable invariants) but is its own type so a catcher can distinguish
+    it from an unrelated `ValueError`/`ConfigError` (which also subclasses
+    `ValueError`) a future change to `_resolve_pairs` might raise -- a bare
+    `except ValueError` would silently misreport that as "refusing to run"
+    for the wrong reason (round 8 gauntlet, Architecture finding 2).
+    """
+
+
 def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
     seen: dict[tuple[str, str | None, str, str | None], bool] = {}
     unique: list[RunPair] = []
@@ -293,7 +306,7 @@ def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
             # not only reached via the CLI (round 5 restart2, Logic L2 /
             # Architecture A3).
             if seen[key] != pair.enforce_latency_budget:
-                raise ValueError(
+                raise PairInvariantError(
                     f"colliding cell key {key} disagrees on enforce_latency_budget "
                     f"({seen[key]} vs {pair.enforce_latency_budget})"
                 )
@@ -317,7 +330,7 @@ def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
     labels = [pair.label for pair in unique]
     if len(set(labels)) != len(labels):
         duplicates = sorted({label for label in labels if labels.count(label) > 1})
-        raise ValueError(
+        raise PairInvariantError(
             f"colliding pair label(s) {duplicates}: two wire-distinct cells share a report identity"
         )
     return unique
@@ -2241,6 +2254,18 @@ def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
     `None` on an individual repeat (a cross-module invariant this function
     never checked); the self-recursion is gone, and with it the silent
     dependency on that invariant.
+
+    Round 8, Architecture finding 3: ``build_report()`` no longer reads this
+    function's status element (it derives its own via ``_overall_status`` to
+    fold in the annotation-failure reason too), so only tests read it today.
+    That is NOT a second verdict authority, despite the unused look -- the
+    returned status IS ``_overall_status(reasons)``, the exact same rule
+    ``build_report`` calls; this function just also hands back the
+    convenience of computing it once for a single-cell-list caller (which is
+    every test in this file). Kept as a tuple rather than narrowed to
+    reasons-only: splitting it would force every one of this file's ~15
+    ``compute_pass_fail(...)`` call sites to route through ``_overall_status``
+    themselves for no behavioural gain.
     """
     reasons: list[str] = []
     for cell in outcomes:
@@ -2529,9 +2554,14 @@ def print_report_summary(report: dict[str, Any]) -> None:
     shapes -- the success annotation (``router``/``worker``/``note``,
     optionally ``unmatched_roles``) and the degrade shape (``error`` only,
     see ``build_report``'s except-branch). Both must render; neither may
-    raise, because this function runs BEFORE the report is persisted
-    (``main()`` calls this at :2782, ``write_no_follow`` at :2805) and a
-    raise here destroys an already-billed run's only remaining record.
+    raise. Round 7 originally relied on this being called BEFORE
+    ``write_no_follow`` persisted the report, so that a raise here would
+    destroy an already-billed run's only remaining record -- round 8 made
+    that a structural guarantee instead of a renderer obligation: ``main()``
+    now calls ``write_no_follow`` first and this function second, so a
+    residual bug here can no longer cost the run its persisted report
+    (round 8 gauntlet, Logic finding 1). This function must still never
+    raise -- a crash here is still a bug, just no longer a data-loss bug.
     """
     shipped_cells = report.get("shipped_config_cells")
     if shipped_cells and "router" in shipped_cells:
@@ -2812,16 +2842,20 @@ def main(argv: list[str] | None = None) -> int:
     # matrix run (round 6 gauntlet, Logic G3 -- the residual, non-pre-
     # flightable case is handled by build_report()'s try/except around the
     # annotation call). Round 7 F6: the check itself now lives in
-    # `_dedupe_pairs` (raised as ValueError), which `default_sweep_pairs()`/
-    # `full_matrix_pairs()` both call internally -- this is just the CLI's
-    # catch-and-report-before-spend wrapper around that shared invariant.
-    # The `--router`/`--worker` branch of `_resolve_pairs` returns a single
-    # pair without going through `_dedupe_pairs` at all, where the
-    # uniqueness invariant holds trivially (one pair cannot collide with
-    # itself).
+    # `_dedupe_pairs`, which `default_sweep_pairs()`/`full_matrix_pairs()`
+    # both call internally -- this is just the CLI's catch-and-report-
+    # before-spend wrapper around that shared invariant. The `--router`/
+    # `--worker` branch of `_resolve_pairs` returns a single pair without
+    # going through `_dedupe_pairs` at all, where the uniqueness invariant
+    # holds trivially (one pair cannot collide with itself). Catches
+    # `PairInvariantError` specifically, not bare `ValueError`: `ConfigError`
+    # (raised elsewhere in `_resolve_pairs`'s call chain) also subclasses
+    # `ValueError`, and a broad catch here would silently misreport a config
+    # error as a pair-invariant violation (round 8 gauntlet, Architecture
+    # finding 2).
     try:
         pairs = _resolve_pairs(args)
-    except ValueError as exc:
+    except PairInvariantError as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 1
     scenarios = _resolve_scenarios(args)
@@ -2901,7 +2935,6 @@ def main(argv: list[str] | None = None) -> int:
         repeat_count=args.repeat,
         shipped_cells=ShippedCellsInput(shipped=shipped, pairs=tuple(pairs)),
     )
-    print_report_summary(report)
     # The aggregate report is always persisted to a file, not only when
     # --out is explicitly passed (round 8 gauntlet, Codex P2 finding 2) --
     # the dev plan's Architecture & Call Flow table requires the run's
@@ -2918,6 +2951,15 @@ def main(argv: list[str] | None = None) -> int:
     # (e.g. a test harness) can share a low-resolution clock tick even at
     # microsecond precision on some platforms; a random suffix has no such
     # dependency on clock granularity.
+    #
+    # write_no_follow() runs BEFORE print_report_summary() -- not after, as
+    # in earlier rounds -- so the report is persisted before any console
+    # rendering happens. print_report_summary() documents that it "must
+    # never raise" because a raise there would otherwise destroy an
+    # already-billed run's only record (round 7 gauntlet, F1); persisting
+    # first makes that a structural guarantee instead of a renderer
+    # obligation on trust (round 8 gauntlet, Logic finding 1) -- a residual
+    # bug in the renderer can no longer cost the run its persisted report.
     out_target = args.out or (
         DEFAULT_REPORT_DIR
         / f"eval-report-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
@@ -2928,6 +2970,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError) as exc:
         print(f"refusing to write report: {exc}", file=sys.stderr)
         return 1
+    print_report_summary(report)
     print(f"\nreport written to {out_path}")
     return 0 if report["overall_status"] == "PASS" else 1
 
