@@ -1965,16 +1965,108 @@ class TestReasoningEffortInheritance:
 
         assert config.resolve_worker_reasoning_effort("deep") == "medium"
 
-    def test_provenance_and_empty_means_absent_are_independent_objects(self) -> None:
-        """Round-4 restart, Architecture Minor #7: _EMPTY_MEANS_ABSENT_KEYS
-        used to be `_PROVENANCE_KEYS` itself (an alias), so changing one
-        object's membership silently changed the other's -- enforced only by
-        a comment, not the independence the two names claim. Pins that they
-        are now separate objects with the same membership today.
+    def test_a_falsy_typed_toml_model_does_not_clear_an_inherited_effort(
+        self, tmp_path: Path
+    ) -> None:
+        """Round 5 restart2, Logic L6: _effectively_set() used to be
+        `value is not None and str(value).strip() != ""`, so a typed falsy
+        value (a TOML boolean/int -- `False`/`0`/`[]`, `str()`-ified to a
+        non-empty "False"/"0"/"[]") counted as SET, even though every
+        consumer's truthiness walrus reads it as absent. That let a falsy
+        typed value record real provenance in _record_layer, which
+        _clear_inherited_reasoning_effort then read to delete a real
+        lower-layer effort key on the strength of a "model override" no
+        consumer would ever read.
+
+        Env values are always strings in real usage, so the only place a
+        genuinely typed (non-str) value can reach a HIGHER-precedence layer
+        than config.toml's own [models] table is a caller that constructs
+        the ``env``/``env_file`` mapping programmatically -- exotic, but
+        real: ``load_config`` accepts ``Mapping[str, str]`` and nothing
+        enforces the value type at runtime. This reproduces exactly that:
+        a higher layer overriding only the model with a typed `False` must
+        be treated exactly like an absent override, so the lower TOML
+        layer's model AND its inherited effort both survive.
+        """
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.2-orion"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": False})  # type: ignore[dict-item]
+
+        assert config.resolve_worker_model("deep") == "gpt-5.2-orion"
+        assert config.resolve_worker_reasoning_effort("deep") == "medium"
+
+    def test_provenance_keys_alone_drive_layer_recording(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Round 5 restart2, Architecture A6: object-identity alone (round-4
+        restart's fix) buys nothing -- both constants are still derived from
+        the same source tuple, so adding a role changes both simultaneously.
+        What actually matters is that _PROVENANCE_KEYS is what _record_layer
+        reads, proven here by zeroing it out: with no keys recorded, a higher
+        layer that overrides only WEBSEARCH_WORKER_MODEL can no longer be
+        told apart from "the model came along with the effort", so
+        _clear_inherited_reasoning_effort must NOT clear the inherited TOML
+        effort.
         """
         import server.config as _config_module
 
-        assert _config_module._EMPTY_MEANS_ABSENT_KEYS is not _config_module._PROVENANCE_KEYS
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.2-orion"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        # Sanity: with the real _PROVENANCE_KEYS, a model-only override at a
+        # higher layer DOES clear the inherited effort.
+        baseline_config = load_config(
+            config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "gpt-5"}
+        )
+        assert baseline_config.resolve_worker_reasoning_effort("deep") is None
+
+        monkeypatch.setattr(_config_module, "_PROVENANCE_KEYS", ())
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "gpt-5"})
+
+        assert config.resolve_worker_reasoning_effort("deep") == "medium"
+
+    def test_empty_means_absent_keys_alone_drive_the_empty_override_skip(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Round 5 restart2, Architecture A6: proves _EMPTY_MEANS_ABSENT_KEYS
+        is what _apply_layer reads, by zeroing it out and reproducing the
+        round-11 gauntlet Minor B regression it was added to fix -- an
+        effectively-empty WEBSEARCH_WORKER_MODEL="" override now lands in
+        `values` as a real write again, erasing the TOML model down to the
+        dataclass default.
+        """
+        import server.config as _config_module
+
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.2-orion"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        # Sanity: with the real _EMPTY_MEANS_ABSENT_KEYS, the empty override
+        # is a no-op and the TOML model survives.
+        baseline_config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": ""})
+        assert baseline_config.resolve_worker_model("deep") == "gpt-5.2-orion"
+
+        monkeypatch.setattr(_config_module, "_EMPTY_MEANS_ABSENT_KEYS", ())
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": ""})
+
+        assert config.resolve_worker_model("deep") == "gpt-5"
+
+    def test_provenance_and_empty_means_absent_membership_coincides_today(self) -> None:
+        """Not a requirement -- see the module comment above
+        _PROVENANCE_KEYS/_EMPTY_MEANS_ABSENT_KEYS: both are derived from the
+        same _ROLE_MODEL_EFFORT_KEYS source tuple, so their membership
+        coinciding is a byproduct of that shared derivation, not an
+        independent invariant either behavioral test above depends on."""
+        import server.config as _config_module
+
         assert set(_config_module._EMPTY_MEANS_ABSENT_KEYS) == set(_config_module._PROVENANCE_KEYS)
 
 

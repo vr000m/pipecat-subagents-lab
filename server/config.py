@@ -828,24 +828,30 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
     ("WEBSEARCH_ROUTER_MODEL", "WEBSEARCH_ROUTER_REASONING_EFFORT"),
     ("WEBSEARCH_WORKER_MODEL", "WEBSEARCH_WORKER_REASONING_EFFORT"),
 )
-# Two independently-motivated rules that happen to cover the same four keys
-# today. Kept as separate names so either can change membership without
-# silently changing the other's behaviour (round 3 confirming pass,
-# Architecture finding 4).
-#
-# _PROVENANCE_KEYS: which keys carry per-layer provenance, so
-# _clear_inherited_reasoning_effort can tell "a higher layer set the model"
-# from "the model came along with the effort".
+# Both derived from _ROLE_MODEL_EFFORT_KEYS, and their membership is
+# identical today by construction -- two names because they encode two
+# different rules with two different justifications, not because the sets
+# are expected to diverge on this checkout:
+#   _PROVENANCE_KEYS: which keys carry per-layer provenance, so
+#   _clear_inherited_reasoning_effort can tell "a higher layer set the model"
+#   from "the model came along with the effort".
+#   _EMPTY_MEANS_ABSENT_KEYS: which keys treat an effectively-empty override
+#   as "absent" rather than as a write that erases the lower layer -- because
+#   THIS KEY'S CONSUMER reads it with a truthiness walrus, so empty already
+#   means absent there too. A key whose consumer does a plain `in values`
+#   presence check must NOT be listed here.
+# A future key that satisfies one rule but not the other is added to that
+# constant alone, and separate *objects* alone buy nothing towards that --
+# round 4 restart's Architecture Minor #7 made them separate comprehensions
+# instead of an alias, but both still derive from the same source tuple, so
+# adding a role still changes both simultaneously; that was never load-
+# bearing independence. What actually matters, and what
+# TestProvenanceKeysAloneDriveLayerRecording /
+# TestEmptyMeansAbsentKeysAloneDriveTheEmptyOverrideSkip in tests/test_config.py
+# pin, is that each constant is read by exactly one function: _PROVENANCE_KEYS
+# by _record_layer, _EMPTY_MEANS_ABSENT_KEYS by _apply_layer (round 5
+# restart2, Architecture A6).
 _PROVENANCE_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
-# _EMPTY_MEANS_ABSENT_KEYS: which keys treat an effectively-empty override as
-# "absent" rather than as a write that erases the lower layer. Justified by
-# these keys' consumers reading them with a truthiness walrus; a key whose
-# consumer does a plain `in values` presence check must NOT be listed here.
-#
-# Its own comprehension, not an alias of _PROVENANCE_KEYS: they cover the
-# same set today, but an alias meant changing one object's membership changed
-# both, enforced only by the paragraph above -- not the independence the two
-# names claim (round-4 restart, Architecture Minor #7).
 _EMPTY_MEANS_ABSENT_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
 
 
@@ -862,8 +868,21 @@ def _effectively_set(value: object) -> bool:
     the consumers treat as absent (``None``, ``""``) is absent here too, so
     the strictness can never resurrect a lower layer the consumers would have
     used (round 3 confirming pass, Logic finding 3).
+
+    Also matches the consumers in the falsy-non-string direction: env vars
+    are always strings, but a typed TOML value can be ``False``/``0``/``[]``
+    -- those are truthy under the OLD ``value is not None`` check (so
+    ``str(value)`` -> ``"False"``/``"0"``, both non-empty) even though every
+    consumer's truthiness walrus treats them as absent. That divergence let a
+    typed-TOML ``router_model = false`` record real provenance in
+    ``_record_layer`` (and pass ``_apply_layer``'s write gate) for a value no
+    consumer would ever read, which ``_clear_inherited_reasoning_effort``
+    could then act on to delete a real lower-layer effort key. ``bool(value)``
+    restores the stated one-directional invariant exactly: falsy in the same
+    sense the consumers are, not just falsy-when-stringified (round 5
+    restart2, Logic L6).
     """
-    return value is not None and str(value).strip() != ""
+    return bool(value) and str(value).strip() != ""
 
 
 def _record_layer(values: Mapping[str, object], layers: dict[str, int], layer: int) -> None:
