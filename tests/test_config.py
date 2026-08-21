@@ -1912,12 +1912,30 @@ class TestReasoningEffortInheritance:
         self, tmp_path: Path
     ) -> None:
         config_file = tmp_path / "config.toml"
+        # Deliberately NOT "gpt-5" (the worker_model_policy dataclass default):
+        # an identical value made the model half of this pairing untestable.
         config_file.write_text(
-            '[models]\nworker_model = "gpt-5"\nworker_reasoning_effort = "medium"\n'
+            '[models]\nworker_model = "gpt-5.2-orion"\nworker_reasoning_effort = "medium"\n'
         )
 
         config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": ""})
 
+        assert config.resolve_worker_reasoning_effort("deep") == "medium"
+        # Round 11 gauntlet, Minor B: the surviving effort must stay paired with
+        # the TOML model it was configured against, not the dataclass default.
+        assert config.resolve_worker_model("deep") == "gpt-5.2-orion"
+
+    def test_explicitly_empty_effort_override_does_not_clear_the_toml_effort(
+        self, tmp_path: Path
+    ) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.2-orion"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_REASONING_EFFORT": ""})
+
+        assert config.resolve_worker_model("deep") == "gpt-5.2-orion"
         assert config.resolve_worker_reasoning_effort("deep") == "medium"
 
     def test_no_overrides_toml_pair_applies_unchanged(self, tmp_path: Path) -> None:

@@ -844,6 +844,31 @@ def _record_layer(values: Mapping[str, object], layers: dict[str, int], layer: i
             layers[key] = layer
 
 
+def _apply_layer(
+    values: dict[str, object],
+    layer_values: Mapping[str, object],
+    layers: dict[str, int],
+    layer: int,
+) -> None:
+    """Merge one precedence layer into ``values`` and record its provenance.
+
+    An effectively-empty override of a role model/effort key (_PROVENANCE_KEYS)
+    is a no-op, not a write. Every consumer of those four keys reads them with a
+    truthiness walrus (load_config's model/effort block), so an empty value
+    already means "absent" there -- but letting it land in ``values`` still
+    ERASED the lower layer's real value, while _record_layer correctly ignored it
+    for provenance. Net effect: `WEBSEARCH_WORKER_MODEL=""` over a TOML
+    worker_model/worker_reasoning_effort pair kept the TOML effort (correct) but
+    repaired it to the dataclass-DEFAULT model, discarding the TOML model the
+    effort was configured against (round 11 gauntlet, Minor B).
+    """
+    for key, value in layer_values.items():
+        if key in _PROVENANCE_KEYS and not _effectively_set(value):
+            continue
+        values[key] = value
+    _record_layer(layer_values, layers, layer)
+
+
 def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[str, int]) -> None:
     """Drop a lower-precedence-layer reasoning effort when a HIGHER-precedence
     layer overrode only that role's model.
@@ -902,11 +927,9 @@ def load_config(
                     env_file_values[key.strip()] = value.strip().strip("\"'")
         else:
             env_file_values = dict(env_file)
-        values.update(env_file_values)
-        _record_layer(env_file_values, layers, 1)
+        _apply_layer(values, env_file_values, layers, 1)
     env_values = os.environ if env is None else env
-    values.update(env_values)
-    _record_layer(env_values, layers, 2)
+    _apply_layer(values, env_values, layers, 2)
     # Overriding only a role's *model* at a higher-precedence layer than the
     # one that set its *effort* must not silently carry that inherited
     # effort along -- see _clear_inherited_reasoning_effort's docstring.
