@@ -40,7 +40,7 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -78,6 +78,7 @@ __all__ = [
     "effective_effort_for_manifest_lookup",
     "error_text",
     "git_head",
+    "judge_extra_kwargs",
     "latest_turn_stage_metrics",
     "sanitize_reason",
     "shipped_candidates",
@@ -215,6 +216,24 @@ WORKER_CANDIDATES: tuple[Candidate, ...] = (
 )
 
 
+def _registered_label(candidate: Candidate, registry: tuple[Candidate, ...]) -> str:
+    """The label of the registered eval candidate that is wire-identical to
+    ``candidate``, or ``"shipped"`` if none is.
+
+    "shipped" only when config.toml ships a (model, effort) no registered
+    eval candidate covers -- TestShippedConfigHasAnEvalCandidateCell
+    guarantees that cannot happen on this checkout, so this fallback exists
+    only so a future config.toml edit degrades instead of crashing (round 5
+    restart2, Architecture A5).
+    """
+    key = (candidate.model, effective_effort_for_manifest_lookup(candidate))
+    match = next(
+        (c for c in registry if (c.model, effective_effort_for_manifest_lookup(c)) == key),
+        None,
+    )
+    return match.label if match is not None else "shipped"
+
+
 def shipped_candidates() -> tuple[Candidate, Candidate]:
     """The (model, effort) pair config.toml actually ships today, as Candidates.
 
@@ -222,21 +241,34 @@ def shipped_candidates() -> tuple[Candidate, Candidate]:
     sweep's production anchor must be what the repo ships, not what the
     developer's process environment happens to override it to, or two runs on
     two machines would anchor against different cells.
+
+    The returned candidates carry the ``label`` of the registered eval
+    candidate that matches them on wire identity (model, effective effort),
+    NOT a synthesized ``"shipped"`` label -- ``Candidate.label`` is a real
+    CLI selector key and report identity string everywhere else it's used
+    (see ``RunPair.label``'s docstring), and constructing a ``Candidate``
+    with a label no other instance shares overloaded that contract for
+    exactly these two instances (round 5 restart2, Architecture A5). Only
+    ``.model``/``.effort`` are config-resolved values; a config.toml edit
+    that ships something no registered candidate covers falls back to
+    ``label="shipped"`` (see ``_registered_label``) rather than crashing.
     """
     config = load_config(env={}, config_file=REPO_ROOT / "config.toml")
+    router = Candidate(
+        label="shipped",
+        role="router",
+        model=config.resolve_router_model("fast"),
+        effort=config.resolve_router_reasoning_effort("fast"),
+    )
+    worker = Candidate(
+        label="shipped",
+        role="worker",
+        model=config.resolve_worker_model("deep"),
+        effort=config.resolve_worker_reasoning_effort("deep"),
+    )
     return (
-        Candidate(
-            label="shipped",
-            role="router",
-            model=config.resolve_router_model("fast"),
-            effort=config.resolve_router_reasoning_effort("fast"),
-        ),
-        Candidate(
-            label="shipped",
-            role="worker",
-            model=config.resolve_worker_model("deep"),
-            effort=config.resolve_worker_reasoning_effort("deep"),
-        ),
+        replace(router, label=_registered_label(router, (ROUTER_BASELINE, *ROUTER_CANDIDATES))),
+        replace(worker, label=_registered_label(worker, (WORKER_BASELINE, *WORKER_CANDIDATES))),
     )
 
 
@@ -366,7 +398,7 @@ def build_session_for_run(
 JUDGE_MAX_TOKENS = 500
 
 
-def _judge_extra_kwargs(model: str) -> dict[str, Any]:
+def judge_extra_kwargs(model: str) -> dict[str, Any]:
     """The model-conditional Chat Completions extras every judge request
     carries. Single source for ``build_judge_llm_service()``'s
     ``Settings.extra`` and ``build_judge_request_kwargs()``'s flat kwargs, so
@@ -383,14 +415,14 @@ def build_judge_request_kwargs(
     """The exact judge request-kwargs shape sent to the Chat Completions API,
     shared by the real judge (via ``build_judge_llm_service``, indirectly)
     and ``scripts/verify_eval_candidates.py``'s probe -- see
-    ``_judge_extra_kwargs`` for why the reasoning-effort piece is hoisted out
+    ``judge_extra_kwargs`` for why the reasoning-effort piece is hoisted out
     rather than duplicated at each call site.
     """
     return {
         "model": model,
         "messages": messages,
         "max_completion_tokens": max_completion_tokens,
-        **_judge_extra_kwargs(model),
+        **judge_extra_kwargs(model),
     }
 
 
@@ -420,7 +452,7 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     every judge call returning ``"judge returned empty response"`` across an
     entire eval matrix (round 9 gauntlet follow-up). Shares the
     ``gpt-5* -> minimal`` model-naming rule with the router via
-    ``default_reasoning_effort_for_model`` (through ``_judge_extra_kwargs``);
+    ``default_reasoning_effort_for_model`` (through ``judge_extra_kwargs``);
     it does **not** go through ``effective_router_reasoning_effort``, whose
     contract is the router's own wire-level prediction and whose policy must
     stay retunable without moving the judge (round 10 gauntlet, Architecture
@@ -431,7 +463,7 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     """
     from pipecat.services.openai.llm import OpenAILLMService
 
-    extra = _judge_extra_kwargs(model)
+    extra = judge_extra_kwargs(model)
 
     return OpenAILLMService(
         settings=OpenAILLMService.Settings(model=model, extra=extra), api_key=api_key

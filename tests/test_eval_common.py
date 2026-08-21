@@ -253,7 +253,7 @@ class TestBuildJudgeLlmServicePinsReasoningEffort:
 class TestBuildJudgeRequestKwargs:
     """Round 10 gauntlet, Logic finding 3: build_judge_request_kwargs() is
     the single source of truth for the judge request shape, shared with
-    build_judge_llm_service() via _judge_extra_kwargs(). Previously
+    build_judge_llm_service() via judge_extra_kwargs(). Previously
     scripts/verify_eval_candidates.py hand-listed its own kwargs, which could
     silently drift from what build_judge_llm_service() actually sends.
     """
@@ -305,7 +305,7 @@ class TestJudgeEffortDecoupledFromRouterPolicy:
     def test_retuning_router_policy_does_not_move_the_judge(self, monkeypatch) -> None:
         # Patched on eval_common_module, not server.router: build_judge_llm_service()
         # no longer calls effective_router_reasoning_effort at all (it calls
-        # default_reasoning_effort_for_model via _judge_extra_kwargs), so this
+        # default_reasoning_effort_for_model via judge_extra_kwargs), so this
         # proves the decoupling regardless of which name is patched.
         monkeypatch.setattr(
             eval_common_module,
@@ -374,3 +374,43 @@ class TestShippedConfigHasAnEvalCandidateCell:
             "cell in WORKER_BASELINE/WORKER_CANDIDATES -- a comparison run no longer "
             "measures against current production; add a candidate for it."
         )
+
+
+class TestShippedCandidatesCarryARegisteredLabel:
+    """Round 5 restart2, Architecture A5: shipped_candidates() must return
+    Candidates whose `label` is a real registered selector/report-identity
+    string, not a synthesized "shipped" label that overloads
+    Candidate.label's documented dual contract (CLI selector key + report
+    identity, see RunPair.label's docstring in eval_model_comparison.py).
+    TestShippedConfigHasAnEvalCandidateCell guarantees a matching registered
+    candidate always exists on this checkout, so the "shipped" fallback
+    should never fire here -- but .model/.effort must still be the
+    config-resolved values, not the matched candidate's own declared values
+    (fidelity: config.toml may ship effort="minimal" for a candidate whose
+    registry entry declares effort=None)."""
+
+    def test_shipped_candidates_carry_a_registered_selectable_label(self) -> None:
+        from server.config import load_config
+
+        repo_config_toml = Path(__file__).resolve().parents[1] / "config.toml"
+        config = load_config(env={}, config_file=repo_config_toml)
+
+        router, worker = eval_common_module.shipped_candidates()
+
+        router_labels = {
+            c.label
+            for c in (eval_common_module.ROUTER_BASELINE, *eval_common_module.ROUTER_CANDIDATES)
+        }
+        worker_labels = {
+            c.label
+            for c in (eval_common_module.WORKER_BASELINE, *eval_common_module.WORKER_CANDIDATES)
+        }
+        assert router.label in router_labels
+        assert worker.label in worker_labels
+
+        # Fidelity half of the decision: .model/.effort stay the
+        # config-resolved values, not the matched registry candidate's own.
+        assert router.model == config.resolve_router_model("fast")
+        assert router.effort == config.resolve_router_reasoning_effort("fast")
+        assert worker.model == config.resolve_worker_model("deep")
+        assert worker.effort == config.resolve_worker_reasoning_effort("deep")

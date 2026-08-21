@@ -540,7 +540,7 @@ Router/worker model evaluation (run in this order):
   tools) tuple with production-equivalent request shapes and writes a
   versioned manifest that gates the runner below. Its judge probe pins
   `reasoning_effort="minimal"` (`scripts/eval_common.py`'s
-  `build_judge_request_kwargs`/`_judge_extra_kwargs`) because the judge runs
+  `build_judge_request_kwargs`/`judge_extra_kwargs`) because the judge runs
   the Chat Completions API on a `gpt-5*` reasoning model: without an explicit
   low effort, hidden reasoning tokens can consume the entire
   `max_completion_tokens` budget before any verdict text is emitted, unlike
