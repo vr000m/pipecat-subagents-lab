@@ -220,6 +220,15 @@ bun test
 bun run lint
 ```
 
+A `justfile` at the repo root wraps the Python half of these into `just
+sync` / `just test` / `just build` / `just web-test` / `just check` (the
+full compile+test pipeline) / `just run` (starts the real server, loading
+`~/.secrets/ai.env` or `$AI_ENV_FILE`) / `just all` (install, check, run).
+Its `sync`/`build` recipes intentionally use the same `--frozen` /
+`--frozen-lockfile` flags as `.github/workflows/ci.yml` so a lockfile
+drift fails the same way locally and in CI — keep the two in sync by hand
+if either's command list changes; neither file reads the other.
+
 `uv run mypy` checks every module under `server/` by default, so a newly added
 file is type-gated without anyone remembering to opt it in. The explicit
 override list in `pyproject.toml` exempts the modules that still carry
