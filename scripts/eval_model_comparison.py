@@ -1055,16 +1055,19 @@ def _aggregate_cell_repeats(
     ``len(repeats) == 1`` (the --repeat 1 default) returns that lone
     CellOutcome unchanged: a strict identity, not just an equivalent
     aggregation, so the default single-run report shape is byte-for-byte
-    what it was before --repeat existed.
+    what it was before --repeat existed. The depth-1 check above applies to
+    this path too -- an already-aggregated cell is rejected rather than
+    round-tripped, which would otherwise let _serialize_cell's recursion emit
+    depth-2 repeats.
     """
-    if len(repeats) == 1:
-        return repeats[0]
-
     if any(cell.repeats is not None for cell in repeats):
         raise ValueError(
             "CellOutcome.repeats must be depth-1: _aggregate_cell_repeats received "
             "an already-aggregated cell as an input repeat"
         )
+
+    if len(repeats) == 1:
+        return repeats[0]
 
     statuses: list[CellStatus] = [cell.status for cell in repeats]
     agg_status = _majority_with_tiebreak(statuses, _CELL_STATUS_TIE_PRIORITY)

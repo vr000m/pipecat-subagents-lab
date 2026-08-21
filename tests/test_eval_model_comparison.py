@@ -1136,6 +1136,15 @@ class TestAggregateCellRepeats:
         assert aggregated.repeats is not None
         assert all(repeat.repeats is None for repeat in aggregated.repeats)
 
+    def test_an_already_aggregated_lone_cell_is_rejected_not_round_tripped(self) -> None:
+        """Round 11 gauntlet, Minor A: the depth-1 guard ran after the len==1
+        identity return, so a single already-aggregated cell was returned
+        unchanged and _serialize_cell would emit depth-2 `repeats`."""
+        nested = self._aggregate([self._cell(), self._cell(), self._cell()])
+        assert nested.repeats is not None
+        with pytest.raises(ValueError, match="depth-1"):
+            self._aggregate([nested])
+
 
 class TestRunMatrixRepeatWiring:
     """run_matrix()'s repeat_count param must call run_cell() that many
