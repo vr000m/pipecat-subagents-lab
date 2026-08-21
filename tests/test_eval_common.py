@@ -27,7 +27,7 @@ from scripts.eval_common import (
     confined_output_path,
     turn_correlated_routing_action,
 )
-from server.config import Config, PromotionManifest
+from server.config import Config, PromotionManifest, load_config
 from server.pipeline import SAFE_FALLBACK_TEXTS
 
 
@@ -416,27 +416,37 @@ class TestShippedCandidatesCarryARegisteredLabel:
         assert worker.effort == config.resolve_worker_reasoning_effort("deep")
 
 
-class TestShippedCandidatesAcceptsAnInjectedConfig:
-    """Round 7 F5: shipped_candidates() hardcoded
-    load_config(env={}, config_file=REPO_ROOT / "config.toml"), doing its
-    own file I/O even for a caller that already holds a Config -- breaking
-    this module's "config comes in, it is never loaded here" convention
-    (cf. build_session_for_run). config is now an optional injection point,
-    resolved LAZILY so a caller that always supplies one triggers zero file
-    I/O -- pinned here by monkeypatching load_config to raise."""
+class TestShippedCandidatesAcceptsAnInjectedConfigFile:
+    """Round 7 F5 hardcoded load_config(env={}, config_file=REPO_ROOT /
+    "config.toml"), coupling this module to the repo layout even for a
+    caller (mainly tests) that wants to point it at a different file --
+    breaking this module's "config comes in, it is never loaded here"
+    convention (cf. build_session_for_run). Round 7 F5's first attempt took
+    a pre-resolved Config parameter instead, but round 8's Architecture lens
+    found that a live footgun: Config carries no provenance of which layers
+    were applied, so nothing stops a future caller from passing a
+    process-env-derived Config and silently breaking the env={} anchoring
+    invariant this function exists to guarantee. Narrowed to config_file --
+    the function still owns calling load_config(env={}, ...) itself, so the
+    anchoring invariant cannot be bypassed by construction (round 8 gauntlet,
+    Architecture finding 1)."""
 
-    def test_shipped_candidates_uses_an_injected_config_without_file_io(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def _raise_if_called(*args: object, **kwargs: object) -> Config:
-            raise AssertionError("load_config() must not be called when config is injected")
+    def test_shipped_candidates_reads_the_injected_config_file(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nrouter_model = "gpt-9-router"\nworker_model = "gpt-9-worker"\n'
+        )
 
-        monkeypatch.setattr(eval_common_module, "load_config", _raise_if_called)
+        router, worker = eval_common_module.shipped_candidates(config_file)
 
-        injected = Config()
-        router, worker = eval_common_module.shipped_candidates(injected)
+        expected = load_config(env={}, config_file=config_file)
+        assert router.model == expected.resolve_router_model("fast") == "gpt-9-router"
+        assert worker.model == expected.resolve_worker_model("deep") == "gpt-9-worker"
 
-        assert router.model == injected.resolve_router_model("fast")
-        assert router.effort == injected.resolve_router_reasoning_effort("fast")
-        assert worker.model == injected.resolve_worker_model("deep")
-        assert worker.effort == injected.resolve_worker_reasoning_effort("deep")
+    def test_shipped_candidates_defaults_to_the_repo_tracked_config_toml(self) -> None:
+        default_result = eval_common_module.shipped_candidates()
+        explicit_result = eval_common_module.shipped_candidates(
+            eval_common_module.REPO_ROOT / "config.toml"
+        )
+
+        assert default_result == explicit_result
