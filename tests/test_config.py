@@ -2059,6 +2059,31 @@ class TestReasoningEffortInheritance:
 
         assert config.resolve_worker_model("deep") == "gpt-5"
 
+    def test_layer_zero_toml_also_honours_the_empty_override_gate(self, tmp_path: Path) -> None:
+        """Round 6 gauntlet, Logic G2 / Architecture A1: before this fix, the
+        TOML layer (layer 0) bypassed `_apply_layer` entirely -- it wrote
+        straight into `values` via `_load_toml_values`, then called
+        `_record_layer` separately, so the empty-override gate that layers 1
+        and 2 get for free never applied to layer 0.
+
+        That was a behavioural no-op *for layer 0 specifically* (nothing
+        beneath it to erase), but it made a shape representable that
+        `_apply_layer` makes unrepresentable for every other layer: a
+        whitespace-only TOML value landing in `values` while `_record_layer`
+        (which already applies `_effectively_set`) declines to record its
+        provenance. Now that layer 0 routes through `_apply_layer` like the
+        other two, a whitespace-only `router_model` must never land in
+        `values` at all, and the real `router_reasoning_effort` set alongside
+        it must survive untouched.
+        """
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[models]\nrouter_model = "   "\nrouter_reasoning_effort = "high"\n')
+
+        config = load_config(config_file=config_file, env={})
+
+        assert config.resolve_router_model("fast") != "   "
+        assert config.resolve_router_reasoning_effort("fast") == "high"
+
     def test_provenance_and_empty_means_absent_membership_coincides_today(self) -> None:
         """Not a requirement -- see the module comment above
         _PROVENANCE_KEYS/_EMPTY_MEANS_ABSENT_KEYS: both are derived from the

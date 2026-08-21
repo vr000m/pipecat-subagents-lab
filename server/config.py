@@ -840,6 +840,13 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
 #   THIS KEY'S CONSUMER reads it with a truthiness walrus, so empty already
 #   means absent there too. A key whose consumer does a plain `in values`
 #   presence check must NOT be listed here.
+#   This precondition is convention-only and deliberately unenforced: every
+#   executable form of it is either tautological (an empty-override behaviour
+#   test just re-tests _apply_layer's own skip) or source introspection over
+#   load_config's consumer block. Accepted because all members derive from
+#   _ROLE_MODEL_EFFORT_KEYS, whose membership is pinned by
+#   tests/test_config.py's constant-parity test -- adding a key here cannot
+#   happen without a human edit that trips that test (round 6, Architecture A2).
 # A future key that satisfies one rule but not the other is added to that
 # constant alone, and separate *objects* alone buy nothing towards that --
 # round 4 restart's Architecture Minor #7 made them separate comprehensions
@@ -908,6 +915,16 @@ def _apply_layer(
     worker_model/worker_reasoning_effort pair kept the TOML effort (correct) but
     repaired it to the dataclass-DEFAULT model, discarding the TOML model the
     effort was configured against (round 11 gauntlet, Minor B).
+
+    This is now the sole merge path for all three precedence layers, including
+    layer 0 (TOML). Layer 0 gains nothing *behaviourally* from the empty-
+    override gate today -- it is the bottom layer, so an "erasing" write has
+    nothing beneath it to erase -- but routing it through this function keeps
+    the invariant "an effectively-empty role model/effort override is never a
+    write" uniform across every layer, rather than true for layers 1-2 and
+    merely incidental for layer 0. That uniformity is what stops a future
+    layer added below TOML from silently reintroducing this bug class (round 6
+    gauntlet, Logic G2 / Architecture A1).
     """
     for key, value in layer_values.items():
         if key in _EMPTY_MEANS_ABSENT_KEYS and not _effectively_set(value):
@@ -969,9 +986,10 @@ def load_config(
                     toml_values = tomllib.load(handle)
             except tomllib.TOMLDecodeError as exc:
                 raise ConfigError(f"invalid TOML config: {path}") from exc
-    _load_toml_values(values, toml_values)
     layers: dict[str, int] = {}
-    _record_layer(values, layers, 0)
+    toml_backed: dict[str, object] = {}
+    _load_toml_values(toml_backed, toml_values)
+    _apply_layer(values, toml_backed, layers, 0)
     if env_file:
         if isinstance(env_file, (str, Path)):
             env_file_values: dict[str, object] = {}
