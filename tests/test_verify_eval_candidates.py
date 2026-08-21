@@ -174,10 +174,10 @@ class TestJudgeProbeKwargsShareProductionsShape:
 
         assert "reasoning_effort" not in kwargs
 
-    def test_probe_token_cap_stays_16_not_judge_max_tokens(self) -> None:
+    def test_probe_token_cap_stays_32_not_judge_max_tokens(self) -> None:
         kwargs = verify_module._judge_kwargs("gpt-5-mini")
 
-        assert kwargs["max_completion_tokens"] == 16
+        assert kwargs["max_completion_tokens"] == 32
 
     def test_parity_with_build_judge_llm_service(self) -> None:
         from scripts.eval_common import build_judge_llm_service

@@ -180,13 +180,21 @@ def _build_worker_kwargs(model: str, effort: str | None) -> dict[str, Any]:
 def _judge_kwargs(judge_model: str) -> dict[str, Any]:
     """Built from eval_common's shared judge-shape helper rather than
     hand-listing kwargs -- same rationale as ``_build_router_kwargs`` above.
-    ``max_completion_tokens`` is deliberately 16, not ``JUDGE_MAX_TOKENS``:
-    this is an existence/credential probe, not a verdict call.
+    ``max_completion_tokens`` is deliberately 32, not ``JUDGE_MAX_TOKENS``:
+    this is an existence/credential probe, not a verdict call. It was 16
+    until the round-10 gauntlet's judge-shape unification fix made this
+    probe start sending ``reasoning_effort`` (previously omitted -- that
+    omission was the bug), and a live manifest-regeneration run then showed
+    16 is too tight even at ``minimal`` effort: gpt-5-mini returned a 400
+    ("max_tokens or model output limit was reached") because minimal-effort
+    reasoning still consumes some of the completion-token budget before any
+    output token is emitted. 32 verified live to pass with 0 reasoning
+    tokens spent; still a small fraction of ``JUDGE_MAX_TOKENS`` (500).
     """
     return build_judge_request_kwargs(
         judge_model,
         messages=[{"role": "user", "content": JUDGE_PROBE_MESSAGE}],
-        max_completion_tokens=16,
+        max_completion_tokens=32,
     )
 
 
