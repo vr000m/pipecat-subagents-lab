@@ -953,6 +953,60 @@ class TestAggregateCellRepeats:
         assert turn.latency_budget_exceeded is True
         assert turn.total_ms is not None and turn.total_ms > 60.0 * 1000
 
+    def test_a_failed_repeat_zero_does_not_disable_the_enforced_budget_gate(self) -> None:
+        """Round 11 gauntlet, Logic finding 1: latency_budget_enforced is only
+        written on run_cell()'s measured path, so a repeat that failed before
+        measuring carries the False default. Sampling repeat 0 let that False
+        outvote two surviving repeats that measured a real baseline breach --
+        compute_pass_fail()'s `enforced and exceeded` gate never fired and the
+        cell reported PASS."""
+        cells = [
+            self._cell(
+                status="provider-error",
+                turns=[self._turn(status="provider-error")],  # enforced defaults False
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=200_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=200_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.status == "ok"  # 2/3 majority
+        assert turn.latency_budget_exceeded is True
+        assert turn.latency_budget_enforced is True
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any("enforced latency budget exceeded" in r for r in reasons)
+
+    def test_a_non_baseline_pairs_budget_stays_report_only(self) -> None:
+        """any() must not manufacture enforcement: no repeat of a non-baseline
+        pair ever sets latency_budget_enforced, so the aggregate stays False and
+        an over-budget mean is reported without failing the run."""
+        cells = [
+            self._cell(turns=[self._turn(total_ms=200_000.0, latency_budget_exceeded=True)]),
+            self._cell(turns=[self._turn(total_ms=200_000.0, latency_budget_exceeded=True)]),
+        ]
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_enforced is False
+        assert eval_runner.compute_pass_fail([aggregated])[0] == "PASS"
+
     def test_routing_leg_over_budget_is_exceeded_even_when_total_ms_is_fine(self) -> None:
         cells = [
             self._cell(turns=[self._turn(routing_ms=20_000.0, total_ms=10.0)]),

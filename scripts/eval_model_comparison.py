@@ -1022,10 +1022,20 @@ def _aggregate_turn_repeats(
         search_ms=_average([turn.search_ms for turn in ok_turns]),
         total_ms=agg_total_ms,
         latency_budget_exceeded=agg_budget_exceeded,
-        # Config-derived, not outcome-derived -- every repeat runs the same
-        # candidate/scenario config, so this is identical across repeats;
-        # take it from the first rather than voting on it.
-        latency_budget_enforced=turn_repeats[0].latency_budget_enforced,
+        # Any repeat that OBSERVED enforcement is authoritative. This field is
+        # pair-derived (run_cell() sets it to pair.is_baseline), but only on the
+        # measured path -- `if stage_metrics is not None` at run_cell():1575.
+        # Every other producer, including _skipped_turn_outcomes()' padding for
+        # a repeat that failed or aborted before it measured anything, leaves it
+        # at its False dataclass default. Sampling repeat 0 therefore reported
+        # enforced=False whenever repeat 0 happened to be the failed one, which
+        # silently disabled compute_pass_fail()'s enforced-budget gate for a cell
+        # whose surviving repeats DID breach a real baseline budget -- the same
+        # mean-vs-verdict inconsistency class as round 10's Logic finding 6,
+        # reintroduced through a different field (round 11 gauntlet).
+        # Deliberately over all turn_repeats, not just ok_turns: a turn measured
+        # at :1575 can still be reclassified non-ok afterwards.
+        latency_budget_enforced=any(turn.latency_budget_enforced for turn in turn_repeats),
     )
 
 
@@ -1096,8 +1106,14 @@ def _aggregate_cell_repeats(
         status=agg_status,
         error=agg_error,
         turns=agg_turns,
-        # Config-derived (identical across repeats of the same cell), same
-        # rationale as TurnOutcome.latency_budget_enforced above.
+        # Config-derived and set unconditionally at every CellOutcome
+        # construction site (_never_ran_cell, run_cell's return, and this
+        # function), so it IS identical across repeats -- unlike
+        # TurnOutcome.latency_budget_enforced above, which is only written on
+        # run_cell()'s measured path and so must be folded with any(), not
+        # sampled. Manifest-rejected cells (the only construction site that can
+        # leave these None) are built in run_matrix() before the repeat loop and
+        # never reach this function.
         router_timeout_seconds=repeats[0].router_timeout_seconds,
         foreground_search_timeout_seconds=repeats[0].foreground_search_timeout_seconds,
         repeats=repeats,
