@@ -1034,7 +1034,7 @@ class TestReportAggregation:
             )
 
     def test_build_report_degrades_instead_of_discarding_a_paid_run_on_annotation_failure(
-        self,
+        self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Round 6 gauntlet, Logic G3: round 5's L5 fix moved
         shipped_candidates() ahead of the paid run precisely because a
@@ -1046,6 +1046,13 @@ class TestReportAggregation:
         of throwing it away: no exception, an `error` key naming the missing
         label, `overall_status` flipped to the failing value, and every
         already-billed outcome still present in `report["cells"]`.
+
+        Round 7 F1: this degrade shape (`{"error": ...}`) is one of the two
+        `shipped_config_cells` shapes -- print_report_summary() previously
+        indexed it unconditionally with `shipped_cells['router'][...]` and
+        raised KeyError on exactly this report, discarding the console
+        record of an already-billed run. Also exercises that path here: it
+        must not raise, and must name the missing label on the console.
         """
         pairs = eval_runner.default_sweep_pairs()
         outcomes = [
@@ -1066,6 +1073,15 @@ class TestReportAggregation:
         assert report["overall_status"] == "FAIL"
         assert len(report["cells"]) == len(outcomes)
         assert {c["pair"] for c in report["cells"]} == {o.pair_label for o in outcomes}
+        # Round 7 F1/F2: build_report's single verdict rule -- overall_status
+        # is derived from the FULL reason list, which must contain both
+        # compute_pass_fail's own reasons and the annotation-failure reason,
+        # not one silently overwriting the other.
+        assert any("shipped-cell annotation failed" in r for r in report["failure_reasons"])
+
+        eval_runner.print_report_summary(report)  # must not raise (F1 repro)
+        captured = capsys.readouterr()
+        assert "nonexistent" in captured.err
 
 
 class TestShippedConfigCellsAnnotationMarksUnmatchedRoles:
@@ -1114,6 +1130,36 @@ class TestShippedConfigCellsAnnotationMarksUnmatchedRoles:
         )
 
         assert "unmatched_roles" not in annotation
+
+    def test_print_report_summary_mirrors_unmatched_roles_to_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Round 7 F1/F2: the console mirror of `unmatched_roles` moved out
+        of `build_report` (a pure serializer, no console side effects) and
+        into `print_report_summary` (the console-facing half of this
+        module). Pins both halves of the relocation: `build_report` alone
+        emits nothing on stderr, and `print_report_summary` prints the
+        `WARNING` line for a report whose annotation carries
+        `unmatched_roles`."""
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+        no_match_router = eval_runner.Candidate(
+            label="shipped", role="router", model="no-registered-candidate-covers-this", effort=None
+        )
+
+        report = eval_runner.build_report(
+            outcomes,
+            judge_model="gpt-5-mini",
+            shipped=(no_match_router, eval_runner.WORKER_BASELINE),
+            pairs=pairs,
+        )
+        assert capsys.readouterr().err == ""
+
+        eval_runner.print_report_summary(report)
+        assert "WARNING" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

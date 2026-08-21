@@ -2095,6 +2095,19 @@ _CELL_INFRA_FAILURE_STATUSES = {
 }
 
 
+def _overall_status(reasons: list[str]) -> str:
+    """The one rule for turning a list of failure reasons into a verdict --
+    round 7's F1/F2: `build_report()` used to write ``overall_status =
+    "FAIL"`` directly on the shipped-annotation degrade path, a second
+    verdict authority that bypassed this rule and silently overwrote
+    whatever `compute_pass_fail()` had already decided. There is now one
+    *rule* (this function) and two *reason sources* (`compute_pass_fail`'s
+    per-cell reasons, plus `build_report`'s own annotation-failure reason),
+    both folded into one `status_reasons` list before this is called once.
+    """
+    return "FAIL" if reasons else "PASS"
+
+
 def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
     """Aggregate the run's cells/turns into one pass/fail verdict.
 
@@ -2191,7 +2204,7 @@ def compute_pass_fail(outcomes: list[CellOutcome]) -> tuple[str, list[str]]:
                 reasons.append(f"semantic: {label} {query!r} citations assertion failed")
             if turn.latency_budget_enforced and turn.latency_budget_exceeded:
                 reasons.append(f"semantic: {label} {query!r} enforced latency budget exceeded")
-    return ("FAIL" if reasons else "PASS"), reasons
+    return _overall_status(reasons), reasons
 
 
 def _serialize_turn(turn: TurnOutcome) -> dict[str, Any]:
@@ -2344,7 +2357,10 @@ def build_report(
         raise ValueError(
             "build_report(shipped=...) also requires pairs=... to resolve each cell's candidates"
         )
-    overall_status, failure_reasons = compute_pass_fail(outcomes)
+    # Only `failure_reasons` is used directly -- the status itself is derived
+    # once, from the FULL reason list (compute_pass_fail's plus any
+    # annotation-failure reason appended below), via `_overall_status()`.
+    _, failure_reasons = compute_pass_fail(outcomes)
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "judge_model": judge_model,
@@ -2397,42 +2413,54 @@ def build_report(
         # (round 6 gauntlet, Architecture A5) -- dropped rather than kept
         # as an assert, since this file's convention is ValueError for
         # reachable invariants and no guard at all for unreachable ones.
+        # A `pair_label` miss here is a caller bug (see
+        # _shipped_config_cells_annotation's docstring: every outcome is
+        # produced from `pairs` by construction), not a config/registry
+        # gap -- unlike A4's `unmatched_roles` warning, this MUST fail the
+        # run. But it must fail it LOUDLY, not by discarding the already-
+        # billed `outcomes` this function was about to persist: round 5's L5
+        # fix moved `shipped_candidates()` ahead of the paid run for exactly
+        # this reason (a post-run raise destroying paid results), and this
+        # was the one remaining post-run raise on that same path (round 6
+        # gauntlet, Logic G3).
+        #
+        # Round 7 F1/F2: the annotation is now computed, and its failure
+        # folded into `annotation_reasons`, BEFORE the verdict is taken --
+        # `_overall_status()` is the one rule for reasons -> status, called
+        # once below, rather than this branch writing `overall_status =
+        # "FAIL"` directly as a second, silently-overwriting authority.
+        # `unmatched_roles` deliberately contributes NO failure reason (A4:
+        # a config/registry gap, not a caller bug, must not flip status) --
+        # its console mirror (the stderr `WARNING` line) has moved to
+        # `print_report_summary`, which is the console-facing half of this
+        # module; `build_report` now does serialization + verdict only.
+        annotation_reasons: list[str] = []
         try:
             report["shipped_config_cells"] = _shipped_config_cells_annotation(
                 outcomes, shipped, pairs
             )
         except ValueError as exc:
-            # A `pair_label` miss here is a caller bug (see
-            # _shipped_config_cells_annotation's docstring: every outcome is
-            # produced from `pairs` by construction), not a config/registry
-            # gap -- unlike A4's `unmatched_roles` warning below, this MUST
-            # fail the run. But it must fail it LOUDLY, not by discarding the
-            # already-billed `outcomes` this function was about to persist:
-            # round 5's L5 fix moved `shipped_candidates()` ahead of the paid
-            # run for exactly this reason (a post-run raise destroying paid
-            # results), and this was the one remaining post-run raise on that
-            # same path (round 6 gauntlet, Logic G3).
             report["shipped_config_cells"] = {"error": str(exc)}
-            failure_reasons = [*failure_reasons, f"shipped-cell annotation failed: {exc}"]
-            overall_status = "FAIL"
-        else:
-            unmatched = report["shipped_config_cells"].get("unmatched_roles")
-            if unmatched:
-                # Console mirror of the persisted `unmatched_roles` marker
-                # (A4) so an operator watching the run live sees the gap, not
-                # only someone who later opens the JSON report.
-                print(
-                    f"WARNING: {report['shipped_config_cells']['note']}",
-                    file=sys.stderr,
-                )
-    report["overall_status"] = overall_status
+            annotation_reasons = [f"shipped-cell annotation failed: {exc}"]
+        failure_reasons = [*failure_reasons, *annotation_reasons]
+    report["overall_status"] = _overall_status(failure_reasons)
     report["failure_reasons"] = failure_reasons
     return report
 
 
 def print_report_summary(report: dict[str, Any]) -> None:
+    """Console mirror of the persisted report.
+
+    Round 7 F1/F2: ``report["shipped_config_cells"]`` has exactly two
+    shapes -- the success annotation (``router``/``worker``/``note``,
+    optionally ``unmatched_roles``) and the degrade shape (``error`` only,
+    see ``build_report``'s except-branch). Both must render; neither may
+    raise, because this function runs BEFORE the report is persisted
+    (``main()`` calls this at :2782, ``write_no_follow`` at :2805) and a
+    raise here destroys an already-billed run's only remaining record.
+    """
     shipped_cells = report.get("shipped_config_cells")
-    if shipped_cells:
+    if shipped_cells and "router" in shipped_cells:
         print(
             f"shipped router ({shipped_cells['router']['model']}"
             f"@{shipped_cells['router']['effort']}): {shipped_cells['router']['cells']}"
@@ -2441,6 +2469,20 @@ def print_report_summary(report: dict[str, Any]) -> None:
             f"shipped worker ({shipped_cells['worker']['model']}"
             f"@{shipped_cells['worker']['effort']}): {shipped_cells['worker']['cells']}"
         )
+        # Console mirror of the persisted `unmatched_roles` marker (round 6
+        # gauntlet, Architecture A4) so an operator watching the run live
+        # sees the gap, not only someone who later opens the JSON report.
+        # `unmatched_roles` deliberately does NOT flip `overall_status`
+        # (a config/registry gap, not a caller bug), so this is a WARNING,
+        # not an error line -- kept distinct from the `error` branch below.
+        if shipped_cells.get("unmatched_roles"):
+            print(f"WARNING: {shipped_cells['note']}", file=sys.stderr)
+    elif shipped_cells and shipped_cells.get("error"):
+        # Degrade shape: build_report() already flipped overall_status to
+        # FAIL and recorded the reason in report["failure_reasons"]; this
+        # only makes the reason visible on the console for an operator who
+        # is watching the run live rather than opening the persisted JSON.
+        print(f"shipped-cell annotation FAILED: {shipped_cells['error']}", file=sys.stderr)
     for cell in report["cells"]:
         print(f"[{cell['status']}] {cell['pair']} / {cell['scenario']}")
         if cell["error"]:
