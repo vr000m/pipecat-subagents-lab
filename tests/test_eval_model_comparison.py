@@ -4685,26 +4685,73 @@ class TestMainPreflightsDuplicatePairLabels:
     knowable before any paid call. main() must catch it pre-flight (before
     print_matrix_preview / --dry-run's own preview) rather than let a paid
     matrix run reach build_report()'s annotation and only degrade there.
+
+    Round 7 F6: the uniqueness check itself moved into `_dedupe_pairs`
+    (raised as `ValueError`, see its own tests in
+    `TestDedupePairsRejectsCollidingLabels`); main() is now just a
+    try/except ValueError wrapper around `_resolve_pairs()` that reports the
+    error and exits 1 before any spend, same operator-visible contract as
+    before (`refusing to run: ...` on stderr, exit code 1) but sourced from
+    the shared invariant instead of a second, main()-local check.
     """
 
     def test_duplicate_pair_labels_are_refused_before_any_paid_call(
         self, monkeypatch: Any, capsys: Any
     ) -> None:
         baseline = eval_runner.default_sweep_pairs()[0]
-        duplicate_pairs = (baseline, baseline)
-        monkeypatch.setattr(eval_runner, "_resolve_pairs", lambda args: duplicate_pairs)
+
+        def _resolve_pairs_raises(args: Any) -> tuple[eval_runner.RunPair, ...]:
+            # What _dedupe_pairs (called internally by default_sweep_pairs()/
+            # full_matrix_pairs()) actually raises on a colliding pair label
+            # -- simulated here via monkeypatch rather than constructing a
+            # real registry collision, matching the prior test's shape.
+            raise ValueError(
+                f"colliding pair label(s) ['{baseline.label}']: two wire-distinct "
+                "cells share a report identity"
+            )
+
+        monkeypatch.setattr(eval_runner, "_resolve_pairs", _resolve_pairs_raises)
 
         exit_code = eval_runner.main(["--dry-run"])
 
         assert exit_code == 1
         captured = capsys.readouterr()
-        assert "duplicate pair label" in captured.err
+        assert "refusing to run" in captured.err
         assert baseline.label in captured.err
 
     def test_unique_pair_labels_are_unaffected(self) -> None:
         # Sanity: the normal, non-colliding matrix still dry-runs cleanly.
         exit_code = eval_runner.main(["--dry-run"])
         assert exit_code == 0
+
+
+class TestDedupePairsRejectsCollidingLabels:
+    """Round 7 F6: pair-LABEL uniqueness -- previously enforced only in
+    main()'s pre-flight -- now lives in `_dedupe_pairs` itself, so a
+    programmatic caller of `default_sweep_pairs()`/`full_matrix_pairs()`
+    (not only the CLI) gets the full invariant
+    `_shipped_config_cells_annotation` depends on.
+    """
+
+    def test_dedupe_pairs_rejects_wire_distinct_pairs_sharing_a_label(self) -> None:
+        # Two pairs that are wire-DISTINCT (different router models, so
+        # _pair_cell_key differs and neither collapses in the dedup loop)
+        # but share a Candidate.label -- the only way a label collision
+        # survives past the wire-key dedup above it.
+        router_a = eval_runner.Candidate(label="dup", role="router", model="model-a", effort=None)
+        router_b = eval_runner.Candidate(label="dup", role="router", model="model-b", effort=None)
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        with pytest.raises(ValueError, match="colliding pair label"):
+            eval_runner._dedupe_pairs(pairs)
+
+    def test_dedupe_pairs_allows_wire_distinct_pairs_with_distinct_labels(self) -> None:
+        # Sanity: the new check must not fire on the normal, non-colliding
+        # case -- pins that it is additive, not a regression on the existing
+        # wire-key dedup behavior.
+        pairs = eval_runner.default_sweep_pairs()
+        assert len(eval_runner._dedupe_pairs(list(pairs))) == len(pairs)
 
 
 class TestJudgeInputSanitization:

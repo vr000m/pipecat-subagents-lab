@@ -300,6 +300,26 @@ def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
             continue
         seen[key] = pair.enforce_latency_budget
         unique.append(pair)
+    # Round 7 F6: pair-LABEL uniqueness -- distinct from the wire-key
+    # uniqueness enforced above -- is the invariant
+    # `_shipped_config_cells_annotation` actually depends on to resolve a
+    # `pair_label` back to a `RunPair` (it looks pairs up by `.label` in a
+    # dict, see its `by_label` construction). Checked HERE, post-dedup, not
+    # pre-dedup: wire-identical pairs are collapsed first, so any label
+    # collision remaining in `unique` is two wire-DISTINCT cells claiming one
+    # report identity (reachable via a registry edit where two `Candidate`s
+    # share a `label` but differ on model or effort) -- a genuine caller bug,
+    # not two constructors describing the same cell twice. Previously
+    # enforced only in main()'s pre-flight, so a programmatic caller of
+    # default_sweep_pairs()/full_matrix_pairs() got half the invariant --
+    # and the half it lost is the one whose violation surfaces later as
+    # build_report()'s degrade path (F1).
+    labels = [pair.label for pair in unique]
+    if len(set(labels)) != len(labels):
+        duplicates = sorted({label for label in labels if labels.count(label) > 1})
+        raise ValueError(
+            f"colliding pair label(s) {duplicates}: two wire-distinct cells share a report identity"
+        )
     return unique
 
 
@@ -2746,18 +2766,25 @@ def main(argv: list[str] | None = None) -> int:
             "--full-matrix conflicts with --router/--worker (which already select one pair)"
         )
 
-    pairs = _resolve_pairs(args)
     # Pre-flight the one pre-run-knowable way `_shipped_config_cells_annotation`
     # can later fail to resolve an outcome's `pair_label` back to its `RunPair`:
-    # a duplicate label in `pairs` itself. This is fully knowable before any
-    # paid call is made, so catching it here means a caller bug is reported
-    # before spend rather than discovered by discarding a paid matrix run
-    # (round 6 gauntlet, Logic G3 -- the residual, non-pre-flightable case is
-    # handled by build_report()'s try/except around the annotation call).
-    labels = [pair.label for pair in pairs]
-    if len(set(labels)) != len(labels):
-        duplicates = sorted({label for label in labels if labels.count(label) > 1})
-        print(f"refusing to run: duplicate pair label(s) in matrix: {duplicates}", file=sys.stderr)
+    # a duplicate label among the resolved pairs. This is fully knowable
+    # before any paid call is made, so catching it here means a caller bug is
+    # reported before spend rather than discovered by discarding a paid
+    # matrix run (round 6 gauntlet, Logic G3 -- the residual, non-pre-
+    # flightable case is handled by build_report()'s try/except around the
+    # annotation call). Round 7 F6: the check itself now lives in
+    # `_dedupe_pairs` (raised as ValueError), which `default_sweep_pairs()`/
+    # `full_matrix_pairs()` both call internally -- this is just the CLI's
+    # catch-and-report-before-spend wrapper around that shared invariant.
+    # The `--router`/`--worker` branch of `_resolve_pairs` returns a single
+    # pair without going through `_dedupe_pairs` at all, where the
+    # uniqueness invariant holds trivially (one pair cannot collide with
+    # itself).
+    try:
+        pairs = _resolve_pairs(args)
+    except ValueError as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
         return 1
     scenarios = _resolve_scenarios(args)
     manifest_status = load_manifest_status(args.manifest_path)
