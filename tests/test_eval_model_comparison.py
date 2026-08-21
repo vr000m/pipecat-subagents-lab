@@ -761,15 +761,30 @@ class TestAggregateCellRepeats:
             turns=turns if turns is not None else [self._turn()],
         )
 
+    def _aggregate(
+        self,
+        cells: list[Any],
+        *,
+        max_routing_seconds: float = eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+        max_latency_seconds: float = eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+    ) -> Any:
+        return eval_runner._aggregate_cell_repeats(
+            "p",
+            "s",
+            cells,
+            max_routing_seconds=max_routing_seconds,
+            max_latency_seconds=max_latency_seconds,
+        )
+
     def test_single_repeat_returns_the_same_object_unchanged(self) -> None:
         cell = self._cell()
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", [cell])
+        aggregated = self._aggregate([cell])
         assert aggregated is cell
         assert aggregated.repeats is None
 
     def test_raw_repeats_are_attached_for_audit(self) -> None:
         cells = [self._cell(), self._cell(), self._cell()]
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        aggregated = self._aggregate(cells)
         assert aggregated.repeats == cells
 
     def test_majority_yes_verdict_wins(self) -> None:
@@ -778,7 +793,7 @@ class TestAggregateCellRepeats:
             self._cell(turns=[self._turn(judge_verdict="yes")]),
             self._cell(turns=[self._turn(judge_verdict="no")]),
         ]
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        aggregated = self._aggregate(cells)
         assert aggregated.turns is not None
         assert aggregated.turns[0].judge_verdict == "yes"
         assert "2/3" in (aggregated.turns[0].judge_reason or "")
@@ -788,13 +803,13 @@ class TestAggregateCellRepeats:
             self._cell(turns=[self._turn(judge_verdict="yes")]),
             self._cell(turns=[self._turn(judge_verdict="no")]),
         ]
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        aggregated = self._aggregate(cells)
         assert aggregated.turns is not None
         assert aggregated.turns[0].judge_verdict == "no"
 
     def test_majority_ok_status_reports_ok(self) -> None:
         cells = [self._cell(status="ok"), self._cell(status="ok"), self._cell(status="timeout")]
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        aggregated = self._aggregate(cells)
         assert aggregated.status == "ok"
         assert aggregated.error is None
 
@@ -804,7 +819,7 @@ class TestAggregateCellRepeats:
             self._cell(status="timeout"),
             self._cell(status="ok"),
         ]
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        aggregated = self._aggregate(cells)
         assert aggregated.status == "timeout"
         assert aggregated.error is not None
         assert "2/3" in aggregated.error
@@ -818,7 +833,7 @@ class TestAggregateCellRepeats:
             self._cell(turns=[self._turn(status="ok", judge_verdict="yes")]),
             self._cell(status="provider-error", turns=[self._turn(status="provider-error")]),
         ]
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        aggregated = self._aggregate(cells)
         assert aggregated.turns is not None
         assert aggregated.turns[0].judge_verdict == "yes"
         assert "2/2" in (aggregated.turns[0].judge_reason or "")
@@ -829,9 +844,107 @@ class TestAggregateCellRepeats:
             self._cell(turns=[self._turn(total_ms=200.0)]),
             self._cell(turns=[self._turn(total_ms=300.0)]),
         ]
-        aggregated = eval_runner._aggregate_cell_repeats("p", "s", cells)
+        aggregated = self._aggregate(cells)
         assert aggregated.turns is not None
         assert aggregated.turns[0].total_ms == pytest.approx(200.0)
+
+    # --- Round 10 gauntlet, Logic findings 5 and 6: latency_budget_exceeded
+    # is recomputed from the aggregated means, not majority-voted, so it can
+    # never disagree with the total_ms/routing_ms the same report publishes.
+
+    def test_tied_latency_budget_exceeded_resolves_to_exceeded(self) -> None:
+        """Finding 5: a 1-1 split, where a hand-voted tie-break would have
+        applied, must not resolve to "not exceeded" via _majority_bool's
+        tie-to-False rule -- the aggregate is instead recomputed from the
+        mean, which this case is deliberately over budget."""
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=100_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=50_000.0,
+                        latency_budget_exceeded=False,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+        ]
+        # mean = 75,000 ms, over the 60s budget.
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_exceeded is True
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+
+    def test_majority_not_exceeded_but_mean_over_budget_is_still_exceeded(self) -> None:
+        """Finding 6: a 2/3 majority voting 'not exceeded' must not outvote
+        a mean that is provably over budget -- the aggregate's
+        latency_budget_exceeded and its own total_ms must stay consistent."""
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=200_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=5_000.0,
+                        latency_budget_exceeded=False,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=5_000.0,
+                        latency_budget_exceeded=False,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+        ]
+        # 2/3 repeats voted "not exceeded" -- the OLD majority-vote behavior
+        # would have reported False here. The mean (70,000 ms) is over the
+        # 60s budget, so the recomputed field must be True and must agree
+        # with the total_ms this same aggregate publishes.
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.latency_budget_exceeded is True
+        assert turn.total_ms is not None and turn.total_ms > 60.0 * 1000
+
+    def test_routing_leg_over_budget_is_exceeded_even_when_total_ms_is_fine(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(routing_ms=20_000.0, total_ms=10.0)]),
+        ]
+        aggregated = self._aggregate(
+            [cells[0], cells[0]], max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_exceeded is True
+
+    def test_no_latency_metrics_stays_none_not_false(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(routing_ms=None, total_ms=None)]),
+            self._cell(turns=[self._turn(routing_ms=None, total_ms=None)]),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_exceeded is None
 
 
 class TestRunMatrixRepeatWiring:

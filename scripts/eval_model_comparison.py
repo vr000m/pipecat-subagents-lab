@@ -871,6 +871,11 @@ def _majority_bool(values: Sequence[bool | None]) -> bool | None:
     evaluated in that repeat) entries. None if every entry is None (the
     check never ran in any repeat). A tie resolves to False -- a repeated
     assertion that only barely passes isn't confidently a pass.
+
+    Only valid for fields where ``False`` is the failing outcome. A field
+    whose failure is ``True`` must not use this function -- see
+    ``latency_budget_exceeded``, which is recomputed from the aggregated
+    means instead (round 10 gauntlet, Logic findings 5 and 6).
     """
     present = [value for value in values if value is not None]
     if not present:
@@ -884,7 +889,12 @@ def _average(values: Sequence[float | None]) -> float | None:
     return sum(present) / len(present) if present else None
 
 
-def _aggregate_turn_repeats(turn_repeats: list[TurnOutcome]) -> TurnOutcome:
+def _aggregate_turn_repeats(
+    turn_repeats: list[TurnOutcome],
+    *,
+    max_routing_seconds: float,
+    max_latency_seconds: float,
+) -> TurnOutcome:
     """Majority-vote N repetitions of the SAME turn (same query, same
     position in the scenario) into one summary TurnOutcome. See
     _aggregate_cell_repeats for why this exists and the len==1 identity
@@ -929,6 +939,26 @@ def _aggregate_turn_repeats(turn_repeats: list[TurnOutcome]) -> TurnOutcome:
         if turn.deterministic_action_unevaluated_reason is not None
     ]
 
+    agg_routing_ms = _average([turn.routing_ms for turn in ok_turns])
+    agg_total_ms = _average([turn.total_ms for turn in ok_turns])
+    # NOT _majority_bool: this field's FAILING outcome is True, so
+    # _majority_bool's tie-to-False rule would resolve a tie toward "clean",
+    # inverting the documented tie invariant (round 10 gauntlet, Logic
+    # finding 5). Recomputing from the same aggregated means the report
+    # publishes also removes the mean-vs-vote disagreement -- a single slow
+    # repeat pulling the mean over budget while a 2/3 majority voted "not
+    # exceeded" previously reported an aggregate total_ms over budget beside
+    # latency_budget_exceeded=False (round 10 gauntlet, Logic finding 6).
+    # Same predicate as run_cell()'s own live-budget check.
+    agg_budget_exceeded = (
+        None
+        if agg_routing_ms is None and agg_total_ms is None
+        else (
+            (agg_routing_ms is not None and agg_routing_ms > max_routing_seconds * 1000)
+            or (agg_total_ms is not None and agg_total_ms > max_latency_seconds * 1000)
+        )
+    )
+
     return TurnOutcome(
         query=turn_repeats[0].query,
         status=agg_status,
@@ -943,10 +973,10 @@ def _aggregate_turn_repeats(turn_repeats: list[TurnOutcome]) -> TurnOutcome:
         ),
         citations_pass=_majority_bool([turn.citations_pass for turn in ok_turns]),
         worker_presence_pass=_majority_bool([turn.worker_presence_pass for turn in ok_turns]),
-        routing_ms=_average([turn.routing_ms for turn in ok_turns]),
+        routing_ms=agg_routing_ms,
         search_ms=_average([turn.search_ms for turn in ok_turns]),
-        total_ms=_average([turn.total_ms for turn in ok_turns]),
-        latency_budget_exceeded=_majority_bool([turn.latency_budget_exceeded for turn in ok_turns]),
+        total_ms=agg_total_ms,
+        latency_budget_exceeded=agg_budget_exceeded,
         # Config-derived, not outcome-derived -- every repeat runs the same
         # candidate/scenario config, so this is identical across repeats;
         # take it from the first rather than voting on it.
@@ -955,7 +985,12 @@ def _aggregate_turn_repeats(turn_repeats: list[TurnOutcome]) -> TurnOutcome:
 
 
 def _aggregate_cell_repeats(
-    pair_label: str, scenario_name: str, repeats: list[CellOutcome]
+    pair_label: str,
+    scenario_name: str,
+    repeats: list[CellOutcome],
+    *,
+    max_routing_seconds: float,
+    max_latency_seconds: float,
 ) -> CellOutcome:
     """Majority-vote ``--repeat`` independent runs of the SAME (pair,
     scenario) cell -- each a fresh ``run_cell()`` call against a fresh
@@ -990,7 +1025,9 @@ def _aggregate_cell_repeats(
     agg_turns = [
         _aggregate_turn_repeats(
             [cell.turns[i] for cell in repeats if cell.turns and i < len(cell.turns)]
-            or [TurnOutcome(query="", status="skipped")]
+            or [TurnOutcome(query="", status="skipped")],
+            max_routing_seconds=max_routing_seconds,
+            max_latency_seconds=max_latency_seconds,
         )
         for i in range(turn_count)
     ]
@@ -1683,7 +1720,15 @@ async def run_matrix(
                 )
                 for _ in range(repeat_count)
             ]
-            outcomes.append(_aggregate_cell_repeats(pair.label, scenario.name, repeats))
+            outcomes.append(
+                _aggregate_cell_repeats(
+                    pair.label,
+                    scenario.name,
+                    repeats,
+                    max_routing_seconds=max_routing_seconds,
+                    max_latency_seconds=max_latency_seconds,
+                )
+            )
     return outcomes
 
 
