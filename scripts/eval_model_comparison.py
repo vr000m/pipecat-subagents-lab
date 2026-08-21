@@ -938,6 +938,23 @@ def _aggregate_turn_repeats(
         for turn in ok_turns
         if turn.deterministic_action_unevaluated_reason is not None
     ]
+    # Majority, not any-repeat: compute_pass_fail() treats a non-None value
+    # here as an unconditional infra failure, but the sibling
+    # deterministic_action_pass is majority-voted -- so an any-repeat basis
+    # let 1/3 transiently-unevaluated repeats fail a cell that evaluated
+    # cleanly twice, a stricter rule than the assertion it guards (round 10
+    # gauntlet, Logic finding 7). The minority case stays visible by folding
+    # into agg_error below instead of silently vanishing.
+    agg_unevaluated_reason = (
+        f"{len(unevaluated_reasons)}/{len(ok_turns)} repeats: {unevaluated_reasons[0]}"
+        if ok_turns and len(unevaluated_reasons) * 2 > len(ok_turns)
+        else None
+    )
+    if unevaluated_reasons and agg_unevaluated_reason is None:
+        minority_note = (
+            f"{len(unevaluated_reasons)}/{len(ok_turns)} repeats: {unevaluated_reasons[0]}"
+        )
+        agg_error = f"{agg_error}; {minority_note}" if agg_error else minority_note
 
     agg_routing_ms = _average([turn.routing_ms for turn in ok_turns])
     agg_total_ms = _average([turn.total_ms for turn in ok_turns])
@@ -968,9 +985,7 @@ def _aggregate_turn_repeats(
         deterministic_action_pass=_majority_bool(
             [turn.deterministic_action_pass for turn in ok_turns]
         ),
-        deterministic_action_unevaluated_reason=(
-            unevaluated_reasons[0] if unevaluated_reasons else None
-        ),
+        deterministic_action_unevaluated_reason=agg_unevaluated_reason,
         citations_pass=_majority_bool([turn.citations_pass for turn in ok_turns]),
         worker_presence_pass=_majority_bool([turn.worker_presence_pass for turn in ok_turns]),
         routing_ms=agg_routing_ms,

@@ -946,6 +946,100 @@ class TestAggregateCellRepeats:
         assert aggregated.turns is not None
         assert aggregated.turns[0].latency_budget_exceeded is None
 
+    # --- Round 10 gauntlet, Logic finding 7: deterministic_action_unevaluated
+    # _reason is majority-gated, matching its sibling deterministic_action_pass,
+    # instead of propagating on any single unevaluated repeat.
+
+    def test_minority_unevaluated_repeat_does_not_fail_a_clean_majority(self) -> None:
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.deterministic_action_unevaluated_reason is None
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "PASS"
+        assert turn.error is not None
+        assert "routing_action was unavailable" in turn.error
+
+    def test_majority_unevaluated_repeats_fail_the_run(self) -> None:
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.deterministic_action_unevaluated_reason is not None
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any(reason.startswith("infra:") and "unevaluated" in reason for reason in reasons)
+
+    def test_exact_tie_is_not_a_strict_majority(self) -> None:
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].deterministic_action_unevaluated_reason is None
+
 
 class TestRunMatrixRepeatWiring:
     """run_matrix()'s repeat_count param must call run_cell() that many
