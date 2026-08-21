@@ -1701,6 +1701,7 @@ dev = [
     { name = "httpx" },
     { name = "mypy" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
@@ -1716,6 +1717,7 @@ dev = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "mypy", specifier = ">=1.18,<2" },
     { name = "pytest", specifier = ">=8.0,<9" },
+    { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", specifier = ">=0.12,<1" },
 ]
 
