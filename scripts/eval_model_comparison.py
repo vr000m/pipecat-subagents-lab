@@ -207,6 +207,30 @@ class RunPair:
         return f"router={self.router.label}/worker={self.worker.label}"
 
 
+def _candidate_wire_key(candidate: Candidate) -> tuple[str, str | None]:
+    """The wire request a single candidate sends: (model, effective effort).
+
+    Uses effective_effort_for_manifest_lookup(), NOT the raw declared effort:
+    that resolver resolves "unset effort on a gpt-5* model" to "minimal", so
+    ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are ONE wire request
+    under two spellings -- keying on the raw effort let the same paid cell
+    run twice (round-4 restart, Logic finding 1).
+
+    Single source for "same candidate" at the wire level, shared by
+    `_pair_cell_key` (a pair's identity) and `_is_historical_baseline_pair`
+    (whether a pair IS the historical baseline). Before this was extracted,
+    the two functions answered "is this the same cell?" differently --
+    `_pair_cell_key` on wire identity, `_is_historical_baseline_pair` on
+    object identity (`router is ROUTER_BASELINE`) -- so a registry entry
+    wire-identical to but not object-identical with `ROUTER_BASELINE` yielded
+    two pairs with the same `_pair_cell_key` but disagreeing
+    `enforce_latency_budget`, which `_dedupe_pairs` then raised on. Sharing
+    one notion of identity makes that unrepresentable structurally rather
+    than coincidentally (round 6 gauntlet, Architecture A3).
+    """
+    return (candidate.model, effective_effort_for_manifest_lookup(candidate))
+
+
 def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
     """Identity by the request shape a cell actually sends, NOT by label --
     a candidate carrying the shipped config.toml router/worker may be the
@@ -214,19 +238,10 @@ def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
     label differs (round-5 restart, A5: shipped_candidates() now returns the
     matching registered candidate's real label rather than label="shipped",
     but two distinct labels can still collide on wire identity).
-
-    Uses effective_effort_for_manifest_lookup(), NOT the raw declared effort:
-    that resolver resolves "unset effort on a gpt-5* model" to "minimal", so
-    ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are ONE wire request
-    under two spellings -- keying on the raw effort let the same paid cell
-    run twice (round-4 restart, Logic finding 1).
     """
-    return (
-        pair.router.model,
-        effective_effort_for_manifest_lookup(pair.router),
-        pair.worker.model,
-        effective_effort_for_manifest_lookup(pair.worker),
-    )
+    router_model, router_effort = _candidate_wire_key(pair.router)
+    worker_model, worker_effort = _candidate_wire_key(pair.worker)
+    return (router_model, router_effort, worker_model, worker_effort)
 
 
 def _is_historical_baseline_pair(router: Candidate, worker: Candidate) -> bool:
@@ -237,8 +252,27 @@ def _is_historical_baseline_pair(router: Candidate, worker: Candidate) -> bool:
     baseline x baseline cell is enforced. Extracted so a new RunPair
     construction site cannot silently default to False by omission (round 5
     restart2, Architecture A7).
+
+    Enforcement follows the WIRE REQUEST the historical baseline sends
+    (model, effective effort), not the specific module-level `ROUTER_BASELINE`
+    / `WORKER_BASELINE` objects. Round 4 restart's fix moved this off name-
+    string comparison onto object identity (`is`), which stopped a same-named
+    but differently-configured candidate from being misidentified as the
+    baseline -- but object identity is STRICTER than `_pair_cell_key`'s wire
+    identity, which is what `_dedupe_pairs` actually keys collisions on. A
+    registry entry that is wire-identical to but not the same object as
+    `ROUTER_BASELINE`/`WORKER_BASELINE` (e.g. a candidate deliberately
+    configured to match the historical baseline's model/effort) produced two
+    pairs sharing one `_pair_cell_key` but disagreeing on
+    `enforce_latency_budget` (True for the real baseline object, False for the
+    clone) -- exactly the disagreement `_dedupe_pairs` raises `ValueError` on.
+    Keying on wire identity here too means such a clone now dedupes CLEANLY
+    into the enforced baseline cell instead of colliding with it (round 6
+    gauntlet, Logic/Architecture A3).
     """
-    return router is ROUTER_BASELINE and worker is WORKER_BASELINE
+    return _candidate_wire_key(router) == _candidate_wire_key(
+        ROUTER_BASELINE
+    ) and _candidate_wire_key(worker) == _candidate_wire_key(WORKER_BASELINE)
 
 
 def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
@@ -298,8 +332,28 @@ def default_sweep_pairs() -> tuple[RunPair, ...]:
             enforce_latency_budget=True,
         )
     ]
-    pairs += [RunPair(candidate, WORKER_BASELINE) for candidate in ROUTER_CANDIDATES]
-    pairs += [RunPair(ROUTER_BASELINE, candidate) for candidate in WORKER_CANDIDATES]
+    # Route through _is_historical_baseline_pair rather than a hardcoded
+    # False, matching full_matrix_pairs's pattern (round 6, A3 follow-up):
+    # a registered candidate that happens to be wire-identical to a baseline
+    # must not silently default to unenforced, or _dedupe_pairs's collision
+    # guard would fire on a real config change instead of _is_historical_
+    # baseline_pair's wire-identity comparison resolving it cleanly.
+    pairs += [
+        RunPair(
+            candidate,
+            WORKER_BASELINE,
+            enforce_latency_budget=_is_historical_baseline_pair(candidate, WORKER_BASELINE),
+        )
+        for candidate in ROUTER_CANDIDATES
+    ]
+    pairs += [
+        RunPair(
+            ROUTER_BASELINE,
+            candidate,
+            enforce_latency_budget=_is_historical_baseline_pair(ROUTER_BASELINE, candidate),
+        )
+        for candidate in WORKER_CANDIDATES
+    ]
     return tuple(_dedupe_pairs(pairs))
 
 
@@ -2230,7 +2284,7 @@ def _shipped_config_cells_annotation(
             router_cells.append(pair_label)
         if (pair.worker.model, effective_effort_for_manifest_lookup(pair.worker)) == worker_key:
             worker_cells.append(pair_label)
-    return {
+    result: dict[str, Any] = {
         "router": {
             "model": shipped_router.model,
             "effort": shipped_router.effort,
@@ -2246,6 +2300,35 @@ def _shipped_config_cells_annotation(
             "their latency budget is report-only, not blocking"
         ),
     }
+    # `_registered_label` (eval_common.py) returns the sentinel "shipped" when
+    # config.toml ships a (model, effort) no registered eval candidate covers
+    # -- deliberately absent from *_SELECTABLE_BY_LABEL (see its docstring, and
+    # the "sentinel rename: decline" note in round 6's fix record). In that
+    # state neither `router_key`/`worker_key` ever matches any pair here, so
+    # `router_cells`/`worker_cells` come back empty with no error and no
+    # marker -- while default_sweep_pairs()'s docstring and the README both
+    # tell the operator to "run --router <shipped-label> --worker
+    # <shipped-label> explicitly", which is unexecutable because no such
+    # selector key exists. `unmatched_roles` makes that degraded state visible
+    # in the persisted artifact instead of silently shipping an empty `cells`
+    # list an operator would misread as "config.toml's role isn't covered by
+    # any sweep pair" rather than "no candidate registers this role at all."
+    # This is a config/registry GAP, not a caller bug -- unlike build_report's
+    # ValueError degrade path (G3), it must not raise and must not flip
+    # overall_status: failing an otherwise-good paid run over one less-useful
+    # annotation would be disproportionate. Keep these two severities distinct
+    # (round 6 gauntlet, Architecture A4).
+    unmatched = [
+        role for role, cells in (("router", router_cells), ("worker", worker_cells)) if not cells
+    ]
+    if unmatched:
+        result["unmatched_roles"] = unmatched
+        result["note"] += (
+            f"; {', '.join(unmatched)} role(s) ship a (model, effort) no registered eval "
+            "candidate covers, so no sweep cell measures it and there is no CLI selector for "
+            "it -- register a candidate in eval_common.py, not `--router shipped`"
+        )
+    return result
 
 
 def build_report(
@@ -2308,13 +2391,40 @@ def build_report(
     # when it carries a real value, so a strict-key-set consumer of an older
     # report is not broken by a null (round 5 restart2, Architecture A1).
     if shipped is not None:
-        if pairs is None:
-            # Unreachable: the same condition raises ValueError above. Kept as an
-            # explicit check rather than `assert` for consistency with
-            # _dedupe_pairs's guard (round-5 restart, L2/A3) -- asserts vanish
-            # under `-O`, so a real invariant guard should never be one.
-            raise ValueError("build_report(shipped=...) also requires pairs=...")
-        report["shipped_config_cells"] = _shipped_config_cells_annotation(outcomes, shipped, pairs)
+        # pairs is guaranteed not None here: the top-of-function raise above
+        # covers the identical `shipped is not None and pairs is None`
+        # condition, so this second check would be provably unreachable
+        # (round 6 gauntlet, Architecture A5) -- dropped rather than kept
+        # as an assert, since this file's convention is ValueError for
+        # reachable invariants and no guard at all for unreachable ones.
+        try:
+            report["shipped_config_cells"] = _shipped_config_cells_annotation(
+                outcomes, shipped, pairs
+            )
+        except ValueError as exc:
+            # A `pair_label` miss here is a caller bug (see
+            # _shipped_config_cells_annotation's docstring: every outcome is
+            # produced from `pairs` by construction), not a config/registry
+            # gap -- unlike A4's `unmatched_roles` warning below, this MUST
+            # fail the run. But it must fail it LOUDLY, not by discarding the
+            # already-billed `outcomes` this function was about to persist:
+            # round 5's L5 fix moved `shipped_candidates()` ahead of the paid
+            # run for exactly this reason (a post-run raise destroying paid
+            # results), and this was the one remaining post-run raise on that
+            # same path (round 6 gauntlet, Logic G3).
+            report["shipped_config_cells"] = {"error": str(exc)}
+            failure_reasons = [*failure_reasons, f"shipped-cell annotation failed: {exc}"]
+            overall_status = "FAIL"
+        else:
+            unmatched = report["shipped_config_cells"].get("unmatched_roles")
+            if unmatched:
+                # Console mirror of the persisted `unmatched_roles` marker
+                # (A4) so an operator watching the run live sees the gap, not
+                # only someone who later opens the JSON report.
+                print(
+                    f"WARNING: {report['shipped_config_cells']['note']}",
+                    file=sys.stderr,
+                )
     report["overall_status"] = overall_status
     report["failure_reasons"] = failure_reasons
     return report
@@ -2343,12 +2453,28 @@ def print_report_summary(report: dict[str, Any]) -> None:
                 bits.append(f"judge={turn['judge_verdict']}")
             if turn["deterministic_action_pass"] is not None:
                 bits.append(f"action_pass={turn['deterministic_action_pass']}")
-            elif turn["deterministic_action_unevaluated_reason"] is not None:
+            # Deliberately two INDEPENDENT `if`s, not `if`/`elif`: these two
+            # fields follow different aggregation rules
+            # (_aggregate_turn_repeats sets `deterministic_action_unevaluated_
+            # reason` on a strict MAJORITY of unevaluated repeats, while
+            # `deterministic_action_pass` is `_majority_bool`'s vote over the
+            # non-None repeats alone) and so CAN both be non-None at once --
+            # e.g. 2/3 repeats unevaluated, 1/3 True yields both a majority
+            # "unevaluated" reason and a majority-of-the-one-real-vote
+            # `action_pass=True`. An `elif` here silently hid that second fact
+            # whenever the first branch fired, showing a clean pass for a cell
+            # compute_pass_fail was independently failing on the unevaluated
+            # reason. Printing both is the honest rendering of a genuinely
+            # two-valued state (round 6 gauntlet, Logic G1; round 8 gauntlet,
+            # Logic lens finding 2 first added the unevaluated marker itself).
+            if turn["deterministic_action_unevaluated_reason"] is not None:
                 # Distinct from "no action assertion was requested" -- makes
                 # visible that this turn's routing-action check was
-                # requested but never actually ran (round 8 gauntlet, Logic
-                # lens finding 2).
-                bits.append("action_pass=UNEVALUATED (routing_action unavailable)")
+                # requested but never actually ran.
+                bits.append(
+                    "action_unevaluated=UNEVALUATED "
+                    f"({turn['deterministic_action_unevaluated_reason']})"
+                )
             if turn["worker_presence_pass"] is not None:
                 bits.append(f"worker_presence_pass={turn['worker_presence_pass']}")
             if turn["citations_pass"] is not None:
@@ -2563,6 +2689,18 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     pairs = _resolve_pairs(args)
+    # Pre-flight the one pre-run-knowable way `_shipped_config_cells_annotation`
+    # can later fail to resolve an outcome's `pair_label` back to its `RunPair`:
+    # a duplicate label in `pairs` itself. This is fully knowable before any
+    # paid call is made, so catching it here means a caller bug is reported
+    # before spend rather than discovered by discarding a paid matrix run
+    # (round 6 gauntlet, Logic G3 -- the residual, non-pre-flightable case is
+    # handled by build_report()'s try/except around the annotation call).
+    labels = [pair.label for pair in pairs]
+    if len(set(labels)) != len(labels):
+        duplicates = sorted({label for label in labels if labels.count(label) > 1})
+        print(f"refusing to run: duplicate pair label(s) in matrix: {duplicates}", file=sys.stderr)
+        return 1
     scenarios = _resolve_scenarios(args)
     manifest_status = load_manifest_status(args.manifest_path)
 

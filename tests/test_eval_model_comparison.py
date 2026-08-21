@@ -435,19 +435,35 @@ class TestMatrixBuilding:
         _dedupe_pairs() exactly like default_sweep_pairs() does, so a
         wire-identical candidate cannot silently double-run and double-bill.
 
-        With enforcement derived from object identity and dedup keyed on wire
-        identity, a wire-identical CLONE OF THE BASELINE legitimately
-        disagrees on enforce_latency_budget with the real baseline cell
-        (baseline x baseline is enforced; clone x baseline is not, since the
-        clone `is not ROUTER_BASELINE`) -- that is the intended, documented
-        behavior of _dedupe_pairs's new ValueError guard (a wire-identical
-        cell disagreeing on enforcement is a real configuration bug), so this
-        case must raise. A clone that is wire-identical to another candidate
-        but involves neither baseline dedupes silently instead.
+        SUPERSEDES round 5's Case 1 expectation (round 6 gauntlet, Logic G /
+        Architecture A3). Round 5 deliberately derived
+        `_is_historical_baseline_pair` from OBJECT identity while
+        `_pair_cell_key`/`_dedupe_pairs` key on WIRE identity, and asserted
+        that the resulting disagreement -- a wire-identical clone of the
+        baseline lands in the same `_pair_cell_key` bucket as the real
+        baseline cell but gets `enforce_latency_budget=False` since it
+        `is not ROUTER_BASELINE` -- "must raise": Case 1 previously asserted
+        `pytest.raises(ValueError, match="disagrees on enforce_latency_budget")`
+        for exactly this clone, on the rationale that a wire-identical cell
+        disagreeing on enforcement is a real configuration bug.
+
+        Round 6 found the disagreement is not a configuration bug but a
+        self-inflicted skew: two different functions computing "is this the
+        same cell?" two different ways. `_is_historical_baseline_pair` now
+        keys on wire identity too (via the shared `_candidate_wire_key`
+        helper), so the clone's `enforce_latency_budget` agrees with the real
+        baseline's, and the two cells dedupe CLEANLY into one enforced cell
+        instead of raising beside it. `_dedupe_pairs`'s ValueError guard
+        itself is untouched and stays reachable via any future second
+        `enforce=True` caller -- this only removes the one way the guard could
+        fire on a skew the codebase created for itself.
         """
-        # Case 1: a router candidate wire-identical to ROUTER_BASELINE --
-        # baseline x baseline is enforced, clone x baseline is not, so the
-        # collision legitimately raises.
+        # Case 1: a router candidate wire-identical to ROUTER_BASELINE now
+        # dedupes into the single enforced baseline cell instead of raising --
+        # `_is_historical_baseline_pair` recognizes the clone as the
+        # historical baseline by wire identity, so both the real baseline
+        # pair and the clone pair agree on enforce_latency_budget=True, and
+        # `_dedupe_pairs` collapses them into one.
         baseline_clone = eval_runner.Candidate(
             label="baseline-clone",
             role="router",
@@ -457,8 +473,13 @@ class TestMatrixBuilding:
         monkeypatch.setattr(
             eval_runner, "ROUTER_CANDIDATES", (baseline_clone, *eval_runner.ROUTER_CANDIDATES)
         )
-        with pytest.raises(ValueError, match="disagrees on enforce_latency_budget"):
-            eval_runner.full_matrix_pairs()
+        pairs = eval_runner.full_matrix_pairs()
+        baseline_key = eval_runner._pair_cell_key(
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        )
+        matching = [p for p in pairs if eval_runner._pair_cell_key(p) == baseline_key]
+        assert len(matching) == 1
+        assert matching[0].enforce_latency_budget is True
         monkeypatch.undo()
 
         # Case 2: two non-baseline candidates wire-identical to EACH OTHER --
@@ -472,6 +493,61 @@ class TestMatrixBuilding:
         pairs = eval_runner.full_matrix_pairs()
         keys = [eval_runner._pair_cell_key(p) for p in pairs]
         assert len(keys) == len(set(keys))
+
+    def test_default_sweep_dedupes_a_wire_identical_baseline_clone(self, monkeypatch: Any) -> None:
+        """Round 6 gauntlet, Architecture A3 follow-up (verifier blocking
+        finding #1): the same wire-identical-baseline-clone dedupe that
+        `test_full_matrix_dedupes_wire_identical_cells` Case 1 pins for
+        `full_matrix_pairs()` must also hold on the DEFAULT CLI path,
+        `default_sweep_pairs()`. The round-6 implementer's first pass fixed
+        `full_matrix_pairs()` (and `_is_historical_baseline_pair` itself) but
+        left `default_sweep_pairs()`'s two candidate-pair list comprehensions
+        silently defaulting `enforce_latency_budget=False`, so a clone still
+        collided with the real baseline pair's `enforce_latency_budget=True`
+        and `_dedupe_pairs` still raised `ValueError` on the one path an
+        operator actually runs by default.
+        """
+        baseline_clone = eval_runner.Candidate(
+            label="baseline-clone",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        monkeypatch.setattr(
+            eval_runner, "ROUTER_CANDIDATES", (baseline_clone, *eval_runner.ROUTER_CANDIDATES)
+        )
+        pairs = eval_runner.default_sweep_pairs()
+        baseline_key = eval_runner._pair_cell_key(
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        )
+        matching = [p for p in pairs if eval_runner._pair_cell_key(p) == baseline_key]
+        assert len(matching) == 1
+        assert matching[0].enforce_latency_budget is True
+
+    def test_is_historical_baseline_pair_keys_on_wire_identity_not_object_identity(
+        self,
+    ) -> None:
+        """Round 6 gauntlet, Architecture A3: pins the predicate-level
+        semantics directly -- a candidate that is wire-identical to
+        ROUTER_BASELINE/WORKER_BASELINE (same model, same effective effort)
+        but is a DIFFERENT object must still be recognized as the historical
+        baseline pair.
+        """
+        router_clone = eval_runner.Candidate(
+            label="router-clone",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        worker_clone = eval_runner.Candidate(
+            label="worker-clone",
+            role="worker",
+            model=eval_runner.WORKER_BASELINE.model,
+            effort=eval_runner.WORKER_BASELINE.effort,
+        )
+        assert router_clone is not eval_runner.ROUTER_BASELINE
+        assert worker_clone is not eval_runner.WORKER_BASELINE
+        assert eval_runner._is_historical_baseline_pair(router_clone, worker_clone) is True
 
 
 class TestLatencyEnforcementIsExplicitNotLabelDerived:
@@ -932,12 +1008,18 @@ class TestReportAggregation:
                 shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
             )
 
-    def test_annotation_raises_on_an_outcome_whose_pair_is_not_in_pairs(self) -> None:
+    def test_annotation_helper_itself_still_raises_on_an_outcome_whose_pair_is_not_in_pairs(
+        self,
+    ) -> None:
         """Round 5 restart2, Architecture A2: the direct regression for the
         silent-drop path _parse_pair_label's `.get()`-based lookup used to
         take -- an outcome whose pair_label has no matching RunPair in
-        `pairs` is a caller bug and must raise loudly, not be dropped from
-        the annotation."""
+        `pairs` is a caller bug. `_shipped_config_cells_annotation` itself
+        still raises loudly rather than silently dropping the outcome (round
+        6 gauntlet, Logic G3 moved WHERE this is handled -- see
+        `test_build_report_degrades_instead_of_discarding_a_paid_run_on_annotation_failure`
+        below for build_report()'s non-destructive wrapping of this same
+        raise -- but did not remove the raise itself)."""
         pairs = eval_runner.default_sweep_pairs()
         outcomes = [
             eval_runner.CellOutcome(
@@ -945,12 +1027,93 @@ class TestReportAggregation:
             )
         ]
         with pytest.raises(ValueError, match="nonexistent"):
-            eval_runner.build_report(
+            eval_runner._shipped_config_cells_annotation(
                 outcomes,
-                judge_model="gpt-5-mini",
-                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
-                pairs=pairs,
+                (eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+                pairs,
             )
+
+    def test_build_report_degrades_instead_of_discarding_a_paid_run_on_annotation_failure(
+        self,
+    ) -> None:
+        """Round 6 gauntlet, Logic G3: round 5's L5 fix moved
+        shipped_candidates() ahead of the paid run precisely because a
+        post-run raise on this path would discard an already-billed
+        `outcomes` list -- but build_report()'s own call into
+        _shipped_config_cells_annotation was a second, later raise on the
+        same path that L5 didn't cover. An outcome whose pair_label has no
+        matching RunPair (a caller bug) must now degrade the report instead
+        of throwing it away: no exception, an `error` key naming the missing
+        label, `overall_status` flipped to the failing value, and every
+        already-billed outcome still present in `report["cells"]`.
+        """
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pairs[0].label, scenario_name="s", status="ok"),
+            eval_runner.CellOutcome(
+                pair_label="router=nonexistent/worker=nonexistent", scenario_name="s", status="ok"
+            ),
+        ]
+
+        report = eval_runner.build_report(
+            outcomes,
+            judge_model="gpt-5-mini",
+            shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+            pairs=pairs,
+        )
+
+        assert "nonexistent" in report["shipped_config_cells"]["error"]
+        assert report["overall_status"] == "FAIL"
+        assert len(report["cells"]) == len(outcomes)
+        assert {c["pair"] for c in report["cells"]} == {o.pair_label for o in outcomes}
+
+
+class TestShippedConfigCellsAnnotationMarksUnmatchedRoles:
+    """Round 6 gauntlet, Architecture A4: `_registered_label`
+    (eval_common.py) returns the sentinel "shipped" when config.toml ships a
+    (model, effort) no registered eval candidate covers -- deliberately
+    absent from `*_SELECTABLE_BY_LABEL`. In that state
+    `_shipped_config_cells_annotation` previously produced `cells: []` for
+    the affected role with no error and no marker, while
+    `default_sweep_pairs()`'s docstring and the README both tell the operator
+    to run `--router <shipped-label> --worker <shipped-label>` explicitly --
+    unexecutable, since no such selector key exists. `unmatched_roles` makes
+    the degraded state visible in the persisted artifact.
+    """
+
+    def test_a_role_whose_shipped_config_matches_no_pair_is_marked_unmatched(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+        no_match_router = eval_runner.Candidate(
+            label="shipped", role="router", model="no-registered-candidate-covers-this", effort=None
+        )
+
+        annotation = eval_runner._shipped_config_cells_annotation(
+            outcomes, (no_match_router, eval_runner.WORKER_BASELINE), pairs
+        )
+
+        assert annotation["unmatched_roles"] == ["router"]
+        assert annotation["router"]["cells"] == []
+        assert "no registered eval candidate covers" in annotation["note"]
+
+    def test_the_normal_all_matched_case_has_no_unmatched_roles_key(self) -> None:
+        """Pins the optional-key convention: the key must be ABSENT (not
+        present-and-empty) when every role's shipped config matches a pair,
+        so a strict-key-set consumer of an older report is unaffected."""
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+
+        annotation = eval_runner._shipped_config_cells_annotation(
+            outcomes, (eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE), pairs
+        )
+
+        assert "unmatched_roles" not in annotation
 
 
 # ---------------------------------------------------------------------------
@@ -2880,6 +3043,47 @@ class TestUnevaluatedDeterministicActionFailsTheRun:
         assert overall_status == "PASS"
 
 
+class TestPrintReportSummaryShowsBothActionPassAndUnevaluatedNote:
+    """Round 6 gauntlet, Logic G1: `_aggregate_turn_repeats` sets
+    `deterministic_action_unevaluated_reason` on a STRICT MAJORITY of
+    unevaluated repeats, while the sibling `deterministic_action_pass` is
+    `_majority_bool`'s vote over the non-None repeats alone -- e.g. 2/3
+    repeats unevaluated + 1/3 judged True yields BOTH fields non-None at
+    once (`deterministic_action_pass=True` from the one real vote,
+    `deterministic_action_unevaluated_reason` from the 2/3 majority).
+    `print_report_summary`'s old `if`/`elif` only ever showed one side,
+    so this state printed a clean `action_pass=True` for a cell
+    `compute_pass_fail` was independently failing on the unevaluated
+    reason. Both facts must now print.
+    """
+
+    def test_both_the_pass_value_and_the_unevaluated_marker_are_printed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        turn = eval_runner.TurnOutcome(
+            query="Hi.",
+            status="ok",
+            deterministic_action_pass=True,
+            deterministic_action_unevaluated_reason=(
+                "2/3 repeats: routing_action was unavailable for this turn"
+            ),
+        )
+        cell = eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="s",
+            status="ok",
+            turns=[turn],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini")
+
+        eval_runner.print_report_summary(report)
+
+        captured = capsys.readouterr().out
+        assert "action_pass=True" in captured
+        assert "action_unevaluated=UNEVALUATED" in captured
+        assert "2/3 repeats: routing_action was unavailable for this turn" in captured
+
+
 class TestMissingTurnMetricsIsNotSilentlySwallowed:
     """Regression for round 8 gauntlet, merged Codex P1 + Logic lens finding 4:
     round 7 added ``except RuntimeError: stage_metrics = None`` around
@@ -4424,6 +4628,35 @@ class TestFullMatrixConflictsWithSingleCellSelection:
     def test_full_matrix_alone_is_still_allowed(self) -> None:
         # Must not raise: no --router/--worker present.
         exit_code = eval_runner.main(["--full-matrix", "--dry-run"])
+        assert exit_code == 0
+
+
+class TestMainPreflightsDuplicatePairLabels:
+    """Round 6 gauntlet, Logic G3: a duplicate pair label in the resolved
+    matrix is the one way `_shipped_config_cells_annotation`'s
+    `pair_label -> RunPair` lookup can lose track of a pair, and it is fully
+    knowable before any paid call. main() must catch it pre-flight (before
+    print_matrix_preview / --dry-run's own preview) rather than let a paid
+    matrix run reach build_report()'s annotation and only degrade there.
+    """
+
+    def test_duplicate_pair_labels_are_refused_before_any_paid_call(
+        self, monkeypatch: Any, capsys: Any
+    ) -> None:
+        baseline = eval_runner.default_sweep_pairs()[0]
+        duplicate_pairs = (baseline, baseline)
+        monkeypatch.setattr(eval_runner, "_resolve_pairs", lambda args: duplicate_pairs)
+
+        exit_code = eval_runner.main(["--dry-run"])
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "duplicate pair label" in captured.err
+        assert baseline.label in captured.err
+
+    def test_unique_pair_labels_are_unaffected(self) -> None:
+        # Sanity: the normal, non-colliding matrix still dry-runs cleanly.
+        exit_code = eval_runner.main(["--dry-run"])
         assert exit_code == 0
 
 
