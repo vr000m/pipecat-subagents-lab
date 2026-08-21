@@ -578,7 +578,13 @@ Router/worker model evaluation (run in this order):
     dispatch), so the cross product's non-baseline x non-baseline cells add
     no comparison signal beyond `--repeat`'s resampling of the same
     one-at-a-time cells — use it only to confirm two already-good
-    candidates work well together, not as the default comparison method.
+    candidates work well together, not as the default comparison method. The
+    default sweep does not run a live shipped x shipped cell (config.toml's
+    current router/worker paired together) — the one-at-a-time sweep already
+    contains a cell for each shipped candidate against the historical
+    baseline, and the aggregate report's `shipped_config_cells` key names
+    which cells those are; run `--router <shipped-label> --worker
+    <shipped-label>` explicitly to measure the joint pairing.
 
 Phase 4 query-context narrowing experiment (run in this order):
 

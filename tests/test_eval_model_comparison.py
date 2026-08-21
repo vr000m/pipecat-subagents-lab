@@ -360,25 +360,12 @@ class TestMatrixBuilding:
     def test_default_sweep_is_not_the_full_cross_product(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
         # baseline x baseline (1) + N router candidates x baseline worker
-        # + baseline router x M worker candidates + the shipped anchor cell
-        # (round 3 confirming pass, Architecture finding 3; deduped if it
-        # happens to coincide with an already-emitted cell) -- not the
-        # (N+1)*(M+1) full cross product full_matrix_pairs() would produce.
-        shipped_router, shipped_worker = eval_common.shipped_candidates()
-        shipped_pair = eval_runner.RunPair(shipped_router, shipped_worker)
-        base_pairs = [eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)]
-        base_pairs += [
-            eval_runner.RunPair(c, eval_runner.WORKER_BASELINE)
-            for c in eval_runner.ROUTER_CANDIDATES
-        ]
-        base_pairs += [
-            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, c)
-            for c in eval_runner.WORKER_CANDIDATES
-        ]
-        base_keys = {eval_runner._pair_cell_key(p) for p in base_pairs}
-        expected = len(base_pairs) + (
-            0 if eval_runner._pair_cell_key(shipped_pair) in base_keys else 1
-        )
+        # + baseline router x M worker candidates -- no shipped x shipped
+        # cell (round-4 restart, Architecture finding 2: build_report()
+        # annotates the shipped cells instead of running a live joint
+        # cell) -- not the (N+1)*(M+1) full cross product full_matrix_pairs()
+        # would produce.
+        expected = 1 + len(eval_runner.ROUTER_CANDIDATES) + len(eval_runner.WORKER_CANDIDATES)
         assert len(pairs) == expected
         full_matrix_size = (1 + len(eval_runner.ROUTER_CANDIDATES)) * (
             1 + len(eval_runner.WORKER_CANDIDATES)
@@ -387,54 +374,199 @@ class TestMatrixBuilding:
 
     def test_default_sweep_contains_baseline_by_baseline(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
+        baseline_keys = {eval_runner._pair_cell_key(p) for p in pairs}
         assert (
-            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE) in pairs
+            eval_runner._pair_cell_key(
+                eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+            )
+            in baseline_keys
         )
 
     def test_default_sweep_varies_router_only_against_baseline_worker(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
+        keys = {eval_runner._pair_cell_key(p) for p in pairs}
         for candidate in eval_runner.ROUTER_CANDIDATES:
-            assert eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE) in pairs
+            assert (
+                eval_runner._pair_cell_key(
+                    eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE)
+                )
+                in keys
+            )
             # A router candidate must never be paired with a worker candidate
             # in the default (non-full-matrix) sweep.
             for worker_candidate in eval_runner.WORKER_CANDIDATES:
-                assert eval_runner.RunPair(candidate, worker_candidate) not in pairs
+                assert (
+                    eval_runner._pair_cell_key(eval_runner.RunPair(candidate, worker_candidate))
+                    not in keys
+                )
 
     def test_default_sweep_varies_worker_only_against_baseline_router(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
+        keys = {eval_runner._pair_cell_key(p) for p in pairs}
         for candidate in eval_runner.WORKER_CANDIDATES:
-            assert eval_runner.RunPair(eval_runner.ROUTER_BASELINE, candidate) in pairs
+            assert (
+                eval_runner._pair_cell_key(
+                    eval_runner.RunPair(eval_runner.ROUTER_BASELINE, candidate)
+                )
+                in keys
+            )
 
     def test_full_matrix_is_the_full_cross_product(self) -> None:
         pairs = eval_runner.full_matrix_pairs()
         routers = (eval_runner.ROUTER_BASELINE, *eval_runner.ROUTER_CANDIDATES)
         workers = (eval_runner.WORKER_BASELINE, *eval_runner.WORKER_CANDIDATES)
         assert len(pairs) == len(routers) * len(workers)
+        keys = {eval_runner._pair_cell_key(p) for p in pairs}
         for router in routers:
             for worker in workers:
-                assert eval_runner.RunPair(router, worker) in pairs
+                assert eval_runner._pair_cell_key(eval_runner.RunPair(router, worker)) in keys
 
-    def test_full_matrix_is_a_strict_superset_of_the_default_sweep_minus_the_shipped_anchor(
-        self,
-    ) -> None:
-        # The shipped anchor cell (round 3 confirming pass, Architecture
-        # finding 3) is deliberately NOT added to ROUTER_SELECTABLE_BY_LABEL/
-        # WORKER_SELECTABLE_BY_LABEL, so full_matrix_pairs()'s baseline x
-        # candidates cross product does not include it -- it is an addition
-        # to the default sweep, not a subset relationship with the full
-        # matrix.
-        shipped_router, shipped_worker = eval_common.shipped_candidates()
-        shipped_key = eval_runner._pair_cell_key(
-            eval_runner.RunPair(shipped_router, shipped_worker)
+    def test_full_matrix_is_a_strict_superset_of_the_default_sweep(self) -> None:
+        # No shipped anchor to exclude any more (round-4 restart, Architecture
+        # finding 2) -- the default sweep's cells are exactly a subset of the
+        # full matrix's cells.
+        default_keys = {eval_runner._pair_cell_key(p) for p in eval_runner.default_sweep_pairs()}
+        full_keys = {eval_runner._pair_cell_key(p) for p in eval_runner.full_matrix_pairs()}
+        assert default_keys <= full_keys
+        assert default_keys != full_keys
+
+
+class TestLatencyEnforcementIsExplicitNotLabelDerived:
+    """Regression for round-4 restart, Architecture finding 1 / Logic finding
+    2: RunPair.enforce_latency_budget is an explicit field, not derived from
+    Candidate.label (the old `is_baseline` property compared
+    router.label == "baseline" and worker.label == "baseline"). Only the
+    historical baseline x baseline cell is enforced, regardless of what
+    config.toml happens to ship.
+    """
+
+    def test_only_the_historical_baseline_cell_is_enforced(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        enforced = [p for p in pairs if p.enforce_latency_budget]
+        assert len(enforced) == 1
+        assert enforced[0].router is eval_runner.ROUTER_BASELINE
+        assert enforced[0].worker is eval_runner.WORKER_BASELINE
+
+    def test_enforcement_does_not_depend_on_config_toml_coincidence(self, monkeypatch: Any) -> None:
+        # The bug reproduction: pre-fix, enforcement was derived from
+        # Candidate.label == "baseline", so a shipped-config coincidence with
+        # the historical baseline silently changed which cells got enforced.
+        # build_report()'s shipped-cell annotation (F2) reads shipped_candidates()
+        # independently of default_sweep_pairs()'s enforcement, so monkeypatching
+        # it here exercises the same "coincidence must not matter" property
+        # the old is_baseline property broke.
+        coincident = (
+            replace(eval_runner.ROUTER_BASELINE, label="shipped"),
+            replace(eval_runner.WORKER_BASELINE, label="shipped"),
         )
-        default_pairs = {
-            p
-            for p in eval_runner.default_sweep_pairs()
-            if eval_runner._pair_cell_key(p) != shipped_key
-        }
-        full_pairs = set(eval_runner.full_matrix_pairs())
-        assert default_pairs <= full_pairs
-        assert default_pairs != full_pairs
+        divergent = (
+            replace(eval_runner.ROUTER_CANDIDATES[0], label="shipped"),
+            replace(eval_runner.WORKER_CANDIDATES[0], label="shipped"),
+        )
+
+        def _enforced_keys() -> set[tuple[str, str | None, str, str | None]]:
+            return {
+                eval_runner._pair_cell_key(p)
+                for p in eval_runner.default_sweep_pairs()
+                if p.enforce_latency_budget
+            }
+
+        monkeypatch.setattr(eval_runner, "shipped_candidates", lambda: coincident)
+        coincident_enforced = _enforced_keys()
+        monkeypatch.setattr(eval_runner, "shipped_candidates", lambda: divergent)
+        divergent_enforced = _enforced_keys()
+
+        assert coincident_enforced == divergent_enforced
+
+    def test_selected_baseline_pair_is_enforced(self) -> None:
+        from argparse import Namespace
+
+        baseline_args = Namespace(router="baseline", worker="baseline")
+        (pair,) = eval_runner._resolve_pairs(baseline_args)
+        assert pair.enforce_latency_budget is True
+
+        candidate_args = Namespace(router=eval_runner.ROUTER_CANDIDATES[0].label, worker="baseline")
+        (pair,) = eval_runner._resolve_pairs(candidate_args)
+        assert pair.enforce_latency_budget is False
+
+
+class TestPairCellKeyUsesEffectiveEffort:
+    """Regression for round-4 restart, Logic finding 1: _pair_cell_key() must
+    key on effective_effort_for_manifest_lookup(), not the raw declared
+    effort -- ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are ONE wire
+    request under two spellings.
+    """
+
+    def test_unset_and_explicit_minimal_dedupe_to_one_cell(self) -> None:
+        router_a = eval_runner.Candidate(label="a", role="router", model="gpt-5-mini", effort=None)
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 1
+
+    def test_genuinely_different_efforts_stay_distinct(self) -> None:
+        router_a = eval_runner.Candidate(
+            label="a", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="high"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 2
+
+    def test_non_gpt5_model_unset_vs_minimal_effort_stays_distinct(self) -> None:
+        # Pins that the fix delegates to the shared resolver rather than
+        # hardcoding "unset defaults to minimal" for every model.
+        router_a = eval_runner.Candidate(
+            label="a", role="router", model="not-a-gpt-5-model", effort=None
+        )
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="not-a-gpt-5-model", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 2
+
+
+class TestDedupePairsGuardsEnforcementConsistency:
+    """Regression for round-4 restart verification follow-up: two RunPairs
+    that collide on wire identity but disagree on enforce_latency_budget
+    must be caught loudly, not silently first-wins resolved. Unreachable
+    today by construction (only one caller ever sets True), but a future
+    construction site could reintroduce F1's original bug in a new shape."""
+
+    def test_agreeing_enforcement_dedupes_silently(self) -> None:
+        router_a = eval_runner.Candidate(label="a", role="router", model="gpt-5-mini", effort=None)
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [
+            eval_runner.RunPair(router_a, worker, enforce_latency_budget=True),
+            eval_runner.RunPair(router_b, worker, enforce_latency_budget=True),
+        ]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 1
+
+    def test_disagreeing_enforcement_raises(self) -> None:
+        router_a = eval_runner.Candidate(label="a", role="router", model="gpt-5-mini", effort=None)
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [
+            eval_runner.RunPair(router_a, worker, enforce_latency_budget=True),
+            eval_runner.RunPair(router_b, worker, enforce_latency_budget=False),
+        ]
+
+        with pytest.raises(AssertionError, match="disagrees on enforce_latency_budget"):
+            eval_runner._dedupe_pairs(pairs)
 
 
 class TestSpendEstimateIsWorstCase:
@@ -579,7 +711,9 @@ class TestLatencyBudgetChecking:
     def test_baseline_over_budget_is_enforced_and_flagged_exceeded(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        pair = eval_runner.RunPair(
+            eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE, enforce_latency_budget=True
+        )
         outcome = _run_cell(
             monkeypatch,
             pair=pair,
@@ -593,7 +727,9 @@ class TestLatencyBudgetChecking:
         assert turn.latency_budget_exceeded is True
 
     def test_baseline_within_budget_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        pair = eval_runner.RunPair(
+            eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE, enforce_latency_budget=True
+        )
         outcome = _run_cell(
             monkeypatch, pair=pair, turns=(Turn(query="hi"),), routing_ms=100.0, total_ms=100.0
         )
@@ -772,6 +908,102 @@ class TestMajorityBool:
 
     def test_all_none_is_none(self) -> None:
         assert eval_runner._majority_bool([None, None]) is None
+
+
+class TestCleanOutcomeRequiresStrictMajority:
+    """Regression for round-4 restart, Codex P2: _majority_with_tiebreak()'s
+    `clean` outcome must require a STRICT majority, not merely a plurality --
+    with --repeat 4, (ok, ok, timeout, provider-error) is a 2/4 plurality for
+    "ok", but half the repetitions did not complete cleanly.
+    """
+
+    def test_codexs_exact_case(self) -> None:
+        # Pre-fix returns "ok".
+        result = eval_runner._majority_with_tiebreak(
+            ["ok", "ok", "timeout", "provider-error"],
+            eval_runner._TURN_STATUS_TIE_PRIORITY,
+            "ok",
+        )
+        assert result == "provider-error"
+
+    def test_judge_case(self) -> None:
+        # Pre-fix returns "yes".
+        result = eval_runner._majority_with_tiebreak(
+            ["yes", "yes", "no", "judge-error"],
+            eval_runner._JUDGE_VERDICT_TIE_PRIORITY,
+            "yes",
+        )
+        assert result == "judge-error"
+
+    def test_strict_majority_still_passes(self) -> None:
+        assert (
+            eval_runner._majority_with_tiebreak(
+                ["ok", "ok", "timeout"], eval_runner._TURN_STATUS_TIE_PRIORITY, "ok"
+            )
+            == "ok"
+        )
+        assert (
+            eval_runner._majority_with_tiebreak(
+                ["yes", "yes", "yes", "no"], eval_runner._JUDGE_VERDICT_TIE_PRIORITY, "yes"
+            )
+            == "yes"
+        )
+
+    def test_single_value(self) -> None:
+        assert (
+            eval_runner._majority_with_tiebreak(["ok"], eval_runner._TURN_STATUS_TIE_PRIORITY, "ok")
+            == "ok"
+        )
+
+    def test_two_two_clean_dirty_tie_is_unchanged(self) -> None:
+        # Already correct pre-fix (a genuine tie, not a plurality) -- pins no
+        # regression.
+        assert (
+            eval_runner._majority_with_tiebreak(
+                ["ok", "ok", "timeout", "timeout"], eval_runner._TURN_STATUS_TIE_PRIORITY, "ok"
+            )
+            == "timeout"
+        )
+
+    def test_end_to_end_repeat_4_cell_fails(self) -> None:
+        """The finding as actually stated: the cell can pass with only half
+        of its repetitions completing cleanly."""
+        turn_repeats = [
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="yes"),
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="yes"),
+            eval_runner.TurnOutcome(query="q", status="timeout"),
+            eval_runner.TurnOutcome(query="q", status="provider-error"),
+        ]
+        aggregated_turn = eval_runner._aggregate_turn_repeats(
+            turn_repeats,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated_turn.status == "provider-error"
+
+        cell_repeats = [
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="ok", turns=[turn_repeats[0]]
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="ok", turns=[turn_repeats[1]]
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="timeout", turns=[turn_repeats[2]]
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="provider-error", turns=[turn_repeats[3]]
+            ),
+        ]
+        aggregated_cell = eval_runner._aggregate_cell_repeats(
+            "p",
+            "s",
+            cell_repeats,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated_cell])
+        assert overall_status == "FAIL"
 
 
 class TestAggregateCellRepeats:
@@ -1337,7 +1569,7 @@ class TestRunMatrixRejectsANonPositiveRepeatCount:
 
     def test_majority_with_tiebreak_rejects_an_empty_sequence(self) -> None:
         with pytest.raises(ValueError):
-            eval_runner._majority_with_tiebreak([], eval_runner._CELL_STATUS_TIE_PRIORITY)
+            eval_runner._majority_with_tiebreak([], eval_runner._CELL_STATUS_TIE_PRIORITY, "ok")
 
 
 class TestBuildReportRepeatCount:
@@ -3457,6 +3689,30 @@ class TestRequestKwargsRequiredKeysAreDerivedFromProductionBuilders:
             is True
         )
 
+    def test_judge_required_keys_track_the_builder(self) -> None:
+        """Round-4 restart, Architecture Minor #6: the judge branch used to
+        hand-list model/reasoning_effort/messages instead of deriving them
+        from build_judge_request_kwargs(), unlike the router/worker branches
+        above -- so a new key added to the builder silently went unchecked.
+        """
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        required = set(
+            eval_runner.build_judge_request_kwargs(
+                entry["model"], messages=[{"role": "user", "content": "p"}]
+            )
+        ) - {"max_completion_tokens"}
+        assert required, "the judge builder produced no required keys -- fixture likely broken"
+
+        for key in required:
+            entry_missing_key = dict(entry["request_kwargs"])
+            del entry_missing_key[key]
+            assert (
+                eval_runner._request_kwargs_shape_ok(
+                    "judge", entry["model"], entry["effort"], entry_missing_key
+                )
+                is False
+            ), f"removing {key!r} should have failed the judge shape check"
+
     def test_existing_fixtures_still_pass_with_the_derived_required_set(self) -> None:
         # The router/worker fixtures already used throughout this file must
         # not regress -- confirms the derived required set didn't
@@ -4558,74 +4814,130 @@ class TestLatencyBudgetExceededPredicate:
 
 
 class TestDefaultSweepAnchorsOnShippedConfig:
-    """Regression for round-3 confirming pass, Architecture finding 3:
-    ROUTER_BASELINE/WORKER_BASELINE are a fixed HISTORICAL anchor
-    (gpt-5-mini/gpt-5), not what config.toml ships today. Every
-    default_sweep_pairs() report previously answered "how does X compare to
-    the pre-shortlist default", so a candidate that beat the historical
-    baseline while regressing against current production read as a win.
-    default_sweep_pairs() now appends a deduped shipped x shipped anchor cell.
+    """Regression for round-4 restart, Architecture finding 2: the sweep
+    varies one role at a time, so the production anchor for a router
+    candidate is (shipped_router x WORKER_BASELINE) -- already guaranteed
+    present by TestShippedConfigHasAnEvalCandidateCell -- not a live joint
+    shipped x shipped cell. default_sweep_pairs() no longer runs that joint
+    cell; build_report() names which already-present cells carry the shipped
+    router/worker instead.
     """
 
     @staticmethod
-    def _shipped_pair() -> tuple[str, str | None, str, str | None]:
+    def _shipped_pair() -> tuple[eval_runner.Candidate, eval_runner.Candidate]:
         # Same construction as tests/test_eval_common.py's
         # TestShippedConfigHasAnEvalCandidateCell -- the repo-tracked
         # config.toml, loaded with env={} so the anchor is the same on every
         # machine.
-        from server.config import load_config
+        return eval_runner.shipped_candidates()
 
-        repo_config_toml = Path(__file__).resolve().parents[1] / "config.toml"
-        config = load_config(env={}, config_file=repo_config_toml)
-        return (
-            config.resolve_router_model("fast"),
-            config.resolve_router_reasoning_effort("fast"),
-            config.resolve_worker_model("deep"),
-            config.resolve_worker_reasoning_effort("deep"),
+    def test_default_sweep_has_no_joint_shipped_cell(self) -> None:
+        shipped_router, shipped_worker = self._shipped_pair()
+        router_key = (
+            shipped_router.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_router),
         )
+        worker_key = (
+            shipped_worker.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_worker),
+        )
+        baseline_router_key = (
+            eval_runner.ROUTER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.ROUTER_BASELINE),
+        )
+        baseline_worker_key = (
+            eval_runner.WORKER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.WORKER_BASELINE),
+        )
+        if router_key == baseline_router_key and worker_key == baseline_worker_key:
+            pytest.skip("shipped pair coincides with the historical baseline on this checkout")
 
-    def test_default_sweep_contains_the_shipped_cell(self) -> None:
-        shipped_router_model, shipped_router_effort, shipped_worker_model, shipped_worker_effort = (
-            self._shipped_pair()
+        pairs = eval_runner.default_sweep_pairs()
+
+        for pair in pairs:
+            pair_router_key = (
+                pair.router.model,
+                eval_runner.effective_effort_for_manifest_lookup(pair.router),
+            )
+            pair_worker_key = (
+                pair.worker.model,
+                eval_runner.effective_effort_for_manifest_lookup(pair.worker),
+            )
+            assert not (pair_router_key == router_key and pair_worker_key == worker_key)
+
+    def test_shipped_router_and_worker_each_have_a_one_role_varied_cell(self) -> None:
+        shipped_router, shipped_worker = self._shipped_pair()
+        router_key = (
+            shipped_router.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_router),
+        )
+        worker_key = (
+            shipped_worker.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_worker),
+        )
+        baseline_worker_key = (
+            eval_runner.WORKER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.WORKER_BASELINE),
+        )
+        baseline_router_key = (
+            eval_runner.ROUTER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.ROUTER_BASELINE),
         )
 
         pairs = eval_runner.default_sweep_pairs()
 
         assert any(
-            pair.router.model == shipped_router_model
-            and pair.router.effort == shipped_router_effort
-            and pair.worker.model == shipped_worker_model
-            and pair.worker.effort == shipped_worker_effort
+            (pair.router.model, eval_runner.effective_effort_for_manifest_lookup(pair.router))
+            == router_key
+            and (pair.worker.model, eval_runner.effective_effort_for_manifest_lookup(pair.worker))
+            == baseline_worker_key
+            for pair in pairs
+        )
+        assert any(
+            (pair.router.model, eval_runner.effective_effort_for_manifest_lookup(pair.router))
+            == baseline_router_key
+            and (pair.worker.model, eval_runner.effective_effort_for_manifest_lookup(pair.worker))
+            == worker_key
             for pair in pairs
         )
 
-    def test_shipped_cell_is_deduped_when_it_equals_the_historical_baseline(
-        self, monkeypatch: Any
-    ) -> None:
-        pre_fix_pairs = [
-            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
-        ]
-        pre_fix_pairs += [
-            eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE)
-            for candidate in eval_runner.ROUTER_CANDIDATES
-        ]
-        pre_fix_pairs += [
-            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, candidate)
-            for candidate in eval_runner.WORKER_CANDIDATES
-        ]
-        pre_fix_count = len(pre_fix_pairs)
-
-        shipped_as_historical = (
-            replace(eval_runner.ROUTER_BASELINE, label="shipped"),
-            replace(eval_runner.WORKER_BASELINE, label="shipped"),
-        )
-        monkeypatch.setattr(eval_runner, "shipped_candidates", lambda: shipped_as_historical)
-
+    def test_report_annotates_the_shipped_cells(self) -> None:
+        shipped_router, shipped_worker = self._shipped_pair()
         pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
 
-        assert len(pairs) == pre_fix_count
-        keys = [eval_runner._pair_cell_key(pair) for pair in pairs]
-        assert len(keys) == len(set(keys))
+        report = eval_runner.build_report(
+            outcomes, judge_model="judge", shipped=(shipped_router, shipped_worker)
+        )
+
+        shipped_cells = report["shipped_config_cells"]
+        assert shipped_cells is not None
+        router_key = (
+            shipped_router.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_router),
+        )
+        expected_router_cells = [
+            pair.label
+            for pair in pairs
+            if (pair.router.model, eval_runner.effective_effort_for_manifest_lookup(pair.router))
+            == router_key
+        ]
+        assert sorted(shipped_cells["router"]["cells"]) == sorted(expected_router_cells)
+        assert expected_router_cells  # sanity: the guaranteeing invariant actually holds here
+
+    def test_default_sweep_pairs_does_no_file_io(self, monkeypatch: Any) -> None:
+        # The dry-run contract reproduction: default_sweep_pairs() must not
+        # call load_config() (directly or via shipped_candidates()) -- that
+        # call now lives on the live-run-only path in main().
+        def _raise(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("default_sweep_pairs() must not read config.toml")
+
+        monkeypatch.setattr(eval_common, "load_config", _raise)
+
+        eval_runner.default_sweep_pairs()
 
     def test_shipped_anchor_does_not_disturb_the_existing_sweep(self) -> None:
         pairs = eval_runner.default_sweep_pairs()
@@ -4634,7 +4946,11 @@ class TestDefaultSweepAnchorsOnShippedConfig:
         )
 
         expected_prefix = [
-            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+            eval_runner.RunPair(
+                eval_runner.ROUTER_BASELINE,
+                eval_runner.WORKER_BASELINE,
+                enforce_latency_budget=True,
+            )
         ]
         expected_prefix += [
             eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE)

@@ -329,11 +329,15 @@ class TestShippedConfigHasAnEvalCandidateCell:
     pass, since the matrix would only be measuring against the stale
     baseline and older candidates.
 
-    Still guards the --router/--worker selectable path and --full-matrix,
-    which the shipped anchor cell added by round 3's
-    TestDefaultSweepAnchorsOnShippedConfig (tests/test_eval_model_comparison.py)
-    does not cover -- that class is the stronger sibling for the default
-    sweep specifically.
+    Round-4 restart, Architecture finding 2: this is now the ENABLING
+    invariant for scripts/eval_model_comparison.py's default sweep too --
+    default_sweep_pairs() no longer runs a live shipped x shipped cell;
+    instead it relies on this test's guarantee that a one-role-varied cell
+    for each shipped candidate already exists, and build_report() annotates
+    those cells by name. If this test starts failing, that annotation would
+    silently name nothing rather than loudly erroring (see
+    tests/test_eval_model_comparison.py's TestDefaultSweepAnchorsOnShippedConfig
+    for the annotation's own coverage).
     """
 
     def test_shipped_router_and_worker_models_have_a_candidate_cell(self) -> None:

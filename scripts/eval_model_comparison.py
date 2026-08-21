@@ -56,6 +56,7 @@ from scripts.eval_common import (
     CollectingMeasurementSink,
     _judge_extra_kwargs,
     build_judge_llm_service,
+    build_judge_request_kwargs,
     build_session_for_run,
     confined_output_path,
     effective_effort_for_manifest_lookup,
@@ -185,60 +186,104 @@ WORKER_SELECTABLE_BY_LABEL = {c.label: c for c in (WORKER_BASELINE, *WORKER_CAND
 class RunPair:
     router: Candidate
     worker: Candidate
+    # Whether a latency-budget breach in this cell FAILS the run, or is
+    # merely reported. Explicit, not derived from Candidate.label: label
+    # is simultaneously a --router/--worker selector key and a report
+    # identity string, and inferring pass/fail gating from it made this
+    # decision by string comparison rather than deliberately (round-4
+    # restart, Architecture finding 1 / Logic finding 2).
+    #
+    # Only the historical baseline x baseline cell is enforced. The budget
+    # is calibrated at that cell's effort=minimal, so it is not a fair
+    # gate for an effort=high/medium candidate -- and every non-baseline
+    # cell in the default sweep, INCLUDING the cells carrying the shipped
+    # router/worker, is such a candidate. Enforcing production's latency
+    # is a separate concern needing its own calibrated budget; deliberately
+    # out of scope here rather than inherited by accident.
+    enforce_latency_budget: bool = False
 
     @property
     def label(self) -> str:
         return f"router={self.router.label}/worker={self.worker.label}"
 
-    @property
-    def is_baseline(self) -> bool:
-        return self.router.label == "baseline" and self.worker.label == "baseline"
-
 
 def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
     """Identity by the request shape a cell actually sends, NOT by label --
     the shipped pair carries label="shipped" but may be the same wire request
-    as an existing baseline/candidate cell."""
-    return (pair.router.model, pair.router.effort, pair.worker.model, pair.worker.effort)
+    as an existing baseline/candidate cell.
+
+    Uses effective_effort_for_manifest_lookup(), NOT the raw declared effort:
+    that resolver resolves "unset effort on a gpt-5* model" to "minimal", so
+    ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are ONE wire request
+    under two spellings -- keying on the raw effort let the same paid cell
+    run twice (round-4 restart, Logic finding 1).
+    """
+    return (
+        pair.router.model,
+        effective_effort_for_manifest_lookup(pair.router),
+        pair.worker.model,
+        effective_effort_for_manifest_lookup(pair.worker),
+    )
 
 
 def _dedupe_pairs(pairs: Sequence[RunPair]) -> list[RunPair]:
-    seen: set[tuple[str, str | None, str, str | None]] = set()
+    seen: dict[tuple[str, str | None, str, str | None], bool] = {}
     unique: list[RunPair] = []
     for pair in pairs:
         key = _pair_cell_key(pair)
         if key in seen:
+            # Two constructors producing the same wire request must agree on
+            # whether it's budget-enforced -- a silent first-wins here would
+            # let a future caller's cell inherit enforcement it never asked
+            # for, or lose enforcement the baseline cell relies on (round-4
+            # restart, F1 follow-up: this is unreachable today by
+            # construction, since only one caller ever sets True, but it's
+            # a cheap guard against that changing silently).
+            assert seen[key] == pair.enforce_latency_budget, (
+                f"colliding cell key {key} disagrees on enforce_latency_budget "
+                f"({seen[key]} vs {pair.enforce_latency_budget})"
+            )
             continue
-        seen.add(key)
+        seen[key] = pair.enforce_latency_budget
         unique.append(pair)
     return unique
 
 
 def default_sweep_pairs() -> tuple[RunPair, ...]:
-    """baseline x baseline, one-role-varied sweeps, plus the shipped anchor.
+    """baseline x baseline plus the one-role-varied sweeps. Not the full cross
+    product -- proportionate to what "compare Codex's per-role recommendation"
+    actually needs. See Requirements.
 
-    Not the full cross product -- proportionate to what "compare Codex's
-    per-role recommendation" actually needs. See Requirements.
+    Deliberately NOT a shipped x shipped cell. *_BASELINE is a fixed
+    HISTORICAL anchor (gpt-5-mini/gpt-5), not what config.toml ships -- but
+    this sweep varies one role at a time, so the production anchor for a
+    router candidate is (shipped_router x WORKER_BASELINE), which
+    TestShippedConfigHasAnEvalCandidateCell guarantees is already in this
+    list. Adding a joint shipped x shipped cell would be exactly the
+    non-baseline x non-baseline cell that --full-matrix's help text argues
+    carries no signal in this codebase (the router never influences the
+    worker's request). What was actually missing was naming which cells are
+    the shipped ones -- build_report() does that now, at zero extra paid
+    calls. To measure the specific joint pairing, run
+    `--router <shipped-router-label> --worker <shipped-worker-label>`
+    explicitly (round-4 restart, Architecture finding 2).
 
-    The trailing shipped x shipped cell exists because *_BASELINE is a fixed
-    HISTORICAL anchor (gpt-5-mini/gpt-5), not what config.toml ships. Without
-    this cell every sweep answered "how does X compare to the pre-shortlist
-    default", so a candidate that beat the historical baseline while
-    regressing against current production read as a win. Deduped, so a
-    config.toml reverted to the historical pair does not emit the cell twice.
+    Pure by construction: no file I/O, so --dry-run stays a zero-I/O path.
     """
-    pairs = [RunPair(ROUTER_BASELINE, WORKER_BASELINE)]
+    pairs = [RunPair(ROUTER_BASELINE, WORKER_BASELINE, enforce_latency_budget=True)]
     pairs += [RunPair(candidate, WORKER_BASELINE) for candidate in ROUTER_CANDIDATES]
     pairs += [RunPair(ROUTER_BASELINE, candidate) for candidate in WORKER_CANDIDATES]
-    shipped_router, shipped_worker = shipped_candidates()
-    pairs.append(RunPair(shipped_router, shipped_worker))
     return tuple(_dedupe_pairs(pairs))
 
 
 def full_matrix_pairs() -> tuple[RunPair, ...]:
     routers = (ROUTER_BASELINE, *ROUTER_CANDIDATES)
     workers = (WORKER_BASELINE, *WORKER_CANDIDATES)
-    return tuple(RunPair(r, w) for r in routers for w in workers)
+    return tuple(
+        RunPair(r, w, enforce_latency_budget=(r is ROUTER_BASELINE and w is WORKER_BASELINE))
+        for r in routers
+        for w in workers
+    )
 
 
 # --------------------------------------------------------------------------
@@ -434,6 +479,19 @@ def _request_kwargs_shape_ok(
             and any(isinstance(t, dict) and t.get("type") == "web_search" for t in tools)
         )
     if kind == "judge":
+        # Same derivation as the router/worker branches above: the required
+        # key set is DERIVED from build_judge_request_kwargs() itself, not a
+        # hand-written literal, so a new load-bearing kwarg added to that
+        # production builder is automatically required here too. Excludes
+        # "max_completion_tokens" -- a runtime-only cap that varies per call
+        # and carries no request-shape contract, mirroring the router
+        # branch's "timeout" exclusion (round-4 restart, Architecture Minor
+        # #6).
+        required = set(
+            build_judge_request_kwargs(model, messages=[{"role": "user", "content": "p"}])
+        ) - {"max_completion_tokens"}
+        if not required <= request_kwargs.keys():
+            return False
         messages = request_kwargs.get("messages")
         # reasoning_effort is a load-bearing part of the judge request shape
         # (see _judge_extra_kwargs's docstring): a manifest entry that omits
@@ -894,7 +952,11 @@ class CellOutcome:
 # Tie-break priority for _majority_with_tiebreak(): when a repeat vote is
 # split exactly evenly, resolve toward the more "something went wrong"
 # outcome rather than the clean one -- a --repeat run exists to catch
-# flakiness, so a coin-flip tie must not silently read as a clean pass.
+# flakiness, so a coin-flip tie must not silently read as a clean pass. The
+# clean outcome (last entry in each tuple below) additionally requires a
+# STRICT majority, not just a plurality -- anything less resolves to the
+# worst observed non-clean value in this priority order (round-4 restart,
+# Codex P2).
 _CELL_STATUS_TIE_PRIORITY: tuple[CellStatus, ...] = (
     "timeout",
     "provider-error",
@@ -917,20 +979,32 @@ _StrEnumT = TypeVar("_StrEnumT", bound=str)
 
 
 def _majority_with_tiebreak(
-    values: Sequence[_StrEnumT], priority: Sequence[_StrEnumT]
+    values: Sequence[_StrEnumT], priority: Sequence[_StrEnumT], clean: _StrEnumT
 ) -> _StrEnumT:
-    """Mode of ``values``; a tied plurality resolves to the first matching
-    entry in ``priority`` rather than an arbitrary dict-iteration winner.
+    """Mode of ``values``, with two guards.
+
+    A tied plurality resolves to the first matching entry in ``priority``
+    rather than an arbitrary dict-iteration winner.
+
+    ``clean`` (the one value that means "nothing went wrong") additionally
+    requires a STRICT majority: a plurality is not enough. With --repeat 4,
+    (ok, ok, timeout, provider-error) is a 2/4 plurality for "ok" -- half the
+    repetitions did not complete, and _aggregate_cell_repeats() preserves
+    those only in `error`, which compute_pass_fail() never reads. Falling
+    short of a strict majority resolves to the worst observed non-clean value
+    in `priority` order (round-4 restart, Codex P2).
     """
     if not values:
         raise ValueError("_majority_with_tiebreak requires at least one value")
     counts = Counter(values)
     max_count = max(counts.values())
     winners = {value for value, count in counts.items() if count == max_count}
-    for candidate in priority:
-        if candidate in winners:
-            return candidate
-    return next(iter(winners))  # pragma: no cover -- unreachable for a closed Literal vocabulary
+    winner = next((c for c in priority if c in winners), next(iter(winners)))
+    if winner == clean and counts[clean] * 2 <= len(values):
+        for candidate in priority:
+            if candidate != clean and candidate in counts:
+                return candidate
+    return winner
 
 
 def _majority_bool(values: Sequence[bool | None]) -> bool | None:
@@ -994,7 +1068,7 @@ def _aggregate_turn_repeats(
         return turn_repeats[0]
 
     statuses: list[TurnStatus] = [turn.status for turn in turn_repeats]
-    agg_status = _majority_with_tiebreak(statuses, _TURN_STATUS_TIE_PRIORITY)
+    agg_status = _majority_with_tiebreak(statuses, _TURN_STATUS_TIE_PRIORITY, "ok")
 
     # Every semantic field below is only meaningful for a repeat that
     # actually produced a real result -- a provider-error/timeout/skipped
@@ -1005,7 +1079,7 @@ def _aggregate_turn_repeats(
     ok_turns = [turn for turn in turn_repeats if turn.status == "ok"]
     verdicts = [turn.judge_verdict for turn in ok_turns if turn.judge_verdict is not None]
     agg_verdict = (
-        _majority_with_tiebreak(verdicts, _JUDGE_VERDICT_TIE_PRIORITY) if verdicts else None
+        _majority_with_tiebreak(verdicts, _JUDGE_VERDICT_TIE_PRIORITY, "yes") if verdicts else None
     )
     reason_bits = [turn.judge_reason for turn in ok_turns if turn.judge_reason]
     agg_reason = (
@@ -1097,7 +1171,7 @@ def _aggregate_turn_repeats(
         total_ms=agg_total_ms,
         latency_budget_exceeded=agg_budget_exceeded,
         # Any repeat that OBSERVED enforcement is authoritative. This field is
-        # pair-derived (run_cell() sets it to pair.is_baseline), but only on the
+        # pair-derived (run_cell() sets it to pair.enforce_latency_budget), but only on the
         # measured path -- `if stage_metrics is not None` at run_cell():1575.
         # Every other producer, including _skipped_turn_outcomes()' padding for
         # a repeat that failed or aborted before it measured anything, leaves it
@@ -1144,7 +1218,7 @@ def _aggregate_cell_repeats(
         return repeats[0]
 
     statuses: list[CellStatus] = [cell.status for cell in repeats]
-    agg_status = _majority_with_tiebreak(statuses, _CELL_STATUS_TIE_PRIORITY)
+    agg_status = _majority_with_tiebreak(statuses, _CELL_STATUS_TIE_PRIORITY, "ok")
     non_ok = [status for status in statuses if status != "ok"]
     # Not gated on agg_status == "ok" -- a minority infra failure is real
     # evidence about a live paid run and must survive into the report's
@@ -1381,7 +1455,12 @@ async def run_cell(
         )
         # Pre-call assertion: the per-run Config resolves to exactly this
         # cell's candidate model/effort -- checkable before any paid call
-        # happens.
+        # happens. Deliberately compares pair.router.effort RAW, not through
+        # effective_effort_for_manifest_lookup() (unlike _pair_cell_key): this
+        # asserts config plumbing ("did the per-run Config get built with
+        # this cell's declared values"), not wire identity, and both sides
+        # here are raw -- do not "fix" this into using the resolver (round-4
+        # restart, Logic finding 1).
         resolved_router_model = config.resolve_router_model("fast")
         resolved_router_effort = config.resolve_router_reasoning_effort("fast")
         if (
@@ -1665,7 +1744,7 @@ async def run_cell(
                 outcome.routing_ms = round(stage_metrics["routing_ms"], 1)
                 outcome.search_ms = round(stage_metrics["search_ms"], 1)
                 outcome.total_ms = round(stage_metrics["total_ms"], 1)
-                outcome.latency_budget_enforced = pair.is_baseline
+                outcome.latency_budget_enforced = pair.enforce_latency_budget
                 outcome.latency_budget_exceeded = _latency_budget_exceeded(
                     stage_metrics["routing_ms"],
                     stage_metrics["total_ms"],
@@ -2024,12 +2103,84 @@ def _serialize_cell(outcome: CellOutcome) -> dict[str, Any]:
     return cell
 
 
+def _parse_pair_label(pair_label: str) -> tuple[str, str]:
+    """Split a ``RunPair.label`` back into ``(router_label, worker_label)``.
+
+    Inverse of ``RunPair.label``'s ``f"router={...}/worker={...}"`` format --
+    ``build_report`` only receives ``CellOutcome.pair_label`` strings, not the
+    ``RunPair`` objects themselves, so annotating the shipped cells has to
+    recover the candidate labels this way rather than threading the pairs
+    list through as a second parameter.
+    """
+    router_part, worker_part = pair_label.split("/", 1)
+    return router_part.removeprefix("router="), worker_part.removeprefix("worker=")
+
+
+def _shipped_config_cells_annotation(
+    outcomes: list[CellOutcome], shipped: tuple[Candidate, Candidate]
+) -> dict[str, Any]:
+    """Name which already-present sweep cells carry the (model, effort)
+    config.toml ships -- see ``default_sweep_pairs()``'s docstring for why
+    this replaces a live shipped x shipped cell (round-4 restart, Architecture
+    finding 2).
+
+    Matches on ``(model, effective_effort_for_manifest_lookup(...))``, NOT on
+    label: the shipped candidate is registered under ``label="shipped"``,
+    never under a sweep cell's actual candidate label, so a label compare
+    would always come up empty.
+    """
+    shipped_router, shipped_worker = shipped
+    router_key = (shipped_router.model, effective_effort_for_manifest_lookup(shipped_router))
+    worker_key = (shipped_worker.model, effective_effort_for_manifest_lookup(shipped_worker))
+    router_cells: list[str] = []
+    worker_cells: list[str] = []
+    for pair_label in sorted({outcome.pair_label for outcome in outcomes}):
+        router_label, worker_label = _parse_pair_label(pair_label)
+        router_candidate = ROUTER_SELECTABLE_BY_LABEL.get(router_label)
+        worker_candidate = WORKER_SELECTABLE_BY_LABEL.get(worker_label)
+        if (
+            router_candidate is not None
+            and (
+                router_candidate.model,
+                effective_effort_for_manifest_lookup(router_candidate),
+            )
+            == router_key
+        ):
+            router_cells.append(pair_label)
+        if (
+            worker_candidate is not None
+            and (
+                worker_candidate.model,
+                effective_effort_for_manifest_lookup(worker_candidate),
+            )
+            == worker_key
+        ):
+            worker_cells.append(pair_label)
+    return {
+        "router": {
+            "model": shipped_router.model,
+            "effort": shipped_router.effort,
+            "cells": router_cells,
+        },
+        "worker": {
+            "model": shipped_worker.model,
+            "effort": shipped_worker.effort,
+            "cells": worker_cells,
+        },
+        "note": (
+            "these sweep cells carry the (model, effort) config.toml ships; "
+            "their latency budget is report-only, not blocking"
+        ),
+    }
+
+
 def build_report(
     outcomes: list[CellOutcome],
     *,
     judge_model: str,
     call_accounting: CallAccounting | None = None,
     repeat_count: int = 1,
+    shipped: tuple[Candidate, Candidate] | None = None,
 ) -> dict[str, Any]:
     overall_status, failure_reasons = compute_pass_fail(outcomes)
     report: dict[str, Any] = {
@@ -2042,8 +2193,9 @@ def build_report(
             else (
                 f"n={repeat_count} per cell -- each cell's reported status/verdicts are a "
                 "majority vote across independent repetitions (see each cell's `repeats` "
-                "field for the raw per-repetition results); a tied vote resolves toward the "
-                "failure outcome, not the clean one"
+                "field for the raw per-repetition results); the clean outcome requires a "
+                "STRICT majority (more than half), not just a plurality -- anything less "
+                "resolves to the worst observed failure outcome, not the clean one"
             )
         ),
         # Threaded through from main()'s pre-flight matrix_call_accounting()
@@ -2066,6 +2218,9 @@ def build_report(
             }
         ),
         "cells": [_serialize_cell(outcome) for outcome in outcomes],
+        "shipped_config_cells": (
+            None if shipped is None else _shipped_config_cells_annotation(outcomes, shipped)
+        ),
     }
     report["overall_status"] = overall_status
     report["failure_reasons"] = failure_reasons
@@ -2073,6 +2228,16 @@ def build_report(
 
 
 def print_report_summary(report: dict[str, Any]) -> None:
+    shipped_cells = report.get("shipped_config_cells")
+    if shipped_cells:
+        print(
+            f"shipped router ({shipped_cells['router']['model']}"
+            f"@{shipped_cells['router']['effort']}): {shipped_cells['router']['cells']}"
+        )
+        print(
+            f"shipped worker ({shipped_cells['worker']['model']}"
+            f"@{shipped_cells['worker']['effort']}): {shipped_cells['worker']['cells']}"
+        )
     for cell in report["cells"]:
         print(f"[{cell['status']}] {cell['pair']} / {cell['scenario']}")
         if cell["error"]:
@@ -2115,7 +2280,8 @@ def _resolve_pairs(args: argparse.Namespace) -> tuple[RunPair, ...]:
     if args.router or args.worker:
         router = ROUTER_SELECTABLE_BY_LABEL[args.router or "baseline"]
         worker = WORKER_SELECTABLE_BY_LABEL[args.worker or "baseline"]
-        return (RunPair(router, worker),)
+        enforce = router is ROUTER_BASELINE and worker is WORKER_BASELINE
+        return (RunPair(router, worker, enforce_latency_budget=enforce),)
     return full_matrix_pairs() if args.full_matrix else default_sweep_pairs()
 
 
@@ -2369,7 +2535,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     report = build_report(
-        outcomes, judge_model=args.judge_model, call_accounting=accounting, repeat_count=args.repeat
+        outcomes,
+        judge_model=args.judge_model,
+        call_accounting=accounting,
+        repeat_count=args.repeat,
+        shipped=shipped_candidates(),
     )
     print_report_summary(report)
     # The aggregate report is always persisted to a file, not only when
