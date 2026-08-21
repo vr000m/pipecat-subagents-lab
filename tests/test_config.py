@@ -1965,6 +1965,18 @@ class TestReasoningEffortInheritance:
 
         assert config.resolve_worker_reasoning_effort("deep") == "medium"
 
+    def test_provenance_and_empty_means_absent_are_independent_objects(self) -> None:
+        """Round-4 restart, Architecture Minor #7: _EMPTY_MEANS_ABSENT_KEYS
+        used to be `_PROVENANCE_KEYS` itself (an alias), so changing one
+        object's membership silently changed the other's -- enforced only by
+        a comment, not the independence the two names claim. Pins that they
+        are now separate objects with the same membership today.
+        """
+        import server.config as _config_module
+
+        assert _config_module._EMPTY_MEANS_ABSENT_KEYS is not _config_module._PROVENANCE_KEYS
+        assert set(_config_module._EMPTY_MEANS_ABSENT_KEYS) == set(_config_module._PROVENANCE_KEYS)
+
 
 class TestDefaultReasoningEffortForModel:
     """Round 10 gauntlet, Architecture finding 4: the gpt-5*-naming rule,

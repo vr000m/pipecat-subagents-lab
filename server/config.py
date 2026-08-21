@@ -842,10 +842,11 @@ _PROVENANCE_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
 # these keys' consumers reading them with a truthiness walrus; a key whose
 # consumer does a plain `in values` presence check must NOT be listed here.
 #
-# Alias, not a copy: they are the same set today and a copy would invite them
-# to drift by accident rather than by decision. Changing membership means
-# giving this its own comprehension.
-_EMPTY_MEANS_ABSENT_KEYS = _PROVENANCE_KEYS
+# Its own comprehension, not an alias of _PROVENANCE_KEYS: they cover the
+# same set today, but an alias meant changing one object's membership changed
+# both, enforced only by the paragraph above -- not the independence the two
+# names claim (round-4 restart, Architecture Minor #7).
+_EMPTY_MEANS_ABSENT_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
 
 
 def _effectively_set(value: object) -> bool:
@@ -904,6 +905,13 @@ def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[st
     baseline recipe) still inherited config.toml's ``worker_reasoning_effort =
     "medium"``, so the "baseline" request carried a ``reasoning`` param the
     real baseline never sends.
+
+    Known second instance of the same concern, not yet migrated to layer
+    provenance: the ``WEBSEARCH_TTS_WS_URI``/``_SOCKET``/``_HOST``/``_PORT``
+    family below carries the same "a higher layer overriding one related key
+    should clear an inherited sibling" shape, handled by an older idiom
+    instead of this function's pattern (round-4 restart, Architecture Minor
+    #8 -- signpost only, no behaviour change on this branch).
     """
     for model_key, effort_key in _ROLE_MODEL_EFFORT_KEYS:
         if effort_key not in values:
