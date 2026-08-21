@@ -135,16 +135,20 @@ def _accepted_worker_entry(model: str, effort: str | None) -> dict[str, Any]:
 def _accepted_judge_entry(model: str) -> dict[str, Any]:
     # See _accepted_router_entry(): shape must also satisfy
     # _request_kwargs_shape_ok()'s judge branch -- a non-empty `messages`
-    # list of role/content dicts.
+    # list of role/content dicts, plus whatever reasoning_effort production
+    # actually sends for this model (round 3 confirming pass, Codex P2
+    # finding: the judge branch didn't used to cross-check this at all).
+    request_kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": "probe"}],
+        **eval_runner._judge_extra_kwargs(model),
+    }
     return {
         "kind": "judge",
         "model": model,
         "effort": None,
         "tools": [],
-        "request_kwargs": {
-            "model": model,
-            "messages": [{"role": "user", "content": "probe"}],
-        },
+        "request_kwargs": request_kwargs,
         "accepted": True,
         "error": None,
     }
@@ -3576,6 +3580,34 @@ class TestManifestEntryRequestKwargsMustMatchItsOwnModelAndEffort:
         status = eval_runner.load_manifest_status(manifest_path)
 
         assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is True
+
+    def test_judge_entry_missing_reasoning_effort_is_rejected(self, tmp_path: Path) -> None:
+        """Regression for round 3 confirming pass, Codex P2 finding: the judge
+        branch never cross-checked request_kwargs["reasoning_effort"] against
+        what production actually sends for this model, so a hand-edited or
+        stale-overridden manifest entry could authorize a live run against a
+        gpt-5* judge request that was never probed with an effort pin at all
+        -- the exact request-shape gap the round-3 reasoning_effort fix
+        introduced without a manifest-side check for it.
+        """
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        del entry["request_kwargs"]["reasoning_effort"]
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is False
+
+    def test_judge_entry_with_a_disagreeing_reasoning_effort_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        entry["request_kwargs"]["reasoning_effort"] = "high"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is False
 
 
 class TestManifestGateRunMatrixDirectly:

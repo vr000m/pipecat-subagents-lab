@@ -54,6 +54,7 @@ from scripts.eval_common import (
     WORKER_MANIFEST_TOOLS,
     Candidate,
     CollectingMeasurementSink,
+    _judge_extra_kwargs,
     build_judge_llm_service,
     build_session_for_run,
     confined_output_path,
@@ -434,6 +435,16 @@ def _request_kwargs_shape_ok(
         )
     if kind == "judge":
         messages = request_kwargs.get("messages")
+        # reasoning_effort is a load-bearing part of the judge request shape
+        # (see _judge_extra_kwargs's docstring): a manifest entry that omits
+        # it, or carries a stale/wrong value, would authorize a live run
+        # against a judge request Phase 0 never actually probed -- a
+        # hand-edited manifest or the --i-know-the-manifest-is-stale override
+        # could otherwise let a gpt-5* judge run with no reasoning_effort pin
+        # at all (round 3 confirming pass, Codex P2 finding).
+        reasoning_effort_ok = request_kwargs.get("reasoning_effort") == _judge_extra_kwargs(
+            model
+        ).get("reasoning_effort")
         return (
             # The router/worker branches above already cross-check
             # request_kwargs["model"] against this entry's own recorded
@@ -443,6 +454,7 @@ def _request_kwargs_shape_ok(
             # judge model that was never actually probed (round 9 gauntlet,
             # Codex P2 finding 2).
             request_kwargs.get("model") == model
+            and reasoning_effort_ok
             and isinstance(messages, list)
             and len(messages) >= 1
             and all(isinstance(m, dict) and "role" in m and "content" in m for m in messages)
