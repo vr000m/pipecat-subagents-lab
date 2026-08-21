@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import scripts.verify_eval_candidates as verify_module
+from scripts import eval_common
 from scripts.eval_common import error_text
 
 
@@ -177,7 +178,12 @@ class TestJudgeProbeKwargsShareProductionsShape:
     def test_probe_token_cap_stays_32_not_judge_max_tokens(self) -> None:
         kwargs = verify_module._judge_kwargs("gpt-5-mini")
 
-        assert kwargs["max_completion_tokens"] == 32
+        assert kwargs["max_completion_tokens"] == eval_common.JUDGE_PROBE_MAX_TOKENS
+        # Round 9 gauntlet, Logic F6: the whole point of the finding -- these
+        # two budgets are intentionally distinct and must not be collapsed
+        # by a future "single source of truth" cleanup, which would silently
+        # send 500-token probes instead of the deliberate 32-token cap.
+        assert eval_common.JUDGE_PROBE_MAX_TOKENS != eval_common.JUDGE_MAX_TOKENS
 
     def test_parity_with_build_judge_llm_service(self) -> None:
         from scripts.eval_common import build_judge_llm_service
