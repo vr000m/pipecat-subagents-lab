@@ -117,9 +117,12 @@ supplied its *reasoning effort* clears that inherited effort for that role:
 `WEBSEARCH_WORKER_MODEL=gpt-5` alone drops `config.toml`'s
 `[models].worker_reasoning_effort = "medium"`, so the baseline worker sends
 no `reasoning` param at all — exactly the baseline's request shape. Setting
-both keys at the same layer keeps both (the router line above is therefore
-still required to pin `minimal`, since `gpt-5-mini` would otherwise fall back
-to the router's own `gpt-5*` → `minimal` default rather than to nothing).
+both keys at the same layer keeps both. The router line above is now
+redundant, not required: dropping it also clears the TOML `medium`, leaving
+`resolved_effort=None`, and `gpt-5-mini` falls back to the router's own
+`gpt-5*` → `minimal` naming default anyway — same value on the wire either
+way. It's kept here for explicitness and as a hedge against that naming
+default changing later, not because it's load-bearing.
 
 ## Caveats (still relevant after applying)
 

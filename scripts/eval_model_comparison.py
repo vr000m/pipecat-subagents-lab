@@ -959,6 +959,13 @@ def _aggregate_turn_repeats(
     # cleanly twice, a stricter rule than the assertion it guards (round 10
     # gauntlet, Logic finding 7). The minority case stays visible by folding
     # into agg_error below instead of silently vanishing.
+    # Exact-tie note: `* 2 >` (strict) means a 1-of-2 tie resolves toward
+    # "clean" here, the opposite of _CELL_STATUS_TIE_PRIORITY's tie-toward-
+    # "something went wrong" invariant above -- but this field is asked for a
+    # strict majority by design (finding 7 above), not a tie-break vote, and
+    # the minority case still surfaces via agg_error below rather than
+    # vanishing. Flagged as an accepted asymmetry, not a bug (verify pass,
+    # round 10 gauntlet).
     agg_unevaluated_reason = (
         f"{len(unevaluated_reasons)}/{len(ok_turns)} repeats: {unevaluated_reasons[0]}"
         if ok_turns and len(unevaluated_reasons) * 2 > len(ok_turns)
@@ -981,6 +988,15 @@ def _aggregate_turn_repeats(
     # exceeded" previously reported an aggregate total_ms over budget beside
     # latency_budget_exceeded=False (round 10 gauntlet, Logic finding 6).
     # Same predicate as run_cell()'s own live-budget check.
+    #
+    # Accepted tradeoff (verify pass, round 10 gauntlet): recomputing from the
+    # mean is *less* sensitive than the old majority vote in one direction. A
+    # repeat set like 61s/61s/5s against a 60s budget means to 42.3s (not
+    # exceeded), where the old vote said "exceeded" 2/3. This follows
+    # necessarily from wanting agg_budget_exceeded provably consistent with
+    # the published mean (finding 6 above) -- it is not a bug, but a masked
+    # high-variance repeat set will no longer flip this field. No test pins
+    # this direction; add one if the masked case becomes a real incident.
     agg_budget_exceeded = (
         None
         if agg_routing_ms is None and agg_total_ms is None
