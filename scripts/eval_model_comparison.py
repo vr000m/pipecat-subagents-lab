@@ -1023,9 +1023,16 @@ def _aggregate_cell_repeats(
     statuses: list[CellStatus] = [cell.status for cell in repeats]
     agg_status = _majority_with_tiebreak(statuses, _CELL_STATUS_TIE_PRIORITY)
     non_ok = [status for status in statuses if status != "ok"]
+    # Not gated on agg_status == "ok" -- a minority infra failure is real
+    # evidence about a live paid run and must survive into the report's
+    # `error` field even when the majority voted clean. compute_pass_fail()
+    # gates purely on cell/turn `status`, never on `error` truthiness, so
+    # surfacing this unconditionally is reporting-only and does not change
+    # any FAIL/PASS verdict. Matches _aggregate_turn_repeats' own
+    # non_ok_turns handling above (round 10 gauntlet, Logic finding 8).
     agg_error = (
         None
-        if agg_status == "ok"
+        if not non_ok
         else f"{len(non_ok)}/{len(repeats)} repeats did not complete cleanly: "
         + ", ".join(sorted(set(non_ok)))
     )

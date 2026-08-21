@@ -811,7 +811,13 @@ class TestAggregateCellRepeats:
         cells = [self._cell(status="ok"), self._cell(status="ok"), self._cell(status="timeout")]
         aggregated = self._aggregate(cells)
         assert aggregated.status == "ok"
-        assert aggregated.error is None
+        # A minority infra failure still surfaces in `error` even though the
+        # majority-voted status is "ok" -- see
+        # test_minority_infra_failure_surfaces_in_error_without_flipping_status
+        # (round 10 gauntlet, Logic finding 8). This test's own concern is the
+        # STATUS vote, not error content.
+        assert aggregated.error is not None
+        assert "1/3" in aggregated.error
 
     def test_majority_infra_failure_reports_the_failure_with_a_summary(self) -> None:
         cells = [
@@ -823,6 +829,26 @@ class TestAggregateCellRepeats:
         assert aggregated.status == "timeout"
         assert aggregated.error is not None
         assert "2/3" in aggregated.error
+
+    def test_minority_infra_failure_surfaces_in_error_without_flipping_status(self) -> None:
+        """Round 10 gauntlet, Logic finding 8: a minority provider-error
+        repeat is real evidence about a live paid run and must survive into
+        the aggregate's `error` field even when the majority voted "ok" --
+        previously agg_error was gated on agg_status == "ok" and silently
+        dropped it. Purely a reporting change: compute_pass_fail() gates on
+        status, not error, so the verdict must stay PASS."""
+        cells = [
+            self._cell(status="ok"),
+            self._cell(status="ok"),
+            self._cell(status="provider-error"),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.status == "ok"
+        assert aggregated.error is not None
+        assert "1/3" in aggregated.error
+        assert "provider-error" in aggregated.error
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "PASS"
 
     def test_infra_failed_repeats_do_not_pollute_the_semantic_vote(self) -> None:
         # A judge=no from a genuinely-ok repeat outvotes... but an
