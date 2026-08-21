@@ -143,7 +143,10 @@ OpenAI model IDs without allowing model output to select an arbitrary model.
 Their TOML equivalents are `[models].router_model`/`[models].worker_model`
 (checked-in defaults above reflect the
 `docs/dev_plans/artifacts/router-worker-eval-shortlist-2026-08-20.md`
-comparison). `WEBSEARCH_ROUTER_REASONING_EFFORT` and
+comparison, machine-checked against
+`docs/dev_plans/artifacts/eval-candidates-manifest.json` — the shortlist is
+the human-facing decision record, the manifest is the machine-checked gate
+the paid runner refuses to run without). `WEBSEARCH_ROUTER_REASONING_EFFORT` and
 `WEBSEARCH_WORKER_REASONING_EFFORT` override the `reasoning.effort` value
 sent with router/worker requests (validated against the OpenAI SDK's
 `ReasoningEffort` literal: `none`, `minimal`, `low`, `medium`, `high`,
@@ -538,7 +541,12 @@ Router/worker model evaluation (run in this order):
 
 - `verify_eval_candidates.py` — live-verifies every candidate (model, effort,
   tools) tuple with production-equivalent request shapes and writes a
-  versioned manifest that gates the runner below. Its judge probe pins
+  versioned manifest that gates the runner below. The manifest is written to
+  the tracked `docs/dev_plans/artifacts/eval-candidates-manifest.json`
+  (`DEFAULT_MANIFEST_RELATIVE_PATH` in `scripts/eval_common.py`) — unlike the
+  run reports below, this path IS git-tracked, since both the verifier and
+  the runner need to read it from a fresh checkout; overridable via `--out`
+  on this writer and `--manifest-path` on the runner. Its judge probe pins
   `reasoning_effort="minimal"` (`scripts/eval_common.py`'s
   `build_judge_request_kwargs`/`judge_extra_kwargs`) because the judge runs
   the Chat Completions API on a `gpt-5*` reasoning model: without an explicit
@@ -551,8 +559,14 @@ Router/worker model evaluation (run in this order):
   candidate and scenario, scoring replies via `pipecat.evals.judge.EvalJudge`
   and producing one aggregate pass/fail + latency report. Supports
   `--dry-run` (zero live calls), `--router`/`--worker`/`--scenario` for a
-  single cheap smoke pair, `--max-calls`/`--max-cost` spend gates, and
-  `--i-know-the-manifest-is-stale` to proceed against a manifest whose
+  single cheap smoke pair (valid `--router` labels: `baseline`, `luna-high`,
+  `luna-medium`, `terra-low`; valid `--worker` labels: `baseline`,
+  `terra-medium`, `sol-low` — these are `Candidate.label` values from
+  `ROUTER_CANDIDATES`/`WORKER_CANDIDATES` in `scripts/eval_common.py`, the
+  source of truth if this list drifts; `shipped` is NOT a selectable label,
+  see the `--router <shipped-label>` note below), `--max-calls`/`--max-cost`
+  spend gates, and `--i-know-the-manifest-is-stale` to proceed against a
+  manifest whose
   recorded source commit no longer matches `HEAD` — the manifest's
   `source_commit` is checked for exact equality, so any commit made after the
   manifest was written trips staleness even when the commit is unrelated to
