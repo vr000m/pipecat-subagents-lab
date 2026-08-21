@@ -246,7 +246,7 @@ def _registered_label(candidate: Candidate, registry: tuple[Candidate, ...]) -> 
     return match.label if match is not None else "shipped"
 
 
-def shipped_candidates() -> tuple[Candidate, Candidate]:
+def shipped_candidates(config: Config | None = None) -> tuple[Candidate, Candidate]:
     """The (model, effort) pair config.toml actually ships today, as Candidates.
 
     Deliberately loaded from the repo-tracked config.toml with ``env={}``: the
@@ -264,8 +264,24 @@ def shipped_candidates() -> tuple[Candidate, Candidate]:
     ``.model``/``.effort`` are config-resolved values; a config.toml edit
     that ships something no registered candidate covers falls back to
     ``label="shipped"`` (see ``_registered_label``) rather than crashing.
+
+    Round 7 F5: ``config`` is an optional injection point for a caller that
+    already holds a ``Config`` and would otherwise re-read config.toml a
+    second time -- restoring this module's "config comes in, it is never
+    loaded here" convention (cf. ``build_session_for_run``) for every caller
+    that can honour it. The default is resolved LAZILY, inside the function
+    body (not a default-argument expression evaluated at import time), so a
+    caller that always supplies its own ``config`` triggers zero file I/O --
+    this keeps ``--dry-run`` a zero-I/O path when a future caller wires this
+    through it. ``main()`` deliberately does NOT pass its own ``base_config``
+    here: ``main()``'s ``load_config()`` reads the process environment, and
+    passing it would defeat this function's documented ``env={}`` anchoring
+    invariant (two machines must anchor against the same shipped cell,
+    regardless of either one's local environment overrides) -- do not
+    "simplify" that away.
     """
-    config = load_config(env={}, config_file=REPO_ROOT / "config.toml")
+    if config is None:
+        config = load_config(env={}, config_file=REPO_ROOT / "config.toml")
     router = Candidate(
         label="shipped",
         role="router",

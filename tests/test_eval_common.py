@@ -414,3 +414,29 @@ class TestShippedCandidatesCarryARegisteredLabel:
         assert router.effort == config.resolve_router_reasoning_effort("fast")
         assert worker.model == config.resolve_worker_model("deep")
         assert worker.effort == config.resolve_worker_reasoning_effort("deep")
+
+
+class TestShippedCandidatesAcceptsAnInjectedConfig:
+    """Round 7 F5: shipped_candidates() hardcoded
+    load_config(env={}, config_file=REPO_ROOT / "config.toml"), doing its
+    own file I/O even for a caller that already holds a Config -- breaking
+    this module's "config comes in, it is never loaded here" convention
+    (cf. build_session_for_run). config is now an optional injection point,
+    resolved LAZILY so a caller that always supplies one triggers zero file
+    I/O -- pinned here by monkeypatching load_config to raise."""
+
+    def test_shipped_candidates_uses_an_injected_config_without_file_io(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _raise_if_called(*args: object, **kwargs: object) -> Config:
+            raise AssertionError("load_config() must not be called when config is injected")
+
+        monkeypatch.setattr(eval_common_module, "load_config", _raise_if_called)
+
+        injected = Config()
+        router, worker = eval_common_module.shipped_candidates(injected)
+
+        assert router.model == injected.resolve_router_model("fast")
+        assert router.effort == injected.resolve_router_reasoning_effort("fast")
+        assert worker.model == injected.resolve_worker_model("deep")
+        assert worker.effort == injected.resolve_worker_reasoning_effort("deep")
