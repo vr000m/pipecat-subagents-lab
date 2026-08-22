@@ -80,8 +80,8 @@ __all__ = [
     "build_session_for_run",
     "candidate_wire_key",
     "close_judge_llm_service",
-    "confined_output_path",
     "close_session_provider_clients",
+    "confined_output_path",
     "effective_effort_for_manifest_lookup",
     "error_text",
     "git_head",
@@ -579,38 +579,6 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     )
 
 
-async def close_judge_llm_service(service: Any) -> None:
-    """Close the ``AsyncOpenAI``/``DefaultAsyncHttpxClient`` pool a
-    ``build_judge_llm_service()`` result owns.
-
-    ``OpenAILLMService.__init__`` (``pipecat/services/openai/base_llm.py``)
-    constructs an ``AsyncOpenAI`` client -- and its own httpx connection
-    pool -- but pipecat exposes no public close/cleanup hook for it. Left
-    unclosed, every ``run_cell()`` call leaks one pool; ``--repeat N`` on an
-    M-cell matrix multiplies that to ``M * N`` (round 10 gauntlet, Logic
-    finding 2).
-
-    Reaches the client through the same private ``service._client``
-    convention ``verify_eval_candidates.probe_judge`` already established
-    (round 7 gauntlet, Architecture finding 19a) -- documented here too so a
-    future pipecat rename has one place to fix rather than two.
-
-    No-ops when ``service`` is ``None`` or exposes no ``_client`` (many
-    tests monkeypatch ``build_judge_llm_service`` to
-    ``lambda *_a, **_k: None`` -- this must not break them), and when the
-    resolved client has no ``close`` attribute.
-    """
-    if service is None:
-        return
-    client = getattr(service, "_client", None)
-    if client is None:
-        return
-    close = getattr(client, "close", None)
-    if close is None:
-        return
-    await close()
-
-
 async def close_session_provider_clients(host: Any) -> None:
     """Close the router and worker Responses clients a single ``run_cell()``
     call's ``SessionHost`` owns.
@@ -681,6 +649,38 @@ async def close_session_provider_clients(host: Any) -> None:
     call = getattr(router, "_call", None)
     router_responses = getattr(call, "_responses", None)
     await _close_hop(getattr(router_responses, "_client", None))
+
+
+async def close_judge_llm_service(service: Any) -> None:
+    """Close the ``AsyncOpenAI``/``DefaultAsyncHttpxClient`` pool a
+    ``build_judge_llm_service()`` result owns.
+
+    ``OpenAILLMService.__init__`` (``pipecat/services/openai/base_llm.py``)
+    constructs an ``AsyncOpenAI`` client -- and its own httpx connection
+    pool -- but pipecat exposes no public close/cleanup hook for it. Left
+    unclosed, every ``run_cell()`` call leaks one pool; ``--repeat N`` on an
+    M-cell matrix multiplies that to ``M * N`` (round 10 gauntlet, Logic
+    finding 2).
+
+    Reaches the client through the same private ``service._client``
+    convention ``verify_eval_candidates.probe_judge`` already established
+    (round 7 gauntlet, Architecture finding 19a) -- documented here too so a
+    future pipecat rename has one place to fix rather than two.
+
+    No-ops when ``service`` is ``None`` or exposes no ``_client`` (many
+    tests monkeypatch ``build_judge_llm_service`` to
+    ``lambda *_a, **_k: None`` -- this must not break them), and when the
+    resolved client has no ``close`` attribute.
+    """
+    if service is None:
+        return
+    client = getattr(service, "_client", None)
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if close is None:
+        return
+    await close()
 
 
 def strip_control_chars(text: str) -> str:
