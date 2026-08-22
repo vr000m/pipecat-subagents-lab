@@ -7,48 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- `scripts/eval_model_comparison.py --repeat N` (default 1): runs each
-  (router, worker, scenario) cell N times live and majority-votes the
-  results into one summary, since live calls run at `temperature=1.0` and a
-  single sample is noisy. Raw per-repetition results are preserved on the
-  report for audit; a coin-flip tie always resolves toward the failing
-  outcome. `--repeat 1` reproduces the prior single-run report shape
-  exactly.
-- `luna-medium` (`gpt-5.6-luna` at `effort=medium`) as a router candidate in
-  the eval suite's `ROUTER_CANDIDATES` (`scripts/eval_common.py`).
-- `[models].router_reasoning_effort` / `[models].worker_reasoning_effort`
-  TOML keys (`config.toml`), mapped to the existing
-  `WEBSEARCH_ROUTER_REASONING_EFFORT`/`WEBSEARCH_WORKER_REASONING_EFFORT`
-  env-var path so reasoning effort can be set the same way model IDs
-  already are, with env vars still taking precedence over TOML.
-
-### Fixed
-
-- `scripts/eval_model_comparison.py`'s citations assertion no longer fails
-  weather-query turns that were genuinely delegated and answered correctly:
-  the hosted `web_search` tool answers weather via an internal `oai-weather`
-  sub-tool whose sources never carry a citable URL, by design. Decoupled via
-  a new `Turn.expect_citations` field (`evals/scenarios.py`), independent of
-  `expect_delegated`.
-
-### Changed
-
-- `scripts/eval_model_comparison.py --full-matrix`'s help text now documents
-  that the router cannot influence worker output in this codebase, so its
-  non-baseline×non-baseline cells add no comparison signal beyond `--repeat`'s
-  resampling — it remains available as an opt-in "confirm two already-good
-  candidates pair well together" check, not the default comparison method.
-- `config.toml`'s `[models]` defaults changed to the shortlist from the
-  `--repeat 3` live comparison: router `gpt-5.6-luna`@medium (was
-  `gpt-5-mini`, no reasoning param), worker `gpt-5.6-terra`@medium (was
-  `gpt-5`, no reasoning param). See
-  `docs/dev_plans/artifacts/router-worker-eval-shortlist-2026-08-20.md` for
-  the comparison data. Override via `WEBSEARCH_ROUTER_MODEL`/
-  `WEBSEARCH_WORKER_MODEL`/`WEBSEARCH_ROUTER_REASONING_EFFORT`/
-  `WEBSEARCH_WORKER_REASONING_EFFORT` to keep the prior baseline.
-
 ## [0.1.3] - 2026-08-16
 
 ### Added
@@ -112,6 +70,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider, scored via `pipecat.evals.judge.EvalJudge`. Candidate
   verification (`scripts/verify_eval_candidates.py`) gates the runner behind
   a versioned manifest of live-confirmed (model, effort, tools) tuples.
+- `scripts/eval_model_comparison.py --repeat N` (default 1): runs each
+  (router, worker, scenario) cell N times live and majority-votes the
+  results into one summary, since live calls run at `temperature=1.0` and a
+  single sample is noisy. Raw per-repetition results are preserved on the
+  report for audit; a coin-flip tie always resolves toward the failing
+  outcome. `--repeat 1` reproduces the prior single-run report shape
+  exactly.
+- `luna-medium` (`gpt-5.6-luna` at `effort=medium`) as a router candidate in
+  the eval suite's `ROUTER_CANDIDATES` (`scripts/eval_common.py`).
+- `[models].router_reasoning_effort` / `[models].worker_reasoning_effort`
+  TOML keys (`config.toml`), mapped to the existing
+  `WEBSEARCH_ROUTER_REASONING_EFFORT`/`WEBSEARCH_WORKER_REASONING_EFFORT`
+  env-var path so reasoning effort can be set the same way model IDs
+  already are, with env vars still taking precedence over TOML.
 
 ### Changed
 
@@ -128,6 +100,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the existing `state` → `render` pattern already used for the
   runtime panel. `web/src/state.js` gained device-list/selection/mic-enabled
   reducers to support this.
+- `scripts/eval_model_comparison.py --full-matrix`'s help text now documents
+  that the router cannot influence worker output in this codebase, so its
+  non-baseline×non-baseline cells add no comparison signal beyond `--repeat`'s
+  resampling — it remains available as an opt-in "confirm two already-good
+  candidates pair well together" check, not the default comparison method.
+- `config.toml`'s `[models]` defaults changed to the shortlist from the
+  `--repeat 3` live comparison: router `gpt-5.6-luna`@medium (was
+  `gpt-5-mini`, no reasoning param), worker `gpt-5.6-terra`@medium (was
+  `gpt-5`, no reasoning param). See
+  `docs/dev_plans/artifacts/router-worker-eval-shortlist-2026-08-20.md` for
+  the comparison data. Override via `WEBSEARCH_ROUTER_MODEL`/
+  `WEBSEARCH_WORKER_MODEL`/`WEBSEARCH_ROUTER_REASONING_EFFORT`/
+  `WEBSEARCH_WORKER_REASONING_EFFORT` to keep the prior baseline.
 
 ### Fixed
 
@@ -300,6 +285,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer proceeds against an already-tombstoned generation, closing a race
   that could hold the global transport slot roughly tenfold longer than
   intended.
+- `scripts/eval_model_comparison.py`'s citations assertion no longer fails
+  weather-query turns that were genuinely delegated and answered correctly:
+  the hosted `web_search` tool answers weather via an internal `oai-weather`
+  sub-tool whose sources never carry a citable URL, by design. Decoupled via
+  a new `Turn.expect_citations` field (`evals/scenarios.py`), independent of
+  `expect_delegated`.
 
 ## [0.1.2] - 2026-07-28
 
