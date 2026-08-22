@@ -20,6 +20,21 @@
   `README.md`'s "Verification commands" section for the underlying `uv`/`bun`
   commands it wraps.
 
+## Review-gauntlet round labels
+
+Code comments and dev-plan status logs cite "round N" (e.g. "round 10
+gauntlet, Logic finding 3") to attribute a fix to the review pass that found
+it. These labels are **per-session**, not a single global index: multiple
+independent review-gauntlet sessions have run against this branch over its
+history, each restarting its own round count from 1. Two comments citing
+"round 3" may therefore refer to different sessions' round 3, with different
+findings and different commits — do not assume a shared timeline across
+comments, and do not renumber existing citations to force one (round 10
+gauntlet, Architecture finding 8: the citations are accurate to the session
+that wrote them, and renumbering would falsify that attribution). When
+writing a new comment, cite the round it was written in and leave earlier
+citations untouched.
+
 ## Router/worker model evaluation
 
 `scripts/verify_eval_candidates.py` (candidate verification, writes a
