@@ -37,19 +37,18 @@ from pathlib import Path
 from typing import Any
 
 from scripts.eval_common import (
+    ALL_ROUTER_CANDIDATES,
+    ALL_WORKER_CANDIDATES,
     DEFAULT_JUDGE_MODEL,
     DEFAULT_MANIFEST_RELATIVE_PATH,
     JUDGE_PROBE_MAX_TOKENS,
     MANIFEST_VERSION,
     REPO_ROOT,
-    ROUTER_BASELINE,
-    ROUTER_CANDIDATES,
     ROUTER_MANIFEST_TOOLS,
-    WORKER_BASELINE,
-    WORKER_CANDIDATES,
     WORKER_MANIFEST_TOOLS,
     build_judge_llm_service,
     build_judge_request_kwargs,
+    close_judge_llm_service,
     confined_output_path,
     effective_effort_for_manifest_lookup,
     error_text,
@@ -90,12 +89,10 @@ DEFAULT_OUT = DEFAULT_MANIFEST_RELATIVE_PATH
 # server/router.py's LazyRouterProvider.__call__ does. `None` worker effort
 # means "omit the `reasoning` kwarg entirely", not "resolve to a default".
 PHASE0_ROUTER_PROBES: tuple[tuple[str, str | None], ...] = tuple(
-    (c.model, effective_effort_for_manifest_lookup(c))
-    for c in (ROUTER_BASELINE, *ROUTER_CANDIDATES)
+    (c.model, effective_effort_for_manifest_lookup(c)) for c in ALL_ROUTER_CANDIDATES
 )
 PHASE0_WORKER_PROBES: tuple[tuple[str, str | None], ...] = tuple(
-    (c.model, effective_effort_for_manifest_lookup(c))
-    for c in (WORKER_BASELINE, *WORKER_CANDIDATES)
+    (c.model, effective_effort_for_manifest_lookup(c)) for c in ALL_WORKER_CANDIDATES
 )
 
 
@@ -339,22 +336,32 @@ def probe_judge(judge_model: str, api_key: str | None) -> ProbeResult:
         # the WEBSEARCH_OPENAI_API_KEY(_ENV)-resolved credential this probe
         # already went to the trouble of resolving via load_config().
         service = build_judge_llm_service(judge_model, api_key)
-        # `service._client` reaches into a private pipecat attribute -- a
-        # future pipecat rename would otherwise surface as a bare
-        # AttributeError that the generic `except Exception` below would
-        # misattribute to "judge model absent from manifest" (a rejected
-        # probe) rather than "probe plumbing broke" (this script needs a
-        # fix). Resolved separately, before the actual network call, so that
-        # distinction survives into the reported error text (round 7
-        # gauntlet, Architecture finding 19a).
         try:
-            client = service._client
-        except AttributeError as exc:
-            raise RuntimeError(
-                "judge probe plumbing broke: OpenAILLMService no longer exposes the "
-                f"private `_client` attribute this probe relies on ({exc})"
-            ) from exc
-        return await client.chat.completions.create(**kwargs)
+            # `service._client` reaches into a private pipecat attribute -- a
+            # future pipecat rename would otherwise surface as a bare
+            # AttributeError that the generic `except Exception` below would
+            # misattribute to "judge model absent from manifest" (a rejected
+            # probe) rather than "probe plumbing broke" (this script needs a
+            # fix). Resolved separately, before the actual network call, so
+            # that distinction survives into the reported error text (round
+            # 7 gauntlet, Architecture finding 19a).
+            try:
+                client = service._client
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "judge probe plumbing broke: OpenAILLMService no longer exposes the "
+                    f"private `_client` attribute this probe relies on ({exc})"
+                ) from exc
+            return await client.chat.completions.create(**kwargs)
+        finally:
+            # Same leaked-pool mechanism run_cell() closes (round 10
+            # gauntlet, Logic finding 2) -- one AsyncOpenAI/httpx pool per
+            # script invocation here, far lower impact than the matrix
+            # runner's per-cell leak, but the same fix. Must close inside
+            # this coroutine (not after asyncio.run(_call()) returns below):
+            # the event loop this client's connections belong to is torn
+            # down the moment asyncio.run() exits.
+            await close_judge_llm_service(service)
 
     try:
         response = asyncio.run(_call())

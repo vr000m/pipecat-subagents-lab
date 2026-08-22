@@ -56,6 +56,8 @@ from server.pipeline import SAFE_FALLBACK_TEXTS, TIMEOUT_FALLBACK_TEXTS, Session
 from server.router import effective_router_reasoning_effort
 
 __all__ = [
+    "ALL_ROUTER_CANDIDATES",
+    "ALL_WORKER_CANDIDATES",
     "DEFAULT_JUDGE_MODEL",
     "DEFAULT_MANIFEST_RELATIVE_PATH",
     "JUDGE_MAX_TOKENS",
@@ -75,6 +77,7 @@ __all__ = [
     "build_judge_llm_service",
     "build_judge_request_kwargs",
     "build_session_for_run",
+    "close_judge_llm_service",
     "confined_output_path",
     "effective_effort_for_manifest_lookup",
     "error_text",
@@ -217,6 +220,18 @@ WORKER_CANDIDATES: tuple[Candidate, ...] = (
     Candidate(label="sol-low", role="worker", model="gpt-5.6-sol", effort="low"),
 )
 
+# The full candidate registry for each role, baseline included -- round 10
+# gauntlet, Architecture finding 4: `(ROUTER_BASELINE, *ROUTER_CANDIDATES)`/
+# `(WORKER_BASELINE, *WORKER_CANDIDATES)` used to be re-spelled at every
+# lookup/selection call site (5 production sites across 3 modules), a real
+# drift surface once a new candidate tier is added. The baseline is
+# deliberately part of the registry for lookup/selection purposes (it is a
+# real, selectable candidate, not a separate concept) -- a new candidate
+# tier must be folded in HERE, at the constant definition, not re-spelled at
+# a call site.
+ALL_ROUTER_CANDIDATES: tuple[Candidate, ...] = (ROUTER_BASELINE, *ROUTER_CANDIDATES)
+ALL_WORKER_CANDIDATES: tuple[Candidate, ...] = (WORKER_BASELINE, *WORKER_CANDIDATES)
+
 
 def is_registered_candidate(candidate: Candidate, registry: tuple[Candidate, ...]) -> bool:
     """Whether any registered eval candidate is wire-identical to
@@ -312,8 +327,8 @@ def shipped_candidates(config_file: Path | None = None) -> tuple[Candidate, Cand
         effort=config.resolve_worker_reasoning_effort("deep"),
     )
     return (
-        replace(router, label=_registered_label(router, (ROUTER_BASELINE, *ROUTER_CANDIDATES))),
-        replace(worker, label=_registered_label(worker, (WORKER_BASELINE, *WORKER_CANDIDATES))),
+        replace(router, label=_registered_label(router, ALL_ROUTER_CANDIDATES)),
+        replace(worker, label=_registered_label(worker, ALL_WORKER_CANDIDATES)),
     )
 
 
@@ -528,6 +543,38 @@ def build_judge_llm_service(model: str, api_key: str | None) -> Any:
     return OpenAILLMService(
         settings=OpenAILLMService.Settings(model=model, extra=extra), api_key=api_key
     )
+
+
+async def close_judge_llm_service(service: Any) -> None:
+    """Close the ``AsyncOpenAI``/``DefaultAsyncHttpxClient`` pool a
+    ``build_judge_llm_service()`` result owns.
+
+    ``OpenAILLMService.__init__`` (``pipecat/services/openai/base_llm.py``)
+    constructs an ``AsyncOpenAI`` client -- and its own httpx connection
+    pool -- but pipecat exposes no public close/cleanup hook for it. Left
+    unclosed, every ``run_cell()`` call leaks one pool; ``--repeat N`` on an
+    M-cell matrix multiplies that to ``M * N`` (round 10 gauntlet, Logic
+    finding 2).
+
+    Reaches the client through the same private ``service._client``
+    convention ``verify_eval_candidates.probe_judge`` already established
+    (round 7 gauntlet, Architecture finding 19a) -- documented here too so a
+    future pipecat rename has one place to fix rather than two.
+
+    No-ops when ``service`` is ``None`` or exposes no ``_client`` (many
+    tests monkeypatch ``build_judge_llm_service`` to
+    ``lambda *_a, **_k: None`` -- this must not break them), and when the
+    resolved client has no ``close`` attribute.
+    """
+    if service is None:
+        return
+    client = getattr(service, "_client", None)
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if close is None:
+        return
+    await close()
 
 
 def strip_control_chars(text: str) -> str:

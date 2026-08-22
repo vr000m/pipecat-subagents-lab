@@ -2246,6 +2246,52 @@ class TestBuildReportRepeatCount:
         assert "repeats" not in report["cells"][0]
 
 
+class TestBuildReportReconcilesRepeatCount:
+    """Round 10 gauntlet, Architecture F5: ``repeat_count`` and each cell's
+    own ``repeats`` length are two authorities on one fact; build_report()
+    must reconcile them rather than trust the parameter blindly. This is
+    the tripwire that would have caught F1 (the manifest-rejection path
+    that used to skip repeat aggregation) had it existed first.
+    """
+
+    def _cell_with_n_repeats(self, n: int) -> eval_runner.CellOutcome:
+        repeats = None
+        if n != 1:
+            repeats = [
+                eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[])
+                for _ in range(n)
+            ]
+        return eval_runner.CellOutcome(
+            pair_label="p",
+            scenario_name="s",
+            status="ok",
+            turns=[eval_runner.TurnOutcome(query="q", status="ok")],
+            repeats=repeats,
+        )
+
+    def test_matching_repeat_count_has_no_mismatch_key(self) -> None:
+        cell = self._cell_with_n_repeats(3)
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=3)
+        assert "repetition_count_mismatch" not in report
+        assert report["overall_status"] == "PASS"
+
+    def test_mismatched_repeat_count_flips_status_to_fail(self) -> None:
+        cell = self._cell_with_n_repeats(3)
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=2)
+        assert report["repetition_count_mismatch"] == {"declared": 2, "observed": [3]}
+        assert report["overall_status"] == "FAIL"
+        assert any("repeat_count mismatch" in reason for reason in report["failure_reasons"])
+
+    def test_empty_outcomes_has_no_mismatch_key(self) -> None:
+        report = eval_runner.build_report([], judge_model="gpt-5-mini", repeat_count=3)
+        assert "repetition_count_mismatch" not in report
+
+    def test_print_report_summary_does_not_raise_on_a_degraded_report(self) -> None:
+        cell = self._cell_with_n_repeats(3)
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=2)
+        eval_runner.print_report_summary(report)  # must not raise
+
+
 # ---------------------------------------------------------------------------
 # Dry-run: zero live calls invariant
 # ---------------------------------------------------------------------------
@@ -3597,6 +3643,23 @@ class TestScenarioDefinitions:
     def test_two_scenarios_are_defined(self) -> None:
         assert len(eval_scenarios.SCENARIOS) == 2
 
+    def test_at_least_one_turn_sets_expect_citations(self) -> None:
+        """Round 10 gauntlet, Architecture finding 6: ``Turn.expect_citations``
+        defaults to opt-out (``False``) -- decoupled from ``expect_delegated``
+        because weather turns route through ``oai-weather``, whose sources
+        carry ``url: null`` and so can't pass a citations check. That
+        decoupling is correct, but the opt-out default means a scenario
+        author who forgets to set it silently loses citation coverage
+        entirely. This is the tripwire: if a future scenario refactor drops
+        the last citation-checked turn, this fails loudly instead of the
+        citations check silently retiring.
+        """
+        assert any(
+            turn.expect_citations
+            for scenario in eval_scenarios.SCENARIOS
+            for turn in scenario.turns
+        )
+
     def test_evals_package_does_not_import_scripts(self) -> None:
         """Regression for round-2 gauntlet finding 8: evals/scenarios.py used
         to import its query constants from scripts/eval_common.py, making
@@ -4685,6 +4748,78 @@ class TestManifestGateRunMatrixDirectly:
         assert len(outcomes) == 1
         assert outcomes[0].status == "manifest-rejected"
 
+    def test_rejected_cell_is_repeat_shaped_at_repeat_count_above_one(self, tmp_path: Path) -> None:
+        """Round 10 gauntlet, Codex F1: a manifest-rejected cell must carry
+        the same N-long ``repeats`` shape as every accepted cell so
+        ``build_report(..., repeat_count=N)`` doesn't advertise repetitions
+        the rejected cell never produced.
+        """
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (Scenario(name="s", turns=(Turn(query="hi"),)),),
+                eval_runner.Config(),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+                repeat_count=3,
+            )
+        )
+
+        assert len(outcomes) == 1
+        outcome = outcomes[0]
+        assert outcome.status == "manifest-rejected"
+        assert outcome.repeats is not None
+        assert len(outcome.repeats) == 3
+        for repeat in outcome.repeats:
+            assert repeat.status == "manifest-rejected"
+            assert repeat.error == "one or both candidates are absent from the manifest"
+
+        report = eval_runner.build_report(
+            outcomes, judge_model=eval_runner.DEFAULT_JUDGE_MODEL, repeat_count=3
+        )
+        assert "repetition_count_mismatch" not in report
+
+    def test_rejected_cell_at_repeat_count_one_preserves_repeats_none(self, tmp_path: Path) -> None:
+        """Identity-preserved shape at repeat_count=1 (default path):
+        _aggregate_cell_repeats returns repeats[0] unchanged, so the
+        rejected cell must still carry repeats=None, matching the pre-F1
+        behaviour exactly.
+        """
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (Scenario(name="s", turns=(Turn(query="hi"),)),),
+                eval_runner.Config(),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+                repeat_count=1,
+            )
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "manifest-rejected"
+        assert outcomes[0].repeats is None
+
 
 class TestOutputPathConfinement:
     """Regression for finding 6: a ``--out`` path must not escape the repo
@@ -5124,6 +5259,211 @@ class TestRunCellSetupExceptionsDontCrashTheMatrix:
 
         assert outcome.status == "turn-error"
         assert "shutdown exploded" in (outcome.error or "")
+
+
+class _FakeJudgeClient:
+    def __init__(self, *, raise_on_close: bool = False) -> None:
+        self.close_calls = 0
+        self._raise_on_close = raise_on_close
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self._raise_on_close:
+            raise RuntimeError("judge client close exploded")
+
+
+class _FakeJudgeService:
+    def __init__(self, client: _FakeJudgeClient) -> None:
+        self._client = client
+
+
+class TestRunCellClosesJudgeService:
+    """Round 10 gauntlet, Logic finding 2: run_cell() built a fresh judge
+    LLM service (and its AsyncOpenAI/httpx connection pool) every call but
+    never closed it -- ``--repeat`` multiplies the leak. The judge client
+    must now be closed in run_cell()'s existing finally, alongside
+    host.shutdown(), with the same never-mask-the-outcome guard.
+    """
+
+    def test_judge_client_is_closed_exactly_once_on_a_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient()
+        service = _FakeJudgeService(client)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+        assert client.close_calls == 1
+
+    def test_judge_client_is_still_closed_when_the_host_path_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient()
+        service = _FakeJudgeService(client)
+
+        class _RaisingHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            async def start(self) -> None:
+                raise RuntimeError("host start exploded")
+
+            async def connect(self, _h: Any) -> str:
+                raise AssertionError("connect() must not be reached")
+
+            async def _handle_transcript(self, *_a: Any, **_k: Any) -> Any:
+                raise AssertionError("a turn must not run")
+
+            async def shutdown(self) -> None:
+                pass
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", lambda *_a, **_k: _RaisingHost())
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "host start exploded" in (outcome.error or "")
+        assert client.close_calls == 1
+
+    def test_judge_close_failure_is_reported_on_an_otherwise_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient(raise_on_close=True)
+        service = _FakeJudgeService(client)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # An otherwise-clean cell must not silently stay "ok" once the
+        # judge-close cleanup itself fails.
+        assert outcome.status == "turn-error"
+        assert "judge client close exploded" in (outcome.error or "")
+
+    def test_judge_close_failure_does_not_overwrite_an_already_failed_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient(raise_on_close=True)
+        service = _FakeJudgeService(client)
+
+        monkeypatch.setattr(
+            eval_runner,
+            "_per_run_config",
+            lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad config")),
+        )
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # judge_service is never constructed on this path (the exception
+        # fires before build_judge_llm_service is called), so the original
+        # setup-error outcome must survive untouched.
+        assert outcome.status == "setup-error"
+        assert "bad config" in (outcome.error or "")
+        assert client.close_calls == 0
+
+    def test_build_judge_llm_service_returning_none_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
 
 
 class TestNeverRanCellsAreBackfilledConsistently:

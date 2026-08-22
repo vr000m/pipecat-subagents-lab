@@ -24,6 +24,7 @@ from scripts.eval_common import (
     build_judge_llm_service,
     build_judge_request_kwargs,
     build_session_for_run,
+    close_judge_llm_service,
     confined_output_path,
     turn_correlated_routing_action,
 )
@@ -250,6 +251,31 @@ class TestBuildJudgeLlmServicePinsReasoningEffort:
         assert service._client.api_key == "sk-test-credential"
 
 
+class TestCloseJudgeLlmService:
+    """Round 10 gauntlet, Logic finding 2: close_judge_llm_service() is the
+    single close authority for a build_judge_llm_service() result's
+    AsyncOpenAI/httpx pool, shared between run_cell() and
+    verify_eval_candidates.probe_judge().
+    """
+
+    def test_none_service_is_a_noop(self) -> None:
+        import asyncio
+
+        asyncio.run(close_judge_llm_service(None))  # must not raise
+
+    def test_service_with_no_client_attribute_is_a_noop(self) -> None:
+        import asyncio
+
+        asyncio.run(close_judge_llm_service(SimpleNamespace()))  # must not raise
+
+    def test_real_service_client_is_closed(self) -> None:
+        import asyncio
+
+        service = build_judge_llm_service("gpt-5-mini", api_key="sk-test")
+        asyncio.run(close_judge_llm_service(service))
+        assert service._client.is_closed()
+
+
 class TestBuildJudgeRequestKwargs:
     """Round 10 gauntlet, Logic finding 3: build_judge_request_kwargs() is
     the single source of truth for the judge request shape, shared with
@@ -464,3 +490,49 @@ class TestShippedCandidatesAcceptsAnInjectedConfigFile:
         )
 
         assert default_result == explicit_result
+
+
+class TestAllCandidateRegistries:
+    """Round 10 gauntlet, Architecture finding 4: ALL_ROUTER_CANDIDATES/
+    ALL_WORKER_CANDIDATES are the single named abstraction for "the full
+    candidate registry, baseline included" -- previously re-spelled as
+    `(ROUTER_BASELINE, *ROUTER_CANDIDATES)`/`(WORKER_BASELINE,
+    *WORKER_CANDIDATES)` at 5 production call sites across 3 modules.
+    """
+
+    def test_registries_match_the_selection_maps(self) -> None:
+        from scripts.eval_model_comparison import (
+            ROUTER_SELECTABLE_BY_LABEL,
+            WORKER_SELECTABLE_BY_LABEL,
+        )
+
+        assert {c.label for c in eval_common_module.ALL_ROUTER_CANDIDATES} == set(
+            ROUTER_SELECTABLE_BY_LABEL
+        )
+        assert {c.label for c in eval_common_module.ALL_WORKER_CANDIDATES} == set(
+            WORKER_SELECTABLE_BY_LABEL
+        )
+
+    def test_no_module_under_scripts_re_spells_the_registry_tuple(self) -> None:
+        """Source-introspection guard, same idiom as
+        tests/test_justfile_ci_parity.py -- without this, the set-equality
+        test above is tautological: nothing stops a new call site from
+        re-spelling `(ROUTER_BASELINE, *ROUTER_CANDIDATES)` instead of using
+        the constant, and both would still agree by construction.
+        """
+        import re
+
+        repo_root = Path(__file__).resolve().parents[1]
+        scripts_dir = repo_root / "scripts"
+        pattern = re.compile(r"\(ROUTER_BASELINE,\s*\*|\(WORKER_BASELINE,\s*\*")
+        offenders: list[str] = []
+        for path in sorted(scripts_dir.glob("*.py")):
+            if path.name == "eval_common.py":
+                # The one place these are legitimately spelled out: the
+                # ALL_ROUTER_CANDIDATES/ALL_WORKER_CANDIDATES definitions
+                # themselves.
+                continue
+            text = path.read_text(encoding="utf-8")
+            if pattern.search(text):
+                offenders.append(path.name)
+        assert offenders == []

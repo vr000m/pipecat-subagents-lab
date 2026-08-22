@@ -18,6 +18,21 @@ Usage::
     uv run python scripts/eval_model_comparison.py --dry-run
     uv run python scripts/eval_model_comparison.py --router baseline --worker baseline --scenario single-turn-default
     uv run python scripts/eval_model_comparison.py --full-matrix --max-calls 40 --max-cost 5.0
+
+Round 10 gauntlet, Architecture finding 9 -- considered and declined: this
+module is ~3000 lines and holds an extractable pure aggregation layer
+(``_aggregate_turn_repeats``, ``_aggregate_cell_repeats``,
+``_majority_with_tiebreak``, ``compute_pass_fail``, ``build_report`` -- all
+pure functions over ``CellOutcome``/``TurnOutcome`` with no I/O) that could
+move to its own module. The lens raised this as an observation, not a
+request for action. Splitting a module this size in the final round of a
+converging review loop is disproportionate: it is a multi-file, no-behaviour
+-change refactor with real regression risk (every one of these functions has
+several rounds of hard-won regression tests pinned to its current location
+and import path) and no further review round to verify it against, the same
+reasoning round 9's F3 (justfile parser) was declined on. Deliberately
+deferred, not forgotten; a later round should not re-raise this as new
+without a concrete reason the deferral no longer holds.
 """
 
 from __future__ import annotations
@@ -39,6 +54,8 @@ from typing import Any, Literal, TypeVar, cast
 
 from evals.scenarios import SCENARIOS, SCENARIOS_BY_NAME, Scenario
 from scripts.eval_common import (
+    ALL_ROUTER_CANDIDATES,
+    ALL_WORKER_CANDIDATES,
     DEFAULT_JUDGE_MODEL,
     DEFAULT_MANIFEST_RELATIVE_PATH,
     JUDGE_MAX_TOKENS,
@@ -57,6 +74,7 @@ from scripts.eval_common import (
     build_judge_llm_service,
     build_judge_request_kwargs,
     build_session_for_run,
+    close_judge_llm_service,
     confined_output_path,
     effective_effort_for_manifest_lookup,
     error_text,
@@ -179,8 +197,8 @@ _RETRY_WORST_CASE_MULTIPLIER = 1 + _OPENAI_SDK_DEFAULT_MAX_RETRIES
 # load_config() to run at import time. The shipped cell is still reachable
 # today via `--router luna-medium --worker terra-medium` (round 3 confirming
 # pass, Architecture finding 3).
-ROUTER_SELECTABLE_BY_LABEL = {c.label: c for c in (ROUTER_BASELINE, *ROUTER_CANDIDATES)}
-WORKER_SELECTABLE_BY_LABEL = {c.label: c for c in (WORKER_BASELINE, *WORKER_CANDIDATES)}
+ROUTER_SELECTABLE_BY_LABEL = {c.label: c for c in ALL_ROUTER_CANDIDATES}
+WORKER_SELECTABLE_BY_LABEL = {c.label: c for c in ALL_WORKER_CANDIDATES}
 
 
 @dataclass(frozen=True)
@@ -392,8 +410,8 @@ def default_sweep_pairs() -> tuple[RunPair, ...]:
 
 
 def full_matrix_pairs() -> tuple[RunPair, ...]:
-    routers = (ROUTER_BASELINE, *ROUTER_CANDIDATES)
-    workers = (WORKER_BASELINE, *WORKER_CANDIDATES)
+    routers = ALL_ROUTER_CANDIDATES
+    workers = ALL_WORKER_CANDIDATES
     # Same enforcement-consistency guard as default_sweep_pairs: a
     # wire-identical candidate must not be paid for (and run) twice (round 5
     # restart2, Logic L4).
@@ -1221,8 +1239,8 @@ def _latency_budget_exceeded(
     """Whether a turn's measured latency broke either budget.
 
     ``None`` when nothing was measured -- distinct from ``False`` ("measured,
-    within budget"), which compute_pass_fail's `enforced and exceeded` gate at
-    :1901 relies on. Single source of truth for run_cell()'s per-turn live
+    within budget"), which compute_pass_fail's `enforced and exceeded` gate
+    relies on. Single source of truth for run_cell()'s per-turn live
     check and _aggregate_turn_repeats()' recomputation from the aggregated
     means: both must stay identical or the aggregate would contradict the
     per-repeat values it summarises (round 10 gauntlet, Logic finding 6).
@@ -1367,7 +1385,7 @@ def _aggregate_turn_repeats(
         latency_budget_exceeded=agg_budget_exceeded,
         # Any repeat that OBSERVED enforcement is authoritative. This field is
         # pair-derived (run_cell() sets it to pair.enforce_latency_budget), but only on the
-        # measured path -- `if stage_metrics is not None` at run_cell():1575.
+        # measured path -- run_cell()'s `if stage_metrics is not None` branch.
         # Every other producer, including _skipped_turn_outcomes()' padding for
         # a repeat that failed or aborted before it measured anything, leaves it
         # at its False dataclass default. Sampling repeat 0 therefore reported
@@ -1376,8 +1394,9 @@ def _aggregate_turn_repeats(
         # whose surviving repeats DID breach a real baseline budget -- the same
         # mean-vs-verdict inconsistency class as round 10's Logic finding 6,
         # reintroduced through a different field (round 11 gauntlet).
-        # Deliberately over all turn_repeats, not just ok_turns: a turn measured
-        # at :1575 can still be reclassified non-ok afterwards.
+        # Deliberately over all turn_repeats, not just ok_turns: a turn
+        # measured in run_cell()'s `if stage_metrics is not None` branch can
+        # still be reclassified non-ok afterwards.
         latency_budget_enforced=any(turn.latency_budget_enforced for turn in turn_repeats),
     )
 
@@ -1651,6 +1670,14 @@ async def run_cell(
     # exception raised during setup (config resolution, judge construction)
     # before the host exists can't call shutdown() on nothing.
     host: Any | None = None
+    # Same "None until constructed, only cleaned up if constructed" pattern
+    # as `host`: hoisted out here (rather than an EvalJudge(...) inline
+    # expression) so the finally block below can close its underlying
+    # AsyncOpenAI client -- pipecat exposes no public close/cleanup for it,
+    # and left unclosed every run_cell() call leaks one httpx connection
+    # pool; --repeat multiplies that leak (round 10 gauntlet, Logic
+    # finding 2).
+    judge_service: Any | None = None
     config: Config | None = None
     # Set True immediately before the current turn's paid call, and stays
     # True until that turn's TurnOutcome is appended to `turns` (every
@@ -1704,10 +1731,8 @@ async def run_cell(
         # Assigned to the outer `host` (not a local) as soon as it's
         # constructed, before judge construction can raise and leak it.
         host = build_session_for_run(config, measurement_sink=sink)
-        judge = EvalJudge(
-            build_judge_llm_service(judge_model, config.openai_api_key),
-            max_tokens=JUDGE_MAX_TOKENS,
-        )
+        judge_service = build_judge_llm_service(judge_model, config.openai_api_key)
+        judge = EvalJudge(judge_service, max_tokens=JUDGE_MAX_TOKENS)
 
         await host.start()
         connection = await host.connect(_connect_handshake(host))
@@ -1896,7 +1921,7 @@ async def run_cell(
             # need routing_action to be non-None to evaluate: `result.worker_id`
             # is a signal valid on every _handle_transcript() return path,
             # including multi_intent/continue_pending -- the same reason
-            # scripts/smoke_conversation.py:368's `result.worker_id == "main"`
+            # scripts/smoke_conversation.py's `result.worker_id == "main"`
             # check exists. Folding it into `delegated_action` via `or` means
             # a multi_intent/continue_pending turn that genuinely delegated
             # (any committed result's worker_id != "main") is still correctly
@@ -2113,6 +2138,22 @@ async def run_cell(
                         "host.shutdown() raised: "
                         f"{error_text(shutdown_exc, credential=config.openai_api_key if config else None)}"
                     )
+        # Separate try/except from host.shutdown() above (not a shared one):
+        # a judge-close failure must not skip host shutdown, and a
+        # shutdown failure must not skip this close -- each cleanup step is
+        # independent and best-effort. Runs strictly after shutdown, same
+        # never-mask-the-outcome guard: only overwrite cell_status/cell_error
+        # when nothing else already explains why this cell isn't "ok".
+        if judge_service is not None:
+            try:
+                await close_judge_llm_service(judge_service)
+            except Exception as close_exc:  # noqa: BLE001 -- never mask the original outcome
+                if cell_status == "ok":
+                    cell_status = "turn-error"
+                    cell_error = (
+                        "close_judge_llm_service() raised: "
+                        f"{error_text(close_exc, credential=config.openai_api_key if config else None)}"
+                    )
 
     if cell_status != "ok":
         # Record every turn the scenario defines but this cell never
@@ -2173,15 +2214,42 @@ async def run_matrix(
             # unreachable. It stays reachable for a caller that invokes
             # run_matrix() directly without that preflight -- see
             # TestManifestGate.test_run_matrix_rejects_uncovered_candidate_directly.
+            #
+            # Repeat-shaped even on rejection (round 10 gauntlet, Codex F1):
+            # build_report(..., repeat_count=N) advertises N repetitions for
+            # every cell, so a rejected cell must carry the same repeats-list
+            # shape as an accepted one rather than a bare single-cell outcome
+            # with repeats=None. Routing the rejection through
+            # _aggregate_cell_repeats (the one aggregation authority, not a
+            # hand-rolled replace(cell, repeats=[...])) keeps that invariant
+            # true everywhere, including at repeat_count=1 where
+            # _aggregate_cell_repeats returns repeats[0] unchanged -- so this
+            # is not a behaviour change on the default path. The trade: the
+            # aggregate's own .error collapses to the generic "N/N repeats
+            # did not complete cleanly: manifest-rejected" message, but the
+            # specific "one or both candidates are absent from the manifest"
+            # text survives verbatim in every entry of the repeats audit
+            # list. F5's build_report reconciliation is the tripwire that
+            # would have caught this gap had it existed earlier.
             if not candidate_accepted(pair.router, manifest_status) or not candidate_accepted(
                 pair.worker, manifest_status
             ):
-                outcomes.append(
+                rejected = [
                     _never_ran_cell(
                         pair,
                         scenario,
                         "manifest-rejected",
                         "one or both candidates are absent from the manifest",
+                    )
+                    for _ in range(repeat_count)
+                ]
+                outcomes.append(
+                    _aggregate_cell_repeats(
+                        pair.label,
+                        scenario.name,
+                        rejected,
+                        max_routing_seconds=max_routing_seconds,
+                        max_latency_seconds=max_latency_seconds,
                     )
                 )
                 continue
@@ -2509,8 +2577,8 @@ def _shipped_config_cells_annotation(
     unmatched = [
         role
         for role, candidate, registry in (
-            ("router", shipped_router, (ROUTER_BASELINE, *ROUTER_CANDIDATES)),
-            ("worker", shipped_worker, (WORKER_BASELINE, *WORKER_CANDIDATES)),
+            ("router", shipped_router, ALL_ROUTER_CANDIDATES),
+            ("worker", shipped_worker, ALL_WORKER_CANDIDATES),
         )
         if not is_registered_candidate(candidate, registry)
     ]
@@ -2598,6 +2666,35 @@ def build_report(
         ),
         "cells": [_serialize_cell(outcome) for outcome in outcomes],
     }
+    # `repeat_count` and each cell's own `repeats` length are two authorities
+    # on one fact -- same class as `_overall_status`/`_latency_budget_
+    # exceeded` elsewhere in this module. Reconcile rather than trust the
+    # parameter blindly: a caller-supplied `repeat_count` that doesn't match
+    # what the outcomes actually carry is exactly the shape of bug round
+    # 10's F1 was (a rejected cell built outside the shared aggregator, with
+    # repeats=None while repeat_count=N was advertised everywhere else).
+    # This check is the tripwire that would have caught F1 had it existed
+    # first; the two fixes are a pair. A cell with `repeats is None` counts
+    # as 1 repetition (identity-preserved shape at repeat_count=1, see
+    # _aggregate_cell_repeats).
+    observed_repeat_counts = {
+        len(cell.repeats) if cell.repeats is not None else 1 for cell in outcomes
+    }
+    if observed_repeat_counts and observed_repeat_counts != {repeat_count}:
+        report["repetition_count_mismatch"] = {
+            "declared": repeat_count,
+            "observed": sorted(observed_repeat_counts),
+        }
+        # Degrade, don't raise -- same reasoning as the shipped-cell
+        # annotation failure below (round 5's L5 / round 6's G3): a
+        # post-run raise would destroy an already-billed run's report.
+        # `_overall_status()` is still the one rule for reasons -> status,
+        # called once below.
+        failure_reasons = [
+            *failure_reasons,
+            f"repeat_count mismatch: declared {repeat_count}, observed "
+            f"{sorted(observed_repeat_counts)}",
+        ]
     # Same optional-key rule as _serialize_cell's `repeats` (see its comment):
     # a key that never existed in the pre-`shipped` report shape is only added
     # when it carries a real value, so a strict-key-set consumer of an older
@@ -2697,6 +2794,18 @@ def print_report_summary(report: dict[str, Any]) -> None:
         # only makes the reason visible on the console for an operator who
         # is watching the run live rather than opening the persisted JSON.
         print(f"shipped-cell annotation FAILED: {shipped_cells['error']}", file=sys.stderr)
+    # Console mirror of the persisted `repetition_count_mismatch` marker
+    # (round 10 gauntlet, Architecture F5): build_report() already flipped
+    # overall_status to FAIL and recorded the reason in
+    # report["failure_reasons"]; this only surfaces it for an operator
+    # watching the run live. Must never raise -- `.get` throughout.
+    mismatch = report.get("repetition_count_mismatch")
+    if mismatch:
+        print(
+            f"repetition count mismatch: declared {mismatch['declared']}, "
+            f"observed {mismatch['observed']}",
+            file=sys.stderr,
+        )
     for cell in report["cells"]:
         print(f"[{cell['status']}] {cell['pair']} / {cell['scenario']}")
         if cell["error"]:
