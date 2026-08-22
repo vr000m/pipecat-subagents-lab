@@ -860,6 +860,12 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
 # restart2, Architecture A6).
 _PROVENANCE_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
 _EMPTY_MEANS_ABSENT_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
+# The model half of _ROLE_MODEL_EFFORT_KEYS alone -- used by _record_layer to
+# decide *whether to compare* a key's incoming value against its incumbent
+# before advancing provenance (round 10 gauntlet, Logic finding 3). Effort
+# keys are deliberately NOT in this set; see _record_layer's docstring for
+# why that asymmetry is load-bearing, not an oversight.
+_ROLE_MODEL_KEYS = tuple(model_key for model_key, _effort_key in _ROLE_MODEL_EFFORT_KEYS)
 
 
 def _effectively_set(value: object) -> bool:
@@ -892,10 +898,70 @@ def _effectively_set(value: object) -> bool:
     return bool(value) and str(value).strip() != ""
 
 
-def _record_layer(values: Mapping[str, object], layers: dict[str, int], layer: int) -> None:
+def _record_layer(
+    values: Mapping[str, object],
+    layers: dict[str, int],
+    layer: int,
+    incumbent_models: Mapping[str, object],
+) -> None:
+    """Record which layer last set each provenance key -- asymmetric between
+    model keys and effort keys (round 10 gauntlet, Logic finding 3).
+
+    Model keys (``_ROLE_MODEL_KEYS``) only advance provenance when this
+    layer's effectively-set value actually CHANGES the effective model, per
+    ``incumbent_models`` -- the merged value each model key held immediately
+    before this layer's ``_apply_layer`` merge ran. Without this, re-
+    asserting a role's model to its already-shipped value (concrete trigger:
+    the justfile ``run`` recipe sourcing an env file that pins
+    ``WEBSEARCH_WORKER_MODEL=gpt-5.6-terra``, identical to config.toml's
+    default) still advanced provenance for that model key, and
+    ``_clear_inherited_reasoning_effort`` then deleted the shipped
+    ``worker_reasoning_effort`` purely because the model's layer number was
+    higher than the effort's -- even though the model didn't actually
+    change. Comparing against the incumbent removes the silent drop instead
+    of merely narrating it (option (b), logging the drop, was declined:
+    ``server/config.py`` has no logger and no logging import today, and
+    introducing one into config loading for a diagnostic is a larger change
+    than this fix).
+
+    Effort keys deliberately keep the OLD unconditional
+    advance-on-effectively-set rule -- this asymmetry is NOT applied
+    symmetrically to effort keys, and that is the non-obvious part of this
+    fix. Counter-example: TOML sets ``model=A, effort=medium``; env
+    re-asserts ``model=B, effort=medium`` (a genuine model change AND an
+    explicit effort re-assertion at the same, highest layer). A symmetric
+    "only advance on change" rule would leave the effort's provenance at
+    layer 0 (its value didn't change either), and
+    ``_clear_inherited_reasoning_effort`` would then delete an effort the
+    HIGHEST layer just explicitly re-asserted -- a new bug, not a fix. So an
+    effort key's provenance still advances whenever it is effectively set,
+    regardless of whether its value changed.
+
+    Residual, documented rather than silently left: when NO lower layer set
+    the model at all, ``incumbent_models`` holds ``None`` for that key, this
+    layer's value never equals ``None`` (``_effectively_set`` already
+    filters ``None``/empty out), so provenance advances exactly as before,
+    and the inherited effort is still cleared. That covers a config.toml
+    that sets an effort but not the paired model; comparing against the
+    ``Config`` dataclass default instead would require resolving
+    ``*_model_policy`` defaults before ``kwargs`` is built, which is out of
+    proportion here. On this branch ``config.toml`` sets both role models,
+    so the reported trigger is fully covered.
+
+    ``_PROVENANCE_KEYS`` remains the sole gate on *which* keys are recorded
+    at all -- unchanged, so ``test_provenance_keys_alone_drive_layer_
+    recording``'s zeroing test still holds. ``_ROLE_MODEL_KEYS`` only
+    decides *whether to compare* for a key already selected by that gate.
+    """
     for key in _PROVENANCE_KEYS:
-        if key in values and _effectively_set(values[key]):
-            layers[key] = layer
+        if key not in values or not _effectively_set(values[key]):
+            continue
+        if key in _ROLE_MODEL_KEYS and values[key] == incumbent_models.get(key):
+            # Same-value re-assertion: this layer didn't change the
+            # effective model, so it must not advance provenance past
+            # whichever earlier layer actually set it.
+            continue
+        layers[key] = layer
 
 
 def _apply_layer(
@@ -925,12 +991,18 @@ def _apply_layer(
     merely incidental for layer 0. That uniformity is what stops a future
     layer added below TOML from silently reintroducing this bug class (round 6
     gauntlet, Logic G2 / Architecture A1).
+    Captures each role model key's incumbent value BEFORE this layer's merge
+    loop runs, and threads it into ``_record_layer`` -- see that function's
+    docstring for why model-key provenance must compare against the
+    incumbent while effort-key provenance must not (round 10 gauntlet,
+    Logic finding 3).
     """
+    incumbent_models = {key: values.get(key) for key in _ROLE_MODEL_KEYS}
     for key, value in layer_values.items():
         if key in _EMPTY_MEANS_ABSENT_KEYS and not _effectively_set(value):
             continue
         values[key] = value
-    _record_layer(layer_values, layers, layer)
+    _record_layer(layer_values, layers, layer, incumbent_models)
 
 
 def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[str, int]) -> None:

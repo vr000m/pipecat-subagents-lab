@@ -1857,13 +1857,22 @@ def test_load_promotion_manifest_refuses_a_symlinked_phase4c_artifact_path(
 
 class TestReasoningEffortInheritance:
     def test_env_model_override_clears_toml_effort(self, tmp_path: Path) -> None:
+        # Deliberately a DIFFERING model ("gpt-5.9-other" vs TOML's "gpt-5"):
+        # round 10 gauntlet, Logic finding 3 made provenance advance only
+        # when a layer's model value actually changes the effective model,
+        # so a same-value re-assertion here would no longer clear the
+        # inherited effort (see
+        # test_same_value_model_reassertion_does_not_clear_the_shipped_effort
+        # below for that case).
         config_file = tmp_path / "config.toml"
         config_file.write_text(
             '[models]\nworker_model = "gpt-5"\nworker_reasoning_effort = "medium"\n'
             'router_model = "gpt-5-mini"\nrouter_reasoning_effort = "minimal"\n'
         )
 
-        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "gpt-5"})
+        config = load_config(
+            config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "gpt-5.9-other"}
+        )
 
         assert config.worker_reasoning_effort_policy == {}
         assert config.resolve_worker_reasoning_effort("deep") is None
@@ -1997,6 +2006,84 @@ class TestReasoningEffortInheritance:
 
         assert config.resolve_worker_model("deep") == "gpt-5.2-orion"
         assert config.resolve_worker_reasoning_effort("deep") == "medium"
+
+    def test_same_value_model_reassertion_does_not_clear_the_shipped_effort(
+        self, tmp_path: Path
+    ) -> None:
+        """Round 10 gauntlet, Logic finding 3: re-asserting a role's model at
+        a higher-precedence layer to its ALREADY-SHIPPED value must not
+        advance that key's provenance, so the shipped effort survives.
+        Concrete trigger: the justfile ``run`` recipe sourcing an env file
+        that pins ``WEBSEARCH_WORKER_MODEL`` to exactly config.toml's
+        default.
+        """
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.6-terra"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(
+            config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "gpt-5.6-terra"}
+        )
+
+        assert config.resolve_worker_reasoning_effort("deep") == "medium"
+        assert config.resolve_worker_model("deep") == "gpt-5.6-terra"
+
+    def test_differing_value_model_reassertion_still_clears_the_shipped_effort(
+        self, tmp_path: Path
+    ) -> None:
+        """Pins that the existing revert-to-baseline recipe is untouched by
+        the same-value fix above -- a genuinely differing model override
+        must still clear the inherited effort.
+        """
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.6-terra"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_WORKER_MODEL": "gpt-5"})
+
+        assert config.resolve_worker_reasoning_effort("deep") is None
+
+    def test_same_value_model_reassertion_with_an_explicit_effort_lets_the_effort_win(
+        self, tmp_path: Path
+    ) -> None:
+        """Pins the deliberate asymmetry: an effort key's provenance still
+        advances on every effectively-set value, even when its paired model
+        key's provenance does not (because the model didn't change). An env
+        layer that re-asserts the same model AND explicitly sets an effort
+        must have that effort win, not be silently cleared by
+        _clear_inherited_reasoning_effort comparing stale layer numbers.
+        """
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nworker_model = "gpt-5.6-terra"\nworker_reasoning_effort = "medium"\n'
+        )
+
+        config = load_config(
+            config_file=config_file,
+            env={
+                "WEBSEARCH_WORKER_MODEL": "gpt-5.6-terra",
+                "WEBSEARCH_WORKER_REASONING_EFFORT": "high",
+            },
+        )
+
+        assert config.resolve_worker_reasoning_effort("deep") == "high"
+
+    def test_same_value_router_model_reassertion_does_not_clear_the_shipped_effort(
+        self, tmp_path: Path
+    ) -> None:
+        """Router-role mirror of the worker case above -- both roles go
+        through the same _record_layer/_apply_layer loop.
+        """
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[models]\nrouter_model = "gpt-5-mini"\nrouter_reasoning_effort = "minimal"\n'
+        )
+
+        config = load_config(config_file=config_file, env={"WEBSEARCH_ROUTER_MODEL": "gpt-5-mini"})
+
+        assert config.router_reasoning_effort_policy == {"fast": "minimal"}
 
     def test_provenance_keys_alone_drive_layer_recording(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
