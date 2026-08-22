@@ -76,6 +76,7 @@ from scripts.eval_common import (
     build_session_for_run,
     close_judge_llm_service,
     confined_output_path,
+    close_session_provider_clients,
     effective_effort_for_manifest_lookup,
     error_text,
     git_head,
@@ -2152,6 +2153,20 @@ async def run_cell(
                     cell_status = "turn-error"
                     cell_error = (
                         "close_judge_llm_service() raised: "
+        # Same never-mask-the-outcome guard, its own try/except, after the
+        # judge close above: this closes the router/worker Responses clients
+        # `host` (via `build_session_for_run`) constructed for this cell --
+        # `host.shutdown()` above never touches them (round 11 gauntlet,
+        # Codex F1). A `None` host is a no-op inside the helper itself.
+        try:
+            await close_session_provider_clients(host)
+        except Exception as provider_close_exc:  # noqa: BLE001 -- never mask the original outcome
+            if cell_status == "ok":
+                cell_status = "turn-error"
+                cell_error = (
+                    "close_session_provider_clients() raised: "
+                    f"{error_text(provider_close_exc, credential=config.openai_api_key if config else None)}"
+                )
                         f"{error_text(close_exc, credential=config.openai_api_key if config else None)}"
                     )
 

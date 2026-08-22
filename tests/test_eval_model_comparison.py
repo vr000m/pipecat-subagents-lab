@@ -42,6 +42,7 @@ import asyncio
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, get_args
 
 import pytest
@@ -5665,6 +5666,206 @@ class TestForegroundTimeoutIsClassifiedAsTimeoutNotSemanticFailure:
             pair=pair,
             turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
             ui_text=("That is taking longer than expected; I will continue in the background."),
+class _RecordingProviderClient:
+    def __init__(self, *, raise_on_close: bool = False) -> None:
+        self.close_calls = 0
+        self._raise_on_close = raise_on_close
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self._raise_on_close:
+            raise RuntimeError("provider client close exploded")
+
+
+class _FakeHostWithProviderClients(_FakeHost):
+    """Extends the shared ``_FakeHost`` harness with the same
+    ``registry.responses._client`` / ``coordinator.router._call._responses.
+    _client`` shape ``close_session_provider_clients()`` reaches through, so
+    ``run_cell()`` can be exercised end-to-end without a real SDK client.
+    """
+
+    def __init__(self, result_factory: Any, *, worker_client: Any, router_client: Any) -> None:
+        super().__init__(result_factory)
+        self.registry = SimpleNamespace(
+            workers=[], responses=SimpleNamespace(_client=worker_client)
+        )
+        router_call = SimpleNamespace(_responses=SimpleNamespace(_client=router_client))
+        self.coordinator = SimpleNamespace(router=SimpleNamespace(_call=router_call))
+
+
+class TestRunCellClosesSessionProviderClients:
+    """Round 11 gauntlet, Codex F1: run_cell() closed the judge client
+    (round 10 F2) but never the router/worker Responses clients
+    build_session_for_run() constructs per cell -- SessionHost.shutdown()
+    never touches them either. Both must now be closed in run_cell()'s
+    existing finally, alongside host.shutdown() and the judge close, with
+    the same never-mask-the-outcome guard.
+    """
+
+    def test_both_provider_clients_are_closed_on_a_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_client = _RecordingProviderClient()
+        router_client = _RecordingProviderClient()
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHostWithProviderClients(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                ),
+                worker_client=worker_client,
+                router_client=router_client,
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+        assert worker_client.close_calls == 1
+        assert router_client.close_calls == 1
+
+    def test_a_missing_hop_is_a_clean_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The plain _FakeHost harness has no registry.responses/coordinator
+        # shape at all -- close_session_provider_clients() must no-op
+        # through every missing hop rather than raising.
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+
+    def test_a_provider_close_failure_is_reported_on_an_otherwise_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_client = _RecordingProviderClient()
+        router_client = _RecordingProviderClient(raise_on_close=True)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHostWithProviderClients(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                ),
+                worker_client=worker_client,
+                router_client=router_client,
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # An otherwise-clean cell must not silently stay "ok" once the
+        # provider-close cleanup itself fails; the pre-existing "ok" status
+        # is downgraded, not overwritten by a status that already explains
+        # a real failure (see the sibling test below).
+        assert outcome.status == "turn-error"
+        assert "close_session_provider_clients() raised" in (outcome.error or "")
+        assert "provider client close exploded" in (outcome.error or "")
+
+    def test_a_provider_close_failure_does_not_overwrite_an_already_failed_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_client = _RecordingProviderClient()
+        router_client = _RecordingProviderClient(raise_on_close=True)
+
+        class _RaisingHost(_FakeHostWithProviderClients):
+            async def _handle_transcript(self, query: str, *, origin: Any) -> Any:
+                del query, origin
+                raise RuntimeError("turn exploded")
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _RaisingHost(
+                lambda _q: _FakeResult(
+                    ui_text="unused",
+                    spoken_text="unused",
+                    citations=[],
+                    turn_id="turn-1",
+                ),
+                worker_client=worker_client,
+                router_client=router_client,
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # "provider-error" (a real turn failure), not "turn-error" -- the
+        # never-mask-the-outcome guard only downgrades an "ok" cell; a cell
+        # that already failed for a real reason keeps that reason.
+        assert outcome.status == "provider-error"
+        assert "turn exploded" in (outcome.error or "")
+        assert "close_session_provider_clients() raised" not in (outcome.error or "")
+        assert router_client.close_calls == 1
+
+
             judge_recorder=recorder,
         )
 

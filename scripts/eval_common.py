@@ -36,6 +36,7 @@ One definition here now backs both.
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import subprocess
@@ -79,6 +80,7 @@ __all__ = [
     "build_session_for_run",
     "close_judge_llm_service",
     "confined_output_path",
+    "close_session_provider_clients",
     "effective_effort_for_manifest_lookup",
     "error_text",
     "git_head",
@@ -575,6 +577,78 @@ async def close_judge_llm_service(service: Any) -> None:
     if close is None:
         return
     await close()
+
+
+async def close_session_provider_clients(host: Any) -> None:
+    """Close the router and worker Responses clients a single ``run_cell()``
+    call's ``SessionHost`` owns.
+
+    ``build_session_for_run()`` (via ``server.composition.build_session_host``)
+    constructs a fresh ``WorkerRegistry`` and router provider per cell.
+    Each lazily builds its own real OpenAI SDK client -- and its own httpx
+    connection pool -- the first time it is actually used:
+    ``WorkerRegistry._create_web_search_worker`` assigns
+    ``self.responses = build_openai_async_responses_client(...)`` (an
+    ``AsyncOpenAI`` client's ``.responses`` resource, or an
+    ``_UnavailableResponses()`` stand-in when no credential is configured),
+    and ``LazyRouterProvider._get_responses`` assigns
+    ``self._responses = build_openai_responses_client(...)`` (a *sync*
+    ``OpenAI`` client's ``.responses`` resource). ``SessionHost.shutdown()``
+    (``server/pipeline.py``) cancels tasks and finalizes recorders but never
+    touches either client -- so every cell leaks one async and one sync
+    httpx pool, and ``--repeat N`` / ``--full-matrix`` multiplies that leak
+    (round 11 gauntlet, Codex F1 -- the same leak class round 10 F2 closed
+    for the judge client, left open here for the router/worker).
+
+    Reaches each client through the same private-attribute convention
+    ``close_judge_llm_service`` above documents, hop by hop, via
+    ``getattr(..., None)`` at every step so this is a clean no-op for a
+    ``None`` host, a host with no ``registry``/``coordinator``, a worker
+    registry that never built a real client (``responses`` still ``None``,
+    or the ``_UnavailableResponses()`` stand-in), a router built with an
+    injected ``call`` that is not a ``LazyRouterProvider`` (many eval/smoke
+    tests inject a fake router callable), and any of those objects' own
+    ``_client``/``close`` attributes being absent -- all shapes this eval
+    suite's fakes and tests already rely on.
+
+    Deliberately does not use ``inspect.isawaitable`` to decide sync vs.
+    async up front and then branch -- it *calls* ``close()`` first (which
+    for both ``AsyncOpenAI.close()`` and sync ``OpenAI.close()`` is a plain
+    method call) and only awaits the result when ``inspect.isawaitable(result)``
+    is true, so the same probe handles the async worker client and the sync
+    router client without hand-tracking which is which per hop.
+
+    Deliberate scope note: production's own ``SessionHost.shutdown()`` still
+    does not close these clients, so a long-lived server that churns
+    sessions has the same leak class this function closes here for the eval
+    runner only. Not fixed there in this diff -- it needs an ownership flag
+    on ``WorkerRegistry``/``LazyRouterProvider`` (only close what the object
+    itself built, never a caller-injected client) and a change to production
+    teardown semantics, which is out of scope for what is otherwise the eval
+    runner's own cleanup helper.
+    """
+    if host is None:
+        return
+
+    async def _close_hop(client: Any) -> None:
+        if client is None:
+            return
+        close = getattr(client, "close", None)
+        if close is None:
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
+    registry = getattr(host, "registry", None)
+    responses = getattr(registry, "responses", None)
+    await _close_hop(getattr(responses, "_client", None))
+
+    coordinator = getattr(host, "coordinator", None)
+    router = getattr(coordinator, "router", None)
+    call = getattr(router, "_call", None)
+    router_responses = getattr(call, "_responses", None)
+    await _close_hop(getattr(router_responses, "_client", None))
 
 
 def strip_control_chars(text: str) -> str:

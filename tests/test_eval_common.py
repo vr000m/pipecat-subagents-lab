@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -25,6 +26,7 @@ from scripts.eval_common import (
     build_judge_request_kwargs,
     build_session_for_run,
     close_judge_llm_service,
+    close_session_provider_clients,
     confined_output_path,
     turn_correlated_routing_action,
 )
@@ -274,6 +276,104 @@ class TestCloseJudgeLlmService:
         service = build_judge_llm_service("gpt-5-mini", api_key="sk-test")
         asyncio.run(close_judge_llm_service(service))
         assert service._client.is_closed()
+
+
+class _RecordingClient:
+    def __init__(self, *, raise_on_close: bool = False) -> None:
+        self.close_calls = 0
+        self._raise_on_close = raise_on_close
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self._raise_on_close:
+            raise RuntimeError("client close exploded")
+
+
+class _SyncRecordingClient:
+    """A sync ``OpenAI.close()`` stand-in -- close_session_provider_clients()
+    must handle both the async worker client and the sync router client
+    through the same probe."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _fake_provider_host(*, worker_client: Any = None, router_client: Any = None) -> SimpleNamespace:
+    registry = SimpleNamespace(responses=SimpleNamespace(_client=worker_client))
+    call = SimpleNamespace(_responses=SimpleNamespace(_client=router_client))
+    router = SimpleNamespace(_call=call)
+    coordinator = SimpleNamespace(router=router)
+    return SimpleNamespace(registry=registry, coordinator=coordinator)
+
+
+class TestCloseSessionProviderClients:
+    """Round 11 gauntlet, Codex F1: run_cell() closed the judge client
+    (round 10 F2) but never the router/worker Responses clients
+    build_session_for_run() constructs per cell -- SessionHost.shutdown()
+    never touches them either. close_session_provider_clients() is the
+    single close authority for both, reached through the same private-
+    attribute convention close_judge_llm_service() already documents.
+    """
+
+    def test_none_host_is_a_noop(self) -> None:
+        import asyncio
+
+        asyncio.run(close_session_provider_clients(None))  # must not raise
+
+    def test_host_missing_registry_and_coordinator_is_a_noop(self) -> None:
+        import asyncio
+
+        asyncio.run(close_session_provider_clients(SimpleNamespace()))  # must not raise
+
+    def test_worker_client_still_none_is_a_noop(self) -> None:
+        import asyncio
+
+        # registry.responses is None until a worker is actually built --
+        # must not raise reaching for ._client on a None responses object.
+        host = _fake_provider_host()
+        asyncio.run(close_session_provider_clients(host))
+
+    def test_router_with_a_non_lazy_call_is_a_noop_for_the_router_hop(self) -> None:
+        import asyncio
+
+        # Many eval/smoke tests inject a plain callable (not a
+        # LazyRouterProvider) as Router._call -- it has no ._responses hop.
+        worker_client = _RecordingClient()
+        registry = SimpleNamespace(responses=SimpleNamespace(_client=worker_client))
+        router = SimpleNamespace(_call=lambda prompt: {})
+        coordinator = SimpleNamespace(router=router)
+        host = SimpleNamespace(registry=registry, coordinator=coordinator)
+
+        asyncio.run(close_session_provider_clients(host))
+
+        assert worker_client.close_calls == 1
+
+    def test_both_worker_and_router_clients_are_closed_exactly_once(self) -> None:
+        import asyncio
+
+        worker_client = _RecordingClient()
+        router_client = _SyncRecordingClient()
+        host = _fake_provider_host(worker_client=worker_client, router_client=router_client)
+
+        asyncio.run(close_session_provider_clients(host))
+
+        assert worker_client.close_calls == 1
+        assert router_client.close_calls == 1
+
+    def test_a_router_close_failure_propagates_to_the_caller(self) -> None:
+        import asyncio
+
+        # close_session_provider_clients() itself does not swallow a close
+        # failure -- run_cell()'s finally block is responsible for the
+        # never-mask-the-outcome guard around this call, not this helper.
+        router_client = _RecordingClient(raise_on_close=True)
+        host = _fake_provider_host(router_client=router_client)
+
+        with pytest.raises(RuntimeError, match="client close exploded"):
+            asyncio.run(close_session_provider_clients(host))
 
 
 class TestBuildJudgeRequestKwargs:
