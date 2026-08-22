@@ -5666,205 +5666,6 @@ class TestRunCellClosesJudgeService:
         assert outcome.status == "ok"
 
 
-class TestNeverRanCellsAreBackfilledConsistently:
-    """Regression for round-3 gauntlet finding 2: cells that never ran any
-    turn were reported inconsistently depending on which code path produced
-    them. The router-config-mismatch early return and the manifest-rejected
-    early return in ``run_matrix()`` both left ``turns`` at its default
-    (rendering as ``[]`` in the report), while the exception-path fallback
-    backfilled ``N`` "skipped" ``TurnOutcome``s. Fixed by routing every
-    "never ran" producer through the shared ``_never_ran_cell()``/
-    ``_skipped_turn_outcomes()`` helpers.
-    """
-
-    def test_router_config_mismatch_backfills_all_turns_as_skipped(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Force the pre-call router assertion to fail by making the resolved
-        # model diverge from what the candidate claims -- no real Config
-        # subclassing needed, just monkeypatch resolve_router_model.
-        monkeypatch.setattr(
-            eval_runner.Config,
-            "resolve_router_model",
-            lambda self, _label: "some-other-model",
-        )
-
-        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
-        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
-        outcome = asyncio.run(
-            eval_runner.run_cell(
-                pair,
-                scenario,
-                eval_runner.Config(),
-                judge_model="gpt-5-mini",
-                max_routing_seconds=15.0,
-                max_latency_seconds=15.0,
-            )
-        )
-
-        assert outcome.status == "setup-error"
-        assert len(outcome.turns) == 2
-        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
-        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
-        # The per-run Config had already been resolved by the time the
-        # mismatch was caught -- its provider timeouts must still be threaded
-        # into the CellOutcome, not dropped.
-        assert outcome.router_timeout_seconds is not None
-        assert outcome.foreground_search_timeout_seconds is not None
-
-    def test_manifest_rejected_cell_backfills_all_turns_as_skipped(self) -> None:
-        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
-        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
-        empty_status = eval_runner.ManifestStatus(
-            path=Path("/nonexistent"),
-            exists=True,
-            source_commit="deadbeef",
-            current_commit="deadbeef",
-            stale=False,
-            accepted=frozenset(),
-        )
-
-        outcomes = asyncio.run(
-            eval_runner.run_matrix(
-                (pair,),
-                (scenario,),
-                eval_runner.Config(),
-                judge_model="gpt-5-mini",
-                max_routing_seconds=15.0,
-                max_latency_seconds=15.0,
-                manifest_status=empty_status,
-            )
-        )
-
-        assert len(outcomes) == 1
-        outcome = outcomes[0]
-        assert outcome.status == "manifest-rejected"
-        assert len(outcome.turns) == 2
-        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
-        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
-
-
-class TestManifestDiagnosticsPrintEffectiveEffort:
-    """Regression for round-2 gauntlet finding 13: the "absent from manifest"
-    error and the dry-run matrix preview must print the EFFECTIVE (resolved)
-    effort, not the raw candidate.effort -- for the router baseline,
-    candidate.effort is None but the manifest lookup actually resolved and
-    checked "minimal" (server.router.effective_router_reasoning_effort's
-    gpt-5* conditional). Printing the raw None would show an operator a
-    combination that isn't the one actually looked up.
-    """
-
-    def test_missing_baseline_error_names_the_effective_effort_not_none(
-        self, tmp_path: Path
-    ) -> None:
-        # Manifest exists but doesn't cover the router baseline at all.
-        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
-        status = eval_runner.load_manifest_status(manifest_path)
-
-        with pytest.raises(eval_runner.ManifestError) as excinfo:
-            eval_runner.require_manifest_ok_for_live_run(
-                status,
-                allow_stale=True,
-                candidates=(eval_runner.ROUTER_BASELINE,),
-                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
-            )
-
-        message = str(excinfo.value)
-        assert "@minimal" in message
-        assert "@None" not in message
-
-    def test_dry_run_preview_prints_effective_effort_for_the_baseline_pair(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
-        status = eval_runner.load_manifest_status(manifest_path)
-        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
-
-        eval_runner.print_matrix_preview(
-            (pair,),
-            (Scenario(name="s", turns=(Turn(query="hi"),)),),
-            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
-            status=status,
-        )
-
-        out = capsys.readouterr().out
-        assert "router=gpt-5-mini@minimal" in out
-        assert "router=gpt-5-mini@None" not in out
-
-
-# ---------------------------------------------------------------------------
-# Round 4 gauntlet regressions.
-# ---------------------------------------------------------------------------
-
-
-class TestLatencyBudgetRejectsNonFinite:
-    """Regression for round-4 finding 1: --max-latency-seconds must reject
-    NaN/inf/non-positive the same way --max-routing-seconds does. run_cell()'s
-    blocking-budget check (`total_ms > max_latency_seconds * 1000`) is false
-    for nan/inf, and even 0/-1 make every measured result exceed the limit.
-    """
-
-    def test_rejects_nan(self) -> None:
-        parser = eval_runner.build_arg_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--max-latency-seconds", "nan"])
-
-    def test_rejects_infinity(self) -> None:
-        parser = eval_runner.build_arg_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--max-latency-seconds", "inf"])
-
-    def test_rejects_zero_or_negative(self) -> None:
-        parser = eval_runner.build_arg_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--max-latency-seconds", "0"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--max-latency-seconds", "-1000"])
-
-    def test_accepts_a_normal_value(self) -> None:
-        parser = eval_runner.build_arg_parser()
-        args = parser.parse_args(["--max-latency-seconds", "60.0"])
-        assert args.max_latency_seconds == 60.0
-
-    def test_error_message_names_the_correct_flag(self) -> None:
-        parser = eval_runner.build_arg_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--max-latency-seconds", "not-a-number"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--max-routing-seconds", "not-a-number"])
-
-
-class TestForegroundTimeoutIsClassifiedAsTimeoutNotSemanticFailure:
-    """Regression for round-4 finding 2: the foreground-search-timeout
-    placeholder text must be classified as a "timeout" infra outcome, not
-    scored as a semantic judge/citations failure -- previously only 3 of 7
-    degraded/failure texts were covered by SAFE_FALLBACK_TEXTS.
-    """
-
-    def test_timeout_placeholder_marks_the_turn_status_timeout(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
-        outcome = _run_cell(
-            monkeypatch,
-            pair=pair,
-            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
-            ui_text=("That is taking longer than expected; I will continue in the background."),
-        )
-
-        assert outcome.status == "timeout"
-        assert outcome.turns[0].status == "timeout"
-
-    def test_timeout_placeholder_never_reaches_the_judge(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
-        recorder: list[Any] = []
-        _run_cell(
-            monkeypatch,
-            pair=pair,
-            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
-            ui_text=("That is taking longer than expected; I will continue in the background."),
 class _RecordingProviderClient:
     def __init__(self, *, raise_on_close: bool = False) -> None:
         self.close_calls = 0
@@ -6065,6 +5866,205 @@ class TestRunCellClosesSessionProviderClients:
         assert router_client.close_calls == 1
 
 
+class TestNeverRanCellsAreBackfilledConsistently:
+    """Regression for round-3 gauntlet finding 2: cells that never ran any
+    turn were reported inconsistently depending on which code path produced
+    them. The router-config-mismatch early return and the manifest-rejected
+    early return in ``run_matrix()`` both left ``turns`` at its default
+    (rendering as ``[]`` in the report), while the exception-path fallback
+    backfilled ``N`` "skipped" ``TurnOutcome``s. Fixed by routing every
+    "never ran" producer through the shared ``_never_ran_cell()``/
+    ``_skipped_turn_outcomes()`` helpers.
+    """
+
+    def test_router_config_mismatch_backfills_all_turns_as_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Force the pre-call router assertion to fail by making the resolved
+        # model diverge from what the candidate claims -- no real Config
+        # subclassing needed, just monkeypatch resolve_router_model.
+        monkeypatch.setattr(
+            eval_runner.Config,
+            "resolve_router_model",
+            lambda self, _label: "some-other-model",
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert len(outcome.turns) == 2
+        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
+        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
+        # The per-run Config had already been resolved by the time the
+        # mismatch was caught -- its provider timeouts must still be threaded
+        # into the CellOutcome, not dropped.
+        assert outcome.router_timeout_seconds is not None
+        assert outcome.foreground_search_timeout_seconds is not None
+
+    def test_manifest_rejected_cell_backfills_all_turns_as_skipped(self) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        empty_status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (scenario,),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=empty_status,
+            )
+        )
+
+        assert len(outcomes) == 1
+        outcome = outcomes[0]
+        assert outcome.status == "manifest-rejected"
+        assert len(outcome.turns) == 2
+        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
+        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
+
+
+class TestManifestDiagnosticsPrintEffectiveEffort:
+    """Regression for round-2 gauntlet finding 13: the "absent from manifest"
+    error and the dry-run matrix preview must print the EFFECTIVE (resolved)
+    effort, not the raw candidate.effort -- for the router baseline,
+    candidate.effort is None but the manifest lookup actually resolved and
+    checked "minimal" (server.router.effective_router_reasoning_effort's
+    gpt-5* conditional). Printing the raw None would show an operator a
+    combination that isn't the one actually looked up.
+    """
+
+    def test_missing_baseline_error_names_the_effective_effort_not_none(
+        self, tmp_path: Path
+    ) -> None:
+        # Manifest exists but doesn't cover the router baseline at all.
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        with pytest.raises(eval_runner.ManifestError) as excinfo:
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=True,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+        message = str(excinfo.value)
+        assert "@minimal" in message
+        assert "@None" not in message
+
+    def test_dry_run_preview_prints_effective_effort_for_the_baseline_pair(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (Scenario(name="s", turns=(Turn(query="hi"),)),),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+        )
+
+        out = capsys.readouterr().out
+        assert "router=gpt-5-mini@minimal" in out
+        assert "router=gpt-5-mini@None" not in out
+
+
+# ---------------------------------------------------------------------------
+# Round 4 gauntlet regressions.
+# ---------------------------------------------------------------------------
+
+
+class TestLatencyBudgetRejectsNonFinite:
+    """Regression for round-4 finding 1: --max-latency-seconds must reject
+    NaN/inf/non-positive the same way --max-routing-seconds does. run_cell()'s
+    blocking-budget check (`total_ms > max_latency_seconds * 1000`) is false
+    for nan/inf, and even 0/-1 make every measured result exceed the limit.
+    """
+
+    def test_rejects_nan(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "nan"])
+
+    def test_rejects_infinity(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "inf"])
+
+    def test_rejects_zero_or_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "0"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "-1000"])
+
+    def test_accepts_a_normal_value(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        args = parser.parse_args(["--max-latency-seconds", "60.0"])
+        assert args.max_latency_seconds == 60.0
+
+    def test_error_message_names_the_correct_flag(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "not-a-number"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "not-a-number"])
+
+
+class TestForegroundTimeoutIsClassifiedAsTimeoutNotSemanticFailure:
+    """Regression for round-4 finding 2: the foreground-search-timeout
+    placeholder text must be classified as a "timeout" infra outcome, not
+    scored as a semantic judge/citations failure -- previously only 3 of 7
+    degraded/failure texts were covered by SAFE_FALLBACK_TEXTS.
+    """
+
+    def test_timeout_placeholder_marks_the_turn_status_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text=("That is taking longer than expected; I will continue in the background."),
+        )
+
+        assert outcome.status == "timeout"
+        assert outcome.turns[0].status == "timeout"
+
+    def test_timeout_placeholder_never_reaches_the_judge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text=("That is taking longer than expected; I will continue in the background."),
             judge_recorder=recorder,
         )
 
