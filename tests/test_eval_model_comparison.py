@@ -4948,6 +4948,74 @@ class TestReportIsPersistedByDefault:
         assert written[0].name != written[1].name
 
 
+class TestReportWriteFailureNeverDiscardsTheConsoleSummary:
+    """Round 11 gauntlet, Logic finding 2: round 8's persist-before-
+    summarize reorder closed one data-loss path but opened the mirror-
+    image one -- a rejected/failed report write ``return 1``'d before
+    ``print_report_summary(report)`` ever ran, discarding the already-billed
+    run's only remaining record. Two independent fixes: a pre-flight check
+    of ``--out`` before any paid call, and printing the summary on the
+    residual write-failure path too.
+    """
+
+    def test_an_out_path_outside_repo_root_is_rejected_before_run_matrix_is_ever_called(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def _run_matrix_must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("run_matrix() must not be reached -- pre-flight must fire first")
+
+        monkeypatch.setattr(eval_runner, "run_matrix", _run_matrix_must_not_be_called)
+
+        # tmp_path is outside the real REPO_ROOT (unpatched here on purpose --
+        # the pre-flight must fire using the real confinement root, before
+        # anything else runs).
+        outside_path = tmp_path / "outside-report.json"
+
+        exit_code = eval_runner.main(["--out", str(outside_path)])
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "refusing to write report" in captured.err
+
+    def test_a_write_failure_after_the_run_still_prints_the_console_summary(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+        monkeypatch.setattr(eval_runner, "REPO_ROOT", tmp_path)
+        monkeypatch.setattr(eval_runner, "DEFAULT_REPORT_DIR", tmp_path / "eval-reports")
+
+        def _write_no_follow_raises(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(eval_runner, "write_no_follow", _write_no_follow_raises)
+
+        exit_code = eval_runner.main(
+            [
+                "--router",
+                "baseline",
+                "--worker",
+                "baseline",
+                "--scenario",
+                "single-turn-default",
+                "--i-know-the-manifest-is-stale",
+            ]
+        )
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "refusing to write report" in captured.err
+        # The already-billed run's console record must still print, in the
+        # same place a successful run would print it -- not silently
+        # discarded alongside the file this run failed to write.
+        assert "overall:" in captured.out
+
+
 class TestSpendLimitValidation:
     """Regression for finding 12: --max-cost must reject non-finite (NaN/inf)
     values -- a NaN spend limit makes every comparison in _confirm_spend's

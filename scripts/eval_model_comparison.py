@@ -3068,6 +3068,26 @@ def main(argv: list[str] | None = None) -> int:
             "--full-matrix conflicts with --router/--worker (which already select one pair)"
         )
 
+    # Pre-flight the one pre-run-knowable way the final report write can
+    # fail: an explicit --out resolving outside REPO_ROOT (confined_output_
+    # path() rejects it with ValueError -- symlink escape, absolute path
+    # outside the repo, or a denylisted path). confined_output_path() is
+    # pure (resolve + symlink/denylist checks, no I/O side effects), so
+    # calling it here and again at the real write below is safe and cheap.
+    # Catching this before _confirm_spend()/run_matrix() run means a bad
+    # --out is reported before any paid call, not after -- previously this
+    # same ValueError only surfaced after run_matrix() had already spent
+    # every call, discarding the entire billed run's console summary too
+    # (see the write below, which still handles residual OSError cases this
+    # pre-flight structurally cannot: disk full, permission change, TOCTOU
+    # symlink races) (round 11 gauntlet, Logic finding 2).
+    if args.out is not None:
+        try:
+            confined_output_path(args.out, allowed_root=REPO_ROOT)
+        except ValueError as exc:
+            print(f"refusing to write report: {exc}", file=sys.stderr)
+            return 1
+
     # Pre-flight the one pre-run-knowable way `_shipped_config_cells_annotation`
     # can later fail to resolve an outcome's `pair_label` back to its `RunPair`:
     # a duplicate label among the resolved pairs. This is fully knowable
@@ -3202,7 +3222,20 @@ def main(argv: list[str] | None = None) -> int:
         out_path = confined_output_path(out_target, allowed_root=REPO_ROOT)
         write_no_follow(out_path, json.dumps(report, indent=2, sort_keys=True))
     except (ValueError, OSError) as exc:
+        # The pre-flight check above already rejects a bad --out before any
+        # paid call, but this branch is still reachable for the residual
+        # cases pre-flight structurally cannot catch (disk full, ENOSPC, a
+        # permission change between the pre-flight check and this write, a
+        # TOCTOU symlink race write_no_follow() itself rejects) -- and by
+        # this point the matrix has already run and been billed. The
+        # persist-before-summarize ordering above (round 8 gauntlet, Logic
+        # finding 1) is preserved: this only adds the console summary on the
+        # FAILURE path, after the "refusing to write report" line so the
+        # operator sees why no file exists, rather than losing the run's
+        # only remaining record alongside the file (round 11 gauntlet, Logic
+        # finding 2).
         print(f"refusing to write report: {exc}", file=sys.stderr)
+        print_report_summary(report)
         return 1
     print_report_summary(report)
     print(f"\nreport written to {out_path}")
