@@ -2848,10 +2848,17 @@ def print_report_summary(report: dict[str, Any]) -> None:
             if turn["deterministic_action_unevaluated_reason"] is not None:
                 # Distinct from "no action assertion was requested" -- makes
                 # visible that this turn's routing-action check was
-                # requested but never actually ran.
+                # requested but never actually ran. `!r` (not bare), matching
+                # the sibling `error=` bit, both to visually bound a
+                # multi-word prose reason in the space-joined `bits` line and
+                # to drop the "UNEVALUATED" sentinel restating its own key --
+                # a leftover from the if/elif era, before this and
+                # `deterministic_action_pass` became two independent `if`s
+                # above (round 11 gauntlet, Architecture finding 8).
+                # `action_unevaluated=` prefix is unchanged, so operators
+                # keying on it for grep-ability are unaffected.
                 bits.append(
-                    "action_unevaluated=UNEVALUATED "
-                    f"({turn['deterministic_action_unevaluated_reason']})"
+                    f"action_unevaluated={turn['deterministic_action_unevaluated_reason']!r}"
                 )
             if turn["worker_presence_pass"] is not None:
                 bits.append(f"worker_presence_pass={turn['worker_presence_pass']}")

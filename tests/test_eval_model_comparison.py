@@ -3313,7 +3313,8 @@ class TestMultiIntentRoutingSignalGap:
 
         eval_runner.print_report_summary(report)
         captured = capsys.readouterr().out
-        assert "UNEVALUATED" in captured
+        assert "action_unevaluated=" in captured
+        assert report_turn["deterministic_action_unevaluated_reason"] in captured
 
     def test_no_unevaluated_reason_when_no_action_assertion_was_requested(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3421,8 +3422,14 @@ class TestPrintReportSummaryShowsBothActionPassAndUnevaluatedNote:
 
         captured = capsys.readouterr().out
         assert "action_pass=True" in captured
-        assert "action_unevaluated=UNEVALUATED" in captured
+        assert "action_unevaluated=" in captured
         assert "2/3 repeats: routing_action was unavailable for this turn" in captured
+        # Round 11 gauntlet, R1 follow-up: pin the exact rendering so a
+        # revert back to the old `UNEVALUATED (<reason>)` sentinel form
+        # fails this test instead of slipping through on the substring
+        # checks above, which both forms satisfy.
+        assert f"action_unevaluated={turn.deterministic_action_unevaluated_reason!r}" in captured
+        assert "UNEVALUATED" not in captured
 
 
 class TestMissingTurnMetricsIsNotSilentlySwallowed:
