@@ -451,7 +451,7 @@ class TestMatrixBuilding:
         Round 6 found the disagreement is not a configuration bug but a
         self-inflicted skew: two different functions computing "is this the
         same cell?" two different ways. `_is_historical_baseline_pair` now
-        keys on wire identity too (via the shared `_candidate_wire_key`
+        keys on wire identity too (via the shared `candidate_wire_key`
         helper), so the clone's `enforce_latency_budget` agrees with the real
         baseline's, and the two cells dedupe CLEANLY into one enforced cell
         instead of raising beside it. `_dedupe_pairs`'s ValueError guard
@@ -1182,6 +1182,58 @@ class TestShippedConfigCellsAnnotationMarksUnmatchedRoles:
         assert annotation["router"]["cells"] == []
         assert annotation["worker"]["cells"] == []
         assert "no registered eval candidate covers" not in annotation["note"]
+
+
+class TestCandidateWireKeySharedAcrossModules:
+    """Round 11 gauntlet, Architecture finding 5: `candidate_wire_key`
+    (moved to `scripts/eval_common.py`, round 11) is the single source for
+    "same candidate" at the wire level, now shared by
+    `_pair_cell_key`/`_is_historical_baseline_pair`
+    (`scripts/eval_model_comparison.py`) AND
+    `is_registered_candidate`/`_registered_label`/
+    `_shipped_config_cells_annotation` -- previously each hand-spelled the
+    same `(model, effective_effort_for_manifest_lookup(...))` tuple
+    independently, a drift surface the round-6 A3 collision already showed
+    is real once two call sites disagree.
+    """
+
+    def test_a_wire_identical_clone_with_a_different_label_annotates_under_the_shipped_role(
+        self,
+    ) -> None:
+        # A hand-built candidate wire-identical to ROUTER_BASELINE but with
+        # a different label/object identity -- the exact shape the round-6
+        # A3 collision was about.
+        clone_router = eval_runner.Candidate(
+            label="clone-of-baseline",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        assert clone_router.label != eval_runner.ROUTER_BASELINE.label
+
+        # eval_common.py's is_registered_candidate()/_registered_label()
+        # agree with this: the clone resolves to the REGISTERED label, not
+        # its own.
+        assert eval_common.is_registered_candidate(clone_router, eval_common.ALL_ROUTER_CANDIDATES)
+        assert (
+            eval_common._registered_label(clone_router, eval_common.ALL_ROUTER_CANDIDATES)
+            == eval_runner.ROUTER_BASELINE.label
+        )
+
+        # And _shipped_config_cells_annotation() (eval_model_comparison.py)
+        # agrees too: a pair built from the REAL ROUTER_BASELINE object
+        # still lists under the clone's "shipped" role, because both keys
+        # resolve through the same candidate_wire_key().
+        pair = eval_runner.RunPair(
+            router=eval_runner.ROUTER_BASELINE, worker=eval_runner.WORKER_BASELINE
+        )
+        outcomes = [eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")]
+
+        annotation = eval_runner._shipped_config_cells_annotation(
+            outcomes, (clone_router, eval_runner.WORKER_BASELINE), (pair,)
+        )
+
+        assert pair.label in annotation["router"]["cells"]
 
 
 # ---------------------------------------------------------------------------

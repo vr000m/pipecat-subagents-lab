@@ -74,6 +74,7 @@ from scripts.eval_common import (
     build_judge_llm_service,
     build_judge_request_kwargs,
     build_session_for_run,
+    candidate_wire_key,
     close_judge_llm_service,
     confined_output_path,
     close_session_provider_clients,
@@ -227,30 +228,6 @@ class RunPair:
         return f"router={self.router.label}/worker={self.worker.label}"
 
 
-def _candidate_wire_key(candidate: Candidate) -> tuple[str, str | None]:
-    """The wire request a single candidate sends: (model, effective effort).
-
-    Uses effective_effort_for_manifest_lookup(), NOT the raw declared effort:
-    that resolver resolves "unset effort on a gpt-5* model" to "minimal", so
-    ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are ONE wire request
-    under two spellings -- keying on the raw effort let the same paid cell
-    run twice (round-4 restart, Logic finding 1).
-
-    Single source for "same candidate" at the wire level, shared by
-    `_pair_cell_key` (a pair's identity) and `_is_historical_baseline_pair`
-    (whether a pair IS the historical baseline). Before this was extracted,
-    the two functions answered "is this the same cell?" differently --
-    `_pair_cell_key` on wire identity, `_is_historical_baseline_pair` on
-    object identity (`router is ROUTER_BASELINE`) -- so a registry entry
-    wire-identical to but not object-identical with `ROUTER_BASELINE` yielded
-    two pairs with the same `_pair_cell_key` but disagreeing
-    `enforce_latency_budget`, which `_dedupe_pairs` then raised on. Sharing
-    one notion of identity makes that unrepresentable structurally rather
-    than coincidentally (round 6 gauntlet, Architecture A3).
-    """
-    return (candidate.model, effective_effort_for_manifest_lookup(candidate))
-
-
 def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
     """Identity by the request shape a cell actually sends, NOT by label --
     a candidate carrying the shipped config.toml router/worker may be the
@@ -259,8 +236,8 @@ def _pair_cell_key(pair: RunPair) -> tuple[str, str | None, str, str | None]:
     matching registered candidate's real label rather than label="shipped",
     but two distinct labels can still collide on wire identity).
     """
-    router_model, router_effort = _candidate_wire_key(pair.router)
-    worker_model, worker_effort = _candidate_wire_key(pair.worker)
+    router_model, router_effort = candidate_wire_key(pair.router)
+    worker_model, worker_effort = candidate_wire_key(pair.worker)
     return (router_model, router_effort, worker_model, worker_effort)
 
 
@@ -290,9 +267,9 @@ def _is_historical_baseline_pair(router: Candidate, worker: Candidate) -> bool:
     into the enforced baseline cell instead of colliding with it (round 6
     gauntlet, Logic/Architecture A3).
     """
-    return _candidate_wire_key(router) == _candidate_wire_key(
-        ROUTER_BASELINE
-    ) and _candidate_wire_key(worker) == _candidate_wire_key(WORKER_BASELINE)
+    return candidate_wire_key(router) == candidate_wire_key(ROUTER_BASELINE) and candidate_wire_key(
+        worker
+    ) == candidate_wire_key(WORKER_BASELINE)
 
 
 class PairInvariantError(ValueError):
@@ -2523,8 +2500,8 @@ def _shipped_config_cells_annotation(
     path: every outcome is produced from these pairs by construction, so a
     miss is a caller bug, not a data gap.
 
-    Matching itself is still on ``(model, effective_effort_for_manifest_
-    lookup(...))``, NOT on label, and this stays deliberate even now that the
+    Matching itself is still on the shared ``candidate_wire_key()`` (model,
+    effective effort), NOT on label, and this stays deliberate even now that the
     candidates arrive structured: matching on label would now usually work
     (each pair carries its real candidate label) but would silently break in
     the ``"shipped"``-fallback case (see ``shipped_candidates()``'s
@@ -2532,8 +2509,8 @@ def _shipped_config_cells_annotation(
     (model, effort) has no registered eval candidate at all.
     """
     shipped_router, shipped_worker = shipped
-    router_key = (shipped_router.model, effective_effort_for_manifest_lookup(shipped_router))
-    worker_key = (shipped_worker.model, effective_effort_for_manifest_lookup(shipped_worker))
+    router_key = candidate_wire_key(shipped_router)
+    worker_key = candidate_wire_key(shipped_worker)
     by_label = {pair.label: pair for pair in pairs}
     router_cells: list[str] = []
     worker_cells: list[str] = []
@@ -2544,9 +2521,9 @@ def _shipped_config_cells_annotation(
                 f"_shipped_config_cells_annotation: outcome pair_label {pair_label!r} has no "
                 "matching RunPair in `pairs` -- outcomes must be produced from these pairs"
             )
-        if (pair.router.model, effective_effort_for_manifest_lookup(pair.router)) == router_key:
+        if candidate_wire_key(pair.router) == router_key:
             router_cells.append(pair_label)
-        if (pair.worker.model, effective_effort_for_manifest_lookup(pair.worker)) == worker_key:
+        if candidate_wire_key(pair.worker) == worker_key:
             worker_cells.append(pair_label)
     result: dict[str, Any] = {
         "router": {

@@ -636,3 +636,35 @@ class TestAllCandidateRegistries:
             if pattern.search(text):
                 offenders.append(path.name)
         assert offenders == []
+
+
+class TestCandidateWireKey:
+    """Round 11 gauntlet, Architecture finding 5: candidate_wire_key() moved
+    here from scripts/eval_model_comparison.py (as the private
+    `_candidate_wire_key`) and is now the shared, exported single source
+    for "same candidate" at the wire level.
+    """
+
+    def test_unset_and_explicit_minimal_router_effort_collapse_to_the_same_key(self) -> None:
+        # The round-4 restart collision this function exists to prevent:
+        # ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are one wire
+        # request under two spellings for the router role.
+        from scripts.eval_common import Candidate, candidate_wire_key
+        from server.router import effective_router_reasoning_effort
+
+        model = "gpt-5-mini"
+        minimal = effective_router_reasoning_effort(model, None)
+        assert minimal == "minimal"
+
+        unset = Candidate(label="a", role="router", model=model, effort=None)
+        explicit_minimal = Candidate(label="b", role="router", model=model, effort=minimal)
+
+        assert candidate_wire_key(unset) == candidate_wire_key(explicit_minimal)
+
+    def test_different_models_never_collide(self) -> None:
+        from scripts.eval_common import Candidate, candidate_wire_key
+
+        a = Candidate(label="a", role="worker", model="gpt-5.6-sol", effort="low")
+        b = Candidate(label="b", role="worker", model="gpt-5.6-luna", effort="low")
+
+        assert candidate_wire_key(a) != candidate_wire_key(b)

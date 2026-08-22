@@ -78,6 +78,7 @@ __all__ = [
     "build_judge_llm_service",
     "build_judge_request_kwargs",
     "build_session_for_run",
+    "candidate_wire_key",
     "close_judge_llm_service",
     "confined_output_path",
     "close_session_provider_clients",
@@ -235,6 +236,39 @@ ALL_ROUTER_CANDIDATES: tuple[Candidate, ...] = (ROUTER_BASELINE, *ROUTER_CANDIDA
 ALL_WORKER_CANDIDATES: tuple[Candidate, ...] = (WORKER_BASELINE, *WORKER_CANDIDATES)
 
 
+def candidate_wire_key(candidate: Candidate) -> tuple[str, str | None]:
+    """The wire request a single candidate sends: (model, effective effort).
+
+    Uses effective_effort_for_manifest_lookup(), NOT the raw declared effort:
+    that resolver resolves "unset effort on a gpt-5* model" to "minimal", so
+    ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are ONE wire request
+    under two spellings -- keying on the raw effort let the same paid cell
+    run twice (round-4 restart, Logic finding 1).
+
+    Single source for "same candidate" at the wire level. Originally lived
+    in scripts/eval_model_comparison.py as `_candidate_wire_key`, shared
+    there by `_pair_cell_key` (a pair's identity) and
+    `_is_historical_baseline_pair` (whether a pair IS the historical
+    baseline). Before that extraction, the two functions answered "is this
+    the same cell?" differently -- `_pair_cell_key` on wire identity,
+    `_is_historical_baseline_pair` on object identity (`router is
+    ROUTER_BASELINE`) -- so a registry entry wire-identical to but not
+    object-identical with `ROUTER_BASELINE` yielded two pairs with the same
+    `_pair_cell_key` but disagreeing `enforce_latency_budget`, which
+    `_dedupe_pairs` then raised on. Sharing one notion of identity makes
+    that unrepresentable structurally rather than coincidentally (round 6
+    gauntlet, Architecture A3).
+
+    Moved here (round 11 gauntlet, Architecture finding 5) and made public
+    as the shared export used by both `scripts/eval_model_comparison.py`
+    and this module's own `is_registered_candidate`/`_registered_label`,
+    which previously hand-spelled the same tuple instead of calling it --
+    the same drift surface round 10 F4 closed for
+    `ALL_ROUTER_CANDIDATES`/`ALL_WORKER_CANDIDATES`, left open here.
+    """
+    return (candidate.model, effective_effort_for_manifest_lookup(candidate))
+
+
 def is_registered_candidate(candidate: Candidate, registry: tuple[Candidate, ...]) -> bool:
     """Whether any registered eval candidate is wire-identical to
     ``candidate`` -- same (model, effective effort) key ``_registered_label``
@@ -249,8 +283,8 @@ def is_registered_candidate(candidate: Candidate, registry: tuple[Candidate, ...
     hand-built ones in tests that never went through ``shipped_candidates()``
     at all (round 9 gauntlet, Codex F1).
     """
-    key = (candidate.model, effective_effort_for_manifest_lookup(candidate))
-    return any((c.model, effective_effort_for_manifest_lookup(c)) == key for c in registry)
+    key = candidate_wire_key(candidate)
+    return any(candidate_wire_key(c) == key for c in registry)
 
 
 def _registered_label(candidate: Candidate, registry: tuple[Candidate, ...]) -> str:
@@ -275,11 +309,9 @@ def _registered_label(candidate: Candidate, registry: tuple[Candidate, ...]) -> 
     should not re-raise this as a new finding (round 6 gauntlet,
     Architecture A4).
     """
-    if not is_registered_candidate(candidate, registry):
-        return "shipped"
-    key = (candidate.model, effective_effort_for_manifest_lookup(candidate))
-    match = next(c for c in registry if (c.model, effective_effort_for_manifest_lookup(c)) == key)
-    return match.label
+    key = candidate_wire_key(candidate)
+    match = next((c for c in registry if candidate_wire_key(c) == key), None)
+    return "shipped" if match is None else match.label
 
 
 def shipped_candidates(config_file: Path | None = None) -> tuple[Candidate, Candidate]:

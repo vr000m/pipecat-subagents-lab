@@ -48,9 +48,9 @@ from scripts.eval_common import (
     WORKER_MANIFEST_TOOLS,
     build_judge_llm_service,
     build_judge_request_kwargs,
+    candidate_wire_key,
     close_judge_llm_service,
     confined_output_path,
-    effective_effort_for_manifest_lookup,
     error_text,
     git_head,
     write_no_follow,
@@ -84,15 +84,21 @@ DEFAULT_OUT = DEFAULT_MANIFEST_RELATIVE_PATH
 # runner's Candidate-based ones) reconciled only by convention. The
 # baseline entries (router: gpt-5-mini @ minimal; worker: gpt-5 @ no
 # reasoning param) still reproduce today's production behavior --
-# effective_effort_for_manifest_lookup() resolves the router's
-# "unset effort + gpt-5* model defaults to minimal" rule the same way
-# server/router.py's LazyRouterProvider.__call__ does. `None` worker effort
-# means "omit the `reasoning` kwarg entirely", not "resolve to a default".
+# candidate_wire_key() resolves the router's "unset effort + gpt-5* model
+# defaults to minimal" rule the same way server/router.py's
+# LazyRouterProvider.__call__ does. `None` worker effort means "omit the
+# `reasoning` kwarg entirely", not "resolve to a default".
+# These are literally candidate_wire_key(c) for each candidate -- calling the
+# shared helper instead of hand-spelling the (model, effective_effort) tuple
+# a 7th time keeps this file in sync with eval_common.py's single source of
+# truth for "same candidate at the wire level" (round 11 gauntlet, R2
+# follow-up; F5 converted the other six hand-spelled tuples but missed
+# these).
 PHASE0_ROUTER_PROBES: tuple[tuple[str, str | None], ...] = tuple(
-    (c.model, effective_effort_for_manifest_lookup(c)) for c in ALL_ROUTER_CANDIDATES
+    candidate_wire_key(c) for c in ALL_ROUTER_CANDIDATES
 )
 PHASE0_WORKER_PROBES: tuple[tuple[str, str | None], ...] = tuple(
-    (c.model, effective_effort_for_manifest_lookup(c)) for c in ALL_WORKER_CANDIDATES
+    candidate_wire_key(c) for c in ALL_WORKER_CANDIDATES
 )
 
 
