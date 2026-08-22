@@ -2151,6 +2151,8 @@ async def run_cell(
                     cell_status = "turn-error"
                     cell_error = (
                         "close_judge_llm_service() raised: "
+                        f"{error_text(close_exc, credential=config.openai_api_key if config else None)}"
+                    )
         # Same never-mask-the-outcome guard, its own try/except, after the
         # judge close above: this closes the router/worker Responses clients
         # `host` (via `build_session_for_run`) constructed for this cell --
@@ -2165,8 +2167,6 @@ async def run_cell(
                     "close_session_provider_clients() raised: "
                     f"{error_text(provider_close_exc, credential=config.openai_api_key if config else None)}"
                 )
-                        f"{error_text(close_exc, credential=config.openai_api_key if config else None)}"
-                    )
 
     if cell_status != "ok":
         # Record every turn the scenario defines but this cell never
