@@ -273,6 +273,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discarding every incremental until a manual reconnect; and an
   already-cancelled advance task could resurrect itself via its own
   cancellation callback during a full stop. All three are fixed.
+- Review-gauntlet rounds 8–10 (`cafb89e`..`9b6fbca`) closed a further batch
+  of hardening and correctness gaps found by adversarial/deep/security
+  review: the evidence writers (`analyze_query_context_latency.py`,
+  `run_query_context_experiment.py`, `collect_query_context_latency.py`,
+  `record_phase3_completion.py`) previously wrote through plain
+  `write_text()`/`.open("w")` at predictable paths, letting a planted
+  symlink redirect the write — now routed through the same
+  `O_NOFOLLOW`-hardened helpers the promotion-manifest writer already used;
+  `server/config.py`'s runtime evidence reads had a stat-then-read TOCTOU
+  window, closed by reading through one held fd; a restored (non-terminal)
+  work-status record surviving a TTL prune lost the marker distinguishing
+  it from a complete record, letting a single still-running child's result
+  terminalize a multi-intent parent early — the client (`web/src/state.js`)
+  had the same gap, with no retention clock for a restored record at all;
+  `audibility_verified` transport-contract metadata was accepted on key
+  presence alone, letting an empty browser name, a stringly-typed gesture
+  flag, or an unparseable timestamp through into a promotion-eligible
+  manifest; the source-anchor package check matched a bare unscoped leaf
+  name, letting a lookalike URL pass as the real scoped package; the
+  promotion-manifest writer stamped the package-default release version
+  instead of the configured one, so any non-default configured release
+  always failed closed; a timer scheduler read its delay off the wall
+  clock instead of the injectable `Clock` it was handed, silently
+  defeating every timeout under a fake/test clock; and a TTS hand-off no
+  longer proceeds against an already-tombstoned generation, closing a race
+  that could hold the global transport slot roughly tenfold longer than
+  intended.
 
 ## [0.1.2] - 2026-07-28
 
