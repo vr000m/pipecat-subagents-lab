@@ -40,16 +40,20 @@ class Turn:
     hosted ``web_search`` tool to answer with citable URL sources, driving
     the deterministic non-empty-citations check (never a judge criterion --
     ``spoken_text``'s contract forbids citation markers/URLs, so asking the
-    judge to check for a citation would be self-contradictory). This is
-    deliberately independent of ``expect_delegated``: a live probe of
-    ``server/workers/web_search.py``'s ``build_worker_request_kwargs``
-    request against a real weather query showed the hosted ``web_search``
-    tool answers weather with its internal ``oai-weather`` sub-tool, whose
-    ``action.sources`` entries carry ``url: null`` -- the response is
-    genuinely delegated and genuinely sourced, but never yields a citable
-    URL. Coupling the citations check to ``expect_delegated`` alone made
-    every weather turn fail a check the worker cannot pass by design, not a
-    real per-candidate quality signal.
+    judge to check for a citation would be self-contradictory). The
+    independence from ``expect_delegated`` is one-directional:
+    ``expect_delegated=True, expect_citations=False`` is the meaningful case
+    (a live probe of ``server/workers/web_search.py``'s
+    ``build_worker_request_kwargs`` request against a real weather query
+    showed the hosted ``web_search`` tool answers weather with its internal
+    ``oai-weather`` sub-tool, whose ``action.sources`` entries carry
+    ``url: null`` -- the response is genuinely delegated and genuinely
+    sourced, but never yields a citable URL). The reverse,
+    ``expect_citations=True, expect_delegated=False``, is not meaningful:
+    citations only ever arrive from a worker result, so that combination
+    can only ever score a guaranteed-fail assertion, never a real signal --
+    ``__post_init__`` below rejects it (round 11 gauntlet, Architecture
+    finding 7).
     """
 
     query: str
@@ -57,6 +61,15 @@ class Turn:
     expect_action: str | None = None
     expect_delegated: bool = False
     expect_citations: bool = False
+
+    def __post_init__(self) -> None:
+        if self.expect_citations and not self.expect_delegated:
+            raise ValueError(
+                "expect_citations=True requires expect_delegated=True: citations can only "
+                "originate from a worker result, so expect_citations=True with "
+                "expect_delegated=False could never pass -- it is a guaranteed-fail "
+                "assertion, not a real signal"
+            )
 
 
 @dataclass(frozen=True)

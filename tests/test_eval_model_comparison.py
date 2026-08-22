@@ -3784,6 +3784,29 @@ class TestScenarioDefinitions:
                     assert not any(marker in lowered for marker in placeholder_markers)
 
 
+class TestExpectCitationsRequiresExpectDelegated:
+    """Round 11 gauntlet, Architecture finding 7: ``expect_citations=True,
+    expect_delegated=False`` is representable but meaningless -- citations
+    only ever arrive from a worker result, so that combination is a
+    guaranteed-fail assertion, not a real signal. ``Turn.__post_init__``
+    now rejects it.
+    """
+
+    def test_expect_citations_without_expect_delegated_raises(self) -> None:
+        with pytest.raises(ValueError, match="expect_citations"):
+            Turn(query="q", expect_citations=True)
+
+    def test_expect_delegated_true_expect_citations_false_still_constructs(self) -> None:
+        turn = Turn(query="q", expect_delegated=True, expect_citations=False)
+        assert turn.expect_delegated is True
+        assert turn.expect_citations is False
+
+    def test_both_true_still_constructs(self) -> None:
+        turn = Turn(query="q", expect_delegated=True, expect_citations=True)
+        assert turn.expect_delegated is True
+        assert turn.expect_citations is True
+
+
 # ---------------------------------------------------------------------------
 # Round-1 review-gauntlet regression tests.
 # ---------------------------------------------------------------------------
