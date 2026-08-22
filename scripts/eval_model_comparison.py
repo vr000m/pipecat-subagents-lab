@@ -1346,7 +1346,15 @@ def _aggregate_turn_repeats(
     )
 
     return TurnOutcome(
-        query=turn_repeats[0].query,
+        # First non-empty query, not repeat index 0: the padding placeholder
+        # (`TurnOutcome(query="", status="skipped")`, see `_skipped_turn_
+        # outcomes`) is a reachable repeat-0 value, and sampling it blindly
+        # blanks the aggregated turn's identity in `_cell_failure_reasons`
+        # and `print_report_summary`'s `- {turn['query']!r}` line -- the same
+        # index-0-sampling class the neighboring fold-based fields
+        # (`latency_budget_enforced`, `router_timeout_seconds`) already avoid
+        # (round 11 gauntlet, Logic finding 3).
+        query=next((t.query for t in turn_repeats if t.query), ""),
         status=agg_status,
         judge_verdict=agg_verdict,
         judge_reason=agg_reason,

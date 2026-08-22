@@ -1408,6 +1408,39 @@ class TestCleanOutcomeRequiresStrictMajority:
         assert "1/2" in aggregated_turn.judge_reason
 
 
+class TestAggregateTurnRepeatsQuerySamplesFirstNonEmpty:
+    """Round 11 gauntlet, Logic finding 3: `_aggregate_turn_repeats` used to
+    sample `query` from repeat index 0 unconditionally, unlike its sibling
+    fold-based fields (`latency_budget_enforced`, `router_timeout_seconds`).
+    If repeat 0 is the padding placeholder
+    (`TurnOutcome(query="", status="skipped")`), the aggregated turn's query
+    renders as "", losing turn identity in the report/summary. Fixed to the
+    first non-empty query among the repeats.
+    """
+
+    def test_empty_repeat_zero_falls_back_to_the_first_non_empty_query(self) -> None:
+        aggregated = eval_runner._aggregate_turn_repeats(
+            [
+                eval_runner.TurnOutcome(query="", status="skipped"),
+                eval_runner.TurnOutcome(query="real q", status="ok"),
+            ],
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated.query == "real q"
+
+    def test_all_empty_queries_yields_empty_string_not_none(self) -> None:
+        aggregated = eval_runner._aggregate_turn_repeats(
+            [
+                eval_runner.TurnOutcome(query="", status="skipped"),
+                eval_runner.TurnOutcome(query="", status="skipped"),
+            ],
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated.query == ""
+
+
 class TestTieBreakPrioritiesCoverTheirLiteralVocabulary:
     """Round 5 restart2, Logic L3: _majority_with_tiebreak()'s fallback loop
     (`for candidate in priority: if candidate != clean and candidate in
