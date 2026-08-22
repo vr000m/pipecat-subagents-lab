@@ -551,6 +551,22 @@ class TestMatrixBuilding:
         assert eval_runner._is_historical_baseline_pair(router_clone, worker_clone) is True
 
 
+class TestEveryPairEnforcesExactlyWhatIsHistoricalBaselinePairSays:
+    """Round 11 gauntlet, Architecture finding 6 -- optional invariant guard
+    the softened `_is_historical_baseline_pair` docstring actually promises:
+    `RunPair.enforce_latency_budget` still defaults to `False` (not removed),
+    but every pair this module actually constructs must agree with
+    `_is_historical_baseline_pair` on the value, not merely with the
+    default.
+    """
+
+    def test_default_sweep_and_full_matrix_pairs_all_agree(self) -> None:
+        for pair in (*eval_runner.default_sweep_pairs(), *eval_runner.full_matrix_pairs()):
+            assert pair.enforce_latency_budget == eval_runner._is_historical_baseline_pair(
+                pair.router, pair.worker
+            )
+
+
 class TestLatencyEnforcementIsExplicitNotLabelDerived:
     """Regression for round-4 restart, Architecture finding 1 / Logic finding
     2: RunPair.enforce_latency_budget is an explicit field, not derived from
@@ -6394,6 +6410,27 @@ class TestLatencyBudgetExceededPredicate:
         )
 
         assert aggregated.latency_budget_exceeded is sentinel
+
+    def test_run_cell_itself_also_uses_the_patched_predicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 11 gauntlet, Logic finding 4 (test-coverage gap): the test
+        above only ever exercised `_aggregate_turn_repeats()`'s use of
+        `_latency_budget_exceeded` -- `run_cell()` was never called, so the
+        "same predicate" claim this class's docstring makes was unpinned on
+        the `run_cell()` side. `run_cell()` only *stores* the predicate's
+        result (it never branches on its truthiness), so a non-bool sentinel
+        cannot distort control flow here -- safe to patch the same way.
+        """
+        sentinel = object()
+        monkeypatch.setattr(
+            eval_runner, "_latency_budget_exceeded", lambda *args, **kwargs: sentinel
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(monkeypatch, pair=pair, turns=(Turn(query="hi"),))
+
+        assert outcome.turns[0].latency_budget_exceeded is sentinel
 
 
 class TestDefaultSweepAnchorsOnShippedConfig:

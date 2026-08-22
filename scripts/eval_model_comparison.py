@@ -221,6 +221,14 @@ class RunPair:
     # router/worker, is such a candidate. Enforcing production's latency
     # is a separate concern needing its own calibrated budget; deliberately
     # out of scope here rather than inherited by accident.
+    #
+    # Still defaults to False -- this is a convenience default for the field
+    # declaration, not a guarantee: every production construction site below
+    # (`default_sweep_pairs()`/`full_matrix_pairs()`/`_resolve_pairs()`)
+    # states the value explicitly via `_is_historical_baseline_pair()`, and a
+    # new construction site must too (round 11 gauntlet, Architecture
+    # finding 6 -- `_is_historical_baseline_pair`'s docstring previously
+    # overclaimed that extraction alone made silent omission impossible).
     enforce_latency_budget: bool = False
 
     @property
@@ -246,9 +254,14 @@ def _is_historical_baseline_pair(router: Candidate, worker: Candidate) -> bool:
 
     Single source for RunPair.enforce_latency_budget's decision -- see
     RunPair.enforce_latency_budget's own comment for why only the historical
-    baseline x baseline cell is enforced. Extracted so a new RunPair
-    construction site cannot silently default to False by omission (round 5
-    restart2, Architecture A7).
+    baseline x baseline cell is enforced. Extracted so every RunPair
+    construction site computes this decision the same way, via one shared
+    rule, rather than each re-deriving it independently (round 5 restart2,
+    Architecture A7) -- this centralizes the RULE, but does not make
+    omitting `enforce_latency_budget` at a new construction site
+    structurally impossible: the field still defaults to `False` (round 11
+    gauntlet, Architecture finding 6). Every production construction site
+    states the value explicitly; a new one must too.
 
     Enforcement follows the WIRE REQUEST the historical baseline sends
     (model, effective effort), not the specific module-level `ROUTER_BASELINE`
