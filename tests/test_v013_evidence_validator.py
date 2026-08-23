@@ -595,6 +595,134 @@ def _full_valid_inputs_with_phase3(tmp_path: Path) -> tuple[Path, Path, Path, Pa
     return phase0, phase1, phase2, phase3
 
 
+class TestVerifyManifestDriftCheck:
+    """Round-3 restart gauntlet, Architecture finding: CI's ``release-metadata``
+    job wrote a promotion manifest into an ephemeral workspace and ended there
+    -- no commit, no upload-artifact, no deploy, and ``permissions: contents:
+    read`` so it could not have pushed one. The consumer,
+    ``server/config.py::load_promotion_manifest``, reads the repo-committed
+    file, so producer and consumer were never connected and the job proved
+    nothing.
+
+    The conservative remedy is a read-only drift check against the *committed*
+    manifest, which is what these tests pin. No publish path was added: how a
+    manifest gets published is a release-mechanics decision for an operator.
+    """
+
+    def _written_manifest(self, tmp_path: Path) -> Path:
+        module = _validator()
+        phase0, phase1, phase2, phase3 = _full_valid_inputs_with_phase3(tmp_path)
+        assert (
+            module.main(
+                _write_manifest_final_argv(
+                    tmp_path, phase0=phase0, phase1=phase1, phase2=phase2, phase3=phase3
+                )
+            )
+            == 0
+        )
+        return tmp_path / "promotion-manifest.json"
+
+    def test_a_freshly_written_manifest_verifies_clean(self, tmp_path: Path) -> None:
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        assert module.verify_manifest(manifest_path) == []
+        assert module.main(["--verify-manifest", str(manifest_path)]) == 0
+
+    def test_an_edited_evidence_artifact_is_reported_as_digest_drift(self, tmp_path: Path) -> None:
+        """The drift that actually matters: someone edits an evidence file
+        without regenerating the manifest that vouches for its digest."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+
+        edited = tmp_path / manifest["inputs"]["phase0"]["path"]
+        edited.write_text(edited.read_text() + "\n", encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("inputs.phase0 digest drift" in item for item in drift), drift
+        assert module.main(["--verify-manifest", str(manifest_path)]) == 1
+
+    def test_a_hand_edited_promotion_eligible_is_reported(self, tmp_path: Path) -> None:
+        """The check that stops a stale/forged manifest authorizing
+        data-driven tuning the current evidence does not support."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["promotion_eligible"] is False
+        manifest["promotion_eligible"] = True
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("promotion_eligible drift" in item for item in drift), drift
+
+    def test_a_hand_edited_top_level_digest_is_reported(self, tmp_path: Path) -> None:
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        manifest["phase3_completion_hash"] = "f" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("phase3_completion_hash" in item for item in drift), drift
+
+    def test_an_unrecognized_manifest_field_fails_closed(self, tmp_path: Path) -> None:
+        """A field added to ``write_manifest`` but not to ``verify_manifest``
+        must not be silently unchecked -- that is how the job came to prove
+        nothing in the first place."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        manifest["some_future_binding"] = "abc"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("some_future_binding" in item for item in drift), drift
+
+    def test_release_identity_fields_are_not_compared(self, tmp_path: Path) -> None:
+        """A manifest committed at one commit can never match a regeneration at
+        a later one, so comparing the identity/timestamp fields would fail the
+        job on every push. They are excluded deliberately, and the excluded set
+        plus the verified set must together cover the whole document."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+
+        manifest["source_commit"] = "9" * 40
+        manifest["deployed_at_utc"] = "2099-01-01T00:00:00Z"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        assert module.verify_manifest(manifest_path) == []
+
+        assert set(manifest) <= module._MANIFEST_VOLATILE_FIELDS | module._MANIFEST_VERIFIED_FIELDS
+
+    def test_verify_mode_writes_nothing(self, tmp_path: Path) -> None:
+        """It is a *check*, not a producer -- the whole point of the fix."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        before = sorted(p.name for p in tmp_path.iterdir())
+        digest_before = manifest_path.read_bytes()
+
+        assert module.main(["--verify-manifest", str(manifest_path)]) == 0
+
+        assert sorted(p.name for p in tmp_path.iterdir()) == before
+        assert manifest_path.read_bytes() == digest_before
+
+    def test_the_repo_committed_manifest_verifies_clean(self) -> None:
+        """The live check the CI job runs. This is the assertion that would
+        actually catch a real drift landing on main."""
+        module = _validator()
+        committed = REPO_ROOT / "docs" / "benchmarks" / "v0.1.3-promotion-manifest.json"
+        if not committed.exists():
+            pytest.skip("no committed promotion manifest in this checkout")
+        # `_confine_manifest_evidence_root_to_tmp_path` repoints the module's
+        # REPO_ROOT at tmp_path; this check needs the real tree.
+        original_root = module.REPO_ROOT
+        module.REPO_ROOT = REPO_ROOT
+        try:
+            assert module.verify_manifest(committed) == []
+        finally:
+            module.REPO_ROOT = original_root
+
+
 def test_final_manifest_requires_phase3_input_and_binds_its_hash(tmp_path: Path) -> None:
     module = _validator()
     phase0, phase1, phase2, phase3 = _full_valid_inputs_with_phase3(tmp_path)
@@ -627,6 +755,54 @@ def test_final_manifest_refuses_when_phase3_input_is_missing(tmp_path: Path) -> 
 
     assert exit_code != 0
     assert not (tmp_path / "promotion-manifest.json").exists()
+
+
+def test_write_manifest_final_without_phase3_input_raises_not_a_reason(tmp_path: Path) -> None:
+    """Round-3 restart gauntlet, Logic finding: the ``final`` branch could
+    select a ``"phase3_incomplete"`` reason that was unreachable.
+
+    Both entry points already refuse ``--manifest-phase final`` without a
+    phase3 input -- ``main()`` rejects the argv combination, and
+    ``write_manifest`` itself raises before reaching the reason selection --
+    so no manifest could ever carry that string, and a downstream consumer
+    keying on it would wait forever. This pins the behaviour that makes the
+    branch dead: the missing phase3 input is a *raise*, never a recorded
+    reason, so removing the branch cannot have changed an observable outcome.
+    """
+    module = _validator()
+    phase0, phase1, phase2 = _full_valid_inputs(tmp_path)
+
+    with pytest.raises(module.EvidenceGateError, match="requires --phase3-input"):
+        module.write_manifest(
+            manifest_phase="final",
+            phase0_input=phase0,
+            phase1_input=phase1,
+            phase2_input=phase2,
+            phase3_input=None,
+            phase4c_input=None,
+            source_commit=SOURCE_COMMIT,
+            source_tree_hash=SOURCE_TREE_HASH,
+            deployed_at_utc="2026-07-28T00:00:00+00:00",
+            feature_policy_fingerprint=FEATURE_POLICY_FINGERPRINT,
+            output=tmp_path / "promotion-manifest.json",
+        )
+
+    assert not (tmp_path / "promotion-manifest.json").exists()
+
+
+def test_no_written_manifest_can_carry_the_removed_phase3_incomplete_reason() -> None:
+    """The reason vocabulary the writer can actually emit no longer contains
+    ``phase3_incomplete`` -- guards against it being reintroduced as a dead
+    string by a future edit.
+
+    Scans code lines only: the explanatory comment above the removal names the
+    string deliberately and must not trip this.
+    """
+    source = (REPO_ROOT / "scripts" / "validate_v013_evidence.py").read_text(encoding="utf-8")
+    code_lines = [
+        line for line in source.splitlines() if not line.lstrip().startswith(("#", '"""', "*"))
+    ]
+    assert not [line for line in code_lines if "phase3_incomplete" in line]
 
 
 def test_final_manifest_rejects_a_phase3_record_with_mismatched_source_commit(
@@ -831,15 +1007,52 @@ def test_atomic_write_refuses_a_fifo_planted_at_the_manifest_path(tmp_path: Path
 def test_read_bytes_no_follow_caps_an_oversized_manifest(tmp_path: Path) -> None:
     """Companion to the FIFO case (#7): the `.previous` read loop had no size
     cap, so a large file planted at the predictable manifest path was read
-    unbounded into memory. It is now capped at ``_MAX_MANIFEST_BYTES``,
-    mirroring ``server.config._MAX_EVIDENCE_INPUT_BYTES``."""
-    module = _validator()
-    output = tmp_path / "manifest.json"
-    assert module._MAX_MANIFEST_BYTES == 8 * 1024 * 1024
-    output.write_bytes(b"x" * (module._MAX_MANIFEST_BYTES + 1))
+    unbounded into memory.
 
-    with pytest.raises(module.EvidenceGateError):
-        module._read_bytes_no_follow(output)
+    Round-3 restart gauntlet, Architecture finding: the private
+    ``_read_bytes_no_follow``/``_MAX_MANIFEST_BYTES`` pair this used to assert
+    on were forked copies of ``evidence_common``'s hardened reader and its
+    ``_MAX_EVIDENCE_INPUT_BYTES``. The cap is now the shared module's, so the
+    property under test is unchanged and there is one implementation of it.
+    """
+    from scripts.evidence_common import _MAX_EVIDENCE_INPUT_BYTES, read_bytes_if_present
+
+    output = tmp_path / "manifest.json"
+    assert _MAX_EVIDENCE_INPUT_BYTES == 8 * 1024 * 1024
+    output.write_bytes(b"x" * (_MAX_EVIDENCE_INPUT_BYTES + 1))
+
+    with pytest.raises(_validator().EvidenceGateError):
+        read_bytes_if_present(output)
+
+
+def test_read_bytes_if_present_returns_none_only_for_an_absent_path(tmp_path: Path) -> None:
+    """The one behaviour the private copy had that the plain shared reader
+    does not: a first run has no manifest to back up, so absent must be
+    ``None`` rather than a raised gate error.
+
+    Every *other* failure mode must still raise -- treating a symlink or FIFO
+    at the manifest path as "nothing there to preserve" would let the writer
+    clobber it, which is exactly what the `.previous` copy exists to prevent.
+    """
+    import os
+
+    from scripts.evidence_common import EvidenceGateError, read_bytes_if_present
+
+    assert read_bytes_if_present(tmp_path / "absent.json") is None
+
+    real = tmp_path / "real.json"
+    real.write_bytes(b"{}")
+    assert read_bytes_if_present(real) == b"{}"
+
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    with pytest.raises(EvidenceGateError):
+        read_bytes_if_present(link)
+
+    fifo = tmp_path / "fifo.json"
+    os.mkfifo(fifo)
+    with pytest.raises(EvidenceGateError):
+        read_bytes_if_present(fifo)
 
 
 def test_atomic_write_ignores_a_planted_predictable_temp_file(tmp_path: Path) -> None:

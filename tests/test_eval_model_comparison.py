@@ -2643,6 +2643,54 @@ class TestManifestGate:
                 judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
             )
 
+    def test_manifest_fifo_is_refused_instead_of_blocking(self, tmp_path: Path) -> None:
+        """Round-3 restart gauntlet, Security finding: the manifest read was
+        ``exists()`` + ``read_text()``.
+
+        ``--manifest-path`` defaults to a predictable, repo-relative artifact
+        path. A FIFO planted there made ``read_text()`` block the eval run
+        indefinitely, and the surrounding ``except (OSError,
+        json.JSONDecodeError, UnicodeDecodeError)`` could not catch it -- a
+        blocking open never returns to raise. This test must complete
+        promptly, and must degrade to the documented fail-closed status rather
+        than raising.
+        """
+        import os
+
+        manifest_path = tmp_path / "manifest.json"
+        os.mkfifo(manifest_path)
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+        assert status.accepted == frozenset()
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=False,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_manifest_symlink_is_not_read_through(self, tmp_path: Path) -> None:
+        """``O_NOFOLLOW`` half of the same finding: a symlink planted at the
+        predictable manifest path must not silently redirect the read to its
+        target, even when that target is a perfectly valid manifest."""
+        real = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=self._full_manifest_results(),
+        )
+        link = tmp_path / "linked-manifest.json"
+        link.symlink_to(real)
+
+        # Read directly: valid and accepted.
+        assert eval_runner.load_manifest_status(real).accepted != frozenset()
+        # Read through the symlink: refused, with no accepted entries.
+        linked_status = eval_runner.load_manifest_status(link)
+        assert linked_status.stale is True
+        assert linked_status.accepted == frozenset()
+
     def test_combination_absent_from_manifest_is_refused(self, tmp_path: Path) -> None:
         # Manifest only covers the baseline, not the router candidates.
         manifest_path = _write_manifest(
@@ -4490,17 +4538,60 @@ class TestSourceTreeDirtyCheckIsWholeTreeAttested:
     """Regression for round 9 gauntlet, Architecture lens finding 15: round
     7, 8, and 9 of the review gauntlet each independently found one more
     file a hand-enumerated ``_MANIFEST_ATTESTED_PATHS`` tuple was missing.
-    Replaced with whole-tree attestation over ``server/``,
-    ``scripts/eval_common.py``, and ``evals/`` -- a dirty file under any of
-    those, not just a previously-enumerated subset, must now be detected.
+    Replaced with whole-tree attestation over ``server/``, ``scripts/`` and
+    ``evals/`` -- a dirty file under any of those, not just a
+    previously-enumerated subset, must now be detected.
     """
 
     def test_attested_paths_cover_the_whole_server_tree_not_an_enumerated_subset(self) -> None:
         assert eval_runner._MANIFEST_ATTESTED_PATHS == (
             "server/",
-            "scripts/eval_common.py",
+            "scripts/",
             "evals/",
         )
+
+    def test_every_attested_entry_is_a_directory_not_a_single_file(self) -> None:
+        """Round-3 restart gauntlet, Architecture finding: round 9's "whole
+        tree" fix left ``scripts/eval_common.py`` as a lone *file* entry.
+
+        The round-1/2 consolidation then moved shared helpers out of
+        eval_common.py into ``scripts/evidence_common.py`` -- which
+        eval_common.py imports but which no attested path covered -- so
+        uncommitted edits to that dependency stopped marking the manifest
+        stale. That is the enumerate-and-miss failure the whole-tree
+        attestation exists to end, recurring one level down in the import
+        graph. Requiring every entry to be a directory prefix makes it
+        unrepresentable: a new shared module under an attested tree is covered
+        the day it lands.
+        """
+        for entry in eval_runner._MANIFEST_ATTESTED_PATHS:
+            assert entry.endswith("/"), (
+                f"{entry!r} attests a single file; a file entry cannot cover a "
+                "module that file later grows a dependency on -- attest its "
+                "directory instead"
+            )
+
+    def test_a_dirty_shared_scripts_module_marks_the_tree_dirty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The concrete gap: ``scripts/evidence_common.py`` is not
+        ``scripts/eval_common.py``, so under the old tuple a dirty
+        evidence_common.py read as a clean tree."""
+        captured: dict[str, list[str]] = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return SimpleNamespace(
+                returncode=0, stdout=" M scripts/evidence_common.py\n", stderr=""
+            )
+
+        monkeypatch.setattr(eval_runner.subprocess, "run", _fake_run)
+
+        assert eval_runner._source_tree_dirty() is True
+        # The pathspec actually handed to git must be the directory, not the
+        # single file -- otherwise git would never have reported the above.
+        assert "scripts/" in captured["cmd"]
+        assert "scripts/eval_common.py" not in captured["cmd"]
 
     def test_git_status_is_invoked_with_the_broadened_attested_paths(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4988,6 +5079,35 @@ class TestOutputPathConfinement:
         with pytest.raises(OSError):
             eval_runner.write_no_follow(symlink_path, "clobbered")
         assert real_target.read_text() == "do not overwrite me"
+
+    def test_write_no_follow_refuses_a_fifo_instead_of_blocking(self, tmp_path: Path) -> None:
+        """Round-3 restart gauntlet, Architecture finding: ``write_no_follow``
+        was a fifth, already-diverged copy of the no-follow write primitive.
+
+        It opened with ``O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW`` and no
+        ``O_NONBLOCK`` and no regular-file check on the held fd -- so a FIFO
+        planted at this predictable, repo-relative ``--out`` path made the
+        open (and then the write) block the eval run indefinitely, the exact
+        gap ``evidence_common.write_bytes_no_follow`` documents ``O_NOFOLLOW``
+        as not covering. This test must complete promptly, not hang.
+        """
+        import os
+
+        from scripts.evidence_common import EvidenceGateError
+
+        fifo_path = tmp_path / "out.json"
+        os.mkfifo(fifo_path)
+
+        with pytest.raises((EvidenceGateError, OSError)):
+            eval_runner.write_no_follow(fifo_path, "payload")
+
+    def test_write_no_follow_still_writes_a_regular_file(self, tmp_path: Path) -> None:
+        """The delegation must not regress the ordinary path, including the
+        ``mkdir(parents=True)`` this wrapper keeps (the shared byte-level
+        writer does not create directories)."""
+        out_path = tmp_path / "nested" / "deeper" / "out.json"
+        eval_runner.write_no_follow(out_path, '{"ok": true}')
+        assert out_path.read_text(encoding="utf-8") == '{"ok": true}'
 
 
 class TestReportIsPersistedByDefault:

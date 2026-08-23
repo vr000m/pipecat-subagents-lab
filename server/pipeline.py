@@ -27,7 +27,7 @@ from .contracts import (
     WorkStatusState,
 )
 from .frames import CONNECTION_LOCAL_FRAMES
-from .handshake_gate import CapabilityCarrier, HandshakeGate
+from .handshake_gate import HandshakeGate
 from .observers import RuntimeObserver
 from .perf_metrics import (
     AppTurnRecorder,
@@ -696,12 +696,25 @@ class SessionHost:
     def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
         return self._handshake_gate.validate_handshake_token(token, proposed_epoch, redeem=redeem)
 
-    def validate_patch_handshake(
-        self,
-        connection: CapabilityCarrier | None,
-        handshake: SnapshotHandshake,
-    ) -> None:
-        self._handshake_gate.validate_patch_handshake(connection, handshake)
+    def validate_patch_handshake(self, handshake: SnapshotHandshake) -> None:
+        """Validate `handshake` against *this host's own* bound connection.
+
+        Takes only the handshake (round-3 restart gauntlet, Architecture
+        finding). It used to take the connection too, so the sole production
+        caller read `session_host.validate_patch_handshake(
+        session_host.connection, handshake)` -- handing the host back a piece
+        of its own state for it to forward on. The parameter existed because
+        ``HandshakeGate`` is deliberately state-free, but that is the gate's
+        constraint, not the host's: the host owns ``self.connection``
+        (see ``__init__``), so it is the one object that never needs to be
+        told which connection it is validating for.
+
+        ``HandshakeGate.validate_patch_handshake`` keeps its two-argument
+        signature -- the arbiter-level tests validate a *promoted*
+        ``Connection`` that is not the host's bound one, and go through the
+        gate directly for exactly that reason.
+        """
+        self._handshake_gate.validate_patch_handshake(self.connection, handshake)
 
     async def start(self) -> None:
         if self.started:
@@ -1255,7 +1268,7 @@ class SessionHost:
         # but not yet task-backed (the ack-to-registration window in
         # `_handle_multi_intent`) still counts as live here too.
         live = scheduler_live | self._work_ledger.live_ids() | coordinator_live
-        remaining = (live & own_work_items) - self._cancelled_work_items
+        remaining = (live & own_work_items) - self._work_ledger.cancelled_ids
         remaining.discard(child_work_item_id)
         if not remaining:
             scheduler.cancel(ack_work_item_id)
@@ -1325,7 +1338,7 @@ class SessionHost:
         try:
             turn_task = asyncio.current_task()
             if turn_task is not None:
-                self._track_turn_task(work_item_id, turn_task)
+                self._work_ledger.register_turn_task(work_item_id, turn_task)
             self.state.append_transcript(
                 TranscriptEntry(
                     role="user",
@@ -1541,7 +1554,7 @@ class SessionHost:
                     # the (tracked) turn task and unwinds this frame without
                     # ever touching an untracked search task, which would keep
                     # running with its result discarded.
-                    self._track_work_task(work_item_id, search_task)
+                    self._work_ledger.register_work_task(work_item_id, search_task)
                 self._mark_delegation_searching(
                     delegation, turn_id=turn_id, origin_epoch=origin_epoch
                 )
@@ -1677,7 +1690,7 @@ class SessionHost:
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "failed"
-            was_cancelled = work_item_id in self._cancelled_work_items
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
             self._settle_turn_ack(origin.scheduler, turn_id)
@@ -1953,7 +1966,7 @@ class SessionHost:
                 turn_id,
                 cancel_admitted=not submitted.results and not submitted.pending_work_item_ids,
             )
-            was_cancelled = work_item_id in self._cancelled_work_items
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             # A cancelled child is settled here and now, so its ack ownership
             # does not have to survive for a late result that will not speak.
             retained_still_open = retained_still_open and not was_cancelled
@@ -2332,7 +2345,7 @@ class SessionHost:
                 attributed_indexes.add(index)
                 derived = work_status_for_outcome(
                     item_outcome,
-                    cancelled=item_work_item_id in self._cancelled_work_items,
+                    cancelled=item_work_item_id in self._work_ledger.cancelled_ids,
                     terminal_kind=item_outcome,
                 )
                 if derived is not None:
@@ -2353,7 +2366,7 @@ class SessionHost:
                     continue
                 item_index = matched
                 attributed_indexes.add(item_index)
-                if work_item_id not in self._cancelled_work_items:
+                if work_item_id not in self._work_ledger.cancelled_ids:
                     retained_work_items.add(work_item_id)
                 worker_id = index_to_worker_id[item_index][0]
                 if not (
@@ -2381,7 +2394,7 @@ class SessionHost:
                 # path); a `failed` here could never be flipped back.
                 derived = child_work_status_after_dispatch(
                     "retained",
-                    cancelled=work_item_id in self._cancelled_work_items,
+                    cancelled=work_item_id in self._work_ledger.cancelled_ids,
                 )
                 if derived is not None:
                     status_state, status_reason = derived
@@ -2420,7 +2433,7 @@ class SessionHost:
                 )
                 derived = work_status_for_outcome(
                     failure_outcome,
-                    cancelled=failure.work_item_id in self._cancelled_work_items,
+                    cancelled=failure.work_item_id in self._work_ledger.cancelled_ids,
                     terminal_kind=failure_outcome,
                 )
                 if derived is not None:
@@ -2455,17 +2468,17 @@ class SessionHost:
                     parent_work_item_id=parent_work_item_id,
                     worker_id=index_to_worker_id[index][0],
                     state="cancelled"
-                    if unmatched_work_item_id in self._cancelled_work_items
+                    if unmatched_work_item_id in self._work_ledger.cancelled_ids
                     else "failed",
                     origin_epoch=origin_epoch,
                 )
-                # Neither `_known_work_items` nor `_cancelled_work_items` is
+                # Neither `_work_ledger.known_ids` nor `_work_ledger.cancelled_ids` is
                 # discarded here, unlike every other discard site: this fires
                 # when the child's fate is *unknown* (it may still be a
                 # coordinator-retained task whose late result hasn't arrived
                 # yet), not known-terminal like every sibling discard site.
                 #
-                # `_known_work_items` feeds `_cancel_work(None)`'s whole-turn
+                # `_work_ledger.known_ids` feeds `_cancel_work(None)`'s whole-turn
                 # cancel set (line ~3332). Discarding it here would remove
                 # the *only* remaining registry that can still reach this id
                 # if a whole-turn cancel arrives *after* this reconcile loop
@@ -2478,7 +2491,7 @@ class SessionHost:
                 # autoplay a result the user actually cancelled -- the exact
                 # failure this whole mechanism exists to prevent, just
                 # triggered by a cancel landing after reconcile instead of
-                # before it. `_cancelled_work_items` must stay for the
+                # before it. `_work_ledger.cancelled_ids` must stay for the
                 # matching reason: a late callback that arrives for this id
                 # must still see it as cancelled if a whole-turn cancel
                 # landed (before *or* after this loop).
@@ -2689,7 +2702,7 @@ class SessionHost:
         if task is None:
             return SearchExecution("capacity_rejected")
         work_item_id = work_item_id or f"work-{turn_id}"
-        self._track_work_task(work_item_id, task)
+        self._work_ledger.register_work_task(work_item_id, task)
         # Captured before the foreground wait below, which may span other
         # turns being accepted concurrently: this is the turn-sequence
         # snapshot LateDeliveryContext needs to detect a newer-turn arrival.
@@ -2848,7 +2861,7 @@ class SessionHost:
         # the marker's consumption independent of branch order; the error
         # path keeps its pre-existing behavior of leaving the marker
         # untouched.
-        was_cancelled = late.error is None and late.work_item_id in self._cancelled_work_items
+        was_cancelled = late.error is None and late.work_item_id in self._work_ledger.cancelled_ids
         if was_cancelled:
             self._work_ledger.clear_cancelled(late.work_item_id)
             if isinstance(late.result, GroundedResult):
@@ -3132,7 +3145,7 @@ class SessionHost:
         """
         origin_epoch = result.origin_epoch
         work_item_id = f"work-{result.turn_id}"
-        if work_item_id in self._cancelled_work_items:
+        if work_item_id in self._work_ledger.cancelled_ids:
             self._work_ledger.clear_cancelled(work_item_id)
             self._work_ledger.retire(work_item_id)
             self._worker_projection.pop_clarification_candidate(result.result_id)
@@ -3178,38 +3191,17 @@ class SessionHost:
         return coordinator.dispatch(decision, catalogue=catalogue)
 
     # ------------------------------------------------------------------
-    # Work/turn task bookkeeping. Storage lives in `self._work_ledger`
-    # (server/work_task_ledger.py, deep-review Architecture finding #3);
-    # these properties forward to it so every other read/write call site in
-    # this class keeps working unchanged. `_track_work_task` and
-    # `_track_turn_task` are thin delegators to the ledger's tracking
-    # methods. `_cancel_work` still needs the coordinator (which the ledger
+    # Work/turn task bookkeeping. Storage *and* the tracking API both live on
+    # `self._work_ledger` (server/work_task_ledger.py, deep-review
+    # Architecture finding #3); call sites in this class reach the ledger
+    # directly (`self._work_ledger.known_ids`,
+    # `self._work_ledger.register_work_task`, ...) rather than through
+    # pass-through properties on the host, so there is exactly one API for
+    # this state. `_cancel_work` still needs the coordinator (which the ledger
     # deliberately has no handle to -- see the ledger's module docstring),
     # so it composes the ledger's local selection/cancellation with the
     # coordinator's own cancel; the union logic itself is unchanged.
     # ------------------------------------------------------------------
-    @property
-    def _inflight_turn_tasks(self) -> dict[str, asyncio.Task[Any]]:
-        return self._work_ledger.turn_tasks
-
-    @property
-    def _inflight_work_tasks(self) -> dict[str, set[asyncio.Task[Any]]]:
-        return self._work_ledger.work_tasks
-
-    @property
-    def _known_work_items(self) -> set[str]:
-        return self._work_ledger.known_ids
-
-    @property
-    def _cancelled_work_items(self) -> set[str]:
-        return self._work_ledger.cancelled_ids
-
-    def _track_work_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
-        self._work_ledger.register_work_task(work_item_id, task)
-
-    def _track_turn_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
-        self._work_ledger.register_turn_task(work_item_id, task)
-
     def _cancel_work(
         self,
         work_item_id: str | None,

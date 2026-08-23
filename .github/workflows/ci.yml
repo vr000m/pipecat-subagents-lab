@@ -75,9 +75,28 @@ jobs:
             ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
             git /repo --no-banner --redact --log-opts="$scan_range"
 
-  # Owns the v0.1.3 release/manifest identity: derives deployment metadata
-  # from a clean release checkout and (re)writes the provisional promotion
-  # manifest scripts/validate_v013_evidence.py's evidence gates produce.
+  # Guards the v0.1.3 release/manifest identity: derives deployment metadata
+  # from a clean release checkout, then verifies the *committed* promotion
+  # manifest still matches the evidence it binds.
+  #
+  # This job used to WRITE the manifest with --write-manifest --output
+  # docs/benchmarks/v0.1.3-promotion-manifest.json and end there -- no commit,
+  # no actions/upload-artifact, no deploy step, and `permissions: contents:
+  # read` so it could not have pushed one anyway. The consumer,
+  # server/config.py's load_promotion_manifest, reads the repo-committed file.
+  # So the generated manifest went into an ephemeral workspace and was
+  # discarded: producer and consumer were never connected, and the job proved
+  # nothing (round-3 restart gauntlet, Architecture finding). Worse, it wrote a
+  # *provisional* manifest over the path holding a *final* one, so had the
+  # write ever been delivered it would have downgraded the committed manifest.
+  #
+  # Verification is the conservative remedy: it makes the job prove something
+  # real about the file the consumer actually reads (input digests, schema
+  # hash, gate outcomes, promotion_eligible) and fails on drift, without
+  # introducing a publish/upload path. Whether and how the manifest gets
+  # published is a release-mechanics decision for an operator, not something
+  # this job should start doing on its own.
+  #
   # This job never enables autoplay by itself -- a provisional manifest is
   # always promotion_eligible=false; see docs/dev_plans/
   # 20260728-feature-early-ack-background-delivery-v0.1.3.md Phase 2.
@@ -105,14 +124,21 @@ jobs:
       - name: Derive and export deployment metadata
         run: uv run python scripts/emit_v013_deployment_metadata.py --shell-export >> "$GITHUB_ENV"
 
-      - name: Write the provisional promotion manifest
+      # Read-only. Fails the job if the committed manifest no longer matches
+      # the evidence it binds -- an edited evidence artifact, a changed
+      # evidence schema, an input that no longer passes its gate, or a
+      # promotion_eligible the current evidence does not support. The fix for
+      # a failure here is to regenerate the manifest with --write-manifest
+      # locally and commit it, which is a deliberate human step.
+      #
+      # The release-identity fields (source_commit, source_tree_hash,
+      # deployed_at_utc, ...) are deliberately NOT compared: a manifest
+      # committed at one commit can never match a regeneration at a later one,
+      # so comparing them would make this job fail on every push. See
+      # _MANIFEST_VOLATILE_FIELDS in scripts/validate_v013_evidence.py. The
+      # metadata derivation above still runs, because that step failing is
+      # itself a signal the release checkout is not clean.
+      - name: Verify the committed promotion manifest has not drifted
         run: |
-          uv run python scripts/validate_v013_evidence.py --write-manifest --manifest-phase provisional \
-            --phase0-input docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl \
-            --phase1-input docs/benchmarks/v0.1.3-phase1-ack-evidence.jsonl \
-            --phase2-input docs/benchmarks/v0.1.3-phase2-transport-browser-contract.json \
-            --source-commit "$PIPECAT_SOURCE_COMMIT" \
-            --source-tree-hash "$PIPECAT_SOURCE_TREE_HASH" \
-            --deployed-at-utc "$PIPECAT_DEPLOYED_AT_UTC" \
-            --feature-policy-fingerprint "$PIPECAT_FEATURE_POLICY_FINGERPRINT" \
-            --output docs/benchmarks/v0.1.3-promotion-manifest.json
+          uv run python scripts/validate_v013_evidence.py \
+            --verify-manifest docs/benchmarks/v0.1.3-promotion-manifest.json

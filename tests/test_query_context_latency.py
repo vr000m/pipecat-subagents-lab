@@ -1641,6 +1641,118 @@ def test_runner_condition_order_is_reproducible_for_a_given_seed(tmp_path: Path)
     assert a["condition_orders"] == b["condition_orders"]
 
 
+def test_value_default_follows_the_selected_dimensions_units(tmp_path: Path) -> None:
+    """Round-3 restart gauntlet, Logic finding: ``--value``'s default was
+    hardcoded to ``NARROWED_VALUE`` regardless of ``--dimension``.
+
+    ``NARROWED_VALUE`` is 2, a *history turn count*. Running
+    ``--dimension answer_chars`` without an explicit ``--value`` therefore
+    swept an answer budget of 2 characters against the 1200-character
+    baseline, and ``build_dry_run_artifact`` baked that 2 into the artifact as
+    the narrowed answer_chars value. The run exited 0 and emitted a
+    well-formed artifact, so the wrong-dimension default was entirely silent.
+    """
+    module = _runner()
+
+    output = tmp_path / "answer-chars.json"
+    assert (
+        module.main(
+            [
+                "--dry-run",
+                "--fixture",
+                str(_fixture_path()),
+                "--output",
+                str(output),
+                "--dimension",
+                "answer_chars",
+                "--seed",
+                "1",
+            ]
+        )
+        == 0
+    )
+    artifact = json.loads(output.read_text())
+    assert artifact["selected_dimension"] == "answer_chars"
+    narrowed = {r["selected_value"] for r in artifact["records"] if r["condition"] == "narrowed"}
+    assert narrowed == {module.NARROWED_ANSWER_CHARS}
+    # The bug's signature: a 2-character answer budget.
+    assert module.NARROWED_VALUE not in narrowed
+
+    # The history_count default is unchanged.
+    history_output = tmp_path / "history-count.json"
+    assert (
+        module.main(
+            [
+                "--dry-run",
+                "--fixture",
+                str(_fixture_path()),
+                "--output",
+                str(history_output),
+                "--seed",
+                "1",
+            ]
+        )
+        == 0
+    )
+    history_artifact = json.loads(history_output.read_text())
+    assert history_artifact["selected_dimension"] == "history_count"
+    assert {
+        r["selected_value"] for r in history_artifact["records"] if r["condition"] == "narrowed"
+    } == {module.NARROWED_VALUE}
+
+
+def test_every_selectable_dimension_has_a_narrowed_default() -> None:
+    """The map must stay in step with ``SELECTABLE_DIMENSIONS`` -- a new
+    dimension added without a narrowed default would otherwise reintroduce the
+    silent wrong-units default (or, now, raise at run time)."""
+    module = _runner()
+    assert set(module.NARROWED_VALUE_BY_DIMENSION) == set(module.SELECTABLE_DIMENSIONS)
+
+
+def test_load_fixture_refuses_a_fifo_and_a_symlink(tmp_path: Path) -> None:
+    """Round-3 restart gauntlet, Security finding: ``load_fixture`` read the
+    operator-supplied ``--fixture`` path with a raw ``path.open()``.
+
+    No symlink refusal, no FIFO guard, no size cap -- while this same module
+    already imported the hardened helpers and confined its *write* side. A
+    FIFO or ``/dev/zero`` at the fixture path hung or exhausted memory before
+    the run. This test must complete promptly.
+    """
+    import os
+
+    module = _runner()
+
+    fifo = tmp_path / "fixture.json"
+    os.mkfifo(fifo)
+    with pytest.raises(module.EvidenceGateError):
+        module.load_fixture(fifo)
+
+    real = tmp_path / "real-fixture.json"
+    real.write_text(json.dumps({"fixture_version": "v1", "turns": [{"turn_id": "t"}]}))
+    link = tmp_path / "linked-fixture.json"
+    link.symlink_to(real)
+    with pytest.raises(module.EvidenceGateError):
+        module.load_fixture(link)
+
+    # The ordinary path still works.
+    assert module.load_fixture(real)["fixture_version"] == "v1"
+
+
+def test_load_fixture_turns_a_malformed_fixture_into_a_gate_error(tmp_path: Path) -> None:
+    """``load_json`` collapses read *and* parse failures into one
+    ``EvidenceGateError``, so a truncated fixture no longer escapes as a raw
+    ``json.JSONDecodeError``."""
+    module = _runner()
+    broken = tmp_path / "broken.json"
+    broken.write_text('{"fixture_version": ', encoding="utf-8")
+    with pytest.raises(module.EvidenceGateError):
+        module.load_fixture(broken)
+
+    missing = tmp_path / "absent.json"
+    with pytest.raises(module.EvidenceGateError):
+        module.load_fixture(missing)
+
+
 def test_collector_rejects_a_match_id_the_fixture_does_not_declare(tmp_path: Path) -> None:
     """Regression: the collector recomputed scorer_hash purely from fields the
     record itself supplied, so an editor could invent a match, recompute the

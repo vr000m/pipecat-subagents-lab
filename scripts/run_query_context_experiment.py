@@ -63,279 +63,94 @@ fields to be self-describing.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import random
 import sys
-from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from scripts.evidence_common import (
+    REPO_ROOT,
     EvidenceGateError,
     closed_object,
     confined_output_path,
     require_type,
     write_bytes_no_follow,
 )
+from scripts.query_context_common import (
+    CACHE_STATUSES,
+    CONDITIONS,
+    OUTCOMES,
+    RAW_ALLOWED,
+    RAW_REQUIRED,
+    SCORER_VERSION,
+    SELECTABLE_DIMENSIONS,
+    load_fixture,
+    scorer_hash,
+    validate_raw_record,
+)
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# Re-exported for existing callers (in this module and in tests reaching them
+# via ``scripts.run_query_context_experiment``) that pull these names from
+# this module rather than from ``scripts.query_context_common`` directly --
+# see ``scripts/query_context_common.py``'s module docstring for why they
+# moved. Listed explicitly so ruff's unused-import check does not flag names
+# this module re-exports but does not itself reference.
+__all__ = [
+    "CACHE_STATUSES",
+    "CONDITIONS",
+    "OUTCOMES",
+    "RAW_ALLOWED",
+    "RAW_REQUIRED",
+    "SCORER_VERSION",
+    "SELECTABLE_DIMENSIONS",
+    "load_fixture",
+    "main",
+    "scorer_hash",
+    "validate_raw_record",
+]
 
-SCORER_VERSION = "v1"
 SELECTED_DIMENSION = "history_count"
-SELECTABLE_DIMENSIONS = frozenset({"history_count", "answer_chars"})
 BASELINE_VALUE = 4  # matches production server/workers/web_search.py history[-4:]
 NARROWED_VALUE = 2  # the one named candidate condition this experiment evaluates
 DEFAULT_ANSWER_CHAR_LIMIT = 1200  # matches production _contextual_input's per-entry truncation
-CONDITIONS = ("baseline", "narrowed")
+NARROWED_ANSWER_CHARS = 600  # the answer_chars candidate condition: half the production limit
+
+#: The narrowed value ``--value`` defaults to, *per dimension* (round-3
+#: restart gauntlet, Logic finding). The default used to be ``NARROWED_VALUE``
+#: unconditionally -- but that constant is a *history turn count*. Running
+#: ``--dimension answer_chars`` without an explicit ``--value`` therefore swept
+#: an answer budget of 2 characters against the 1200-character baseline, and
+#: ``build_dry_run_artifact`` baked that 2 into the artifact as the narrowed
+#: answer_chars value. The run completed and emitted a well-formed artifact,
+#: so the wrong-dimension default was entirely silent. Keyed by dimension so a
+#: new dimension cannot inherit another dimension's units by omission --
+#: ``_default_narrowed_value`` raises for a dimension missing from this map.
+NARROWED_VALUE_BY_DIMENSION = {
+    "history_count": NARROWED_VALUE,
+    "answer_chars": NARROWED_ANSWER_CHARS,
+}
 DEFAULT_BASELINE_REPEATS = 10
 DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-4o-search-preview"
 
-RAW_REQUIRED = frozenset(
-    {
-        "run_id",
-        "run_block",
-        "run_order",
-        "fixture_version",
-        "fixture_turn_id",
-        "condition",
-        "selected_dimension",
-        "selected_value",
-        "context_chars",
-        "query_chars",
-        "provider",
-        "model",
-        "latency_ms",
-        "outcome",
-        "quality_score",
-        "matched_fact_ids",
-        "matched_citation_ids",
-        "matched_disallowed_claim_ids",
-        "scorer_version",
-        "scorer_hash",
-        "attempt_count",
-        "retry_count",
-        "rate_limit_count",
-        "cache_status",
-        "retrieval_snapshot_id",
-        "recorded_at_utc",
-    }
-)
-# `fixture_sha256` is populated by the collector (a sha256 of the exact
-# fixture file bytes each record's matched IDs/quality_score were resolved
-# against), not by the runner's raw output, so it is allowed but not
-# required -- an artifact predating this field is still valid raw shape.
-RAW_ALLOWED = RAW_REQUIRED | frozenset({"fixture_sha256"})
 
-# Fields deliberately excluded from `scorer_hash`'s whole-record binding.
-# `scorer_hash` is the digest itself; `fixture_sha256` is stamped by the
-# collector *after* the runner has scored and hashed the record, and has its
-# own binding path (compared against `sha256_file(fixture_path)`).
-_UNBOUND_RECORD_FIELDS = frozenset({"scorer_hash", "fixture_sha256"})
+def _default_narrowed_value(dimension: str) -> int:
+    """The ``--value`` default for `dimension`, in that dimension's own units.
 
-
-OUTCOMES = frozenset({"success", "error", "timeout"})
-CACHE_STATUSES = frozenset({"hit", "miss", "unknown"})
-
-# (field, python types, minimum) for the numeric raw fields, mirroring
-# `shared/schemas/v013-query-context-raw.json`'s type/minimum constraints.
-_RAW_NUMERIC_FIELDS: tuple[tuple[str, tuple[type, ...], float], ...] = (
-    ("run_block", (int,), 0),
-    ("run_order", (int,), 0),
-    ("selected_value", (int,), 0),
-    ("context_chars", (int,), 0),
-    ("query_chars", (int,), 0),
-    ("latency_ms", (int, float), 0),
-    ("attempt_count", (int,), 1),
-    ("retry_count", (int,), 0),
-    ("rate_limit_count", (int,), 0),
-)
-_RAW_STRING_FIELDS = (
-    "run_id",
-    "fixture_version",
-    "fixture_turn_id",
-    "provider",
-    "model",
-    "scorer_version",
-    "recorded_at_utc",
-)
-_RAW_ID_LIST_FIELDS = (
-    "matched_fact_ids",
-    "matched_citation_ids",
-    "matched_disallowed_claim_ids",
-)
-
-
-def validate_raw_record(record: dict[str, Any], *, where: str = "record") -> None:
-    """Full type/range/enum validation of one raw record against the schema.
-
-    Both the collector and the analyzer need this: a hand-edited or
-    externally produced JSONL can reach either one, and a key-set
-    (`closed_object`) check alone lets wrong numeric types, negative values,
-    and invalid enums through to skew statistics or raise downstream. It
-    lives here because this module already owns `RAW_REQUIRED`/`RAW_ALLOWED`,
-    so the allowlist and the field contract cannot drift apart.
+    Raises rather than falling back, so a dimension added to
+    ``SELECTABLE_DIMENSIONS`` without a narrowed default here fails loudly
+    instead of silently inheriting another dimension's units -- the exact
+    failure this map replaced.
     """
-    closed_object(record, required=RAW_REQUIRED, allowed=RAW_ALLOWED)
-    for field in _RAW_STRING_FIELDS:
-        value = record[field]
-        require_type(value, (str,), f"{where}: {field}")
-        if not value:
-            raise EvidenceGateError(f"{where}: {field} must be non-empty")
-    if record["condition"] not in CONDITIONS:
-        raise EvidenceGateError(f"{where}: invalid condition {record['condition']!r}")
-    if record["selected_dimension"] not in SELECTABLE_DIMENSIONS:
+    try:
+        return NARROWED_VALUE_BY_DIMENSION[dimension]
+    except KeyError:
         raise EvidenceGateError(
-            f"{where}: invalid selected_dimension {record['selected_dimension']!r}"
-        )
-    if record["outcome"] not in OUTCOMES:
-        raise EvidenceGateError(f"{where}: invalid outcome {record['outcome']!r}")
-    if record["cache_status"] not in CACHE_STATUSES:
-        raise EvidenceGateError(f"{where}: invalid cache_status {record['cache_status']!r}")
-    # A record's declared `scorer_version` was previously never checked against
-    # anything -- `scorer_hash` bound the module constant `SCORER_VERSION`
-    # regardless of what a record claimed, so a uniformly forged
-    # `scorer_version` across an entire batch produced an identical, correctly
-    # matching digest and passed every gate. Rejecting any declared value that
-    # is not the actual current scorer version closes that gap independent of
-    # hash binding.
-    if record["scorer_version"] != SCORER_VERSION:
-        raise EvidenceGateError(
-            f"{where}: scorer_version {record['scorer_version']!r} does not match the "
-            f"current scorer version {SCORER_VERSION!r}"
-        )
-
-    for field, kinds, minimum in _RAW_NUMERIC_FIELDS:
-        value = record[field]
-        require_type(value, kinds, f"{where}: {field}")
-        if value < minimum:
-            raise EvidenceGateError(f"{where}: {field} must be >= {minimum}, got {value!r}")
-
-    require_type(record["quality_score"], (int, float), f"{where}: quality_score")
-    if not (0.0 <= float(record["quality_score"]) <= 1.0):
-        raise EvidenceGateError(f"{where}: quality_score must be within [0, 1]")
-
-    for field in _RAW_ID_LIST_FIELDS:
-        value = record[field]
-        require_type(value, (list,), f"{where}: {field}")
-        for item in value:
-            if not isinstance(item, str) or not item:
-                raise EvidenceGateError(f"{where}: {field} entries must be non-empty strings")
-
-    digest = record["scorer_hash"]
-    require_type(digest, (str,), f"{where}: scorer_hash")
-    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-        raise EvidenceGateError(f"{where}: scorer_hash must be a 64-character lowercase hex digest")
-
-    snapshot = record["retrieval_snapshot_id"]
-    if snapshot is not None:
-        require_type(snapshot, (str,), f"{where}: retrieval_snapshot_id")
-        if not snapshot:
-            raise EvidenceGateError(f"{where}: retrieval_snapshot_id must be non-empty or null")
-
-    if "fixture_sha256" in record:
-        fixture_digest = record["fixture_sha256"]
-        require_type(fixture_digest, (str,), f"{where}: fixture_sha256")
-        if len(fixture_digest) != 64 or any(c not in "0123456789abcdef" for c in fixture_digest):
-            raise EvidenceGateError(
-                f"{where}: fixture_sha256 must be a 64-character lowercase hex digest"
-            )
-
-
-def scorer_hash(
-    fixture_version: str,
-    fixture_turn_id: str | None = None,
-    *,
-    matched_fact_ids: list[str] | None = None,
-    matched_citation_ids: list[str] | None = None,
-    matched_disallowed_claim_ids: list[str] | None = None,
-    quality_score: float | None = None,
-    scorer_version: str = SCORER_VERSION,
-    record: Mapping[str, Any] | None = None,
-) -> str:
-    """Provenance hash binding a scorer identity to a fixture (and, when the
-    per-record fields are supplied, to one record's exact matched-ID sets and
-    quality_score).
-
-    Called two ways: ``scorer_hash(fixture_version)`` is the coarse
-    scorer/fixture identity binding -- it changes whenever the scorer version
-    or fixture version changes. The fully-parameterized form additionally
-    binds one record's sorted matched-ID sets and quality_score, so a caller
-    who forges or edits a matched ID after scoring -- without re-running the
-    scorer -- changes this hash's expected value, letting
-    ``collect_query_context_latency.py`` detect the forgery by recomputing
-    and comparing, with no fixture file of its own to consult.
-
-    ``scorer_version`` defaults to the module constant for internal callers
-    stamping a hash for a record they are about to emit (there is no
-    record yet to read a declared version from). A verifier recomputing this
-    hash to check an *existing* record must instead pass
-    ``record["scorer_version"]`` explicitly -- otherwise recomputing with the
-    constant regardless of what the record declares lets a uniformly forged
-    ``scorer_version`` produce a matching digest for every record in a batch.
-
-    ``record`` binds the *whole* raw record, not just the scoring fields. The
-    scoring-field-only payload authenticated exactly the values the scorer
-    produced and nothing else, which left the measurement and stratum-identity
-    fields the promotion decision actually rests on -- ``latency_ms``,
-    ``condition``, ``selected_value``, ``provider``, ``model``, ``outcome``,
-    ``cache_status``, ``retrieval_snapshot_id``, the attempt/retry/rate-limit
-    counters -- entirely unauthenticated. Since the analyzer's synthetic guard
-    is a name denylist over those same unbound strings
-    (``SYNTHETIC_STRATA``), a dry-run artifact could be relabelled into the
-    paid stratum with any chosen latency and still satisfy every ID, quality,
-    fixture-digest, and hash check. Binding the full record closes that: any
-    post-scoring edit to any field invalidates the digest.
-
-    ``scorer_hash`` itself is excluded (it is the digest being computed) and
-    so is ``fixture_sha256``, which the *collector* stamps onto a record after
-    the runner has already scored and hashed it; including it would make the
-    runner's stamp and every verifier's recomputation disagree by
-    construction. ``fixture_sha256`` has its own binding path -- it is
-    compared against ``sha256_file(fixture_path)``.
-
-    This remains a keyless self-hash: it detects edits to a runner-produced
-    artifact, not a wholly regenerated one. Fixture resolution
-    (``validate_against_fixture``) is the anti-fabrication layer on top. A
-    threat model that includes regeneration needs an HMAC stamped with a
-    collection-time key, or a signed artifact, not a bare SHA-256.
-    """
-    fixture_turn_id = fixture_turn_id or ""
-    matched_fact_ids = matched_fact_ids or []
-    matched_citation_ids = matched_citation_ids or []
-    matched_disallowed_claim_ids = matched_disallowed_claim_ids or []
-    bound_record = (
-        {key: value for key, value in sorted(record.items()) if key not in _UNBOUND_RECORD_FIELDS}
-        if record is not None
-        else None
-    )
-    payload = json.dumps(
-        {
-            "scorer_version": scorer_version,
-            "fixture_version": fixture_version,
-            "fixture_turn_id": fixture_turn_id,
-            "matched_fact_ids": sorted(matched_fact_ids),
-            "matched_citation_ids": sorted(matched_citation_ids),
-            "matched_disallowed_claim_ids": sorted(matched_disallowed_claim_ids),
-            "quality_score": round(float(quality_score), 6) if quality_score is not None else None,
-            "record": bound_record,
-        },
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def load_fixture(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        fixture = json.load(handle)
-    if not isinstance(fixture, dict) or "fixture_version" not in fixture or "turns" not in fixture:
-        raise EvidenceGateError(f"{path}: fixture must be an object with fixture_version/turns")
-    if not fixture["turns"]:
-        raise EvidenceGateError(f"{path}: fixture must declare at least one turn")
-    return fixture
+            f"--dimension {dimension!r} has no narrowed default; pass --value explicitly"
+        ) from None
 
 
 def score_response(
@@ -601,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"unknown --dimension {args.dimension!r}; must be one of "
                 f"{sorted(SELECTABLE_DIMENSIONS)}"
             )
-        values = args.value if args.value is not None else [NARROWED_VALUE]
+        values = args.value if args.value is not None else [_default_narrowed_value(args.dimension)]
         if len(values) != 1:
             raise EvidenceGateError(
                 f"exactly one --value must be selected per named condition, got {len(values)}"

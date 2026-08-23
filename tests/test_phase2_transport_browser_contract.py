@@ -327,6 +327,93 @@ def test_main_cli_returns_nonzero_for_an_unreadable_input_file(tmp_path: Path) -
     assert exit_code == 1
 
 
+def test_malformed_package_json_is_a_gate_error_not_a_raw_traceback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Round-3 restart gauntlet, Logic finding: ``_package_json_declared_version``
+    used ``json.loads(PACKAGE_JSON_PATH.read_text(...))`` with no error
+    handling.
+
+    ``json.JSONDecodeError`` subclasses ``ValueError``, not ``OSError``, so a
+    truncated or malformed web/package.json sailed past ``main()``'s
+    ``except (EvidenceGateError, OSError)`` and produced a raw traceback and a
+    nonstandard exit code instead of the gate's structured failure. It now
+    reads through ``load_json``, which collapses every read/parse failure into
+    one ``EvidenceGateError``.
+    """
+    module = _load_validator()
+    broken = tmp_path / "package.json"
+    broken.write_text('{"dependencies": {', encoding="utf-8")
+    monkeypatch.setattr(module, "PACKAGE_JSON_PATH", broken)
+
+    with pytest.raises(module.EvidenceGateError):
+        module._package_json_declared_version()
+
+    # And end-to-end through the CLI: a controlled exit code, not a traceback.
+    artifact = _write(tmp_path, _valid_artifact())
+    assert module.main(["--input", str(artifact)]) == 1
+
+
+class TestDeclaredRangeAdmitsTheLockedPin:
+    """Round-3 restart gauntlet, Logic finding: package.json's dependency spec
+    was compared to the lockfile's *resolved* version with ``!=``.
+
+    Any range prefix (``^1.10.6``, ``~1.10.6``, ``>=1.10.6``) failed that
+    equality even when the lockfile pin was a correct resolution of the range,
+    producing a false "regenerate the lockfile" gate failure. Latent only
+    because both files currently hold the bare string ``1.10.6``; it fires on
+    the next dependency edit that introduces a caret.
+    """
+
+    def _admits(self, declared: str, locked: str) -> bool:
+        return _load_validator()._declared_range_admits(declared, locked)
+
+    def test_exact_pin_still_requires_equality(self) -> None:
+        assert self._admits("1.10.6", "1.10.6") is True
+        assert self._admits("1.10.6", "1.10.7") is False
+
+    def test_caret_admits_a_later_minor_and_patch_in_the_same_major(self) -> None:
+        assert self._admits("^1.10.6", "1.10.6") is True
+        assert self._admits("^1.10.6", "1.11.0") is True
+        assert self._admits("^1.10.6", "1.10.5") is False
+        assert self._admits("^1.10.6", "2.0.0") is False
+
+    def test_caret_on_a_zero_major_is_bounded_by_the_minor(self) -> None:
+        """``^0.2.3`` is ``<0.3.0``, not ``<1.0.0`` -- the left-most non-zero
+        rule. Getting this wrong would wave through a breaking 0.x bump."""
+        assert self._admits("^0.2.3", "0.2.9") is True
+        assert self._admits("^0.2.3", "0.3.0") is False
+        assert self._admits("^0.0.3", "0.0.3") is True
+        assert self._admits("^0.0.3", "0.0.4") is False
+
+    def test_tilde_is_bounded_by_the_minor(self) -> None:
+        assert self._admits("~1.10.6", "1.10.9") is True
+        assert self._admits("~1.10.6", "1.11.0") is False
+
+    def test_comparison_operators(self) -> None:
+        assert self._admits(">=1.10.6", "2.0.0") is True
+        assert self._admits(">=1.10.6", "1.10.5") is False
+        assert self._admits(">1.10.6", "1.10.6") is False
+        assert self._admits("<2.0.0", "1.99.0") is True
+        assert self._admits("<=1.10.6", "1.10.6") is True
+
+    def test_an_unevaluatable_range_fails_closed(self) -> None:
+        """This is an evidence gate: a range shape it cannot reason about must
+        raise "pin it exactly", never be silently admitted."""
+        module = _load_validator()
+        for spec in ("*", "1.x", "^1.0.0 || ^2.0.0", "1.0.0 - 2.0.0", "workspace:*", "latest"):
+            with pytest.raises(module.EvidenceGateError):
+                self._admits(spec, "1.10.6")
+
+    def test_the_repo_as_it_stands_passes(self) -> None:
+        """The real web/package.json and web/bun.lock must still agree -- the
+        new comparison must not have loosened or broken the live check."""
+        module = _load_validator()
+        declared = module._package_json_declared_version()
+        locked, _integrity = module._lockfile_dependency_anchor()
+        assert module._declared_range_admits(declared, locked) is True
+
+
 def test_validator_records_audibility_unverified_when_no_named_browser_device_check_exists(
     tmp_path: Path,
 ) -> None:

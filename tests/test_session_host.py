@@ -249,7 +249,7 @@ def test_shutdown_finalizes_retained_recorders_only_after_coordinator_shutdown_r
 
         # Register a retained work item the way the real timeout path does,
         # so the host has an open recorder to finalize during shutdown.
-        host._known_work_items.add("work-open-at-shutdown")
+        host._work_ledger.known_ids.add("work-open-at-shutdown")
 
         await host.shutdown()
 
@@ -724,12 +724,12 @@ def test_commit_late_result_once_cancelled_before_callback_still_commits_display
             promotion_manifest=PromotionManifest(promotion_eligible=True), speakable=True
         )
         # Simulate the turn's child work item having already been cancelled
-        # before this late callback arrives -- the same _cancelled_work_items
+        # before this late callback arrives -- the same _work_ledger.cancelled_ids
         # membership host.cancel_turn_or_child() itself populates for a real
         # in-flight task (see cancel_turn_or_child -> _cancel_work), driven
         # directly here since this scenario has no real dispatched task to
         # cancel through the coordinator.
-        host._cancelled_work_items.add("work-late-1")
+        host._work_ledger.cancelled_ids.add("work-late-1")
         context = _late_delivery_context(host)
         result = _grounded_result()
 
@@ -914,7 +914,7 @@ def test_commit_late_result_once_cancelled_foreign_epoch_result_is_never_committ
             pytest.skip("commit_late_result_once not yet implemented")
         sink = CollectingMeasurementSink()
         host, _origin = await _connected_host(measurement_sink=sink)
-        host._cancelled_work_items.add("work-late-1")
+        host._work_ledger.cancelled_ids.add("work-late-1")
         _register_late_recorder(host)
         context = _late_delivery_context(host, origin_epoch=1)
         # Foreign-epoch result: the worker produced it under epoch 7 while the
@@ -949,7 +949,7 @@ def test_commit_late_result_once_cancelled_duplicate_is_classified_suppressed_du
         result = _grounded_result()
 
         for _ in range(2):
-            host._cancelled_work_items.add("work-late-1")
+            host._work_ledger.cancelled_ids.add("work-late-1")
             _register_late_recorder(host)
             await host.commit_late_result_once(
                 _late_delivery_context(host),

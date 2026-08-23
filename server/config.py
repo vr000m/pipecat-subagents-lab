@@ -15,6 +15,7 @@ from importlib.metadata import version as _package_version
 from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
+from stat import S_ISREG
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -480,14 +481,35 @@ def _read_regular_file_no_follow(path: Path, *, max_bytes: int) -> bytes | None:
     treat every evidence-read failure as one fail-closed outcome (e.g.
     `evidence_unresolvable`/`manifest_missing`/`phase4c_unresolvable`), so
     there is nothing for a caller to do differently per failure kind.
+
+    **Deliberately not shared with `scripts/evidence_common.read_bytes_no_follow`,
+    which performs the same open/fstat/bounded-read sequence.** Two reasons,
+    both structural rather than incidental:
+
+    1. `server/` must stay deployable without the `scripts/` package, and
+       `scripts/` must stay free of `server.*` imports (the evidence gates run
+       in checkouts with no pipecat runtime installed). Neither direction of
+       import is available, so "share it" would mean introducing a third
+       top-level package purely for two ~25-line functions.
+    2. The two have *opposite* error contracts by design. This one collapses
+       every failure to `None` because it runs on the server-boot path, where
+       the only correct response to unreadable evidence is a fail-closed
+       display-only verdict. `read_bytes_no_follow` raises `EvidenceGateError`
+       because it runs in a CLI gate, where the only correct response is a
+       loud non-zero exit. Unifying would force one contract onto both call
+       sites and lose that distinction.
+
+    What *must* stay in step is the hardening itself -- the flag set
+    (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`), the `fstat`-on-the-held-fd
+    `S_ISREG` check, the chunked read, and the byte cap. A change to any of
+    those here needs the mirrored change in
+    `scripts/evidence_common._iter_file_chunks`, and vice versa.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
-        from stat import S_ISREG
-
         st = os.fstat(fd)
         if not S_ISREG(st.st_mode):
             return None

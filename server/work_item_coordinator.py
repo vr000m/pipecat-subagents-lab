@@ -232,6 +232,37 @@ class Coordinator(Protocol):
     ) -> None: ...
 
 
+OPTIONAL_COORDINATOR_MEMBERS: frozenset[str] = frozenset(
+    {
+        "registry",
+        "config",
+        "OWNED_CONFIG_FIELDS",
+        "live_work_item_ids",
+        "start_task",
+        "cancel",
+        "shutdown",
+    }
+)
+"""The one roster of the optional coordinator members, named once.
+
+This module states the coordinator boundary four times on purpose --
+``OptionalCoordinator`` (the spec an implementer reads), ``CoordinatorDefaults``
+(the concrete fallbacks an implementer can subclass), ``CoordinatorView`` (the
+resolved, statically-typed shape production calls through) and
+``coordinator_view`` (the resolution itself). Each says something the others
+cannot, so they are not collapsible; a view generated from
+``OptionalCoordinator.__annotations__`` would have to be dynamically
+constructed, which would erase exactly the per-member typing
+:class:`StartTask`/:class:`CancelWork` exist to restore.
+
+What is *not* deliberate is that adding a member requires four coordinated
+edits with nothing catching a missed one -- two such drifts have already
+happened (see ``CoordinatorDefaults.OWNED_CONFIG_FIELDS``' note and
+``start_task``'s keyword). This frozenset is the single roster all four are
+pinned against by a test, so a member added to three of them fails the suite
+instead of silently taking a fallback in production."""
+
+
 class OptionalCoordinator(Protocol):
     """The 7 ``Coordinator`` members accessed via ``getattr`` fallbacks.
 
@@ -297,6 +328,35 @@ class CoordinatorDefaults:
         return None
 
 
+class StartTask(Protocol):
+    """The bound-method shape of ``Coordinator.start_task``.
+
+    Exists so ``CoordinatorView.start_task`` can carry the real signature
+    instead of ``Callable[..., asyncio.Task[Any] | None]``. ``...`` erased the
+    keyword-only ``mandatory`` that ``Coordinator``/``OptionalCoordinator``
+    declare, on the one boundary declaration production actually resolves
+    through, so a ``view.start_task(op, mandatory=True)`` call was unchecked.
+
+    This constrains the *call* side (and any typed value assigned to the
+    field). It cannot constrain what a coordinator supplies, because
+    ``coordinator_view`` reads members off an ``Any`` via ``getattr`` on
+    purpose -- the suite's duck-typed coordinator doubles do not conform to
+    the Protocol (see ``Coordinator``'s docstring). A coordinator whose
+    ``start_task`` omits ``mandatory`` still fails at runtime, not at
+    type-check time; what changed is that the call sites can no longer drop
+    the keyword unnoticed, and a signature change on the Protocols is pinned
+    against this one by a test.
+    """
+
+    def __call__(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None: ...
+
+
+class CancelWork(Protocol):
+    """The bound-method shape of ``Coordinator.cancel``; see :class:`StartTask`."""
+
+    def __call__(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
+
+
 @dataclass(frozen=True)
 class CoordinatorView:
     """The 7 optional ``Coordinator`` members, resolved to concrete values.
@@ -320,8 +380,8 @@ class CoordinatorView:
     config: Config | None
     OWNED_CONFIG_FIELDS: frozenset[str]
     live_work_item_ids: Callable[[], frozenset[str]]
-    start_task: Callable[..., asyncio.Task[Any] | None]
-    cancel: Callable[..., tuple[str, ...]]
+    start_task: StartTask
+    cancel: CancelWork
     shutdown: Callable[[], Any]
 
 

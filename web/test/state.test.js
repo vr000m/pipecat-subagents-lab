@@ -4,6 +4,7 @@ import {
   applyServerMessage,
   createInitialState,
   WORK_STATUS_MAX_KEYS,
+  WORK_STATUS_MAX_TOMBSTONES,
   WORK_STATUS_TERMINAL_TTL_MS,
 } from "../src/state.js";
 import workStatusRetention from "../../shared/work-status-retention.json";
@@ -650,6 +651,189 @@ if (hasWorkStatusField) {
 
       expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
       expect(state.workStatus["1::turn-2::work-2"]).toBeDefined();
+    });
+
+    // Round-3 restart gauntlet, Logic finding: the increment reducer's
+    // staleness guard was `if (previous && previous.event_sequence >=
+    // projected.event_sequence) return state;`. Prune/evict removed entries
+    // outright, so once a key was dropped `previous` was `undefined`, the
+    // guard short-circuited on the falsy check, and a late-arriving
+    // *lower*-sequence increment for the same (origin_epoch, turn_id,
+    // work_item_id) triple was re-inserted as if fresh -- resurrecting a
+    // record that had already gone terminal and aged out. The server keeps
+    // `_work_status_terminal_keys` precisely to prevent this on its side.
+    test("a stale increment cannot resurrect a TTL-pruned terminal record", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 2,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "result_ready", event_sequence: 7, origin_epoch: 1 },
+      });
+      expect(state.workStatus["1::turn-1::work-1"]).toBeDefined();
+
+      // Age the terminal record out via an unrelated increment.
+      const realNow = Date.now;
+      Date.now = () => realNow() + 6 * 60 * 1000;
+      try {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 3,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: { turn_id: "turn-9", work_item_id: "work-9", state: "routing", event_sequence: 0, origin_epoch: 1 },
+        });
+      } finally {
+        Date.now = realNow;
+      }
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+      expect(state.workStatusTombstones["1::turn-1::work-1"]).toBe(7);
+
+      // A late, out-of-order increment for the aged-out key. Lower sequence
+      // than the terminal one already seen -- it must be rejected, not
+      // re-inserted as a live `searching` record.
+      const beforeWorkStatus = state.workStatus;
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 4,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "searching", event_sequence: 3, origin_epoch: 1 },
+      });
+      // Rejected outright: the ledger is the identical object, not a rebuilt
+      // one that happens to look the same.
+      expect(state.workStatus).toBe(beforeWorkStatus);
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+
+      // An equal sequence is likewise rejected (the guard is `>=`).
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 5,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "failed", event_sequence: 7, origin_epoch: 1 },
+      });
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+
+      // A genuinely newer increment for the same key is still accepted -- the
+      // tombstone is a staleness guard, not a permanent ban.
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 6,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "searching", event_sequence: 8, origin_epoch: 1 },
+      });
+      expect(state.workStatus["1::turn-1::work-1"]).toBeDefined();
+      expect(state.workStatus["1::turn-1::work-1"].event_sequence).toBe(8);
+    });
+
+    test("a stale increment cannot resurrect an evicted record", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      // Fill past the cap with terminal (evictable) records.
+      for (let index = 0; index <= WORK_STATUS_MAX_KEYS; index += 1) {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 2 + index,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: {
+            turn_id: `turn-${index}`,
+            work_item_id: `work-${index}`,
+            state: "result_ready",
+            event_sequence: 5,
+            origin_epoch: 1,
+          },
+        });
+      }
+      // The oldest terminal record was evicted and tombstoned.
+      expect(state.workStatus["1::turn-0::work-0"]).toBeUndefined();
+      expect(state.workStatusTombstones["1::turn-0::work-0"]).toBe(5);
+
+      const beforeWorkStatus = state.workStatus;
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 3 + WORK_STATUS_MAX_KEYS,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-0", work_item_id: "work-0", state: "routing", event_sequence: 1, origin_epoch: 1 },
+      });
+      expect(state.workStatus).toBe(beforeWorkStatus);
+      expect(state.workStatus["1::turn-0::work-0"]).toBeUndefined();
+    });
+
+    test("the tombstone map is bounded", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      for (let index = 0; index < WORK_STATUS_MAX_KEYS * 3; index += 1) {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 2 + index,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: {
+            turn_id: `turn-${index}`,
+            work_item_id: `work-${index}`,
+            state: "result_ready",
+            event_sequence: 1,
+            origin_epoch: 1,
+          },
+        });
+      }
+      expect(Object.keys(state.workStatusTombstones).length).toBeLessThanOrEqual(
+        WORK_STATUS_MAX_TOMBSTONES,
+      );
+    });
+
+    test("a snapshot supersedes the tombstone for every key it re-establishes", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 2,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "result_ready", event_sequence: 7, origin_epoch: 1 },
+      });
+      const realNow = Date.now;
+      Date.now = () => realNow() + 6 * 60 * 1000;
+      try {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 3,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: { turn_id: "turn-9", work_item_id: "work-9", state: "routing", event_sequence: 0, origin_epoch: 1 },
+        });
+      } finally {
+        Date.now = realNow;
+      }
+      expect(state.workStatusTombstones["1::turn-1::work-1"]).toBe(7);
+
+      // The server is authoritative: a snapshot carrying the key means the
+      // pre-snapshot watermark must not reject later increments on it.
+      state = applyServerMessage(state, {
+        ...snapshot(4),
+        data: {
+          ...snapshot(4).data,
+          work_status: [
+            {
+              turn_id: "turn-1",
+              work_item_id: "work-1",
+              worker_id: null,
+              state: "searching",
+              event_sequence: 2,
+              terminal_reason: null,
+              origin_epoch: 1,
+            },
+          ],
+        },
+      });
+      expect(state.workStatusTombstones["1::turn-1::work-1"]).toBeUndefined();
+      expect(state.workStatus["1::turn-1::work-1"]).toBeDefined();
     });
 
     // Regression: a non-terminal work_status record restored from a

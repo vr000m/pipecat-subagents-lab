@@ -1,4 +1,5 @@
 import workStatusRetention from "../../shared/work-status-retention.json";
+import workStatusSchema from "../../shared/schemas/work-status.json";
 
 export const DELIVERY_COMPLETE = "delivery_completed";
 
@@ -22,6 +23,10 @@ export function createInitialState() {
     results: [],
     speech: {},
     workStatus: {},
+    // key -> the last `event_sequence` seen for a work_status key that has
+    // since been TTL-pruned or evicted out of `workStatus`. See
+    // `rememberDroppedWorkStatus` for why the client needs these at all.
+    workStatusTombstones: {},
     localDiagnostics: { ...EMPTY_DIAGNOSTICS },
     lastAppliedSequence: 0,
     serverState: false,
@@ -182,7 +187,15 @@ function workStatusKey(status) {
 // shared/protocol.md's "Progressive work status" retention section.
 export const WORK_STATUS_MAX_KEYS = workStatusRetention.max_keys;
 export const WORK_STATUS_TERMINAL_TTL_MS = workStatusRetention.ttl_seconds * 1000;
-const WORK_STATUS_TERMINAL_STATES = new Set(["result_ready", "failed", "cancelled"]);
+// Read from shared/schemas/work-status.json's `x-terminal-states`, not
+// hand-written here (round-3 restart gauntlet, Architecture finding). JSON
+// Schema cannot express terminality -- it is a property of the state machine,
+// not of any single document -- so it is declared beside the `state` enum it
+// is a subset of. Python does not read it: server/contracts.py derives
+// WORK_STATUS_TERMINAL from _WORK_STATUS_TRANSITIONS (no successors =>
+// terminal), which stays the authority, and tests/test_contracts.py asserts
+// the two agree so the array cannot drift from the transitions table.
+const WORK_STATUS_TERMINAL_STATES = new Set(workStatusSchema["x-terminal-states"]);
 
 // `_restoredAt` mirrors the server's `_work_status_nonauthoritative_at`: a
 // non-terminal record restored from a snapshot can never be terminalized
@@ -191,12 +204,13 @@ const WORK_STATUS_TERMINAL_STATES = new Set(["result_ready", "failed", "cancelle
 // would never satisfy the `_terminalSince` check below and would be
 // retained forever. Stamping it at the restore instant gives it the same
 // five-minute TTL a terminal record gets, measured from the same instant.
-function pruneExpiredWorkStatus(workStatus, now) {
+function pruneExpiredWorkStatus(workStatus, now, dropped) {
   let changed = false;
   const next = {};
   for (const [key, record] of Object.entries(workStatus)) {
     if (record._terminalSince !== undefined && now - record._terminalSince >= WORK_STATUS_TERMINAL_TTL_MS) {
       changed = true;
+      dropped?.push([key, record]);
       continue;
     }
     if (
@@ -205,6 +219,7 @@ function pruneExpiredWorkStatus(workStatus, now) {
       now - record._restoredAt >= WORK_STATUS_TERMINAL_TTL_MS
     ) {
       changed = true;
+      dropped?.push([key, record]);
       continue;
     }
     next[key] = record;
@@ -212,11 +227,53 @@ function pruneExpiredWorkStatus(workStatus, now) {
   return changed ? next : workStatus;
 }
 
+// Bound on the tombstone map. Deliberately the same bound as the ledger it
+// shadows: a tombstone is strictly smaller than the record it replaces, so
+// this cannot grow the client's worst-case footprint by more than a constant
+// factor, and an unbounded tombstone map would just be the unbounded-ledger
+// problem `WORK_STATUS_MAX_KEYS` exists to prevent, wearing a different hat.
+export const WORK_STATUS_MAX_TOMBSTONES = WORK_STATUS_MAX_KEYS;
+
+// Records the staleness watermark for keys leaving `workStatus`.
+//
+// Round-3 restart gauntlet, Logic finding: the increment reducer's guard is
+// `if (previous && previous.event_sequence >= projected.event_sequence)`.
+// `pruneExpiredWorkStatus`/`evictOldestWorkStatus` removed terminal entries
+// outright rather than leaving anything behind, so once a key was dropped
+// `previous` was `undefined`, the guard short-circuited on the falsy check,
+// and any late-arriving *lower*-sequence increment for that same
+// (origin_epoch, turn_id, work_item_id) triple was re-inserted as if fresh --
+// resurrecting a record that had already gone terminal and aged out. The
+// server keeps `_work_status_terminal_keys` precisely to stop this on its
+// side; this is the client's mirror of it.
+//
+// Only the sequence number is retained, not the record: the point is to
+// answer "have we already seen this key at or past this sequence?", not to
+// keep rendering anything.
+function rememberDroppedWorkStatus(tombstones, dropped) {
+  if (dropped.length === 0) return tombstones;
+  const next = { ...tombstones };
+  for (const [key, record] of dropped) {
+    const previous = next[key];
+    // A key can be dropped more than once (re-added by a snapshot, aged out
+    // again); keep the highest sequence ever seen for it, never regress.
+    next[key] = previous === undefined ? record.event_sequence : Math.max(previous, record.event_sequence);
+  }
+  // Insertion-ordered oldest-first trim. Losing the oldest tombstone only
+  // degrades back to the pre-fix behaviour for that one key, which is the
+  // correct thing to give up first under pressure.
+  const keys = Object.keys(next);
+  for (let index = 0; index < keys.length - WORK_STATUS_MAX_TOMBSTONES; index += 1) {
+    delete next[keys[index]];
+  }
+  return next;
+}
+
 // Oldest-eligible-first eviction, mirroring _evict_work_status_overflow's
 // ordering (which picks the single oldest expiry stamp across both terminal
 // and restored-non-authoritative candidates, not terminal-before-restored);
 // `protectKey` is the record just written and is never the eviction victim.
-function evictOldestWorkStatus(workStatus, protectKey) {
+function evictOldestWorkStatus(workStatus, protectKey, dropped) {
   if (Object.keys(workStatus).length <= WORK_STATUS_MAX_KEYS) return workStatus;
   const next = { ...workStatus };
   const expiryStamp = (key) => next[key]._terminalSince ?? next[key]._restoredAt;
@@ -232,12 +289,16 @@ function evictOldestWorkStatus(workStatus, protectKey) {
     for (const key of candidates) {
       if (expiryStamp(key) < expiryStamp(oldestKey)) oldestKey = key;
     }
+    dropped?.push([oldestKey, next[oldestKey]]);
     delete next[oldestKey];
   }
   return next;
 }
 
-function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previousRecord = workStatus[key], isRestore = false) {
+// Returns `{ workStatus, tombstones }`: the prune/evict passes below can drop
+// keys, and each dropped key must leave a staleness watermark behind (see
+// `rememberDroppedWorkStatus`), so the two maps can only be updated together.
+function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previousRecord = workStatus[key], isRestore = false, tombstones = {}) {
   // Preserve an already-terminal key's original `_terminalSince` (e.g. a
   // reconnect snapshot re-delivering the same terminal record) instead of
   // restamping it to `now`: within this serving process, the server's
@@ -270,7 +331,12 @@ function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previous
         ? { ...projected, _restoredAt: previousRecord._restoredAt }
         : projected;
   const withEntry = { ...workStatus, [key]: record };
-  return evictOldestWorkStatus(pruneExpiredWorkStatus(withEntry, now), key);
+  const dropped = [];
+  const retained = evictOldestWorkStatus(pruneExpiredWorkStatus(withEntry, now, dropped), key, dropped);
+  // The key just written is never its own tombstone: it is present and
+  // authoritative, so `previous` in the increment guard covers it.
+  const droppedOthers = dropped.filter(([droppedKey]) => droppedKey !== key);
+  return { workStatus: retained, tombstones: rememberDroppedWorkStatus(tombstones, droppedOthers) };
 }
 
 function projectedSpeech(progress) {
@@ -302,18 +368,28 @@ function snapshotState(state, snapshot, sequence) {
   // does reappear keeps its pre-snapshot `_terminalSince` looked up from
   // `state.workStatus` explicitly, rather than restamping a fresh TTL
   // window on every reconnect.
-  const workStatus = (Array.isArray(snapshot.work_status) ? snapshot.work_status : [])
+  const restored = (Array.isArray(snapshot.work_status) ? snapshot.work_status : [])
     .map(projectedWorkStatus)
     .filter(Boolean)
-    .reduce((acc, item) => {
-      const key = workStatusKey(item);
-      // `previousRecord` is seeded from the pre-snapshot `state.workStatus`,
-      // not from `acc` (the in-progress reduce accumulator). Harmless today
-      // since a snapshot carries at most one parent record per key, but
-      // would make this non-idempotent under a hypothetical future
-      // duplicate-key-within-one-snapshot case.
-      return upsertWorkStatus(acc, key, item, now, (state.workStatus || {})[key], true);
-    }, {});
+    .reduce(
+      (acc, item) => {
+        const key = workStatusKey(item);
+        // `previousRecord` is seeded from the pre-snapshot `state.workStatus`,
+        // not from `acc` (the in-progress reduce accumulator). Harmless today
+        // since a snapshot carries at most one parent record per key, but
+        // would make this non-idempotent under a hypothetical future
+        // duplicate-key-within-one-snapshot case.
+        const next = upsertWorkStatus(acc.workStatus, key, item, now, (state.workStatus || {})[key], true, acc.tombstones);
+        // The snapshot is authoritative for every key it carries, so a
+        // tombstone for one of them is superseded: drop it rather than let a
+        // pre-snapshot watermark reject a later legitimate increment on a key
+        // the server has just re-established.
+        const { [key]: _superseded, ...tombstones } = next.tombstones;
+        return { workStatus: next.workStatus, tombstones };
+      },
+      { workStatus: {}, tombstones: state.workStatusTombstones || {} },
+    );
+  const workStatus = restored.workStatus;
   const diagnostics = {
     ...state.localDiagnostics,
     lastSequence: snapshotSequence,
@@ -329,6 +405,7 @@ function snapshotState(state, snapshot, sequence) {
     results,
     speech,
     workStatus,
+    workStatusTombstones: restored.tombstones,
     routing: snapshot.routing ?? null,
     transcript: Array.isArray(snapshot.transcript) ? snapshot.transcript.map((item) => ({ ...item })) : [],
     serverState: true,
@@ -367,9 +444,17 @@ function applyIncrement(state, payload) {
       if (!projected) return state;
       const key = workStatusKey(projected);
       const workStatus = state.workStatus || {};
+      const tombstones = state.workStatusTombstones || {};
       const previous = workStatus[key];
-      if (previous && previous.event_sequence >= projected.event_sequence) return state;
-      return { ...state, workStatus: upsertWorkStatus(workStatus, key, projected) };
+      // The staleness watermark is the live record's sequence when the key is
+      // still retained, and the tombstoned sequence once it has been pruned or
+      // evicted. Without the second half, a dropped key made `previous`
+      // `undefined`, the guard short-circuited, and a late lower-sequence
+      // increment resurrected an already-terminal record.
+      const lastSequence = previous ? previous.event_sequence : tombstones[key];
+      if (lastSequence !== undefined && lastSequence >= projected.event_sequence) return state;
+      const upserted = upsertWorkStatus(workStatus, key, projected, undefined, undefined, false, tombstones);
+      return { ...state, workStatus: upserted.workStatus, workStatusTombstones: upserted.tombstones };
     }
     case "user_transcript":
     case "bot_transcript":

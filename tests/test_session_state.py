@@ -1,5 +1,7 @@
 """Session state is authoritative and retains immutable result history."""
 
+from pathlib import Path
+
 import pytest
 
 from server.contracts import (
@@ -1028,3 +1030,36 @@ def test_retention_fallback_matches_shared_config() -> None:
     assert _RETENTION_FALLBACK == numeric, (
         "the packaged-install fallback has drifted from shared/work-status-retention.json"
     )
+
+
+def test_retention_config_read_refuses_fifo_and_symlink(tmp_path: Path) -> None:
+    """Round-3 gauntlet, Security finding: the boot-path retention read used
+    ``Path.read_text()``, which follows a symlink silently and blocks forever
+    on a FIFO planted at this predictable, repo-relative path -- and does so at
+    ``import server.session_state`` time, before every other guard in the
+    process. The ``except (OSError, ValueError)`` fallback catches neither.
+
+    Pins the primitive the module now reads through: it must refuse a FIFO
+    (rather than block) and refuse to read *through* a symlink, returning
+    ``None`` so the caller lands on ``_RETENTION_FALLBACK``.
+    """
+    import os
+
+    from server.session_state import _RETENTION_MAX_BYTES, _read_regular_file_no_follow
+
+    real = tmp_path / "real.json"
+    real.write_text('{"ttl_seconds": 1, "max_keys": 2}')
+    assert _read_regular_file_no_follow(real, max_bytes=_RETENTION_MAX_BYTES) is not None
+
+    fifo = tmp_path / "fifo.json"
+    os.mkfifo(fifo)
+    # Must return promptly with None rather than hanging on the open/read.
+    assert _read_regular_file_no_follow(fifo, max_bytes=_RETENTION_MAX_BYTES) is None
+
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    assert _read_regular_file_no_follow(link, max_bytes=_RETENTION_MAX_BYTES) is None
+
+    oversized = tmp_path / "big.json"
+    oversized.write_bytes(b"x" * (_RETENTION_MAX_BYTES + 1))
+    assert _read_regular_file_no_follow(oversized, max_bytes=_RETENTION_MAX_BYTES) is None

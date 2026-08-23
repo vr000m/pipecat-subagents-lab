@@ -475,6 +475,56 @@ def test_work_status_state_set_is_the_coarse_six_state_set() -> None:
     assert set(_IMPL_WORK_STATUS_STATES) == WORK_STATUS_STATES
 
 
+def _work_status_schema() -> dict:
+    import json
+    from pathlib import Path
+
+    schema_path = Path(__file__).resolve().parents[1] / "shared" / "schemas" / "work-status.json"
+    return json.loads(schema_path.read_text(encoding="utf-8"))
+
+
+def test_schema_state_enum_matches_the_python_state_vocabulary() -> None:
+    """Round-3 restart gauntlet, Architecture finding: web/src/protocol.js
+    imported shared/schemas/work-status.json to derive the *key* set, then
+    hand-wrote the *state* enum out of that same file.
+
+    protocol.js now derives `workStatusStates` from
+    `properties.state.enum`. This pins the other end: that enum must equal
+    Python's state vocabulary, so schema and server cannot drift while the
+    browser silently follows only one of them.
+    """
+    assert set(_work_status_schema()["properties"]["state"]["enum"]) == WORK_STATUS_STATES
+
+
+def test_schema_terminal_states_match_the_transitions_table() -> None:
+    """`x-terminal-states` exists so web/src/state.js can read terminality
+    from one place instead of hand-copying it.
+
+    JSON Schema cannot express terminality, so the array is declared beside
+    the enum it is a subset of -- but `server/contracts.py` remains the
+    authority, deriving `WORK_STATUS_TERMINAL` from `_WORK_STATUS_TRANSITIONS`
+    (a state with no successors is terminal). This test is what stops the
+    declared array from becoming a third, drifting source of truth.
+    """
+    schema = _work_status_schema()
+    declared_terminal = set(schema["x-terminal-states"])
+
+    derived_terminal = {state for state, successors in LEGAL_TRANSITIONS.items() if not successors}
+    assert declared_terminal == derived_terminal
+
+    # And every declared terminal state must actually be a legal state.
+    assert declared_terminal <= set(schema["properties"]["state"]["enum"])
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_schema_terminal_states_match_the_server_implementation() -> None:
+    """The same assertion against the *implementation*, not the test's own copy
+    of the transitions table -- otherwise both could drift together."""
+    from server.contracts import WORK_STATUS_TERMINAL
+
+    assert set(_work_status_schema()["x-terminal-states"]) == set(WORK_STATUS_TERMINAL)
+
+
 @pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
 @pytest.mark.parametrize("state", sorted(WORK_STATUS_STATES))
 def test_work_status_accepts_every_coarse_state(state: str) -> None:

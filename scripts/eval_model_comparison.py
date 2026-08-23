@@ -90,6 +90,13 @@ from scripts.eval_common import (
     turn_correlated_routing_action,
     write_no_follow,
 )
+
+# Imported straight from the dependency-light shared module rather than
+# re-exported through eval_common: this is the hardened read primitive every
+# other evidence-gate script already routes its artifact reads through, and
+# routing the manifest read through a second hop would be one more place for
+# the two to drift.
+from scripts.evidence_common import EvidenceGateError, read_bytes_no_follow
 from server.config import Config, load_config
 from server.pipeline import split_multi_intent_turn_id
 from server.router import build_router_request_kwargs, effective_router_reasoning_effort
@@ -484,7 +491,17 @@ class ManifestStatus:
 # is structurally unable to stay complete as this feature grows. Replaced
 # with a whole-tree attestation (below) instead of trying to enumerate a
 # fourth time.
-_MANIFEST_ATTESTED_PATHS = ("server/", "scripts/eval_common.py", "evals/")
+#
+# Round-3 restart gauntlet (Architecture finding) found the fourth instance
+# anyway, because `scripts/eval_common.py` was still a *file* entry while
+# `server/` and `evals/` were directory entries: the round-1/2 consolidation
+# moved `REPO_ROOT`/`confined_output_path`/`write_bytes_no_follow` out of
+# eval_common.py and into `scripts/evidence_common.py`, which eval_common.py
+# now imports -- so uncommitted edits to that dependency no longer marked the
+# manifest stale. Attesting `scripts/` as a whole closes it by construction:
+# a *new* shared module under scripts/ is covered the day it is added, with
+# no tuple to remember to update.
+_MANIFEST_ATTESTED_PATHS = ("server/", "scripts/", "evals/")
 
 
 def _source_tree_dirty() -> bool | None:
@@ -492,8 +509,8 @@ def _source_tree_dirty() -> bool | None:
     uncommitted changes.
 
     Deliberately over-broad, not a curated file list (round 9 gauntlet,
-    Architecture lens finding 15): the whole ``server/`` package plus
-    ``scripts/eval_common.py`` and ``evals/`` are attested, rather than a
+    Architecture lens finding 15): the whole ``server/``, ``scripts/`` and
+    ``evals/`` trees are attested, rather than a
     hand-enumerated subset of "the files that matter" -- every prior round of
     this gauntlet found one more file the enumerated list was missing, so
     fail-closed over the whole tree (accepting some false-positive staleness
@@ -662,20 +679,42 @@ def load_manifest_status(manifest_path: Path) -> ManifestStatus:
     ``ManifestStatus.exists=False``/an empty accepted set, and it is the
     caller's job to decide whether that is fatal (it is, for any live cell;
     it is a printed warning for ``--dry-run``).
+
+    The read goes through ``evidence_common.read_bytes_no_follow``, not
+    ``Path.exists()`` + ``Path.read_text()`` (round-3 restart gauntlet,
+    Security finding). ``--manifest-path`` defaults to a predictable,
+    repo-relative artifact path, and the check-then-read pair was the exact
+    TOCTOU shape that helper exists to close: the path could be swapped
+    between the ``exists()`` probe and the separate ``read_text()``. Worse,
+    ``read_text()`` follows a symlink planted there and *blocks indefinitely*
+    on a FIFO -- and a blocking open never returns to raise, so the
+    ``except (OSError, ...)`` below could not catch it. The shared helper
+    opens once with ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK``, ``fstat``-checks
+    ``S_ISREG`` on the held fd, and caps the read at
+    ``_MAX_EVIDENCE_INPUT_BYTES`` -- the same treatment every other artifact
+    read in the evidence-gate scripts already gets.
+
+    ``exists`` is still reported, because ``require_manifest_ok_for_live_run``
+    words a distinct "run verify_eval_candidates.py first" error for it. It is
+    now derived *after* the read has already failed, purely to label that
+    failure -- not as a gate the read then depends on -- so the security
+    property does not rest on it.
     """
     current_commit = git_head()
-    if not manifest_path.exists():
+    try:
+        manifest_bytes = read_bytes_no_follow(manifest_path)
+    except EvidenceGateError:
         return ManifestStatus(
             path=manifest_path,
-            exists=False,
+            exists=manifest_path.exists(),
             source_commit=None,
             current_commit=current_commit,
             stale=True,
             accepted=frozenset(),
         )
     try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        manifest = json.loads(manifest_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return ManifestStatus(
             path=manifest_path,
             exists=True,

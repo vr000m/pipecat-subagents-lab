@@ -277,6 +277,35 @@ class TestCloseJudgeLlmService:
         asyncio.run(close_judge_llm_service(service))
         assert service._client.is_closed()
 
+    def test_sync_close_is_not_awaited(self) -> None:
+        """Round-3 restart gauntlet, Logic finding: the helper did a bare
+        ``await close()``.
+
+        A provider exposing a *synchronous* ``close()`` -- the shape the
+        sibling ``close_session_provider_clients._close_hop`` already handles
+        for the sync router client -- returns ``None``, so ``await close()``
+        raised ``TypeError: object NoneType can't be used in 'await'
+        expression``. Because this runs in ``run_cell``'s ``finally``, that
+        TypeError replaced an otherwise-successful cell result and rewrote it
+        to ``turn-error``, corrupting the matrix over a cleanup detail.
+        """
+        import asyncio
+
+        client = _SyncRecordingClient()
+        service = SimpleNamespace(_client=client)
+        asyncio.run(close_judge_llm_service(service))  # must not raise
+        assert client.close_calls == 1
+
+    def test_async_close_is_still_awaited(self) -> None:
+        """The awaitable probe must not silently *stop* awaiting the async
+        client -- that would reinstate the round-10 httpx-pool leak."""
+        import asyncio
+
+        client = _RecordingClient()
+        service = SimpleNamespace(_client=client)
+        asyncio.run(close_judge_llm_service(service))
+        assert client.close_calls == 1
+
 
 class _RecordingClient:
     def __init__(self, *, raise_on_close: bool = False) -> None:

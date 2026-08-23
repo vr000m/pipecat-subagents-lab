@@ -10,6 +10,7 @@ primitives live, so the three scripts cannot silently drift from each other.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,21 @@ class EvidenceGateError(ValueError):
     """Raised when an evidence artifact or manifest fails a hard gate check."""
 
 
+class MissingEvidenceInput(EvidenceGateError):
+    """The path does not exist -- the one read failure some callers treat as
+    "nothing to do" rather than "fail the gate".
+
+    A subclass of :class:`EvidenceGateError`, deliberately: every existing
+    ``except EvidenceGateError`` handler keeps catching it, so this narrows
+    the vocabulary without changing any current caller's behaviour. It exists
+    so :func:`read_bytes_if_present` can tell "absent" from every other
+    failure mode *from the failed open itself*, rather than re-``stat``-ing
+    the path afterwards -- which would put a second, TOCTOU-able look at the
+    filesystem back into a helper whose whole point is that the type check and
+    the read happen against one held fd.
+    """
+
+
 # Gates two halves of the same Phase 4 promotion decision (the collector's
 # per-cell undersizing check and the analyzer's per-stratum pairing check);
 # defined once here so the two scripts cannot drift apart on the minimum.
@@ -68,8 +84,6 @@ def sha256_file(path: Path) -> str:
     memory just to be digested. The cap itself still applies -- a file this
     module refuses to *load* must not be one it will happily *vouch for*.
     """
-    import hashlib
-
     digest = hashlib.sha256()
     for chunk in _iter_file_chunks(path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES):
         digest.update(chunk)
@@ -77,8 +91,6 @@ def sha256_file(path: Path) -> str:
 
 
 def sha256_bytes(data: bytes) -> str:
-    import hashlib
-
     return hashlib.sha256(data).hexdigest()
 
 
@@ -358,7 +370,7 @@ def _iter_file_chunks(path: Path, *, max_bytes: int) -> Iterator[bytes]:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         if exc.errno == errno.ENOENT:
-            raise EvidenceGateError(f"missing evidence input: {path}") from exc
+            raise MissingEvidenceInput(f"missing evidence input: {path}") from exc
         if exc.errno == errno.ENXIO:
             # Read-opening the write end of a reader-less FIFO with
             # O_NONBLOCK fails here rather than blocking; same verdict as
@@ -386,6 +398,29 @@ def _iter_file_chunks(path: Path, *, max_bytes: int) -> Iterator[bytes]:
 def read_bytes_no_follow(path: Path, *, max_bytes: int = _MAX_EVIDENCE_INPUT_BYTES) -> bytes:
     """Read `path`'s whole contents through :func:`_iter_file_chunks`'s hardening."""
     return b"".join(_iter_file_chunks(path, max_bytes=max_bytes))
+
+
+def read_bytes_if_present(
+    path: Path, *, max_bytes: int = _MAX_EVIDENCE_INPUT_BYTES
+) -> bytes | None:
+    """:func:`read_bytes_no_follow`, but ``None`` when `path` simply is not there.
+
+    For the callers whose read is a *conditional* step rather than a gate
+    input -- the promotion-manifest writer's ``.previous`` backup, which has
+    nothing to back up on a first run. Every *other* failure mode still
+    raises: a symlink, a FIFO, a device node, or an oversized file at this
+    path all mean something is there that must not be, and treating them as
+    "absent" would let the writer clobber it.
+
+    Only ``ENOENT`` at the open produces ``None``, signalled by
+    :class:`MissingEvidenceInput` from the failed open itself -- no follow-up
+    ``exists()``/``stat()``, which would reopen the TOCTOU window the held-fd
+    design closes.
+    """
+    try:
+        return read_bytes_no_follow(path, max_bytes=max_bytes)
+    except MissingEvidenceInput:
+        return None
 
 
 def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = None) -> Path:

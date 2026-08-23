@@ -43,9 +43,7 @@ import sys
 from datetime import UTC
 from pathlib import Path
 
-from scripts.evidence_common import sha256_bytes
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from scripts.evidence_common import REPO_ROOT, sha256_bytes
 
 # The deployable runtime identity surface. Deliberately excludes
 # docs/benchmarks/**, shared/schemas/v013-*.json, tests/**, and scripts/**,
@@ -158,18 +156,27 @@ def check_release_inputs() -> int:
 
 
 def shell_export() -> int:
-    if _is_dirty():
-        print(
-            "FAIL: refusing to emit release metadata from a dirty/untracked tree", file=sys.stderr
-        )
-        return 1
+    # ``_is_dirty()`` runs *inside* the guard (round-3 restart gauntlet, Logic
+    # finding). It calls ``_run_git`` with ``check=True``, so outside a git
+    # checkout -- or against a corrupt index -- it raised an uncaught
+    # ``CalledProcessError``: a raw traceback and a Python exit code, not the
+    # structured ``FAIL:`` message and return-1 this function promises every
+    # caller. CI pipes this straight into ``$GITHUB_ENV``, so the failure mode
+    # mattered: an unhandled traceback there is a much worse signal than the
+    # documented refusal.
     try:
+        dirty = _is_dirty()
         commit = source_commit()
         tree_hash = source_tree_hash()
         deployed_at = deployed_at_utc()
         fingerprint = feature_policy_fingerprint_value()
     except Exception as exc:  # noqa: BLE001 - report and fail rather than emit partial exports
         print(f"FAIL: could not derive deployment metadata: {exc}", file=sys.stderr)
+        return 1
+    if dirty:
+        print(
+            "FAIL: refusing to emit release metadata from a dirty/untracked tree", file=sys.stderr
+        )
         return 1
     lines = [
         f"PIPECAT_SOURCE_COMMIT={commit}",

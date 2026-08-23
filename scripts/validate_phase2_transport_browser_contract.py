@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.evidence_common import (
+    REPO_ROOT,
     EvidenceGateError,
     closed_object,
     load_json,
@@ -36,7 +37,6 @@ from scripts.evidence_common import (
     require_type,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-transport-browser-contract.json"
 PACKAGE_JSON_PATH = REPO_ROOT / "web" / "package.json"
 BUN_LOCK_PATH = REPO_ROOT / "web" / "bun.lock"
@@ -170,15 +170,87 @@ def _package_json_declared_version() -> str:
     `validate_artifact` catch package.json/bun.lock drift (an updated
     dependency declaration whose lockfile was never regenerated) instead of
     silently trusting the lockfile alone.
-    """
-    import json as _json
 
-    data = _json.loads(PACKAGE_JSON_PATH.read_text(encoding="utf-8"))
-    dependencies = data.get("dependencies")
+    Read through ``evidence_common.load_json``, not ``read_text`` +
+    ``json.loads`` (round-3 restart gauntlet, Logic finding). A malformed or
+    truncated web/package.json raised ``json.JSONDecodeError``, which
+    subclasses ``ValueError`` and *not* ``OSError`` -- so it sailed past
+    ``main()``'s ``except (EvidenceGateError, OSError)`` and surfaced as a raw
+    traceback with a nonstandard exit code instead of the gate's structured
+    failure. ``load_json`` collapses every read and parse failure into one
+    ``EvidenceGateError``, and hardens the read while it is there.
+    """
+    data = load_json(PACKAGE_JSON_PATH)
+    dependencies = data.get("dependencies") if isinstance(data, dict) else None
     version = dependencies.get(PACKAGE_NAME) if isinstance(dependencies, dict) else None
     if not isinstance(version, str) or not version:
         raise EvidenceGateError(f"{PACKAGE_NAME} not found in {PACKAGE_JSON_PATH} dependencies")
     return version
+
+
+#: The npm range operators this gate understands. Anything outside this set
+#: (``||`` unions, hyphen ranges, ``*``/``x`` wildcards, ``workspace:``/URL/
+#: git specifiers) is refused rather than guessed at -- see
+#: :func:`_declared_range_admits`.
+_RANGE_OPERATOR_RE = re.compile(r"^(\^|~|>=|<=|>|<|=)?\s*v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+
+
+def _declared_range_admits(declared: str, locked: str) -> bool:
+    """Does the package.json range `declared` admit the lockfile pin `locked`?
+
+    Round-3 restart gauntlet, Logic finding: this comparison used to be
+    ``declared != locked`` string equality. Any range prefix -- ``^1.10.6``,
+    ``~1.10.6``, ``>=1.10.6`` -- then failed the gate even when the lockfile
+    held a perfectly correct resolution of that range, producing a false
+    "regenerate the lockfile" failure. The defect was latent only because
+    both files currently hold the bare string ``1.10.6``; it fires on the next
+    dependency edit that introduces a caret.
+
+    Deliberately implements a *subset* of npm's range grammar -- exact,
+    ``^``, ``~``, ``>=``, ``>``, ``<=``, ``<``, ``=`` against a plain
+    ``MAJOR.MINOR.PATCH`` -- and raises for anything else rather than
+    guessing. This is an evidence gate: a range shape it cannot reason about
+    must fail closed with "pin it exactly", never be waved through. Prerelease
+    and build suffixes are likewise refused rather than half-ordered, since
+    correct prerelease precedence is more machinery than this gate needs.
+    """
+    declared_match = _RANGE_OPERATOR_RE.fullmatch(declared.strip())
+    locked_match = _RANGE_OPERATOR_RE.fullmatch(locked.strip())
+    if declared_match is None:
+        raise EvidenceGateError(
+            f"web/package.json declares {PACKAGE_NAME}@{declared!r}, a version range this gate "
+            "cannot evaluate -- pin an exact version or a simple ^/~/>= range"
+        )
+    if locked_match is None or locked_match.group(1):
+        raise EvidenceGateError(
+            f"web/bun.lock resolved {PACKAGE_NAME} to {locked!r}, which is not an exact "
+            "MAJOR.MINOR.PATCH version"
+        )
+
+    operator = declared_match.group(1) or "="
+    want = tuple(int(g) for g in declared_match.group(2, 3, 4))
+    have = tuple(int(g) for g in locked_match.group(2, 3, 4))
+
+    if operator == "=":
+        return have == want
+    if operator == ">=":
+        return have >= want
+    if operator == ">":
+        return have > want
+    if operator == "<=":
+        return have <= want
+    if operator == "<":
+        return have < want
+    if operator == "~":
+        # ~X.Y.Z admits >=X.Y.Z and <X.(Y+1).0.
+        return have >= want and have[:2] == want[:2]
+    # ^X.Y.Z admits >=X.Y.Z up to the next *left-most non-zero* bump: ^0.2.3
+    # is <0.3.0 and ^0.0.3 is <0.0.4, not <1.0.0.
+    if want[0] != 0:
+        return have >= want and have[0] == want[0]
+    if want[1] != 0:
+        return have >= want and have[:2] == want[:2]
+    return have == want
 
 
 def validate_artifact(record: dict[str, Any]) -> None:
@@ -273,11 +345,16 @@ def validate_artifact(record: dict[str, Any]) -> None:
     # lockfile regeneration, the artifact could still match the (now stale)
     # lockfile pin while silently describing a dependency that package.json
     # itself no longer declares.
+    #
+    # Compared as "does the declared range admit the locked pin", not as
+    # string equality: the lockfile stores a resolved exact version while
+    # package.json may legitimately declare a range.
     declared_version = _package_json_declared_version()
-    if declared_version != locked_version:
+    if not _declared_range_admits(declared_version, locked_version):
         raise EvidenceGateError(
             f"web/package.json declares {PACKAGE_NAME}@{declared_version} but web/bun.lock "
-            f"is pinned to {locked_version} -- regenerate the lockfile"
+            f"is pinned to {locked_version}, which that range does not admit -- "
+            "regenerate the lockfile"
         )
 
     # `source_anchor` names the source the check was actually run against.

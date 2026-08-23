@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://pipecat-subagents-lab.local/schemas/v1/work-status.json",
   "title": "WorkStatus",
+  "x-terminal-states-comment": "JSON Schema can express which states are legal (properties.state.enum) but not which of them are TERMINAL -- terminality is a property of the state machine, not of any single document. Declared here anyway, beside the enum it is a subset of, so the browser has one place to read it from instead of hand-copying it. Python does NOT read this: server/contracts.py derives WORK_STATUS_TERMINAL from _WORK_STATUS_TRANSITIONS (a state with no successors is terminal), which is the real authority. tests/test_contracts.py asserts the two agree, so this array cannot drift from the transitions table without failing CI.",
+  "x-terminal-states": ["result_ready", "failed", "cancelled"],
   "type": "object",
   "additionalProperties": false,
   "required": ["turn_id", "work_item_id", "worker_id", "state", "event_sequence", "terminal_reason", "origin_epoch"],

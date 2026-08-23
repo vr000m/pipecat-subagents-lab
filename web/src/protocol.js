@@ -33,14 +33,20 @@ const runtimeSnapshotKeys = Object.freeze(
 // null -- so treating an absent key as acceptable would have quietly diverged
 // from the schema.
 const workStatusKeys = Object.freeze(Object.keys(workStatusSchema.properties));
-const workStatusStates = new Set([
-  "routing",
-  "searching",
-  "background",
-  "result_ready",
-  "failed",
-  "cancelled",
-]);
+// Derived from the schema's own `enum` arrays, not hand-copied from them
+// (round-3 restart gauntlet, Architecture finding). This file already imported
+// work-status.json to derive `workStatusKeys` from `properties`, then
+// hand-wrote the two enums out of that same file -- so a state added to the
+// schema was picked up by the key check and silently rejected by the value
+// check. The Python side derives `WORK_STATUS_STATES`/`WORK_STATUS_TERMINAL`
+// from a single transitions table for the same reason.
+const workStatusStates = new Set(workStatusSchema.properties.state.enum);
+// `null` is a legal `terminal_reason` and is in the schema enum, but it is
+// handled by the explicit `!== null` check at the call site, so it is filtered
+// out here rather than being a member of the "named reason" set.
+const workStatusTerminalReasons = new Set(
+  workStatusSchema.properties.terminal_reason.enum.filter((reason) => reason !== null),
+);
 const deliveryStates = new Set([
   "displayed",
   "queued",
@@ -156,7 +162,7 @@ function validWorkStatus(value) {
   if (!optionalString(value.work_item_id) || !optionalString(value.worker_id)) return false;
   if (!workStatusStates.has(value.state)) return false;
   if (!Number.isInteger(value.event_sequence) || value.event_sequence < 0) return false;
-  if (value.terminal_reason !== null && !["missing_worker", "retention_rejected"].includes(value.terminal_reason)) return false;
+  if (value.terminal_reason !== null && !workStatusTerminalReasons.has(value.terminal_reason)) return false;
   if (value.terminal_reason !== null && value.state !== "failed") return false;
   return validOrigin(value.origin_epoch);
 }

@@ -37,7 +37,12 @@ class CapabilityCarrier(Protocol):
     type.
     """
 
-    capabilities: frozenset[str] | tuple[str, ...]
+    # Read-only on purpose. ``ConnectionPipeline.capabilities`` is a
+    # ``@property``, and a plain mutable Protocol attribute is invariant --
+    # it would reject both the property and ``Connection``'s narrower
+    # ``tuple[str, ...]``. The gate only ever reads this member.
+    @property
+    def capabilities(self) -> frozenset[str] | tuple[str, ...]: ...
 
 
 class HandshakeGate:

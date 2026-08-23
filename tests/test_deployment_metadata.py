@@ -120,6 +120,33 @@ def test_shell_export_rejects_an_untracked_file_in_the_tree(tmp_path: Path, monk
     assert module.main(["--shell-export"]) != 0
 
 
+def test_shell_export_fails_structurally_outside_a_git_checkout(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Round-3 restart gauntlet, Logic finding: ``_is_dirty()`` was called
+    *outside* ``shell_export()``'s try/except.
+
+    It uses ``_run_git`` with ``check=True``, so running outside a git
+    checkout (or against a corrupt index) raised an uncaught
+    ``subprocess.CalledProcessError`` -- a raw traceback and a Python exit
+    code, not the ``FAIL:`` message and return-1 the script promises. CI pipes
+    this into ``$GITHUB_ENV``, where a traceback is a far worse signal than
+    the documented refusal.
+    """
+    not_a_repo = tmp_path / "no-git-here"
+    not_a_repo.mkdir()
+    module = _load_module()
+    monkeypatch.setattr(module, "REPO_ROOT", not_a_repo)
+
+    exit_code = module.main(["--shell-export"])
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("FAIL: could not derive deployment metadata")
+    # And nothing partial was emitted for CI to source.
+    assert not EXPORT_RE.findall(captured.out)
+
+
 def test_check_release_inputs_does_not_require_a_clean_tree(tmp_path: Path, monkeypatch) -> None:
     """Plan/script docstring: local dev/test may leave metadata unset and
     remains display-only -- --check-release-inputs is a lightweight

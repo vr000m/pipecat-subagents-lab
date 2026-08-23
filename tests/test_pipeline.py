@@ -1853,7 +1853,7 @@ def test_unknown_cancel_target_does_not_poison_future_work_or_accumulate_state()
         for index in range(100):
             host._cancel_work(f"work-turn-{index}")
 
-        assert host._cancelled_work_items == set()
+        assert host._work_ledger.cancelled_ids == set()
         future = GroundedResult(
             result_id="future-result",
             worker_id="worker-search",
@@ -4435,7 +4435,7 @@ def test_retained_user_cancelled_work_item_suppresses_commit_and_speech() -> Non
     async def run() -> None:
         sink = CollectingMeasurementSink()
         host = SessionHost(measurement_sink=sink)
-        host._cancelled_work_items.add("work-user-cancelled")
+        host._work_ledger.cancelled_ids.add("work-user-cancelled")
         _register_dispatch_recorder(host, "work-user-cancelled", turn_id="turn-user-cancelled")
         result = GroundedResult(
             result_id="result-user-cancelled",
@@ -5983,7 +5983,7 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_subsequent_w
 ):
     """Regression: the reconcile loop used to discard a dispatched multi-
     intent child that reaches it (never accounted for in
-    results/pending/failures) from `_known_work_items`. That set is the
+    results/pending/failures) from `_work_ledger.known_ids`. That set is the
     *only* remaining registry `_cancel_work(None)` (a whole-turn cancel) can
     use to reach this id once the coordinator's own live-task tracking has
     already dropped it -- which it typically has, or this id would have been
@@ -5991,7 +5991,7 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_subsequent_w
     time meant a whole-turn cancel arriving *after* reconcile could no
     longer mark this id cancelled at all, so a late result arriving for it
     afterwards would be committed and autoplayed despite the user having
-    cancelled the turn. `_known_work_items` must still contain the id after
+    cancelled the turn. `_work_ledger.known_ids` must still contain the id after
     reconcile so a later whole-turn cancel can still reach it."""
 
     async def run() -> None:
@@ -6010,14 +6010,14 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_subsequent_w
         )
 
         # Still reachable after reconcile -- not yet cancelled.
-        assert "work-turn-orphan-0" in host._known_work_items
-        assert "work-turn-orphan-0" not in host._cancelled_work_items
+        assert "work-turn-orphan-0" in host._work_ledger.known_ids
+        assert "work-turn-orphan-0" not in host._work_ledger.cancelled_ids
 
         # A whole-turn cancel landing after the reconcile loop ran must still
         # be able to mark this id cancelled.
         await host.cancel_turn_or_child(None, None, origin=origin)
 
-        assert "work-turn-orphan-0" in host._cancelled_work_items
+        assert "work-turn-orphan-0" in host._work_ledger.cancelled_ids
 
         _register_dispatch_recorder(
             host, "work-turn-orphan-0", origin_epoch=origin.epoch, turn_id="turn-orphan"
@@ -6101,7 +6101,7 @@ def test_multi_intent_whole_turn_cancel_between_children_reaches_the_already_ack
         )
 
         assert f"work-{turn_id}-0" in captured_cancelled_work
-        assert f"work-{turn_id}-0" in host._cancelled_work_items
+        assert f"work-{turn_id}-0" in host._work_ledger.cancelled_ids
         await host.shutdown()
 
     asyncio.run(run())
@@ -6239,7 +6239,7 @@ def test_cancel_turn_or_child_sole_child_check_treats_a_known_only_sibling_as_li
     ``coordinator.submit`` has run) as still live, not just siblings with a
     local task, a scheduler entry, or a coordinator-tracked task. Regression
     for the ``live`` union previously being built from
-    ``_inflight_work_tasks``/``_inflight_turn_tasks`` directly instead of
+    ``_work_ledger.work_tasks``/``_work_ledger.turn_tasks`` directly instead of
     ``self._work_ledger.live_ids()``, which silently dropped ``known_ids``."""
 
     async def run() -> None:
@@ -6283,12 +6283,12 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_
     """Regression: unlike every other discard site, the reconcile loop fires
     when a child's fate is *unknown* (it may still be alive), not
     known-terminal. A prior round's fix discarded the id from both
-    `_known_work_items` and `_cancelled_work_items`, which would make a late
+    `_work_ledger.known_ids` and `_work_ledger.cancelled_ids`, which would make a late
     callback arriving afterwards read `was_cancelled=False` and commit +
     autoplay a result the user actually cancelled. The cancel marker must
     survive the reconcile loop so a late callback for this id is still
     treated as cancelled -- and (see the sibling
-    ..._subsequent_whole_turn_cancel test) `_known_work_items` must survive
+    ..._subsequent_whole_turn_cancel test) `_work_ledger.known_ids` must survive
     it too, so a whole-turn cancel arriving *after* reconcile can still
     reach this id at all."""
 
@@ -6299,7 +6299,7 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_
 
         # Stand in for a whole-turn cancel that landed before the reconcile
         # loop ran.
-        host._cancelled_work_items.add("work-turn-orphan-0")
+        host._work_ledger.cancelled_ids.add("work-turn-orphan-0")
 
         await host._handle_multi_intent(
             _multi_intent_outcome("first item"),
@@ -6311,8 +6311,8 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_
             ),
         )
 
-        assert "work-turn-orphan-0" in host._known_work_items
-        assert "work-turn-orphan-0" in host._cancelled_work_items
+        assert "work-turn-orphan-0" in host._work_ledger.known_ids
+        assert "work-turn-orphan-0" in host._work_ledger.cancelled_ids
 
         _register_dispatch_recorder(
             host, "work-turn-orphan-0", origin_epoch=origin.epoch, turn_id="turn-orphan"
@@ -6869,8 +6869,8 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
 def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_live_sibling() -> None:
     """Regression for round-5 review-gauntlet Theme H (Codex adversarial
     finding): a multi-intent turn's coordinator-retained background
-    children are not tracked in the host's own ``_inflight_work_tasks``/
-    ``_inflight_turn_tasks`` maps once their turn handler has returned --
+    children are not tracked in the host's own ``_work_ledger.work_tasks``/
+    ``_work_ledger.turn_tasks`` maps once their turn handler has returned --
     only the coordinator's own bookkeeping (``live_work_item_ids``) still
     knows they're live. Before the fix, cancelling one such child made the
     host's local ``remaining`` liveness check empty even though the sibling
@@ -8329,7 +8329,7 @@ def test_cancel_during_the_early_ack_yield_window_reaches_the_dispatched_search(
 
         async def cancelling_emit_early_ack(*args: object, **kwargs: object) -> None:
             tracked_at_ack.append(
-                any(dispatched[0] in tasks for tasks in host._inflight_work_tasks.values())
+                any(dispatched[0] in tasks for tasks in host._work_ledger.work_tasks.values())
             )
             # A cancel landing exactly inside the ack's scheduling-tick yield.
             host._cancel_work(None)
@@ -8372,7 +8372,7 @@ def test_multi_intent_cancel_racing_the_commit_downgrades_the_pre_derived_status
         ) -> object:
             # Stand in for a concurrent cancel arriving after derivation but
             # before this item's commit reads the cancel set.
-            host._cancelled_work_items.add(f"work-{result.turn_id}")
+            host._work_ledger.cancelled_ids.add(f"work-{result.turn_id}")
             return await real_commit_and_speak(result, *args, **kwargs)  # type: ignore[arg-type]
 
         host._commit_and_speak = cancel_racing_commit_and_speak  # type: ignore[method-assign]
@@ -9688,8 +9688,48 @@ def test_session_host_keeps_public_forwarders_for_the_extracted_collaborators() 
         assert host._handshake_gate.validate_handshake_token(token, epoch, redeem=False)
         assert not host._handshake_gate.validate_handshake_token(token, epoch, redeem=True)
 
+        # The forwarder still exists and is still wired to the gate -- but it
+        # now takes only the handshake and supplies ``self.connection``
+        # itself (round-3 restart gauntlet, Architecture finding), so the
+        # production caller no longer hands the host back its own state.
         with pytest.raises(AttributeError):
-            host.validate_patch_handshake(None, object())  # type: ignore[arg-type]
+            host.validate_patch_handshake(object())  # type: ignore[arg-type]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_session_host_validate_patch_handshake_uses_its_own_connection() -> None:
+    """Round-3 restart gauntlet, Architecture finding: the SessionHost
+    forwarder took ``(connection, handshake)``, so the sole production caller
+    in ``server/app.py`` read
+    ``session_host.validate_patch_handshake(session_host.connection,
+    handshake)`` -- handing the host back a piece of its own state to forward
+    on. The host owns ``self.connection``; the state-free two-argument shape is
+    ``HandshakeGate``'s constraint, not the host's.
+    """
+    import inspect as _inspect
+
+    signature = _inspect.signature(SessionHost.validate_patch_handshake)
+    assert list(signature.parameters) == ["self", "handshake"]
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        seen: list[tuple[object, object]] = []
+        host._handshake_gate.validate_patch_handshake = (  # type: ignore[method-assign]
+            lambda connection, handshake: seen.append((connection, handshake))
+        )
+        original_connection = host.connection
+        sentinel_connection = object()
+        sentinel_handshake = object()
+        host.connection = sentinel_connection  # type: ignore[assignment]
+        try:
+            host.validate_patch_handshake(sentinel_handshake)  # type: ignore[arg-type]
+        finally:
+            host.connection = original_connection
+
+        # It forwarded its OWN connection, not one the caller supplied.
+        assert seen == [(sentinel_connection, sentinel_handshake)]
         await host.shutdown()
 
     asyncio.run(run())

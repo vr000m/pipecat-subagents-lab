@@ -28,6 +28,7 @@ from typing import Any
 
 from scripts.evidence_common import (
     MIN_PAIRED_SAMPLES_PER_CELL,
+    REPO_ROOT,
     EvidenceGateError,
     EvidenceStatus,
     FixtureIndex,
@@ -38,9 +39,8 @@ from scripts.evidence_common import (
     validate_against_fixture,
     write_bytes_no_follow,
 )
-from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
+from scripts.query_context_common import load_fixture, scorer_hash, validate_raw_record
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1.json"
 
 

@@ -19,7 +19,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from scripts.evidence_common import REPO_ROOT
+
 
 # The date group requires an actual `YYYY-MM-DD` token, not merely
 # `(\S+)`: this repo's own CHANGELOG.md convention (see every dated heading

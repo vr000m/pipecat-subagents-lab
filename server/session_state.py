@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from .config import _read_regular_file_no_follow
 from .contracts import (
     WORK_STATUS_TERMINAL,
     DeliveryState,
@@ -56,10 +57,31 @@ _RETENTION_CONFIG_PATH = Path(__file__).resolve().parents[1] / "shared/work-stat
 #: terminal-record retention.
 _RETENTION_FALLBACK = {"ttl_seconds": 300, "max_keys": 256}
 
-try:
-    _retention_config = json.loads(_RETENTION_CONFIG_PATH.read_text())
-except (OSError, ValueError):
+#: Read through ``server/config.py``'s hardened primitive, not
+#: ``Path.read_text()``. This read runs at ``import server.session_state``
+#: time -- i.e. before every other guard in the process -- against a
+#: predictable, repo-relative path. ``read_text()`` follows a symlink planted
+#: there and blocks forever on a FIFO or character device, and the
+#: ``except`` below cannot catch either: a symlink resolves silently, and a
+#: blocking open never returns to raise. ``_read_regular_file_no_follow``
+#: applies ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK`` plus an ``fstat`` ``S_ISREG``
+#: check on the held fd and a byte cap, and folds every failure -- including
+#: "not a regular file" -- into ``None``, which lands on the same
+#: ``_RETENTION_FALLBACK`` degrade path the packaged-install case already
+#: uses. ``server.config`` has no intra-package imports and only stdlib
+#: module-level ones, so importing it here adds no cycle and no runtime cost.
+_RETENTION_MAX_BYTES = 64 * 1024
+
+_retention_bytes = _read_regular_file_no_follow(
+    _RETENTION_CONFIG_PATH, max_bytes=_RETENTION_MAX_BYTES
+)
+if _retention_bytes is None:
     _retention_config = dict(_RETENTION_FALLBACK)
+else:
+    try:
+        _retention_config = json.loads(_retention_bytes)
+    except ValueError:
+        _retention_config = dict(_RETENTION_FALLBACK)
 
 # Terminal work_status records remain in capable-client snapshots for a fixed
 # five-minute session-clock TTL (Requirements). SessionState has no timer

@@ -20,7 +20,6 @@ rewrite the manifest as ``final`` before autoplay can ever activate.
 from __future__ import annotations
 
 import argparse
-import errno
 import json
 import os
 import re
@@ -32,19 +31,22 @@ from pathlib import Path
 from typing import Any
 
 from scripts.evidence_common import (
+    REPO_ROOT,
     EvidenceGateError,
     confined_output_path,
     load_json,
     load_jsonl,
+    read_bytes_if_present,
     require_hex64,
+    require_type,
     sha256_file,
+    write_bytes_no_follow,
 )
 from scripts.validate_phase2_transport_browser_contract import (
     validate_artifact as validate_transport_browser_artifact,
 )
 from server.config import load_config
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
 TRANSPORT_SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-transport-browser-contract.json"
 
@@ -151,12 +153,19 @@ PHASE_SCENARIO_MIN_COUNT: Mapping[str, Mapping[str, int]] = {
 
 
 def _require_type(value: Any, kinds: tuple[type, ...], field: str, index: int) -> None:
-    if isinstance(value, bool) and bool not in kinds:
-        raise EvidenceGateError(f"record {index}: {field} must not be a bool, got {value!r}")
-    if not isinstance(value, kinds):
-        raise EvidenceGateError(
-            f"record {index}: {field} expected {kinds}, got {type(value).__name__}"
-        )
+    """``evidence_common.require_type`` with this file's per-record prefix.
+
+    Round-3 restart gauntlet, Architecture finding: this was a forked copy of
+    the shared check (same bool-is-not-an-int rule, same isinstance test),
+    differing only in prefixing the message with the record index. Two copies
+    of a type predicate can harden independently, so the predicate now lives
+    in one place and only the *message* is local -- which is the actual
+    difference.
+    """
+    try:
+        require_type(value, kinds, field)
+    except EvidenceGateError as exc:
+        raise EvidenceGateError(f"record {index}: {exc}") from exc
 
 
 def validate_record(record: Mapping[str, Any], index: int) -> None:
@@ -600,7 +609,6 @@ def write_manifest(
         + [r for r in phase1_records if r["phase"] == "phase1"]
     )
     transport_eligible = bool(transport_record.get("promotion_eligible"))
-    phase3_complete = phase3_record is not None
 
     reason: str | None
     if manifest_phase == "provisional":
@@ -615,17 +623,27 @@ def write_manifest(
         else:
             reason = "provisional_manifest"
     else:
-        promotion_eligible = real_stratum_present and transport_eligible and phase3_complete
+        # Phase 3 completeness is not a *reason* this branch can report: the
+        # guard at the top of this function refuses `--manifest-phase final`
+        # without `--phase3-input` outright, so `phase3_record` is never None
+        # here. The old `"phase3_incomplete"` reason string was therefore dead
+        # (round-3 restart gauntlet, Logic finding) -- a downstream consumer
+        # keying on it would have waited forever for a value the writer could
+        # not emit.
+        #
+        # Removed rather than made reachable: turning the hard refusal into a
+        # soft reason would mean writing an ineligible-but-well-formed final
+        # manifest where the writer currently declines to write one at all.
+        # That is a promotion-gate policy change, not a dead-code cleanup, and
+        # it is not one this file gets to make on its own.
+        assert phase3_record is not None, (
+            "--manifest-phase final without --phase3-input must have been refused above"
+        )
+        promotion_eligible = real_stratum_present and transport_eligible
         reason = (
             None
             if promotion_eligible
-            else (
-                "real_stratum_missing"
-                if not real_stratum_present
-                else "audibility_unverified"
-                if not transport_eligible
-                else "phase3_incomplete"
-            )
+            else ("real_stratum_missing" if not real_stratum_present else "audibility_unverified")
         )
 
     if not SCHEMA_PATH.exists():
@@ -669,118 +687,19 @@ def write_manifest(
     return manifest
 
 
-# Mirrors ``server.config._MAX_EVIDENCE_INPUT_BYTES``: the manifest path is
-# repo-relative and predictable, so the bytes found there are attacker-
-# steerable under the same threat model. Cap the read well above any real
-# manifest rather than letting a planted large file be slurped into memory.
-_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
-
-
-def _require_regular_fd(fd: int, path: Path, verb: str) -> None:
-    """Reject anything that is not a regular file, from the *open fd*.
-
-    ``O_NOFOLLOW`` covers symlinks and nothing else. An attacker who can plant
-    a symlink at this predictable, repo-relative path can equally ``mkfifo``
-    it, and opening a FIFO blocks forever (which ``O_NONBLOCK`` at the open
-    turns into a non-blocking open, not into a safe read) -- or plant a device
-    node. ``fstat`` on the fd we actually hold, rather than a ``stat`` before
-    the open, is what closes the TOCTOU window between the check and the use.
-    """
-    from stat import S_ISREG
-
-    st = os.fstat(fd)
-    if not S_ISREG(st.st_mode):
-        raise EvidenceGateError(
-            f"{path}: refusing to {verb} the existing manifest -- not a regular file"
-        )
-
-
-def _write_bytes_no_follow(path: Path, payload: bytes) -> None:
-    """Write `payload` to `path`, refusing to write *through* a symlink.
-
-    ``O_NOFOLLOW`` makes an attacker-planted symlink at this predictable path
-    fail with ``ELOOP`` instead of silently redirecting manifest bytes to the
-    link's target. The path may legitimately already exist as a regular file
-    (a `.previous` copy from an earlier run), so ``O_EXCL`` is not usable
-    here -- ``O_NOFOLLOW`` is the check that matters.
-
-    ``O_NONBLOCK`` plus the ``_require_regular_fd`` check closes the sibling
-    gap ``O_NOFOLLOW`` does not cover: a FIFO planted at this path would
-    otherwise make the open (and then the write) block indefinitely. The flag
-    is cleared implicitly by closing the fd; nothing here needs it beyond the
-    open.
-    """
-    try:
-        fd = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644
-        )
-    except OSError as exc:
-        # ELOOP/EMLINK deliberately propagates as the raw OSError it always
-        # has here -- callers already pin that -- and only the newly-covered
-        # non-regular-file cases become an EvidenceGateError.
-        if exc.errno == errno.ENXIO:
-            # Write-opening a reader-less FIFO with O_NONBLOCK fails here
-            # rather than blocking; same verdict as the fstat check below.
-            raise EvidenceGateError(
-                f"{path}: refusing to overwrite the existing manifest -- not a regular file"
-            ) from exc
-        raise
-    try:
-        _require_regular_fd(fd, path, "overwrite")
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _read_bytes_no_follow(path: Path) -> bytes | None:
-    """Read `path`, refusing to read *through* a symlink.
-
-    The write side is already ``O_NOFOLLOW``-hardened, but the `.previous`
-    copy first has to read the destination, and ``Path.exists()`` /
-    ``Path.read_bytes()`` both follow links. A symlink planted at the manifest
-    path -- a predictable, repo-relative location CI also writes -- would
-    otherwise copy the link target's contents into a world-readable
-    `<output>.previous` just before the rename replaced the link. ``ELOOP`` is
-    a hard failure here, not a "treat as absent": something is at the manifest
-    path that must not be, and silently proceeding would write the real
-    manifest over it.
-
-    ``O_NOFOLLOW`` is only half the story, though: the same attacker can
-    ``mkfifo`` this path instead, and a blocking read on a writer-less FIFO
-    hangs the gate forever. ``O_NONBLOCK`` plus the ``_require_regular_fd``
-    ``fstat`` rejects that (and device nodes) from the fd actually held, and
-    the read loop is capped at ``_MAX_MANIFEST_BYTES`` so an oversized planted
-    file cannot be slurped into memory either.
-    """
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.EMLINK):
-            raise EvidenceGateError(
-                f"{path}: refusing to read the existing manifest through a symlink"
-            ) from exc
-        raise
-    try:
-        _require_regular_fd(fd, path, "read")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(fd, 1 << 20)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > _MAX_MANIFEST_BYTES:
-                raise EvidenceGateError(
-                    f"{path}: refusing to read the existing manifest -- "
-                    f"exceeds {_MAX_MANIFEST_BYTES} bytes"
-                )
-            chunks.append(chunk)
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
+# The manifest's own no-follow read/write primitives used to live here as
+# private copies of ``scripts/evidence_common``'s (round-3 restart gauntlet,
+# Architecture finding). They were the security-critical half of this file --
+# ``O_NOFOLLOW``/``O_NONBLOCK``/``fstat``-``S_ISREG``/byte-cap -- duplicated
+# beside the five helpers this file already imported from that module, so the
+# two copies could (and did) harden independently: the shared writer had
+# gained an output byte cap and a short-write loop that the copy here never
+# got, meaning a payload larger than one ``write(2)`` could return was
+# silently truncated into the manifest with no error raised.
+#
+# ``_MAX_MANIFEST_BYTES`` is likewise ``evidence_common``'s
+# ``_MAX_EVIDENCE_INPUT_BYTES`` under a local name; the cap is now expressed
+# as that module's default rather than as a second constant to keep in step.
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -812,17 +731,22 @@ def _atomic_write_manifest(output: Path, manifest: dict[str, Any]) -> None:
       `<output>.tmp` path opened without ``O_EXCL``/``O_NOFOLLOW``, so a
       planted symlink there would have received the manifest bytes. The temp
       file is now created by `tempfile.mkstemp` (random name, ``O_EXCL``) and
-      the `.previous` copy is both read (`_read_bytes_no_follow`) and written
-      (`_write_bytes_no_follow`) ``O_NOFOLLOW``. The read side matters as much
+      the `.previous` copy is both read (`read_bytes_if_present`) and written
+      (`write_bytes_no_follow`) ``O_NOFOLLOW``. The read side matters as much
       as the write side: it is what stops a symlink at the manifest path from
       leaking its target's contents into `<output>.previous`.
+
+    ``read_bytes_if_present`` is the shared reader's "absent is fine, every
+    other failure is not" variant: a first run has no manifest to back up, but
+    a symlink, FIFO, device node or oversized file at the manifest path still
+    raises rather than being read as "nothing there to preserve".
     """
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     previous_path = output.with_suffix(output.suffix + ".previous")
-    previous_bytes = _read_bytes_no_follow(output)
+    previous_bytes = read_bytes_if_present(output)
     if previous_bytes is not None:
-        _write_bytes_no_follow(previous_path, previous_bytes)
+        write_bytes_no_follow(previous_path, previous_bytes)
 
     fd, tmp_name = tempfile.mkstemp(
         dir=str(output.parent), prefix=f".{output.name}.", suffix=".tmp"
@@ -857,14 +781,203 @@ def _rollback_manifest(output: Path, previous_bytes: bytes | None) -> None:
     never finds a half-committed new manifest in place. A failure *during*
     the restore is deliberately suppressed: the original write failure is the
     error worth reporting, and re-raising from here would mask it.
+
+    The handler catches ``EvidenceGateError`` as well as ``OSError`` (round-3
+    restart gauntlet, Logic finding). ``write_bytes_no_follow`` raises both --
+    ``OSError`` for ``ELOOP`` and the ordinary IO failures, but
+    ``EvidenceGateError`` for the non-regular-file and over-cap checks -- so
+    suppressing only ``OSError`` let exactly those cases propagate out of the
+    rollback and replace the original write failure, which is the outcome the
+    paragraph above says must not happen.
     """
     try:
         if previous_bytes is None:
             output.unlink(missing_ok=True)
         else:
-            _write_bytes_no_follow(output, previous_bytes)
-    except OSError:
+            write_bytes_no_follow(output, previous_bytes)
+    except (OSError, EvidenceGateError):
         pass
+
+
+#: Manifest fields that describe *when and where* the manifest was produced
+#: rather than *what evidence it binds*. Excluded from the drift check in
+#: :func:`verify_manifest`, because a manifest committed at one commit can
+#: never match a regeneration at a later one: ``deployed_at_utc`` and
+#: ``generated_at_utc`` are wall-clock stamps, and the release-identity trio
+#: is derived from whichever checkout the verifier happens to be running in.
+#: Everything *not* listed here is evidence binding, and must match.
+_MANIFEST_VOLATILE_FIELDS = frozenset(
+    {
+        "deployed_at_utc",
+        "generated_at_utc",
+        "source_commit",
+        "source_tree_hash",
+        "release_version",
+        "feature_policy_fingerprint",
+    }
+)
+
+#: The evidence-binding fields :func:`verify_manifest` knows how to re-derive.
+#: Together with ``_MANIFEST_VOLATILE_FIELDS`` this must cover every top-level
+#: manifest key -- ``verify_manifest`` reports anything left over as drift, so
+#: a field added to ``write_manifest`` cannot slip through unverified.
+_MANIFEST_VERIFIED_FIELDS = frozenset(
+    {
+        "inputs",
+        "schema_hash",
+        "manifest_phase",
+        "promotion_eligible",
+        "reason",
+        "phase3_completion_hash",
+        "phase3_command_digest",
+        "phase4c_artifact_sha256",
+    }
+)
+
+
+def verify_manifest(manifest_path: Path) -> list[str]:
+    """Re-derive the committed manifest's evidence bindings and report drift.
+
+    The read-only counterpart to :func:`write_manifest`, for CI. The
+    ``release-metadata`` job used to *write* a manifest into an ephemeral
+    workspace and end there -- no commit, no artifact upload, no deploy step --
+    while the actual consumer (``server/config.py``'s
+    ``load_promotion_manifest``) reads the repo-committed file. Producer and
+    consumer were never connected, so the job proved nothing (round-3 restart
+    gauntlet, Architecture finding).
+
+    Verifying instead of writing is the conservative fix: it makes the job
+    prove something real about the file the consumer actually reads, without
+    introducing a publish path (which is an operator decision about release
+    mechanics, not something a review fix gets to add).
+
+    What is checked, and why each one is drift worth failing on:
+
+    * every declared ``inputs[*].sha256`` still matches the bytes at
+      ``inputs[*].path`` -- i.e. nobody edited an evidence artifact without
+      regenerating the manifest that vouches for it;
+    * ``schema_hash`` still matches ``shared/schemas/v013-evidence.json`` --
+      ``server/config.py`` recomputes this at boot and fails closed on a
+      mismatch, so CI should catch it first;
+    * every declared input still *passes its gate* -- a manifest must not
+      outlive the validity of the evidence it points at;
+    * ``promotion_eligible``/``reason`` still equal what those gates now
+      conclude -- the check that stops a stale manifest from authorizing
+      data-driven tuning the current evidence no longer supports.
+
+    Returns a list of human-readable drift descriptions; empty means clean.
+    Raises ``EvidenceGateError`` only when the manifest itself cannot be read
+    or is structurally unusable.
+    """
+    manifest = load_json(manifest_path)
+    if not isinstance(manifest, dict):
+        raise EvidenceGateError(f"{manifest_path}: manifest must be a JSON object")
+
+    drift: list[str] = []
+
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, dict) or not inputs:
+        raise EvidenceGateError(f"{manifest_path}: manifest declares no inputs")
+
+    resolved: dict[str, Path] = {}
+    for phase, entry in sorted(inputs.items()):
+        if not isinstance(entry, dict):
+            drift.append(f"inputs.{phase} is not an object")
+            continue
+        declared_path = entry.get("path")
+        declared_sha = entry.get("sha256")
+        if not isinstance(declared_path, str) or not isinstance(declared_sha, str):
+            drift.append(f"inputs.{phase} is missing a string path/sha256")
+            continue
+        # Confined the same way `load_promotion_manifest` confines it: the
+        # path comes from the artifact under scrutiny, so it is not a
+        # trustworthy read target on its own.
+        candidate = (REPO_ROOT / declared_path).resolve()
+        if not candidate.is_relative_to(REPO_ROOT.resolve()):
+            drift.append(f"inputs.{phase}.path escapes the repo tree: {declared_path}")
+            continue
+        try:
+            actual_sha = sha256_file(candidate)
+        except EvidenceGateError as exc:
+            drift.append(f"inputs.{phase} is unreadable: {exc}")
+            continue
+        if actual_sha != declared_sha:
+            drift.append(
+                f"inputs.{phase} digest drift: manifest says {declared_sha}, "
+                f"{declared_path} now hashes to {actual_sha}"
+            )
+            continue
+        resolved[phase] = candidate
+
+    if SCHEMA_PATH.exists():
+        actual_schema_hash = sha256_file(SCHEMA_PATH)
+        if manifest.get("schema_hash") != actual_schema_hash:
+            drift.append(
+                f"schema_hash drift: manifest says {manifest.get('schema_hash')}, "
+                f"{SCHEMA_PATH.name} now hashes to {actual_schema_hash}"
+            )
+    else:
+        drift.append(f"evidence schema missing, cannot verify schema_hash: {SCHEMA_PATH}")
+
+    # Re-run the gates over the still-matching inputs and re-derive the
+    # verdict. Only possible when phase0/1/2 all resolved above; a digest
+    # mismatch is already reported, so this is skipped rather than
+    # double-reported.
+    if {"phase0", "phase1", "phase2"} <= resolved.keys():
+        try:
+            phase0_records = validate_artifact("phase0", resolved["phase0"])
+            phase1_records = validate_artifact("phase1", resolved["phase1"])
+            transport_record = _validate_transport_contract(resolved["phase2"])
+        except EvidenceGateError as exc:
+            drift.append(f"a declared input no longer passes its gate: {exc}")
+        else:
+            real_stratum_present = has_real_provider_stratum(
+                [r for r in phase0_records if r["phase"] == "phase0"]
+                + [r for r in phase1_records if r["phase"] == "phase1"]
+            )
+            transport_eligible = bool(transport_record.get("promotion_eligible"))
+            if manifest.get("manifest_phase") == "final":
+                expected_eligible = real_stratum_present and transport_eligible
+            else:
+                expected_eligible = False
+            if bool(manifest.get("promotion_eligible")) != expected_eligible:
+                drift.append(
+                    f"promotion_eligible drift: manifest says "
+                    f"{manifest.get('promotion_eligible')!r}, the current evidence supports "
+                    f"{expected_eligible!r}"
+                )
+
+    # The digests the manifest repeats at top level must agree with the
+    # `inputs` entries they are copied from -- a hand-edited manifest could
+    # otherwise pass every check above while its top-level binding pointed at
+    # different bytes than the input it claims to summarize.
+    for field, phase in (
+        ("phase3_completion_hash", "phase3"),
+        ("phase3_command_digest", None),
+        ("phase4c_artifact_sha256", "phase4c"),
+    ):
+        if field not in manifest or phase is None:
+            continue
+        entry = inputs.get(phase)
+        declared = entry.get("sha256") if isinstance(entry, dict) else None
+        if manifest[field] != declared:
+            drift.append(
+                f"{field} does not match inputs.{phase}.sha256 "
+                f"({manifest[field]!r} vs {declared!r})"
+            )
+
+    # Fail closed on a manifest field nothing above knows how to verify: a
+    # future field added to `write_manifest` but not here would otherwise be
+    # silently unchecked, which is how this job came to prove nothing in the
+    # first place.
+    uncovered = set(manifest) - _MANIFEST_VOLATILE_FIELDS - _MANIFEST_VERIFIED_FIELDS
+    if uncovered:
+        drift.append(
+            f"manifest field(s) {sorted(uncovered)} are covered by neither the drift check "
+            "nor the documented volatile set -- extend verify_manifest()"
+        )
+
+    return drift
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -872,6 +985,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--phase", choices=sorted(PHASE_MINIMUMS))
     parser.add_argument("--input", type=Path)
     parser.add_argument("--write-manifest", action="store_true")
+    parser.add_argument(
+        "--verify-manifest",
+        type=Path,
+        help=(
+            "Read-only drift check on a committed promotion manifest: re-derive its "
+            "evidence bindings and exit non-zero if they no longer hold. Does not write."
+        ),
+    )
     parser.add_argument("--manifest-phase", default="provisional", choices=("provisional", "final"))
     parser.add_argument("--phase0-input", type=Path)
     parser.add_argument("--phase1-input", type=Path)
@@ -884,6 +1005,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--feature-policy-fingerprint")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
+
+    if args.verify_manifest is not None:
+        try:
+            drift = verify_manifest(args.verify_manifest)
+        except (EvidenceGateError, OSError) as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            return 1
+        if drift:
+            print(
+                f"FAIL: {args.verify_manifest} has drifted from the evidence it binds:",
+                file=sys.stderr,
+            )
+            for item in drift:
+                print(f"  - {item}", file=sys.stderr)
+            print(
+                "  Regenerate it with --write-manifest and commit the result.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"OK: {args.verify_manifest} still matches the evidence it binds")
+        return 0
 
     if args.write_manifest:
         required = {

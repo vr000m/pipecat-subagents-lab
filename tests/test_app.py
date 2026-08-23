@@ -1158,7 +1158,15 @@ def test_handshake_rejects_trailing_bare_percent_at_asgi_boundary() -> None:
     assert getattr(excinfo.value, "status_code", 400) == 400
 
 
-# --- Phase 3: PATCH capability inheritance/mismatch (SessionHost.validate_patch_handshake) -
+# --- Phase 3: PATCH capability inheritance/mismatch (HandshakeGate.validate_patch_handshake) -
+#
+# These go through ``host._handshake_gate`` rather than the SessionHost
+# forwarder: they validate a *promoted* Connection that is deliberately not the
+# host's own bound one, which is the case the gate's two-argument, state-free
+# signature exists for. ``SessionHost.validate_patch_handshake(handshake)``
+# takes only the handshake and always validates against ``self.connection``
+# (round-3 restart gauntlet, Architecture finding) -- see
+# ``test_session_host_validate_patch_handshake_uses_its_own_connection``.
 
 
 def test_validate_patch_handshake_omitted_field_inherits_the_post_bound_set() -> None:
@@ -1181,7 +1189,7 @@ def test_validate_patch_handshake_omitted_field_inherits_the_post_bound_set() ->
     )
 
     # Omission must not raise and must not mutate the bound connection.
-    host.validate_patch_handshake(promoted, patch_handshake)
+    host._handshake_gate.validate_patch_handshake(promoted, patch_handshake)
 
     assert promoted.capabilities == ("work_status_v1",)
 
@@ -1208,7 +1216,7 @@ def test_validate_patch_handshake_present_mismatch_is_rejected() -> None:
     )
 
     with pytest.raises(ValueError):
-        host.validate_patch_handshake(promoted, mismatched_patch)
+        host._handshake_gate.validate_patch_handshake(promoted, mismatched_patch)
     # Rejecting the mismatch must not mutate the bound connection/entitlement.
     assert promoted.capabilities == ("work_status_v1",)
 
@@ -1234,7 +1242,7 @@ def test_validate_patch_handshake_exact_matching_set_is_accepted() -> None:
         capabilities_present=True,
     )
 
-    host.validate_patch_handshake(promoted, matching_patch)  # must not raise
+    host._handshake_gate.validate_patch_handshake(promoted, matching_patch)  # must not raise
 
 
 # --- Phase 3: mixed-version client/server compatibility fixture -----------

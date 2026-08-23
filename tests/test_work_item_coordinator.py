@@ -1,6 +1,8 @@
 """Bounded work items preserve accepted order and isolate worker contexts."""
 
 import asyncio
+import dataclasses
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,10 +10,14 @@ import pytest
 
 from server.config import Config
 from server.work_item_coordinator import (
+    OPTIONAL_COORDINATOR_MEMBERS,
+    CancelWork,
     Coordinator,
     CoordinatorDefaults,
+    CoordinatorView,
     OptionalCoordinator,
     PendingDialogue,
+    StartTask,
     WorkItemCoordinator,
     WorkItemFailure,
     coordinator_view,
@@ -1196,6 +1202,71 @@ def test_coordinator_view_prefers_a_conforming_coordinators_own_members() -> Non
     assert view.registry is coordinator.registry
     assert view.OWNED_CONFIG_FIELDS == coordinator.OWNED_CONFIG_FIELDS
     assert view.cancel() == coordinator.cancel()
+
+
+def test_all_four_coordinator_boundary_declarations_carry_the_same_members() -> None:
+    """The four declarations of the coordinator boundary must agree on
+    *which* members exist.
+
+    They stay four declarations on purpose (see
+    ``OPTIONAL_COORDINATOR_MEMBERS``' docstring), but adding a member used to
+    take four coordinated edits with nothing catching a missed one -- and two
+    drifts had already landed that way. This pins all four against the single
+    roster, so a member added to three of them fails here instead of silently
+    resolving to a fallback in production.
+    """
+    assert set(OptionalCoordinator.__protocol_attrs__) == set(OPTIONAL_COORDINATOR_MEMBERS)
+
+    for member_name in OPTIONAL_COORDINATOR_MEMBERS:
+        assert hasattr(CoordinatorDefaults, member_name), (
+            f"CoordinatorDefaults is missing {member_name}"
+        )
+
+    assert {field.name for field in dataclasses.fields(CoordinatorView)} == set(
+        OPTIONAL_COORDINATOR_MEMBERS
+    )
+
+    # coordinator_view resolves every one of them -- a member declared on the
+    # view but never populated by the factory would be a TypeError at call
+    # time, not a silent fallback, but a member the factory forgets to *read*
+    # off the coordinator would be.
+    coordinator = WorkItemCoordinator()
+    view = coordinator_view(coordinator)
+    for member_name in OPTIONAL_COORDINATOR_MEMBERS:
+        resolved = getattr(view, member_name)
+        declared = getattr(coordinator, member_name)
+        if callable(declared):
+            assert resolved == declared, f"coordinator_view shadowed {member_name}"
+        else:
+            assert resolved is declared, f"coordinator_view shadowed {member_name}"
+
+
+def test_coordinator_view_callables_keep_the_protocols_declared_signatures() -> None:
+    """``CoordinatorView``'s two callable members must stay signature-exact
+    with the Protocols that declare them.
+
+    They were typed ``Callable[..., ...]``, which erased ``start_task``'s
+    keyword-only ``mandatory`` on the *only* one of this module's four
+    boundary declarations production resolves through -- so a call site could
+    silently drop the keyword the Protocol fix added. They are now
+    ``StartTask``/``CancelWork`` Protocols; this test fails if a signature
+    change lands on ``Coordinator``/``OptionalCoordinator`` without being
+    mirrored onto the view's callable, which is the drift the ``...`` hid.
+    """
+
+    def call_signature(protocol: type) -> inspect.Signature:
+        return inspect.signature(protocol.__call__).replace(return_annotation=None)
+
+    def method_signature(protocol: type, name: str) -> inspect.Signature:
+        return inspect.signature(getattr(protocol, name)).replace(return_annotation=None)
+
+    assert call_signature(StartTask) == method_signature(Coordinator, "start_task")
+    assert call_signature(StartTask) == method_signature(OptionalCoordinator, "start_task")
+    assert call_signature(CancelWork) == method_signature(Coordinator, "cancel")
+    assert call_signature(CancelWork) == method_signature(OptionalCoordinator, "cancel")
+
+    # And the erased keyword really is reachable through the view.
+    assert coordinator_view(object()).cancel(work_item_id=None) == ()
 
 
 def test_wait_timeout_ms_override_applies_independently_of_max_work_items() -> None:

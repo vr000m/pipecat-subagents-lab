@@ -839,7 +839,7 @@ def create_app(
         if not session_host.accepts(handshake.proposed_epoch):
             raise HTTPException(status_code=409, detail="stale Small WebRTC connection epoch")
         try:
-            session_host.validate_patch_handshake(session_host.connection, handshake)
+            session_host.validate_patch_handshake(handshake)
         except ValueError:
             raise HTTPException(
                 status_code=400, detail="capabilities cannot change after connection promotion"

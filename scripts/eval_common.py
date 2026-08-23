@@ -37,7 +37,6 @@ One definition here now backs both.
 from __future__ import annotations
 
 import inspect
-import os
 import re
 import subprocess
 from collections.abc import Callable
@@ -46,7 +45,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from scripts.evidence_common import REPO_ROOT as _REPO_ROOT
-from scripts.evidence_common import confined_output_path
+from scripts.evidence_common import confined_output_path, write_bytes_no_follow
 from server.composition import build_session_host
 from server.config import (
     Config,
@@ -677,6 +676,17 @@ async def close_judge_llm_service(service: Any) -> None:
     tests monkeypatch ``build_judge_llm_service`` to
     ``lambda *_a, **_k: None`` -- this must not break them), and when the
     resolved client has no ``close`` attribute.
+
+    Probes the *result* of ``close()`` with ``inspect.isawaitable`` rather
+    than awaiting unconditionally, exactly as
+    ``close_session_provider_clients._close_hop`` above does (round-3 restart
+    gauntlet, Logic finding). A provider exposing a synchronous ``close()``
+    made the bare ``await close()`` raise ``TypeError: object NoneType can't
+    be used in 'await' expression`` -- and because this runs in ``run_cell``'s
+    ``finally``, that exception replaced an otherwise-successful cell result
+    and rewrote it to ``turn-error``, corrupting the matrix over a cleanup
+    detail. The awaitable probe is why the sibling helper handles the async
+    worker client and the sync router client through one code path.
     """
     if service is None:
         return
@@ -686,7 +696,9 @@ async def close_judge_llm_service(service: Any) -> None:
     close = getattr(client, "close", None)
     if close is None:
         return
-    await close()
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 def strip_control_chars(text: str) -> str:
@@ -778,6 +790,17 @@ def sanitize_reason(text: str, *, credential: str | None = None, max_len: int = 
 def write_no_follow(path: Path, content: str) -> None:
     """Write text to ``path`` without following an existing symlink there.
 
+    The text-mode, directory-creating front end over
+    :func:`scripts.evidence_common.write_bytes_no_follow` -- which owns the
+    actual hardening. This function used to carry its own ``os.open`` with
+    ``O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW`` and had already diverged from
+    that one: it lacked ``O_NONBLOCK``, the ``require_regular_fd`` check on
+    the held fd, the output byte cap, the short-write loop, and the
+    ``fsync`` (round-3 restart gauntlet, Architecture finding). Delegating
+    means a FIFO planted at this predictable, repo-relative path is now
+    refused rather than blocking the run indefinitely, and the two copies
+    cannot harden independently again.
+
     Pairs with :func:`confined_output_path` -- that function rejects a
     symlink already resolved by the time it runs its check, but a TOCTOU
     window remains between that check and the actual write unless the write
@@ -790,11 +813,16 @@ def write_no_follow(path: Path, content: str) -> None:
     ``os.open(..., O_DIRECTORY | O_NOFOLLOW)`` and a ``dir_fd``-relative
     final open, which this function does not do). That residual window
     requires local write access to the repo tree during the run to exploit.
+
+    The ``mkdir`` and the UTF-8 encode stay here rather than moving into the
+    shared byte-level writer: the evidence-gate scripts write to paths a
+    prior gate step has already created, whereas this runner's ``--out`` may
+    name a fresh timestamped directory. Raw ``OSError`` (``ELOOP`` for a
+    planted symlink, ``EISDIR`` for a directory target) still propagates
+    unchanged -- callers and tests pin that.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(content)
+    write_bytes_no_follow(path, content.encode("utf-8"))
 
 
 def git_head(*, cwd: Path | None = None) -> str | None:
