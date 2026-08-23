@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._evidence_common import (
+from scripts.evidence_common import (
     EvidenceGateError,
     load_json,
     load_jsonl,
@@ -388,7 +388,7 @@ PHASE4C_STRING_FIELDS = frozenset({"fixture_version", "scorer_version", "generat
 PHASE4C_ALLOWED_FIELDS = (
     frozenset({"status", "promotion_eligible"}) | PHASE4C_HASH_LIKE_FIELDS | PHASE4C_STRING_FIELDS
 )
-# Unanchored + `fullmatch`, matching `_evidence_common.HEX64_RE` and
+# Unanchored + `fullmatch`, matching `evidence_common.HEX64_RE` and
 # `server.config._is_hex_hash`: `$` also matches before a trailing newline.
 _HEX_RE = re.compile(r"[0-9a-f]+")
 

@@ -30,6 +30,7 @@ from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from pipecat.frames.frames import SystemFrame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
 class GenerationPhase(str, Enum):
@@ -857,13 +858,6 @@ class SpeechLifecycleCoordinator:
         result = callback(*args)
         if asyncio.iscoroutine(result):
             await result
-
-
-try:
-    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-except ImportError:  # pragma: no cover - dependency-free contract fallback
-    FrameProcessor = object  # type: ignore[assignment,misc]
-    FrameDirection = Any  # type: ignore[misc,assignment]
 
 
 class TransportSpeechLifecycleProcessor(FrameProcessor):

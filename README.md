@@ -190,6 +190,13 @@ empty, and overriding it to a version the manifest was not cut for resolves to
 a display-only verdict. The three boolean flags are parsed strictly: only `true` or `false`
 (case-insensitive) is accepted, and any other value fails startup.
 
+Server deployment binding is controlled by three more env vars, with no TOML
+equivalents: `WEBSEARCH_BIND_HOST` (default `127.0.0.1`, must be a loopback
+address) and `WEBSEARCH_BIND_PORT` (default `7860`) configure the address
+Uvicorn binds the FastAPI app to; `WEBSEARCH_KNOWN_CLIENT_URL` (default
+`http://127.0.0.1:7860`) is the URL browser clients use to reach that bound
+server and is surfaced back to callers (e.g. in preflight/readiness output).
+
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
 The default host opens these websocket endpoints with the versioned local STT
 and TTS wire clients; adapter-level client factories remain injectable for

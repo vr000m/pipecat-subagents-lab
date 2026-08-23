@@ -38,7 +38,17 @@ from .results import ResultLog
 # web/test/state.test.js against shared/protocol.md's "Progressive work
 # status" retention section.
 _RETENTION_CONFIG_PATH = Path(__file__).resolve().parents[1] / "shared/work-status-retention.json"
-_retention_config = json.loads(_RETENTION_CONFIG_PATH.read_text())
+# server/config.py documents that the shared/ tree is deliberately excluded
+# from the deployable package (a packaged/standalone install has no
+# docs/benchmarks or shared/schemas tree either) and every caller there
+# degrades gracefully rather than raising. This module previously assumed
+# shared/ is always a sibling of server/ and crashed at import time
+# otherwise; fall back to the values shared/work-status-retention.json
+# itself documents as defaults so a packaged install can still import.
+try:
+    _retention_config = json.loads(_RETENTION_CONFIG_PATH.read_text())
+except (OSError, ValueError):
+    _retention_config = {"ttl_seconds": 300, "max_keys": 256}
 
 # Terminal work_status records remain in capable-client snapshots for a fixed
 # five-minute session-clock TTL (Requirements). SessionState has no timer
@@ -301,6 +311,12 @@ class SessionState:
             )
         return self._emit("result", result.model_dump(mode="json"))
 
+    # `commit_result` and `append_result` are the same operation under two
+    # names: this ledger has no distinct "append" vs "commit" semantics
+    # (there is no staging/undo step between them), so the alias exists only
+    # for call-site readability (`SessionHost.commit_late_result_once` and
+    # `pipeline.py`'s `_commit_result_state` read naturally as committing a
+    # result, not merely appending one). Prefer `append_result` in new code.
     commit_result = append_result
 
     def result_history(self, worker_id: str) -> tuple[GroundedResult, ...]:

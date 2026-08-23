@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._evidence_common import (
+from scripts.evidence_common import (
     MIN_PAIRED_SAMPLES_PER_CELL,
     EvidenceGateError,
     EvidenceStatus,
@@ -237,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             lines.append(json.dumps(status_record, sort_keys=True) + "\n")
         for record in data_records:
             lines.append(json.dumps(record, sort_keys=True) + "\n")
-        # write_bytes_no_follow (scripts/_evidence_common.py): this
+        # write_bytes_no_follow (scripts/evidence_common.py): this
         # predictable, repo-relative output path gets the same symlink/FIFO
         # hardening as the promotion-manifest writer, instead of a plain
         # open("w") that would follow a planted symlink. Kept inside this

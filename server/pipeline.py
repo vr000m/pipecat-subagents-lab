@@ -11,11 +11,12 @@ from typing import Any, Literal
 
 from loguru import logger
 from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
 from .config import Config, FeaturePolicy, PromotionManifest
-from .connection_arbiter import Connection, ConnectionArbiter
+from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     GroundedResult,
     RoutingDecision,
@@ -26,7 +27,7 @@ from .contracts import (
     WorkStatusState,
 )
 from .frames import CONNECTION_LOCAL_FRAMES
-from .handshake_gate import HandshakeGate
+from .handshake_gate import CapabilityCarrier, HandshakeGate
 from .observers import RuntimeObserver
 from .perf_metrics import (
     AppTurnRecorder,
@@ -136,6 +137,18 @@ they are separate tables so neither key type has to widen to ``str | None``.
 """
 
 
+def resolve_bus(preferred: Any = None) -> Any:
+    """Return ``preferred`` if given, else the dependency-free probe bus (or ``None``).
+
+    Public seam for callers (e.g. ``server.app``) that need a bus and would
+    otherwise have to reach into the leading-underscore ``_ProbeBus`` name
+    directly. ``_ProbeBus`` stays private; this is the sanctioned entry point.
+    """
+    if preferred is not None:
+        return preferred
+    return _ProbeBus() if _ProbeBus is not None else None
+
+
 def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
     """Construct the pinned framework bridge with connection-local output frames."""
     if getattr(BusBridgeProcessor, "framework_fallback", False):
@@ -152,13 +165,6 @@ def _contract_bridge() -> Any:
         bus=_ProbeBus() if _ProbeBus is not None else None,
         worker_name="contract-pipeline",
     )
-
-
-try:
-    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-except ImportError:  # pragma: no cover - dependency-free contract fallback
-    FrameProcessor = object  # type: ignore[assignment,misc]
-    FrameDirection = Any  # type: ignore[misc,assignment]
 
 
 class CanonicalResultAdapter(FrameProcessor):
@@ -692,7 +698,7 @@ class SessionHost:
 
     def validate_patch_handshake(
         self,
-        connection: Connection | ConnectionPipeline | None,
+        connection: CapabilityCarrier | None,
         handshake: SnapshotHandshake,
     ) -> None:
         self._handshake_gate.validate_patch_handshake(connection, handshake)

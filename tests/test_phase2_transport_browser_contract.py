@@ -11,7 +11,7 @@ promotion predicate: an artifact is ``promotion_eligible`` only when
 ``status == "promotion_eligible"`` *and* ``audibility.state ==
 "audibility_verified"`` -- schema validity alone never proves eligibility.
 
-This module imports the script and ``scripts/_evidence_common.py`` by path
+This module imports the script and ``scripts/evidence_common.py`` by path
 (matching the ``_load_validator()`` pattern already used in
 tests/test_v013_perf_scenarios.py) since ``scripts/`` is not a package.
 """

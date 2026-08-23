@@ -15,7 +15,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts._evidence_common import EvidenceGateError, require_nonempty_str, write_bytes_no_follow
+from scripts.evidence_common import EvidenceGateError, require_nonempty_str, write_bytes_no_follow
 from scripts.eval_common import REPO_ROOT, confined_output_path
 
 
@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
             command_digest=args.command_digest,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        # write_bytes_no_follow (scripts/_evidence_common.py): this predictable,
+        # write_bytes_no_follow (scripts/evidence_common.py): this predictable,
         # repo-relative output path gets the same symlink/FIFO hardening as the
         # promotion-manifest writer, instead of a plain write_text that would
         # follow a planted symlink. Kept inside this try block, not after it,

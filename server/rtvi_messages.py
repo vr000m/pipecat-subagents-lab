@@ -166,16 +166,12 @@ class RTVIMessagePublisher:
         data = (
             self._snapshot.model_dump(mode="json")
             if self._snapshot
-            else {
-                "contract_version": CONTRACT_VERSION,
-                "session_id": self.session_id,
-                "workers": [],
-                "results": [],
-                "speech_progress": [],
-                "routing": None,
-                "transcript": [],
-                "origin_epoch": self.active_epoch,
-            }
+            else RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=self.session_id,
+                snapshot_sequence=0,
+                origin_epoch=self.active_epoch,
+            ).model_dump(mode="json")
         )
         sequence = (
             self._sequence_provider() if self._sequence_provider is not None else self._watermark

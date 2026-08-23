@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._evidence_common import (
+from scripts.evidence_common import (
     EvidenceGateError,
     closed_object,
     load_json,

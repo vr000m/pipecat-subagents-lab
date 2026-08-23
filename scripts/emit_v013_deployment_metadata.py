@@ -43,7 +43,7 @@ import sys
 from datetime import UTC
 from pathlib import Path
 
-from scripts._evidence_common import sha256_bytes
+from scripts.evidence_common import sha256_bytes
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

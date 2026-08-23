@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://pipecat.example/schemas/v013-query-context-post-change-analysis.json",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/v013-query-context-post-change-analysis.json",
   "title": "v0.1.3 Phase 4C promoted post-change analysis artifact",
   "description": "Strict artifact produced only when Phase 4B promotes query-context narrowing and Phase 4C lands the runtime change. Bound into the final promotion manifest by SHA-256 as phase4c_artifact_sha256.",
   "type": "object",

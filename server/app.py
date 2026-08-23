@@ -41,7 +41,7 @@ from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .frames import SnapshotBarrierFlushFrame
 from .observers import ProjectedEvent, SnapshotBarrier
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
-from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
+from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge, resolve_bus
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
 from .router import Router
 from .rtvi_messages import RTVIMessagePublisher
@@ -340,13 +340,9 @@ async def _attach_connection(
             audio_out_sample_rate=output_sample_rate,
         )
         transport = SmallWebRTCTransport(connection, params)
-        bus = getattr(host.runner, "bus", None)
-        if bus is None:
-            from .pipeline import _ProbeBus
-
-            bus = _ProbeBus() if _ProbeBus is not None else None
+        bus = resolve_bus(getattr(host.runner, "bus", None))
         bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
-        config = getattr(host.registry, "config", None) or Config()
+        config = host.config
         processors = [transport.input()]
         if runtime.stt is not None:
             processors.extend(
@@ -708,7 +704,7 @@ def create_app(
     """Create the local FastAPI app and its Small WebRTC signaling routes."""
     _configure_logging()
     session_host = host if host is not None else _default_session_host()
-    config = getattr(session_host.registry, "config", None) or Config()
+    config = session_host.config
     webrtc_handler = SmallWebRTCRequestHandler()
 
     @asynccontextmanager

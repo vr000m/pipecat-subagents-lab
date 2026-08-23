@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://pipecat.example/schemas/v013-query-context-raw.json",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/v013-query-context-raw.json",
   "title": "v0.1.3 Phase 4A query-context raw record",
   "description": "One credential-safe raw sample from the query-context narrowing experiment (docs/benchmarks/v0.1.3-query-context-raw.jsonl). Strict allowlist: no transcript or prompt content, no free-form fields.",
   "type": "object",

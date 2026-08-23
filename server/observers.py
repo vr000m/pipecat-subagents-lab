@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import RuntimeSnapshot, resolve_work_status_wire_presence
+from .contracts import CONTRACT_VERSION, RuntimeSnapshot, resolve_work_status_wire_presence
 from .frames import SnapshotBarrierFlushFrame
 from .session_state import SessionState, StateEvent
 
@@ -255,7 +255,7 @@ class RuntimeObserver:
 
     def _payload(self, event: StateEvent, sequence: int) -> dict[str, Any]:
         return {
-            "contract_version": "v1.0",
+            "contract_version": CONTRACT_VERSION,
             "session_id": self.state.session_id,
             "sequence": sequence,
             "kind": event.kind,

@@ -5,7 +5,7 @@ the query-context narrowing experiment.
 See the "Phase 4: Query-context narrowing experiment" section of
 ``docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md``.
 
-Consumes ``scripts/_evidence_common.py``'s shared
+Consumes ``scripts/evidence_common.py``'s shared
 ``blocked``/``not-run``/``provider_effect_uncontrolled`` status vocabulary
 rather than re-implementing it. Always emits
 ``docs/benchmarks/v0.1.3-query-context-analysis.json`` -- for a blocked,
@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scripts._evidence_common import (
+from scripts.evidence_common import (
     MIN_PAIRED_SAMPLES_PER_CELL,
     EvidenceGateError,
     EvidenceStatus,
@@ -579,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         records = load_jsonl(args.input)
         result = analyze(records, fixture_path=args.fixture)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        # `write_bytes_no_follow` (scripts/_evidence_common.py) rather than
+        # `write_bytes_no_follow` (scripts/evidence_common.py) rather than
         # `Path.write_text` -- this predictable, repo-relative output path is
         # exactly the kind of target the promotion-manifest writer's symlink
         # hardening exists for, and every evidence-gate writer routes through

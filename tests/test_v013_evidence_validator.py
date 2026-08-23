@@ -1,9 +1,9 @@
 """Tests for ``scripts/validate_v013_evidence.py --write-manifest`` and the
-shared status enum in ``scripts/_evidence_common.py``.
+shared status enum in ``scripts/evidence_common.py``.
 
 Plan: docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md,
 Phase 2 bullets 189-192 and the "New files to create" entries for
-``scripts/_evidence_common.py`` and the promotion manifest. This module
+``scripts/evidence_common.py`` and the promotion manifest. This module
 imports both scripts by path -- neither is a package -- following the
 ``_load_validator()`` pattern in tests/test_v013_perf_scenarios.py.
 
@@ -68,7 +68,7 @@ def _confine_manifest_evidence_root_to_tmp_path(
 
 
 def _evidence_common() -> Any:
-    from scripts import _evidence_common
+    from scripts import evidence_common as _evidence_common
 
     return _evidence_common
 
@@ -283,7 +283,7 @@ def test_plain_phase_input_cli_cleanly_fails_on_a_missing_file(
     """The plain ``--phase``/``--input`` CLI path (``validate_artifact`` ->
     ``load_records``) must still print a clean ``FAIL: ...`` and exit 1 for a
     missing input file -- not a raw traceback. ``load_records`` delegates to
-    the shared ``_evidence_common.load_jsonl``, which raises
+    the shared ``evidence_common.load_jsonl``, which raises
     ``EvidenceGateError``; that must be translated to
     ``EvidenceValidationError`` since this CLI path's except clause only
     catches the latter."""
@@ -482,7 +482,7 @@ def test_write_manifest_embeds_artifact_hashes_for_all_three_inputs(tmp_path: Pa
 
 
 def test_evidence_common_status_enum_contains_the_documented_values() -> None:
-    """Plan: '_evidence_common.py -- shared eligibility/validation module
+    """Plan: 'evidence_common.py -- shared eligibility/validation module
     owning the blocked/not-run/unavailable/provider_effect_uncontrolled
     status enum ... consumed by validate_v013_evidence.py,
     validate_phase2_transport_browser_contract.py, and

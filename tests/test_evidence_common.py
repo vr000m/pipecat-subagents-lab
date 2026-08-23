@@ -1,4 +1,4 @@
-"""Regression tests for scripts/_evidence_common.py's I/O hardening.
+"""Regression tests for scripts/evidence_common.py's I/O hardening.
 
 Round-1 review-gauntlet findings fixed here:
   - write_bytes_no_follow never enforced its own documented
@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from scripts._evidence_common import (
+from scripts.evidence_common import (
     _MAX_EVIDENCE_OUTPUT_BYTES,
     EvidenceGateError,
     load_json,
@@ -50,7 +50,7 @@ def test_write_bytes_no_follow_loops_past_a_short_write(tmp_path: Path) -> None:
         chunk = bytes(data)[:7]
         return real_os_write(fd, chunk)
 
-    with patch("scripts._evidence_common.os.write", side_effect=short_write):
+    with patch("scripts.evidence_common.os.write", side_effect=short_write):
         write_bytes_no_follow(target, payload)
 
     assert len(calls) > 1  # the short-write loop actually looped

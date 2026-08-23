@@ -20,13 +20,24 @@ are unchanged from the code that previously lived directly on SessionHost.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from .connection_arbiter import Connection
     from .contracts import SnapshotHandshake
-    from .pipeline import ConnectionPipeline
+
+
+class CapabilityCarrier(Protocol):
+    """The one attribute ``validate_patch_handshake`` needs from a connection.
+
+    Both real carriers -- ``connection_arbiter.Connection`` (a ``tuple[str,
+    ...]``) and ``pipeline.ConnectionPipeline`` (a ``frozenset[str]``
+    property backed by its ``RuntimeObserver``) -- satisfy this structurally,
+    so neither module needs to be imported here just to name the parameter
+    type.
+    """
+
+    capabilities: frozenset[str] | tuple[str, ...]
 
 
 class HandshakeGate:
@@ -78,7 +89,7 @@ class HandshakeGate:
 
     def validate_patch_handshake(
         self,
-        connection: Connection | ConnectionPipeline | None,
+        connection: CapabilityCarrier | None,
         handshake: SnapshotHandshake,
     ) -> None:
         """Enforce immutable capability binding for a PATCH ICE-candidate request.
@@ -89,15 +100,14 @@ class HandshakeGate:
         already-constructed ``RuntimeObserver``: capability entitlement is
         immutable for the life of a promoted epoch (Requirements).
 
-        Both concrete carriers are accepted because both real call sites are
-        typed: ``server.app`` passes the live ``ConnectionPipeline`` (whose
-        ``capabilities`` property reads straight off its ``RuntimeObserver``)
-        while the arbiter-level tests pass the promoted ``Connection``. A
-        ``None`` connection means nothing was promoted, so the bound set is
-        empty and any presented capability is a mismatch. Attributes are read
-        directly rather than via ``getattr`` defaults, so a wrong argument or
-        a future field rename raises instead of silently degrading to "no
-        capabilities presented".
+        Any object exposing a ``capabilities`` attribute is accepted (see
+        ``CapabilityCarrier``): ``server.app`` passes the live
+        ``ConnectionPipeline`` while the arbiter-level tests pass the
+        promoted ``Connection``. A ``None`` connection means nothing was
+        promoted, so the bound set is empty and any presented capability is
+        a mismatch. Attributes are read directly rather than via ``getattr``
+        defaults, so a wrong argument or a future field rename raises
+        instead of silently degrading to "no capabilities presented".
         """
         if not handshake.capabilities_present:
             return

@@ -25,7 +25,7 @@ the actual delivered API rather than a speculative one:
   malformed/forbidden-field/out-of-range input is a hard failure (exit 1).
 - ``scripts/analyze_query_context_latency.py``: ``main(argv)`` with
   ``--input``/``--output``, plus a pure ``analyze(records)`` function. It
-  reuses ``scripts/_evidence_common.py``'s ``EvidenceStatus.BLOCKED``/
+  reuses ``scripts/evidence_common.py``'s ``EvidenceStatus.BLOCKED``/
   ``NOT_RUN`` values for the shared vocabulary and adds Phase-4-only
   ``"not_promoted"``/``"promoted"`` statuses for the data-driven decision.
   ``analysis`` is only ``None`` for the empty-input/passthrough-status-record
@@ -52,7 +52,7 @@ REAL_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1
 
 
 def _evidence_common() -> Any:
-    from scripts import _evidence_common
+    from scripts import evidence_common as _evidence_common
 
     return _evidence_common
 
@@ -1814,7 +1814,7 @@ def test_analyzer_blocks_a_synthetic_stratum_that_looks_fully_controlled(
 def test_evidence_common_write_bytes_no_follow_refuses_a_planted_symlink(
     tmp_path: Path,
 ) -> None:
-    """``write_bytes_no_follow`` (scripts/_evidence_common.py) is the shared
+    """``write_bytes_no_follow`` (scripts/evidence_common.py) is the shared
     primitive every evidence-gate writer must route through so a symlink
     planted at a predictable, repo-relative output path cannot redirect the
     write to the link's target. Exercised directly against the shared

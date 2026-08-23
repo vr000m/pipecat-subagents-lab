@@ -392,7 +392,7 @@ def test_write_manifest_rejects_a_byte_mutated_phase4c_file(tmp_path: Path) -> N
     declared/hashed elsewhere must fail hash verification. This simulates
     the mutation by hashing a pristine copy, then corrupting the file the
     writer actually reads."""
-    from scripts import _evidence_common as common
+    from scripts import evidence_common as common
 
     pristine = _valid_phase4c_artifact()
     phase4c_path = _write_json(tmp_path / "phase4c.json", pristine)
@@ -421,7 +421,7 @@ def test_write_manifest_stores_phase4c_hash_under_the_documented_top_level_field
     entry that load_promotion_manifest never reads."""
     payload = _valid_phase4c_artifact()
     phase4c_path = _write_json(tmp_path / "phase4c.json", payload)
-    from scripts import _evidence_common as common
+    from scripts import evidence_common as common
 
     expected_hash = common.sha256_file(phase4c_path)
     _, manifest = _attempt_write_manifest(tmp_path, phase4c_path)

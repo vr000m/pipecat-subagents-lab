@@ -395,7 +395,7 @@ _MANIFEST_REQUIRED_FIELDS = frozenset(
 _MANIFEST_REQUIRED_FINAL_INPUTS = frozenset({"phase0", "phase1", "phase2", "phase3"})
 
 
-# Lowercase-only, matching scripts/_evidence_common.py's HEX64_RE: every
+# Lowercase-only, matching scripts/evidence_common.py's HEX64_RE: every
 # digest this pattern validates is checked against a hashlib `.hexdigest()`
 # output, which is always lowercase. Admitting uppercase here let a
 # correct-but-uppercase digest pass this shape check and then always
