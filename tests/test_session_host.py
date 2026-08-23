@@ -1395,25 +1395,37 @@ def test_session_host_slices_do_not_import_concrete_worker_implementations() -> 
     from ``.workers.web_search``, coupling a session-level projection to one
     concrete worker type. ``ClarificationContext`` now lives in
     ``workers/base.py`` beside ``WorkerMetadata``; this pins the boundary so a
-    future slice cannot quietly re-couple."""
+    future slice cannot quietly re-couple.
+
+    The roster is DISCOVERED, not listed: a hand-written tuple of six names
+    left the other ~13 modules in ``server/`` -- ``work_item_coordinator``,
+    ``work_task_ledger``, ``main_responder``, ``connection_arbiter`` and the
+    rest, all from the same decomposition -- outside a check whose docstring
+    claimed no future slice could re-couple. Scanning every ``server/*.py``
+    and exempting an explicit allowlist fails safe in the other direction: a
+    module added later is in scope by default (round 6 confirm pass 3,
+    Architecture Minor)."""
     import ast
     from pathlib import Path
 
     server_dir = Path(__file__).parents[1] / "server"
-    slices = (
-        "worker_projection.py",
-        "work_status_publisher.py",
-        "recorder_factory.py",
-        "turn_ack_ledger.py",
-        "handshake_gate.py",
-        "runner_supervisor.py",
+    # The two composition roots that legitimately name concrete workers:
+    # ``registry`` constructs them, ``pipeline`` handles their result frames.
+    # Everything else in server/ is a SessionHost slice or a leaf module, and
+    # neither has any business importing one.
+    allowed_to_import_concrete_workers = {"pipeline.py", "registry.py"}
+    slices = tuple(
+        sorted(
+            path.name
+            for path in server_dir.glob("*.py")
+            if path.name not in allowed_to_import_concrete_workers
+        )
     )
+    assert len(slices) > 6, "roster discovery found fewer modules than the old hand-written list"
 
     offenders: list[str] = []
     for name in slices:
         path = server_dir / name
-        if not path.exists():
-            continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("workers."):
                 if node.module != "workers.base":

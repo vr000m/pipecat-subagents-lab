@@ -47,9 +47,10 @@ from scripts.validate_phase2_transport_browser_contract import (
     validate_artifact as validate_transport_browser_artifact,
 )
 from server.config import (
-    _MANIFEST_REQUIRED_FIELDS,
-    _MANIFEST_REQUIRED_FINAL_INPUTS,
-    _MANIFEST_STRING_FIELDS,
+    MANIFEST_REQUIRED_FIELDS,
+    MANIFEST_REQUIRED_FINAL_INPUTS,
+    MANIFEST_REQUIRED_PROVISIONAL_INPUTS,
+    MANIFEST_STRING_FIELDS,
     effective_feature_policy_fingerprint,
     load_config,
 )
@@ -912,8 +913,8 @@ def verify_manifest(manifest_path: Path) -> list[str]:
 
     What is checked, and why each one is drift worth failing on:
 
-    * every field ``server.config._MANIFEST_REQUIRED_FIELDS`` requires is
-      present, and every field ``_MANIFEST_STRING_FIELDS`` names is a JSON
+    * every field ``server.config.MANIFEST_REQUIRED_FIELDS`` requires is
+      present, and every field ``MANIFEST_STRING_FIELDS`` names is a JSON
       string -- the completeness guard at the end of this function only ever
       caught an *extra* field CI didn't recognize, never a required field
       that was missing or wrongly typed, which let this gate report clean on
@@ -973,11 +974,11 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     # would notice (round-5 restart, Architecture finding -- the exact
     # asymmetry the round-4 `confined_evidence_input_path` fix closed for the
     # declared-input-path rule, now closed here for the top-level field
-    # roster). Reusing `server.config._MANIFEST_REQUIRED_FIELDS`/
-    # `_MANIFEST_STRING_FIELDS` rather than a second hand-copied roster means
+    # roster). Reusing `server.config.MANIFEST_REQUIRED_FIELDS`/
+    # `MANIFEST_STRING_FIELDS` rather than a second hand-copied roster means
     # this check and the runtime loader's own check cannot independently
     # drift.
-    missing_required = _MANIFEST_REQUIRED_FIELDS - set(manifest)
+    missing_required = MANIFEST_REQUIRED_FIELDS - set(manifest)
     if missing_required:
         drift.append(
             f"manifest is missing required field(s) {sorted(missing_required)} -- "
@@ -985,7 +986,7 @@ def verify_manifest(manifest_path: Path) -> list[str]:
         )
     wrongly_typed_fields = sorted(
         name
-        for name in _MANIFEST_STRING_FIELDS
+        for name in MANIFEST_STRING_FIELDS
         if name in manifest and not isinstance(manifest[name], str)
     )
     if wrongly_typed_fields:
@@ -1009,16 +1010,21 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     # The input set the manifest's own `manifest_phase` implies. `write_manifest`
     # requires phase0/1/2 for either phase and additionally phase3 for `final`;
     # phase3-on-a-provisional and phase4c are both optional extras. Derived
-    # from `server.config._MANIFEST_REQUIRED_FINAL_INPUTS` (the same roster
+    # from `server.config.MANIFEST_REQUIRED_FINAL_INPUTS` (the same roster
     # `load_promotion_manifest` itself requires a `final` manifest's `inputs`
     # to cover) rather than a hand-copied `{"phase0", "phase1", "phase2"}`
     # literal, so this gate and the runtime consumer it speaks for cannot
     # silently drift apart on which phases a manifest must declare (round-5
-    # restart, Architecture finding).
-    required_phases = (
-        set(_MANIFEST_REQUIRED_FINAL_INPUTS)
+    # restart, Architecture finding). The provisional roster is likewise a
+    # named `server.config` constant rather than an inline `- {"phase3"}`
+    # here: expressing it as "the final roster minus one name typed at this
+    # call site" reintroduced the same drift one level down, since a phase
+    # later added to the `final` roster would start being required of
+    # provisional manifests too (round 6 confirm pass 3, Architecture Minor).
+    required_phases = set(
+        MANIFEST_REQUIRED_FINAL_INPUTS
         if manifest_phase == "final"
-        else set(_MANIFEST_REQUIRED_FINAL_INPUTS) - {"phase3"}
+        else MANIFEST_REQUIRED_PROVISIONAL_INPUTS
     )
 
     resolved: dict[str, Path] = {}

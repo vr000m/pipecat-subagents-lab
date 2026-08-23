@@ -728,17 +728,17 @@ class TestVerifyManifestDriftCheck:
         """Round-5 restart, Architecture finding: ``required_phases`` inside
         ``verify_manifest`` used to be a hand-copied literal
         (``{"phase0", "phase1", "phase2", "phase3"}``) instead of
-        ``server.config._MANIFEST_REQUIRED_FINAL_INPUTS``, so the two could
+        ``server.config.MANIFEST_REQUIRED_FINAL_INPUTS``, so the two could
         silently drift if a phase were ever added to one without the other.
         This pins the whole-document coverage claim precisely: the volatile
         set plus the verified set must equal exactly
-        ``server.config._MANIFEST_REQUIRED_FIELDS`` plus the three top-level
-        hash fields that are not in ``_MANIFEST_REQUIRED_FIELDS`` because they
+        ``server.config.MANIFEST_REQUIRED_FIELDS`` plus the three top-level
+        hash fields that are not in ``MANIFEST_REQUIRED_FIELDS`` because they
         are optional/phase-conditional (``phase3_completion_hash``,
         ``phase3_command_digest``, ``phase4c_artifact_sha256``), not because
         they go unverified."""
         module = _validator()
-        from server.config import _MANIFEST_REQUIRED_FIELDS
+        from server.config import MANIFEST_REQUIRED_FIELDS
 
         conditional_hash_fields = {
             "phase3_completion_hash",
@@ -747,7 +747,7 @@ class TestVerifyManifestDriftCheck:
         }
         assert (
             module._MANIFEST_VOLATILE_FIELDS | module._MANIFEST_VERIFIED_FIELDS
-            == _MANIFEST_REQUIRED_FIELDS | conditional_hash_fields
+            == MANIFEST_REQUIRED_FIELDS | conditional_hash_fields
         )
 
     def test_a_manifest_missing_a_required_field_is_reported_as_drift(self, tmp_path: Path) -> None:
