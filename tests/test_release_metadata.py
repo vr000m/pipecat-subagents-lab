@@ -207,7 +207,9 @@ def test_rejects_ci_yml_manifest_path_stale_after_a_version_bump(tmp_path: Path)
     ci_yml_path = tmp_path / "ci.yml"
     ci_yml_path.write_text(VALID_CI_YML, encoding="utf-8")  # still says v0.1.3
 
-    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
         module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
 
 
@@ -293,7 +295,9 @@ def test_rejects_ci_yml_whose_only_mention_of_the_manifest_is_a_comment(
         encoding="utf-8",
     )
 
-    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
         module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
 
 
@@ -391,7 +395,9 @@ def test_rejects_a_ci_yml_that_only_echoes_the_manifest_path_in_a_message(
         encoding="utf-8",
     )
 
-    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
         module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
 
 
@@ -415,8 +421,145 @@ def test_rejects_a_ci_yml_mentioning_the_manifest_only_in_a_run_script_comment(
         encoding="utf-8",
     )
 
-    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
         module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_ci_yml_that_only_echoes_the_manifest_path_unquoted(
+    tmp_path: Path,
+) -> None:
+    """Round 8 confirm pass 5, Security Minor: whole-shell-word matching only
+    defeated the QUOTED echo bypass. Unquoted, shlex hands the path back as
+    its own word, so the same reminder message satisfied the gate while the
+    step that actually diffs pointed at the previous release's manifest."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      - name: Remind\n"
+        "        run: echo Regenerate docs/benchmarks/v0.1.3-promotion-manifest.json "
+        "when bumping\n"
+        "      - name: Verify the committed promotion manifest has not drifted\n"
+        "        run: uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.2-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_ci_yml_whose_drift_job_is_neutered_by_continue_on_error(
+    tmp_path: Path,
+) -> None:
+    """Round 8 confirm pass 5, Security Minor: `continue-on-error: true`
+    disables the gate more completely than `if: false` -- the drift check
+    runs, reports drift, and the workflow stays green."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "  promotion-manifest-drift:\n",
+            "  promotion-manifest-drift:\n    continue-on-error: true\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="continue-on-error"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_ci_yml_whose_only_verifying_step_is_continue_on_error(
+    tmp_path: Path,
+) -> None:
+    """The step-level spelling of the same evasion."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "      - name: Verify",
+            "      - continue-on-error: true\n        name: Verify",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="continue-on-error"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_accepts_a_continue_on_error_sibling_alongside_an_armed_step(tmp_path: Path) -> None:
+    """`continue-on-error: false` leaves a step armed, and a switchable
+    SIBLING is not itself a bypass."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "      - name: Verify",
+            "      - continue-on-error: false\n        name: Verify",
+        )
+        + "      - continue-on-error: true\n"
+        "        name: Re-verify, advisory\n"
+        "        run: uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.3-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    assert module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path) == "0.1.3"
+
+
+def test_accepts_a_verifying_step_written_with_line_continuations(tmp_path: Path) -> None:
+    """Round 8 confirm pass 5, Logic Minor: `_shell_words` shlex-split each
+    line independently, and a line ending in `\\` raises `ValueError: No
+    escaped character` -- so a CORRECT workflow written in the standard
+    continuation style lost the line carrying the manifest path and was
+    rejected."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      - name: Verify the committed promotion manifest has not drifted\n"
+        "        run: |\n"
+        "          uv run python scripts/validate_v013_evidence.py \\\n"
+        "            --verify-manifest \\\n"
+        "            docs/benchmarks/v0.1.3-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    assert module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path) == "0.1.3"
+
+
+def test_a_reporting_command_after_a_separator_does_not_hide_a_real_invocation(
+    tmp_path: Path,
+) -> None:
+    """Dropping `echo`-owned words is per-command, not per-line: a real
+    verifier invocation joined to an `echo` by `&&` must still count."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      - name: Verify the committed promotion manifest has not drifted\n"
+        "        run: echo checking && uv run python scripts/validate_v013_evidence.py "
+        "--verify-manifest docs/benchmarks/v0.1.3-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    assert module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path) == "0.1.3"
 
 
 def test_the_real_repo_ci_yml_still_satisfies_the_tightened_gate() -> None:

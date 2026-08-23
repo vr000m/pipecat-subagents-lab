@@ -334,7 +334,11 @@ def _source_anchor_is_valid(anchor: str, *, package_name: str, locked_version: s
     * ``registry.npmjs.org/<org>/<leaf>/<version>`` exactly
     * ``registry.npmjs.org/<org>/<leaf>/-/<leaf>-<version>.tgz`` exactly
 
-    where ``<version>`` is the locked version with or without a ``v`` prefix.
+    where ``<version>`` is the locked version with or without a ``v`` prefix,
+    compared against the segment as WRITTEN: a ``;``-suffixed final segment
+    (``.../tree/v1.10.6;attacker-branch``) is folded back out of
+    ``urlparse``'s ``params`` before comparing, so it is rejected rather than
+    matching the truncated ``v1.10.6``.
     ``/compare/`` has no accepted layout at all: it names two refs, so it can
     never pin one. The npm registry's tarball spelling is an explicitly
     recognised shape rather than a substring exemption -- without it, no
@@ -350,7 +354,15 @@ def _source_anchor_is_valid(anchor: str, *, package_name: str, locked_version: s
     if parsed.hostname not in _ANCHOR_ALLOWED_HOSTS:
         return False
     org_leaf = package_name.lstrip("@")
+    # `urlparse` splits a `;`-suffixed LAST segment off into `params`, so
+    # `.../tree/v1.10.6;attacker-branch` arrives here as path `.../tree/v1.10.6`
+    # with params `attacker-branch` -- the positional check would validate a
+    # ref the URL does not name (`;` is a legal git ref character). Folding it
+    # back makes the comparison see the segment as written
+    # (round 8 confirm pass 5, Logic Minor).
     path = parsed.path.strip("/")
+    if parsed.params:
+        path = f"{path};{parsed.params}"
     # registry.npmjs.org keeps the npm scope in the path
     # (`/@pipecat-ai/small-webrtc-transport/-/...`), so the org/leaf prefix
     # test has to accept the scoped spelling too.

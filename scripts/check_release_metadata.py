@@ -105,26 +105,98 @@ def check_no_hardcoded_version_literals(scripts_dir: Path, version: str) -> None
         )
 
 
+#: Commands that report rather than consume: a path passed to one of these is
+#: a message about the manifest, never a use of it. Words belonging to such a
+#: command are discarded, because tokenising alone cannot tell a mention from a
+#: use -- ``echo Regenerate docs/benchmarks/...json when bumping`` (unquoted)
+#: yields the path as its own shell word and satisfied the gate
+#: (round 8 confirm pass 5, Security Minor).
+_REPORTING_COMMANDS = frozenset({"echo", "printf", ":", "true", "false"})
+
+#: Tokens ``shlex`` emits (with ``punctuation_chars``) that end one command and
+#: begin another, so ``echo hi && uv run x.py path`` keeps ``path``.
+_COMMAND_SEPARATORS = frozenset({";", "|", "||", "&", "&&", "(", ")"})
+
+
+def _tokenise(text: str) -> list[str]:
+    """Comment-stripped, quote-aware tokens, with shell punctuation separated.
+
+    Raises ``ValueError`` on input shlex cannot tokenise.
+    """
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
 def _shell_words(command: str) -> set[str]:
-    """The comment-stripped shell words of a workflow ``run:`` script.
+    """The shell words of a workflow ``run:`` script that a command consumes.
 
     Tokenising rather than substring-matching is what stops a ``#`` comment or
-    a quoted ``echo`` message from satisfying the manifest-path gate: shlex
+    a *quoted* ``echo`` message from satisfying the manifest-path gate: shlex
     drops comments outright, and a path mentioned inside a quoted sentence
-    comes back as one long word that cannot equal the path.
+    comes back as one long word that cannot equal the path. Tokenising alone
+    does not close the *unquoted* spelling of the same reminder, though, so
+    words belonging to a command whose ``argv[0]`` is in
+    ``_REPORTING_COMMANDS`` are dropped as well.
 
-    A ``run:`` script that shlex cannot tokenise (an unbalanced quote, which
-    is a shell syntax error anyway) contributes no words rather than raising,
-    so one malformed step cannot mask a well-formed sibling that does
-    reference the manifest.
+    Line continuations are joined before tokenising: a ``run: |`` script
+    written in the standard ``\\``-continued style put the manifest path on a
+    line shlex could not tokenise on its own (``ValueError: No escaped
+    character``), so a *correct* workflow failed the gate
+    (round 8 confirm pass 5, Logic Minor).
+
+    Lines are then tokenised independently, because shlex treats a newline as
+    plain whitespace and would otherwise let one line's ``echo`` swallow the
+    next line's command. A line shlex still cannot tokenise (an unbalanced
+    quote -- including one legitimately opened on one line and closed on the
+    next) contributes no words rather than raising, so one malformed step
+    cannot mask a well-formed sibling that does reference the manifest.
     """
     words: set[str] = set()
-    for line in command.splitlines():
+    for line in command.replace("\\\n", " ").splitlines():
         try:
-            words.update(shlex.split(line, comments=True))
+            tokens = _tokenise(line)
         except ValueError:
             continue
+        argv: list[str] = []
+        for token in [*tokens, ";"]:
+            if token in _COMMAND_SEPARATORS:
+                if argv and argv[0] not in _REPORTING_COMMANDS:
+                    words.update(argv)
+                argv = []
+            else:
+                argv.append(token)
     return words
+
+
+#: The script (and its flag) whose invocation is what actually proves the
+#: committed manifest has not drifted. Requiring the manifest path to appear
+#: alongside these -- rather than merely as some shell word somewhere -- is
+#: what makes the gate check a USE of the path rather than a mention of it
+#: (round 8 confirm pass 5, Security Minor).
+_MANIFEST_VERIFIER = "scripts/validate_v013_evidence.py"
+_VERIFY_MANIFEST_FLAG = "--verify-manifest"
+
+
+def _is_truthy(raw: object) -> bool:
+    """Whether a workflow field YAML-parses to something GitHub treats as true.
+
+    ``continue-on-error: true`` parses to a bool; ``continue-on-error:
+    ${{ ... }}`` parses to a non-empty string, which is switchable at will and
+    so is treated as truthy here too. Only an explicit ``false``/absent value
+    leaves the gate armed.
+    """
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("", "false", "0")
+
+
+def _verifies_manifest(command: str, expected: str) -> bool:
+    """Whether ``command`` actually runs the drift verifier against ``expected``."""
+    words = _shell_words(command)
+    return {_MANIFEST_VERIFIER, _VERIFY_MANIFEST_FLAG, expected} <= words
 
 
 def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version: str) -> None:
@@ -164,12 +236,28 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
       while the step that actually diffs pointed at the previous release's
       manifest.
 
+    Neither of those was enough either, so (round 8 confirm pass 5, Security
+    Minor):
+
+    * ``continue-on-error`` is rejected on the job, and disqualifies a step,
+      exactly as ``if:`` is. It disables the gate more completely than
+      ``if: false``: the drift check runs, reports drift, and CI stays green.
+    * a step qualifies only when it runs ``_MANIFEST_VERIFIER`` with
+      ``_VERIFY_MANIFEST_FLAG`` and the expected path, not when it merely
+      names the path as a word. Whole-word matching only defeated the
+      *quoted* echo bypass; ``run: echo Regenerate docs/benchmarks/...json
+      when bumping`` yields the path as its own word. Requiring the verifier
+      invocation checks a USE of the path rather than a mention (and
+      :func:`_shell_words` additionally drops words belonging to ``echo``-like
+      reporting commands).
+
     Not checked, deliberately: the workflow's ``on:`` triggers. Which events
     run CI is a routine, legitimately-varying choice (this repo's gates run on
     push and pull_request; a fork may reasonably differ), so pinning it here
-    would fail for reasons unrelated to release-version drift. The ``if:``
-    rejection is narrow because a conditional on *this* job has no legitimate
-    use: the gate is cheap and must run whenever CI runs.
+    would fail for reasons unrelated to release-version drift. The ``if:``/
+    ``continue-on-error`` rejections are narrow because neither has a
+    legitimate use on *this* job: the gate is cheap, must run whenever CI
+    runs, and exists only to fail.
     """
     try:
         text = read_bytes_no_follow(ci_yml_path).decode("utf-8")
@@ -192,6 +280,13 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
             f"({job['if']!r}) -- a conditional job can be switched off while still "
             "satisfying this gate, so the drift check must run unconditionally"
         )
+    if _is_truthy(job.get("continue-on-error")):
+        raise ReleaseMetadataError(
+            f"{ci_yml_path}: the `{_MANIFEST_DRIFT_JOB}` job carries "
+            f"`continue-on-error: {job['continue-on-error']!r}` -- the drift check would run, "
+            "report drift, and leave the workflow green, which disables the gate as "
+            "completely as `if: false`"
+        )
     steps = job.get("steps")
     expected = f"docs/benchmarks/v{version}-promotion-manifest.json"
     matching = [
@@ -199,24 +294,28 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
         for step in (steps if isinstance(steps, list) else [])
         if isinstance(step, dict)
         and isinstance(step.get("run"), str)
-        and expected in _shell_words(step["run"])
+        and _verifies_manifest(step["run"], expected)
     ]
     if not matching:
         raise ReleaseMetadataError(
-            f"{ci_yml_path}: the `{_MANIFEST_DRIFT_JOB}` job does not reference {expected!r} "
-            "as a shell word of any step it runs -- the release version changed without "
-            "updating the manifest path here (and renaming/regenerating the committed "
-            "manifest file to match)"
+            f"{ci_yml_path}: no `{_MANIFEST_DRIFT_JOB}` step runs "
+            f"{_MANIFEST_VERIFIER!r} with {_VERIFY_MANIFEST_FLAG} against {expected!r} -- "
+            "either the release version changed without updating the manifest path here "
+            "(and renaming/regenerating the committed manifest file to match), or the "
+            "step that actually verifies it is gone"
         )
-    # One unconditional referencing step is enough; a *sibling* step may
-    # legitimately carry an `if:`. Only a roster where every reference is
-    # conditional means the gate can be switched off while staying green.
-    if not any("if" not in step for step in matching):
+    # One step that is neither conditional nor continue-on-error is enough; a
+    # *sibling* step may legitimately carry either. Only a roster where every
+    # reference is switchable means the gate can be turned off while staying
+    # green (round 8 confirm pass 5, Security Minor).
+    if not any(
+        "if" not in step and not _is_truthy(step.get("continue-on-error")) for step in matching
+    ):
         names = [str(step.get("name", "<unnamed>")) for step in matching]
         raise ReleaseMetadataError(
-            f"{ci_yml_path}: every `{_MANIFEST_DRIFT_JOB}` step referencing {expected!r} "
-            f"carries an `if:` ({names}) -- a conditional step can be switched off while "
-            "still satisfying this gate"
+            f"{ci_yml_path}: every `{_MANIFEST_DRIFT_JOB}` step verifying {expected!r} "
+            f"carries an `if:` or `continue-on-error:` ({names}) -- such a step can be "
+            "switched off, or fail harmlessly, while still satisfying this gate"
         )
 
 

@@ -523,6 +523,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     detection stayed narrow: `from .workers import web_search` names the
     concrete worker as an imported *name*, not in the module path, and was
     missed. Detection is now a named, directly tested helper.
+- Restart-gauntlet round 8 (confirm pass 5) fixed all 11 findings a 4-lens
+  confirm pass over round 7's fix diff raised (4 logic, 2 security,
+  4 architecture, 1 documentation):
+  - **Behaviour change:** the `ci.yml` drift gate now requires a step that
+    actually *runs* `scripts/validate_v013_evidence.py --verify-manifest`
+    against the expected path, not one that merely names the path as a shell
+    word — round 7's whole-word matching defeated a *quoted* `echo` reminder
+    but not an unquoted one. It also rejects a truthy `continue-on-error` on
+    the job, and treats it as disqualifying on a step, exactly as it does
+    `if:`: `continue-on-error` disables the gate more completely than
+    `if: false`, since the check runs, reports drift, and leaves CI green.
+    Line continuations are joined before tokenising, so a correct workflow
+    written in the standard `\`-continued style no longer fails the gate.
+  - **Behaviour change:** `source_anchor` rejects a `;`-suffixed ref.
+    `urlparse` splits a `;`-suffixed final path segment into `.params`, so
+    `.../tree/v1.10.6;attacker-branch` was validated against the truncated
+    `v1.10.6` while naming a different ref.
+  - The endpoint families are declared once in `_ENDPOINT_FAMILIES`, which
+    `load_config` iterates to resolve them and `_families()` splats — round 7
+    derived the alias axis but left `load_config` hand-naming the endpoint
+    member constants, so a third endpoint family could have been resolved
+    while staying outside the registry. A scanning test now pins that every
+    `_*_ENDPOINT_MEMBERS` constant is registered.
+  - `_ALIAS_FAMILY_SPELLINGS` carries "this row's bare spelling is named at
+    runtime" as data (a `None` bare key) instead of a
+    `field_name == "openai_api_key"` comparison inside the generic builder,
+    and `_winning_alias_key`'s parameter type is narrowed to the single-key
+    member shape it actually supports rather than the endpoint families'
+    shape, which it would have crashed on.
+  - The `MANIFEST_REQUIRED_PROVISIONAL_INPUTS ⊆ FINAL` guard raises instead of
+    asserting: `python -O` strips an assert, taking the only mechanism
+    covering the "narrow `final`" direction with it.
+  - `scripts/run_query_context_experiment.py`'s live credential gate resolves
+    the OpenAI key through `load_config()` like its sibling scripts, instead
+    of reading the bare `OPENAI_API_KEY` env var and reporting
+    `provider_unavailable` to an operator who configured the scoped spelling.
 - `scripts/eval_model_comparison.py`'s citations assertion no longer fails
   weather-query turns that were genuinely delegated and answered correctly:
   the hosted `web_search` tool answers weather via an internal `oai-weather`

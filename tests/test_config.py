@@ -2289,9 +2289,42 @@ class TestReasoningEffortInheritance:
         import server.config as _config_module
 
         families = dict(_config_module._alias_families("MY_OPENAI_KEY"))
-        assert _config_module._family_keys(families["openai_api_key"]) == (
+        assert _config_module._family_keys(
+            _config_module._widen_members(families["openai_api_key"])
+        ) == (
             "WEBSEARCH_OPENAI_API_KEY",
             "MY_OPENAI_KEY",
+        )
+        # Only the row that declares a `None` bare key takes the runtime name;
+        # the others keep their declared vendor spelling (round 8 confirm
+        # pass 5, Architecture Minor: the property moved into the data).
+        assert _config_module._family_keys(
+            _config_module._widen_members(families["deepgram_api_key"])
+        ) == (
+            "WEBSEARCH_DEEPGRAM_API_KEY",
+            "DEEPGRAM_API_KEY",
+        )
+
+    def test_every_endpoint_member_constant_is_registered(self) -> None:
+        """A `_*_ENDPOINT_MEMBERS` constant that never reached
+        `_ENDPOINT_FAMILIES` would be resolved by nothing and enumerated by
+        nothing -- `load_config` iterates that registry, so an unregistered
+        family is simply dead (round 8 confirm pass 5, Architecture Minor)."""
+        import server.config as _config_module
+
+        declared = {
+            name: value
+            for name, value in vars(_config_module).items()
+            if name.startswith("_") and name.endswith("_ENDPOINT_MEMBERS")
+        }
+        assert declared, "no `_*_ENDPOINT_MEMBERS` constants found -- has the naming changed?"
+        registered = {id(members) for _field, members in _config_module._ENDPOINT_FAMILIES}
+        unregistered = sorted(
+            name for name, value in declared.items() if id(value) not in registered
+        )
+        assert not unregistered, (
+            f"{unregistered} declared but absent from _ENDPOINT_FAMILIES -- "
+            "load_config resolves only what that registry names"
         )
 
 

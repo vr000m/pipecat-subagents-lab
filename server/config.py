@@ -429,9 +429,18 @@ MANIFEST_REQUIRED_PROVISIONAL_INPUTS = frozenset({"phase0", "phase1", "phase2"})
 
 # A provisional manifest is a final manifest still missing its in-flight
 # bindings, never a manifest required to declare a phase `final` does not.
-assert MANIFEST_REQUIRED_PROVISIONAL_INPUTS <= MANIFEST_REQUIRED_FINAL_INPUTS, (
-    "MANIFEST_REQUIRED_PROVISIONAL_INPUTS must stay a subset of MANIFEST_REQUIRED_FINAL_INPUTS"
-)
+#
+# Raised, not `assert`ed: `python -O`/`PYTHONOPTIMIZE` strips an assert at
+# compile time, and this is the only mechanism covering the "narrow `final`
+# without narrowing provisional" direction now that the subtraction is gone --
+# a guard that disappears under a supported interpreter flag is not a guard
+# (round 8 confirm pass 5, Logic Minor).
+if not MANIFEST_REQUIRED_PROVISIONAL_INPUTS <= MANIFEST_REQUIRED_FINAL_INPUTS:
+    raise ValueError(
+        "MANIFEST_REQUIRED_PROVISIONAL_INPUTS must stay a subset of "
+        "MANIFEST_REQUIRED_FINAL_INPUTS; "
+        f"extra: {sorted(MANIFEST_REQUIRED_PROVISIONAL_INPUTS - MANIFEST_REQUIRED_FINAL_INPUTS)}"
+    )
 
 
 # Lowercase-only, matching scripts/evidence_common.py's HEX64_RE: every
@@ -1141,21 +1150,36 @@ _TTS_ENDPOINT_MEMBERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("socket", ("WEBSEARCH_TTS_WS_SOCKET",)),
     ("host_port", ("WEBSEARCH_TTS_WS_HOST", "WEBSEARCH_TTS_WS_PORT")),
 )
+#: The endpoint families, ``(config field, members)``. THE roster ``load_config``
+#: iterates to resolve them -- it no longer names the two member constants
+#: directly, so a third endpoint family declared here reaches both resolution
+#: and :func:`_families` in one edit (round 8 confirm pass 5, Architecture
+#: Minor). Only the per-member ``kwargs`` branches (which know how to turn a
+#: winning member's keys into an endpoint tuple) stay hand-written; the
+#: drift-prone part -- pairing a family's key roster with its layer computation
+#: -- is derived from here.
+_ENDPOINT_FAMILIES: tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ...] = (
+    ("stt_endpoint", _STT_ENDPOINT_MEMBERS),
+    ("tts_endpoint", _TTS_ENDPOINT_MEMBERS),
+)
+
 #: The env var naming the OpenAI family's bare spelling when the operator has
 #: not redirected it with ``WEBSEARCH_OPENAI_API_KEY_ENV``.
 _DEFAULT_OPENAI_KEY_ENV = "OPENAI_API_KEY"
 
-#: The vendor-credential alias families, ``(config field, members)`` -- the
-#: same ``(name, members)`` shape the endpoint families use, so
-#: :func:`_family_keys` derives their key roster too and nothing hand-writes a
-#: second copy (round 7 confirm pass 4, Architecture Minor).
+#: The vendor-credential alias families as ``(config field, scoped key, bare
+#: key)`` rows. ``None`` for the bare key means "this family's bare spelling is
+#: named at runtime" -- :func:`_alias_families` substitutes its argument there.
+#: That property lives in the data rather than in a ``field_name ==
+#: "openai_api_key"`` comparison inside the generic builder, so a second
+#: runtime-redirectable credential needs a row, not a branch (round 8 confirm
+#: pass 5, Architecture Minor).
 #:
-#: Their members are always a single key each, and they resolve through
-#: :func:`_winning_alias_key`, NOT :func:`_winning_family_member` -- see that
-#: function for why credential aliases do not take the endpoint families'
-#: layer-first rule.
-_ALIAS_FAMILY_SPELLINGS: tuple[tuple[str, str, str], ...] = (
-    ("openai_api_key", "WEBSEARCH_OPENAI_API_KEY", _DEFAULT_OPENAI_KEY_ENV),
+#: These resolve through :func:`_winning_alias_key`, NOT
+#: :func:`_winning_family_member` -- see that function for why credential
+#: aliases do not take the endpoint families' layer-first rule.
+_ALIAS_FAMILY_SPELLINGS: tuple[tuple[str, str, str | None], ...] = (
+    ("openai_api_key", "WEBSEARCH_OPENAI_API_KEY", None),
     ("deepgram_api_key", "WEBSEARCH_DEEPGRAM_API_KEY", "DEEPGRAM_API_KEY"),
     ("cartesia_api_key", "WEBSEARCH_CARTESIA_API_KEY", "CARTESIA_API_KEY"),
     ("cartesia_voice_id", "WEBSEARCH_CARTESIA_VOICE_ID", "CARTESIA_VOICE_ID"),
@@ -1163,26 +1187,41 @@ _ALIAS_FAMILY_SPELLINGS: tuple[tuple[str, str, str], ...] = (
 
 
 def _alias_families(
-    openai_bare_key: str = _DEFAULT_OPENAI_KEY_ENV,
-) -> tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ...]:
-    """The alias families in ``(field, members)`` form.
+    runtime_named_key: str = _DEFAULT_OPENAI_KEY_ENV,
+) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """The alias families in ``(field, members)`` form, one key per member.
 
-    A function rather than a constant because the OpenAI family's bare
-    spelling is named at runtime by ``WEBSEARCH_OPENAI_API_KEY_ENV``: passing
-    that name in here keeps the runtime-named key inside the same registry
-    every other family key is derived from, instead of assembling a one-off
-    pair inline in ``load_config``.
+    A function rather than a constant because a family's bare spelling can be
+    named at runtime (``WEBSEARCH_OPENAI_API_KEY_ENV`` names the OpenAI one):
+    passing that name in here keeps the runtime-named key inside the same
+    registry every other family key is derived from, instead of assembling a
+    one-off pair inline in ``load_config``. Which rows take it is declared in
+    ``_ALIAS_FAMILY_SPELLINGS`` (a ``None`` bare key), not decided here.
+
+    The member shape is ``(name, key)``, deliberately narrower than the
+    endpoint families' ``(name, keys)``: :func:`_winning_alias_key` supports
+    exactly one key per member, so the type it accepts now says so rather than
+    advertising a shape it would crash on (round 8 confirm pass 5,
+    Architecture Minor). :func:`_widen_members` adapts these to the shared
+    shape for key enumeration.
     """
     return tuple(
         (
             field_name,
             (
-                ("scoped", (scoped_key,)),
-                ("bare", (openai_bare_key if field_name == "openai_api_key" else bare_key,)),
+                ("scoped", scoped_key),
+                ("bare", runtime_named_key if bare_key is None else bare_key),
             ),
         )
         for field_name, scoped_key, bare_key in _ALIAS_FAMILY_SPELLINGS
     )
+
+
+def _widen_members(
+    members: Sequence[tuple[str, str]],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Adapt single-key alias members to the shared multi-key family shape."""
+    return tuple((name, (key,)) for name, key in members)
 
 
 def _families() -> tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ...]:
@@ -1190,15 +1229,17 @@ def _families() -> tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ..
 
     Key enumeration only -- the two kinds of family resolve by different
     rules (see :func:`_winning_alias_key`), so this is not a dispatch table.
-    Its point is that a family added to this registry is automatically covered
-    by the parity test pinning "family keys carry no provenance entry", rather
-    than needing a second hand-written enumeration to be remembered
-    (round 7 confirm pass 4, Architecture Minor).
+    Both axes are now derived: the endpoint side splats
+    ``_ENDPOINT_FAMILIES`` (which ``load_config`` also iterates) and the alias
+    side splats ``_alias_families()`` (likewise), so neither can fall behind
+    this registry. ``test_every_endpoint_member_constant_is_registered``
+    additionally scans the module for a ``_*_ENDPOINT_MEMBERS`` constant that
+    never reached ``_ENDPOINT_FAMILIES`` (round 8 confirm pass 5,
+    Architecture Minor).
     """
     return (
-        ("stt_endpoint", _STT_ENDPOINT_MEMBERS),
-        ("tts_endpoint", _TTS_ENDPOINT_MEMBERS),
-        *_alias_families(),
+        *_ENDPOINT_FAMILIES,
+        *((field, _widen_members(members)) for field, members in _alias_families()),
     )
 
 
@@ -1303,14 +1344,17 @@ def _winning_family_member(
 
 def _winning_alias_key(
     values: Mapping[str, object],
-    members: Sequence[tuple[str, tuple[str, ...]]],
+    members: Sequence[tuple[str, str]],
 ) -> str | None:
     """Pick which spelling of a vendor credential supplies the value.
 
     Declaration order decides -- the scoped ``WEBSEARCH_``-prefixed spelling
-    beats the bare one whatever layer either was set at -- and the layer is
-    consulted only to break a tie *within* a group, of which these families
-    have none (one key per member).
+    beats the bare one whatever layer either was set at -- and no layer is
+    consulted at all: a member here is exactly one key, so there is no
+    within-group tie to break. The parameter type says ``(name, key)`` rather
+    than the endpoint families' ``(name, keys)`` for that reason; advertising
+    the wider shape while unpacking a single key was a declared type this
+    function could not honour (round 8 confirm pass 5, Architecture Minor).
 
     This is deliberately NOT :func:`_winning_family_member`'s layer-first rule,
     even though the two look like the same shape. The endpoint families can
@@ -1330,10 +1374,7 @@ def _winning_alias_key(
 
     A caller can still put a bare credential on top: unset the scoped one.
     """
-    for _name, keys in members:
-        # Alias members are single-key by construction (_alias_families); the
-        # multi-key member shape exists for the endpoint families.
-        (key,) = keys
+    for _name, key in members:
         if _family_key_set(values.get(key)):
             return key
     return None
@@ -1572,16 +1613,28 @@ def load_config(
     # process environment (layer 2), silently connecting to the endpoint the
     # operator's highest-precedence override had replaced. This closes the gap
     # _clear_inherited_reasoning_effort's docstring signposted.
-    stt_layers = _family_layers(values, layer_maps, _family_keys(_STT_ENDPOINT_MEMBERS))
-    stt_member = _winning_family_member(values, stt_layers, _STT_ENDPOINT_MEMBERS)
+    #
+    # Resolved by iterating `_ENDPOINT_FAMILIES` rather than naming the two
+    # member constants here: pairing a family's key roster with its layer
+    # computation is the drift-prone step, so a third endpoint family declared
+    # in that registry is resolved without a second edit (round 8 confirm
+    # pass 5, Architecture Minor). Only the per-member branches below, which
+    # know how each member's keys become an endpoint tuple, stay explicit.
+    endpoint_resolution: dict[str, tuple[str | None, dict[str, int]]] = {}
+    for family_name, family_members in _ENDPOINT_FAMILIES:
+        family_layers = _family_layers(values, layer_maps, _family_keys(family_members))
+        endpoint_resolution[family_name] = (
+            _winning_family_member(values, family_layers, family_members),
+            family_layers,
+        )
+    stt_member, _stt_layers = endpoint_resolution["stt_endpoint"]
     if stt_member == "endpoint":
         kwargs["stt_endpoint"] = parse_endpoint(str(values["WEBSEARCH_STT_ENDPOINT"]))
     elif stt_member == "socket":
         kwargs["stt_endpoint"] = ("uds", _expand_socket(str(values["WEBSEARCH_STT_WS_SOCKET"])))
     tts_host = values.get("WEBSEARCH_TTS_WS_HOST")
     tts_port = values.get("WEBSEARCH_TTS_WS_PORT")
-    tts_layers = _family_layers(values, layer_maps, _family_keys(_TTS_ENDPOINT_MEMBERS))
-    tts_member = _winning_family_member(values, tts_layers, _TTS_ENDPOINT_MEMBERS)
+    tts_member, tts_layers = endpoint_resolution["tts_endpoint"]
     if _family_key_set(tts_host) != _family_key_set(tts_port):
         # Half a pair is malformed input, and every other malformed endpoint
         # input here is loud (non-integer port, out-of-range port). Falling

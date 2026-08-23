@@ -64,7 +64,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import sys
 from pathlib import Path
@@ -357,10 +356,19 @@ def build_dry_run_artifact(
 
 
 def run_live(*, output: Path) -> int:
-    if not os.environ.get("OPENAI_API_KEY"):
+    # Resolved the way production resolves it -- TOML -> env-file -> process
+    # environment, honouring WEBSEARCH_OPENAI_API_KEY(_ENV) -- not a raw
+    # `os.environ["OPENAI_API_KEY"]` read, which false-negatives for an
+    # operator whose key only lives in config.toml, an env-file, or the scoped
+    # spelling. Matches scripts/verify_eval_candidates.py's
+    # `_resolve_openai_api_key` (round 8 confirm pass 5, Architecture Minor).
+    from server.config import load_config
+
+    if not load_config().openai_api_key:
         print(
-            "BLOCKED: provider_unavailable -- OPENAI_API_KEY is not set; writing no "
-            f"fabricated records to {output}",
+            "BLOCKED: provider_unavailable -- no OpenAI API key resolved via load_config() "
+            "(checked config.toml, env-file, WEBSEARCH_OPENAI_API_KEY, and OPENAI_API_KEY); "
+            f"writing no fabricated records to {output}",
             file=sys.stderr,
         )
         return 1

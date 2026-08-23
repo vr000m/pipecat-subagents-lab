@@ -1950,6 +1950,36 @@ def test_evidence_common_write_bytes_no_follow_refuses_a_planted_symlink(
     )
 
 
+def test_runner_live_gate_honours_the_scoped_openai_key_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 8 confirm pass 5, Architecture Minor: ``run_live``'s credential
+    gate read ``os.environ["OPENAI_API_KEY"]`` directly, so an operator who
+    configured the scoped ``WEBSEARCH_OPENAI_API_KEY`` spelling (or put the
+    key in config.toml/an env-file) got a misleading
+    ``provider_unavailable`` message. It now resolves through
+    ``load_config()`` like ``verify_eval_candidates.py`` does.
+
+    Both branches still return 1 (the live path is unwired), so what this
+    pins is WHICH message the operator sees."""
+    module = _runner()
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("WEBSEARCH_OPENAI_API_KEY", "sk-scoped-test-key")
+
+    exit_code = module.run_live(output=tmp_path / "live.json")
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "provider_unavailable" not in stderr, (
+        "the scoped spelling resolves a key, so the credential gate must not fire"
+    )
+    assert "not wired to a responses client" in stderr
+
+    monkeypatch.delenv("WEBSEARCH_OPENAI_API_KEY", raising=False)
+    assert module.run_live(output=tmp_path / "live.json") == 1
+    assert "provider_unavailable" in capsys.readouterr().err
+
+
 def test_runner_dry_run_refuses_to_write_through_a_symlinked_output(
     tmp_path: Path,
 ) -> None:

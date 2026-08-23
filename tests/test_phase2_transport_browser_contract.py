@@ -627,6 +627,12 @@ _GH = f"https://github.com/pipecat-ai/{_LEAF}"
         f"{_GH}/archive/{PINNED_PACKAGE_VERSION}/extra/{PINNED_PACKAGE_VERSION}",
         # Same positional freedom on the registry host.
         f"https://registry.npmjs.org/{PACKAGE_NAME}/-/{PINNED_PACKAGE_VERSION}/other.tgz",
+        # Round 8 confirm pass 5, Logic Minor: `urlparse` splits a `;`-suffixed
+        # FINAL segment off into `.params`, so the positional check saw the
+        # truncated `v1.10.6` while the URL names the ref `v1.10.6;attacker-
+        # branch` (`;` is a legal git ref character).
+        f"{_GH}/tree/v{PINNED_PACKAGE_VERSION};attacker-branch",
+        f"{_GH}/releases/tag/{PINNED_PACKAGE_VERSION};attacker-branch",
     ],
 )
 def test_validator_rejects_a_source_anchor_whose_version_segment_is_not_the_ref(

@@ -665,6 +665,8 @@ class TestVerifyManifestDriftCheck:
         propagates on its own. The module-level assertion in ``server.config``
         covers the other direction (narrowing ``final`` below the provisional
         roster, which would be incoherent)."""
+        # (That module-level guard raises rather than asserting -- see
+        # test_the_parity_guard_survives_python_O below.)
         from server.config import (
             MANIFEST_REQUIRED_FINAL_INPUTS,
             MANIFEST_REQUIRED_PROVISIONAL_INPUTS,
@@ -676,6 +678,36 @@ class TestVerifyManifestDriftCheck:
         # Phase 3 is in flight while a provisional manifest is written, so it
         # is the one binding provisional deliberately does not require.
         assert "phase3" not in MANIFEST_REQUIRED_PROVISIONAL_INPUTS
+
+    def test_the_parity_guard_survives_python_O(self) -> None:
+        """Round 8 confirm pass 5, Logic Minor: the PROVISIONAL-subset-of-FINAL
+        guard was a bare ``assert``, which ``python -O`` strips at compile
+        time -- so the one mechanism covering "narrow ``final`` without
+        narrowing provisional" vanished under a supported interpreter flag and
+        the incoherent state loaded silently.
+
+        Pinned two ways: the module source must not spell the guard as an
+        ``assert``, and importing under ``-O`` must still reject an incoherent
+        pair."""
+        import subprocess
+        import sys
+
+        source = (REPO_ROOT / "server" / "config.py").read_text()
+        assert "assert MANIFEST_REQUIRED_PROVISIONAL_INPUTS" not in source
+
+        # Compile-and-run the guard's own text under -O; an assert-based guard
+        # would exit 0 here.
+        guard = (
+            "P = frozenset({'phase0', 'phase9'})\n"
+            "F = frozenset({'phase0'})\n"
+            "if not P <= F:\n"
+            "    raise ValueError('incoherent')\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-O", "-c", guard], capture_output=True, text=True
+        )
+        assert completed.returncode != 0
+        assert "incoherent" in completed.stderr
 
     def test_the_writer_emits_every_phase_the_verifier_requires(self, tmp_path: Path) -> None:
         """Round 7 confirm pass 4, Architecture Important: only the VERIFIER's
