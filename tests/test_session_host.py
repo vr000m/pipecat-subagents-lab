@@ -1387,6 +1387,66 @@ def test_active_speech_oracle_holds_through_cleanup_and_teardown() -> None:
     asyncio.run(run())
 
 
+def _concrete_worker_imports(source: str) -> list[str]:
+    """Every import in ``source`` that names a concrete worker module.
+
+    A named helper rather than a loop body inside the boundary test below, so
+    the detection itself is testable: the roster of scanned modules was
+    widened in round 6 while this logic stayed narrow, and nothing could
+    demonstrate which import forms it actually caught (round 7 confirm pass 4,
+    Architecture Minor). ``workers.base`` is the one legitimate target.
+    """
+    import ast
+
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("workers."):
+            # `from .workers.web_search import X`
+            if node.module != "workers.base":
+                offenders.append(f"from .{node.module}")
+        elif isinstance(node, ast.ImportFrom) and (node.module or "") == "workers":
+            # `from .workers import web_search`: the concrete worker is an
+            # imported NAME, so the module path alone never names it.
+            for alias in node.names:
+                if alias.name != "base":
+                    offenders.append(f"from .workers import {alias.name}")
+        elif isinstance(node, ast.Import):
+            # `import server.workers.web_search`
+            for alias in node.names:
+                if alias.name.startswith("server.workers.") and alias.name != "server.workers.base":
+                    offenders.append(f"import {alias.name}")
+    return offenders
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from .workers.web_search import ClarificationContext",
+        "from .workers import web_search",
+        "import server.workers.web_search",
+        "import server.workers.web_search as ws",
+    ],
+)
+def test_concrete_worker_import_detection_catches_every_import_form(source: str) -> None:
+    """Each spelling that reaches a concrete worker module must be caught --
+    the module-path forms and the imported-name form alike."""
+    assert _concrete_worker_imports(source) != []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from .workers.base import WorkerMetadata",
+        "from .workers import base",
+        "import server.workers.base",
+        "from .contracts import TurnAck",
+        "import ast",
+    ],
+)
+def test_concrete_worker_import_detection_allows_the_base_boundary(source: str) -> None:
+    assert _concrete_worker_imports(source) == []
+
+
 def test_session_host_slices_do_not_import_concrete_worker_implementations() -> None:
     """Round-5 restart gauntlet, Architecture Minor: every slice extracted from
     the SessionHost god class depends only on ``.contracts``/``.config``/
@@ -1404,8 +1464,14 @@ def test_session_host_slices_do_not_import_concrete_worker_implementations() -> 
     claimed no future slice could re-couple. Scanning every ``server/*.py``
     and exempting an explicit allowlist fails safe in the other direction: a
     module added later is in scope by default (round 6 confirm pass 3,
-    Architecture Minor)."""
-    import ast
+    Architecture Minor).
+
+    Widening the roster left the DETECTION narrow, though: only ``ImportFrom``
+    whose module started with ``workers.`` was caught, so ``from .workers
+    import web_search`` -- module ``workers``, the concrete worker arriving as
+    an imported *name* rather than as part of the module path -- slipped
+    through. Both axes are covered now (round 7 confirm pass 4, Architecture
+    Minor)."""
     from pathlib import Path
 
     server_dir = Path(__file__).parents[1] / "server"
@@ -1423,19 +1489,11 @@ def test_session_host_slices_do_not_import_concrete_worker_implementations() -> 
     )
     assert len(slices) > 6, "roster discovery found fewer modules than the old hand-written list"
 
-    offenders: list[str] = []
-    for name in slices:
-        path = server_dir / name
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("workers."):
-                if node.module != "workers.base":
-                    offenders.append(f"{name}: from .{node.module}")
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name.startswith("server.workers.") and (
-                        alias.name != "server.workers.base"
-                    ):
-                        offenders.append(f"{name}: import {alias.name}")
+    offenders = [
+        f"{name}: {offender}"
+        for name in slices
+        for offender in _concrete_worker_imports((server_dir / name).read_text(encoding="utf-8"))
+    ]
 
     assert offenders == [], (
         "SessionHost slices must depend on workers/base.py only, never on a "
