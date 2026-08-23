@@ -9940,6 +9940,33 @@ def test_reclaiming_a_turns_generation_still_increments_monotonically() -> None:
     assert (first, second) == (1, 2)
 
 
+def test_relatching_an_evicted_turn_cannot_reuse_a_live_chains_generation() -> None:
+    """Round 6 confirm pass 3, Logic Minor: generations were per-turn
+    (``get(turn_id, 0) + 1``), so a turn whose entry ``_MAX_ACK_GENERATION_TURNS``
+    evicted restarted at 1 -- the same number its still-live chain holds, since
+    most turns only ever have one chain. That chain then read
+    ``current_generation == generation``, concluded it was current, and
+    proceeded against the newer chain's latch and queued item: two live chains
+    under one key, exactly what the supersession bail-out exists to prevent."""
+    from server.turn_ack_ledger import _MAX_ACK_GENERATION_TURNS, TurnAckLedger
+
+    ledger = TurnAckLedger(
+        feature_policy=lambda: None,
+        early_ack_text=lambda: "",
+        connection=lambda: None,
+        accepts=lambda _epoch: True,
+    )
+
+    live_chain_generation = ledger._claim_ack_admission_generation("turn-evicted")
+    for index in range(_MAX_ACK_GENERATION_TURNS + 1):
+        ledger._claim_ack_admission_generation(f"turn-later-{index}")
+    assert "turn-evicted" not in ledger._ack_admission_generation
+
+    relatched_generation = ledger._claim_ack_admission_generation("turn-evicted")
+
+    assert relatched_generation != live_chain_generation
+
+
 def test_evicted_generation_entry_does_not_orphan_a_live_ack_chains_latch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

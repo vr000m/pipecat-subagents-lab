@@ -72,16 +72,19 @@ _MAX_ACK_GENERATION_TURNS = 2048
 """Cap on retained per-turn admission-chain generation counters.
 
 ``_ack_admission_generation`` cannot be popped when a turn's latch clears
-(see its own comment: a re-latched turn restarting at generation 1 would be
-indistinguishable from an already-superseded chain), so it needs an explicit
-bound instead -- one ``TurnAckLedger`` lives for the whole ``SessionHost``,
-across every session the process serves. Eviction is oldest-turn-first, and
-turn ids are minted from a strictly increasing sequence, so the entries
-dropped are always the least recent. The collision this dict exists to
-prevent needs a *live* stale chain for the evicted turn, and a chain's whole
-lifetime is bounded by ``_ACK_ADMISSION_MAX_ATTEMPTS`` retries at
-``_ACK_ADMISSION_RETRY_DELAY_SECONDS`` (~1s); losing an entry therefore
-requires this many later turns to be latched inside that window."""
+(see its own comment: absence must keep meaning "no chain holds this turn",
+which is what lets a stale chain fall through to the liveness path and
+release its own queued ack), so it needs an explicit bound instead -- one
+``TurnAckLedger`` lives for the whole ``SessionHost``, across every session
+the process serves. Eviction is oldest-turn-first, and turn ids are minted
+from a strictly increasing sequence, so the entries dropped are always the
+least recent.
+
+Eviction cannot resurrect the generation collision this dict exists to
+prevent: generations come from one ledger-wide sequence
+(``_ack_generation_sequence``), so a turn whose entry was evicted and then
+re-latched claims a fresh number rather than restarting at 1 beside a chain
+that still holds 1."""
 
 
 class TurnAckLedger:
@@ -129,16 +132,21 @@ class TurnAckLedger:
         # chain) and wrongly treat that as proof its own admission is still
         # current -- see ``_retry_or_abandon``'s generation check.
         # Deliberately *not* popped on latch clear (unlike
-        # ``_ack_emitted_turns``): turn ids are minted once each from a
-        # strictly increasing sequence and never reused, so resetting a
-        # turn's counter back to zero on clear would let a later chain for
-        # the *same* turn_id collide with an earlier, already-superseded
-        # chain's generation number instead of being distinguishable from
-        # it. Because it cannot be popped per turn, it is instead explicitly
+        # ``_ack_emitted_turns``): an absent entry means "no chain holds this
+        # turn", the premise on which a stale chain falls through to the
+        # liveness path and releases its own queued ack. Popping on clear
+        # would make a superseded chain read the live one's turn as unheld,
+        # so it would resume against the *newer* chain's latch and queued
+        # item. Because it cannot be popped per turn, it is instead explicitly
         # capped at ``_MAX_ACK_GENERATION_TURNS`` with oldest-turn-first
         # eviction -- see that constant for why the cap cannot resurrect the
         # collision it exists to prevent.
         self._ack_admission_generation: OrderedDict[str, int] = OrderedDict()
+        # The ledger-wide source of every generation number above. Strictly
+        # increasing and never reset (not even by ``clear_all``), so no two
+        # admission chains -- for the same turn or different ones -- can ever
+        # hold the same number. See _claim_ack_admission_generation.
+        self._ack_generation_sequence = 0
         # Authoritative turn -> delegated-child-work-item registry. Ack
         # ownership and the sole-delegated-child cancellation decision are
         # answered from this map rather than by re-deriving the
@@ -363,12 +371,23 @@ class TurnAckLedger:
         """Supersede whatever admission chain previously held ``turn_id``.
 
         The returned generation is strictly greater than any previously
-        issued for this turn, which is what lets ``_retry_or_abandon`` and
-        ``admit`` tell a stale chain's belated retry from the live one.
+        issued by this ledger -- for this turn or any other -- which is what
+        lets ``_retry_or_abandon`` and ``admit`` tell a stale chain's belated
+        retry from the live one.
         Enforces ``_MAX_ACK_GENERATION_TURNS`` here rather than at every
         mutation site, so the bound has exactly one definition.
         """
-        generation = self._ack_admission_generation.get(turn_id, 0) + 1
+        # Drawn from ONE ledger-wide sequence, not from this turn's own
+        # counter + 1: a per-turn counter restarts at 1 for a turn whose entry
+        # _MAX_ACK_GENERATION_TURNS evicted, and most turns only ever have one
+        # chain -- so the evicted-but-still-live chain also held generation 1
+        # and would read itself as current, which is exactly the collision the
+        # bail-out exists to prevent (round 6 confirm pass 3, Logic Minor). A
+        # ledger-wide sequence is never reused by any turn, so "the entry
+        # holds a number that is not mine" always means superseded and
+        # "there is no entry" always means evicted.
+        self._ack_generation_sequence += 1
+        generation = self._ack_generation_sequence
         self._ack_admission_generation[turn_id] = generation
         # Newest-first retention: a turn claiming a fresh chain becomes the
         # most recently used entry, so the eviction below only ever discards
