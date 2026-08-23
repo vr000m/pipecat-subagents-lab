@@ -1215,7 +1215,22 @@ def test_all_four_coordinator_boundary_declarations_carry_the_same_members() -> 
     roster, so a member added to three of them fails here instead of silently
     resolving to a fallback in production.
     """
-    assert set(OptionalCoordinator.__protocol_attrs__) == set(OPTIONAL_COORDINATOR_MEMBERS)
+    # `__protocol_attrs__` is a `typing` implementation detail with no public
+    # equivalent and no cross-version stability guarantee (round-4 confirm
+    # pass, Architecture finding). It is still the only thing that can pin the
+    # Protocol leg of this four-way roster, so guard it rather than drop it: if
+    # a future CPython renames it or changes which members it collects, this
+    # assertion fails as an obvious breakage instead of the equality below
+    # silently comparing an empty or truncated set.
+    protocol_attrs = getattr(OptionalCoordinator, "__protocol_attrs__", None)
+    assert protocol_attrs, (
+        "typing.Protocol no longer exposes __protocol_attrs__ -- this roster check needs "
+        "a new way to enumerate OptionalCoordinator's members"
+    )
+    assert "live_work_item_ids" in protocol_attrs, (
+        "__protocol_attrs__ no longer collects the members this check assumes it does"
+    )
+    assert set(protocol_attrs) == set(OPTIONAL_COORDINATOR_MEMBERS)
 
     for member_name in OPTIONAL_COORDINATOR_MEMBERS:
         assert hasattr(CoordinatorDefaults, member_name), (

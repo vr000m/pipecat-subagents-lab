@@ -227,3 +227,57 @@ def test_sha256_file_streams_instead_of_buffering_the_whole_artifact(tmp_path: P
         digest = sha256_file(target)
 
     assert digest == hashlib.sha256(payload).hexdigest()
+
+
+class TestConfinedEvidenceInputPathMatchesTheRuntimeLoader:
+    """Round-4 confirm pass, Architecture + Security findings.
+
+    ``verify_manifest`` hand-rolled a third copy of "confine an
+    attacker-declared path to the repo tree" -- join, then ``is_relative_to``
+    -- under a comment claiming parity with
+    ``server/config._resolve_confined_evidence_path``. It had no parity:
+    ``Path(root) / "/abs/path"`` discards ``root`` entirely in pathlib, so the
+    copy accepted absolute in-repo paths that the runtime loader rejects
+    outright. CI reported a manifest clean that the consumer it exists to
+    speak for degrades to ``evidence_unresolvable``/display-only.
+
+    The rule now lives once, in ``confined_evidence_input_path``. The
+    ``server``/``scripts`` split forbids either package importing the other,
+    so this test is what keeps the two from disagreeing about which declared
+    paths are legal.
+    """
+
+    def _both(self, raw: str) -> tuple[bool, bool]:
+        from server.config import _PACKAGE_ROOT, _resolve_confined_evidence_path
+        from scripts.evidence_common import confined_evidence_input_path
+
+        return (
+            confined_evidence_input_path(raw, allowed_root=_PACKAGE_ROOT) is not None,
+            _resolve_confined_evidence_path(raw) is not None,
+        )
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl",
+            "shared/schemas/v013-evidence.json",
+            "./docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl",
+            "docs/../docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl",
+            "../../../../etc/passwd",
+            "docs/../../etc/passwd",
+            "/etc/passwd",
+            "",
+        ],
+    )
+    def test_the_two_implementations_agree(self, raw: str) -> None:
+        gate_accepts, loader_accepts = self._both(raw)
+        assert gate_accepts == loader_accepts, raw
+
+    def test_an_absolute_in_repo_path_is_refused_by_both(self) -> None:
+        """The exact divergence: an absolute path that *is* inside the tree.
+        A join-then-``is_relative_to`` confinement accepts it; both of these
+        must not."""
+        from server.config import _PACKAGE_ROOT
+
+        absolute_in_repo = str(_PACKAGE_ROOT / "shared" / "schemas" / "v013-evidence.json")
+        assert self._both(absolute_in_repo) == (False, False)

@@ -453,9 +453,20 @@ _EVIDENCE_SCHEMA_PATH = _PACKAGE_ROOT / "shared/schemas/v013-evidence.json"
 _MAX_EVIDENCE_INPUT_BYTES = 8 * 1024 * 1024
 
 
-def _read_regular_file_no_follow(path: Path, *, max_bytes: int) -> bytes | None:
+def read_regular_file_no_follow(path: Path, *, max_bytes: int) -> bytes | None:
     """Open, fstat-verify, and read `path`, returning `None` for anything that
     is not a size-bounded regular file -- or is unreadable at all.
+
+    **Public, despite living in a configuration module.** It was named
+    `_read_regular_file_no_follow` while `config.py` was its only consumer;
+    `server/session_state.py` now reads
+    `shared/work-status-retention.json` through it too, so it is part of the
+    package's internal contract rather than config-private and reaching into
+    it under an underscore name misstated that (round-4 confirm pass,
+    Architecture finding). It stays in `config.py` rather than moving to a
+    dedicated module because `config.py` deliberately has no intra-package
+    imports -- it is the leaf every other `server` module may import -- and
+    splitting the hardened read out would make it the first.
 
     Runtime evidence paths here are either attacker-steerable (a manifest's
     own declared `inputs[*].path`) or operator-controllable (env/TOML
@@ -544,9 +555,16 @@ def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
     Deliberately does *not* also check "is a regular file within the size
     cap" here: doing that with a `stat()` call and then reading the path
     separately at the caller is exactly the TOCTOU gap
-    `_read_regular_file_no_follow` exists to close, so every caller must
+    `read_regular_file_no_follow` exists to close, so every caller must
     route the actual read through that helper, which re-derives both facts
     from the fd it opens for the read.
+
+    `scripts/evidence_common.confined_evidence_input_path` is the CLI-gate
+    mirror of this function (the `server`/`scripts` split forbids either
+    importing the other -- see `read_regular_file_no_follow`'s docstring).
+    The two must agree on *which declared paths are legal*, or CI reports a
+    manifest clean that this loader then refuses; `tests/test_evidence_common.py`
+    pins them against each other on exactly that.
     """
     candidate = Path(raw_path)
     if candidate.is_absolute():
@@ -568,13 +586,13 @@ def _schema_hash_matches(declared: str) -> Literal["match", "mismatch", "unverif
     as its own state rather than collapsed into a match, and the caller decides
     fail-closed.
 
-    Routed through `_read_regular_file_no_follow` -- the same guard every
+    Routed through `read_regular_file_no_follow` -- the same guard every
     other evidence read on this boot path uses -- rather than a plain
     `read_bytes()`: a FIFO or character device (`/dev/zero`) planted at this
     predictable, repo-relative path would otherwise block server boot inside
     the read forever instead of degrading to "unverifiable".
     """
-    data = _read_regular_file_no_follow(_EVIDENCE_SCHEMA_PATH, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
+    data = read_regular_file_no_follow(_EVIDENCE_SCHEMA_PATH, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
     if data is None:
         return "unverifiable"
     if hashlib.sha256(data).hexdigest() == declared:
@@ -633,10 +651,10 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # is operator config, and a path that names a device or FIFO would hang or
     # OOM-kill server boot on read_text(). This is the first evidence read the
     # boot path takes, so it is the one that must fail closed. Routed through
-    # `_read_regular_file_no_follow` (a single open+fstat+read, not a
+    # `read_regular_file_no_follow` (a single open+fstat+read, not a
     # `stat()`-then-`read_text()` pair) so the type/size decision and the
     # bytes actually read cannot be split across a TOCTOU window.
-    content = _read_regular_file_no_follow(path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
+    content = read_regular_file_no_follow(path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
     if content is None:
         return _unavailable("manifest_missing")
     try:
@@ -738,10 +756,10 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         _phase_path = _resolve_confined_evidence_path(_phase_entry["path"])
         if _phase_path is None:
             return replace(identity, reason="evidence_unresolvable")
-        # `_read_regular_file_no_follow`, not `_phase_path.read_bytes()`: a
+        # `read_regular_file_no_follow`, not `_phase_path.read_bytes()`: a
         # single open+fstat+read closes the TOCTOU window a separate
         # regular-file/size check followed by a read would leave open.
-        _phase_content = _read_regular_file_no_follow(
+        _phase_content = read_regular_file_no_follow(
             _phase_path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES
         )
         if _phase_content is None:
@@ -804,7 +822,7 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         # manifest-declared, so it is not attacker-steerable the way the
         # phase0-3 `inputs[*].path` entries are -- but it is still an
         # operator-controllable path read on the server-boot path, and
-        # `_read_regular_file_no_follow` applies the same size/regular-file
+        # `read_regular_file_no_follow` applies the same size/regular-file
         # bound, from one held fd, for exactly that reason: an accidental
         # device-file or FIFO path would otherwise make `read_bytes()` block
         # indefinitely (`/dev/zero` never reaches EOF), and a separate
@@ -813,7 +831,7 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         # boot, or reading through a swapped-in symlink, instead of
         # degrading to `phase4c_unresolvable` like every other
         # unreadable-path case here.
-        phase4c_content = _read_regular_file_no_follow(
+        phase4c_content = read_regular_file_no_follow(
             phase4c_path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES
         )
         if phase4c_content is None:

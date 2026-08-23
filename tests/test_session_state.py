@@ -1045,21 +1045,26 @@ def test_retention_config_read_refuses_fifo_and_symlink(tmp_path: Path) -> None:
     """
     import os
 
-    from server.session_state import _RETENTION_MAX_BYTES, _read_regular_file_no_follow
+    # Each name from its owning module: the read primitive belongs to
+    # ``server.config`` (``session_state`` only imports it), and reaching it
+    # through the importer made the same function addressable under three
+    # names (round-4 confirm pass, Architecture finding).
+    from server.config import read_regular_file_no_follow
+    from server.session_state import _RETENTION_MAX_BYTES
 
     real = tmp_path / "real.json"
     real.write_text('{"ttl_seconds": 1, "max_keys": 2}')
-    assert _read_regular_file_no_follow(real, max_bytes=_RETENTION_MAX_BYTES) is not None
+    assert read_regular_file_no_follow(real, max_bytes=_RETENTION_MAX_BYTES) is not None
 
     fifo = tmp_path / "fifo.json"
     os.mkfifo(fifo)
     # Must return promptly with None rather than hanging on the open/read.
-    assert _read_regular_file_no_follow(fifo, max_bytes=_RETENTION_MAX_BYTES) is None
+    assert read_regular_file_no_follow(fifo, max_bytes=_RETENTION_MAX_BYTES) is None
 
     link = tmp_path / "link.json"
     link.symlink_to(real)
-    assert _read_regular_file_no_follow(link, max_bytes=_RETENTION_MAX_BYTES) is None
+    assert read_regular_file_no_follow(link, max_bytes=_RETENTION_MAX_BYTES) is None
 
     oversized = tmp_path / "big.json"
     oversized.write_bytes(b"x" * (_RETENTION_MAX_BYTES + 1))
-    assert _read_regular_file_no_follow(oversized, max_bytes=_RETENTION_MAX_BYTES) is None
+    assert read_regular_file_no_follow(oversized, max_bytes=_RETENTION_MAX_BYTES) is None

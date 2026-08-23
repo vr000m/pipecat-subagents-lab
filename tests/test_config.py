@@ -1629,7 +1629,7 @@ def test_load_promotion_manifest_does_not_hang_on_a_fifo_planted_at_the_schema_p
 ) -> None:
     """Round 1 gauntlet security finding: `_schema_hash_matches` previously
     read `_EVIDENCE_SCHEMA_PATH` with a plain `read_bytes()`, bypassing this
-    module's own `_read_regular_file_no_follow` guard. A FIFO (or
+    module's own `read_regular_file_no_follow` guard. A FIFO (or
     `/dev/zero`) planted at that predictable, repo-relative path never
     raises `OSError` from `read_bytes()`, so the fail-closed "unverifiable"
     branch was never reached and server boot hung inside the read instead.
@@ -1818,7 +1818,7 @@ def test_environment_release_version_overrides_the_toml_value(tmp_path) -> None:
 # `Path.stat()` check, then a *separate* `read_text()`/`read_bytes()` call at
 # the actual read site -- a symlink (or FIFO/device) can be swapped in
 # between the two, so the stat-checked path and the bytes actually read are
-# not guaranteed to be the same file. `_read_regular_file_no_follow` closes
+# not guaranteed to be the same file. `read_regular_file_no_follow` closes
 # that window with a single open(O_NOFOLLOW|O_NONBLOCK)+fstat+read.
 
 
@@ -1851,7 +1851,7 @@ def test_read_regular_file_no_follow_refuses_a_planted_symlink(tmp_path: Path) -
     link = tmp_path / "evidence-input.json"
     link.symlink_to(target)
 
-    result = _config_module._read_regular_file_no_follow(
+    result = _config_module.read_regular_file_no_follow(
         link, max_bytes=_config_module._MAX_EVIDENCE_INPUT_BYTES
     )
 

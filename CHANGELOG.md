@@ -326,6 +326,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     raw one.
   - `server/handshake_gate.py`: a `CapabilityCarrier` Protocol replaces the
     `Connection | ConnectionPipeline | None` union in handshake validation.
+- Restart-gauntlet round 4 (`dd2ee9f`..) closed a batch of bypasses a 4-lens
+  confirm pass reproduced *in round 3's own hardening additions*, each with
+  its own regression test:
+  - `scripts/validate_v013_evidence.py`: the new `--verify-manifest` CI drift
+    gate failed open three ways. Its verdict re-derivation was guarded on all
+    of phase0/1/2 having resolved, so a manifest that simply *omitted* an
+    `inputs` entry skipped the check entirely and a forged
+    `promotion_eligible=true` exited 0; its path confinement was a private
+    copy of the runtime loader's rule that accepted absolute in-repo paths
+    the loader rejects; and three fields it advertised as verified
+    (`reason`, `manifest_phase`, `phase3_command_digest`) were never compared
+    to anything, while the completeness guard counted them as covered. The
+    required input set is now derived from the manifest's own
+    `manifest_phase`, every "cannot check this" path reports drift instead of
+    falling through, `promotion_eligible`/`reason` are both re-derived through
+    one function the writer also stamps from, `phase3_command_digest` is
+    compared against the resolved Phase 3 artifact, and `release_version` /
+    `feature_policy_fingerprint` are verified rather than excluded as
+    volatile — so CI now pre-catches the two identity mismatches the runtime
+    loader is guaranteed to reject.
+  - `scripts/evidence_common.py`: the manifest-declared-path confinement rule
+    now lives once, as `confined_evidence_input_path`, pinned by test against
+    `server/config._resolve_confined_evidence_path` so the CI gate and the
+    runtime loader cannot disagree about which declared paths are legal.
+  - `.github/workflows/ci.yml`: the manifest drift check runs as its own
+    `promotion-manifest-drift` job on pull requests as well as pushes. As a
+    step inside the main-only `release-metadata` job it only ever ran
+    post-merge, so a PR editing the manifest or any evidence artifact merged
+    before the gate protecting that file had executed.
+  - `scripts/validate_phase2_transport_browser_contract.py`: round 3's new
+    semver range support discarded prerelease/build suffixes, so the declared
+    `1.10.6` "admitted" lockfile pins `1.10.6-evil.0`, `1.10.6+evil` and
+    `v1.10.6` — three different package builds that npm semver satisfies
+    none of, and that the pre-round-3 exact string comparison had caught.
+    Both sides now fail closed on any suffix.
+  - `web/src/state.js`: round 3's work-status tombstone mechanism had two
+    resurrection holes of its own. A terminal record updated after its TTL
+    had elapsed was written and immediately pruned in the same pass, leaving
+    neither record nor watermark; and a snapshot that no longer carries a key
+    dropped it with no watermark at all. Both paths now leave a tombstone, so
+    a late lower-sequence increment can no longer re-insert an aged-out
+    terminal record.
+  - `server/config.py`: `_read_regular_file_no_follow` is now the public
+    `read_regular_file_no_follow`, since `server/session_state.py` reads
+    through it too and the underscore name misstated it as config-private.
 - `scripts/eval_model_comparison.py`'s citations assertion no longer fails
   weather-query turns that were genuinely delegated and answered correctly:
   the hosted `web_search` tool answers weather via an internal `oai-weather`

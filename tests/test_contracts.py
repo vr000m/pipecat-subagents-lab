@@ -476,6 +476,8 @@ def test_work_status_state_set_is_the_coarse_six_state_set() -> None:
 
 
 def _work_status_schema() -> dict:
+    """Load `shared/schemas/work-status.json`, the contract the assertions below
+    pin the server's and client's work-status vocabularies against."""
     import json
     from pathlib import Path
 

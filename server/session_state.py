@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from loguru import logger
 
-from .config import _read_regular_file_no_follow
+from .config import read_regular_file_no_follow
 from .contracts import (
     WORK_STATUS_TERMINAL,
     DeliveryState,
@@ -63,7 +63,7 @@ _RETENTION_FALLBACK = {"ttl_seconds": 300, "max_keys": 256}
 #: predictable, repo-relative path. ``read_text()`` follows a symlink planted
 #: there and blocks forever on a FIFO or character device, and the
 #: ``except`` below cannot catch either: a symlink resolves silently, and a
-#: blocking open never returns to raise. ``_read_regular_file_no_follow``
+#: blocking open never returns to raise. ``read_regular_file_no_follow``
 #: applies ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK`` plus an ``fstat`` ``S_ISREG``
 #: check on the held fd and a byte cap, and folds every failure -- including
 #: "not a regular file" -- into ``None``, which lands on the same
@@ -72,7 +72,7 @@ _RETENTION_FALLBACK = {"ttl_seconds": 300, "max_keys": 256}
 #: module-level ones, so importing it here adds no cycle and no runtime cost.
 _RETENTION_MAX_BYTES = 64 * 1024
 
-_retention_bytes = _read_regular_file_no_follow(
+_retention_bytes = read_regular_file_no_follow(
     _RETENTION_CONFIG_PATH, max_bytes=_RETENTION_MAX_BYTES
 )
 if _retention_bytes is None:

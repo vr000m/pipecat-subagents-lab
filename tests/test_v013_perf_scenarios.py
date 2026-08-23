@@ -49,8 +49,13 @@ def _evidence_record(
     run_id: str,
     sample_index: int,
     sample_count: int,
-    monotonic_origin_ns: int,
+    monotonic_origin_ns: int | None,
 ) -> dict[str, Any]:
+    sample_timestamp_ms = (
+        0
+        if monotonic_origin_ns is None
+        else (time.monotonic_ns() - monotonic_origin_ns) // 1_000_000
+    )
     return {
         "phase": "phase0",
         "scenario": scenario,
@@ -63,16 +68,31 @@ def _evidence_record(
         "routing_phase_latency_ms": routing_phase_latency_ms,
         "outcome": outcome,
         "disposition": disposition,
-        "sample_timestamp_ms": (time.monotonic_ns() - monotonic_origin_ns) // 1_000_000,
+        "sample_timestamp_ms": sample_timestamp_ms,
         "run_id": run_id,
         "sample_index": sample_index,
         "sample_count": sample_count,
     }
 
 
-def build_phase0_fixture(run_id: str | None = None) -> list[dict[str, Any]]:
+def build_phase0_fixture(
+    run_id: str | None = None, *, deterministic_sample_timestamps: bool = False
+) -> list[dict[str, Any]]:
     """Drive the Phase 0 scenario matrix through the real recorders and
     return one schema-shaped evidence record per scenario.
+
+    ``deterministic_sample_timestamps`` stamps every record's
+    ``sample_timestamp_ms`` as ``0`` instead of measuring elapsed monotonic
+    time. Required by the one caller that writes the *committed*
+    ``docs/benchmarks`` artifact: elapsed-time stamps are machine-speed
+    dependent, so that test rewrote the committed file with different bytes on
+    any host slower than the one it was first generated on, silently churning
+    an artifact whose SHA-256 is a promotion-manifest binding -- and, under
+    randomized test ordering, failing
+    ``test_the_repo_committed_manifest_verifies_clean`` in the same run
+    (round-4 confirm pass, found while sweeping the manifest drift gate's
+    blast radius). The elapsed values carry no analytical weight here: all six
+    scenarios are synchronous in-process recorder calls.
 
     Each scenario finalizes a real ``AppTurnRecorder`` (and, where the
     scenario dispatches a search, a child ``WorkItemRecorder`` or a
@@ -82,7 +102,7 @@ def build_phase0_fixture(run_id: str | None = None) -> list[dict[str, Any]]:
     rather than invented directly in the fixture.
     """
     run_id = run_id or f"phase0-fixture-{uuid.uuid4().hex[:12]}"
-    monotonic_origin_ns = time.monotonic_ns()
+    monotonic_origin_ns = None if deterministic_sample_timestamps else time.monotonic_ns()
     sink = CollectingMeasurementSink()
     records: list[dict[str, Any]] = []
 
@@ -328,13 +348,31 @@ def test_phase0_writes_the_committed_docs_benchmarks_artifact() -> None:
     validate it in place, per the Phase 0 completion gate.
 
     Uses a fixed run_id (rather than build_phase0_fixture's default random
-    uuid) so re-running this test does not churn the committed artifact with
-    a no-op diff.
+    uuid) *and* deterministic sample timestamps so re-running this test does
+    not churn the committed artifact. The run_id alone was not enough: the
+    elapsed-monotonic ``sample_timestamp_ms`` values are machine-speed
+    dependent, so on any host slower than the one that first generated the
+    file this test rewrote four of its six records -- changing the SHA-256
+    that ``docs/benchmarks/v0.1.3-promotion-manifest.json`` binds, and (under
+    randomized ordering) failing the committed-manifest drift test in the same
+    session.
+
+    The write must therefore be byte-idempotent, which this asserts directly
+    rather than leaving to the next reader of ``git status``.
     """
-    records = build_phase0_fixture(run_id="phase0-fixture-committed")
+    records = build_phase0_fixture(
+        run_id="phase0-fixture-committed", deterministic_sample_timestamps=True
+    )
+    payload = "\n".join(json.dumps(r) for r in records) + "\n"
     ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ARTIFACT_PATH.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    before = ARTIFACT_PATH.read_text(encoding="utf-8") if ARTIFACT_PATH.exists() else None
+    ARTIFACT_PATH.write_text(payload, encoding="utf-8")
 
     validated = validate_artifact("phase0", ARTIFACT_PATH)
 
     assert len(validated) == 6
+    if before is not None:
+        assert payload == before, (
+            "regenerating the committed phase0 artifact changed its bytes -- the promotion "
+            "manifest's inputs.phase0.sha256 no longer matches; the fixture is not deterministic"
+        )

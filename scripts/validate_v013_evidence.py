@@ -33,6 +33,7 @@ from typing import Any
 from scripts.evidence_common import (
     REPO_ROOT,
     EvidenceGateError,
+    confined_evidence_input_path,
     confined_output_path,
     load_json,
     load_jsonl,
@@ -45,7 +46,7 @@ from scripts.evidence_common import (
 from scripts.validate_phase2_transport_browser_contract import (
     validate_artifact as validate_transport_browser_artifact,
 )
-from server.config import load_config
+from server.config import FeaturePolicy, feature_policy_fingerprint, load_config
 
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
 TRANSPORT_SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-transport-browser-contract.json"
@@ -328,16 +329,31 @@ PHASE3_COMPLETION_REQUIRED_FIELDS = (
 )
 
 
-def _validate_phase3_completion(
-    input_path: Path, *, source_commit: str, source_tree_hash: str
-) -> dict[str, Any]:
-    """Revalidate the Phase 3 completion artifact `record_phase3_completion.py` writes."""
+def _read_phase3_completion(input_path: Path) -> dict[str, Any]:
+    """Shape-validate the Phase 3 completion artifact, without binding it to a
+    source identity.
+
+    Split out of :func:`_validate_phase3_completion` for
+    :func:`verify_manifest`, which needs `command_digest` off this record but
+    has no trustworthy ``--source-commit``/``--source-tree-hash`` to bind it
+    against: those live in the manifest under scrutiny and are deliberately
+    *not* re-derived (see ``_MANIFEST_VOLATILE_FIELDS``), so comparing the
+    artifact to them would only prove the forged manifest is self-consistent.
+    """
     record = load_json(input_path)
     if not isinstance(record, dict):
         raise EvidenceGateError("phase3 completion artifact must be a JSON object")
     missing = [field for field in PHASE3_COMPLETION_REQUIRED_FIELDS if not record.get(field)]
     if missing:
         raise EvidenceGateError(f"phase3 completion artifact missing field(s) {missing}")
+    return record
+
+
+def _validate_phase3_completion(
+    input_path: Path, *, source_commit: str, source_tree_hash: str
+) -> dict[str, Any]:
+    """Revalidate the Phase 3 completion artifact `record_phase3_completion.py` writes."""
+    record = _read_phase3_completion(input_path)
     if record["source_commit"] != source_commit:
         raise EvidenceGateError(
             "phase3 completion artifact source_commit "
@@ -517,6 +533,34 @@ def _repo_relative_evidence_path(input_path: Path) -> str:
         ) from exc
 
 
+def _promotion_verdict(
+    *, manifest_phase: str, real_stratum_present: bool, transport_eligible: bool
+) -> tuple[bool, str | None]:
+    """The ``(promotion_eligible, reason)`` pair the current evidence supports.
+
+    Called by :func:`write_manifest` to *stamp* the verdict and by
+    :func:`verify_manifest` to *re-derive* it. One function rather than two
+    copies: ``verify_manifest`` re-derived only ``promotion_eligible`` while
+    listing ``reason`` as covered, so hand-editing ``reason`` to a different
+    string passed the CI gate clean (round-4 confirm pass, Logic + Security +
+    Architecture findings). Sharing the selection makes the two structurally
+    unable to disagree about what the reason for a verdict is.
+    """
+    if manifest_phase == "provisional":
+        # A provisional manifest is diagnostic-only and is permanently
+        # ineligible; Phase 3 replaces it with a "final" manifest that can
+        # actually pass `load_promotion_manifest`'s eligibility gate.
+        if not real_stratum_present:
+            return False, "real_stratum_missing"
+        if not transport_eligible:
+            return False, "audibility_unverified"
+        return False, "provisional_manifest"
+    promotion_eligible = real_stratum_present and transport_eligible
+    if promotion_eligible:
+        return True, None
+    return False, ("real_stratum_missing" if not real_stratum_present else "audibility_unverified")
+
+
 def write_manifest(
     *,
     manifest_phase: str,
@@ -610,26 +654,14 @@ def write_manifest(
     )
     transport_eligible = bool(transport_record.get("promotion_eligible"))
 
-    reason: str | None
-    if manifest_phase == "provisional":
-        # A provisional manifest is diagnostic-only and is permanently
-        # ineligible; Phase 3 replaces it with a "final" manifest that can
-        # actually pass `load_promotion_manifest`'s eligibility gate.
-        promotion_eligible = False
-        if not real_stratum_present:
-            reason = "real_stratum_missing"
-        elif not transport_eligible:
-            reason = "audibility_unverified"
-        else:
-            reason = "provisional_manifest"
-    else:
-        # Phase 3 completeness is not a *reason* this branch can report: the
-        # guard at the top of this function refuses `--manifest-phase final`
-        # without `--phase3-input` outright, so `phase3_record` is never None
-        # here. The old `"phase3_incomplete"` reason string was therefore dead
-        # (round-3 restart gauntlet, Logic finding) -- a downstream consumer
-        # keying on it would have waited forever for a value the writer could
-        # not emit.
+    if manifest_phase == "final":
+        # Phase 3 completeness is not a *reason* `_promotion_verdict` can
+        # report: the guard at the top of this function refuses
+        # `--manifest-phase final` without `--phase3-input` outright, so
+        # `phase3_record` is never None here. The old `"phase3_incomplete"`
+        # reason string was therefore dead (round-3 restart gauntlet, Logic
+        # finding) -- a downstream consumer keying on it would have waited
+        # forever for a value the writer could not emit.
         #
         # Removed rather than made reachable: turning the hard refusal into a
         # soft reason would mean writing an ineligible-but-well-formed final
@@ -639,12 +671,11 @@ def write_manifest(
         assert phase3_record is not None, (
             "--manifest-phase final without --phase3-input must have been refused above"
         )
-        promotion_eligible = real_stratum_present and transport_eligible
-        reason = (
-            None
-            if promotion_eligible
-            else ("real_stratum_missing" if not real_stratum_present else "audibility_unverified")
-        )
+    promotion_eligible, reason = _promotion_verdict(
+        manifest_phase=manifest_phase,
+        real_stratum_present=real_stratum_present,
+        transport_eligible=transport_eligible,
+    )
 
     if not SCHEMA_PATH.exists():
         # Stamping an empty digest here would still print "OK: ...
@@ -803,8 +834,19 @@ def _rollback_manifest(output: Path, previous_bytes: bytes | None) -> None:
 #: rather than *what evidence it binds*. Excluded from the drift check in
 #: :func:`verify_manifest`, because a manifest committed at one commit can
 #: never match a regeneration at a later one: ``deployed_at_utc`` and
-#: ``generated_at_utc`` are wall-clock stamps, and the release-identity trio
-#: is derived from whichever checkout the verifier happens to be running in.
+#: ``generated_at_utc`` are wall-clock stamps, and ``source_commit`` /
+#: ``source_tree_hash`` name the checkout the manifest was written *from*,
+#: which every subsequent commit on the branch changes.
+#:
+#: ``release_version`` and ``feature_policy_fingerprint`` used to be listed
+#: here too, on the same "derived from whichever checkout the verifier happens
+#: to be running in" rationale -- which does not apply to them (round-4 confirm
+#: pass, Architecture finding). Both are deterministic from the effective
+#: config, both are re-derived by ``verify_manifest`` now, and both are
+#: compared by ``server/config.py::load_promotion_manifest`` with a fail-closed
+#: display-only verdict, so excluding them meant CI could not pre-catch two
+#: mismatches the runtime loader is guaranteed to reject.
+#:
 #: Everything *not* listed here is evidence binding, and must match.
 _MANIFEST_VOLATILE_FIELDS = frozenset(
     {
@@ -812,8 +854,6 @@ _MANIFEST_VOLATILE_FIELDS = frozenset(
         "generated_at_utc",
         "source_commit",
         "source_tree_hash",
-        "release_version",
-        "feature_policy_fingerprint",
     }
 )
 
@@ -821,6 +861,17 @@ _MANIFEST_VOLATILE_FIELDS = frozenset(
 #: Together with ``_MANIFEST_VOLATILE_FIELDS`` this must cover every top-level
 #: manifest key -- ``verify_manifest`` reports anything left over as drift, so
 #: a field added to ``write_manifest`` cannot slip through unverified.
+#:
+#: **Membership here is a claim that the field is actually compared**, and
+#: ``tests/test_v013_evidence_validator.py`` pins that claim per field by
+#: mutating each one and asserting drift is reported. Three names were listed
+#: here while nothing in ``verify_manifest`` compared them (round-4 confirm
+#: pass, Architecture + Security + Logic findings): ``reason`` (never
+#: re-derived), ``manifest_phase`` (read as an input, never checked), and
+#: ``phase3_command_digest`` (unreachable by construction -- the cross-check
+#: loop paired it with ``phase = None`` and skipped it on the first
+#: statement). The trailing uncovered-field guard counted all three as
+#: covered, so it asserted a completeness property the function did not have.
 _MANIFEST_VERIFIED_FIELDS = frozenset(
     {
         "inputs",
@@ -828,6 +879,8 @@ _MANIFEST_VERIFIED_FIELDS = frozenset(
         "manifest_phase",
         "promotion_eligible",
         "reason",
+        "release_version",
+        "feature_policy_fingerprint",
         "phase3_completion_hash",
         "phase3_command_digest",
         "phase4c_artifact_sha256",
@@ -859,11 +912,34 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     * ``schema_hash`` still matches ``shared/schemas/v013-evidence.json`` --
       ``server/config.py`` recomputes this at boot and fails closed on a
       mismatch, so CI should catch it first;
-    * every declared input still *passes its gate* -- a manifest must not
-      outlive the validity of the evidence it points at;
-    * ``promotion_eligible``/``reason`` still equal what those gates now
-      conclude -- the check that stops a stale manifest from authorizing
-      data-driven tuning the current evidence no longer supports.
+    * ``release_version`` and ``feature_policy_fingerprint`` still match the
+      effective config, the two identity bindings ``load_promotion_manifest``
+      itself compares and fails closed on;
+    * ``manifest_phase`` is one of the two known values and the ``inputs``
+      *it* implies are all declared -- a ``final`` manifest must carry
+      phase0-3 and a ``phase3_completion_hash``. It is a writer input, not
+      something re-derivable from evidence, so this presence-and-consistency
+      check plus its role in the verdict below is the whole of its coverage;
+    * every *required* declared input still resolves and *passes its gate* --
+      a manifest must not outlive the validity of the evidence it points at;
+    * ``promotion_eligible`` **and** ``reason`` still equal what those gates
+      now conclude, re-derived through the same :func:`_promotion_verdict`
+      the writer stamps them with -- the check that stops a stale manifest
+      from authorizing data-driven tuning the current evidence no longer
+      supports;
+    * ``phase3_command_digest`` still matches the ``command_digest`` inside
+      the resolved Phase 3 completion artifact, the provenance binding
+      ``write_manifest`` copies up so release verification can re-check which
+      command produced Phase 3.
+
+    **The empty return is the security property.** An empty list must mean
+    every one of the above was actually evaluated, never that some of them
+    were skipped: the pre-fix guard was ``if {"phase0","phase1","phase2"} <=
+    resolved.keys()``, so a manifest that simply *omitted* an ``inputs`` entry
+    never entered the branch and a forged ``promotion_eligible=true`` passed
+    with exit 0 (round-4 confirm pass, Logic + Security findings). Every
+    "cannot check this" path below therefore appends drift rather than
+    falling through.
 
     Returns a list of human-readable drift descriptions; empty means clean.
     Raises ``EvidenceGateError`` only when the manifest itself cannot be read
@@ -875,9 +951,24 @@ def verify_manifest(manifest_path: Path) -> list[str]:
 
     drift: list[str] = []
 
+    manifest_phase = manifest.get("manifest_phase")
+    if manifest_phase not in ("provisional", "final"):
+        drift.append(
+            f"manifest_phase {manifest_phase!r} is neither 'provisional' nor 'final'; "
+            "the verdict it governs cannot be re-derived"
+        )
+        manifest_phase = None
+
     inputs = manifest.get("inputs")
     if not isinstance(inputs, dict) or not inputs:
         raise EvidenceGateError(f"{manifest_path}: manifest declares no inputs")
+
+    # The input set the manifest's own `manifest_phase` implies. `write_manifest`
+    # requires phase0/1/2 for either phase and additionally phase3 for `final`;
+    # phase3-on-a-provisional and phase4c are both optional extras.
+    required_phases = {"phase0", "phase1", "phase2"}
+    if manifest_phase == "final":
+        required_phases.add("phase3")
 
     resolved: dict[str, Path] = {}
     for phase, entry in sorted(inputs.items()):
@@ -889,12 +980,19 @@ def verify_manifest(manifest_path: Path) -> list[str]:
         if not isinstance(declared_path, str) or not isinstance(declared_sha, str):
             drift.append(f"inputs.{phase} is missing a string path/sha256")
             continue
-        # Confined the same way `load_promotion_manifest` confines it: the
-        # path comes from the artifact under scrutiny, so it is not a
-        # trustworthy read target on its own.
-        candidate = (REPO_ROOT / declared_path).resolve()
-        if not candidate.is_relative_to(REPO_ROOT.resolve()):
-            drift.append(f"inputs.{phase}.path escapes the repo tree: {declared_path}")
+        # Confined the same way `load_promotion_manifest` confines it -- by
+        # calling the shared primitive rather than by re-implementing the rule,
+        # which is how the copy that used to live here came to accept absolute
+        # in-repo paths the runtime loader rejects outright (round-4 confirm
+        # pass, Architecture + Security findings). The path comes from the
+        # artifact under scrutiny, so it is not a trustworthy read target on
+        # its own.
+        candidate = confined_evidence_input_path(declared_path, allowed_root=REPO_ROOT)
+        if candidate is None:
+            drift.append(
+                f"inputs.{phase}.path is absolute or escapes the repo tree: {declared_path!r} "
+                "-- load_promotion_manifest refuses it too"
+            )
             continue
         try:
             actual_sha = sha256_file(candidate)
@@ -902,12 +1000,24 @@ def verify_manifest(manifest_path: Path) -> list[str]:
             drift.append(f"inputs.{phase} is unreadable: {exc}")
             continue
         if actual_sha != declared_sha:
+            # Only the digest prefix is echoed: `declared_path` is
+            # manifest-declared and confined to the repo tree but otherwise
+            # free, so printing the full digest of whatever it names would make
+            # the CI log a general hashing oracle over the tree. A prefix is
+            # enough to tell one artifact revision from another, which is all a
+            # human debugging drift needs.
             drift.append(
                 f"inputs.{phase} digest drift: manifest says {declared_sha}, "
-                f"{declared_path} now hashes to {actual_sha}"
+                f"{declared_path} now hashes to {actual_sha[:12]}..."
             )
             continue
         resolved[phase] = candidate
+
+    for phase in sorted(required_phases - set(inputs)):
+        drift.append(
+            f"inputs.{phase} is missing; a {manifest_phase!r} manifest must declare it "
+            "and promotion_eligible cannot be re-derived without it"
+        )
 
     if SCHEMA_PATH.exists():
         actual_schema_hash = sha256_file(SCHEMA_PATH)
@@ -919,15 +1029,46 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     else:
         drift.append(f"evidence schema missing, cannot verify schema_hash: {SCHEMA_PATH}")
 
+    config = load_config()
+    if manifest.get("release_version") != config.release_version:
+        drift.append(
+            f"release_version drift: manifest says {manifest.get('release_version')!r}, "
+            f"the effective config resolves {config.release_version!r}"
+        )
+    expected_fingerprint = feature_policy_fingerprint(FeaturePolicy.from_config(config))
+    if manifest.get("feature_policy_fingerprint") != expected_fingerprint:
+        drift.append(
+            "feature_policy_fingerprint drift: manifest says "
+            f"{manifest.get('feature_policy_fingerprint')!r}, the effective feature policy "
+            f"fingerprints to {expected_fingerprint!r}"
+        )
+
+    if manifest_phase == "final" and "phase3_completion_hash" not in manifest:
+        drift.append("a 'final' manifest must carry phase3_completion_hash")
+
     # Re-run the gates over the still-matching inputs and re-derive the
-    # verdict. Only possible when phase0/1/2 all resolved above; a digest
-    # mismatch is already reported, so this is skipped rather than
-    # double-reported.
-    if {"phase0", "phase1", "phase2"} <= resolved.keys():
+    # verdict. `unresolved` collapses "never declared" and "declared but the
+    # digest/gate check above rejected it" -- either way the verdict is not
+    # re-derivable, and that must be reported, not skipped.
+    unresolved = sorted(required_phases - resolved.keys())
+    phase3_command_digest_checked = False
+    if unresolved:
+        drift.append(
+            "promotion_eligible/reason could not be re-derived: required input(s) "
+            f"{unresolved} are missing or did not resolve"
+        )
+    elif manifest_phase is None:
+        drift.append(
+            "promotion_eligible/reason could not be re-derived: manifest_phase is unusable"
+        )
+    else:
         try:
             phase0_records = validate_artifact("phase0", resolved["phase0"])
             phase1_records = validate_artifact("phase1", resolved["phase1"])
             transport_record = _validate_transport_contract(resolved["phase2"])
+            phase3_record = (
+                _read_phase3_completion(resolved["phase3"]) if "phase3" in resolved else None
+            )
         except EvidenceGateError as exc:
             drift.append(f"a declared input no longer passes its gate: {exc}")
         else:
@@ -935,17 +1076,39 @@ def verify_manifest(manifest_path: Path) -> list[str]:
                 [r for r in phase0_records if r["phase"] == "phase0"]
                 + [r for r in phase1_records if r["phase"] == "phase1"]
             )
-            transport_eligible = bool(transport_record.get("promotion_eligible"))
-            if manifest.get("manifest_phase") == "final":
-                expected_eligible = real_stratum_present and transport_eligible
-            else:
-                expected_eligible = False
+            expected_eligible, expected_reason = _promotion_verdict(
+                manifest_phase=manifest_phase,
+                real_stratum_present=real_stratum_present,
+                transport_eligible=bool(transport_record.get("promotion_eligible")),
+            )
             if bool(manifest.get("promotion_eligible")) != expected_eligible:
                 drift.append(
                     f"promotion_eligible drift: manifest says "
                     f"{manifest.get('promotion_eligible')!r}, the current evidence supports "
                     f"{expected_eligible!r}"
                 )
+            if manifest.get("reason") != expected_reason:
+                drift.append(
+                    f"reason drift: manifest says {manifest.get('reason')!r}, "
+                    f"the current evidence supports {expected_reason!r}"
+                )
+            if phase3_record is not None:
+                phase3_command_digest_checked = True
+                if (
+                    "phase3_command_digest" in manifest
+                    and manifest["phase3_command_digest"] != phase3_record["command_digest"]
+                ):
+                    drift.append(
+                        "phase3_command_digest does not match the resolved phase3 artifact's "
+                        f"command_digest ({manifest['phase3_command_digest']!r} vs "
+                        f"{phase3_record['command_digest']!r})"
+                    )
+
+    if "phase3_command_digest" in manifest and not phase3_command_digest_checked:
+        drift.append(
+            "phase3_command_digest could not be checked: the phase3 completion artifact it "
+            "is copied from did not resolve"
+        )
 
     # The digests the manifest repeats at top level must agree with the
     # `inputs` entries they are copied from -- a hand-edited manifest could
@@ -953,10 +1116,9 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     # different bytes than the input it claims to summarize.
     for field, phase in (
         ("phase3_completion_hash", "phase3"),
-        ("phase3_command_digest", None),
         ("phase4c_artifact_sha256", "phase4c"),
     ):
-        if field not in manifest or phase is None:
+        if field not in manifest:
             continue
         entry = inputs.get(phase)
         declared = entry.get("sha256") if isinstance(entry, dict) else None

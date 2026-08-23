@@ -218,7 +218,14 @@ def _valid_transport_artifact(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def _write_manifest_argv(tmp_path: Path, *, phase0: Path, phase1: Path, phase2: Path) -> list[str]:
+def _write_manifest_argv(
+    tmp_path: Path,
+    *,
+    phase0: Path,
+    phase1: Path,
+    phase2: Path,
+    feature_policy_fingerprint: str = FEATURE_POLICY_FINGERPRINT,
+) -> list[str]:
     return [
         "--write-manifest",
         "--manifest-phase",
@@ -236,7 +243,7 @@ def _write_manifest_argv(tmp_path: Path, *, phase0: Path, phase1: Path, phase2: 
         "--deployed-at-utc",
         "2026-08-04T00:00:00Z",
         "--feature-policy-fingerprint",
-        FEATURE_POLICY_FINGERPRINT,
+        feature_policy_fingerprint,
         "--output",
         str(tmp_path / "promotion-manifest.json"),
     ]
@@ -560,6 +567,7 @@ def _write_manifest_final_argv(
     phase1: Path,
     phase2: Path,
     phase3: Path,
+    feature_policy_fingerprint: str = FEATURE_POLICY_FINGERPRINT,
 ) -> list[str]:
     return [
         "--write-manifest",
@@ -580,10 +588,27 @@ def _write_manifest_final_argv(
         "--deployed-at-utc",
         "2026-08-04T00:00:00Z",
         "--feature-policy-fingerprint",
-        FEATURE_POLICY_FINGERPRINT,
+        feature_policy_fingerprint,
         "--output",
         str(tmp_path / "promotion-manifest.json"),
     ]
+
+
+def _real_feature_policy_fingerprint() -> str:
+    """The fingerprint the *running checkout's* effective feature policy
+    produces -- the same expression ``verify_manifest`` re-derives and
+    ``server/config.py::load_promotion_manifest`` compares against.
+
+    The write-path tests deliberately stamp the ``fp-cccc...`` placeholder,
+    which is fine for asserting the writer copies its argument through. A
+    manifest carrying it is one the runtime loader would reject outright as
+    ``policy_fingerprint_mismatch``, though, so the verify-path tests must
+    write a manifest with the real value or they would only ever be pinning
+    the drift they expect to see.
+    """
+    from server.config import FeaturePolicy, feature_policy_fingerprint, load_config
+
+    return feature_policy_fingerprint(FeaturePolicy.from_config(load_config()))
 
 
 def _full_valid_inputs_with_phase3(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -615,7 +640,12 @@ class TestVerifyManifestDriftCheck:
         assert (
             module.main(
                 _write_manifest_final_argv(
-                    tmp_path, phase0=phase0, phase1=phase1, phase2=phase2, phase3=phase3
+                    tmp_path,
+                    phase0=phase0,
+                    phase1=phase1,
+                    phase2=phase2,
+                    phase3=phase3,
+                    feature_policy_fingerprint=_real_feature_policy_fingerprint(),
                 )
             )
             == 0
@@ -693,6 +723,183 @@ class TestVerifyManifestDriftCheck:
         assert module.verify_manifest(manifest_path) == []
 
         assert set(manifest) <= module._MANIFEST_VOLATILE_FIELDS | module._MANIFEST_VERIFIED_FIELDS
+
+    # --- Round-4 confirm pass: the gate proved less than its roster claimed. -
+
+    def test_truncated_inputs_cannot_bypass_the_eligibility_check(self, tmp_path: Path) -> None:
+        """Round-4 confirm pass, Logic + Security findings (reproduced before
+        the fix): the verdict re-derivation was guarded by ``if
+        {"phase0","phase1","phase2"} <= resolved.keys()``, so a manifest that
+        simply omitted an ``inputs`` entry never entered the branch. Deleting
+        ``inputs.phase2`` and flipping ``promotion_eligible`` to true printed
+        "OK: ... still matches the evidence it binds" and exited 0.
+        """
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["promotion_eligible"] is False
+        del manifest["inputs"]["phase2"]
+        manifest["promotion_eligible"] = True
+        manifest["reason"] = None
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("inputs.phase2 is missing" in item for item in drift), drift
+        assert any("could not be re-derived" in item for item in drift), drift
+        assert module.main(["--verify-manifest", str(manifest_path)]) == 1
+
+    def test_an_absolute_declared_input_path_is_rejected(self, tmp_path: Path) -> None:
+        """Round-4 confirm pass, Architecture + Security findings: the
+        confinement here was a hand-rolled ``(REPO_ROOT / declared).resolve()``
+        followed by ``is_relative_to``. ``Path(root) / "/abs"`` discards
+        ``root`` in pathlib, so an *absolute in-repo* path passed here while
+        ``server/config._resolve_confined_evidence_path`` rejects it outright
+        -- CI would report clean a manifest the consumer refuses.
+        """
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        relative = manifest["inputs"]["phase0"]["path"]
+        manifest["inputs"]["phase0"]["path"] = str((tmp_path / relative).resolve())
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("inputs.phase0.path is absolute" in item for item in drift), drift
+
+        from server.config import _resolve_confined_evidence_path
+
+        assert _resolve_confined_evidence_path(manifest["inputs"]["phase0"]["path"]) is None
+
+    def test_a_hand_edited_reason_is_reported(self, tmp_path: Path) -> None:
+        """``reason`` was listed in ``_MANIFEST_VERIFIED_FIELDS`` and named in
+        the docstring, but nothing re-derived it."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["reason"] == "real_stratum_missing"
+        manifest["reason"] = "audibility_unverified"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("reason drift" in item for item in drift), drift
+
+    def test_a_hand_edited_phase3_command_digest_is_reported(self, tmp_path: Path) -> None:
+        """``phase3_command_digest`` was unreachable by construction: the
+        cross-check loop paired it with ``phase = None`` and its body's first
+        statement skipped on exactly that."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["phase3_command_digest"]
+        manifest["phase3_command_digest"] = "f" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("phase3_command_digest does not match" in item for item in drift), drift
+
+    def test_an_unknown_manifest_phase_is_reported(self, tmp_path: Path) -> None:
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        manifest["manifest_phase"] = "definitely-not-a-phase"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("manifest_phase" in item for item in drift), drift
+
+    def test_the_identity_bindings_the_loader_compares_are_verified(self, tmp_path: Path) -> None:
+        """``release_version`` and ``feature_policy_fingerprint`` were excluded
+        as "derived from whichever checkout the verifier is running in", which
+        is not true of either: both are deterministic from the effective config
+        and both are compared by ``load_promotion_manifest`` with a fail-closed
+        display-only verdict, so CI could not pre-catch two mismatches the
+        runtime loader is guaranteed to reject.
+        """
+        module = _validator()
+        for field in ("release_version", "feature_policy_fingerprint"):
+            manifest_path = self._written_manifest(tmp_path)
+            manifest = json.loads(manifest_path.read_text())
+            manifest[field] = "not-what-this-checkout-resolves"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            drift = module.verify_manifest(manifest_path)
+            assert any(f"{field} drift" in item for item in drift), (field, drift)
+
+    def test_every_verified_field_is_actually_compared(self, tmp_path: Path) -> None:
+        """The invariant behind ``_MANIFEST_VERIFIED_FIELDS``: membership is a
+        claim that the field is compared, and the trailing uncovered-field
+        guard trusts that claim. Three fields were listed while nothing
+        compared them, so the guard asserted a completeness property the
+        function did not have. Mutating each field in turn must produce drift.
+        """
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        original = json.loads(manifest_path.read_text())
+
+        covered = sorted(set(original) & module._MANIFEST_VERIFIED_FIELDS)
+        # Guard the guard: a roster this loop never exercises proves nothing.
+        assert {"reason", "manifest_phase", "phase3_command_digest"} <= set(covered), covered
+
+        for field in covered:
+            mutated = json.loads(json.dumps(original))
+            value = mutated[field]
+            if field == "inputs":
+                del mutated[field]["phase2"]
+            elif isinstance(value, bool):
+                mutated[field] = not value
+            else:
+                mutated[field] = "e" * 64 if value == "f" * 64 else "f" * 64
+            manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+            assert module.verify_manifest(manifest_path) != [], (
+                f"{field} is listed in _MANIFEST_VERIFIED_FIELDS but mutating it is not drift"
+            )
+
+    def test_a_digest_drift_message_does_not_echo_a_full_digest(self, tmp_path: Path) -> None:
+        """``inputs[*].path`` is manifest-declared, so echoing the full SHA-256
+        of whatever it names would make the CI log a general hashing oracle
+        over the repo tree (round-4 confirm pass, Security finding). The
+        prefix is enough to tell one artifact revision from another.
+        """
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        edited = tmp_path / manifest["inputs"]["phase0"]["path"]
+        edited.write_text(edited.read_text() + "\n", encoding="utf-8")
+        actual = module.sha256_file(edited)
+
+        drift = module.verify_manifest(manifest_path)
+        digest_drift = next(item for item in drift if "inputs.phase0 digest drift" in item)
+        assert actual not in digest_drift
+        assert actual[:12] in digest_drift
+
+    def test_a_provisional_manifest_verifies_clean_and_pins_its_own_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """The required-input set is derived from ``manifest_phase``, so the
+        provisional path (phase0-2, no phase3) must still verify clean -- and
+        its ``reason`` vocabulary differs from the final path's."""
+        module = _validator()
+        phase0, phase1, phase2 = _full_valid_inputs(tmp_path)
+        assert (
+            module.main(
+                _write_manifest_argv(
+                    tmp_path,
+                    phase0=phase0,
+                    phase1=phase1,
+                    phase2=phase2,
+                    feature_policy_fingerprint=_real_feature_policy_fingerprint(),
+                )
+            )
+            == 0
+        )
+        manifest_path = tmp_path / "promotion-manifest.json"
+        assert module.verify_manifest(manifest_path) == []
+
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["manifest_phase"] == "provisional"
+        manifest["reason"] = "provisional_manifest"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        assert any("reason drift" in item for item in module.verify_manifest(manifest_path))
 
     def test_verify_mode_writes_nothing(self, tmp_path: Path) -> None:
         """It is a *check*, not a producer -- the whole point of the fix."""

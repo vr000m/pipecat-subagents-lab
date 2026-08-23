@@ -836,6 +836,109 @@ if (hasWorkStatusField) {
       expect(state.workStatus["1::turn-1::work-1"]).toBeDefined();
     });
 
+    // Round-4 confirm pass, Logic finding: `upsertWorkStatus` filtered the
+    // key it had just written out of the tombstone list unconditionally, on
+    // the premise that it is "present and authoritative". That premise fails
+    // for the prune pass, which runs before the eviction pass that actually
+    // protects the key: an already-terminal key keeps its original
+    // `_terminalSince`, so a higher-sequence terminal update arriving after
+    // the TTL elapsed is written and then immediately pruned. The key was
+    // dropped with neither a record nor a tombstone left behind, and the very
+    // next lower-sequence increment resurrected it -- the exact hole the
+    // tombstone mechanism was added to close.
+    test("an increment that is immediately TTL-pruned still leaves a tombstone", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 2,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "result_ready", event_sequence: 7, origin_epoch: 1 },
+      });
+
+      // A newer terminal update for the same key, arriving past the TTL
+      // measured from the *original* terminal instant.
+      const realNow = Date.now;
+      Date.now = () => realNow() + 6 * 60 * 1000;
+      try {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 3,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: { turn_id: "turn-1", work_item_id: "work-1", state: "result_ready", event_sequence: 8, origin_epoch: 1 },
+        });
+      } finally {
+        Date.now = realNow;
+      }
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+      // The watermark must carry the highest sequence seen, not the older one.
+      expect(state.workStatusTombstones["1::turn-1::work-1"]).toBe(8);
+
+      const beforeWorkStatus = state.workStatus;
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 4,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "searching", event_sequence: 5, origin_epoch: 1 },
+      });
+      expect(state.workStatus).toBe(beforeWorkStatus);
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+    });
+
+    // Round-4 confirm pass, Logic finding: `snapshotState` rebuilds
+    // `workStatus` from `{}`, so a pre-snapshot key the snapshot does not
+    // carry never passes through `upsertWorkStatus` and never reached
+    // `rememberDroppedWorkStatus`. It was dropped with no watermark at all --
+    // the same drop-without-a-watermark the prune/evict paths tombstone
+    // against. The snapshot stays authoritative about what is *rendered*; the
+    // watermark only records that the key has already been seen at or past
+    // that sequence, which remains true.
+    test("a snapshot that drops a key leaves a tombstone for it", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 2,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "result_ready", event_sequence: 7, origin_epoch: 1 },
+      });
+      expect(state.workStatus["1::turn-1::work-1"]).toBeDefined();
+
+      // A later snapshot that no longer reports the key (e.g. server-side
+      // eviction). It disappears from the ledger, but not without a trace.
+      state = applyServerMessage(state, {
+        ...snapshot(3),
+        data: { ...snapshot(3).data, work_status: [] },
+      });
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+      expect(state.workStatusTombstones["1::turn-1::work-1"]).toBe(7);
+
+      const beforeWorkStatus = state.workStatus;
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 4,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "searching", event_sequence: 5, origin_epoch: 1 },
+      });
+      expect(state.workStatus).toBe(beforeWorkStatus);
+      expect(state.workStatus["1::turn-1::work-1"]).toBeUndefined();
+
+      // Still not a permanent ban: a genuinely newer increment is accepted.
+      state = applyServerMessage(state, {
+        kind: "work_status",
+        sequence: 5,
+        session_id: "session-1",
+        origin_epoch: 1,
+        data: { turn_id: "turn-1", work_item_id: "work-1", state: "searching", event_sequence: 9, origin_epoch: 1 },
+      });
+      expect(state.workStatus["1::turn-1::work-1"].event_sequence).toBe(9);
+    });
+
     // Regression: a non-terminal work_status record restored from a
     // snapshot mirrors server/session_state.py's non-authoritative
     // records -- its children map is known-incomplete, so it can never be

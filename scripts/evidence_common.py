@@ -363,7 +363,7 @@ def _iter_file_chunks(path: Path, *, max_bytes: int) -> Iterator[bytes]:
     (EIO on a failing device, EBADF, a signal-interrupted read) would
     otherwise escape raw and break :func:`load_json`'s documented promise
     that *every* read failure mode collapses to one ``EvidenceGateError``.
-    ``server/config.py``'s ``_read_regular_file_no_follow`` guards the same
+    ``server/config.py``'s ``read_regular_file_no_follow`` guards the same
     call for the same reason.
     """
     try:
@@ -468,6 +468,45 @@ def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = No
     denylisted_dirs = {".git", ".github"}
     if any(part.lower() in denylisted_dirs for part in resolved.parts):
         raise ValueError(f"output path must not write under .git/ or .github/: {raw_path!r}")
+    return resolved
+
+
+def confined_evidence_input_path(raw_path: str, *, allowed_root: Path | None = None) -> Path | None:
+    """Resolve a *manifest-declared* evidence input path, confined to the repo tree.
+
+    The read-side counterpart to :func:`confined_output_path`, and the CLI-side
+    mirror of ``server.config._resolve_confined_evidence_path``. ``raw_path``
+    comes from ``manifest["inputs"][phase]["path"]`` -- a value the artifact
+    under scrutiny declares about *itself*, not an operator setting -- so it is
+    attacker-steerable and must never be used as a read target unconfined.
+    Returns ``None`` when the path is absolute or escapes ``allowed_root``
+    after resolution.
+
+    **The absolute-path rejection is load-bearing, not belt-and-braces.**
+    ``Path(root) / "/etc/passwd"`` discards ``root`` entirely in pathlib, so a
+    confinement written as "join, then ``is_relative_to``" accepts every
+    absolute path that happens to sit inside the tree -- and the runtime loader
+    rejects those outright. A CI gate that accepts a manifest the consumer it
+    speaks for will refuse is worse than no gate: it reports clean while the
+    server degrades to ``evidence_unresolvable``/display-only with nothing
+    surfaced anywhere (round-4 confirm pass, Architecture + Security findings).
+    ``tests/test_evidence_common.py`` pins this against
+    ``server.config._resolve_confined_evidence_path`` so the two cannot
+    disagree about which declared paths are legal.
+
+    Deliberately does *not* also check "is a regular file within the size cap":
+    doing that with a ``stat()`` here and reading the path separately at the
+    caller is exactly the TOCTOU gap :func:`read_bytes_no_follow` /
+    :func:`sha256_file` exist to close, so callers must route the read through
+    one of those, which re-derive both facts from the fd they open.
+    """
+    root = (allowed_root or REPO_ROOT).resolve()
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        return None
+    resolved = (root / candidate).resolve()
+    if not resolved.is_relative_to(root):
+        return None
     return resolved
 
 

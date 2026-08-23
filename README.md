@@ -652,11 +652,20 @@ A `manifest_phase=provisional` manifest is permanently
 `manifest_phase=final` manifest bound to a Phase 3 completion record can make
 the runtime promotion-eligible.
 
-CI's `release-metadata` job (`.github/workflows/ci.yml`, `main` pushes only)
-regenerates the provisional manifest: it runs
-`emit_v013_deployment_metadata.py --shell-export` into `$GITHUB_ENV`, then
-`validate_v013_evidence.py --write-manifest --manifest-phase provisional`
-with the Phase 0-2 inputs and the exported identity values.
+CI never writes the manifest — it *verifies* the committed one. The
+`promotion-manifest-drift` job (`.github/workflows/ci.yml`, on both pull
+requests and pushes) runs `validate_v013_evidence.py --verify-manifest
+docs/benchmarks/v0.1.3-promotion-manifest.json`, which re-derives every
+binding: each `inputs[*].sha256` against the bytes at its declared path, the
+schema hash, `release_version`, `feature_policy_fingerprint`, the
+`phase3_command_digest` provenance binding, and `promotion_eligible`/`reason`
+against what the evidence gates now conclude. Only the wall-clock stamps and
+the writing checkout's `source_commit`/`source_tree_hash` are exempt (a
+manifest committed at one commit can never match a regeneration at a later
+one). A failure means the committed manifest has drifted from its evidence;
+the fix is to regenerate it locally and commit the result. The separate
+`release-metadata` job (`main` pushes only) just derives and exports the
+deployment identity.
 
 To regenerate locally, export the same identity from a clean checkout and run
 the writer by hand:

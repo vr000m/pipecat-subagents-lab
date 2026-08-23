@@ -192,7 +192,19 @@ def _package_json_declared_version() -> str:
 #: (``||`` unions, hyphen ranges, ``*``/``x`` wildcards, ``workspace:``/URL/
 #: git specifiers) is refused rather than guessed at -- see
 #: :func:`_declared_range_admits`.
-_RANGE_OPERATOR_RE = re.compile(r"^(\^|~|>=|<=|>|<|=)?\s*v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+#:
+#: The prerelease/build tail is *captured*, not swallowed: an earlier version
+#: matched it with a non-capturing ``(?:[-+].*)?`` and discarded it, so
+#: ``1.10.6`` "admitted" the lockfile pin ``1.10.6-evil.0`` (and ``1.10.6+evil``,
+#: and ``v1.10.6``) even though npm semver satisfies none of them -- a
+#: dependency-anchor gate that had been exact string equality before round 3
+#: silently loosened into one that accepts a different package build (round-4
+#: confirm pass, Security finding). Both sides are now rejected outright when
+#: a suffix is present, which is what the docstring below always claimed.
+_RANGE_OPERATOR_RE = re.compile(
+    r"^(?P<op>\^|~|>=|<=|>|<|=)?\s*(?P<v>v)?"
+    r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?P<suffix>[-+].*)?$"
+)
 
 
 def _declared_range_admits(declared: str, locked: str) -> bool:
@@ -212,24 +224,38 @@ def _declared_range_admits(declared: str, locked: str) -> bool:
     guessing. This is an evidence gate: a range shape it cannot reason about
     must fail closed with "pin it exactly", never be waved through. Prerelease
     and build suffixes are likewise refused rather than half-ordered, since
-    correct prerelease precedence is more machinery than this gate needs.
+    correct prerelease precedence is more machinery than this gate needs --
+    on *both* sides. A suffix on the locked side is the one that matters
+    security-wise: ``1.10.6-evil.0`` and ``1.10.6+evil`` are different package
+    builds from ``1.10.6``, and npm semver satisfies neither.
     """
     declared_match = _RANGE_OPERATOR_RE.fullmatch(declared.strip())
     locked_match = _RANGE_OPERATOR_RE.fullmatch(locked.strip())
-    if declared_match is None:
+    if declared_match is None or declared_match.group("suffix"):
         raise EvidenceGateError(
             f"web/package.json declares {PACKAGE_NAME}@{declared!r}, a version range this gate "
-            "cannot evaluate -- pin an exact version or a simple ^/~/>= range"
+            "cannot evaluate -- pin an exact version or a simple ^/~/>= range "
+            "with no prerelease/build suffix"
         )
-    if locked_match is None or locked_match.group(1):
+    # The locked side must be a bare MAJOR.MINOR.PATCH: no operator, no
+    # ``v`` prefix, and no prerelease/build tail. Each of those was previously
+    # accepted and then thrown away, so a lockfile pinned to a *different
+    # package build* (``1.10.6-evil.0``, ``1.10.6+evil``) compared equal to the
+    # declared ``1.10.6`` (round-4 confirm pass, Security finding).
+    if (
+        locked_match is None
+        or locked_match.group("op")
+        or locked_match.group("v")
+        or locked_match.group("suffix")
+    ):
         raise EvidenceGateError(
             f"web/bun.lock resolved {PACKAGE_NAME} to {locked!r}, which is not an exact "
             "MAJOR.MINOR.PATCH version"
         )
 
-    operator = declared_match.group(1) or "="
-    want = tuple(int(g) for g in declared_match.group(2, 3, 4))
-    have = tuple(int(g) for g in locked_match.group(2, 3, 4))
+    operator = declared_match.group("op") or "="
+    want = tuple(int(declared_match.group(name)) for name in ("major", "minor", "patch"))
+    have = tuple(int(locked_match.group(name)) for name in ("major", "minor", "patch"))
 
     if operator == "=":
         return have == want

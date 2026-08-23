@@ -333,9 +333,19 @@ function upsertWorkStatus(workStatus, key, projected, now = Date.now(), previous
   const withEntry = { ...workStatus, [key]: record };
   const dropped = [];
   const retained = evictOldestWorkStatus(pruneExpiredWorkStatus(withEntry, now, dropped), key, dropped);
-  // The key just written is never its own tombstone: it is present and
-  // authoritative, so `previous` in the increment guard covers it.
-  const droppedOthers = dropped.filter(([droppedKey]) => droppedKey !== key);
+  // A *retained* key is never its own tombstone: it is present and
+  // authoritative, so `previous` in the increment guard covers it. The filter
+  // must test survival, not identity -- `evictOldestWorkStatus` protects
+  // `key`, but `pruneExpiredWorkStatus` does not, and it runs first. When the
+  // record just written preserves an already-expired `_terminalSince` (a
+  // higher-sequence terminal update arriving after the TTL elapsed), that
+  // prune pass drops the key it just wrote. Filtering it out on identity then
+  // left neither a record nor a tombstone, so the very next lower-sequence
+  // increment resurrected it -- the exact hole this mechanism exists to close
+  // (round-4 confirm pass, Logic finding).
+  const droppedOthers = dropped.filter(
+    ([droppedKey]) => droppedKey !== key || retained[key] === undefined,
+  );
   return { workStatus: retained, tombstones: rememberDroppedWorkStatus(tombstones, droppedOthers) };
 }
 
@@ -390,6 +400,20 @@ function snapshotState(state, snapshot, sequence) {
       { workStatus: {}, tombstones: state.workStatusTombstones || {} },
     );
   const workStatus = restored.workStatus;
+  // The reduce seeds `workStatus` from `{}`, so a pre-snapshot key the
+  // snapshot does not carry never passes through `upsertWorkStatus` and so
+  // never reaches `rememberDroppedWorkStatus` -- it was dropped with no
+  // watermark, and a later lower-sequence increment re-inserted it, which is
+  // the same resurrection the prune/evict paths tombstone against (round-4
+  // confirm pass, Logic finding). The snapshot stays authoritative about what
+  // is *rendered*; the watermark only says "this key has already been seen at
+  // or past this sequence", which remains true whatever the server reports.
+  // Keys the snapshot *does* carry are excluded here for the same reason the
+  // reduce supersedes their tombstones above.
+  const preSnapshotDrops = Object.entries(state.workStatus || {}).filter(
+    ([key]) => workStatus[key] === undefined,
+  );
+  const workStatusTombstones = rememberDroppedWorkStatus(restored.tombstones, preSnapshotDrops);
   const diagnostics = {
     ...state.localDiagnostics,
     lastSequence: snapshotSequence,
@@ -405,7 +429,7 @@ function snapshotState(state, snapshot, sequence) {
     results,
     speech,
     workStatus,
-    workStatusTombstones: restored.tombstones,
+    workStatusTombstones,
     routing: snapshot.routing ?? null,
     transcript: Array.isArray(snapshot.transcript) ? snapshot.transcript.map((item) => ({ ...item })) : [],
     serverState: true,

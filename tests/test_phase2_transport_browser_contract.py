@@ -405,6 +405,31 @@ class TestDeclaredRangeAdmitsTheLockedPin:
             with pytest.raises(module.EvidenceGateError):
                 self._admits(spec, "1.10.6")
 
+    def test_a_prerelease_or_build_suffixed_pin_fails_closed(self) -> None:
+        """Round-4 confirm pass, Security finding (reproduced before the fix):
+        the range regex matched the prerelease/build tail with a
+        non-capturing ``(?:[-+].*)?`` and threw it away, so ``1.10.6``
+        "admitted" the lockfile pins ``1.10.6-evil.0``, ``1.10.6+evil`` and
+        ``v1.10.6``. npm semver satisfies none of those -- each names a
+        different package build -- and the pre-round-3 string equality had
+        caught every one, so the range support silently loosened a dependency
+        anchor into a bypass.
+        """
+        module = _load_validator()
+        for declared, locked in (
+            ("1.10.6", "1.10.6-evil.0"),
+            ("1.10.6", "1.10.6+evil"),
+            ("1.10.6", "v1.10.6"),
+            ("^1.10.6", "1.10.6-attack"),
+            ("^1.10.6", "1.11.0+build"),
+            (">=1.10.6", "2.0.0-rc.1"),
+            # The declared side too, per the docstring's stated intent.
+            ("1.10.6-x", "1.10.6"),
+            ("^1.10.6+build", "1.10.6"),
+        ):
+            with pytest.raises(module.EvidenceGateError):
+                self._admits(declared, locked)
+
     def test_the_repo_as_it_stands_passes(self) -> None:
         """The real web/package.json and web/bun.lock must still agree -- the
         new comparison must not have loosened or broken the live check."""
