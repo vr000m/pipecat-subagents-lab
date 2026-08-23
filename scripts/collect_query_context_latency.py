@@ -22,7 +22,6 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,20 +31,18 @@ from scripts.evidence_common import (
     EvidenceGateError,
     EvidenceStatus,
     FixtureIndex,
-    confined_output_path,
+    confine_output_arg,
     load_jsonl,
+    now_utc,
     require_nonempty_str,
     sha256_file,
-    validate_against_fixture,
     write_bytes_no_follow,
 )
-from scripts.query_context_common import load_fixture, scorer_hash, validate_raw_record
-
-DEFAULT_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1.json"
-
-
-def _now_utc() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+from scripts.query_context_common import (
+    DEFAULT_FIXTURE_PATH,
+    load_fixture,
+    validate_scored_record,
+)
 
 
 def _status_record(
@@ -73,34 +70,8 @@ def _status_record(
         "record_count": record_count,
         "source_commit": source_commit,
         "source_tree_hash": source_tree_hash,
-        "generated_at_utc": _now_utc(),
+        "generated_at_utc": now_utc(),
     }
-
-
-def _validate_raw_record(
-    record: dict[str, Any], *, line_no: int, fixture_index: FixtureIndex
-) -> None:
-    if "status" in record:
-        raise EvidenceGateError(f"line {line_no}: raw records must not carry a 'status' field")
-    validate_raw_record(record, where=f"line {line_no}")
-    validate_against_fixture(record, index=fixture_index, where=f"line {line_no}")
-    expected_hash = scorer_hash(
-        record["fixture_version"],
-        record["fixture_turn_id"],
-        matched_fact_ids=record["matched_fact_ids"],
-        matched_citation_ids=record["matched_citation_ids"],
-        matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
-        quality_score=record["quality_score"],
-        scorer_version=record["scorer_version"],
-        record=record,
-    )
-    if record["scorer_hash"] != expected_hash:
-        raise EvidenceGateError(
-            f"line {line_no}: scorer_hash does not match this record's own fields "
-            "-- internally inconsistent scorer provenance (the digest binds every "
-            "field except scorer_hash/fixture_sha256, so any post-scoring edit "
-            "invalidates it)"
-        )
 
 
 def _cell_key(record: dict[str, Any]) -> tuple[str, str, str]:
@@ -111,7 +82,18 @@ def load_and_validate_raw(input_path: Path, *, fixture_path: Path) -> list[dict[
     fixture_index = FixtureIndex(load_fixture(fixture_path))
 
     def _validate(line_no: int, record: dict[str, Any]) -> None:
-        _validate_raw_record(record, line_no=line_no, fixture_index=fixture_index)
+        # query_context_common.validate_scored_record (round-5 restart,
+        # Architecture finding): the same shape -> scorer_hash re-derivation
+        # -> fixture cross-check gate the analyzer applies, with
+        # reject_status_field=True reproducing this script's stricter input
+        # contract -- a raw record must never carry a 'status' field, which
+        # belongs to the whole-file status-line records this gate never sees.
+        validate_scored_record(
+            record,
+            index=fixture_index,
+            where=f"line {line_no}",
+            reject_status_field=True,
+        )
 
     return load_jsonl(input_path, validate_record=_validate)
 
@@ -185,25 +167,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
-    # confine every operator-supplied --out/--output to the repo tree before
-    # writing; this evidence writer previously skipped that, so --output
-    # could point at an arbitrary destination such as .github/workflows/ci.yml
-    # despite write_bytes_no_follow already blocking symlink/FIFO redirection
-    # at the resolved path.
-    # The confined result is bound back onto ``args.output`` and is what
-    # every write below uses: the check resolves a relative --output against
-    # ``allowed_root``, but the raw argparse Path an os.open() would see
-    # resolves against the process cwd instead -- so dropping the return
-    # value validates one path and writes another, which is no confinement
-    # at all.
     try:
-        args.output = confined_output_path(args.output, allowed_root=REPO_ROOT)
-    except ValueError as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
-        return 1
-
-    try:
+        # confine_output_arg (scripts/evidence_common.py): an operator-supplied
+        # --output is still attacker-influenced surface (a credentialed run
+        # could be invoked with a scripted or copy-pasted value), so it is
+        # confined to the repo tree -- and rejected as EvidenceGateError, not
+        # a bare ValueError, so this one call folds into the same FAIL/exit-1
+        # gate-error handling as everything else below rather than needing
+        # its own earlier try/except block.
+        args.output = confine_output_arg(args.output, allowed_root=REPO_ROOT)
         if args.source_commit is not None:
             require_nonempty_str(args.source_commit, "--source-commit")
         if args.source_tree_hash is not None:

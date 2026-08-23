@@ -23,7 +23,6 @@ import random
 import statistics
 import sys
 from collections import defaultdict
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,15 +32,18 @@ from scripts.evidence_common import (
     EvidenceGateError,
     EvidenceStatus,
     FixtureIndex,
-    confined_output_path,
+    confine_output_arg,
     load_jsonl,
+    now_utc,
     sha256_file,
-    validate_against_fixture,
     write_bytes_no_follow,
 )
-from scripts.query_context_common import load_fixture, scorer_hash, validate_raw_record
-
-DEFAULT_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1.json"
+from scripts.query_context_common import (
+    DEFAULT_FIXTURE_PATH,
+    load_fixture,
+    validate_raw_record,
+    validate_scored_record,
+)
 
 BOOTSTRAP_ITERATIONS = 10_000
 BOOTSTRAP_SEED = 0
@@ -53,10 +55,6 @@ BASELINE_NOISE_SD_THRESHOLD = 0.01
 EPSILON = 1e-9  # float round-off tolerance for exact-boundary threshold comparisons
 
 CONTAMINATION_FIELDS = ("attempt_count", "retry_count", "rate_limit_count")
-
-
-def _now_utc() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _terminal(
@@ -71,7 +69,7 @@ def _terminal(
         "reason": reason,
         "promotion_eligible": promotion_eligible,
         "analysis": analysis,
-        "generated_at_utc": _now_utc(),
+        "generated_at_utc": now_utc(),
     }
 
 
@@ -121,10 +119,6 @@ def _spearman(xs: list[float], ys: list[float]) -> float | None:
     if denom == 0:
         return None
     return cov / denom
-
-
-def _median(values: list[float]) -> float:
-    return statistics.median(values)
 
 
 # Provider/model pairs that `run_query_context_experiment.py` stamps on
@@ -193,36 +187,19 @@ def build_analysis(
 
     for index, record in enumerate(records):
         where = f"record {index}"
-        # Shape validation alone accepted a record whose scorer_hash was
-        # unrelated to the matched IDs and quality_score it claims, so an edit
-        # made after scoring (or a wholly invented row) reached the promotion
-        # rubric. Recomputing the same provenance hash the runner emitted
-        # binds each row back to its own scored values, the way the collector
-        # already does before it ever writes the analyzer's input.
-        expected_scorer_hash = scorer_hash(
-            record["fixture_version"],
-            record["fixture_turn_id"],
-            matched_fact_ids=record["matched_fact_ids"],
-            matched_citation_ids=record["matched_citation_ids"],
-            matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
-            quality_score=record["quality_score"],
-            scorer_version=record["scorer_version"],
-            record=record,
-        )
-        if record["scorer_hash"] != expected_scorer_hash:
-            raise EvidenceGateError(
-                f"{where}: scorer_hash does not match this record's own fields "
-                "-- internally inconsistent scorer provenance (the digest binds every "
-                "field except scorer_hash/fixture_sha256, so any post-scoring edit "
-                "invalidates it)"
-            )
-        # A keyless self-hash proves only that scorer_hash agrees with the
-        # record's OWN fields -- it cannot detect an editor who invents
-        # unknown fixture IDs and recomputes the hash from those fabricated
-        # values. Every match ID and the quality_score are therefore also
-        # resolved against the versioned fixture, exactly as the collector
-        # already does before it ever writes this script's input.
-        validate_against_fixture(record, index=fixture_index, where=where)
+        # query_context_common.validate_scored_record (round-5 restart,
+        # Architecture finding): the same composed shape -> scorer_hash
+        # re-derivation -> fixture cross-check gate the collector applies.
+        # Shape was already validated above (deliberately, before the
+        # synthetic-strata check reads `provider`/`model`), so this call
+        # re-validates shape a second time -- cheap, and keeps this loop's
+        # scorer_hash/fixture-binding logic identical to the collector's
+        # rather than a hand-maintained copy of it. A keyless self-hash alone
+        # proves only that scorer_hash agrees with the record's OWN fields --
+        # it cannot detect an editor who invents unknown fixture IDs and
+        # recomputes the hash from those fabricated values, which is why the
+        # fixture cross-check inside the shared gate matters too.
+        validate_scored_record(record, index=fixture_index, where=where)
         # `fixture_version` is a string the record declares about itself, so it
         # binds nothing: a `--fixture` file carrying the same version string
         # but weaker required_facts/expected_citations/disallowed_claims would
@@ -394,7 +371,7 @@ def build_analysis(
             "baseline_quality_sd": baseline_quality_sd,
             "quality_drop": quality_drop,
             "quality_ok": quality_ok,
-            "median_relative_improvement": _median(rel_improvements),
+            "median_relative_improvement": statistics.median(rel_improvements),
         }
 
         if baseline_too_noisy:
@@ -465,8 +442,8 @@ def build_analysis(
         )
 
     strata = sorted(per_stratum_pair_improvements)
-    stratum_medians = [_median(per_stratum_pair_improvements[s]) for s in strata]
-    equal_weight_median = _median(stratum_medians)
+    stratum_medians = [statistics.median(per_stratum_pair_improvements[s]) for s in strata]
+    equal_weight_median = statistics.median(stratum_medians)
 
     rng = random.Random(BOOTSTRAP_SEED)
     bootstrap_overall_medians: list[float] = []
@@ -475,8 +452,8 @@ def build_analysis(
         for stratum in strata:
             pool = per_stratum_pair_improvements[stratum]
             resample = [pool[rng.randrange(len(pool))] for _ in range(len(pool))]
-            resample_medians.append(_median(resample))
-        bootstrap_overall_medians.append(_median(resample_medians))
+            resample_medians.append(statistics.median(resample))
+        bootstrap_overall_medians.append(statistics.median(resample_medians))
     bootstrap_overall_medians.sort()
     # `int(0.05 * N)` truncates towards zero, so for N=10_000 it picked index
     # 500 -- the 501st order statistic, one past the true 5th-percentile
@@ -563,25 +540,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
-    # confine every operator-supplied --out/--output to the repo tree before
-    # writing; this evidence writer previously skipped that, so --output
-    # could point at an arbitrary destination such as .github/workflows/ci.yml
-    # despite write_bytes_no_follow already blocking symlink/FIFO redirection
-    # at the resolved path.
-    # The confined result is bound back onto ``args.output`` and is what
-    # every write below uses: the check resolves a relative --output against
-    # ``allowed_root``, but the raw argparse Path an os.open() would see
-    # resolves against the process cwd instead -- so dropping the return
-    # value validates one path and writes another, which is no confinement
-    # at all.
     try:
-        args.output = confined_output_path(args.output, allowed_root=REPO_ROOT)
-    except ValueError as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
-        return 1
-
-    try:
+        # confine_output_arg (scripts/evidence_common.py): an operator-supplied
+        # --output is still attacker-influenced surface (a credentialed run
+        # could be invoked with a scripted or copy-pasted value), so it is
+        # confined to the repo tree -- and rejected as EvidenceGateError, not
+        # a bare ValueError, so this one call folds into the same FAIL/exit-1
+        # gate-error handling as everything else below rather than needing
+        # its own earlier try/except block.
+        args.output = confine_output_arg(args.output, allowed_root=REPO_ROOT)
         records = load_jsonl(args.input)
         result = analyze(records, fixture_path=args.fixture)
         args.output.parent.mkdir(parents=True, exist_ok=True)

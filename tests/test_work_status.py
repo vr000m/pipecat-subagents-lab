@@ -452,3 +452,48 @@ def test_late_multi_intent_child_status_aggregates_under_the_parent_key() -> Non
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def test_legacy_result_suppression_predicate_has_one_implementation() -> None:
+    """Round-5 restart gauntlet, Architecture Minor: the composite
+    "capable connection AND feature enabled" gate that decides whether the
+    ``background`` status REPLACES a legacy canonical timeout result was
+    spelled inline at three SessionHost call sites. A fourth site remembering
+    only one term is the drift this decomposition exists to remove, so the
+    predicate must have exactly one implementation."""
+    import re
+    from pathlib import Path
+
+    server_dir = Path(__file__).parents[1] / "server"
+    pattern = re.compile(r"supports_work_status\s+and\s+.*enable_background_status")
+
+    hits = [
+        f"{path.name}:{index}"
+        for path in sorted(server_dir.rglob("*.py"))
+        for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line)
+    ]
+
+    assert len(hits) == 1 and hits[0].startswith("work_status_publisher.py:"), (
+        "the two-term gate must live only in "
+        f"WorkStatusPublisher.replaces_legacy_result_for; found: {hits}"
+    )
+
+
+def test_replaces_legacy_result_for_requires_both_terms() -> None:
+    from server.config import Config, FeaturePolicy
+    from server.session_state import SessionState
+    from server.work_status_publisher import WorkStatusPublisher
+
+    class _Origin:
+        def __init__(self, capable: bool) -> None:
+            self.supports_work_status = capable
+
+    def publisher(*, enabled: bool) -> WorkStatusPublisher:
+        policy = FeaturePolicy.from_config(Config(enable_background_status=enabled))
+        return WorkStatusPublisher(state=SessionState(), feature_policy=lambda: policy)
+
+    assert publisher(enabled=True).replaces_legacy_result_for(_Origin(True))
+    assert not publisher(enabled=True).replaces_legacy_result_for(_Origin(False))
+    assert not publisher(enabled=False).replaces_legacy_result_for(_Origin(True))
+    assert not publisher(enabled=False).replaces_legacy_result_for(_Origin(False))

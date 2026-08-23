@@ -1385,3 +1385,47 @@ def test_active_speech_oracle_holds_through_cleanup_and_teardown() -> None:
         await host.shutdown()
 
     asyncio.run(run())
+
+
+def test_session_host_slices_do_not_import_concrete_worker_implementations() -> None:
+    """Round-5 restart gauntlet, Architecture Minor: every slice extracted from
+    the SessionHost god class depends only on ``.contracts``/``.config``/
+    ``.session_state``/``.perf_metrics``/``.workers.base`` -- except
+    ``worker_projection``, which imported ``ClarificationContext`` straight
+    from ``.workers.web_search``, coupling a session-level projection to one
+    concrete worker type. ``ClarificationContext`` now lives in
+    ``workers/base.py`` beside ``WorkerMetadata``; this pins the boundary so a
+    future slice cannot quietly re-couple."""
+    import ast
+    from pathlib import Path
+
+    server_dir = Path(__file__).parents[1] / "server"
+    slices = (
+        "worker_projection.py",
+        "work_status_publisher.py",
+        "recorder_factory.py",
+        "turn_ack_ledger.py",
+        "handshake_gate.py",
+        "runner_supervisor.py",
+    )
+
+    offenders: list[str] = []
+    for name in slices:
+        path = server_dir / name
+        if not path.exists():
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("workers."):
+                if node.module != "workers.base":
+                    offenders.append(f"{name}: from .{node.module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("server.workers.") and (
+                        alias.name != "server.workers.base"
+                    ):
+                        offenders.append(f"{name}: import {alias.name}")
+
+    assert offenders == [], (
+        "SessionHost slices must depend on workers/base.py only, never on a "
+        f"concrete worker implementation: {offenders}"
+    )

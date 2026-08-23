@@ -528,6 +528,34 @@ def test_schema_terminal_states_match_the_server_implementation() -> None:
 
 
 @pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_schema_terminal_reason_enum_matches_the_python_literal() -> None:
+    """Round-5 restart gauntlet, Architecture Important: the third work-status
+    enum was the one with no Python<->schema parity assertion.
+
+    Its two siblings are pinned above (`properties.state.enum` against
+    `WORK_STATUS_STATES`, `x-terminal-states` against `WORK_STATUS_TERMINAL`).
+    `web/src/protocol.js` derives `workStatusTerminalReasons` from this enum
+    and `validWorkStatus` returns false on an unknown reason, so adding a third
+    `TerminalReason` in Python without touching the schema would silently make
+    the browser drop every frame carrying it -- exactly the failure mode the
+    schema's own `x-terminal-states-comment` says the state-enum pinning
+    exists to prevent.
+
+    `null` is excluded on the schema side: it encodes the optionality that
+    Python spells as `TerminalReason | None` on the field, not a member of the
+    reason vocabulary itself.
+    """
+    from typing import get_args
+
+    from server.contracts import TerminalReason
+
+    declared = set(_work_status_schema()["properties"]["terminal_reason"]["enum"])
+
+    assert None in declared, "the schema must keep encoding terminal_reason's optionality"
+    assert declared - {None} == set(get_args(TerminalReason))
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
 @pytest.mark.parametrize("state", sorted(WORK_STATUS_STATES))
 def test_work_status_accepts_every_coarse_state(state: str) -> None:
     status = _work_status(state=state)
@@ -693,3 +721,86 @@ def test_resolve_work_status_wire_presence_is_the_single_capability_gate() -> No
     assert "runtime.observer.supports_work_status" in app_source
     assert f"{WORK_STATUS_V1!r} in" not in app_source
     assert f'"{WORK_STATUS_V1}" in' not in app_source
+
+
+def test_snapshot_monotonicity_watermarks_are_bounded_per_process() -> None:
+    """Round-5 restart gauntlet, Logic Minor: ``_highest_by_session`` is a
+    process-lifetime ClassVar with one entry per session id that ever emitted a
+    snapshot. ``reset_monotonicity`` only clears the INCOMING session's key
+    (``SessionState.__init__``), never the outgoing one, so nothing ever
+    evicted a retired session -- unlike every sibling cache on this branch
+    (``HandshakeGate._MAX_HANDSHAKE_TOKENS``, ``_MAX_ACK_GENERATION_TURNS``,
+    the work-status 256-key cap), which are all explicitly bounded."""
+    from server.contracts import CONTRACT_VERSION, RuntimeSnapshot
+
+    cap = RuntimeSnapshot._MAX_WATERMARK_SESSIONS
+    saved = RuntimeSnapshot._highest_by_session.copy()
+    RuntimeSnapshot._highest_by_session.clear()
+    try:
+        for index in range(cap + 50):
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=f"session-bound-{index}",
+                snapshot_sequence=1,
+                origin_epoch=1,
+            )
+
+        assert len(RuntimeSnapshot._highest_by_session) == cap
+        # Least-recently-watermarked-first: the newest sessions -- the ones
+        # whose monotonicity still needs enforcing -- are the ones retained.
+        assert f"session-bound-{cap + 49}" in RuntimeSnapshot._highest_by_session
+        assert "session-bound-0" not in RuntimeSnapshot._highest_by_session
+    finally:
+        RuntimeSnapshot._highest_by_session.clear()
+        RuntimeSnapshot._highest_by_session.update(saved)
+
+
+def test_a_re_emitting_session_keeps_its_watermark_against_unrelated_traffic() -> None:
+    """The LRU refresh is what makes the bound safe: a session that keeps
+    emitting snapshots must not be evicted just because it was *first* seen a
+    long time ago, or its monotonicity check would silently go unenforced
+    while it is still live."""
+    from server.contracts import CONTRACT_VERSION, RuntimeSnapshot
+
+    cap = RuntimeSnapshot._MAX_WATERMARK_SESSIONS
+    saved = RuntimeSnapshot._highest_by_session.copy()
+    RuntimeSnapshot._highest_by_session.clear()
+    try:
+        live = "session-still-live"
+        RuntimeSnapshot(
+            contract_version=CONTRACT_VERSION,
+            session_id=live,
+            snapshot_sequence=5,
+            origin_epoch=1,
+        )
+        # Twice the cap in unrelated sessions, so eviction really does run --
+        # a first-seen-order (non-LRU) bound would have dropped ``live`` long
+        # before this loop ended.
+        noise_sessions = cap * 2
+        for index in range(noise_sessions):
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=f"session-noise-{index}",
+                snapshot_sequence=1,
+                origin_epoch=1,
+            )
+            # The live session re-emits, refreshing its recency.
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=live,
+                snapshot_sequence=5 + index + 1,
+                origin_epoch=1,
+            )
+
+        assert len(RuntimeSnapshot._highest_by_session) == cap
+        assert RuntimeSnapshot._highest_by_session[live] == 5 + noise_sessions
+        with pytest.raises(ValueError):
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=live,
+                snapshot_sequence=1,
+                origin_epoch=1,
+            )
+    finally:
+        RuntimeSnapshot._highest_by_session.clear()
+        RuntimeSnapshot._highest_by_session.update(saved)

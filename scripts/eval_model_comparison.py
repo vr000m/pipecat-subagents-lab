@@ -96,7 +96,7 @@ from scripts.eval_common import (
 # other evidence-gate script already routes its artifact reads through, and
 # routing the manifest read through a second hop would be one more place for
 # the two to drift.
-from scripts.evidence_common import EvidenceGateError, read_bytes_no_follow
+from scripts.evidence_common import EvidenceGateError, now_utc, read_bytes_no_follow
 from server.config import Config, load_config
 from server.pipeline import split_multi_intent_turn_id
 from server.router import build_router_request_kwargs, effective_router_reasoning_effort
@@ -2678,7 +2678,7 @@ def build_report(
     # annotation-failure reason appended below), via `_overall_status()`.
     _, failure_reasons = compute_pass_fail(outcomes)
     report: dict[str, Any] = {
-        "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at_utc": now_utc(),
         "judge_model": judge_model,
         "repetition_count_per_cell": repeat_count,
         "repetition_note": (

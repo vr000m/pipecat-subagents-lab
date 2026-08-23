@@ -1517,6 +1517,7 @@ def test_pre_admission_terminal_reason_is_a_closed_no_tts_unavailable_transport_
         "no_tts",
         "unavailable_transport",
         "connection_closed",
+        "cancelled",
     }
 
 

@@ -105,9 +105,23 @@ export WEBSEARCH_TTS_ENDPOINT=uds:///path/to/tts.sock
 ```
 
 The equivalent overrides are `WEBSEARCH_STT_WS_SOCKET`,
-`WEBSEARCH_TTS_WS_SOCKET`, and `WEBSEARCH_TTS_WS_URI`; for TTS, URI takes
-precedence over socket, followed by `WEBSEARCH_TTS_WS_HOST` plus
-`WEBSEARCH_TTS_WS_PORT`. `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
+`WEBSEARCH_TTS_WS_SOCKET`, and `WEBSEARCH_TTS_WS_URI`.
+
+These alternative spellings of one endpoint resolve by **configuration layer
+first, key priority second**. The layers, lowest to highest, are `config.toml`,
+the env file, and the process environment — so `WEBSEARCH_TTS_WS_SOCKET`
+exported in your shell beats a `[tts] tts_ws_uri` in `config.toml`, and the
+highest-precedence layer that names *any* member of the family wins. Key
+priority only breaks a tie *within* one layer: there, `WEBSEARCH_TTS_ENDPOINT`
+beats `WEBSEARCH_TTS_WS_URI`, which beats `WEBSEARCH_TTS_WS_SOCKET`, which beats
+`WEBSEARCH_TTS_WS_HOST` plus `WEBSEARCH_TTS_WS_PORT`. The STT pair
+(`WEBSEARCH_STT_ENDPOINT` / `WEBSEARCH_STT_WS_SOCKET`) follows the same rule.
+
+`WEBSEARCH_TTS_WS_HOST` and `WEBSEARCH_TTS_WS_PORT` must be set together;
+setting one without the other is a startup error rather than a silent fallback
+to the packaged default endpoint.
+
+`WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
 semantic-turn fallback. After Smart Turn reports an incomplete turn, each new
 speech boundary resets this timer; five silent seconds finalize the accumulated
 transcript by default. `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` controls a
@@ -132,6 +146,13 @@ bound hosted routing and worker requests, while
 `WEBSEARCH_SHUTDOWN_GRACE_SECONDS` prevents cancellation-resistant work from
 blocking server shutdown. `WEBSEARCH_MAX_CITATIONS` caps the normalized source
 list. Their TOML equivalents use the same lowercase names under `[turn]`.
+
+An explicitly-set numeric value is always validated, never quietly replaced by
+the packaged default: `[turn] max_citations = 0`, a zero smart-turn timeout, or
+a non-numeric `WEBSEARCH_MAX_WORK_ITEMS_PER_TURN` each fail startup with a
+`ConfigError` naming the field, rather than starting under a configuration the
+operator did not ask for.
+
 `WEBSEARCH_MAX_WORK_ITEMS_PER_TURN` limits one routed turn to 2, 3, or 4 work
 items and defaults to 2. `WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS` controls how
 long a multi-intent turn waits for all routed work before returning its
@@ -241,9 +262,12 @@ running a single check in isolation. Its `sync`/`build` recipes intentionally
 use the same `--frozen` / `--frozen-lockfile` flags as
 `.github/workflows/ci.yml` so a lockfile drift fails the same way locally and
 in CI. `tests/test_justfile_ci_parity.py` asserts every `uv run`/`bun`
-command CI's `test` job executes is reachable from `just check`'s recipe
-closure, so the two files drifting out of sync now fails a test rather than
-depending on a developer noticing by hand.
+command CI executes in *any* pull-request-blocking job — not just the `test`
+job — is reachable from `just check`'s recipe closure, so the two files
+drifting out of sync now fails a test rather than depending on a developer
+noticing by hand. That widening is what brought the `promotion-manifest-drift`
+job under the guard and added the `just verify-manifest` recipe (also wired
+into `just check`) so it can be reproduced locally.
 
 `uv run mypy` checks every module under `server/` by default, so a newly added
 file is type-gated without anyone remembering to opt it in. The explicit
@@ -665,7 +689,12 @@ manifest committed at one commit can never match a regeneration at a later
 one). A failure means the committed manifest has drifted from its evidence;
 the fix is to regenerate it locally and commit the result. The separate
 `release-metadata` job (`main` pushes only) just derives and exports the
-deployment identity.
+deployment identity. The manifest path in that job carries the release version,
+so `scripts/check_release_metadata.py` additionally asserts the workflow still
+points at `docs/benchmarks/v{version}-promotion-manifest.json` for the current
+`pyproject.toml` version — a version bump that forgot the workflow would
+otherwise keep verifying the previous release's manifest and report green about
+a file nothing consumes. Reproduce the job locally with `just verify-manifest`.
 
 To regenerate locally, export the same identity from a clean checkout and run
 the writer by hand:

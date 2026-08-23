@@ -724,6 +724,63 @@ class TestVerifyManifestDriftCheck:
 
         assert set(manifest) <= module._MANIFEST_VOLATILE_FIELDS | module._MANIFEST_VERIFIED_FIELDS
 
+    def test_verified_field_roster_stays_in_lockstep_with_server_config(self) -> None:
+        """Round-5 restart, Architecture finding: ``required_phases`` inside
+        ``verify_manifest`` used to be a hand-copied literal
+        (``{"phase0", "phase1", "phase2", "phase3"}``) instead of
+        ``server.config._MANIFEST_REQUIRED_FINAL_INPUTS``, so the two could
+        silently drift if a phase were ever added to one without the other.
+        This pins the whole-document coverage claim precisely: the volatile
+        set plus the verified set must equal exactly
+        ``server.config._MANIFEST_REQUIRED_FIELDS`` plus the three top-level
+        hash fields that are not in ``_MANIFEST_REQUIRED_FIELDS`` because they
+        are optional/phase-conditional (``phase3_completion_hash``,
+        ``phase3_command_digest``, ``phase4c_artifact_sha256``), not because
+        they go unverified."""
+        module = _validator()
+        from server.config import _MANIFEST_REQUIRED_FIELDS
+
+        conditional_hash_fields = {
+            "phase3_completion_hash",
+            "phase3_command_digest",
+            "phase4c_artifact_sha256",
+        }
+        assert (
+            module._MANIFEST_VOLATILE_FIELDS | module._MANIFEST_VERIFIED_FIELDS
+            == _MANIFEST_REQUIRED_FIELDS | conditional_hash_fields
+        )
+
+    def test_a_manifest_missing_a_required_field_is_reported_as_drift(self, tmp_path: Path) -> None:
+        """Round-5 restart, Architecture finding regression: the completeness
+        guard at the end of ``verify_manifest`` only ever caught an *extra*
+        unrecognized field, never a *missing* required one -- so CI reported
+        clean on a manifest ``server.config.load_promotion_manifest`` rejects
+        outright at boot as ``manifest_schema_invalid``."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["deployed_at_utc"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("deployed_at_utc" in item and "missing" in item for item in drift), drift
+
+    def test_a_manifest_with_a_wrongly_typed_string_field_is_reported_as_drift(
+        self, tmp_path: Path
+    ) -> None:
+        """Same gap as above, the type-check half: a required field present
+        but not a JSON string (e.g. ``source_commit`` as an int) also passed
+        this gate clean before the fix, even though
+        ``server.config.load_promotion_manifest`` rejects it outright."""
+        module = _validator()
+        manifest_path = self._written_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        manifest["source_commit"] = 12345
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        drift = module.verify_manifest(manifest_path)
+        assert any("source_commit" in item and "string" in item for item in drift), drift
+
     # --- Round-4 confirm pass: the gate proved less than its roster claimed. -
 
     def test_truncated_inputs_cannot_bypass_the_eligibility_check(self, tmp_path: Path) -> None:

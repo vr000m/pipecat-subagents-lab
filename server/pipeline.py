@@ -86,7 +86,8 @@ from .work_status_publisher import (
 )
 from .work_task_ledger import WorkTaskLedger
 from .worker_projection import WorkerProjection
-from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
+from .workers.base import ClarificationContext
+from .workers.web_search import WorkerClarify, WorkerDeclined
 
 
 class _FallbackBridge:
@@ -170,9 +171,31 @@ def _contract_bridge() -> Any:
 class CanonicalResultAdapter(FrameProcessor):
     """Gate result envelopes without interrupting Pipecat frame lifecycles."""
 
-    def __init__(self) -> None:
+    def __init__(self, supports_work_status: Callable[[], bool] | None = None) -> None:
+        """``supports_work_status`` is this connection's work_status_v1
+        entitlement, read at frame time.
+
+        The adapter is constructed once per connection (``app.py``'s
+        ``_attach_connection``), so it can hold the connection's own
+        entitlement thunk -- the same narrow-callable pattern the SessionHost
+        slices use. Without it the re-serialization gate below had to
+        reconstruct the entitlement by sniffing whether ``work_status`` was
+        present in the already-serialized inbound payload: a third derivation
+        of a decision ``server/contracts.py`` documents as living in exactly
+        one predicate (``resolve_work_status_wire_presence``, whose sole
+        caller is ``RuntimeObserver.supports_work_status`` by design), plus a
+        bare ``True`` fallback for any non-dict payload (round-5 restart,
+        Architecture Important).
+
+        ``None`` is for the connection-less constructions -- ``LabPipeline``'s
+        contract-test pipeline and the direct unit-test constructions -- which
+        have no connection to ask. Those fall back to mirroring the inbound
+        payload's own wire presence, which is what the entitlement produced
+        upstream anyway; see ``process_frame``.
+        """
         if FrameProcessor is not object:
             super().__init__()
+        self._supports_work_status = supports_work_status
 
     @staticmethod
     def _normalized_result(frame: Any) -> dict[str, Any] | None:
@@ -247,11 +270,27 @@ class CanonicalResultAdapter(FrameProcessor):
             # frame. Wire presence on the way out mirrors wire presence on the
             # way in; this adapter normalizes envelopes, it does not decide
             # capability projection.
-            inbound_payload = data.get("data")
-            frame.data = RTVIMessage.model_validate(data).wire_payload(
-                include_work_status=(
-                    "work_status" in inbound_payload if isinstance(inbound_payload, dict) else True
+            #
+            # When this adapter was given its connection's entitlement thunk
+            # (the real ``app.py`` path), ask that authority rather than
+            # re-deriving the same boolean from wire bytes. The two agree by
+            # construction -- the payload lacks the key precisely because the
+            # entitlement was false upstream -- but only one of them is the
+            # documented single predicate.
+            if self._supports_work_status is not None:
+                include_work_status = self._supports_work_status()
+            else:
+                # No connection to ask (LabPipeline / unit-test constructions):
+                # mirror the payload's own wire presence. A non-dict payload
+                # is never a RuntimeSnapshot, so ``wire_payload`` ignores this
+                # value entirely for it; ``False`` keeps the no-authority
+                # default from being the one that can re-materialize a field.
+                inbound_payload = data.get("data")
+                include_work_status = (
+                    "work_status" in inbound_payload if isinstance(inbound_payload, dict) else False
                 )
+            frame.data = RTVIMessage.model_validate(data).wire_payload(
+                include_work_status=include_work_status
             )
         if isinstance(getattr(frame, "data", frame), dict) and (
             getattr(frame, "data", frame).get("kind") == "canonical_result"
@@ -1623,7 +1662,7 @@ class SessionHost:
                         state="background",
                         origin_epoch=origin_epoch,
                     )
-                    if origin.supports_work_status and self.feature_policy.enable_background_status:
+                    if self._work_status_publisher.replaces_legacy_result_for(origin):
                         # Phase 3 capability-gated path: retain the work item
                         # and let the `background` status stand alone instead
                         # of speaking a second canonical timeout result or
@@ -1925,7 +1964,7 @@ class SessionHost:
                     state="background",
                     origin_epoch=origin_epoch,
                 )
-                if origin.supports_work_status and self.feature_policy.enable_background_status:
+                if self._work_status_publisher.replaces_legacy_result_for(origin):
                     # Same capability-gated rule the single-intent path takes:
                     # a capable client gets the `background` status alone, not
                     # a second canonical timeout result plus its transcript and
@@ -2369,9 +2408,7 @@ class SessionHost:
                 if work_item_id not in self._work_ledger.cancelled_ids:
                     retained_work_items.add(work_item_id)
                 worker_id = index_to_worker_id[item_index][0]
-                if not (
-                    origin.supports_work_status and self.feature_policy.enable_background_status
-                ):
+                if not self._work_status_publisher.replaces_legacy_result_for(origin):
                     # Capability-blind clients keep the legacy per-item timeout
                     # notice. A capable client gets the `background` status
                     # below and nothing else: committing and speaking the
@@ -3071,8 +3108,32 @@ class SessionHost:
             # outcome -- so discard it before releasing ownership, or an
             # unrelated generation later freeing the transport lane could
             # still speak it after the real result was already committed.
-            if self.connection is not None:
-                self._settle_turn_ack(self.connection.scheduler, context.turn_id)
+            #
+            # Epoch-fenced on the TURN's own origin epoch, not on whatever
+            # connection happens to be live now. ``self.connection`` is
+            # re-pointed on every reconnect/epoch promotion, so a late result
+            # committed after a reconnect used to settle its ack against the
+            # NEW epoch's scheduler -- discarding a queued ack and releasing a
+            # latch that scheduler never set, while the retired scheduler's
+            # latch for this turn stayed set. Every other epoch-sensitive step
+            # in this method already fences on ``context``'s own epoch (the
+            # explicit foreign-epoch branch in the precedence chain above
+            # exists precisely because a late result can outlive its
+            # originating connection); this one did not (round-5 restart,
+            # Logic Minor).
+            #
+            # On a mismatch the retired connection's own teardown
+            # (``deactivate`` -> ``SpeechScheduler.interrupt(full_stop=True)``)
+            # already swept its queued/paused acks through
+            # ``_notify_ack_swept``, so there is no queued item left to
+            # discard -- but the host-level latch is connection-independent
+            # state, so clear that half directly rather than reaching for a
+            # foreign scheduler.
+            connection = self.connection
+            if connection is not None and connection.epoch == origin_epoch:
+                self._settle_turn_ack(connection.scheduler, context.turn_id)
+            else:
+                self._turn_ack_ledger.clear_ack_latch(context.turn_id)
             self._release_turn_work_item(context.turn_id, context.work_item_id)
             if recorder is not None:
                 recorder.finalize(

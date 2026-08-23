@@ -2236,15 +2236,20 @@ class TestReasoningEffortInheritance:
         assert config.resolve_router_model("fast") != "   "
         assert config.resolve_router_reasoning_effort("fast") == "high"
 
-    def test_provenance_and_empty_means_absent_membership_coincides_today(self) -> None:
-        """Not a requirement -- see the module comment above
-        _PROVENANCE_KEYS/_EMPTY_MEANS_ABSENT_KEYS: both are derived from the
-        same _ROLE_MODEL_EFFORT_KEYS source tuple, so their membership
-        coinciding is a byproduct of that shared derivation, not an
-        independent invariant either behavioral test above depends on."""
+    def test_empty_means_absent_keys_are_a_subset_of_provenance_keys(self) -> None:
+        """Every key that treats an empty override as "absent" must also carry
+        provenance -- otherwise _clear_inherited_reasoning_effort and
+        _winning_endpoint_member would reason about a layer number that was
+        never recorded. The reverse does not hold: _ENDPOINT_FAMILY_KEYS carry
+        provenance without adopting the empty-means-absent rule (round-5
+        restart, Logic Important)."""
         import server.config as _config_module
 
-        assert set(_config_module._EMPTY_MEANS_ABSENT_KEYS) == set(_config_module._PROVENANCE_KEYS)
+        assert set(_config_module._EMPTY_MEANS_ABSENT_KEYS) <= set(_config_module._PROVENANCE_KEYS)
+        assert set(_config_module._ENDPOINT_FAMILY_KEYS) <= set(_config_module._PROVENANCE_KEYS)
+        assert not set(_config_module._ENDPOINT_FAMILY_KEYS) & set(
+            _config_module._EMPTY_MEANS_ABSENT_KEYS
+        )
 
 
 class TestDefaultReasoningEffortForModel:
@@ -2259,3 +2264,104 @@ class TestDefaultReasoningEffortForModel:
 
     def test_non_gpt5_model_has_no_default(self) -> None:
         assert default_reasoning_effort_for_model("gpt-4.1-mini") is None
+
+
+class TestExplicitZeroNumericOverrides:
+    """Round-5 restart gauntlet, Logic Important: a truthiness walrus treated an
+    operator's explicit numeric ``0`` as absent, substituted the packaged
+    default, and so bypassed the ``__post_init__`` validation that exists
+    precisely to reject that value by name."""
+
+    def test_toml_zero_max_citations_reaches_validation(self, tmp_path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[turn]\nmax_citations = 0\n")
+
+        with pytest.raises(ConfigError, match="max_citations must be between 1 and 50"):
+            load_config(config_file=config_file, env={})
+
+    def test_toml_zero_smart_turn_timeout_reaches_validation(self, tmp_path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[turn]\nsmart_turn_timeout_seconds = 0.0\n")
+
+        with pytest.raises(ConfigError, match="smart_turn_timeout_seconds must be between"):
+            load_config(config_file=config_file, env={})
+
+    def test_toml_zero_smart_turn_complete_grace_reaches_validation(self, tmp_path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[turn]\nsmart_turn_complete_grace_seconds = 0.0\n")
+
+        with pytest.raises(ConfigError, match="smart_turn_complete_grace_seconds must be between"):
+            load_config(config_file=config_file, env={})
+
+    def test_non_numeric_max_work_items_raises_config_error_not_bare_value_error(self) -> None:
+        """Round-5 restart, Logic Minor: the two unwrapped ``int()`` calls
+        escaped ``load_config`` as a bare ValueError naming no field."""
+        with pytest.raises(ConfigError, match="WEBSEARCH_MAX_WORK_ITEMS_PER_TURN must be"):
+            load_config(env={"WEBSEARCH_MAX_WORK_ITEMS_PER_TURN": "many"})
+
+    def test_non_numeric_multi_intent_wait_timeout_raises_config_error(self) -> None:
+        with pytest.raises(ConfigError, match="WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS must be"):
+            load_config(env={"WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS": "soon"})
+
+
+class TestEndpointFamilyLayerPrecedence:
+    """Round-5 restart gauntlet, Logic Important: the STT/TTS endpoint families
+    resolved by hardcoded key priority, so a lower-precedence layer's spelling
+    silently beat a higher-precedence layer's override."""
+
+    def test_process_env_tts_socket_beats_toml_tts_uri(self, tmp_path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[tts]\ntts_ws_uri = "wss://tts.example.test:9443"\n')
+
+        config = load_config(
+            config_file=config_file,
+            env={"WEBSEARCH_TTS_WS_SOCKET": "/tmp/override-tts.sock"},
+        )
+
+        assert config.tts_endpoint == ("uds", "/tmp/override-tts.sock")
+
+    def test_process_env_tts_host_port_beats_toml_tts_uri(self, tmp_path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[tts]\ntts_ws_uri = "wss://tts.example.test:9443"\n')
+
+        config = load_config(
+            config_file=config_file,
+            env={
+                "WEBSEARCH_TTS_WS_HOST": "127.0.0.1",
+                "WEBSEARCH_TTS_WS_PORT": "9100",
+            },
+        )
+
+        assert config.tts_endpoint == ("ws", "127.0.0.1:9100")
+
+    def test_process_env_stt_socket_beats_env_file_stt_endpoint(self) -> None:
+        config = load_config(
+            env_file={"WEBSEARCH_STT_ENDPOINT": "ws://stt.example.test:9001"},
+            env={"WEBSEARCH_STT_WS_SOCKET": "/tmp/override-stt.sock"},
+        )
+
+        assert config.stt_endpoint == ("uds", "/tmp/override-stt.sock")
+
+    def test_key_priority_still_breaks_a_same_layer_tie(self, tmp_path) -> None:
+        """The README's documented within-layer order (URI > socket > host:port)
+        is unchanged; layer precedence only outranks it across layers."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[tts]\ntts_ws_uri = "wss://tts.example.test:9443"\n'
+            'tts_ws_socket = "~/tts.sock"\n'
+            'tts_ws_host = "ignored.example.test"\ntts_ws_port = 9000\n'
+        )
+
+        config = load_config(config_file=config_file, env={})
+
+        assert config.tts_endpoint == ("wss", "tts.example.test:9443")
+
+    def test_tts_host_without_port_is_loud(self) -> None:
+        """Round-5 restart, Logic Minor: a half-specified pair was the only
+        malformed endpoint input that failed open onto the dataclass default."""
+        with pytest.raises(ConfigError, match="must be set together"):
+            load_config(env={"WEBSEARCH_TTS_WS_HOST": "127.0.0.1"})
+
+    def test_tts_port_without_host_is_loud(self) -> None:
+        with pytest.raises(ConfigError, match="must be set together"):
+            load_config(env={"WEBSEARCH_TTS_WS_PORT": "9100"})

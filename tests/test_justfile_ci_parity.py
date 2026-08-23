@@ -6,13 +6,21 @@ twice -- round 10 raised the flag-mismatch risk, round 2's fix restated the
 comment, and `just check` still didn't reach `smoke` afterwards. This test
 replaces the comment with an executable, directional invariant:
 
-    Every `uv run ...` or `bun ...` command CI's `test` job executes is
-    reachable from `just check`'s transitive recipe closure.
+    Every `uv run ...` or `bun ...` command any CI job that can run on
+    `pull_request` executes is reachable from `just check`'s transitive
+    recipe closure.
 
 Directional on purpose -- CI is the merge gate, so CI subset-of `just check`
 is what protects a developer from a green local run and a red CI run. The
 reverse is not wanted: the justfile legitimately holds `preflight`, `run`,
 and `all`, which CI must never execute.
+
+Originally scoped to only `jobs['test']`. Widened to every job that can run
+on `pull_request` (round-5 restart, Architecture finding #7): the
+`promotion-manifest-drift` job was split out specifically so it blocks pull
+requests (no push-to-main `if:` guard), but a check hardcoded to
+`jobs['test']` never saw it, so its `uv run` command had no `just`
+equivalent and no test would have caught one going missing.
 """
 
 from __future__ import annotations
@@ -150,10 +158,31 @@ def _qualified_commands_from_steps(steps: list[dict]) -> set[tuple[str, str]]:
     return commands
 
 
-def _ci_test_job_commands() -> set[tuple[str, str]]:
+# A job is excluded only when its `if:` explicitly restricts it to the
+# push-to-main event -- i.e. it cannot run on `pull_request` and is
+# therefore not a merge gate a developer needs to reproduce locally before
+# opening a PR. `release-metadata` is the only such job today
+# (`if: github.event_name == 'push' && github.ref == 'refs/heads/main'`);
+# everything else -- including jobs added later with no `if:` at all --
+# defaults to IN scope, which is the fail-safe direction (round-5 restart,
+# Architecture finding #7).
+_PUSH_TO_MAIN_ONLY_MARKER = "event_name == 'push'"
+
+
+def _pull_request_job_names(data: dict) -> list[str]:
+    return [
+        name
+        for name, job in data["jobs"].items()
+        if _PUSH_TO_MAIN_ONLY_MARKER not in str(job.get("if", ""))
+    ]
+
+
+def _ci_pull_request_job_commands() -> set[tuple[str, str]]:
     data = yaml.safe_load(_CI_YML.read_text())
-    steps = data["jobs"]["test"]["steps"]
-    return _qualified_commands_from_steps(steps)
+    commands: set[tuple[str, str]] = set()
+    for name in _pull_request_job_names(data):
+        commands.update(_qualified_commands_from_steps(data["jobs"][name]["steps"]))
+    return commands
 
 
 # Follow-up (deliberately deferred, round-4 restart, architecture Minor #3):
@@ -165,20 +194,46 @@ def _ci_test_job_commands() -> set[tuple[str, str]]:
 # human-readable step name (`_CI_STEPS_WITHOUT_A_JUST_EQUIVALENT` above).
 
 
-def test_ci_test_job_commands_are_reachable_from_just_check() -> None:
+def test_ci_pull_request_job_commands_are_reachable_from_just_check() -> None:
     closure = _just_check_command_closure()
     assert closure, "`check`'s recipe closure resolved to zero commands -- parser likely broken"
 
     tracked = [
-        (cwd, cmd) for cwd, cmd in _ci_test_job_commands() if cmd.startswith(_TRACKED_PREFIXES)
+        (cwd, cmd)
+        for cwd, cmd in _ci_pull_request_job_commands()
+        if cmd.startswith(_TRACKED_PREFIXES)
     ]
-    assert tracked, "no `uv run`/`bun` commands found in ci.yml's test job -- parser likely broken"
+    assert tracked, (
+        "no `uv run`/`bun` commands found in any pull_request-triggered CI job -- "
+        "parser likely broken"
+    )
 
     missing = [pair for pair in tracked if pair not in closure]
     assert not missing, (
-        "CI's `test` job runs commands `just check` cannot reach: "
+        "A CI job that runs on pull_request executes commands `just check` cannot reach: "
         f"{missing}. Add them to a recipe `check` depends on."
     )
+
+
+def test_promotion_manifest_drift_job_is_covered_by_the_parity_check() -> None:
+    """Reproduction for round-5 restart, Architecture finding #7: this job
+    runs on `pull_request` (no push-to-main `if:` guard) and was invisible
+    to the parity check while it was hardcoded to `jobs['test']`."""
+    data = yaml.safe_load(_CI_YML.read_text())
+    assert "promotion-manifest-drift" in _pull_request_job_names(data)
+
+
+def test_release_metadata_job_is_excluded_as_push_to_main_only() -> None:
+    data = yaml.safe_load(_CI_YML.read_text())
+    assert "release-metadata" not in _pull_request_job_names(data)
+
+
+def test_a_job_with_no_if_defaults_to_in_scope() -> None:
+    """The fail-safe direction: a future job added without an `if:` at all
+    must not silently fall outside the parity check the way `test` and
+    `promotion-manifest-drift` did before this job was hardcoded in."""
+    data = {"jobs": {"new-job": {"steps": []}}}
+    assert _pull_request_job_names(data) == ["new-job"]
 
 
 def test_uv_sync_flags_match() -> None:
@@ -187,7 +242,7 @@ def test_uv_sync_flags_match() -> None:
     sync_body = recipes["sync"][1]
     assert "uv sync --frozen" in sync_body
 
-    assert (".", "uv sync --frozen") in _ci_test_job_commands()
+    assert (".", "uv sync --frozen") in _ci_pull_request_job_commands()
 
 
 def test_ci_run_lines_are_split_on_ampersands() -> None:

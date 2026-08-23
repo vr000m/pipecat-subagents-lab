@@ -7,7 +7,7 @@ import json
 import os
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
@@ -350,6 +350,24 @@ def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def effective_feature_policy_fingerprint(config: Config) -> str:
+    """`feature_policy_fingerprint(FeaturePolicy.from_config(config))`, named.
+
+    Two independent callers -- ``scripts/emit_v013_deployment_metadata.py``
+    (the writer, which stamps this into the release-metadata shell exports)
+    and ``scripts/validate_v013_evidence.py`` (the verifier, which re-derives
+    it to check manifest drift) -- must resolve this composition identically
+    by construction, not by both happening to spell the same three-call chain
+    the same way. Previously the writer wrapped it in a script-local
+    ``feature_policy_fingerprint_value()`` (with a function-local
+    ``server.config`` import) while the verifier spelled the same composition
+    inline; this is the one home for it, since both the writer and the
+    verifier already import from ``server.config`` (round-5 restart,
+    Architecture finding).
+    """
+    return feature_policy_fingerprint(FeaturePolicy.from_config(config))
 
 
 @dataclass(frozen=True)
@@ -880,10 +898,11 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
     ("WEBSEARCH_ROUTER_MODEL", "WEBSEARCH_ROUTER_REASONING_EFFORT"),
     ("WEBSEARCH_WORKER_MODEL", "WEBSEARCH_WORKER_REASONING_EFFORT"),
 )
-# Both derived from _ROLE_MODEL_EFFORT_KEYS, and their membership is
-# identical today by construction -- two names because they encode two
-# different rules with two different justifications, not because the sets
-# are expected to diverge on this checkout:
+# Two names because they encode two different rules with two different
+# justifications. _EMPTY_MEANS_ABSENT_KEYS is now a strict SUBSET of
+# _PROVENANCE_KEYS -- the divergence the comment below anticipated arrived when
+# the endpoint-family keys started carrying provenance without adopting the
+# empty-means-absent rule:
 #   _PROVENANCE_KEYS: which keys carry per-layer provenance, so
 #   _clear_inherited_reasoning_effort can tell "a higher layer set the model"
 #   from "the model came along with the effort".
@@ -899,18 +918,35 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
 #   _ROLE_MODEL_EFFORT_KEYS, whose membership is pinned by
 #   tests/test_config.py's constant-parity test -- adding a key here cannot
 #   happen without a human edit that trips that test (round 6, Architecture A2).
-# A future key that satisfies one rule but not the other is added to that
-# constant alone, and separate *objects* alone buy nothing towards that --
-# round 4 restart's Architecture Minor #7 made them separate comprehensions
-# instead of an alias, but both still derive from the same source tuple, so
-# adding a role still changes both simultaneously; that was never load-
-# bearing independence. What actually matters, and what
+# A key that satisfies one rule but not the other is added to that constant
+# alone -- which is exactly what _ENDPOINT_FAMILY_KEYS below does. What
+# matters, and what
 # TestProvenanceKeysAloneDriveLayerRecording /
 # TestEmptyMeansAbsentKeysAloneDriveTheEmptyOverrideSkip in tests/test_config.py
 # pin, is that each constant is read by exactly one function: _PROVENANCE_KEYS
 # by _record_layer, _EMPTY_MEANS_ABSENT_KEYS by _apply_layer (round 5
 # restart2, Architecture A6).
-_PROVENANCE_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
+# The STT/TTS endpoint-family keys: several mutually-exclusive spellings of one
+# setting, resolved across layers by _winning_endpoint_member. They carry
+# provenance for the same reason the role keys do -- without it the family
+# resolved by hardcoded key priority alone and a config.toml spelling (layer 0)
+# silently beat a process-env spelling (layer 2). They are deliberately NOT in
+# _EMPTY_MEANS_ABSENT_KEYS: an empty override of one spelling must still be a
+# write that erases a lower layer's value for THAT SAME KEY, since the family's
+# other spellings remain available to supply the endpoint (round-5 restart,
+# Logic Important).
+_ENDPOINT_FAMILY_KEYS = (
+    "WEBSEARCH_STT_ENDPOINT",
+    "WEBSEARCH_STT_WS_SOCKET",
+    "WEBSEARCH_TTS_ENDPOINT",
+    "WEBSEARCH_TTS_WS_URI",
+    "WEBSEARCH_TTS_WS_SOCKET",
+    "WEBSEARCH_TTS_WS_HOST",
+    "WEBSEARCH_TTS_WS_PORT",
+)
+_PROVENANCE_KEYS = (
+    tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair) + _ENDPOINT_FAMILY_KEYS
+)
 _EMPTY_MEANS_ABSENT_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
 # The model half of _ROLE_MODEL_EFFORT_KEYS alone -- used by _record_layer to
 # decide *whether to compare* a key's incoming value against its incumbent
@@ -1066,18 +1102,48 @@ def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[st
     "medium"``, so the "baseline" request carried a ``reasoning`` param the
     real baseline never sends.
 
-    Known second instance of the same concern, not yet migrated to layer
-    provenance: the ``WEBSEARCH_TTS_WS_URI``/``_SOCKET``/``_HOST``/``_PORT``
-    family below carries the same "a higher layer overriding one related key
-    should clear an inherited sibling" shape, handled by an older idiom
-    instead of this function's pattern (round-4 restart, Architecture Minor
-    #8 -- signpost only, no behaviour change on this branch).
+    The STT/TTS endpoint families carry the same "a higher layer overriding one
+    related key should beat an inherited sibling" shape; they resolve it through
+    ``_winning_endpoint_member`` rather than by deletion, because there the
+    sibling keys are alternative spellings of one setting, not a dependent pair.
     """
     for model_key, effort_key in _ROLE_MODEL_EFFORT_KEYS:
         if effort_key not in values:
             continue
         if layers.get(model_key, -1) > layers.get(effort_key, -1):
             del values[effort_key]
+
+
+def _winning_endpoint_member(
+    values: Mapping[str, object],
+    layers: Mapping[str, int],
+    members: Sequence[tuple[str, tuple[str, ...]]],
+) -> str | None:
+    """Pick which member of an endpoint family (STT/TTS) supplies the endpoint.
+
+    An endpoint family is several mutually-exclusive spellings of one setting
+    (``WEBSEARCH_TTS_ENDPOINT`` / ``_WS_URI`` / ``_WS_SOCKET`` / ``_WS_HOST`` +
+    ``_WS_PORT``). Resolving it by hardcoded key priority ignored the layered
+    precedence system entirely: a config.toml ``tts_ws_uri`` (layer 0) beat a
+    ``WEBSEARCH_TTS_WS_SOCKET`` exported in the process environment (layer 2),
+    so the operator's highest-precedence override was silently discarded and the
+    service connected to the TOML endpoint (round-5 restart, Logic Important).
+
+    The winner is the present member set at the highest precedence layer; the
+    declaration order of ``members`` (the documented key priority) breaks a
+    same-layer tie, which is what preserves the README's "for TTS, URI takes
+    precedence over socket, followed by host plus port" rule within one layer.
+    A multi-key member (host + port) takes the highest layer among its keys.
+    Returns ``None`` when no member is set, leaving the dataclass default.
+    """
+    present = [
+        (name, max(layers.get(key, -1) for key in keys))
+        for name, keys in members
+        if all(values.get(key) for key in keys)
+    ]
+    if not present:
+        return None
+    return max(present, key=lambda member: member[1])[0]
 
 
 def _parse_strict_bool(raw: object, *, field: str) -> bool:
@@ -1140,10 +1206,23 @@ def load_config(
         kwargs["cartesia_api_key"] = key
     if voice := values.get("WEBSEARCH_CARTESIA_VOICE_ID") or values.get("CARTESIA_VOICE_ID"):
         kwargs["cartesia_voice_id"] = voice
-    if raw := values.get("WEBSEARCH_MAX_WORK_ITEMS_PER_TURN"):
-        kwargs["max_work_items_per_turn"] = int(raw)
-    if raw := values.get("WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS"):
-        kwargs["multi_intent_wait_timeout_ms"] = int(raw)
+    # Membership, not truthiness, and every conversion wrapped: TOML supplies
+    # real ints, so an explicit `max_citations = 0` / `multi_intent_wait_timeout_ms
+    # = 0` is falsy and a truthiness walrus dropped the key outright -- the
+    # packaged default was substituted and `Config.__post_init__`'s field-specific
+    # range check (which exists to reject exactly those values) never fired. Same
+    # bug class the round-7 fix closed for the string fields below; the float
+    # siblings at WEBSEARCH_SPEECH_* already use the corrected form.
+    for env_name, field_name in (
+        ("WEBSEARCH_MAX_WORK_ITEMS_PER_TURN", "max_work_items_per_turn"),
+        ("WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS", "multi_intent_wait_timeout_ms"),
+        ("WEBSEARCH_MAX_CITATIONS", "max_citations"),
+    ):
+        if env_name in values:
+            try:
+                kwargs[field_name] = int(values[env_name])
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{env_name} must be an integer") from exc
     for env_name, field_name in (
         ("WEBSEARCH_FOREGROUND_SEARCH_TIMEOUT_SECONDS", "foreground_search_timeout_seconds"),
         ("WEBSEARCH_ROUTER_TIMEOUT_SECONDS", "router_timeout_seconds"),
@@ -1155,11 +1234,6 @@ def load_config(
                 kwargs[field_name] = float(values[env_name])
             except (TypeError, ValueError) as exc:
                 raise ConfigError(f"{env_name} must be a number") from exc
-    if raw := values.get("WEBSEARCH_MAX_CITATIONS"):
-        try:
-            kwargs["max_citations"] = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise ConfigError("WEBSEARCH_MAX_CITATIONS must be an integer") from exc
     if "WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS" in values:
         raw = values["WEBSEARCH_PENDING_DIALOGUE_TIMEOUT_SECONDS"]
         try:
@@ -1176,12 +1250,15 @@ def load_config(
         kwargs["stt_model"] = str(raw)
     if raw := values.get("WEBSEARCH_STT_LANGUAGE"):
         kwargs["stt_language"] = str(raw)
-    if raw := values.get("WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS"):
+    # Membership, not truthiness -- `__post_init__` rejects a zero/negative
+    # smart-turn timeout by name, and a truthiness gate hid an explicit
+    # `smart_turn_timeout_seconds = 0` behind the packaged default.
+    if (raw := values.get("WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS")) is not None:
         try:
             kwargs["smart_turn_timeout_seconds"] = float(raw)
         except (TypeError, ValueError) as exc:
             raise ConfigError("WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS must be a number") from exc
-    if raw := values.get("WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS"):
+    if (raw := values.get("WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS")) is not None:
         try:
             kwargs["smart_turn_complete_grace_seconds"] = float(raw)
         except (TypeError, ValueError) as exc:
@@ -1277,31 +1354,52 @@ def load_config(
         kwargs["worker_reasoning_effort_policy"] = {
             label: str(raw) for label in _registered_policy_labels(kwargs, "worker_model_policy")
         }
-    stt_endpoint = values.get("WEBSEARCH_STT_ENDPOINT")
-    if stt_endpoint:
-        kwargs["stt_endpoint"] = parse_endpoint(str(stt_endpoint))
-    elif values.get("WEBSEARCH_STT_WS_SOCKET"):
+    # Endpoint families resolve by LAYER precedence first, key priority second
+    # -- see _winning_endpoint_member. Key priority alone let `[stt] stt_ws_uri`
+    # in config.toml (layer 0) beat `WEBSEARCH_STT_WS_SOCKET` exported in the
+    # process environment (layer 2), silently connecting to the endpoint the
+    # operator's highest-precedence override had replaced. This closes the gap
+    # _clear_inherited_reasoning_effort's docstring signposted.
+    stt_member = _winning_endpoint_member(
+        values,
+        layers,
+        (("endpoint", ("WEBSEARCH_STT_ENDPOINT",)), ("socket", ("WEBSEARCH_STT_WS_SOCKET",))),
+    )
+    if stt_member == "endpoint":
+        kwargs["stt_endpoint"] = parse_endpoint(str(values["WEBSEARCH_STT_ENDPOINT"]))
+    elif stt_member == "socket":
         kwargs["stt_endpoint"] = ("uds", _expand_socket(str(values["WEBSEARCH_STT_WS_SOCKET"])))
-    tts_endpoint = values.get("WEBSEARCH_TTS_ENDPOINT")
-    if tts_endpoint:
-        kwargs["tts_endpoint"] = parse_endpoint(str(tts_endpoint))
-    else:
-        tts_uri = values.get("WEBSEARCH_TTS_WS_URI")
-        tts_socket = values.get("WEBSEARCH_TTS_WS_SOCKET")
-        tts_host = values.get("WEBSEARCH_TTS_WS_HOST")
-        tts_port = values.get("WEBSEARCH_TTS_WS_PORT")
-        if tts_uri:
-            kwargs["tts_endpoint"] = parse_endpoint(str(tts_uri))
-        elif tts_socket:
-            kwargs["tts_endpoint"] = ("uds", _expand_socket(str(tts_socket)))
-        elif tts_host and tts_port:
-            try:
-                port = int(str(tts_port))
-            except ValueError as exc:
-                raise ConfigError("WEBSEARCH_TTS_WS_PORT must be an integer") from exc
-            if not 1 <= port <= 65_535:
-                raise ConfigError("WEBSEARCH_TTS_WS_PORT must be between 1 and 65535")
-            kwargs["tts_endpoint"] = ("ws", f"{tts_host}:{port}")
+    tts_host = values.get("WEBSEARCH_TTS_WS_HOST")
+    tts_port = values.get("WEBSEARCH_TTS_WS_PORT")
+    if bool(tts_host) != bool(tts_port):
+        # Half a pair is malformed input, and every other malformed endpoint
+        # input here is loud (non-integer port, out-of-range port). Falling
+        # through the chain silently substituted the dataclass default endpoint.
+        raise ConfigError("WEBSEARCH_TTS_WS_HOST and WEBSEARCH_TTS_WS_PORT must be set together")
+    tts_member = _winning_endpoint_member(
+        values,
+        layers,
+        (
+            ("endpoint", ("WEBSEARCH_TTS_ENDPOINT",)),
+            ("uri", ("WEBSEARCH_TTS_WS_URI",)),
+            ("socket", ("WEBSEARCH_TTS_WS_SOCKET",)),
+            ("host_port", ("WEBSEARCH_TTS_WS_HOST", "WEBSEARCH_TTS_WS_PORT")),
+        ),
+    )
+    if tts_member == "endpoint":
+        kwargs["tts_endpoint"] = parse_endpoint(str(values["WEBSEARCH_TTS_ENDPOINT"]))
+    elif tts_member == "uri":
+        kwargs["tts_endpoint"] = parse_endpoint(str(values["WEBSEARCH_TTS_WS_URI"]))
+    elif tts_member == "socket":
+        kwargs["tts_endpoint"] = ("uds", _expand_socket(str(values["WEBSEARCH_TTS_WS_SOCKET"])))
+    elif tts_member == "host_port":
+        try:
+            port = int(str(tts_port))
+        except ValueError as exc:
+            raise ConfigError("WEBSEARCH_TTS_WS_PORT must be an integer") from exc
+        if not 1 <= port <= 65_535:
+            raise ConfigError("WEBSEARCH_TTS_WS_PORT must be between 1 and 65535")
+        kwargs["tts_endpoint"] = ("ws", f"{tts_host}:{port}")
     return Config(**kwargs)
 
 

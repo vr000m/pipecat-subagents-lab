@@ -40,10 +40,9 @@ import argparse
 import re
 import subprocess
 import sys
-from datetime import UTC
 from pathlib import Path
 
-from scripts.evidence_common import REPO_ROOT, sha256_bytes
+from scripts.evidence_common import REPO_ROOT, now_utc, read_bytes_no_follow, sha256_bytes
 
 # The deployable runtime identity surface. Deliberately excludes
 # docs/benchmarks/**, shared/schemas/v013-*.json, tests/**, and scripts/**,
@@ -115,22 +114,27 @@ def source_tree_hash() -> str:
     for path in sorted(paths, key=lambda p: str(p.relative_to(REPO_ROOT))):
         rel = str(path.relative_to(REPO_ROOT)).encode("utf-8")
         digest_input += len(rel).to_bytes(4, "big") + rel
-        data = path.read_bytes()
+        # read_bytes_no_follow (scripts/evidence_common.py), not
+        # `path.read_bytes()`: `is_file()` above follows symlinks, so a
+        # tracked symlink matching one of `RUNTIME_TREE_GLOBS` would
+        # otherwise have its out-of-tree target's bytes silently folded into
+        # this release-identity digest, with no size cap. Every other
+        # evidence read on this branch is already hardened the same way; this
+        # one feeds a promotion manifest's identity hash, so it must fail
+        # closed too.
+        data = read_bytes_no_follow(path)
         digest_input += len(data).to_bytes(8, "big") + data
     return sha256_bytes(bytes(digest_input))
 
 
 def deployed_at_utc() -> str:
-    from datetime import datetime
-
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return now_utc()
 
 
 def feature_policy_fingerprint_value() -> str:
-    from server.config import FeaturePolicy, feature_policy_fingerprint, load_config
+    from server.config import effective_feature_policy_fingerprint, load_config
 
-    config = load_config()
-    return feature_policy_fingerprint(FeaturePolicy.from_config(config))
+    return effective_feature_policy_fingerprint(load_config())
 
 
 def _is_dirty() -> bool:

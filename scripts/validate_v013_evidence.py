@@ -26,17 +26,17 @@ import re
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from scripts.evidence_common import (
     REPO_ROOT,
     EvidenceGateError,
+    confine_output_arg,
     confined_evidence_input_path,
-    confined_output_path,
     load_json,
     load_jsonl,
+    now_utc,
     read_bytes_if_present,
     require_hex64,
     require_type,
@@ -46,7 +46,13 @@ from scripts.evidence_common import (
 from scripts.validate_phase2_transport_browser_contract import (
     validate_artifact as validate_transport_browser_artifact,
 )
-from server.config import FeaturePolicy, feature_policy_fingerprint, load_config
+from server.config import (
+    _MANIFEST_REQUIRED_FIELDS,
+    _MANIFEST_REQUIRED_FINAL_INPUTS,
+    _MANIFEST_STRING_FIELDS,
+    effective_feature_policy_fingerprint,
+    load_config,
+)
 
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
 TRANSPORT_SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-transport-browser-contract.json"
@@ -701,7 +707,7 @@ def write_manifest(
         "release_version": load_config().release_version,
         "feature_policy_fingerprint": feature_policy_fingerprint,
         "deployed_at_utc": deployed_at_utc,
-        "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at_utc": now_utc(),
         "inputs": inputs,
     }
     if phase3_input is not None:
@@ -906,6 +912,12 @@ def verify_manifest(manifest_path: Path) -> list[str]:
 
     What is checked, and why each one is drift worth failing on:
 
+    * every field ``server.config._MANIFEST_REQUIRED_FIELDS`` requires is
+      present, and every field ``_MANIFEST_STRING_FIELDS`` names is a JSON
+      string -- the completeness guard at the end of this function only ever
+      caught an *extra* field CI didn't recognize, never a required field
+      that was missing or wrongly typed, which let this gate report clean on
+      a manifest ``load_promotion_manifest`` rejects outright;
     * every declared ``inputs[*].sha256`` still matches the bytes at
       ``inputs[*].path`` -- i.e. nobody edited an evidence artifact without
       regenerating the manifest that vouches for it;
@@ -951,6 +963,37 @@ def verify_manifest(manifest_path: Path) -> list[str]:
 
     drift: list[str] = []
 
+    # Presence + type of every field `load_promotion_manifest` requires. The
+    # uncovered-field guard at the end of this function only ever caught an
+    # *extra*, unrecognized field -- never a required field that was absent
+    # or wrongly typed -- so this gate could report clean (drift == []) on a
+    # manifest `server/config.py`'s loader rejects outright as
+    # `manifest_schema_invalid`: delete `deployed_at_utc`, or set
+    # `source_commit` to a non-string, and this function had nothing that
+    # would notice (round-5 restart, Architecture finding -- the exact
+    # asymmetry the round-4 `confined_evidence_input_path` fix closed for the
+    # declared-input-path rule, now closed here for the top-level field
+    # roster). Reusing `server.config._MANIFEST_REQUIRED_FIELDS`/
+    # `_MANIFEST_STRING_FIELDS` rather than a second hand-copied roster means
+    # this check and the runtime loader's own check cannot independently
+    # drift.
+    missing_required = _MANIFEST_REQUIRED_FIELDS - set(manifest)
+    if missing_required:
+        drift.append(
+            f"manifest is missing required field(s) {sorted(missing_required)} -- "
+            "load_promotion_manifest rejects this manifest outright as manifest_schema_invalid"
+        )
+    wrongly_typed_fields = sorted(
+        name
+        for name in _MANIFEST_STRING_FIELDS
+        if name in manifest and not isinstance(manifest[name], str)
+    )
+    if wrongly_typed_fields:
+        drift.append(
+            f"manifest field(s) {wrongly_typed_fields} must be JSON strings -- "
+            "load_promotion_manifest rejects this manifest outright as manifest_schema_invalid"
+        )
+
     manifest_phase = manifest.get("manifest_phase")
     if manifest_phase not in ("provisional", "final"):
         drift.append(
@@ -965,10 +1008,18 @@ def verify_manifest(manifest_path: Path) -> list[str]:
 
     # The input set the manifest's own `manifest_phase` implies. `write_manifest`
     # requires phase0/1/2 for either phase and additionally phase3 for `final`;
-    # phase3-on-a-provisional and phase4c are both optional extras.
-    required_phases = {"phase0", "phase1", "phase2"}
-    if manifest_phase == "final":
-        required_phases.add("phase3")
+    # phase3-on-a-provisional and phase4c are both optional extras. Derived
+    # from `server.config._MANIFEST_REQUIRED_FINAL_INPUTS` (the same roster
+    # `load_promotion_manifest` itself requires a `final` manifest's `inputs`
+    # to cover) rather than a hand-copied `{"phase0", "phase1", "phase2"}`
+    # literal, so this gate and the runtime consumer it speaks for cannot
+    # silently drift apart on which phases a manifest must declare (round-5
+    # restart, Architecture finding).
+    required_phases = (
+        set(_MANIFEST_REQUIRED_FINAL_INPUTS)
+        if manifest_phase == "final"
+        else set(_MANIFEST_REQUIRED_FINAL_INPUTS) - {"phase3"}
+    )
 
     resolved: dict[str, Path] = {}
     for phase, entry in sorted(inputs.items()):
@@ -1035,7 +1086,7 @@ def verify_manifest(manifest_path: Path) -> list[str]:
             f"release_version drift: manifest says {manifest.get('release_version')!r}, "
             f"the effective config resolves {config.release_version!r}"
         )
-    expected_fingerprint = feature_policy_fingerprint(FeaturePolicy.from_config(config))
+    expected_fingerprint = effective_feature_policy_fingerprint(config)
     if manifest.get("feature_policy_fingerprint") != expected_fingerprint:
         drift.append(
             "feature_policy_fingerprint drift: manifest says "
@@ -1206,24 +1257,16 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             print(f"FAIL: --write-manifest requires {missing}", file=sys.stderr)
             return 1
-        # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
-        # confine every operator-supplied --out/--output to the repo tree before
-        # writing; this evidence writer previously skipped that, so --output
-        # could point at an arbitrary destination such as
-        # .github/workflows/ci.yml despite write_bytes_no_follow already
-        # blocking symlink/FIFO redirection at the resolved path.
-        # The confined result is bound back onto ``args.output`` and is what
-        # every write below uses: the check resolves a relative --output against
-        # ``allowed_root``, but the raw argparse Path an os.open() would see
-        # resolves against the process cwd instead -- so dropping the return
-        # value validates one path and writes another, which is no confinement
-        # at all.
         try:
-            args.output = confined_output_path(args.output, allowed_root=REPO_ROOT)
-        except ValueError as exc:
-            print(f"FAIL: {exc}", file=sys.stderr)
-            return 1
-        try:
+            # confine_output_arg (scripts/evidence_common.py): an
+            # operator-supplied --output is still attacker-influenced surface
+            # (a credentialed run could be invoked with a scripted or
+            # copy-pasted value), so it is confined to the repo tree -- and
+            # rejected as EvidenceGateError, not a bare ValueError, so this
+            # one call folds into the same FAIL/exit-1 gate-error handling as
+            # everything else below rather than needing its own earlier
+            # try/except block.
+            args.output = confine_output_arg(args.output, allowed_root=REPO_ROOT)
             manifest = write_manifest(
                 manifest_phase=args.manifest_phase,
                 phase0_input=args.phase0_input,

@@ -30,8 +30,18 @@ py-check:
 web-test:
     cd web && bun test && bun run lint
 
-# Full compile+test: python checks + web build + web checks + real-process smoke
-check: py-check build web-test smoke
+# Read-only drift check: the committed promotion manifest still matches the
+# evidence it binds. Mirrors CI's `promotion-manifest-drift` job command
+# text exactly (round-5 restart, closing Architecture finding #7: that job
+# runs on `pull_request` -- it is a merge gate -- but had no `just`
+# equivalent, so tests/test_justfile_ci_parity.py's invariant, scoped only
+# to `jobs['test']`, never saw it. The parity test now scans every job that
+# can run on `pull_request`, and this recipe is what makes it pass).
+verify-manifest:
+    uv run python scripts/validate_v013_evidence.py --verify-manifest docs/benchmarks/v0.1.3-promotion-manifest.json
+
+# Full compile+test: python checks + web build + web checks + real-process smoke + manifest drift
+check: py-check build web-test smoke verify-manifest
 
 # Values-redacted provider preflight (same probe backing /api/readyz)
 preflight:

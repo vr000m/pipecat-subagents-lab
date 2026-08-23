@@ -9,6 +9,7 @@ backed ``SpeechLifecycleCoordinator`` rather than relying on the removed
 """
 
 import asyncio
+from dataclasses import replace
 
 from server.contracts import DeliveryState
 from server.session_state import SessionState
@@ -56,6 +57,25 @@ def enqueue_ack(scheduler: SpeechScheduler, *, turn_id: str, text: str = "One mo
         text=text,
         role=ROLE_ACK,
         ack_id=ack_work_item_id,
+    )
+
+
+def _enqueue_ack_with_turn_id(
+    scheduler: SpeechScheduler, *, turn_id: str, text: str = "One moment."
+):
+    """``enqueue_ack`` above omits ``turn_id``; ``TurnAckLedger.on_ack_terminal``
+    only clears a latch when the identity carries one, so tests that assert on
+    the ack-terminal notification need the field ``emit_early_ack`` really
+    supplies."""
+    ack_work_item_id = f"ack-{turn_id}"
+    return scheduler.enqueue(
+        work_item_id=ack_work_item_id,
+        run_id=f"run-{ack_work_item_id}",
+        result_id=None,
+        text=text,
+        role=ROLE_ACK,
+        ack_id=ack_work_item_id,
+        turn_id=turn_id,
     )
 
 
@@ -1026,3 +1046,118 @@ def test_clean_delivery_reports_a_completed_terminal_disposition() -> None:
         assert scheduler.state.speech[item.utterance_id].state == DeliveryState.DELIVERY_COMPLETED
 
     asyncio.run(run())
+
+
+def test_cancel_notifies_ack_terminal_for_a_queued_ack_like_interrupt_does() -> None:
+    """Round-5 restart gauntlet, Logic Important: ``cancel()`` did the
+    structurally identical queued/paused sweep as ``interrupt()`` but never
+    called ``_notify_ack_swept``. ``_emit_progress`` is a deliberate no-op for
+    acks, so the ledger learned nothing about the sweep -- leaving the turn's
+    ack latch set and its in-flight admission-retry chain free to re-enqueue an
+    ack for a turn the user had just cancelled."""
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    terminal_calls: list[tuple[GenerationIdentity, object]] = []
+    scheduler = _scheduler(
+        on_ack_terminal=lambda identity, reason: terminal_calls.append((identity, reason))
+    )
+    _enqueue_ack_with_turn_id(scheduler, turn_id="turn-1")
+
+    cancelled = scheduler.cancel("ack-turn-1")
+
+    assert len(cancelled) == 1
+    assert len(terminal_calls) == 1
+    identity, reason = terminal_calls[0]
+    assert identity.role == ROLE_ACK
+    assert identity.ack_id == "ack-turn-1"
+    assert identity.turn_id == "turn-1"
+    # Not CONNECTION_CLOSED: an explicit cancel leaves the connection live.
+    assert reason == PreAdmissionTerminalReason.CANCELLED
+
+
+def test_cancel_notifies_ack_terminal_for_a_paused_ack() -> None:
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    terminal_calls: list[tuple[GenerationIdentity, object]] = []
+    scheduler = _scheduler(
+        on_ack_terminal=lambda identity, reason: terminal_calls.append((identity, reason))
+    )
+    enqueue_ack(scheduler, turn_id="turn-1")
+    admitted = asyncio.run(scheduler.start_next())
+    assert admitted is not None and admitted.role == ROLE_ACK
+    scheduler.pause("ack-turn-1")
+    assert scheduler.paused("ack-turn-1") is not None
+
+    scheduler.cancel("ack-turn-1")
+
+    assert [reason for _identity, reason in terminal_calls] == [
+        PreAdmissionTerminalReason.CANCELLED
+    ]
+
+
+def test_cancel_all_work_notifies_ack_terminal_for_every_swept_ack() -> None:
+    """Blast radius: the ``work_item_id is None`` (cancel-everything) path
+    sweeps the same sets and must notify for each swept ack too."""
+    terminal_calls: list[tuple[GenerationIdentity, object]] = []
+    scheduler = _scheduler(
+        on_ack_terminal=lambda identity, reason: terminal_calls.append((identity, reason))
+    )
+    _enqueue_ack_with_turn_id(scheduler, turn_id="turn-1")
+    _enqueue_ack_with_turn_id(scheduler, turn_id="turn-2")
+    enqueue(scheduler, "work-other", "unrelated")
+
+    scheduler.cancel()
+
+    assert sorted(identity.turn_id or "" for identity, _reason in terminal_calls) == [
+        "turn-1",
+        "turn-2",
+    ]
+
+
+def test_cancel_of_a_non_ack_item_does_not_notify_ack_terminal() -> None:
+    terminal_calls: list[tuple[GenerationIdentity, object]] = []
+    scheduler = _scheduler(
+        on_ack_terminal=lambda identity, reason: terminal_calls.append((identity, reason))
+    )
+    enqueue(scheduler, "work-1", "a result")
+
+    scheduler.cancel("work-1")
+
+    assert terminal_calls == []
+
+
+def test_resume_resolves_the_paused_item_by_key_not_by_the_passed_in_identity() -> None:
+    """Round-5 restart gauntlet, Logic Minor (reported as an eviction bug; the
+    eviction is not reachable, but the invariant it depends on was unpinned).
+
+    ``_paused`` is keyed by work_item_id, and ``resume()`` pops that key. That
+    is only safe because ``resume()`` re-resolves its target through
+    ``paused(work_item_id)`` first, so the item it pops is always the item
+    stored under that key -- a caller passing a stale/foreign ``SpeechItem``
+    gets the real paused item replayed, never a silent eviction of it. This
+    pins that resolution order, which the now-identity-guarded pop relies on."""
+    scheduler = _scheduler()
+    real = enqueue(scheduler, "work-1", "the real utterance")
+    asyncio.run(scheduler.start_next())
+    scheduler.pause("work-1")
+    assert scheduler.paused("work-1") is real
+
+    stale = replace(real, utterance_id="utt-stale", text="a stale copy")
+    resumed = scheduler.resume(stale)
+
+    assert resumed is not None
+    assert resumed.text == "the real utterance"
+    assert scheduler.paused("work-1") is None
+    assert scheduler.state.speech[real.utterance_id].state == DeliveryState.INTERRUPTED
+
+
+def test_resume_of_an_unpaused_key_leaves_other_paused_items_untouched() -> None:
+    scheduler = _scheduler()
+    paused_item = enqueue(scheduler, "work-1", "paused work")
+    asyncio.run(scheduler.start_next())
+    scheduler.pause("work-1")
+    other = enqueue(scheduler, "work-2", "never paused")
+
+    scheduler.resume(other)
+
+    assert scheduler.paused("work-1") is paused_item

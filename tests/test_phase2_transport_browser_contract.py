@@ -288,6 +288,31 @@ def test_validator_rejects_a_source_anchor_matching_only_the_bare_leaf_name(
         module.validate_artifact(json.loads(path.read_text()))
 
 
+def test_validator_rejects_a_source_anchor_on_an_unallowlisted_host(tmp_path: Path) -> None:
+    """Round-5 restart, Security finding regression: the org/leaf-pair
+    tightening (round 4) still checked the anchor as two unanchored substring
+    tests (``org_leaf in anchor and locked_version in anchor``), so an anchor
+    on a completely untrusted host that merely embeds both substrings in its
+    path -- e.g. ``https://evil.example/pipecat-ai/small-webrtc-transport/
+    tree/v1.10.6`` -- passed as if it named the real, allowlisted source."""
+    module = _load_validator()
+    forged_anchor = (
+        f"https://evil.example/pipecat-ai/small-webrtc-transport/tree/v{PINNED_PACKAGE_VERSION}"
+    )
+    path = _write(tmp_path, _valid_artifact(source_anchor=forged_anchor))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_accepts_the_exact_npm_scoped_anchor_form(tmp_path: Path) -> None:
+    """The closed-set replacement for the substring check must still accept
+    the legitimate npm-scoped spelling, not just github.com URLs."""
+    module = _load_validator()
+    npm_anchor = f"{PACKAGE_NAME}@{PINNED_PACKAGE_VERSION}"
+    path = _write(tmp_path, _valid_artifact(source_anchor=npm_anchor))
+    module.validate_artifact(json.loads(path.read_text()))
+
+
 def test_validator_rejects_a_verified_claim_missing_the_checked_source_tree_hash(
     tmp_path: Path,
 ) -> None:

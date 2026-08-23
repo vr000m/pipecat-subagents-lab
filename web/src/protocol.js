@@ -21,10 +21,16 @@ export const RTVI_MESSAGE_KINDS = Object.freeze([
 const runtimeKinds = new Set(RTVI_MESSAGE_KINDS);
 const groundedResultKeys = Object.freeze(Object.keys(groundedResultSchema.properties));
 // "work_status" is the one optional runtime-snapshot key: non-capable
-// projections omit it entirely (field absent, not an empty array), so the
-// exact-key check below treats it separately rather than requiring it.
+// projections omit it entirely (field absent, not an empty array). Named
+// once here and threaded through to `hasExactKeys` as its `optionalKeys`
+// argument below (round-5 restart, Architecture finding #19 -- this used to
+// be a bespoke extra/missing-key comparison with "work_status" hardcoded a
+// second time inside it).
+const RUNTIME_SNAPSHOT_OPTIONAL_KEYS = Object.freeze(["work_status"]);
 const runtimeSnapshotKeys = Object.freeze(
-  Object.keys(runtimeSnapshotSchema.properties).filter((key) => key !== "work_status"),
+  Object.keys(runtimeSnapshotSchema.properties).filter(
+    (key) => !RUNTIME_SNAPSHOT_OPTIONAL_KEYS.includes(key),
+  ),
 );
 // shared/schemas/work-status.json lists every one of these as `required`, so
 // the browser check is symmetric (no extra keys AND no missing keys) rather
@@ -64,11 +70,19 @@ function validOrigin(value) {
   return value === undefined || value === null || (Number.isInteger(value) && value >= 0);
 }
 
-function hasExactKeys(value, expectedKeys) {
+// `optionalKeys` (round-5 restart, Architecture finding #19) covers fields
+// that may be entirely absent -- not present-but-nullable -- on the wire:
+// runtime_snapshot's `work_status` is the one case today (non-capable
+// projections omit it, they don't send an empty array). Every key not in
+// `requiredKeys` or `optionalKeys` is still rejected as extra, and every
+// `requiredKeys` entry must still be present -- only `optionalKeys` entries
+// are allowed to be missing.
+function hasExactKeys(value, requiredKeys, optionalKeys = []) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const allowedKeys = new Set([...requiredKeys, ...optionalKeys]);
   const actualKeys = Object.keys(value);
-  return actualKeys.length === expectedKeys.length &&
-    expectedKeys.every((key) => Object.hasOwn(value, key));
+  return actualKeys.every((key) => allowedKeys.has(key)) &&
+    requiredKeys.every((key) => Object.hasOwn(value, key));
 }
 
 function validTimestamp(value) {
@@ -190,12 +204,7 @@ export function validateServerMessage(message) {
     if (message.kind === "bot_transcript" && data.role !== "assistant") return false;
   }
   if (message.kind === "runtime_snapshot") {
-    const extraKeys = Object.keys(data).filter(
-      (key) => !runtimeSnapshotKeys.includes(key) && key !== "work_status",
-    );
-    if (extraKeys.length > 0 || !runtimeSnapshotKeys.every((key) => Object.hasOwn(data, key))) {
-      return false;
-    }
+    if (!hasExactKeys(data, runtimeSnapshotKeys, RUNTIME_SNAPSHOT_OPTIONAL_KEYS)) return false;
     if (Object.hasOwn(data, "work_status")) {
       if (!Array.isArray(data.work_status) || !data.work_status.every(validWorkStatus)) return false;
     }

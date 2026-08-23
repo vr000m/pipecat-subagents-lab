@@ -182,6 +182,82 @@ def test_the_bumped_0_1_3_release_section_does_not_exist_yet() -> None:
     assert '"0.1.3"' not in real_pyproject_text
 
 
+VALID_CI_YML = """\
+jobs:
+  promotion-manifest-drift:
+    steps:
+      - name: Verify the committed promotion manifest has not drifted
+        run: uv run python scripts/validate_v013_evidence.py --verify-manifest docs/benchmarks/v0.1.3-promotion-manifest.json
+"""
+
+
+def test_rejects_ci_yml_manifest_path_stale_after_a_version_bump(tmp_path: Path) -> None:
+    """Round-5 restart regression (Architecture finding #11): ci.yml's
+    promotion-manifest-drift job hardcodes a version-stamped manifest path
+    that the scripts/*.py-scoped hardcoded-literal guard never scanned. Bump
+    pyproject.toml/CHANGELOG.md's version without updating ci.yml's path and
+    this must fail loudly instead of silently green-checking a manifest
+    nothing consumes."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(
+        tmp_path,
+        pyproject_text=VALID_PYPROJECT.replace("0.1.3", "0.1.4"),
+        changelog_text=VALID_CHANGELOG.replace("0.1.3", "0.1.4"),
+    )
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(VALID_CI_YML, encoding="utf-8")  # still says v0.1.3
+
+    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_accepts_ci_yml_manifest_path_matching_the_current_version(tmp_path: Path) -> None:
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(VALID_CI_YML, encoding="utf-8")  # says v0.1.3, matches
+
+    version = module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+    assert version == "0.1.3"
+
+
+def test_ci_yml_check_is_skipped_when_ci_yml_path_is_omitted(tmp_path: Path) -> None:
+    """Callers that only care about pyproject/CHANGELOG agreement (every
+    other test in this file that calls `check()` directly) must not be
+    forced to also fixture a ci.yml -- version 0.1.4 here would fail the
+    ci.yml check above if it ran, so this proves it doesn't."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(
+        tmp_path,
+        pyproject_text=VALID_PYPROJECT.replace("0.1.3", "0.1.4"),
+        changelog_text=VALID_CHANGELOG.replace("0.1.3", "0.1.4"),
+    )
+    version = module.check(pyproject_path, changelog_path)
+    assert version == "0.1.4"
+
+
+def test_main_cli_checks_ci_yml_by_default_against_the_real_repo_file() -> None:
+    """The real CLI entrypoint always passes --ci-yml (default: the repo's
+    own ci.yml), so this check is live for the actual release gate even
+    though `check()` itself treats it as opt-in. Overlaps with
+    `test_default_paths_point_at_the_real_repo_files_and_agree_on_a_version`
+    but asserts the ci.yml wiring specifically, not just an exit code."""
+    module = _load_script()
+    exit_code = module.main([])
+    assert exit_code == 0
+
+
+def test_main_cli_reports_ci_yml_drift_via_default_path() -> None:
+    """`main()`'s default `--ci-yml` must actually be consulted, not just
+    accepted and ignored -- point it at a ci.yml that doesn't mention the
+    real repo's version and confirm the CLI fails."""
+    module = _load_script()
+    stale_ci_yml = REPO_ROOT / "tests" / "does-not-exist-ci.yml"
+    assert not stale_ci_yml.exists()
+    exit_code = module.main(["--ci-yml", str(stale_ci_yml)])
+    assert exit_code != 0
+
+
 def test_main_cli_supports_the_plan_mandated_version_argument(tmp_path: Path) -> None:
     """Plan Testing Notes / final CI-equivalent command (line 398):
     ``uv run python scripts/check_release_metadata.py --version 0.1.3``.

@@ -27,7 +27,7 @@ from uuid import uuid4
 
 from .contracts import GroundedResult, WorkerState
 from .results import canonical_result
-from .workers.web_search import ClarificationContext
+from .workers.base import ClarificationContext
 
 if TYPE_CHECKING:
     from .session_state import SessionState

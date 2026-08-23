@@ -67,7 +67,6 @@ import json
 import os
 import random
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +74,8 @@ from scripts.evidence_common import (
     REPO_ROOT,
     EvidenceGateError,
     closed_object,
-    confined_output_path,
+    confine_output_arg,
+    now_utc,
     require_type,
     write_bytes_no_follow,
 )
@@ -249,7 +249,7 @@ def build_dry_run_artifact(
             f"unknown --dimension {dimension!r}; must be one of {sorted(SELECTABLE_DIMENSIONS)}"
         )
     fixture_version = fixture["fixture_version"]
-    generated_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_at = now_utc()
     run_id = f"dry-run-{seed}"
     baseline_value = BASELINE_VALUE if dimension == "history_count" else DEFAULT_ANSWER_CHAR_LIMIT
 
@@ -385,21 +385,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--value", type=int, action="append", default=None)
     args = parser.parse_args(argv)
 
-    # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
-    # confine every operator-supplied --out/--output to the repo tree before
-    # writing; this evidence writer previously skipped that, so --output
-    # could point at an arbitrary destination such as .github/workflows/ci.yml
-    # despite write_bytes_no_follow already blocking symlink/FIFO redirection
-    # at the resolved path.
-    # The confined result is bound back onto ``args.output`` and is what
-    # every write below uses: the check resolves a relative --output against
-    # ``allowed_root``, but the raw argparse Path an os.open() would see
-    # resolves against the process cwd instead -- so dropping the return
-    # value validates one path and writes another, which is no confinement
-    # at all.
     try:
-        args.output = confined_output_path(args.output, allowed_root=REPO_ROOT)
-    except ValueError as exc:
+        # confine_output_arg (scripts/evidence_common.py): an operator-supplied
+        # --output is still attacker-influenced surface (a credentialed run
+        # could be invoked with a scripted or copy-pasted value), so it is
+        # confined to the repo tree before either the live or dry-run branch
+        # below ever writes through it. Kept as its own try/except (rather
+        # than folded into the try block further down, as the other
+        # evidence-gate scripts now do) because `--live` returns early, before
+        # that block runs.
+        args.output = confine_output_arg(args.output, allowed_root=REPO_ROOT)
+    except EvidenceGateError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 

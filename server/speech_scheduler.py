@@ -91,10 +91,14 @@ class SpeechScheduler:
         # start_next's own broad except clause can observe and swallow it).
         self._discarded = False
 
-    def _notify_ack_swept(self, item: SpeechItem) -> None:
-        """Route an ack discarded by ``interrupt()``'s queued/paused sweep
-        through the same ack-terminal notification ``start_next`` uses for
-        its ``PreAdmissionTerminal`` branch.
+    def _notify_ack_swept(
+        self,
+        item: SpeechItem,
+        reason: PreAdmissionTerminalReason = PreAdmissionTerminalReason.CONNECTION_CLOSED,
+    ) -> None:
+        """Route an ack discarded by a queued/paused sweep through the same
+        ack-terminal notification ``start_next`` uses for its
+        ``PreAdmissionTerminal`` branch.
 
         ``_emit_progress`` is a deliberate no-op for acks (they are
         wire-invisible), so without this an ack swept here would vanish
@@ -102,12 +106,16 @@ class SpeechScheduler:
         terminal ack path's latch clear (``server/turn_ack_ledger.py``'s
         ``TurnAckLedger.on_ack_terminal``, wired in via
         ``SessionHost.on_ack_terminal``, which clears the owning turn's ack
-        latch). ``CONNECTION_CLOSED`` is
-        reused here rather than adding a new enum member: this sweep only
-        runs when the scheduler itself is being discarded for good
-        (``reconnect``/``full_stop``), the same "this connection is gone"
-        condition that reason already models, and the callback does not
-        branch on the reason value today regardless.
+        latch).
+
+        Two callers, two reasons. ``interrupt()``'s sweep runs only when the
+        scheduler is being discarded for good (``reconnect``/``full_stop``),
+        which is what the default ``CONNECTION_CLOSED`` models. ``cancel()``
+        does the structurally identical sweep on a connection that is still
+        live, and passes ``CANCELLED``; that call site was previously missing
+        altogether, so a cancelled ack's ledger state was never reconciled and
+        its in-flight admission-retry chain could re-enqueue an ack for a turn
+        the user had already cancelled (round-5 restart, Logic Important).
         """
         if item.role != ROLE_ACK or self._on_ack_terminal is None:
             return
@@ -119,7 +127,7 @@ class SpeechScheduler:
             turn_id=item.turn_id,
             ack_id=item.ack_id,
         )
-        self._on_ack_terminal(identity, PreAdmissionTerminalReason.CONNECTION_CLOSED)
+        self._on_ack_terminal(identity, reason)
 
     def _signal_stop(self, item: SpeechItem) -> None:
         if self.stop is None:
@@ -633,7 +641,18 @@ class SpeechScheduler:
             item = target
         if item is None:
             return None
-        self._paused.pop(item.work_item_id, None)
+        # Identity-guarded, not key-guarded. ``_paused`` is keyed by
+        # work_item_id, so a bare ``pop(key)`` removes whatever is stored there
+        # regardless of what ``item`` is. Today that can never evict the wrong
+        # item -- ``item`` is either ``paused(work_item_id)`` itself or a target
+        # for a key with nothing paused, where the pop is a no-op -- so this
+        # guard is invariant-preserving, not a behaviour change (round-5
+        # restart, Logic Minor: reported as reachable, verified not to be). It
+        # keeps the pop honest if a future caller ever supplies an ``item``
+        # this method did not resolve, since an evicted paused item would
+        # vanish mid-state with no PAUSED->terminal transition emitted for it.
+        if self._paused.get(item.work_item_id) is item:
+            del self._paused[item.work_item_id]
         if item.role == ROLE_ACK:
             # A plain re-enqueue here would bypass TurnAckLedger's bounded
             # admission chain (_schedule_ack_admission's 4-attempt/0.25s
@@ -707,12 +726,17 @@ class SpeechScheduler:
         for key in keys:
             for item in self._queues.pop(key, []):
                 self._emit_progress(item, DeliveryState.INTERRUPTED)
+                # ``_emit_progress`` is a no-op for acks, so without this the
+                # ledger learns nothing about an ack swept here -- mirroring
+                # interrupt()'s sweep, which has always notified.
+                self._notify_ack_swept(item, PreAdmissionTerminalReason.CANCELLED)
                 cancelled.append(item)
         paused_keys = [work_item_id] if work_item_id is not None else list(self._paused)
         for key in paused_keys:
             item = self._paused.pop(key, None)
             if item is not None:
                 self._emit_progress(item, DeliveryState.INTERRUPTED)
+                self._notify_ack_swept(item, PreAdmissionTerminalReason.CANCELLED)
                 cancelled.append(item)
         return tuple(cancelled)
 

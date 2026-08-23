@@ -32,7 +32,6 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +54,7 @@ from scripts.eval_common import (
     git_head,
     write_no_follow,
 )
+from scripts.evidence_common import now_utc
 
 # MANIFEST_VERSION/DEFAULT_JUDGE_MODEL/REPO_ROOT hoisted from
 # scripts/eval_common.py (round 5, Architecture lens finding 2; REPO_ROOT
@@ -441,7 +441,15 @@ def write_manifest(out_path: Path, results: list[ProbeResult]) -> dict[str, Any]
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "source_commit": git_head(),
-        "verified_at_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        # now_utc() (scripts/evidence_common.py): this used to be spelled
+        # `datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00",
+        # "Z")` here -- a different code path from every other
+        # `generated_at_utc` writer's `strftime("%Y-%m-%dT%H:%M:%SZ")`, but
+        # producing the exact same second-precision "Z"-suffixed string, not
+        # a genuinely different timestamp contract. Routed through the one
+        # shared helper so there are not two spellings of the same format
+        # (round-5 restart, Architecture finding).
+        "verified_at_utc": now_utc(),
         "results": [asdict(result) for result in results],
     }
     # confined_output_path()/write_no_follow(): an operator-supplied --out

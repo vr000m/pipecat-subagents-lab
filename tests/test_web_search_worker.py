@@ -7,9 +7,8 @@ from typing import Any
 
 import pytest
 
-from server.workers.base import ContextWorker, WorkerMetadata
+from server.workers.base import ClarificationContext, ContextWorker, WorkerMetadata
 from server.workers.web_search import (
-    ClarificationContext,
     WebSearchWorker,
     WorkerClarify,
     WorkerDeclined,

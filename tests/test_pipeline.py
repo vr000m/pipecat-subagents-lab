@@ -47,7 +47,8 @@ from server.speech_lifecycle import (
 from server.speech_scheduler import ROLE_ACK, ROLE_RESULT, ROLE_TIMEOUT_NOTICE
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.work_item_coordinator import LateResult, WorkItemCoordinator
-from server.workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
+from server.workers.base import ClarificationContext
+from server.workers.web_search import WorkerClarify, WorkerDeclined
 
 
 class RoutedCoordinator:
@@ -9937,3 +9938,234 @@ def test_reclaiming_a_turns_generation_still_increments_monotonically() -> None:
     second = ledger._claim_ack_admission_generation("turn-a")
 
     assert (first, second) == (1, 2)
+
+
+def test_evicted_generation_entry_does_not_orphan_a_live_ack_chains_latch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-5 restart gauntlet, Logic Minor -- the residual hole in the
+    ``_MAX_ACK_GENERATION_TURNS`` bound, not the bound itself.
+
+    Both staleness bail-outs were written as
+    ``if self._ack_admission_generation.get(turn_id) != generation: return``.
+    Once the LRU cap evicts a still-live chain's entry, ``.get()`` returns
+    ``None``, ``None != generation`` is true, and the chain takes the
+    "superseded by a newer chain" exit -- which returns WITHOUT settling,
+    because its premise is that a newer chain exists and will settle. After
+    eviction no chain exists, so the queued ack and its latch were never
+    released. Absence must therefore mean "evicted, still mine", not
+    "superseded"."""
+    import server.turn_ack_ledger as turn_ack_ledger_module
+    from server.speech_scheduler import ROLE_ACK
+
+    monkeypatch.setattr(turn_ack_ledger_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.05)
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+        ledger = host._turn_ack_ledger
+        turn_id = "turn-evicted"
+        ack_work_item_id = "ack-turn-evicted"
+
+        async def always_failing_start_next(work_item_id: str | None = None):
+            raise RuntimeError("worker not attached yet")
+
+        origin.scheduler.start_next = always_failing_start_next  # type: ignore[method-assign]
+
+        def enqueue_ack() -> None:
+            origin.scheduler.enqueue(
+                result_id=None,
+                work_item_id=ack_work_item_id,
+                run_id=f"run-{ack_work_item_id}",
+                text="One moment.",
+                origin_epoch=origin.epoch,
+                role=ROLE_ACK,
+                ack_id=ack_work_item_id,
+                turn_id=turn_id,
+            )
+
+        ledger._ack_emitted_turns.add(turn_id)
+        enqueue_ack()
+        ledger._schedule_ack_admission(
+            origin, ack_work_item_id, enqueue_ack, turn_id=turn_id, origin_epoch=origin.epoch
+        )
+        # Evict this live chain's own generation entry, exactly as
+        # _MAX_ACK_GENERATION_TURNS eviction would once enough later turns
+        # latch inside the chain's ~1s lifetime.
+        for _ in range(200):
+            if turn_id in ledger._ack_admission_generation:
+                break
+            await asyncio.sleep(0.005)
+        del ledger._ack_admission_generation[turn_id]
+
+        # Let the whole bounded retry chain run to its abandon branch.
+        await asyncio.sleep(0.6)
+
+        assert turn_id not in ledger._ack_emitted_turns, (
+            "an evicted-but-live chain must still settle its turn's ack latch, "
+            "not read itself as superseded and return without settling"
+        )
+        assert ack_work_item_id not in origin.scheduler._queues, (
+            "the orphaned ack must be discarded from the scheduler queue too"
+        )
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_canonical_adapter_asks_its_connections_entitlement_not_the_wire_bytes() -> None:
+    """Round-5 restart gauntlet, Architecture Important: the adapter
+    reconstructed the work_status_v1 capability gate by sniffing whether the
+    key was present in the already-serialized inbound payload -- a third
+    derivation of a decision ``server/contracts.py`` documents as living in
+    exactly one predicate (``resolve_work_status_wire_presence``, whose sole
+    caller is ``RuntimeObserver.supports_work_status`` by design).
+
+    The adapter is constructed per connection in ``app.py``, so it now holds
+    that connection's entitlement thunk and consults it. This test proves the
+    thunk is the authority: with the entitlement OFF the field is dropped even
+    though the inbound payload carries it, and with it ON the field survives.
+    """
+
+    async def run() -> None:
+        entitled = True
+
+        adapter = CanonicalResultAdapter(lambda: entitled)
+
+        async def push(frame: object, _direction: object) -> None:
+            return None
+
+        adapter.push_frame = push  # type: ignore[method-assign]
+
+        def envelope(payload_extra: dict[str, object]) -> RTVIServerMessageFrame:
+            payload = {
+                "contract_version": "v1.0",
+                "session_id": "entitlement-session",
+                "snapshot_sequence": 11,
+                "workers": [],
+                "results": [],
+                "speech_progress": [],
+                "routing": None,
+                "transcript": [],
+                "origin_epoch": 2,
+            }
+            payload.update(payload_extra)
+            return RTVIServerMessageFrame(
+                data={
+                    "contract_version": "v1.0",
+                    "session_id": "entitlement-session",
+                    "sequence": 11,
+                    "kind": "runtime_snapshot",
+                    "data": payload,
+                    "origin_epoch": 2,
+                }
+            )
+
+        capable = envelope({"work_status": []})
+        await adapter.process_frame(capable, FrameDirection.DOWNSTREAM)
+        assert capable.data["data"]["work_status"] == []
+
+        entitled = False
+        revoked = envelope({"work_status": []})
+        await adapter.process_frame(revoked, FrameDirection.DOWNSTREAM)
+        assert "work_status" not in revoked.data["data"], (
+            "the connection's entitlement, not the inbound payload's key set, "
+            "must decide wire presence"
+        )
+
+    asyncio.run(run())
+
+
+def test_attach_connection_wires_the_adapter_to_the_connections_entitlement() -> None:
+    """The thunk above is only the authority if ``app.py`` actually supplies
+    it -- an adapter constructed with no entitlement silently falls back to
+    mirroring the payload."""
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "server" / "app.py").read_text(encoding="utf-8")
+    constructions = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CanonicalResultAdapter"
+    ]
+
+    assert constructions, "app.py must construct the adapter"
+    assert all(call.args or call.keywords for call in constructions), (
+        "every app.py CanonicalResultAdapter must be given its connection's "
+        "supports_work_status entitlement"
+    )
+
+
+def test_late_commit_after_a_reconnect_does_not_settle_against_the_new_epochs_scheduler() -> None:
+    """Round-5 restart gauntlet, Logic Minor: ``commit_late_result_once``'s
+    ``finally`` settled the turn ack against ``self.connection`` -- the LIVE
+    connection, re-pointed on every reconnect/epoch promotion -- rather than
+    against the epoch the committing turn belongs to.
+
+    A late result that outlives its originating connection therefore reached
+    into the new epoch's scheduler and discarded ITS queued ack, for a turn
+    that scheduler never owned. Every other epoch-sensitive step in the method
+    already fences on ``context``'s own epoch."""
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        old = await host.connect(connection_handshake(host, 1))
+        old.worker = QueueingPipelineWorker()
+
+        # A reconnect promotes epoch 2; `host.connection` now points at it.
+        new = await host.connect(connection_handshake(host, 2))
+        new.worker = QueueingPipelineWorker()
+        assert host.connection is new
+
+        # The new epoch has its own live turn with its own queued ack.
+        new_turn_id = "turn-new-epoch"
+        new_ack_work_item_id = f"ack-{new_turn_id}"
+        host._turn_ack_ledger._ack_emitted_turns.add(new_turn_id)
+        new.scheduler.enqueue(
+            result_id=None,
+            work_item_id=new_ack_work_item_id,
+            run_id=f"run-{new_ack_work_item_id}",
+            text="One moment.",
+            origin_epoch=2,
+            role=ROLE_ACK,
+            ack_id=new_ack_work_item_id,
+            turn_id=new_turn_id,
+        )
+
+        # A result for the RETIRED epoch's turn commits late. Its turn id
+        # happens to be the new epoch's turn id -- the collision the unfenced
+        # settle could not distinguish, and exactly what makes the bug
+        # observable rather than merely untidy.
+        stale_result = GroundedResult(
+            result_id="result-stale-epoch",
+            worker_id="worker-search",
+            turn_id=new_turn_id,
+            text="A result from the retired epoch.",
+            spoken_text="A result from the retired epoch.",
+            origin_epoch=1,
+        )
+        await host.commit_late_result_once(
+            LateDeliveryContext(
+                turn_id=new_turn_id,
+                work_item_id="work-retired-epoch",
+                origin_epoch=1,
+                ack_timestamp=None,
+                accepted_turn_sequence=host._turn_sequence,
+            ),
+            LateResult(
+                work_item_id="work-retired-epoch",
+                worker_id="worker-search",
+                result=stale_result,
+            ),
+        )
+
+        assert new.scheduler._queues.get(new_ack_work_item_id), (
+            "the live epoch's queued ack must survive a late commit belonging to a retired epoch"
+        )
+        await host.shutdown()
+
+    asyncio.run(run())

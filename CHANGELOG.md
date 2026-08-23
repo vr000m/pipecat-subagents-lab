@@ -371,6 +371,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `server/config.py`: `_read_regular_file_no_follow` is now the public
     `read_regular_file_no_follow`, since `server/session_state.py` reads
     through it too and the underscore name misstated it as config-private.
+- Restart-gauntlet round 5 (`b6ce9d2`..) fixed all 28 findings a fresh
+  full-corpus 4-lens review raised (documentation returned zero, the first
+  clean lens of the restart). Four were real production bugs:
+  - `server/config.py` treated an operator's explicit numeric `0` as absent.
+    `[turn] max_citations = 0`, `smart_turn_timeout_seconds = 0`, and their
+    siblings were gated on a truthiness walrus, so TOML's real integers/floats
+    evaluated falsy, the key was dropped, and the packaged default was
+    substituted — bypassing the `__post_init__` range checks that exist to
+    reject those values by name. Now membership-gated, matching the round-7 fix
+    for the string fields. Two unwrapped `int()` conversions that escaped as a
+    bare `ValueError` now raise the field-named `ConfigError` every sibling
+    raises.
+  - `server/config.py` resolved the STT/TTS endpoint families by hardcoded key
+    priority, ignoring the layered precedence system the rest of the loader
+    uses: `[tts] tts_ws_uri` in `config.toml` (layer 0) silently beat a
+    `WEBSEARCH_TTS_WS_SOCKET` exported in the process environment (layer 2), so
+    the service connected to the endpoint the operator's highest-precedence
+    override had replaced. The family now resolves by layer first, with key
+    priority breaking only a same-layer tie. Closes the gap
+    `_clear_inherited_reasoning_effort`'s docstring had signposted since round 4.
+    A half-specified `WEBSEARCH_TTS_WS_HOST`/`_PORT` pair is now a startup error
+    rather than a silent fall-through to the dataclass default.
+  - `SpeechScheduler.cancel()` swept queued and paused ack items without
+    calling `_notify_ack_swept`, asymmetric with `interrupt()`. Since
+    `_emit_progress` is a deliberate no-op for acks, the turn-ack ledger learned
+    nothing about a cancelled ack: its latch stayed set and an in-flight
+    admission-retry chain could re-enqueue an ack for a turn the user had just
+    cancelled. `cancel()` now notifies with a new `PreAdmissionTerminalReason.
+    CANCELLED` (the connection is still live, so `CONNECTION_CLOSED` would have
+    misreported the cause).
+  - `SessionHost.commit_late_result_once`'s `finally` settled the turn ack
+    against `self.connection` — the *live* connection, re-pointed on every
+    reconnect — rather than the epoch the committing turn belongs to. A late
+    result surviving a reconnect discarded the *new* epoch's queued ack and
+    released a latch that scheduler never set. Now fenced on the turn's own
+    origin epoch; on a mismatch only the connection-independent latch half is
+    cleared.
+  - Also: `scripts/validate_v013_evidence.py --verify-manifest`'s completeness
+    guard was one-directional (it rejected unknown manifest fields but never
+    checked that required ones were present and correctly typed), so a manifest
+    missing `deployed_at_utc`, or carrying `source_commit: 123`, passed CI and
+    then failed closed to display-only at boot; the ack-generation LRU bound
+    added in round 2 made an evicted-but-still-live chain read itself as
+    superseded and abandon *without settling*, orphaning its queued ack;
+    `RuntimeSnapshot._highest_by_session` was the one unbounded
+    process-lifetime cache left on the branch; and the justfile/CI parity guard
+    was hardcoded to CI's `test` job, leaving the new pull-request-blocking
+    `promotion-manifest-drift` job with no local `just` equivalent at all
+    (now `just verify-manifest`, reachable from `just check`).
+  - The remaining findings were consolidation follow-through: one shared
+    `evidence_common.now_utc()` replacing seven hand-written UTC stamps in two
+    incompatible formats, one `validate_scored_record` replacing a gate
+    hand-rolled (and already drifting) in two scripts, one
+    `confine_output_arg` replacing a five-times-copy-pasted `--output`
+    confinement idiom, one `effective_feature_policy_fingerprint`,
+    `ClarificationContext` moved to `server/workers/base.py` so a session-level
+    projection no longer imports from a concrete worker, the work-status
+    "replaces the legacy result" predicate named once as
+    `WorkStatusPublisher.replaces_legacy_result_for`, `CanonicalResultAdapter`
+    given its connection's entitlement instead of sniffing it back out of the
+    serialized payload, two more unhardened `read_text()` reads routed through
+    `read_bytes_no_follow`, the Phase 2 `source_anchor` provenance check
+    tightened from two unanchored substring tests to an exact npm-form match,
+    and `web/src/protocol.js`'s bespoke runtime-snapshot key check folded into
+    the shared `hasExactKeys` helper. The `terminal_reason` enum gained the
+    Python-to-schema parity assertion its two siblings already had.
 - `scripts/eval_model_comparison.py`'s citations assertion no longer fails
   weather-query turns that were genuinely delegated and answered correctly:
   the hosted `web_search` tool answers weather via an internal `oai-weather`

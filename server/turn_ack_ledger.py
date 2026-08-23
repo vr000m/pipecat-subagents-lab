@@ -444,7 +444,8 @@ class TurnAckLedger:
             # path never dequeued the item in the first place (start_next
             # returns early, before popping, when the slot is occupied), so
             # calling ``enqueue_ack()`` there would queue a duplicate.
-            if self._ack_admission_generation.get(turn_id) != generation:
+            current_generation = self._ack_admission_generation.get(turn_id)
+            if current_generation is not None and current_generation != generation:
                 # This chain has been superseded: the turn's latch was
                 # cleared (settle/abandon) and a later eligible sibling
                 # already started a fresh chain under the same
@@ -453,6 +454,15 @@ class TurnAckLedger:
                 # and wrongly treat that as proof this stale chain is still
                 # current -- so bail out here first, before touching the
                 # newer chain's queued item or latch at all.
+                #
+                # ``current_generation is None`` is deliberately NOT this
+                # branch: absence means the entry was EVICTED by
+                # _MAX_ACK_GENERATION_TURNS, not that a newer chain exists.
+                # Bailing out on absence took the "a newer chain will settle
+                # it" exit under a premise that no longer holds -- no chain
+                # existed -- so the queued ack and its latch were never
+                # released. Fall through to the normal liveness/retry path
+                # instead (round-5 restart, Logic Minor).
                 logger.debug(
                     "early ack admission chain for {} is stale (superseded by "
                     "a newer chain); dropping it silently",
@@ -524,7 +534,8 @@ class TurnAckLedger:
             retry_task.add_done_callback(self._ack_admission_tasks.discard)
 
         async def admit() -> None:
-            if self._ack_admission_generation.get(turn_id) != generation:
+            current_generation = self._ack_admission_generation.get(turn_id)
+            if current_generation is not None and current_generation != generation:
                 # Stale before ever calling start_next: the turn's latch was
                 # cleared and a later sibling already started a fresh chain
                 # under this same key while this attempt sat scheduled. The
@@ -534,6 +545,10 @@ class TurnAckLedger:
                 # attempt this chain has no business making. Catching it
                 # here, before that call, means a superseded chain never
                 # touches the scheduler at all.
+                #
+                # As in ``_retry_or_abandon``, absence means evicted, not
+                # superseded -- an evicted-but-live chain proceeds normally
+                # rather than dropping its ack and latch on the floor.
                 logger.debug(
                     "early ack admission chain for {} is stale (superseded by "
                     "a newer chain) before starting; dropping it silently",

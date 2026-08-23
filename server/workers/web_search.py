@@ -7,7 +7,6 @@ import inspect
 import re
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -15,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from ..contracts import GroundedResult
 from ..results import canonical_result, normalize_citations
 from ..structured_outputs import structured_text_format
-from .base import ContextWorker, WorkerMetadata
+from .base import ClarificationContext, ContextWorker, WorkerMetadata
 
 
 class WorkerDeclined(Exception):
@@ -28,25 +27,6 @@ class WorkerClarify(Exception):
     def __init__(self, question: str) -> None:
         super().__init__(question)
         self.question = question
-
-
-@dataclass(frozen=True)
-class ClarificationContext:
-    """Typed continuation data rendered only at the provider boundary."""
-
-    original_query: str
-    question: str
-    answer: str
-
-    def provider_query(self) -> str:
-        def bounded(value: str, limit: int) -> str:
-            return " ".join(value.strip().split())[:limit]
-
-        return (
-            f"Original request: {bounded(self.original_query, 650)}\n"
-            f"Clarification asked: {bounded(self.question, 400)}\n"
-            f"User answer: {bounded(self.answer, 800)}"
-        )
 
 
 def default_web_clarification(query: str) -> str | None:

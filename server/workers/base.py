@@ -29,6 +29,36 @@ class WorkerMetadata:
             raise ValueError("worker_id must not be empty")
 
 
+@dataclass(frozen=True)
+class ClarificationContext:
+    """Typed continuation data rendered only at the provider boundary.
+
+    Lives beside ``WorkerMetadata`` rather than in ``workers/web_search.py``:
+    nothing about original_query/question/answer is web-search-specific, and
+    ``server/worker_projection.py`` -- a session-level slice of the SessionHost
+    decomposition, whose siblings depend only on .contracts/.config/
+    .session_state/.perf_metrics -- needs this type. Importing it from a
+    concrete worker implementation coupled that slice to web_search, and a
+    second worker type offering clarification would have had to either import
+    from web_search or grow a parallel type (round-5 restart, Architecture
+    Minor).
+    """
+
+    original_query: str
+    question: str
+    answer: str
+
+    def provider_query(self) -> str:
+        def bounded(value: str, limit: int) -> str:
+            return " ".join(value.strip().split())[:limit]
+
+        return (
+            f"Original request: {bounded(self.original_query, 650)}\n"
+            f"Clarification asked: {bounded(self.question, 400)}\n"
+            f"User answer: {bounded(self.answer, 800)}"
+        )
+
+
 class ContextWorker(_NativeWorker):
     """A small durable worker with one causal mailbox per context owner."""
 

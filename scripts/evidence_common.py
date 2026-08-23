@@ -15,6 +15,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Iterator, Mapping
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from stat import S_ISREG
@@ -73,6 +74,25 @@ class MissingEvidenceInput(EvidenceGateError):
 # per-cell undersizing check and the analyzer's per-stratum pairing check);
 # defined once here so the two scripts cannot drift apart on the minimum.
 MIN_PAIRED_SAMPLES_PER_CELL = 30
+
+
+def now_utc() -> str:
+    """The current UTC instant, formatted ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    Every evidence artifact's ``generated_at_utc`` field is written in this
+    exact format -- ``server/config.py``'s boot-path loader parses it with
+    ``_parse_utc_timestamp``, so the format is a contract between the writer
+    and that parser, not a formatting preference each script was free to pick
+    independently. This was previously hand-written at seven call sites
+    (``analyze_query_context_latency.py`` and ``collect_query_context_latency.py``
+    each wrapped an identical private ``_now_utc``; ``validate_v013_evidence.py``,
+    ``emit_v013_deployment_metadata.py``, ``record_phase3_completion.py``,
+    ``run_query_context_experiment.py``, and ``eval_model_comparison.py`` spelled
+    it inline), all producing the same string -- consolidated here so a future
+    format change happens in one place, not seven (round-5 restart,
+    Architecture finding).
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def sha256_file(path: Path) -> str:
@@ -469,6 +489,44 @@ def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = No
     if any(part.lower() in denylisted_dirs for part in resolved.parts):
         raise ValueError(f"output path must not write under .git/ or .github/: {raw_path!r}")
     return resolved
+
+
+def confine_output_arg(raw_output: str | Path, *, allowed_root: Path) -> Path:
+    """Confine an operator-supplied ``--output``/``--out`` CLI argument to the repo tree.
+
+    A thin wrapper around :func:`confined_output_path` that raises
+    :class:`EvidenceGateError` instead of ``ValueError``, so a caller can fold
+    the confinement check into the same broad ``except (EvidenceGateError,
+    OSError)`` block it already wraps the rest of the gate in, rather than
+    needing a second, earlier ``try/except ValueError`` block just for this
+    one call.
+
+    ``allowed_root`` is a required keyword, not a default of this module's own
+    ``REPO_ROOT``: every calling script keeps its own module-level
+    ``REPO_ROOT`` import specifically so its tests can ``monkeypatch.setattr``
+    that name to a ``tmp_path`` and exercise the real confinement logic
+    without writing into the actual repo tree (see
+    ``tests/test_v013_evidence_validator.py``'s
+    ``_confine_manifest_evidence_root_to_tmp_path`` fixture and its siblings
+    across the other evidence-gate test modules). Defaulting this helper to
+    ``evidence_common.REPO_ROOT`` would silently stop honouring that
+    per-module patch and point every caller back at the real repo root.
+
+    Five evidence-gate scripts (``record_phase3_completion.py``,
+    ``collect_query_context_latency.py``, ``run_query_context_experiment.py``,
+    ``analyze_query_context_latency.py``, ``validate_v013_evidence.py``) used
+    to copy-paste the same prose comment plus ``try/except ValueError: print
+    FAIL; return 1`` block, and the invariant that comment restated in each
+    place -- **the confined return value MUST be bound back onto
+    ``args.output``, or a caller validates one path and writes a different
+    one** -- is exactly the kind of thing a signature enforces better than a
+    comment: returning the confined path here means the caller has nothing
+    else to remember (round-5 restart, Architecture finding).
+    """
+    try:
+        return confined_output_path(raw_output, allowed_root=allowed_root)
+    except ValueError as exc:
+        raise EvidenceGateError(str(exc)) from exc
 
 
 def confined_evidence_input_path(raw_path: str, *, allowed_root: Path | None = None) -> Path | None:

@@ -149,6 +149,49 @@ test("accepts a complete runtime snapshot with an envelope session id", () => {
 })).toBe(true);
 });
 
+// Round-5 restart, Architecture finding #19: `hasExactKeys` gained an
+// `optionalKeys` parameter so runtime_snapshot's one optional field
+// (`work_status`) is handled by the same shared mechanism every other
+// payload validator uses, instead of a bespoke extra/missing-key
+// comparison. These three cases pin the resulting behaviour: optional key
+// absent (accept), optional key present and well-formed (accept), and an
+// actually-unknown key alongside a well-formed optional key (still reject
+// -- proves `optionalKeys` doesn't widen into "anything goes").
+const baseSnapshotData = () => ({
+  contract_version: "v1.0",
+  session_id: "session-1",
+  snapshot_sequence: 5,
+  workers: [],
+  results: [],
+  speech_progress: [],
+  routing: null,
+  transcript: [],
+  origin_epoch: 1,
+});
+
+const snapshotMessage = (data) => ({
+  contract_version: "v1.0",
+  kind: "runtime_snapshot",
+  sequence: 5,
+  session_id: "session-1",
+  origin_epoch: 1,
+  data,
+});
+
+test("accepts a runtime snapshot that omits the optional work_status key entirely", () => {
+  expect(validateServerMessage(snapshotMessage(baseSnapshotData()))).toBe(true);
+});
+
+test("accepts a runtime snapshot carrying a well-formed work_status array", () => {
+  const data = { ...baseSnapshotData(), work_status: [workStatus()] };
+  expect(validateServerMessage(snapshotMessage(data))).toBe(true);
+});
+
+test("rejects a runtime snapshot with an unknown key even when work_status is well-formed", () => {
+  const data = { ...baseSnapshotData(), work_status: [workStatus()], unexpected_private_field: true };
+  expect(validateServerMessage(snapshotMessage(data))).toBe(false);
+});
+
 test("accepts a full display result with a separate concise spoken projection", () => {
   const payload = result("result-1");
   const message = {

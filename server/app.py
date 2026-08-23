@@ -417,7 +417,17 @@ async def _attach_connection(
                 )
             )
         if bridge is not None:
-            processors.extend((bridge, CanonicalResultAdapter()))
+            processors.extend(
+                (
+                    bridge,
+                    # This connection's own work_status_v1 entitlement, read at
+                    # frame time -- so the adapter's re-serialization asks the
+                    # single capability predicate instead of reconstructing it
+                    # from the already-serialized payload (round-5 restart,
+                    # Architecture Important).
+                    CanonicalResultAdapter(lambda: runtime.supports_work_status),
+                )
+            )
         # Placed here, not after TransportSpeechLifecycleProcessor: that
         # processor must remain the sole processor immediately before
         # transport.output() (Phase 1 invariant). RTVIServerMessageFrame-type

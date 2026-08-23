@@ -24,15 +24,26 @@ from pathlib import Path
 from typing import Any
 
 from scripts.evidence_common import (
+    REPO_ROOT,
     EvidenceGateError,
+    FixtureIndex,
     closed_object,
     load_json,
     require_type,
+    validate_against_fixture,
 )
 
 SCORER_VERSION = "v1"
 SELECTABLE_DIMENSIONS = frozenset({"history_count", "answer_chars"})
 CONDITIONS = ("baseline", "narrowed")
+
+#: The committed Phase 4A quality fixture, matching both
+#: ``collect_query_context_latency.py``'s and
+#: ``analyze_query_context_latency.py``'s documented ``--input``/``--output``
+#: invocation. Previously defined identically in both scripts even though
+#: both already imported ``load_fixture`` from this module (round-5 restart,
+#: Architecture finding); moved here alongside the helper that consumes it.
+DEFAULT_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "query-context-quality-v1.json"
 
 RAW_REQUIRED = frozenset(
     {
@@ -266,6 +277,61 @@ def scorer_hash(
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def validate_scored_record(
+    record: dict[str, Any],
+    *,
+    index: FixtureIndex,
+    where: str,
+    reject_status_field: bool = False,
+) -> None:
+    """The composed raw-record gate: shape -> scorer_hash re-derivation -> fixture cross-check.
+
+    Both ``collect_query_context_latency.py`` and
+    ``analyze_query_context_latency.py`` applied this same three-step gate to
+    every raw record -- ``validate_raw_record`` for shape/type/range/enum
+    validation, then a recomputed ``scorer_hash`` comparison proving a
+    record's own fields agree with its self-declared provenance digest, then
+    ``validate_against_fixture`` resolving every matched ID and
+    ``quality_score`` against the versioned fixture -- as two independent,
+    hand-rolled copies, including a verbatim-duplicated error message. Shape
+    validation and the hash's internal self-consistency alone are not enough:
+    an editor who invents unknown fixture IDs and recomputes the hash from
+    those fabricated values passes both, so the fixture cross-check has to
+    run too. Consolidated here (round-5 restart, Architecture finding) so the
+    digest-binding contract and its error text have one home; the two copies
+    had already begun to drift, with the collector rejecting a record
+    carrying a ``status`` field and the analyzer not.
+
+    ``reject_status_field=True`` reproduces that collector-only check: a raw
+    record must never carry a ``status`` field (that vocabulary belongs to
+    the whole-file status-line records this gate never sees). It defaults to
+    ``False`` -- the analyzer's looser behaviour -- so the drift is now an
+    explicit, named parameter instead of an undocumented difference between
+    two copies of the same function.
+    """
+    if reject_status_field and "status" in record:
+        raise EvidenceGateError(f"{where}: raw records must not carry a 'status' field")
+    validate_raw_record(record, where=where)
+    expected_scorer_hash = scorer_hash(
+        record["fixture_version"],
+        record["fixture_turn_id"],
+        matched_fact_ids=record["matched_fact_ids"],
+        matched_citation_ids=record["matched_citation_ids"],
+        matched_disallowed_claim_ids=record["matched_disallowed_claim_ids"],
+        quality_score=record["quality_score"],
+        scorer_version=record["scorer_version"],
+        record=record,
+    )
+    if record["scorer_hash"] != expected_scorer_hash:
+        raise EvidenceGateError(
+            f"{where}: scorer_hash does not match this record's own fields "
+            "-- internally inconsistent scorer provenance (the digest binds every "
+            "field except scorer_hash/fixture_sha256, so any post-scoring edit "
+            "invalidates it)"
+        )
+    validate_against_fixture(record, index=index, where=where)
 
 
 def load_fixture(path: Path) -> dict[str, Any]:

@@ -35,13 +35,25 @@ by both the foreground turn handlers and the late-commit path.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from .contracts import WORK_STATUS_TERMINAL, TerminalReason, WorkStatusState
 
 if TYPE_CHECKING:
     from .config import FeaturePolicy
     from .session_state import SessionState
+
+
+class SupportsWorkStatus(Protocol):
+    """The one attribute ``replaces_legacy_result_for`` needs from a connection.
+
+    A structural type rather than a ``ConnectionPipeline`` import: this slice
+    depends only on .contracts/.config/.session_state, and importing
+    ``pipeline`` here would be a cycle (``pipeline`` imports this module).
+    """
+
+    @property
+    def supports_work_status(self) -> bool: ...
 
 
 def work_status_for_outcome(
@@ -158,6 +170,28 @@ class WorkStatusPublisher:
     def __init__(self, *, state: SessionState, feature_policy: Callable[[], FeaturePolicy]) -> None:
         self.state = state
         self.feature_policy = feature_policy
+
+    def replaces_legacy_result_for(self, origin: SupportsWorkStatus) -> bool:
+        """Whether ``origin`` gets the ``background`` status *instead of* a
+        legacy canonical timeout result.
+
+        The two-term predicate -- this connection negotiated ``work_status_v1``
+        AND the feature is enabled -- was spelled inline at three SessionHost
+        call sites (the single-intent, pending-dialogue, and multi-intent
+        timeout paths), each deciding whether to suppress the legacy result.
+        Both terms are authoritative elsewhere (``emit`` short-circuits on the
+        feature flag; the observer gates wire emission per connection), so a
+        fourth call site remembering only one of them was the drift shape this
+        decomposition exists to remove (round-5 restart, Architecture Minor).
+
+        Distinct from ``emit``'s own gate on purpose: ``emit`` asks "should
+        this status be recorded at all", which is feature-flag-only because
+        the ledger is per-session and the wire projection is filtered per
+        connection downstream. This asks "may the legacy result be suppressed
+        for THIS connection", which additionally requires that the connection
+        can actually see the status replacing it.
+        """
+        return origin.supports_work_status and self.feature_policy().enable_background_status
 
     def emit(
         self,

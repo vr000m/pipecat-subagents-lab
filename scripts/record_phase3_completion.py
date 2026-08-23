@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.evidence_common import (
     REPO_ROOT,
     EvidenceGateError,
-    confined_output_path,
+    confine_output_arg,
+    now_utc,
     require_nonempty_str,
     write_bytes_no_follow,
 )
@@ -34,7 +34,7 @@ def build_record(
         "source_commit": source_commit,
         "source_tree_hash": source_tree_hash,
         "command_digest": command_digest,
-        "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at_utc": now_utc(),
     }
 
 
@@ -48,25 +48,15 @@ def main(argv: list[str] | None = None) -> int:
 
     import json
 
-    # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
-    # confine every operator-supplied --out/--output to the repo tree before
-    # writing; this evidence writer previously skipped that, so --output
-    # could point at an arbitrary destination such as .github/workflows/ci.yml
-    # despite write_bytes_no_follow already blocking symlink/FIFO redirection
-    # at the resolved path.
-    # The confined result is bound back onto ``args.output`` and is what
-    # every write below uses: the check resolves a relative --output against
-    # ``allowed_root``, but the raw argparse Path an os.open() would see
-    # resolves against the process cwd instead -- so dropping the return
-    # value validates one path and writes another, which is no confinement
-    # at all.
     try:
-        args.output = confined_output_path(args.output, allowed_root=REPO_ROOT)
-    except ValueError as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
-        return 1
-
-    try:
+        # confine_output_arg (scripts/evidence_common.py): an operator-supplied
+        # --output is still attacker-influenced surface (a credentialed run
+        # could be invoked with a scripted or copy-pasted value), so it is
+        # confined to the repo tree -- and rejected as EvidenceGateError, not a
+        # bare ValueError, so this one call folds into the same FAIL/exit-1
+        # gate-error handling as everything else below rather than needing its
+        # own earlier try/except block.
+        args.output = confine_output_arg(args.output, allowed_root=REPO_ROOT)
         record = build_record(
             source_commit=args.source_commit,
             source_tree_hash=args.source_tree_hash,

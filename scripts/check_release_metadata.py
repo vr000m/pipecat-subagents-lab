@@ -21,7 +21,6 @@ from pathlib import Path
 
 from scripts.evidence_common import REPO_ROOT
 
-
 # The date group requires an actual `YYYY-MM-DD` token, not merely
 # `(\S+)`: this repo's own CHANGELOG.md convention (see every dated heading
 # below `[Unreleased]`) always carries a real date, never a placeholder like
@@ -85,7 +84,41 @@ def check_no_hardcoded_version_literals(scripts_dir: Path, version: str) -> None
         )
 
 
-def check(pyproject_path: Path, changelog_path: Path) -> str:
+def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version: str) -> None:
+    """Assert ``.github/workflows/ci.yml``'s ``promotion-manifest-drift`` job
+    still points at the manifest for the CURRENT release version.
+
+    ``check_no_hardcoded_version_literals`` above forbids scripts/ from
+    hand-maintaining a copy of the version at all, because scripts/ can
+    always derive it dynamically instead. ci.yml cannot: the manifest path
+    (``docs/benchmarks/v{version}-promotion-manifest.json``) names a real,
+    checked-in file, so a literal is the only option and that scan is scoped
+    to ``scripts/*.py`` and never looked at ci.yml (round-5 restart,
+    Architecture finding #11). What this checks instead is that the literal
+    stays in sync with the version pyproject.toml/CHANGELOG.md just agreed
+    on: on a version bump that renames the committed manifest but forgets to
+    update ci.yml (or vice versa), this fails loudly instead of ci.yml
+    silently keeping the previous release's manifest green.
+    """
+    try:
+        text = ci_yml_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReleaseMetadataError(f"{ci_yml_path}: cannot read CI workflow: {exc}") from exc
+    expected = f"docs/benchmarks/v{version}-promotion-manifest.json"
+    if expected not in text:
+        raise ReleaseMetadataError(
+            f"{ci_yml_path}: promotion-manifest-drift job does not reference {expected!r} -- "
+            "the release version changed without updating the manifest path here (and "
+            "renaming/regenerating the committed manifest file to match)"
+        )
+
+
+def check(
+    pyproject_path: Path,
+    changelog_path: Path,
+    *,
+    ci_yml_path: Path | None = None,
+) -> str:
     """Return the matched version string, or raise ReleaseMetadataError."""
     pyproject_version = read_pyproject_version(pyproject_path)
     changelog_version, changelog_date = read_changelog_release(changelog_path)
@@ -100,6 +133,14 @@ def check(pyproject_path: Path, changelog_path: Path) -> str:
             "(expected `## [x.y.z] - YYYY-MM-DD`)"
         )
     check_no_hardcoded_version_literals(pyproject_path.parent / "scripts", pyproject_version)
+    # Unlike the scripts/ scan above (relative to pyproject_path, so it works
+    # against synthetic tmp_path fixtures for free), ci_yml_path has no
+    # sensible tmp_path-relative default -- callers that want this check
+    # (the real CLI, and tests exercising it directly) pass it explicitly;
+    # callers that only care about pyproject/CHANGELOG agreement omit it and
+    # this step is skipped.
+    if ci_yml_path is not None:
+        check_ci_promotion_manifest_path_matches_version(ci_yml_path, pyproject_version)
     return pyproject_version
 
 
@@ -107,11 +148,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pyproject", type=Path, default=REPO_ROOT / "pyproject.toml")
     parser.add_argument("--changelog", type=Path, default=REPO_ROOT / "CHANGELOG.md")
+    parser.add_argument(
+        "--ci-yml", type=Path, default=REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    )
     parser.add_argument("--version", default=None)
     args = parser.parse_args(argv)
 
     try:
-        version = check(args.pyproject, args.changelog)
+        version = check(args.pyproject, args.changelog, ci_yml_path=args.ci_yml)
         if args.version is not None and version != args.version:
             raise ReleaseMetadataError(
                 f"--version {args.version!r} does not match the version read from "

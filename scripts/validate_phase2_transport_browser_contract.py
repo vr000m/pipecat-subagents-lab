@@ -26,12 +26,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from scripts.evidence_common import (
     REPO_ROOT,
     EvidenceGateError,
     closed_object,
     load_json,
+    read_bytes_no_follow,
     require_hex64,
     require_nonempty_str,
     require_type,
@@ -145,8 +147,18 @@ def _lockfile_dependency_anchor() -> tuple[str, str]:
     with ``[^\\]]*``, since a dependency object containing a literal ``]``
     (e.g. an array-valued field) would otherwise stop the match early or fail
     to find the real closing bracket at all.
+
+    Read through ``read_bytes_no_follow`` (round-5 restart, Security finding),
+    not ``Path.read_text()``: the sibling read four lines below this one
+    (``_package_json_declared_version``) documents that it was migrated to a
+    hardened read for exactly this reason -- a symlink planted at this
+    predictable, repo-relative path would otherwise be followed, and a FIFO
+    or a character device such as ``/dev/zero`` would hang or exhaust memory,
+    with no ``except`` able to catch either -- but this lockfile read was left
+    on the raw path.
     """
-    for line in BUN_LOCK_PATH.read_text(encoding="utf-8").splitlines():
+    text = read_bytes_no_follow(BUN_LOCK_PATH).decode("utf-8")
+    for line in text.splitlines():
         stripped = line.strip().rstrip(",")
         if not stripped.startswith(f'"{PACKAGE_NAME}":'):
             continue
@@ -279,6 +291,47 @@ def _declared_range_admits(declared: str, locked: str) -> bool:
     return have == want
 
 
+#: Hosts a `source_anchor` URL is trusted to actually name the checked source
+#: from, not merely to embed the right substrings somewhere in its text
+#: (round-5 restart, Security finding -- see `_source_anchor_is_valid`).
+_ANCHOR_ALLOWED_HOSTS = frozenset({"registry.npmjs.org", "github.com"})
+
+
+def _source_anchor_is_valid(anchor: str, *, package_name: str, locked_version: str) -> bool:
+    """Does `anchor` actually name `package_name` at `locked_version`?
+
+    Accepts a closed set of spellings rather than "contains these two
+    substrings somewhere": either the npm-scoped form
+    (`@pipecat-ai/small-webrtc-transport@1.10.6`), optionally followed by a
+    free-text citation of where it was pinned (the repo-committed
+    `docs/benchmarks/v0.1.3-phase2-transport-browser-contract.json` spells it
+    `"...@1.10.6 (web/bun.lock, web/package.json)"` -- a real, legitimate
+    anchor this check must keep accepting), or a URL whose parsed host is on
+    `_ANCHOR_ALLOWED_HOSTS` and whose path both starts with the package's
+    org/leaf pair and names the locked version. Two unanchored substring
+    tests previously accepted any host, including one entirely outside the
+    allowlist, as long as the org/leaf and version strings appeared anywhere
+    in the anchor -- `source_anchor` is self-declared inside the artifact
+    under scrutiny (attacker-steerable), and its value flows into a
+    promotion-eligible manifest. The npm-form check only matches the
+    *leading whitespace-delimited token*, not an arbitrary substring, so a
+    citation may follow but cannot itself forge the match.
+    """
+    exact_npm_form = f"{package_name}@{locked_version}"
+    if anchor.split(None, 1)[0:1] == [exact_npm_form]:
+        return True
+    parsed = urlparse(anchor)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.hostname not in _ANCHOR_ALLOWED_HOSTS:
+        return False
+    org_leaf = package_name.lstrip("@")
+    path = parsed.path.lstrip("/")
+    if path != org_leaf and not path.startswith(f"{org_leaf}/"):
+        return False
+    return locked_version in path or f"v{locked_version}" in path
+
+
 def validate_artifact(record: dict[str, Any]) -> None:
     closed_object(record, required=TOP_REQUIRED, allowed=TOP_ALLOWED)
     if record["status"] not in STATUSES:
@@ -387,26 +440,32 @@ def validate_artifact(record: dict[str, Any]) -> None:
     # Validating it only as "a non-empty string" let a verified artifact claim
     # an arbitrary anchor (a fork, a different package, an unrelated URL)
     # while still passing the version/integrity checks above, so it must name
-    # the pinned package *and* the locked version. The exact anchor spelling
-    # is deliberately free-form (a lockfile reference or an upstream source
-    # URL are both legitimate), so this binds the two identifying substrings
-    # rather than one fixed format.
+    # the pinned package *and* the locked version.
     #
-    # Matching only the bare leaf name (`"small-webrtc-transport"`) let an
-    # anchor for a completely unrelated repository that merely happens to
-    # share that leaf segment -- e.g. `https://evil.example/
-    # small-webrtc-transport/tree/v1.10.6` -- pass as if it named the real
-    # `@pipecat-ai/small-webrtc-transport` package. Require the scoped
-    # org/leaf pair together, which both the npm-scoped spelling
-    # (`@pipecat-ai/small-webrtc-transport`) and the GitHub org/repo URL
-    # spelling (`.../pipecat-ai/small-webrtc-transport/...`) satisfy, but an
-    # anchor naming only the leaf does not.
+    # A prior tightening (round 4) required the org/leaf pair
+    # (`pipecat-ai/small-webrtc-transport`) rather than just the bare leaf --
+    # closing an anchor for an unrelated repo that merely shared the leaf
+    # segment -- but still checked it as two unanchored substring tests
+    # (`org_leaf in anchor and locked_version in anchor`). That still accepted
+    # any host: `https://evil.example/pipecat-ai/small-webrtc-transport/tree/
+    # v1.10.6` contains both substrings and passed, even though the host
+    # naming the actual source is exactly what `source_anchor` exists to pin
+    # (round-5 restart, Security finding). `source_anchor` is self-declared
+    # inside the artifact under scrutiny -- attacker-steerable -- and its
+    # value flows into a promotion-eligible manifest, so this now accepts
+    # only a closed set of spellings: the exact npm-scoped form
+    # (`@pipecat-ai/small-webrtc-transport@<locked_version>`), or a URL whose
+    # parsed host is on a fixed allowlist and whose path both starts with the
+    # org/leaf pair and names the locked version.
     anchor = record["source_anchor"]
-    package_org_leaf = PACKAGE_NAME.lstrip("@")
-    if package_org_leaf not in anchor or locked_version not in anchor:
+    if not _source_anchor_is_valid(
+        anchor, package_name=PACKAGE_NAME, locked_version=locked_version
+    ):
         raise EvidenceGateError(
             f"source_anchor {anchor!r} does not name the pinned package "
-            f"{PACKAGE_NAME!r} at the locked version {locked_version!r}"
+            f"{PACKAGE_NAME!r} at the locked version {locked_version!r} -- pin it exactly "
+            f"({PACKAGE_NAME}@{locked_version}) or use an allowlisted host "
+            f"({', '.join(sorted(_ANCHOR_ALLOWED_HOSTS))})"
         )
 
     # The promotion predicate: schema validity alone is never sufficient.

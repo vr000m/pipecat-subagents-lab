@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, ClassVar, Literal
@@ -201,7 +202,22 @@ class RuntimeSnapshot(StrictModel):
     #     pre-Phase-3 runtime-snapshot schema, which does not know the field.
     # The model itself always has the attribute; never assume absence here.
     work_status: list[WorkStatus] = Field(default_factory=list)
-    _highest_by_session: ClassVar[dict[str, int]] = {}
+    # Per-session snapshot-sequence watermark backing the monotonicity
+    # assertion below. Bounded like every other long-lived cache on this
+    # branch (``HandshakeGate._MAX_HANDSHAKE_TOKENS``,
+    # ``_MAX_ACK_GENERATION_TURNS``, the work-status 256-key cap): this is a
+    # process-lifetime ClassVar, and ``reset_monotonicity`` only ever clears
+    # the INCOMING session's key (``SessionState.__init__``), never the
+    # outgoing one -- so every session that ever emitted a snapshot left a
+    # permanent entry behind (round-5 restart, Logic Minor).
+    #
+    # Eviction is least-recently-watermarked-first. Losing a still-live
+    # session's entry weakens the monotonicity check to "unchecked" for that
+    # session rather than making it wrong, and requires
+    # ``_MAX_WATERMARK_SESSIONS`` other sessions to emit snapshots in between,
+    # which is the same trade the sibling caps accept.
+    _MAX_WATERMARK_SESSIONS: ClassVar[int] = 256
+    _highest_by_session: ClassVar[OrderedDict[str, int]] = OrderedDict()
 
     def wire_payload(self, *, include_work_status: bool) -> dict[str, Any]:
         """Serialize for the wire, dropping ``work_status`` when not negotiated.
@@ -224,10 +240,14 @@ class RuntimeSnapshot(StrictModel):
     def validate_version_and_monotonicity(self) -> RuntimeSnapshot:
         if self.contract_version != CONTRACT_VERSION:
             raise ValueError(f"unsupported contract version: {self.contract_version}")
-        previous = type(self)._highest_by_session.get(self.session_id)
+        watermarks = type(self)._highest_by_session
+        previous = watermarks.get(self.session_id)
         if previous is not None and self.snapshot_sequence < previous:
             raise ValueError("snapshot_sequence must be monotonic")
-        type(self)._highest_by_session[self.session_id] = max(previous or 0, self.snapshot_sequence)
+        watermarks[self.session_id] = max(previous or 0, self.snapshot_sequence)
+        watermarks.move_to_end(self.session_id)
+        while len(watermarks) > type(self)._MAX_WATERMARK_SESSIONS:
+            watermarks.popitem(last=False)
         return self
 
 

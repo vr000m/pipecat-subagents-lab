@@ -83,11 +83,20 @@ class PreAdmissionTerminalReason(str, Enum):
 
     A pre-admission terminal never allocates a transport token or timer;
     it is decided before ``try_admit`` runs.
+
+    ``NO_TTS``/``UNAVAILABLE_TRANSPORT``/``CONNECTION_CLOSED`` are returned by
+    ``pre_admission_disposition``. ``CANCELLED`` has one producer instead --
+    ``SpeechScheduler._notify_ack_swept``, for an ack swept out of the queued/
+    paused sets by an explicit ``cancel()`` while the connection is still live.
+    It is a pre-admission terminal in the same sense as its siblings (the ack
+    never reached the transport), but the connection is NOT gone, which is why
+    it is not spelled ``CONNECTION_CLOSED`` (round-5 restart, Logic Important).
     """
 
     NO_TTS = "no_tts"
     UNAVAILABLE_TRANSPORT = "unavailable_transport"
     CONNECTION_CLOSED = "connection_closed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
