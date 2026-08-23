@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 import tomllib
 from pathlib import Path
@@ -40,11 +41,15 @@ class ReleaseMetadataError(ValueError):
 
 
 def read_pyproject_version(pyproject_path: Path) -> str:
+    # Hardened read like every other evidence read on this branch -- the sweep
+    # that migrated the CHANGELOG/scripts/ci.yml reads skipped this one
+    # (round 7 confirm pass 4, Architecture Minor).
     try:
-        with pyproject_path.open("rb") as handle:
-            data = tomllib.load(handle)
+        data = tomllib.loads(read_bytes_no_follow(pyproject_path).decode("utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ReleaseMetadataError(f"{pyproject_path}: invalid TOML: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ReleaseMetadataError(f"{pyproject_path}: not valid UTF-8: {exc}") from exc
     project = data.get("project")
     version = project.get("version") if isinstance(project, dict) else None
     if not isinstance(version, str) or not version:
@@ -57,7 +62,10 @@ def read_changelog_release(changelog_path: Path) -> tuple[str, str | None]:
     # Hardened read, like every other evidence read on this branch: a
     # predictable repo-relative path that a plain `read_text` would follow
     # through a symlink or block on against a FIFO.
-    text = read_bytes_no_follow(changelog_path).decode("utf-8")
+    try:
+        text = read_bytes_no_follow(changelog_path).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReleaseMetadataError(f"{changelog_path}: not valid UTF-8: {exc}") from exc
     headings = CHANGELOG_HEADING_RE.findall(text)
     if not headings:
         raise ReleaseMetadataError(f"{changelog_path}: no `## [version]` headings found")
@@ -84,13 +92,39 @@ def check_no_hardcoded_version_literals(scripts_dir: Path, version: str) -> None
     pattern = re.compile(rf'["\']{re.escape(version)}["\']')
     offending: list[str] = []
     for path in sorted(scripts_dir.glob("*.py")):
-        if pattern.search(read_bytes_no_follow(path).decode("utf-8")):
+        try:
+            source = read_bytes_no_follow(path).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReleaseMetadataError(f"{path}: not valid UTF-8: {exc}") from exc
+        if pattern.search(source):
             offending.append(str(path))
     if offending:
         raise ReleaseMetadataError(
             f"scripts/ hardcodes release version {version!r} in {offending} -- derive it from "
             "pyproject.toml/server.config instead of duplicating the literal"
         )
+
+
+def _shell_words(command: str) -> set[str]:
+    """The comment-stripped shell words of a workflow ``run:`` script.
+
+    Tokenising rather than substring-matching is what stops a ``#`` comment or
+    a quoted ``echo`` message from satisfying the manifest-path gate: shlex
+    drops comments outright, and a path mentioned inside a quoted sentence
+    comes back as one long word that cannot equal the path.
+
+    A ``run:`` script that shlex cannot tokenise (an unbalanced quote, which
+    is a shell syntax error anyway) contributes no words rather than raising,
+    so one malformed step cannot mask a well-formed sibling that does
+    reference the manifest.
+    """
+    words: set[str] = set()
+    for line in command.splitlines():
+        try:
+            words.update(shlex.split(line, comments=True))
+        except ValueError:
+            continue
+    return words
 
 
 def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version: str) -> None:
@@ -116,6 +150,26 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
     actually runs pointed at the previous release's manifest, which is
     strictly weaker than this docstring's claim. A missing job now fails
     loudly for the same reason (round 6 confirm pass 3, Security Minor).
+
+    Parsing alone did not close two of those three bypasses, though, so this
+    also (round 7 confirm pass 4, Security Minor):
+
+    * rejects a job or matching step carrying an ``if:``. ``if: false`` (or
+      any never-true expression) leaves the job declared and this gate green
+      while the drift check never executes -- exactly the "disabled job"
+      evasion the paragraph above claims to have closed.
+    * matches the path as a whole SHELL WORD of a comment-stripped command,
+      not as a free substring of one. ``run: echo "regenerate
+      docs/benchmarks/...json when bumping"`` satisfied the substring form
+      while the step that actually diffs pointed at the previous release's
+      manifest.
+
+    Not checked, deliberately: the workflow's ``on:`` triggers. Which events
+    run CI is a routine, legitimately-varying choice (this repo's gates run on
+    push and pull_request; a fork may reasonably differ), so pinning it here
+    would fail for reasons unrelated to release-version drift. The ``if:``
+    rejection is narrow because a conditional on *this* job has no legitimate
+    use: the gate is cheap and must run whenever CI runs.
     """
     try:
         text = read_bytes_no_follow(ci_yml_path).decode("utf-8")
@@ -132,19 +186,37 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
             f"{ci_yml_path}: no `{_MANIFEST_DRIFT_JOB}` job -- the gate that proves the "
             "committed promotion manifest still matches its inputs is gone"
         )
+    if "if" in job:
+        raise ReleaseMetadataError(
+            f"{ci_yml_path}: the `{_MANIFEST_DRIFT_JOB}` job carries an `if:` "
+            f"({job['if']!r}) -- a conditional job can be switched off while still "
+            "satisfying this gate, so the drift check must run unconditionally"
+        )
     steps = job.get("steps")
-    commands = [
-        step["run"]
-        for step in (steps if isinstance(steps, list) else [])
-        if isinstance(step, dict) and isinstance(step.get("run"), str)
-    ]
     expected = f"docs/benchmarks/v{version}-promotion-manifest.json"
-    if not any(expected in command for command in commands):
+    matching = [
+        step
+        for step in (steps if isinstance(steps, list) else [])
+        if isinstance(step, dict)
+        and isinstance(step.get("run"), str)
+        and expected in _shell_words(step["run"])
+    ]
+    if not matching:
         raise ReleaseMetadataError(
             f"{ci_yml_path}: the `{_MANIFEST_DRIFT_JOB}` job does not reference {expected!r} "
-            "in any step it runs -- the release version changed without updating the "
-            "manifest path here (and renaming/regenerating the committed manifest file "
-            "to match)"
+            "as a shell word of any step it runs -- the release version changed without "
+            "updating the manifest path here (and renaming/regenerating the committed "
+            "manifest file to match)"
+        )
+    # One unconditional referencing step is enough; a *sibling* step may
+    # legitimately carry an `if:`. Only a roster where every reference is
+    # conditional means the gate can be switched off while staying green.
+    if not any("if" not in step for step in matching):
+        names = [str(step.get("name", "<unnamed>")) for step in matching]
+        raise ReleaseMetadataError(
+            f"{ci_yml_path}: every `{_MANIFEST_DRIFT_JOB}` step referencing {expected!r} "
+            f"carries an `if:` ({names}) -- a conditional step can be switched off while "
+            "still satisfying this gate"
         )
 
 
@@ -198,7 +270,10 @@ def main(argv: list[str] | None = None) -> int:
             )
     # EvidenceGateError as well as OSError: the hardened reads collapse a
     # symlinked/FIFO/oversized input into that one type instead of an OSError.
-    except (ReleaseMetadataError, EvidenceGateError, OSError) as exc:
+    # UnicodeDecodeError is converted to ReleaseMetadataError at each decode
+    # site; it is listed here too so a decode site added later without that
+    # conversion still prints FAIL rather than a traceback.
+    except (ReleaseMetadataError, EvidenceGateError, OSError, UnicodeDecodeError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 

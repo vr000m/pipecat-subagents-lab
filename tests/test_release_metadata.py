@@ -310,6 +310,160 @@ def test_rejects_ci_yml_with_no_promotion_manifest_drift_job(tmp_path: Path) -> 
         module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
 
 
+def test_rejects_a_ci_yml_whose_drift_job_is_disabled_by_an_if_condition(
+    tmp_path: Path,
+) -> None:
+    """Round 7 confirm pass 4, Security Minor: parsing the workflow closed the
+    comment bypass but not the disabled-job one the docstring also claimed --
+    `if: false` leaves the job declared, this gate green, and the drift check
+    never executed."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "  promotion-manifest-drift:\n",
+            "  promotion-manifest-drift:\n    if: false\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="carries an `if:`"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_ci_yml_whose_only_referencing_step_is_conditional(tmp_path: Path) -> None:
+    """The step-level spelling of the same evasion."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "      - name: Verify",
+            "      - if: ${{ github.ref == 'refs/heads/never' }}\n        name: Verify",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="carries an `if:`"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_accepts_a_conditional_sibling_step_alongside_an_unconditional_one(
+    tmp_path: Path,
+) -> None:
+    """Only a roster where EVERY reference is conditional means the gate can
+    be switched off -- an extra conditional step is not itself a bypass."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML + "      - if: ${{ failure() }}\n"
+        "        name: Re-verify on failure\n"
+        "        run: uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.3-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    assert module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path) == "0.1.3"
+
+
+def test_rejects_a_ci_yml_that_only_echoes_the_manifest_path_in_a_message(
+    tmp_path: Path,
+) -> None:
+    """`expected in command` was an unanchored substring test at the command
+    level, so a quoted reminder inside an `echo` satisfied the gate while the
+    step that actually diffs pointed at the previous release's manifest
+    (round 7 confirm pass 4, Security Minor)."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      - name: Remind\n"
+        '        run: echo "regenerate docs/benchmarks/v0.1.3-promotion-manifest.json '
+        'when bumping"\n'
+        "      - name: Verify the committed promotion manifest has not drifted\n"
+        "        run: uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.2-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_ci_yml_mentioning_the_manifest_only_in_a_run_script_comment(
+    tmp_path: Path,
+) -> None:
+    """A `#` comment INSIDE a run script, not just above the step -- shlex
+    drops it, so it cannot satisfy the gate either."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      - name: Verify the committed promotion manifest has not drifted\n"
+        "        run: |\n"
+        "          # docs/benchmarks/v0.1.3-promotion-manifest.json\n"
+        "          uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.2-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_the_real_repo_ci_yml_still_satisfies_the_tightened_gate() -> None:
+    """The tightening must not have made the live workflow fail: the real
+    `promotion-manifest-drift` job carries no `if:` and names the manifest as
+    a bare shell word."""
+    module = _load_script()
+    module.check_ci_promotion_manifest_path_matches_version(
+        REPO_ROOT / ".github" / "workflows" / "ci.yml",
+        module.read_pyproject_version(REPO_ROOT / "pyproject.toml"),
+    )
+
+
+def test_rejects_a_symlinked_pyproject(tmp_path: Path) -> None:
+    """The pyproject read is hardened like every other evidence read on this
+    branch -- the round 6 sweep migrated the CHANGELOG/scripts/ci.yml reads and
+    skipped this one (round 7 confirm pass 4, Architecture Minor)."""
+    module = _load_script()
+    _, changelog_path = _write_pair(tmp_path)
+    real_pyproject = tmp_path / "real-pyproject.toml"
+    real_pyproject.write_text(VALID_PYPROJECT, encoding="utf-8")
+    linked = tmp_path / "linked-pyproject.toml"
+    linked.symlink_to(real_pyproject)
+
+    with pytest.raises(module.EvidenceGateError):
+        module.check(linked, changelog_path)
+
+
+def test_non_utf8_changelog_returns_fail_rather_than_a_traceback(tmp_path: Path) -> None:
+    """Only one of three decode sites converted UnicodeDecodeError, and main's
+    except tuple did not list it, so the other two tracebacked out of the CLI
+    (round 7 confirm pass 4, Architecture Minor)."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    changelog_path.write_bytes(b"\xff\xfe## [0.1.3] - 2026-07-28\n")
+
+    assert module.main(_args(pyproject_path, changelog_path)) != 0
+
+
+def test_non_utf8_pyproject_returns_fail_rather_than_a_traceback(tmp_path: Path) -> None:
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    pyproject_path.write_bytes(b'\xff\xfe[project]\nversion = "0.1.3"\n')
+
+    assert module.main(_args(pyproject_path, changelog_path)) != 0
+
+
 def test_rejects_a_symlinked_ci_yml(tmp_path: Path) -> None:
     """The ci.yml read is hardened like every other evidence read on this
     branch: a predictable repo-relative path a plain `read_text` would follow

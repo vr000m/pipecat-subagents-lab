@@ -604,3 +604,62 @@ def test_validator_accepts_the_npm_registry_tarball_url(tmp_path: Path) -> None:
     )
     path = _write(tmp_path, _valid_artifact(source_anchor=registry_anchor))
     module.validate_artifact(json.loads(path.read_text()))
+
+
+_LEAF = PACKAGE_NAME.rsplit("/", 1)[-1]
+_GH = f"https://github.com/pipecat-ai/{_LEAF}"
+
+
+@pytest.mark.parametrize(
+    "forged_anchor",
+    [
+        # An outside contributor can populate `refs/pull/<n>/head` by opening a
+        # PR, including with a directory literally named after the version.
+        f"{_GH}/blob/refs/pull/9999/head/{PINNED_PACKAGE_VERSION}/index.js",
+        # No attacker needed: this names `main`, not the locked version.
+        f"{_GH}/blob/main/{PINNED_PACKAGE_VERSION}/index.js",
+        f"{_GH}/tree/attacker-branch/{PINNED_PACKAGE_VERSION}",
+        # `/compare/` names two refs, so it can never pin one.
+        f"{_GH}/compare/{PINNED_PACKAGE_VERSION}...attacker-branch",
+        # The version must be the segment `releases/tag` introduces.
+        f"{_GH}/releases/tag/nightly/{PINNED_PACKAGE_VERSION}",
+        # An unrecognised layout is not a pin, whatever segments it carries.
+        f"{_GH}/archive/{PINNED_PACKAGE_VERSION}/extra/{PINNED_PACKAGE_VERSION}",
+        # Same positional freedom on the registry host.
+        f"https://registry.npmjs.org/{PACKAGE_NAME}/-/{PINNED_PACKAGE_VERSION}/other.tgz",
+    ],
+)
+def test_validator_rejects_a_source_anchor_whose_version_segment_is_not_the_ref(
+    tmp_path: Path, forged_anchor: str
+) -> None:
+    """Round 7 confirm pass 4, Security Minor: round 6 anchored the version to
+    a whole path SEGMENT but left its POSITION free, so a URL naming an
+    attacker-influenceable ref still validated as long as some segment
+    somewhere equalled the locked version."""
+    module = _load_validator()
+    path = _write(tmp_path, _valid_artifact(source_anchor=forged_anchor))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+@pytest.mark.parametrize(
+    "anchor_template",
+    [
+        f"{_GH}/tree/v{{version}}",
+        f"{_GH}/tree/{{version}}",
+        f"{_GH}/releases/tag/v{{version}}",
+        f"{_GH}/commit/{{version}}",
+        f"{_GH}/blob/v{{version}}/index.js",
+        f"https://registry.npmjs.org/{PACKAGE_NAME}/{{version}}",
+        f"https://registry.npmjs.org/{PACKAGE_NAME}/-/{_LEAF}-{{version}}.tgz",
+    ],
+)
+def test_validator_accepts_every_recognised_source_anchor_layout(
+    tmp_path: Path, anchor_template: str
+) -> None:
+    """The positional tightening must not have narrowed the check to a single
+    spelling: each layout the docstring lists has to stay usable."""
+    module = _load_validator()
+    anchor = anchor_template.format(version=PINNED_PACKAGE_VERSION)
+    path = _write(tmp_path, _valid_artifact(source_anchor=anchor))
+    module.validate_artifact(json.loads(path.read_text()))

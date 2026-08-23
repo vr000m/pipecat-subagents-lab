@@ -317,14 +317,27 @@ def _source_anchor_is_valid(anchor: str, *, package_name: str, locked_version: s
     *leading whitespace-delimited token*, not an arbitrary substring, so a
     citation may follow but cannot itself forge the match.
 
-    The URL branch matches the version as a whole PATH SEGMENT, not as a
-    substring of the path: `.../tree/v1.10.60` and `.../compare/1.10.6...
-    attacker-branch` both contain "1.10.6" while naming a different ref than
-    bun.lock pins. That is the same forgery the npm-form branch above was
-    tightened against; the URL branch kept the loose form (round 6 confirm
-    pass 3, Security/Logic Minor). The npm registry's tarball spelling
-    (`.../-/small-webrtc-transport-1.10.6.tgz`) is an explicitly recognised
-    segment shape rather than a substring exemption -- without it, no
+    The URL branch matches the version at a fixed POSITION in a recognised
+    path layout, not as a substring (`.../tree/v1.10.60`) and not as a
+    whole segment appearing anywhere (round 7 confirm pass 4, Security Minor).
+    Segment-anywhere still validated
+    `.../blob/refs/pull/9999/head/1.10.6/index.js`, whose actual ref is
+    `refs/pull/9999/head` -- a tree any outside contributor can populate by
+    opening a PR, including with a directory literally named `1.10.6` -- and
+    the benign-looking `.../blob/main/1.10.6/x`, which names `main`.
+    `source_anchor` is self-declared inside the artifact under scrutiny and
+    flows into a promotion-eligible manifest, so the ref it names must be the
+    version, not merely contain it somewhere. The accepted layouts are:
+
+    * ``github.com/<org>/<leaf>/(tree|commit|blob)/<version>[/...]``
+    * ``github.com/<org>/<leaf>/releases/tag/<version>``
+    * ``registry.npmjs.org/<org>/<leaf>/<version>`` exactly
+    * ``registry.npmjs.org/<org>/<leaf>/-/<leaf>-<version>.tgz`` exactly
+
+    where ``<version>`` is the locked version with or without a ``v`` prefix.
+    ``/compare/`` has no accepted layout at all: it names two refs, so it can
+    never pin one. The npm registry's tarball spelling is an explicitly
+    recognised shape rather than a substring exemption -- without it, no
     `registry.npmjs.org` URL could ever satisfy this check and the error
     message named a host that could not actually be used.
     """
@@ -337,17 +350,26 @@ def _source_anchor_is_valid(anchor: str, *, package_name: str, locked_version: s
     if parsed.hostname not in _ANCHOR_ALLOWED_HOSTS:
         return False
     org_leaf = package_name.lstrip("@")
-    path = parsed.path.lstrip("/")
+    path = parsed.path.strip("/")
     # registry.npmjs.org keeps the npm scope in the path
     # (`/@pipecat-ai/small-webrtc-transport/-/...`), so the org/leaf prefix
     # test has to accept the scoped spelling too.
     if package_name.startswith("@") and path.startswith("@"):
         path = path[1:]
-    if path != org_leaf and not path.startswith(f"{org_leaf}/"):
+    if not path.startswith(f"{org_leaf}/"):
         return False
+    rest = path[len(org_leaf) + 1 :].split("/")
     leaf = org_leaf.rsplit("/", 1)[-1]
-    version_segments = {locked_version, f"v{locked_version}", f"{leaf}-{locked_version}.tgz"}
-    return bool(version_segments & set(path.split("/")))
+    version_names = {locked_version, f"v{locked_version}"}
+    if parsed.hostname == "registry.npmjs.org":
+        return rest == [locked_version] or rest == ["-", f"{leaf}-{locked_version}.tgz"]
+    # github.com: the version must be the segment the ref-introducing keyword
+    # introduces -- the ref itself, not a directory somewhere beneath it.
+    if rest[:2] == ["releases", "tag"]:
+        return len(rest) == 3 and rest[2] in version_names
+    if rest[0] in ("tree", "commit", "blob"):
+        return len(rest) > 1 and rest[1] in version_names
+    return False
 
 
 def validate_artifact(record: dict[str, Any]) -> None:
