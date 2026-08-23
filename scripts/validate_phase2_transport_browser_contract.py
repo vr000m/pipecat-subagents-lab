@@ -316,6 +316,17 @@ def _source_anchor_is_valid(anchor: str, *, package_name: str, locked_version: s
     promotion-eligible manifest. The npm-form check only matches the
     *leading whitespace-delimited token*, not an arbitrary substring, so a
     citation may follow but cannot itself forge the match.
+
+    The URL branch matches the version as a whole PATH SEGMENT, not as a
+    substring of the path: `.../tree/v1.10.60` and `.../compare/1.10.6...
+    attacker-branch` both contain "1.10.6" while naming a different ref than
+    bun.lock pins. That is the same forgery the npm-form branch above was
+    tightened against; the URL branch kept the loose form (round 6 confirm
+    pass 3, Security/Logic Minor). The npm registry's tarball spelling
+    (`.../-/small-webrtc-transport-1.10.6.tgz`) is an explicitly recognised
+    segment shape rather than a substring exemption -- without it, no
+    `registry.npmjs.org` URL could ever satisfy this check and the error
+    message named a host that could not actually be used.
     """
     exact_npm_form = f"{package_name}@{locked_version}"
     if anchor.split(None, 1)[0:1] == [exact_npm_form]:
@@ -327,9 +338,16 @@ def _source_anchor_is_valid(anchor: str, *, package_name: str, locked_version: s
         return False
     org_leaf = package_name.lstrip("@")
     path = parsed.path.lstrip("/")
+    # registry.npmjs.org keeps the npm scope in the path
+    # (`/@pipecat-ai/small-webrtc-transport/-/...`), so the org/leaf prefix
+    # test has to accept the scoped spelling too.
+    if package_name.startswith("@") and path.startswith("@"):
+        path = path[1:]
     if path != org_leaf and not path.startswith(f"{org_leaf}/"):
         return False
-    return locked_version in path or f"v{locked_version}" in path
+    leaf = org_leaf.rsplit("/", 1)[-1]
+    version_segments = {locked_version, f"v{locked_version}", f"{leaf}-{locked_version}.tgz"}
+    return bool(version_segments & set(path.split("/")))
 
 
 def validate_artifact(record: dict[str, Any]) -> None:

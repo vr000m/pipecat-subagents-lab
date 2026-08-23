@@ -270,3 +270,56 @@ def test_main_cli_supports_the_plan_mandated_version_argument(tmp_path: Path) ->
     assert matching == 0
     mismatching = module.main([*_args(pyproject_path, changelog_path), "--version", "9.9.9"])
     assert mismatching != 0
+
+
+def test_rejects_ci_yml_whose_only_mention_of_the_manifest_is_a_comment(
+    tmp_path: Path,
+) -> None:
+    """Round 6 confirm pass 3, Security Minor: the check was a whole-file
+    substring test, so a stale comment (or a `name:` field, or a disabled job)
+    satisfied it while the step that actually runs pointed at the previous
+    release's manifest."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      # was docs/benchmarks/v0.1.3-promotion-manifest.json\n"
+        "      - name: Verify the committed promotion manifest has not drifted\n"
+        "        run: uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.2-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="does not reference"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_ci_yml_with_no_promotion_manifest_drift_job(tmp_path: Path) -> None:
+    """Deleting the drift job entirely must fail loudly rather than pass: the
+    substring test happened to catch this only because the path string lived
+    inside that job."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text("jobs:\n  test:\n    steps: []\n", encoding="utf-8")
+
+    with pytest.raises(module.ReleaseMetadataError, match="promotion-manifest-drift"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_symlinked_ci_yml(tmp_path: Path) -> None:
+    """The ci.yml read is hardened like every other evidence read on this
+    branch: a predictable repo-relative path a plain `read_text` would follow
+    through a symlink."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    real_ci_yml = tmp_path / "real-ci.yml"
+    real_ci_yml.write_text(VALID_CI_YML, encoding="utf-8")
+    linked = tmp_path / "ci.yml"
+    linked.symlink_to(real_ci_yml)
+
+    with pytest.raises(module.ReleaseMetadataError, match="cannot read CI workflow"):
+        module.check(pyproject_path, changelog_path, ci_yml_path=linked)

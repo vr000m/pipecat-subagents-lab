@@ -19,7 +19,13 @@ import sys
 import tomllib
 from pathlib import Path
 
-from scripts.evidence_common import REPO_ROOT
+import yaml
+
+from scripts.evidence_common import REPO_ROOT, EvidenceGateError, read_bytes_no_follow
+
+#: The CI job whose step command this script pins to the current release
+#: version. Named once: the error messages and the lookup must not drift.
+_MANIFEST_DRIFT_JOB = "promotion-manifest-drift"
 
 # The date group requires an actual `YYYY-MM-DD` token, not merely
 # `(\S+)`: this repo's own CHANGELOG.md convention (see every dated heading
@@ -48,7 +54,10 @@ def read_pyproject_version(pyproject_path: Path) -> str:
 
 def read_changelog_release(changelog_path: Path) -> tuple[str, str | None]:
     """Return (version, date) for the first non-Unreleased CHANGELOG heading."""
-    text = changelog_path.read_text(encoding="utf-8")
+    # Hardened read, like every other evidence read on this branch: a
+    # predictable repo-relative path that a plain `read_text` would follow
+    # through a symlink or block on against a FIFO.
+    text = read_bytes_no_follow(changelog_path).decode("utf-8")
     headings = CHANGELOG_HEADING_RE.findall(text)
     if not headings:
         raise ReleaseMetadataError(f"{changelog_path}: no `## [version]` headings found")
@@ -75,7 +84,7 @@ def check_no_hardcoded_version_literals(scripts_dir: Path, version: str) -> None
     pattern = re.compile(rf'["\']{re.escape(version)}["\']')
     offending: list[str] = []
     for path in sorted(scripts_dir.glob("*.py")):
-        if pattern.search(path.read_text(encoding="utf-8")):
+        if pattern.search(read_bytes_no_follow(path).decode("utf-8")):
             offending.append(str(path))
     if offending:
         raise ReleaseMetadataError(
@@ -99,17 +108,43 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
     on: on a version bump that renames the committed manifest but forgets to
     update ci.yml (or vice versa), this fails loudly instead of ci.yml
     silently keeping the previous release's manifest green.
+
+    The workflow is PARSED, and the expected path looked for in the
+    ``promotion-manifest-drift`` job's own step commands. A whole-file
+    substring test was satisfied by the path appearing anywhere at all --
+    a ``#`` comment, a ``name:`` field, a disabled job -- while the step that
+    actually runs pointed at the previous release's manifest, which is
+    strictly weaker than this docstring's claim. A missing job now fails
+    loudly for the same reason (round 6 confirm pass 3, Security Minor).
     """
     try:
-        text = ci_yml_path.read_text(encoding="utf-8")
-    except OSError as exc:
+        text = read_bytes_no_follow(ci_yml_path).decode("utf-8")
+    except (OSError, EvidenceGateError, UnicodeDecodeError) as exc:
         raise ReleaseMetadataError(f"{ci_yml_path}: cannot read CI workflow: {exc}") from exc
-    expected = f"docs/benchmarks/v{version}-promotion-manifest.json"
-    if expected not in text:
+    try:
+        workflow = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ReleaseMetadataError(f"{ci_yml_path}: invalid YAML: {exc}") from exc
+    jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
+    job = jobs.get(_MANIFEST_DRIFT_JOB) if isinstance(jobs, dict) else None
+    if not isinstance(job, dict):
         raise ReleaseMetadataError(
-            f"{ci_yml_path}: promotion-manifest-drift job does not reference {expected!r} -- "
-            "the release version changed without updating the manifest path here (and "
-            "renaming/regenerating the committed manifest file to match)"
+            f"{ci_yml_path}: no `{_MANIFEST_DRIFT_JOB}` job -- the gate that proves the "
+            "committed promotion manifest still matches its inputs is gone"
+        )
+    steps = job.get("steps")
+    commands = [
+        step["run"]
+        for step in (steps if isinstance(steps, list) else [])
+        if isinstance(step, dict) and isinstance(step.get("run"), str)
+    ]
+    expected = f"docs/benchmarks/v{version}-promotion-manifest.json"
+    if not any(expected in command for command in commands):
+        raise ReleaseMetadataError(
+            f"{ci_yml_path}: the `{_MANIFEST_DRIFT_JOB}` job does not reference {expected!r} "
+            "in any step it runs -- the release version changed without updating the "
+            "manifest path here (and renaming/regenerating the committed manifest file "
+            "to match)"
         )
 
 
@@ -161,7 +196,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"--version {args.version!r} does not match the version read from "
                 f"pyproject.toml/CHANGELOG.md {version!r}"
             )
-    except (ReleaseMetadataError, OSError) as exc:
+    # EvidenceGateError as well as OSError: the hardened reads collapse a
+    # symlinked/FIFO/oversized input into that one type instead of an OSError.
+    except (ReleaseMetadataError, EvidenceGateError, OSError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 

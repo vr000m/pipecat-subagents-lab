@@ -559,3 +559,48 @@ def test_main_cli_returns_zero_for_a_valid_promotion_eligible_artifact(tmp_path:
     path = _write(tmp_path, _valid_artifact())
     exit_code = module.main(["--input", str(path)])
     assert exit_code == 0
+
+
+def test_validator_rejects_a_source_anchor_naming_a_neighbouring_version(
+    tmp_path: Path,
+) -> None:
+    """Round 6 confirm pass 3, Security/Logic Minor: the URL branch matched the
+    locked version as an unanchored substring, so ``v1.10.60`` -- a different
+    ref than bun.lock pins -- satisfied the pin."""
+    module = _load_validator()
+    forged_anchor = (
+        f"https://github.com/pipecat-ai/small-webrtc-transport/tree/v{PINNED_PACKAGE_VERSION}0"
+    )
+    path = _write(tmp_path, _valid_artifact(source_anchor=forged_anchor))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_rejects_a_source_anchor_comparing_the_version_to_a_branch(
+    tmp_path: Path,
+) -> None:
+    """Same substring gap in its other reachable spelling: a ``/compare/``
+    ref embeds the locked version while naming an attacker-chosen branch."""
+    module = _load_validator()
+    forged_anchor = (
+        "https://github.com/pipecat-ai/small-webrtc-transport/compare/"
+        f"{PINNED_PACKAGE_VERSION}...attacker-branch"
+    )
+    path = _write(tmp_path, _valid_artifact(source_anchor=forged_anchor))
+    with pytest.raises(module.EvidenceGateError):
+        module.validate_artifact(json.loads(path.read_text()))
+
+
+def test_validator_accepts_the_npm_registry_tarball_url(tmp_path: Path) -> None:
+    """``registry.npmjs.org`` is on the anchor host allowlist, and its
+    canonical URL form keeps the npm scope in the path and spells the version
+    inside a tarball filename. Neither could satisfy the path or version test
+    before, making that allowlist entry -- which the failure message advertises
+    -- dead (round 6 confirm pass 3, Logic Minor)."""
+    module = _load_validator()
+    leaf = PACKAGE_NAME.rsplit("/", 1)[-1]
+    registry_anchor = (
+        f"https://registry.npmjs.org/{PACKAGE_NAME}/-/{leaf}-{PINNED_PACKAGE_VERSION}.tgz"
+    )
+    path = _write(tmp_path, _valid_artifact(source_anchor=registry_anchor))
+    module.validate_artifact(json.loads(path.read_text()))
