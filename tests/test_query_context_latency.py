@@ -69,6 +69,19 @@ def _analyzer() -> Any:
     return pytest.importorskip("scripts.analyze_query_context_latency")
 
 
+@pytest.fixture(autouse=True)
+def _confine_evidence_writes_to_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner/collector/analyzer now confine every ``--output`` to their
+    own module's ``REPO_ROOT`` via ``confined_output_path`` (round 1
+    gauntlet security finding: evidence writers must apply the same output
+    confinement ``eval_model_comparison.py``/``verify_eval_candidates.py``
+    already do). Tests below write to ``tmp_path``, legitimately outside the
+    real repo tree, so each module's root is patched here the same way
+    ``test_eval_model_comparison.py`` patches ``eval_runner.REPO_ROOT``."""
+    for module in (_runner(), _collector(), _analyzer()):
+        monkeypatch.setattr(module, "REPO_ROOT", tmp_path, raising=False)
+
+
 def _fixture_path() -> Path:
     if not REAL_FIXTURE_PATH.exists():
         pytest.skip(f"{REAL_FIXTURE_PATH} not yet authored (Phase 4 concurrent implementer)")
@@ -1880,3 +1893,31 @@ def test_record_phase3_completion_refuses_to_write_through_a_symlinked_output(
 
     assert exit_code == 1, "a symlinked --output must be refused, not followed"
     assert target.read_text() == "do not touch"
+
+
+def test_record_phase3_completion_refuses_an_output_path_outside_repo_root(
+    tmp_path: Path,
+) -> None:
+    """Round 1 gauntlet security finding: ``record_phase3_completion.py``
+    previously skipped ``confined_output_path``, unlike its sibling eval
+    scripts (``eval_model_comparison.py``, ``verify_eval_candidates.py``),
+    so ``--output`` could point at an arbitrary destination -- not just a
+    symlinked one -- such as a traversal out of the confined root."""
+    module = pytest.importorskip("scripts.record_phase3_completion")
+    outside_root = tmp_path.parent / "escaped-output.json"
+
+    exit_code = module.main(
+        [
+            "--source-commit",
+            "a" * 40,
+            "--source-tree-hash",
+            "b" * 40,
+            "--command-digest",
+            "c" * 64,
+            "--output",
+            f"../{outside_root.name}",
+        ]
+    )
+
+    assert exit_code == 1, "an --output escaping REPO_ROOT must be refused"
+    assert not outside_root.exists()

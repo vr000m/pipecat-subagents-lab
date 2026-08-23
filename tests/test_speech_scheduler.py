@@ -510,6 +510,22 @@ def test_start_next_does_not_start_when_the_coordinator_slot_is_already_occupied
     assert scheduler.active is None
 
 
+def test_start_next_with_empty_string_work_item_id_scans_only_that_queue() -> None:
+    """Round 1 gauntlet logic finding: ``start_next`` tested ``work_item_id``
+    for truthiness, so an empty-string key (a legal dict key ``enqueue``
+    accepts) fell into the "scan every queue" branch instead of selecting its
+    own queue -- admitting an utterance from an unrelated work item."""
+    scheduler = _scheduler()
+    unrelated = enqueue(scheduler, "work-unrelated", "unrelated")
+
+    result = asyncio.run(scheduler.start_next(""))
+
+    assert result is None
+    assert scheduler.active is None
+    assert scheduler.pending_work_item_ids() == frozenset({"work-unrelated"})
+    assert unrelated is not None
+
+
 def test_dropped_prestart_context_cannot_claim_replacement_utterance() -> None:
     scheduler = _scheduler(speak=lambda _item: None)
     old_item = enqueue(scheduler, "work-1", "old")
@@ -591,12 +607,49 @@ def test_ack_items_never_reach_session_state_speech_progress() -> None:
     scheduler.pause("ack-turn-1")
     assert ack.utterance_id not in scheduler.state.speech
 
+    # resume() drops a paused ack instead of re-enqueueing it outside
+    # TurnAckLedger's bounded admission chain (see the dedicated
+    # test_resume_of_a_paused_ack_drops_it_... regression below), so there
+    # is no replay item here to assert against.
     resumed = scheduler.resume("ack-turn-1")
-    assert resumed is not None
-    assert resumed.utterance_id not in scheduler.state.speech
+    assert resumed is None
+    assert ack.utterance_id not in scheduler.state.speech
 
     scheduler.cancel("ack-turn-1")
-    assert resumed.utterance_id not in scheduler.state.speech
+    assert ack.utterance_id not in scheduler.state.speech
+
+
+def test_resume_of_a_paused_ack_drops_it_and_notifies_ack_terminal_instead_of_reenqueueing() -> (
+    None
+):
+    """Regression: resume() used to fall through to the generic replay path
+    for every role, re-enqueueing a paused ack with a fresh utterance_id.
+    That bypasses TurnAckLedger's bounded admission chain entirely (the
+    scheduler has no reference back to the ledger to re-establish it), so
+    the ack could sit queued indefinitely and later get admitted after the
+    turn's real result was already spoken. resume() must instead drop the
+    paused ack and settle the owning turn's ack latch via on_ack_terminal,
+    exactly as start_next's PreAdmissionTerminal branch and interrupt()'s
+    sweep already do."""
+    terminal_calls: list[tuple[GenerationIdentity, object]] = []
+    scheduler = _scheduler(
+        on_ack_terminal=lambda identity, reason: terminal_calls.append((identity, reason))
+    )
+    enqueue_ack(scheduler, turn_id="turn-1")
+    admitted = asyncio.run(scheduler.start_next())
+    assert admitted is not None and admitted.role == ROLE_ACK
+    scheduler.pause("ack-turn-1")
+    assert scheduler.paused("ack-turn-1") is not None
+
+    resumed = scheduler.resume("ack-turn-1")
+
+    assert resumed is None
+    assert scheduler.paused("ack-turn-1") is None
+    assert scheduler._queues.get("ack-turn-1") in (None, [])
+    assert len(terminal_calls) == 1
+    identity, _reason = terminal_calls[0]
+    assert identity.role == ROLE_ACK
+    assert identity.ack_id == "ack-turn-1"
 
 
 def test_discard_queued_ack_removes_only_the_named_ack_and_leaves_other_queues_untouched() -> None:

@@ -6,7 +6,7 @@ import asyncio
 import json
 import sys
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -67,10 +67,33 @@ _MAX_CAPABILITY_NAME_LENGTH = 64
 _MAX_CAPABILITY_FIELD_LENGTH = 2 + _MAX_CAPABILITY_ENTRIES * (_MAX_CAPABILITY_NAME_LENGTH + 3)
 
 
+_logging_configured = False
+
+
 def _configure_logging() -> None:
     """Disable Loguru's diagnose/backtrace rendering so tracebacks never dump
-    local variable values (transcripts, provider payloads, API keys) to logs."""
-    _loguru_logger.remove()
+    local variable values (transcripts, provider payloads, API keys) to logs.
+
+    Called from both ``create_app()`` (so ``uvicorn server.app:app`` direct-
+    ASGI serving -- which never runs ``main()`` -- still gets this hardening)
+    and ``main()`` (the CLI entrypoint, for processes that construct the app
+    some other way). Idempotent via ``_logging_configured`` so the second
+    call is a no-op rather than re-adding a duplicate hardened sink on every
+    request-serving process that happens to call both.
+
+    Removes only Loguru's own default handler (id ``0``, auto-installed with
+    ``diagnose=True``/``backtrace=True`` the moment ``loguru`` is imported),
+    never a blanket ``logger.remove()``: that used to strip every handler,
+    including one a caller/host process installed on the shared ``logger``
+    singleton before importing this module (see
+    ``TestLoguruStartupConfiguration.test_import_preserves_preexisting_handler``).
+    """
+    global _logging_configured
+    if _logging_configured:
+        return
+    _logging_configured = True
+    with suppress(ValueError):
+        _loguru_logger.remove(0)
     _loguru_logger.add(sys.stderr, backtrace=False, diagnose=False)
 
 
@@ -683,6 +706,7 @@ def create_app(
     preflight_probe: Probe | None = None,
 ) -> FastAPI:
     """Create the local FastAPI app and its Small WebRTC signaling routes."""
+    _configure_logging()
     session_host = host if host is not None else _default_session_host()
     config = getattr(session_host.registry, "config", None) or Config()
     webrtc_handler = SmallWebRTCRequestHandler()

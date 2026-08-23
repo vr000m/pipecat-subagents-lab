@@ -172,6 +172,13 @@ class DecliningResultWorker(ResultWorker):
         raise WorkerDeclined(f"cannot satisfy {query}")
 
 
+class NoneResultWorker(ResultWorker):
+    """Completes normally with no result, distinct from raising WorkerDeclined."""
+
+    async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> None:
+        return None
+
+
 class ClarifyingResultWorker(ResultWorker):
     async def search(self, query: str, *, turn_id: str, origin_epoch: int | None) -> GroundedResult:
         raise WorkerClarify("Which city's weather do you mean?")
@@ -348,6 +355,30 @@ def test_successful_result_starts_speech_on_same_pipecat_worker() -> None:
         assert len(speak_frames) == 2
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item.result_id == "result-next"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_search_completing_with_none_is_not_reported_as_a_busy_service() -> None:
+    """Round 1 gauntlet logic finding: a search worker task that completes
+    normally with ``None`` (no result, as opposed to raising WorkerDeclined)
+    previously fell through to the same branch used for busy/refused
+    dispositions, speaking `_SEARCH_BUSY_TEXT` and recording the child
+    outcome as "failed". A legitimately-empty result must not be reported as
+    a service-capacity problem."""
+
+    async def run() -> None:
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(NoneResultWorker()),
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        result = await host._handle_transcript("Riga weather")
+
+        assert result.text == pipeline_module._NO_RELIABLE_RESULT_TEXT
+        assert result.text != pipeline_module._SEARCH_BUSY_TEXT
         await host.shutdown()
 
     asyncio.run(run())
@@ -8749,6 +8780,117 @@ def test_ack_admission_retry_gives_up_after_max_attempts_instead_of_forever(
         # the assertion above raced a slow retry.
         await asyncio.sleep(0.05)
         assert len(attempts) == 3
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_stale_ack_admission_retry_does_not_clobber_a_newer_chain_sharing_its_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-11 deep-review Logic finding: ``ack_work_item_id`` is derived
+    from ``turn_id`` alone, so a later eligible sibling that re-latches the
+    same turn after an earlier admission chain abandoned starts a brand-new
+    chain under the identical scheduler key. Before the fix, a stale chain's
+    belated retry timer (already in flight when the turn settled and a new
+    chain started) would see the latch live again -- set by the *new* chain
+    -- and wrongly treat that as proof its own admission was still current,
+    letting it re-enter ``start_next`` for a key a different chain now owns.
+    A per-chain generation counter must make the stale chain recognize it
+    has been superseded and drop out silently instead."""
+    import server.turn_ack_ledger as turn_ack_ledger_module
+    from server.speech_scheduler import ROLE_ACK
+
+    monkeypatch.setattr(turn_ack_ledger_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.05)
+
+    async def run() -> None:
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        origin = await host.connect(connection_handshake(host, 1))
+        origin.worker = QueueingPipelineWorker()
+        ledger = host._turn_ack_ledger
+        turn_id = "turn-superseded"
+        ack_work_item_id = "ack-turn-superseded"
+        # A single persistent instrumented start_next for the whole test:
+        # records every call, real or stale, so a stale chain quietly
+        # re-entering start_next after being superseded is directly
+        # observable as a third recorded call. Fails only the first call
+        # (chain A's lone attempt); every later call -- chain B's, and
+        # chain A's stale retry if the fix is broken -- goes through to the
+        # real scheduler.
+        real_start_next = origin.scheduler.start_next
+        start_next_calls: list[str | None] = []
+
+        async def instrumented_start_next(work_item_id: str | None = None):
+            start_next_calls.append(work_item_id)
+            if len(start_next_calls) == 1:
+                raise RuntimeError("worker not attached yet")
+            return await real_start_next(work_item_id)
+
+        origin.scheduler.start_next = instrumented_start_next  # type: ignore[method-assign]
+
+        def enqueue_ack() -> None:
+            origin.scheduler.enqueue(
+                result_id=None,
+                work_item_id=ack_work_item_id,
+                run_id=f"run-{ack_work_item_id}",
+                text="One moment.",
+                origin_epoch=origin.epoch,
+                role=ROLE_ACK,
+                ack_id=ack_work_item_id,
+                turn_id=turn_id,
+            )
+
+        # Chain A: latch, enqueue, and schedule admission. Its first attempt
+        # fails and schedules a delayed retry (attempt 2) that has not fired
+        # yet.
+        ledger._ack_emitted_turns.add(turn_id)
+        enqueue_ack()
+        ledger._schedule_ack_admission(
+            origin, ack_work_item_id, enqueue_ack, turn_id=turn_id, origin_epoch=origin.epoch
+        )
+        for _ in range(200):
+            if start_next_calls:
+                break
+            await asyncio.sleep(0.005)
+        assert len(start_next_calls) == 1, "chain A's first admission attempt must have run"
+        assert turn_id in ledger._ack_emitted_turns, "attempt 1 of 4 must not abandon yet"
+
+        # While chain A's delayed retry is still pending, the turn settles
+        # for real (its owning handler's cleanup) and a later eligible
+        # sibling of the *same* turn re-latches and starts chain B under the
+        # identical key.
+        ledger.settle_turn_ack(origin.scheduler, turn_id)
+        assert turn_id not in ledger._ack_emitted_turns
+        assert ack_work_item_id not in origin.scheduler._queues
+
+        ledger._ack_emitted_turns.add(turn_id)
+        enqueue_ack()
+        ledger._schedule_ack_admission(
+            origin, ack_work_item_id, enqueue_ack, turn_id=turn_id, origin_epoch=origin.epoch
+        )
+        for _ in range(200):
+            if len(start_next_calls) >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert len(start_next_calls) == 2, "chain B's own first admission attempt must have run"
+        active = origin.scheduler._active
+        assert active is not None and active.item.work_item_id == ack_work_item_id
+        chain_b_utterance_id = active.item.utterance_id
+
+        # Now let chain A's stale retry timer fire. Before the fix it would
+        # see the latch live again (chain B re-set it) and call start_next
+        # again for the same key, potentially stealing or duplicating chain
+        # B's just-admitted ack. After the fix it must recognize it has been
+        # superseded and drop out without calling start_next at all.
+        await asyncio.sleep(0.15)
+
+        assert len(start_next_calls) == 2, (
+            "chain A must not re-enter start_next once its generation has been superseded"
+        )
+        active = origin.scheduler._active
+        assert active is not None and active.item.utterance_id == chain_b_utterance_id, (
+            "chain B's admitted ack must survive undisturbed by chain A's stale retry"
+        )
         await host.shutdown()
 
     asyncio.run(run())

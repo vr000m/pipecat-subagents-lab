@@ -57,11 +57,7 @@ def sha256_file(path: Path) -> str:
     """Return the hex SHA-256 digest of a file's bytes."""
     import hashlib
 
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hashlib.sha256(read_bytes_no_follow(path)).hexdigest()
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -73,19 +69,14 @@ def sha256_bytes(data: bytes) -> str:
 def load_json(path: Path) -> Any:
     """Read one JSON document, converting *every* read failure into a gate error.
 
-    ``FileNotFoundError`` is only the most common way an evidence input can be
-    unreadable; a permission-denied file, a directory supplied where a file was
-    expected, or a dangling symlink all raise other ``OSError`` subclasses. This
-    helper exists so every caller gets one controlled failure type, so all of
-    them are wrapped here rather than only in the callers that remembered to.
+    Routes through ``read_bytes_no_follow`` so every read failure mode --
+    missing, symlinked, a FIFO/device, or oversized -- collapses to one
+    controlled ``EvidenceGateError``, the same guarantee the raw-``OSError``
+    handling below already gave the more ordinary failure modes.
     """
+    data = read_bytes_no_follow(path)
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except FileNotFoundError as exc:
-        raise EvidenceGateError(f"missing evidence input: {path}") from exc
-    except OSError as exc:
-        raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
+        return json.loads(data)
     except json.JSONDecodeError as exc:
         raise EvidenceGateError(f"malformed JSON in {path}: {exc}") from exc
     except UnicodeDecodeError as exc:
@@ -106,32 +97,25 @@ def load_jsonl(
     ``EvidenceGateError`` with that context, without duplicating this
     function's own read/parse handling.
     """
-    if not path.exists():
-        raise EvidenceGateError(f"missing evidence input: {path}")
-    records: list[dict[str, Any]] = []
+    data = read_bytes_no_follow(path)
     try:
-        handle = path.open("r", encoding="utf-8")
-    except OSError as exc:
-        raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
-    try:
-        with handle:
-            for line_no, raw_line in enumerate(handle, start=1):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise EvidenceGateError(
-                        f"{path}: line {line_no}: invalid JSON ({exc})"
-                    ) from exc
-                if not isinstance(record, dict):
-                    raise EvidenceGateError(f"{path}: line {line_no}: expected a JSON object")
-                if validate_record is not None:
-                    validate_record(line_no, record)
-                records.append(record)
+        text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise EvidenceGateError(f"undecodable evidence input {path}: {exc}") from exc
+    records: list[dict[str, Any]] = []
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise EvidenceGateError(f"{path}: line {line_no}: invalid JSON ({exc})") from exc
+        if not isinstance(record, dict):
+            raise EvidenceGateError(f"{path}: line {line_no}: expected a JSON object")
+        if validate_record is not None:
+            validate_record(line_no, record)
+        records.append(record)
     return records
 
 
@@ -313,6 +297,48 @@ def require_regular_fd(fd: int, path: Path, verb: str) -> None:
         raise EvidenceGateError(f"{path}: refusing to {verb} -- not a regular file")
 
 
+def read_bytes_no_follow(path: Path, *, max_bytes: int = _MAX_EVIDENCE_OUTPUT_BYTES) -> bytes:
+    """Read `path`'s bytes, refusing to read *through* a symlink or hang on a FIFO.
+
+    Mirrors ``write_bytes_no_follow``'s hardening on the read side: an
+    attacker who can plant a symlink at a predictable, repo-relative evidence
+    path can equally ``mkfifo`` it, and a plain ``open()``/``read()`` blocks
+    forever on a reader-less FIFO's write end (or never reaches EOF against a
+    character device such as ``/dev/zero``). ``O_NOFOLLOW`` rejects the
+    symlink case outright (``ELOOP``); ``O_NONBLOCK`` plus
+    ``require_regular_fd`` -- checked against the held fd, so the type check
+    and the read cannot be TOCTOU'd apart -- rejects everything else. The
+    read is additionally capped at ``max_bytes`` so an oversized input is
+    never fully buffered into memory.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise EvidenceGateError(f"missing evidence input: {path}") from exc
+        if exc.errno == errno.ENXIO:
+            # Read-opening the write end of a reader-less FIFO with
+            # O_NONBLOCK fails here rather than blocking; same verdict as
+            # the fstat check below would give a FIFO opened some other way.
+            raise EvidenceGateError(f"{path}: refusing to read -- not a regular file") from exc
+        raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
+    try:
+        require_regular_fd(fd, path, "read")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise EvidenceGateError(f"{path}: evidence input exceeds {max_bytes}-byte cap")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def write_bytes_no_follow(path: Path, payload: bytes) -> None:
     """Write `payload` to `path`, refusing to write *through* a symlink.
 
@@ -328,11 +354,22 @@ def write_bytes_no_follow(path: Path, payload: bytes) -> None:
     is cleared implicitly by closing the fd; nothing here needs it beyond the
     open.
 
+    ``payload`` is rejected outright above ``_MAX_EVIDENCE_OUTPUT_BYTES`` --
+    the threat-model bound this module documents but, before this, never
+    enforced. ``os.write`` is also looped to completion: it is permitted to
+    write fewer bytes than given (a short write), and a discarded return
+    value there would silently truncate the artifact with no error raised.
+
     Every evidence-gate script that writes to a predictable, repo-relative
     path routes through this one function -- see
     ``validate_v013_evidence.py``'s promotion-manifest writer, which this was
     lifted from, for the same hardening applied to that path.
     """
+    if len(payload) > _MAX_EVIDENCE_OUTPUT_BYTES:
+        raise EvidenceGateError(
+            f"{path}: refusing to write {len(payload)} bytes -- exceeds "
+            f"{_MAX_EVIDENCE_OUTPUT_BYTES}-byte cap"
+        )
     try:
         fd = os.open(
             path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644
@@ -348,7 +385,10 @@ def write_bytes_no_follow(path: Path, payload: bytes) -> None:
         raise
     try:
         require_regular_fd(fd, path, "write")
-        os.write(fd, payload)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            written += os.write(fd, view[written:])
         os.fsync(fd)
     finally:
         os.close(fd)

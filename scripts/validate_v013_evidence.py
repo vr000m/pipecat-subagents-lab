@@ -38,6 +38,7 @@ from scripts._evidence_common import (
     require_hex64,
     sha256_file,
 )
+from scripts.eval_common import confined_output_path
 from scripts.validate_phase2_transport_browser_contract import (
     validate_artifact as validate_transport_browser_artifact,
 )
@@ -900,6 +901,17 @@ def main(argv: list[str] | None = None) -> int:
             missing.append("--phase3-input")
         if missing:
             print(f"FAIL: --write-manifest requires {missing}", file=sys.stderr)
+            return 1
+        # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
+        # confine every operator-supplied --out/--output to the repo tree before
+        # writing; this evidence writer previously skipped that, so --output
+        # could point at an arbitrary destination such as
+        # .github/workflows/ci.yml despite write_bytes_no_follow already
+        # blocking symlink/FIFO redirection at the resolved path.
+        try:
+            confined_output_path(args.output, allowed_root=REPO_ROOT)
+        except ValueError as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
             return 1
         try:
             manifest = write_manifest(

@@ -104,6 +104,23 @@ class TurnAckLedger:
         # each turn's normal completion/cancellation/failure cleanup -- never
         # retained as an unbounded process-lifetime set.
         self._ack_emitted_turns: set[str] = set()
+        # One monotonic admission-chain generation counter per turn_id ever
+        # latched. ``ack_work_item_id`` is derived from ``turn_id`` alone, so
+        # a later eligible sibling that re-latches the same turn after an
+        # earlier chain abandoned starts a brand-new chain under the
+        # identical scheduler key. Without this, a stale chain's belated
+        # retry timer would find the latch live again (set by the *new*
+        # chain) and wrongly treat that as proof its own admission is still
+        # current -- see ``_retry_or_abandon``'s generation check.
+        # Deliberately *not* popped on latch clear (unlike
+        # ``_ack_emitted_turns``): turn ids are minted once each from a
+        # strictly increasing sequence and never reused, so resetting a
+        # turn's counter back to zero on clear would let a later chain for
+        # the *same* turn_id collide with an earlier, already-superseded
+        # chain's generation number instead of being distinguishable from
+        # it. Bounded by the number of turns the ledger has ever latched an
+        # ack for, not by anything within a single turn.
+        self._ack_admission_generation: dict[str, int] = {}
         # Authoritative turn -> delegated-child-work-item registry. Ack
         # ownership and the sole-delegated-child cancellation decision are
         # answered from this map rather than by re-deriving the
@@ -333,6 +350,7 @@ class TurnAckLedger:
         turn_id: str,
         origin_epoch: int,
         attempt: int = 1,
+        generation: int | None = None,
     ) -> None:
         """Admit a just-enqueued ack on a later scheduling tick, not inline.
 
@@ -360,7 +378,22 @@ class TurnAckLedger:
         the abandoned ack was discarded, never spoken -- but "one ack per
         turn" should be read as "one ack per admission attempt chain," not
         as a promise that at most one ack is ever queued for a turn.
+
+        ``generation`` identifies this call as belonging to one particular
+        admission chain. ``None`` (the default, and what every entry point
+        outside this method's own retry recursion passes) means "start a
+        fresh chain": a new generation number is claimed here, superseding
+        whatever chain previously held ``turn_id``. That covers both
+        ``emit_early_ack`` (a later eligible sibling re-latching the same
+        turn after an earlier chain abandoned) and callers that schedule
+        admission directly without any generation bookkeeping of their own.
+        Only this method's own ``retry_after_delay`` continuation passes an
+        explicit ``generation``, to prove *its* retry still belongs to the
+        chain that scheduled it -- see ``_retry_or_abandon``.
         """
+        if generation is None:
+            generation = self._ack_admission_generation.get(turn_id, 0) + 1
+            self._ack_admission_generation[turn_id] = generation
 
         def _retry_or_abandon(*, log_reason: str, needs_requeue: bool) -> None:
             # Shared by both admission-failure modes: an exception from
@@ -375,6 +408,21 @@ class TurnAckLedger:
             # path never dequeued the item in the first place (start_next
             # returns early, before popping, when the slot is occupied), so
             # calling ``enqueue_ack()`` there would queue a duplicate.
+            if self._ack_admission_generation.get(turn_id) != generation:
+                # This chain has been superseded: the turn's latch was
+                # cleared (settle/abandon) and a later eligible sibling
+                # already started a fresh chain under the same
+                # ``ack_work_item_id``. The liveness check below cannot
+                # tell the two apart -- it would see the latch live again
+                # and wrongly treat that as proof this stale chain is still
+                # current -- so bail out here first, before touching the
+                # newer chain's queued item or latch at all.
+                logger.debug(
+                    "early ack admission chain for {} is stale (superseded by "
+                    "a newer chain); dropping it silently",
+                    turn_id,
+                )
+                return
             if (
                 turn_id not in self._ack_emitted_turns
                 or self._connection() is not origin
@@ -431,6 +479,7 @@ class TurnAckLedger:
                     enqueue_ack,
                     turn_id=turn_id,
                     origin_epoch=origin_epoch,
+                    generation=generation,
                     attempt=attempt + 1,
                 )
 
@@ -439,6 +488,22 @@ class TurnAckLedger:
             retry_task.add_done_callback(self._ack_admission_tasks.discard)
 
         async def admit() -> None:
+            if self._ack_admission_generation.get(turn_id) != generation:
+                # Stale before ever calling start_next: the turn's latch was
+                # cleared and a later sibling already started a fresh chain
+                # under this same key while this attempt sat scheduled. The
+                # check inside ``_retry_or_abandon`` alone is not enough --
+                # it only runs *after* start_next has already been called
+                # once for this (dead) chain, which is one live admission
+                # attempt this chain has no business making. Catching it
+                # here, before that call, means a superseded chain never
+                # touches the scheduler at all.
+                logger.debug(
+                    "early ack admission chain for {} is stale (superseded by "
+                    "a newer chain) before starting; dropping it silently",
+                    turn_id,
+                )
+                return
             try:
                 admitted = await origin.scheduler.start_next(ack_work_item_id)
             except Exception:  # noqa: BLE001 - ack submission failure must never crash the turn
@@ -483,3 +548,4 @@ class TurnAckLedger:
         """
         self._turn_work_items.clear()
         self._ack_emitted_turns.clear()
+        self._ack_admission_generation.clear()

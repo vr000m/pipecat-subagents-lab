@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -115,6 +116,19 @@ class SessionState:
     # _RETENTION_CONFIG_PATH.
     _MAX_WORK_STATUS_KEYS = int(_retention_config["max_keys"])
 
+    # Hard ceiling on the raw event log `_emit` appends to. Nothing else in
+    # this class prunes it -- unlike the work-status ledger above, it has no
+    # TTL of its own -- so a long-running session (or one deliberately kept
+    # alive across many reconnects/turns) would otherwise grow it for the
+    # process lifetime. The only reader is `RuntimeObserver.messages()`
+    # (server/observers.py), an explicitly diagnostic, non-network API that
+    # replays from the start of this log; a `deque(maxlen=...)` bounds
+    # memory at the cost of that replay silently starting from whatever the
+    # oldest retained event is once a session exceeds the cap, the same
+    # "diagnostic view degrades gracefully" trade the work-status TTL/cap
+    # above already makes for its own ledger.
+    _MAX_EVENTS = 2000
+
     def __init__(self, session_id: str | None = None, resume_token: str | None = None) -> None:
         self.session_id = session_id or f"session-{uuid4().hex}"
         RuntimeSnapshot.reset_monotonicity(self.session_id)
@@ -125,7 +139,7 @@ class SessionState:
         self.speech: dict[str, SpeechProgress] = {}
         self.routing: RoutingState | None = None
         self.transcript: list[TranscriptEntry] = []
-        self._events: list[StateEvent] = []
+        self._events: deque[StateEvent] = deque(maxlen=self._MAX_EVENTS)
         self.active_epoch: int | None = None
         self._speech_history: dict[str, list[SpeechProgress]] = {}
         self._listeners: list[Callable[[StateEvent], Any]] = []
@@ -615,6 +629,8 @@ class SessionState:
 
     @classmethod
     def from_snapshot(cls, snapshot: RuntimeSnapshot) -> SessionState:
+        from loguru import logger
+
         state = cls(snapshot.session_id)
         state.sequence = snapshot.snapshot_sequence
         for worker in snapshot.workers:
@@ -638,6 +654,20 @@ class SessionState:
         restored_at = time.monotonic()
         for status in snapshot.work_status:
             key = WorkStatusKey(status.origin_epoch, status.turn_id, status.work_item_id or "")
+            if key in state._work_status_parents:
+                # Every current producer stamps a real work_item_id onto
+                # every WorkStatus it emits (see _reaggregate_parent), so
+                # this should be unreachable -- but the wire schema still
+                # declares work_item_id Optional, and two distinct records
+                # that both restore to `work_item_id or ""` would otherwise
+                # silently overwrite each other's record and event sequence
+                # with no warning (round 1 gauntlet logic finding). Surface
+                # it instead of losing data quietly.
+                logger.warning(
+                    "from_snapshot: overwriting existing work-status record for "
+                    f"{key} -- multiple restored records collapsed onto the same "
+                    f"WorkStatusKey (work_item_id={status.work_item_id!r})"
+                )
             state._work_status_children.setdefault(key, {})
             state._work_status_sequence[key] = status.event_sequence
             state._work_status_parents[key] = _WorkStatusRecord(

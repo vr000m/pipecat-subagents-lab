@@ -1260,6 +1260,33 @@ def test_load_promotion_manifest_rejects_a_non_hex_schema_hash(tmp_path: Path) -
     assert verdict.reason == "manifest_schema_invalid"
 
 
+def test_load_promotion_manifest_rejects_an_uppercase_hex_schema_hash(tmp_path: Path) -> None:
+    """Round 1 gauntlet logic finding: `_is_hex_hash` previously admitted
+    uppercase hex, but every digest it validates is checked against a
+    `hashlib.hexdigest()` value, which is always lowercase. An uppercased
+    *correct* digest must be rejected at this shape check with an
+    actionable "malformed digest" reason -- not pass the shape check and
+    then always fail as a spurious `manifest_schema_hash_mismatch`."""
+    import json
+
+    load_promotion_manifest = _load_promotion_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    config = _bound_config(manifest_path)
+    manifest_path.write_text(
+        json.dumps(
+            _final_manifest(
+                tmp_path=tmp_path, config=config, schema_hash=_evidence_schema_hash().upper()
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    verdict = load_promotion_manifest(config)
+
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_invalid"
+
+
 def test_load_promotion_manifest_rejects_a_non_hex_phase3_completion_hash(tmp_path: Path) -> None:
     import json
 
@@ -1593,6 +1620,44 @@ def test_load_promotion_manifest_treats_an_unreadable_schema_file_as_unverifiabl
 
     verdict = load_promotion_manifest(config)
 
+    assert verdict.promotion_eligible is False
+    assert verdict.reason == "manifest_schema_unverifiable"
+
+
+def test_load_promotion_manifest_does_not_hang_on_a_fifo_planted_at_the_schema_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 gauntlet security finding: `_schema_hash_matches` previously
+    read `_EVIDENCE_SCHEMA_PATH` with a plain `read_bytes()`, bypassing this
+    module's own `_read_regular_file_no_follow` guard. A FIFO (or
+    `/dev/zero`) planted at that predictable, repo-relative path never
+    raises `OSError` from `read_bytes()`, so the fail-closed "unverifiable"
+    branch was never reached and server boot hung inside the read instead.
+    A bounded `pytest.mark.timeout`-free wall-clock check below fails loudly
+    rather than hanging the suite if this regresses."""
+    import os
+    import threading
+
+    from server import config as config_module
+
+    fifo_path = tmp_path / "v013-evidence.json"
+    os.mkfifo(fifo_path)
+    monkeypatch.setattr(config_module, "_EVIDENCE_SCHEMA_PATH", fifo_path, raising=True)
+
+    load_promotion_manifest = _load_promotion_manifest()
+    config = _write_manifest_for(tmp_path)
+
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        result["verdict"] = load_promotion_manifest(config)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive(), "load_promotion_manifest hung reading a FIFO schema path"
+    verdict = result["verdict"]
     assert verdict.promotion_eligible is False
     assert verdict.reason == "manifest_schema_unverifiable"
 

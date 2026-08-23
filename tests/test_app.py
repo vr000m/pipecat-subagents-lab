@@ -924,6 +924,39 @@ assert handler_id in logger._core.handlers
 
         assert result.returncode == 0, result.stderr
 
+    def test_import_alone_hardens_logging_without_calling_main(self) -> None:
+        """Regression: ``_configure_logging()`` used to be called only from
+        ``main()`` -- ``uvicorn server.app:app`` direct-ASGI serving (or any
+        other host importing the module and using the module-level ``app``
+        without ever calling ``main()``) left Loguru's default handler
+        (``diagnose=True``/``backtrace=True``) in place, risking API keys
+        and transcripts landing in a traceback dump. Merely importing the
+        module -- which runs ``app = create_app()`` at module scope -- must
+        be enough to harden the default handler."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+from loguru import logger
+
+import server.app  # noqa: F401 -- import alone, `main()` is never called
+
+handlers = list(logger._core.handlers.values())
+assert handlers, "import must configure at least one handler"
+for handler in handlers:
+    assert handler._exception_formatter._diagnose is False
+    assert handler._exception_formatter._backtrace is False
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+
     def test_configured_sink_has_diagnose_and_backtrace_disabled(self) -> None:
         from loguru import logger as loguru_logger
 

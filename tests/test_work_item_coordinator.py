@@ -3,7 +3,6 @@
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
 
 import pytest
 
@@ -1214,33 +1213,23 @@ def test_wait_timeout_ms_override_applies_independently_of_max_work_items() -> N
     assert preserves_caller_config.config.multi_intent_wait_timeout_ms == 7_000
 
 
-def test_retain_late_task_delivers_result_to_polling_queue_when_callback_scheduling_is_rejected() -> (
-    None
-):
-    """When an async ``on_complete`` callback is scheduled via ``start_task``
-    and the coordinator refuses it (background capacity exhausted or shut
-    down), ``start_task`` closes the coroutine and returns ``None``. The
-    completed ``LateResult`` must still reach a caller -- via the same
-    polling queue used when no ``on_complete`` is registered -- rather than
-    vanish silently, which would break the at-least-once late-delivery
-    guarantee."""
+def test_retain_late_task_force_schedules_callback_when_background_capacity_is_exhausted() -> None:
+    """The completion callback for a retained task must still run when
+    background capacity is exhausted, not be dropped into the
+    ``_late_results`` polling queue -- nothing in production drains that
+    queue (see ``drain_late_results``), so parking the callback there would
+    silently break the at-least-once late-delivery guarantee."""
 
     async def run() -> None:
-        coordinator = WorkItemCoordinator()
+        coordinator = WorkItemCoordinator(max_background_tasks=1)
 
         async def worker() -> dict:
             return {"text": "hi", "citations": []}
 
+        callback_ran = asyncio.Event()
+
         async def on_complete(_late: object) -> None:
-            return None
-
-        def rejecting_start_task(operation: Any) -> asyncio.Task[Any] | None:
-            # Mirrors the real start_task's rejection contract exactly: close
-            # the coroutine it refuses to run, then return None.
-            operation.close()
-            return None
-
-        coordinator.start_task = rejecting_start_task  # type: ignore[method-assign]
+            callback_ran.set()
 
         task = asyncio.create_task(worker())
         assert coordinator.retain_late_task(
@@ -1249,13 +1238,61 @@ def test_retain_late_task_delivers_result_to_polling_queue_when_callback_schedul
             worker_id="worker-1",
             on_complete=on_complete,
         )
+
+        # Saturate background capacity right before the retained task
+        # completes, so the completion callback below has to schedule its
+        # on_complete coroutine with `_has_background_capacity()` false.
+        sentinel = asyncio.create_task(asyncio.sleep(60))
+        coordinator._owned_tasks.add(sentinel)
+        assert not coordinator._has_background_capacity()
+
+        await task
+        await asyncio.wait_for(callback_ran.wait(), timeout=1.0)
+
+        # The callback ran directly; nothing was left in the polling queue.
+        assert coordinator.drain_late_results() == ()
+
+        coordinator._owned_tasks.discard(sentinel)
+        sentinel.cancel()
+        await asyncio.gather(sentinel, return_exceptions=True)
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retain_late_task_suppresses_callback_once_shutdown_has_begun() -> None:
+    """Once shutdown has begun, a retained task's completion must not call
+    ``on_complete`` at all (the force-adopt fix must not resurrect delivery
+    after shutdown) -- there is no one left to observe it, so the result is
+    neither run through the callback nor queued."""
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator()
+
+        async def worker() -> dict:
+            return {"text": "hi", "citations": []}
+
+        callback_ran = asyncio.Event()
+
+        async def on_complete(_late: object) -> None:
+            callback_ran.set()
+
+        task = asyncio.create_task(worker())
+        assert coordinator.retain_late_task(
+            task,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=on_complete,
+        )
+
+        coordinator._shutdown = True
         await task
         await asyncio.sleep(0)
 
-        results = coordinator.drain_late_results()
-        assert [late.work_item_id for late in results] == ["work-1"]
+        assert not callback_ran.is_set()
+        assert coordinator.drain_late_results() == ()
 
-        coordinator.start_task = WorkItemCoordinator.start_task.__get__(coordinator)
+        coordinator._shutdown = False
         await coordinator.shutdown()
 
     asyncio.run(run())

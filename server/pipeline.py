@@ -1572,6 +1572,23 @@ class SessionHost:
                 if execution.status == "completed" and execution.result is not None:
                     result = execution.result
                     child_outcome_label = "completed"
+                elif execution.status == "completed":
+                    # A worker task that completes normally with no result
+                    # (``execution.result is None``) is not a capacity/busy
+                    # disposition -- the search actually ran and legitimately
+                    # found nothing. Falling through to the busy-text/"failed"
+                    # branch below misreported an empty result as a service
+                    # outage. Reuses the "declined" outcome/text: an explicit
+                    # ``WorkerDeclined`` and a completed-with-nothing search
+                    # are the same user-facing situation -- no reliable result
+                    # -- even though only one of them raised.
+                    result = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=turn_id,
+                        text=_NO_RELIABLE_RESULT_TEXT,
+                        origin_epoch=origin_epoch,
+                    )
+                    child_outcome_label = "declined"
                 elif execution.status == "retained":
                     # A retained work item is still working, so `background` is
                     # its truthful status on every connection -- the observer,

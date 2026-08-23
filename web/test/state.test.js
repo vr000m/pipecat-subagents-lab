@@ -727,6 +727,49 @@ if (hasWorkStatusField) {
       expect(state.workStatus["1::turn-299::work-299"]).toBeDefined();
       expect(state.workStatus["1::turn-0::work-0"]).toBeUndefined();
     });
+
+    // Regression: applyIncrement's work_status case and snapshotState both
+    // indexed `state.workStatus[key]` directly, unlike render.js's
+    // `state.workStatus || {}` guard. A state object missing the field
+    // entirely (e.g. one hand-built by a caller that didn't go through
+    // createInitialState) crashed with a TypeError instead of degrading to
+    // "no prior record" the way an empty object would.
+    test("a work_status increment does not throw when state.workStatus is missing", () => {
+      let state = createInitialState();
+      state = applyServerMessage(state, snapshot(1));
+      delete state.workStatus;
+
+      expect(() => {
+        state = applyServerMessage(state, {
+          kind: "work_status",
+          sequence: 2,
+          session_id: "session-1",
+          origin_epoch: 1,
+          data: { turn_id: "turn-1", work_item_id: "work-1", state: "background", event_sequence: 0, origin_epoch: 1 },
+        });
+      }).not.toThrow();
+
+      expect(state.workStatus["1::turn-1::work-1"]?.state).toBe("background");
+    });
+
+    test("a snapshot does not throw when the pre-snapshot state.workStatus is missing", () => {
+      let state = createInitialState();
+      delete state.workStatus;
+
+      expect(() => {
+        state = applyServerMessage(state, {
+          ...snapshot(1),
+          data: {
+            ...snapshot(1).data,
+            work_status: [
+              { turn_id: "turn-1", work_item_id: "work-1", worker_id: null, state: "searching", event_sequence: 0, terminal_reason: null, origin_epoch: 1 },
+            ],
+          },
+        });
+      }).not.toThrow();
+
+      expect(state.workStatus["1::turn-1::work-1"]?.state).toBe("searching");
+    });
   });
 } else {
   test.skip("Phase 3 work_status reducer not implemented yet (state.js has no workStatus field)", () => {});

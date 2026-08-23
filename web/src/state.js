@@ -312,7 +312,7 @@ function snapshotState(state, snapshot, sequence) {
       // since a snapshot carries at most one parent record per key, but
       // would make this non-idempotent under a hypothetical future
       // duplicate-key-within-one-snapshot case.
-      return upsertWorkStatus(acc, key, item, now, state.workStatus[key], true);
+      return upsertWorkStatus(acc, key, item, now, (state.workStatus || {})[key], true);
     }, {});
   const diagnostics = {
     ...state.localDiagnostics,
@@ -366,9 +366,10 @@ function applyIncrement(state, payload) {
       const projected = projectedWorkStatus(payload.data);
       if (!projected) return state;
       const key = workStatusKey(projected);
-      const previous = state.workStatus[key];
+      const workStatus = state.workStatus || {};
+      const previous = workStatus[key];
       if (previous && previous.event_sequence >= projected.event_sequence) return state;
-      return { ...state, workStatus: upsertWorkStatus(state.workStatus, key, projected) };
+      return { ...state, workStatus: upsertWorkStatus(workStatus, key, projected) };
     }
     case "user_transcript":
     case "bot_transcript":

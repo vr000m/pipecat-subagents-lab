@@ -395,7 +395,14 @@ _MANIFEST_REQUIRED_FIELDS = frozenset(
 _MANIFEST_REQUIRED_FINAL_INPUTS = frozenset({"phase0", "phase1", "phase2", "phase3"})
 
 
-_HEX_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+# Lowercase-only, matching scripts/_evidence_common.py's HEX64_RE: every
+# digest this pattern validates is checked against a hashlib `.hexdigest()`
+# output, which is always lowercase. Admitting uppercase here let a
+# correct-but-uppercase digest pass this shape check and then always
+# mismatch at the equality comparison against the lowercase-only digest it
+# is verified against -- a spurious integrity failure instead of an
+# actionable "malformed digest" rejected right here.
+_HEX_HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 # Manifest keys whose value must be a JSON string. `reason` is deliberately
 # excluded: it is required to be present but is null on an eligible manifest.
@@ -538,10 +545,15 @@ def _schema_hash_matches(declared: str) -> Literal["match", "mismatch", "unverif
     ship this file -- but "cannot verify" is not "verified", so it is reported
     as its own state rather than collapsed into a match, and the caller decides
     fail-closed.
+
+    Routed through `_read_regular_file_no_follow` -- the same guard every
+    other evidence read on this boot path uses -- rather than a plain
+    `read_bytes()`: a FIFO or character device (`/dev/zero`) planted at this
+    predictable, repo-relative path would otherwise block server boot inside
+    the read forever instead of degrading to "unverifiable".
     """
-    try:
-        data = _EVIDENCE_SCHEMA_PATH.read_bytes()
-    except OSError:
+    data = _read_regular_file_no_follow(_EVIDENCE_SCHEMA_PATH, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
+    if data is None:
         return "unverifiable"
     if hashlib.sha256(data).hexdigest() == declared:
         return "match"

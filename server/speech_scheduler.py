@@ -291,7 +291,11 @@ class SpeechScheduler:
     async def start_next(self, work_item_id: str | None = None) -> SpeechItem | None:
         if self._active is not None or self.lifecycle.occupied:
             return None
-        keys = [work_item_id] if work_item_id else list(self._queues)
+        # `is not None`, not truthiness: an empty-string work_item_id is a
+        # legal dict key (`enqueue` accepts it), and falling into the `else`
+        # branch would scan every queue instead of the requested one,
+        # admitting an utterance from an unrelated work item.
+        keys = [work_item_id] if work_item_id is not None else list(self._queues)
         item: SpeechItem | None = None
         identity: GenerationIdentity | None = None
         disposition: PreAdmissionAdmit | None = None
@@ -630,6 +634,30 @@ class SpeechScheduler:
         if item is None:
             return None
         self._paused.pop(item.work_item_id, None)
+        if item.role == ROLE_ACK:
+            # A plain re-enqueue here would bypass TurnAckLedger's bounded
+            # admission chain (_schedule_ack_admission's 4-attempt/0.25s
+            # retry) entirely -- the scheduler has no reference back to the
+            # ledger to re-establish it -- leaving the ack with no bounded
+            # lifetime after resume. It could then sit queued until some
+            # later start_next happens to pick it, potentially admitting
+            # "let me check" after the turn's real result was already
+            # spoken. Drop it and settle the owning turn's ack instead,
+            # through the same terminal-notification path _notify_ack_swept
+            # already uses for an ack discarded outside normal admission.
+            if self._on_ack_terminal is not None:
+                identity = GenerationIdentity(
+                    item.utterance_id,
+                    item.work_item_id,
+                    item.origin_epoch,
+                    role=ROLE_ACK,
+                    turn_id=item.turn_id,
+                    ack_id=item.ack_id,
+                )
+                self._on_ack_terminal(identity, PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
+            if was_paused:
+                self._emit_progress(item, DeliveryState.INTERRUPTED)
+            return None
         if was_paused:
             # A paused item holds a non-terminal PAUSED record in
             # SessionState.speech keyed by its own utterance_id. The replay

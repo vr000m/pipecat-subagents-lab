@@ -52,8 +52,19 @@ def _confine_manifest_evidence_root_to_tmp_path(
     confinement -- see ``_repo_relative_evidence_path``). Point that root at
     each test's own ``tmp_path`` so existing fixtures can keep writing dummy
     evidence files there while still exercising the real relative-path
-    resolution, not a bypass of it."""
+    resolution, not a bypass of it.
+
+    ``--output`` on both ``validate_v013_evidence.py`` and
+    ``record_phase3_completion.py`` is now also confined to each module's own
+    ``REPO_ROOT`` via ``confined_output_path`` (round 1 gauntlet security
+    finding: evidence writers must apply the same output confinement
+    ``eval_model_comparison.py``/``verify_eval_candidates.py`` already do),
+    so both modules' roots are patched here the same way
+    ``test_eval_model_comparison.py`` patches ``eval_runner.REPO_ROOT``.
+    """
     monkeypatch.setattr(_validator(), "REPO_ROOT", tmp_path)
+    record_module = pytest.importorskip("scripts.record_phase3_completion")
+    monkeypatch.setattr(record_module, "REPO_ROOT", tmp_path)
 
 
 def _evidence_common() -> Any:

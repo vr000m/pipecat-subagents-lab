@@ -79,6 +79,7 @@ from scripts._evidence_common import (
     require_type,
     write_bytes_no_follow,
 )
+from scripts.eval_common import confined_output_path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -568,6 +569,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dimension", type=str, default=SELECTED_DIMENSION)
     parser.add_argument("--value", type=int, action="append", default=None)
     args = parser.parse_args(argv)
+
+    # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
+    # confine every operator-supplied --out/--output to the repo tree before
+    # writing; this evidence writer previously skipped that, so --output
+    # could point at an arbitrary destination such as .github/workflows/ci.yml
+    # despite write_bytes_no_follow already blocking symlink/FIFO redirection
+    # at the resolved path.
+    try:
+        confined_output_path(args.output, allowed_root=REPO_ROOT)
+    except ValueError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
 
     if args.live:
         return run_live(output=args.output)

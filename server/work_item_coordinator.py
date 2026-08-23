@@ -590,23 +590,21 @@ class WorkItemCoordinator:
                 return
             callback_result = on_complete(late)
             if inspect.isawaitable(callback_result):
-                callback_task = self.start_task(callback_result)
-                if callback_task is not None:
-                    self._track_callback_task(callback_task)
-                else:
-                    # start_task refused the coroutine for capacity or
-                    # shutdown and already closed it, so on_complete will
-                    # never run. Without this fallback ``late`` reaches
-                    # neither the caller's async callback nor the polling
-                    # queue, silently breaking the at-least-once late-delivery
-                    # guarantee. Deliver it through the same queue used when
-                    # no on_complete is registered at all.
-                    logger.warning(
-                        f"on_complete callback for {work_item_id} could not be "
-                        "scheduled (background capacity exhausted or coordinator "
-                        "shut down); falling back to late-result polling queue"
-                    )
-                    self._late_results.append(late)
+                # ``start_task``'s capacity gate must not be allowed to
+                # refuse this coroutine: nothing in production drains
+                # ``_late_results`` (see ``drain_late_results``), so parking
+                # a refused ``late`` there silently broke the at-least-once
+                # late-delivery guarantee -- neither the caller's async
+                # callback nor any poller would ever see it. This callback
+                # is a bounded, fire-and-forget bookkeeping coroutine
+                # invoked at most once per retained task, so force-adopt it
+                # past the capacity gate the same way ``_track_cancelling_task``
+                # already does for mandatory cleanup work. The ``self._shutdown``
+                # check above already suppresses this entire branch once
+                # shutdown has begun, so no separate guard is needed here.
+                callback_task = asyncio.create_task(callback_result)
+                self._adopt_task(callback_task, force=True)
+                self._track_callback_task(callback_task)
 
         task.add_done_callback(completed)
         return True

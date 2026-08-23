@@ -42,6 +42,31 @@ def test_result_history_is_append_only_and_snapshot_retains_all_results() -> Non
     assert snapshot.contract_version == CONTRACT_VERSION
 
 
+def test_events_log_is_bounded_and_evicts_oldest_first() -> None:
+    """Regression: `_events` used to be a plain, never-pruned `list`. The
+    only reader (`RuntimeObserver.messages()`) is a diagnostic replay API,
+    but nothing bounded the log's growth for a long-running session -- it
+    accumulated one entry per state-mutating call for the process lifetime.
+    A `deque(maxlen=SessionState._MAX_EVENTS)` caps memory, evicting the
+    oldest event once the cap is exceeded."""
+    state = SessionState(session_id="session-1")
+    state.set_worker(
+        WorkerState(worker_id="worker-weather", topic="weather", model_policy="deep", status="idle")
+    )
+    total = SessionState._MAX_EVENTS + 50
+    for index in range(total):
+        state.append_result(result(f"result-{index}"))
+
+    events = state.events
+    assert len(events) == SessionState._MAX_EVENTS
+    # The oldest 50 events (the worker-set plus the first 49 results) were
+    # evicted; the log now starts wherever the cap first bit.
+    kinds_and_payloads = [(event.kind, event.payload.get("result_id")) for event in events]
+    assert ("worker", None) not in kinds_and_payloads
+    assert kinds_and_payloads[0] == ("result", f"result-{total - SessionState._MAX_EVENTS}")
+    assert kinds_and_payloads[-1] == ("result", f"result-{total - 1}")
+
+
 def test_routing_and_semantic_transcript_are_authoritative_snapshot_state() -> None:
     state = SessionState(session_id="session-routing")
     state.active_epoch = 2
@@ -319,6 +344,50 @@ def test_snapshot_round_trip_rebuilds_the_work_status_ledger_and_its_sequences()
     # client already applied.
     key = WorkStatusKey(origin_epoch=1, turn_id="turn-1", parent_key="work-1")
     assert restored._work_status_sequence[key] == 3
+
+
+@pytest.mark.skipif(
+    WorkStatusKey is None, reason="server.session_state.WorkStatusKey not implemented yet"
+)
+def test_from_snapshot_warns_when_two_none_work_item_id_records_collapse_onto_one_key() -> None:
+    """Round 1 gauntlet logic finding: ``from_snapshot`` maps every
+    ``work_item_id is None`` record for a given ``(origin_epoch, turn_id)``
+    onto the same ``WorkStatusKey`` (via ``work_item_id or ""``). No current
+    producer emits ``work_item_id=None`` (the wire schema still declares it
+    Optional), but a manually-constructed snapshot with two such records must
+    not silently lose one -- the collision must at least be logged rather
+    than overwriting silently."""
+    import io
+
+    from loguru import logger
+
+    from server.contracts import RuntimeSnapshot, WorkStatus
+
+    RuntimeSnapshot.reset_monotonicity("session-collision")
+    snapshot = RuntimeSnapshot(
+        contract_version=CONTRACT_VERSION,
+        session_id="session-collision",
+        snapshot_sequence=1,
+        work_status=[
+            WorkStatus(turn_id="turn-1", work_item_id=None, state="routing", event_sequence=1),
+            WorkStatus(turn_id="turn-1", work_item_id=None, state="searching", event_sequence=2),
+        ],
+    )
+
+    sink = io.StringIO()
+    handler_id = logger.add(sink, level="WARNING", format="{message}")
+    try:
+        restored = SessionState.from_snapshot(snapshot)
+    finally:
+        logger.remove(handler_id)
+
+    log_output = sink.getvalue()
+    assert "overwriting existing work-status record" in log_output
+
+    key = WorkStatusKey(origin_epoch=None, turn_id="turn-1", parent_key="")
+    # Documents the known-collision outcome (last-write-wins), not a fix for
+    # the collision itself -- only one of the two records survives.
+    assert restored._work_status_parents[key].status.state == "searching"
 
 
 # --- Phase 3: WorkStatusKey identity and independent sequence ownership ----

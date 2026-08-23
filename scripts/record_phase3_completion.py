@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts._evidence_common import EvidenceGateError, require_nonempty_str, write_bytes_no_follow
+from scripts.eval_common import REPO_ROOT, confined_output_path
 
 
 def build_record(
@@ -41,6 +42,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     import json
+
+    # Sibling eval scripts (eval_model_comparison.py, verify_eval_candidates.py)
+    # confine every operator-supplied --out/--output to the repo tree before
+    # writing; this evidence writer previously skipped that, so --output
+    # could point at an arbitrary destination such as .github/workflows/ci.yml
+    # despite write_bytes_no_follow already blocking symlink/FIFO redirection
+    # at the resolved path.
+    try:
+        confined_output_path(args.output, allowed_root=REPO_ROOT)
+    except ValueError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
 
     try:
         record = build_record(
