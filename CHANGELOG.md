@@ -437,6 +437,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and `web/src/protocol.js`'s bespoke runtime-snapshot key check folded into
     the shared `hasExactKeys` helper. The `terminal_reason` enum gained the
     Python-to-schema parity assertion its two siblings already had.
+- Restart-gauntlet round 6 (confirm pass 3) fixed all 14 findings a 4-lens
+  confirm pass over round 5's own fix diff raised (5 logic, 2 security,
+  7 architecture). Most were round 5's new rules left unswept in a sibling
+  location:
+  - `server/config.py`'s new TTS host/port pairing check fired before endpoint
+    resolution and regardless of which spelling won, so a leftover
+    `[tts] tts_ws_host` in `config.toml` -- never consulted once
+    `WEBSEARCH_TTS_ENDPOINT` is exported -- hard-failed startup for a config
+    that had booted fine. It now fires only when the half-pair sits at a
+    strictly higher precedence layer than the winning member.
+  - The vendor-credential aliases (`CARTESIA_API_KEY`, `DEEPGRAM_API_KEY`,
+    `CARTESIA_VOICE_ID`, and the variable named by
+    `WEBSEARCH_OPENAI_API_KEY_ENV`) kept the hardcoded `scoped or bare` chain
+    the endpoint families had just been migrated off, so a scoped spelling in
+    the env file silently beat a bare spelling exported in the process
+    environment. They resolve by configuration layer first, key priority
+    second, like every other family; the `WEBSEARCH_`-prefixed name still wins
+    a tie within one layer.
+  - An explicit `[tts] tts_ws_port = 0` was still read as an unset port and
+    reported as "must be set together" instead of reaching the range validator
+    that names the field -- the truthiness-vs-membership class round 5 fixed
+    for `max_citations`, unswept in the endpoint block.
+  - The Phase 2 `source_anchor` URL branch matched the locked version as an
+    unanchored substring, accepting `.../tree/v1.10.60` and
+    `.../compare/1.10.6...attacker-branch`; it now compares whole path
+    segments, and the `registry.npmjs.org` spelling the host allowlist
+    advertises actually works.
+  - `scripts/check_release_metadata.py` now parses `ci.yml` and looks for the
+    promotion-manifest path in the `promotion-manifest-drift` job's own step
+    commands, rather than anywhere in the file (a stale comment satisfied the
+    old check); its `ci.yml`, `CHANGELOG.md` and `scripts/*.py` reads are
+    hardened like every other evidence read on this branch.
+  - Ack-admission generations are drawn from one ledger-wide sequence: a
+    per-turn counter restarted at 1 for an evicted turn, colliding with the
+    generation its own still-live chain held.
+  - Drift surfaces closed: the endpoint member tuples are module constants
+    every key roster derives from (the hand-written `_ENDPOINT_FAMILY_KEYS`
+    mirror is gone), `load_promotion_manifest` adopted
+    `effective_feature_policy_fingerprint`, the provisional manifest input
+    roster is a named constant rather than an inline subtraction, the three
+    manifest rosters `scripts/` imports became public names, and the slice
+    import-boundary test discovers its roster from `server/*.py` instead of
+    listing 6 of ~19 modules.
 - `scripts/eval_model_comparison.py`'s citations assertion no longer fails
   weather-query turns that were genuinely delegated and answered correctly:
   the hosted `web_search` tool answers weather via an internal `oai-weather`
