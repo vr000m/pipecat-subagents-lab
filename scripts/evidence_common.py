@@ -13,11 +13,17 @@ import errno
 import json
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from enum import Enum
 from pathlib import Path
 from stat import S_ISREG
 from typing import Any
+
+#: The repo tree every evidence artifact is written inside. Lives here rather
+#: than in ``scripts/eval_common.py`` (which re-exports it) so the five
+#: dependency-light evidence scripts can confine their ``--output`` without
+#: importing ``server.pipeline``/pipecat -- see ``confined_output_path``.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class EvidenceStatus(str, Enum):
@@ -54,10 +60,20 @@ MIN_PAIRED_SAMPLES_PER_CELL = 30
 
 
 def sha256_file(path: Path) -> str:
-    """Return the hex SHA-256 digest of a file's bytes."""
+    """Return the hex SHA-256 digest of a file's bytes.
+
+    Streams through ``_iter_file_chunks`` rather than buffering the whole
+    artifact: hashing needs the bytes only once, in order, so an evidence
+    file near the ``_MAX_EVIDENCE_INPUT_BYTES`` cap is never materialized in
+    memory just to be digested. The cap itself still applies -- a file this
+    module refuses to *load* must not be one it will happily *vouch for*.
+    """
     import hashlib
 
-    return hashlib.sha256(read_bytes_no_follow(path)).hexdigest()
+    digest = hashlib.sha256()
+    for chunk in _iter_file_chunks(path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -103,7 +119,15 @@ def load_jsonl(
     except UnicodeDecodeError as exc:
         raise EvidenceGateError(f"undecodable evidence input {path}: {exc}") from exc
     records: list[dict[str, Any]] = []
-    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+    # ``split("\n")``, never ``splitlines()``: the latter additionally splits
+    # on \v, \f, \x1c-\x1e, \x85, U+2028 and U+2029, all of which are legal
+    # *unescaped* inside a JSON string. A transcript field carrying one would
+    # either fail to parse (a file that read fine before) or -- worse -- split
+    # one physical line into two accepted records, disagreeing with every
+    # other line-oriented consumer of the same file (jq, grep, a reviewer's
+    # eyes, and the byte-wise sha256_file digest that cannot see the
+    # difference). Splitting on \n alone keeps this parser in step with them.
+    for line_no, raw_line in enumerate(text.split("\n"), start=1):
         line = raw_line.strip()
         if not line:
             continue
@@ -281,6 +305,14 @@ def validate_against_fixture(record: dict[str, Any], *, index: FixtureIndex, whe
 # must close for every writer, not just the promotion-manifest one.
 _MAX_EVIDENCE_OUTPUT_BYTES = 8 * 1024 * 1024
 
+# The read-side bound, named and valued separately from the write-side one
+# above -- the same split ``server/config.py`` keeps between its own
+# ``_MAX_EVIDENCE_INPUT_BYTES`` (config.py) and its write path. Reusing the
+# output constant as the read default silently welded the two together, so
+# lowering the cap on artifacts these scripts *write* would also have
+# lowered the cap on evidence they are willing to *read*.
+_MAX_EVIDENCE_INPUT_BYTES = 8 * 1024 * 1024
+
 
 def require_regular_fd(fd: int, path: Path, verb: str) -> None:
     """Reject anything that is not a regular file, from the *open fd*.
@@ -297,8 +329,12 @@ def require_regular_fd(fd: int, path: Path, verb: str) -> None:
         raise EvidenceGateError(f"{path}: refusing to {verb} -- not a regular file")
 
 
-def read_bytes_no_follow(path: Path, *, max_bytes: int = _MAX_EVIDENCE_OUTPUT_BYTES) -> bytes:
-    """Read `path`'s bytes, refusing to read *through* a symlink or hang on a FIFO.
+def _iter_file_chunks(path: Path, *, max_bytes: int) -> Iterator[bytes]:
+    """Yield `path`'s bytes, refusing to read *through* a symlink or hang on a FIFO.
+
+    The shared read primitive behind :func:`read_bytes_no_follow` and
+    :func:`sha256_file` -- chunked so a caller that does not need the whole
+    artifact at once (hashing) never buffers it.
 
     Mirrors ``write_bytes_no_follow``'s hardening on the read side: an
     attacker who can plant a symlink at a predictable, repo-relative evidence
@@ -310,6 +346,13 @@ def read_bytes_no_follow(path: Path, *, max_bytes: int = _MAX_EVIDENCE_OUTPUT_BY
     and the read cannot be TOCTOU'd apart -- rejects everything else. The
     read is additionally capped at ``max_bytes`` so an oversized input is
     never fully buffered into memory.
+
+    ``os.read`` is wrapped as well as ``os.open``: a mid-read ``OSError``
+    (EIO on a failing device, EBADF, a signal-interrupted read) would
+    otherwise escape raw and break :func:`load_json`'s documented promise
+    that *every* read failure mode collapses to one ``EvidenceGateError``.
+    ``server/config.py``'s ``_read_regular_file_no_follow`` guards the same
+    call for the same reason.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -324,19 +367,73 @@ def read_bytes_no_follow(path: Path, *, max_bytes: int = _MAX_EVIDENCE_OUTPUT_BY
         raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
     try:
         require_regular_fd(fd, path, "read")
-        chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(fd, 1 << 20)
+            try:
+                chunk = os.read(fd, 1 << 20)
+            except OSError as exc:
+                raise EvidenceGateError(f"unreadable evidence input {path}: {exc}") from exc
             if not chunk:
                 break
             total += len(chunk)
             if total > max_bytes:
                 raise EvidenceGateError(f"{path}: evidence input exceeds {max_bytes}-byte cap")
-            chunks.append(chunk)
-        return b"".join(chunks)
+            yield chunk
     finally:
         os.close(fd)
+
+
+def read_bytes_no_follow(path: Path, *, max_bytes: int = _MAX_EVIDENCE_INPUT_BYTES) -> bytes:
+    """Read `path`'s whole contents through :func:`_iter_file_chunks`'s hardening."""
+    return b"".join(_iter_file_chunks(path, max_bytes=max_bytes))
+
+
+def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = None) -> Path:
+    """Resolve a user-supplied ``--output``/``--out`` path, confined to the repo tree.
+
+    An operator-supplied output path is still attacker-influenced surface (a
+    credentialed run could be invoked with a scripted or copy-pasted value)
+    -- rejects `..` traversal that escapes ``allowed_root`` and refuses to
+    resolve onto an existing symlink, so a planted symlink at the target path
+    cannot redirect the write to an arbitrary file. Raises ``ValueError`` on
+    either violation; callers decide how to surface that to the operator.
+
+    **Callers must write through the returned path, not the raw one.** A
+    relative candidate is resolved against ``allowed_root``, but the raw
+    argparse ``Path`` an ``os.open`` would see resolves against the process
+    cwd instead -- so dropping the return value validates one path and writes
+    a different one, which is no confinement at all.
+
+    Defined in this module, not in ``scripts/eval_common.py`` (which
+    re-exports it), so the dependency-light evidence scripts can confine
+    their output without dragging ``server.pipeline`` and the whole pipecat
+    runtime into a gate that must stay importable on its own.
+    """
+    root = (allowed_root or REPO_ROOT).resolve()
+    candidate = Path(raw_path)
+    resolved = candidate if candidate.is_absolute() else (root / candidate)
+    if resolved.is_symlink():
+        raise ValueError(f"refusing to write through an existing symlink: {resolved}")
+    resolved = resolved.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(
+            f"output path must stay within {root}: {raw_path!r} resolved to {resolved}"
+        )
+    # Case-insensitive comparison, not exact-case ``in`` membership: on a
+    # case-insensitive filesystem (macOS APFS default, Windows) ``.GIT``/
+    # ``.Git``/etc. name the exact same directory as ``.git`` but bypassed an
+    # exact-case check, letting a path like ``--out .GIT/hooks/pre-commit``
+    # plant a hook despite the check below intending to block exactly that
+    # (round 9 gauntlet, Security lens finding 10). ``.github`` is denylisted
+    # alongside ``.git`` for the same reason (round 9 gauntlet, Security lens
+    # finding 11): a write under ``.github/workflows/*.yml`` is the same
+    # class of risk this check already exists to close -- code execution
+    # triggered on push to a CI-connected repo -- not the git-hook mechanism,
+    # but an equivalent one.
+    denylisted_dirs = {".git", ".github"}
+    if any(part.lower() in denylisted_dirs for part in resolved.parts):
+        raise ValueError(f"output path must not write under .git/ or .github/: {raw_path!r}")
+    return resolved
 
 
 def write_bytes_no_follow(path: Path, payload: bytes) -> None:

@@ -191,7 +191,9 @@ class Coordinator(Protocol):
         catalogue: WorkerCatalogue | None = None,
     ) -> Any: ...
 
-    def start_task(self, operation: Any) -> asyncio.Task[Any] | None: ...
+    def start_task(
+        self, operation: Any, *, mandatory: bool = False
+    ) -> asyncio.Task[Any] | None: ...
 
     async def submit(
         self,
@@ -249,7 +251,9 @@ class OptionalCoordinator(Protocol):
 
     def live_work_item_ids(self) -> frozenset[str]: ...
 
-    def start_task(self, operation: Any) -> asyncio.Task[Any] | None: ...
+    def start_task(
+        self, operation: Any, *, mandatory: bool = False
+    ) -> asyncio.Task[Any] | None: ...
 
     def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
 
@@ -280,7 +284,10 @@ class CoordinatorDefaults:
     def live_work_item_ids(self) -> frozenset[str]:
         return frozenset()
 
-    def start_task(self, operation: Any) -> asyncio.Task[Any] | None:
+    def start_task(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None:
+        # ``mandatory`` is accepted and ignored: this fallback has no capacity
+        # budget to exempt the task from, so every admission already behaves
+        # the way a mandatory one is asking for.
         return asyncio.create_task(operation)
 
     def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]:
@@ -313,7 +320,7 @@ class CoordinatorView:
     config: Config | None
     OWNED_CONFIG_FIELDS: frozenset[str]
     live_work_item_ids: Callable[[], frozenset[str]]
-    start_task: Callable[[Any], asyncio.Task[Any] | None]
+    start_task: Callable[..., asyncio.Task[Any] | None]
     cancel: Callable[..., tuple[str, ...]]
     shutdown: Callable[[], Any]
 
@@ -404,6 +411,9 @@ class WorkItemCoordinator:
         self._callback_tasks: set[asyncio.Task[Any]] = set()
         self._cancelling_tasks: set[asyncio.Task[Any]] = set()
         self._owned_tasks: set[asyncio.Task[Any]] = set()
+        #: Owned tasks admitted with ``start_task(..., mandatory=True)``:
+        #: excluded from the capacity budget by ``_has_background_capacity``.
+        self._mandatory_tasks: set[asyncio.Task[Any]] = set()
         self._submission_tasks: set[asyncio.Task[Any]] = set()
         self._submit_tasks: set[asyncio.Task[Any]] = set()
         self._provider_tasks: set[asyncio.Task[Any]] = set()
@@ -416,7 +426,16 @@ class WorkItemCoordinator:
             raise RuntimeError("work item coordinator is shut down")
 
     def _has_background_capacity(self) -> bool:
-        return len(self._owned_tasks) < self._max_background_tasks
+        # Mandatory tasks are deliberately outside the budget rather than
+        # merely exempt from the gate. They are admitted past the cap by
+        # definition, so counting them would let a burst of them starve every
+        # subsequent legitimate admission until they finished -- the cap would
+        # then be measuring work it never had the option to refuse.
+        # Set difference, not a length subtraction: the two done-callbacks
+        # that drop a finished mandatory task from ``_owned_tasks`` and from
+        # ``_mandatory_tasks`` are scheduled separately, so between them the
+        # counts disagree and an arithmetic difference would under-report.
+        return len(self._owned_tasks - self._mandatory_tasks) < self._max_background_tasks
 
     @staticmethod
     def _consume_task_exception(task: asyncio.Task[Any]) -> None:
@@ -446,15 +465,34 @@ class WorkItemCoordinator:
         task.add_done_callback(completed)
         return True
 
-    def start_task(self, operation: Any) -> asyncio.Task[Any] | None:
-        """Start an awaitable only after reserving bounded coordinator capacity."""
-        if self._shutdown or not self._has_background_capacity():
+    def start_task(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None:
+        """Start an awaitable only after reserving bounded coordinator capacity.
+
+        ``mandatory=True`` is the seam for work the coordinator has no option
+        to refuse -- today, the late-result ``on_complete`` callback, whose
+        refusal would silently break the at-least-once late-delivery
+        guarantee (nothing in production drains ``_late_results``). Such a
+        task skips the capacity gate *and* stays outside the capacity budget
+        (see ``_has_background_capacity``), so admitting one never starves a
+        later refusable admission. It exists as a parameter on this seam
+        rather than as an inline ``_adopt_task(..., force=True)`` at the call
+        site so that a coordinator subclass or injected double overriding
+        ``start_task`` is still honoured on every task-adoption path, and so
+        that this method's ``operation.close()`` handling and its ``Any``
+        tolerance for non-coroutine awaitables are not silently lost there.
+
+        ``_shutdown`` still refuses everything, mandatory included.
+        """
+        if self._shutdown or (not mandatory and not self._has_background_capacity()):
             close = getattr(operation, "close", None)
             if close is not None:
                 close()
             return None
         task = asyncio.create_task(operation)
         self._adopt_task(task, force=True)
+        if mandatory:
+            self._mandatory_tasks.add(task)
+            task.add_done_callback(self._mandatory_tasks.discard)
         return task
 
     def _track_cancelling_task(self, task: asyncio.Task[Any]) -> None:
@@ -597,14 +635,20 @@ class WorkItemCoordinator:
                 # late-delivery guarantee -- neither the caller's async
                 # callback nor any poller would ever see it. This callback
                 # is a bounded, fire-and-forget bookkeeping coroutine
-                # invoked at most once per retained task, so force-adopt it
-                # past the capacity gate the same way ``_track_cancelling_task``
-                # already does for mandatory cleanup work. The ``self._shutdown``
-                # check above already suppresses this entire branch once
-                # shutdown has begun, so no separate guard is needed here.
-                callback_task = asyncio.create_task(callback_result)
-                self._adopt_task(callback_task, force=True)
-                self._track_callback_task(callback_task)
+                # invoked at most once per retained task, so it is admitted
+                # through ``start_task``'s ``mandatory`` seam -- which skips
+                # the gate *and* keeps the task out of the capacity budget,
+                # so a burst of these cannot starve later refusable
+                # admissions. Routing through the seam rather than an inline
+                # ``_adopt_task(..., force=True)`` keeps one task-adoption
+                # path, so a coordinator subclass overriding ``start_task``
+                # is still honoured here. The ``self._shutdown`` check above
+                # already suppresses this entire branch once shutdown has
+                # begun; ``start_task`` re-checks it and returns ``None``
+                # regardless, which the guard below tolerates.
+                callback_task = self.start_task(callback_result, mandatory=True)
+                if callback_task is not None:
+                    self._track_callback_task(callback_task)
 
         task.add_done_callback(completed)
         return True
@@ -632,6 +676,7 @@ class WorkItemCoordinator:
         self._callback_tasks.clear()
         self._cancelling_tasks.clear()
         self._owned_tasks.clear()
+        self._mandatory_tasks.clear()
         self._submission_tasks.clear()
         self._submit_tasks.clear()
         self._provider_tasks.clear()

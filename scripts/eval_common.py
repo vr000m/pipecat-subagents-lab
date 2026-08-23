@@ -45,6 +45,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from scripts.evidence_common import REPO_ROOT as _REPO_ROOT
+from scripts.evidence_common import confined_output_path
 from server.composition import build_session_host
 from server.config import (
     Config,
@@ -144,7 +146,11 @@ _CONTROL_CHAR_PATTERN = re.compile(
     r"\u00ad\u200b-\u200f\u2060\ufeff]"
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+#: Re-exported (not redefined) from ``scripts/evidence_common.py``, which owns
+#: both this constant and ``confined_output_path``: the evidence gates must be
+#: able to confine an ``--output`` without importing this module and, through
+#: it, ``server.pipeline`` and the pipecat runtime.
+REPO_ROOT = _REPO_ROOT
 
 # Manifest producer/consumer contract, hoisted here (round 5, Architecture
 # lens finding 2) so scripts/verify_eval_candidates.py (the producer) and
@@ -767,43 +773,6 @@ def sanitize_reason(text: str, *, credential: str | None = None, max_len: int = 
     with none of ``error_text``'s protections (round 7 gauntlet finding 5).
     """
     return _redact(text, credential)[:max_len]
-
-
-def confined_output_path(raw_path: str | Path, *, allowed_root: Path | None = None) -> Path:
-    """Resolve a user-supplied ``--out`` path, confined to the repo tree.
-
-    An operator-supplied output path is still attacker-influenced surface (a
-    credentialed run could be invoked with a scripted or copy-pasted ``--out``
-    value) -- rejects `..` traversal that escapes ``allowed_root`` and refuses
-    to resolve onto an existing symlink, so a planted symlink at the target
-    path cannot redirect the write to an arbitrary file. Raises ``ValueError``
-    on either violation; callers decide how to surface that to the operator.
-    """
-    root = (allowed_root or REPO_ROOT).resolve()
-    candidate = Path(raw_path)
-    resolved = candidate if candidate.is_absolute() else (root / candidate)
-    if resolved.is_symlink():
-        raise ValueError(f"refusing to write through an existing symlink: {resolved}")
-    resolved = resolved.resolve()
-    if not resolved.is_relative_to(root):
-        raise ValueError(
-            f"output path must stay within {root}: {raw_path!r} resolved to {resolved}"
-        )
-    # Case-insensitive comparison, not exact-case ``in`` membership: on a
-    # case-insensitive filesystem (macOS APFS default, Windows) ``.GIT``/
-    # ``.Git``/etc. name the exact same directory as ``.git`` but bypassed an
-    # exact-case check, letting a path like ``--out .GIT/hooks/pre-commit``
-    # plant a hook despite the check below intending to block exactly that
-    # (round 9 gauntlet, Security lens finding 10). ``.github`` is denylisted
-    # alongside ``.git`` for the same reason (round 9 gauntlet, Security lens
-    # finding 11): a write under ``.github/workflows/*.yml`` is the same
-    # class of risk this check already exists to close -- code execution
-    # triggered on push to a CI-connected repo -- not the git-hook mechanism,
-    # but an equivalent one.
-    denylisted_dirs = {".git", ".github"}
-    if any(part.lower() in denylisted_dirs for part in resolved.parts):
-        raise ValueError(f"output path must not write under .git/ or .github/: {raw_path!r}")
-    return resolved
 
 
 def write_no_follow(path: Path, content: str) -> None:

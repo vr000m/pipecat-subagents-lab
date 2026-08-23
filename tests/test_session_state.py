@@ -1004,3 +1004,27 @@ def test_restored_non_terminal_parent_is_evictable_on_overflow(
     assert restored_key not in restored._work_status_parents
     assert len(restored._work_status_parents) <= SessionState._MAX_WORK_STATUS_KEYS
     assert_ledger_lockstep(restored)
+
+
+def test_retention_fallback_matches_shared_config() -> None:
+    """Round-2 confirm pass: the packaged-install import fix added a *second*
+    copy of the retention numbers as an inline literal fallback.
+
+    shared/work-status-retention.json declares itself the single source of
+    truth for both, so nothing detected drift: editing ``ttl_seconds`` there
+    would leave packaged installs silently running the stale fallback while
+    dev/CI ran the new value, with server and browser disagreeing about
+    terminal-record retention. This test makes that drift fail CI.
+    """
+    import json as _json
+
+    from server.session_state import _RETENTION_CONFIG_PATH, _RETENTION_FALLBACK
+
+    shared = _json.loads(_RETENTION_CONFIG_PATH.read_text())
+    # ``$comment`` is documentation, not a retention bound; every other key in
+    # the file is one and must be mirrored in the fallback.
+    numeric = {key: value for key, value in shared.items() if not key.startswith("$")}
+
+    assert _RETENTION_FALLBACK == numeric, (
+        "the packaged-install fallback has drifted from shared/work-status-retention.json"
+    )

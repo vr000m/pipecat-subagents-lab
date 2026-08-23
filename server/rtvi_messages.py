@@ -102,6 +102,33 @@ class RTVIMessage(BaseModel):
         return frame
 
 
+def _empty_snapshot_data(session_id: str, origin_epoch: int) -> dict[str, Any]:
+    """Shape the publisher's no-snapshot-yet payload from ``RuntimeSnapshot`` itself.
+
+    ``model_construct``, never a validating ``RuntimeSnapshot(...)`` call:
+    ``validate_version_and_monotonicity`` reads *and writes* the class-level
+    ``_highest_by_session`` watermark on every construction, so building a
+    throwaway ``snapshot_sequence=0`` model here would (a) raise
+    ``ValidationError: snapshot_sequence must be monotonic`` for any session
+    that has already produced a higher-sequenced snapshot since the
+    publisher's ``reset_monotonicity`` call, and (b) advance a shared,
+    process-global watermark for a model that is discarded a line later --
+    ``snapshot()`` overwrites ``snapshot_sequence`` with the real allocation
+    before the payload ever reaches the wire.
+
+    The point of deriving the shape from the model rather than hand-writing a
+    dict literal is that a new ``RuntimeSnapshot`` field cannot silently go
+    missing from this fallback; ``model_construct`` still fills every field
+    default (and default factory), it just skips the validators.
+    """
+    return RuntimeSnapshot.model_construct(
+        contract_version=CONTRACT_VERSION,
+        session_id=session_id,
+        snapshot_sequence=0,
+        origin_epoch=origin_epoch,
+    ).model_dump(mode="json")
+
+
 class RTVIMessagePublisher:
     """Serializes RTVI envelopes for one connection.
 
@@ -166,12 +193,7 @@ class RTVIMessagePublisher:
         data = (
             self._snapshot.model_dump(mode="json")
             if self._snapshot
-            else RuntimeSnapshot(
-                contract_version=CONTRACT_VERSION,
-                session_id=self.session_id,
-                snapshot_sequence=0,
-                origin_epoch=self.active_epoch,
-            ).model_dump(mode="json")
+            else _empty_snapshot_data(self.session_id, self.active_epoch)
         )
         sequence = (
             self._sequence_provider() if self._sequence_provider is not None else self._watermark

@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from uuid import uuid4
 
+from loguru import logger
+
 from .contracts import (
     WORK_STATUS_TERMINAL,
     DeliveryState,
@@ -45,10 +47,19 @@ _RETENTION_CONFIG_PATH = Path(__file__).resolve().parents[1] / "shared/work-stat
 # shared/ is always a sibling of server/ and crashed at import time
 # otherwise; fall back to the values shared/work-status-retention.json
 # itself documents as defaults so a packaged install can still import.
+#: The packaged-install fallback. This is a *second copy* of numbers whose
+#: single source of truth is shared/work-status-retention.json, so it is
+#: pinned by ``tests/test_session_state.py``'s
+#: ``test_retention_fallback_matches_shared_config``: editing the JSON without
+#: editing this dict fails CI rather than shipping a packaged install that
+#: silently disagrees with dev/CI (and with web/src/state.js) about
+#: terminal-record retention.
+_RETENTION_FALLBACK = {"ttl_seconds": 300, "max_keys": 256}
+
 try:
     _retention_config = json.loads(_RETENTION_CONFIG_PATH.read_text())
 except (OSError, ValueError):
-    _retention_config = {"ttl_seconds": 300, "max_keys": 256}
+    _retention_config = dict(_RETENTION_FALLBACK)
 
 # Terminal work_status records remain in capable-client snapshots for a fixed
 # five-minute session-clock TTL (Requirements). SessionState has no timer
@@ -645,8 +656,6 @@ class SessionState:
 
     @classmethod
     def from_snapshot(cls, snapshot: RuntimeSnapshot) -> SessionState:
-        from loguru import logger
-
         state = cls(snapshot.session_id)
         state.sequence = snapshot.snapshot_sequence
         for worker in snapshot.workers:

@@ -76,10 +76,10 @@ from typing import Any
 from scripts.evidence_common import (
     EvidenceGateError,
     closed_object,
+    confined_output_path,
     require_type,
     write_bytes_no_follow,
 )
-from scripts.eval_common import confined_output_path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -576,8 +576,14 @@ def main(argv: list[str] | None = None) -> int:
     # could point at an arbitrary destination such as .github/workflows/ci.yml
     # despite write_bytes_no_follow already blocking symlink/FIFO redirection
     # at the resolved path.
+    # The confined result is bound back onto ``args.output`` and is what
+    # every write below uses: the check resolves a relative --output against
+    # ``allowed_root``, but the raw argparse Path an os.open() would see
+    # resolves against the process cwd instead -- so dropping the return
+    # value validates one path and writes another, which is no confinement
+    # at all.
     try:
-        confined_output_path(args.output, allowed_root=REPO_ROOT)
+        args.output = confined_output_path(args.output, allowed_root=REPO_ROOT)
     except ValueError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

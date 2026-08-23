@@ -655,8 +655,13 @@ class SpeechScheduler:
                     ack_id=item.ack_id,
                 )
                 self._on_ack_terminal(identity, PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT)
-            if was_paused:
-                self._emit_progress(item, DeliveryState.INTERRUPTED)
+            # No ``_emit_progress`` terminalization here, unlike the
+            # ``was_paused`` branch below: that branch exists to close out a
+            # PAUSED record left in ``SessionState.speech``, and pausing an
+            # ack never wrote one -- ``_emit_progress`` is a deliberate no-op
+            # for acks (they are wire-invisible, see its docstring). The
+            # ``_on_ack_terminal`` notification above is this branch's whole
+            # terminalization.
             return None
         if was_paused:
             # A paused item holds a non-terminal PAUSED record in

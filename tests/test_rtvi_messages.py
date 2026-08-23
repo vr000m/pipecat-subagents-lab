@@ -503,3 +503,57 @@ def test_rtvi_message_wire_payload_requires_an_explicit_work_status_projection()
     )
     with pytest.raises(TypeError):
         envelope.wire_payload()  # type: ignore[call-arg]
+
+
+def test_empty_snapshot_fallback_does_not_raise_or_touch_the_monotonicity_registry() -> None:
+    """Round-2 confirm pass: the round-1 fix replaced the empty-snapshot dict
+    literal with a *validating* ``RuntimeSnapshot(...)`` construction pinned
+    at ``snapshot_sequence=0``.
+
+    ``RuntimeSnapshot.validate_version_and_monotonicity`` reads and writes a
+    class-level ``_highest_by_session`` watermark, so once any snapshot with a
+    higher sequence exists for this session id, constructing the throwaway
+    zero-sequenced fallback raises ``snapshot_sequence must be monotonic`` --
+    a publisher path that could never raise before. The construction is also
+    pure waste: ``snapshot()`` overwrites ``snapshot_sequence`` with the real
+    allocation immediately afterwards.
+    """
+    from server.contracts import CONTRACT_VERSION
+
+    publisher = RTVIMessagePublisher(
+        session_id="session-fallback", active_epoch=1, sequence_provider=lambda: 7
+    )
+    publisher.client_ready(epoch=1)
+    # Something else in the process builds a higher-sequenced snapshot for the
+    # same session id, advancing the shared watermark past 0.
+    RuntimeSnapshot(
+        contract_version=CONTRACT_VERSION,
+        session_id="session-fallback",
+        snapshot_sequence=5,
+        origin_epoch=1,
+    )
+    watermark_before = dict(RuntimeSnapshot._highest_by_session)
+
+    message = publisher.snapshot()
+
+    assert message is not None
+    assert message.sequence == 7, "the fallback must not clamp the allocated sequence"
+    assert message.data["snapshot_sequence"] == 7
+    # The only watermark movement is the one the *emitted* snapshot causes
+    # (0 -> 7 via RTVIMessage's own payload validation), never a bump from a
+    # discarded fallback model.
+    assert watermark_before["session-fallback"] == 5
+    assert RuntimeSnapshot._highest_by_session["session-fallback"] == 7
+
+
+def test_empty_snapshot_fallback_still_carries_every_contract_field() -> None:
+    """``model_construct`` skips validators, not defaults: the fallback must
+    still get its shape from ``RuntimeSnapshot`` so a newly added contract
+    field cannot silently go missing from a no-snapshot-yet frame."""
+    publisher = RTVIMessagePublisher(session_id="session-shape", active_epoch=2)
+    publisher.client_ready(epoch=2)
+
+    message = publisher.snapshot()
+
+    assert message is not None
+    assert set(message.data) == set(RuntimeSnapshot.model_fields)

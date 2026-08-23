@@ -2004,3 +2004,97 @@ def test_patch_with_correct_capabilities_and_no_connection_is_409_not_400() -> N
 
     assert response.status_code == 409
     assert response.json()["detail"] == "stale Small WebRTC connection epoch"
+
+
+class TestLoguruUnhardenedHandlerWarning:
+    """Round-2 confirm pass: ``remove(0)`` alone leaves a host's unhardened sink."""
+
+    def test_a_surviving_unhardened_sink_is_reported_not_silently_kept(self) -> None:
+        """Handler id ``0`` exists only if nothing reconfigured loguru first.
+        Pipecat's own dev runner does exactly ``logger.remove(); logger.add(
+        sys.stderr, level=...)``, and ``add()`` defaults to
+        ``diagnose=True``/``backtrace=True``. In that ordering ``remove(0)``
+        raises ``ValueError``, the suppression swallows it, and the
+        unhardened sink survives -- every traceback is then rendered twice,
+        once with local-variable values.
+
+        Removing the survivor is not the fix (commit 5f5541a exists because
+        stripping a host's handler is its own regression), so
+        ``_configure_logging`` must at least *name* it.
+        """
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sys
+
+from loguru import logger
+
+# Reproduce a host that reconfigured loguru before server.app is imported:
+# handler id 0 no longer exists, and the survivor is unhardened.
+logger.remove()
+logger.add(sys.stderr)
+
+import server.app  # noqa: F401 -- module import runs create_app()
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "backtrace/diagnose enabled" in result.stderr, (
+            "an unhardened surviving sink must be reported to the operator"
+        )
+
+    def test_no_warning_when_every_surviving_handler_is_hardened(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sys
+
+from loguru import logger
+
+logger.remove()
+logger.add(sys.stderr, backtrace=False, diagnose=False)
+
+import server.app  # noqa: F401
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "backtrace/diagnose enabled" not in result.stderr
+
+
+def test_logging_configuration_latch_can_be_reset() -> None:
+    """Round-2 confirm pass: ``_logging_configured`` is a process-global,
+    never-reset latch, so a caller that legitimately clears loguru's handlers
+    between two ``create_app()`` calls silently got no hardened sink the
+    second time. ``_reset_logging_configuration()`` is the named seam for
+    that, rather than ``monkeypatch.setattr`` on a private module global."""
+    from loguru import logger as loguru_logger
+
+    app_module._configure_logging()
+    before = len(loguru_logger._core.handlers)
+
+    # Second call is a no-op while the latch is set.
+    app_module._configure_logging()
+    assert len(loguru_logger._core.handlers) == before
+
+    app_module._reset_logging_configuration()
+    app_module._configure_logging()
+    assert len(loguru_logger._core.handlers) == before + 1
+
+    for handler in loguru_logger._core.handlers.values():
+        assert handler._exception_formatter._diagnose is False
+        assert handler._exception_formatter._backtrace is False

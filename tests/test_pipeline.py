@@ -9848,3 +9848,52 @@ class TestMultiIntentItemTurnIdRoundTrip:
         # hyphen-free) -- rpartition("-") splits on the LAST hyphen only.
         item_id = pipeline_module.multi_intent_item_turn_id("scenario-turn-1", 0)
         assert pipeline_module.split_multi_intent_turn_id(item_id) == ("scenario-turn-1", 0)
+
+
+def test_ack_admission_generation_dict_is_bounded() -> None:
+    """Round-2 confirm pass: ``_ack_admission_generation`` was never pruned.
+
+    It is deliberately not popped per turn (a re-latched turn restarting at
+    generation 1 would be indistinguishable from an already-superseded
+    chain), and ``clear_all()`` is shutdown-only -- so one entry accumulated
+    per turn_id ever latched, for the whole lifetime of a ``SessionHost``
+    that serves every session in the process. It now carries an explicit
+    oldest-turn-first cap, the same growth class ``SessionState._MAX_EVENTS``
+    was added to bound.
+    """
+    from server.turn_ack_ledger import _MAX_ACK_GENERATION_TURNS, TurnAckLedger
+
+    ledger = TurnAckLedger(
+        feature_policy=lambda: None,
+        early_ack_text=lambda: "",
+        connection=lambda: None,
+        accepts=lambda _epoch: True,
+    )
+
+    for index in range(_MAX_ACK_GENERATION_TURNS + 250):
+        ledger._claim_ack_admission_generation(f"turn-{index}")
+
+    assert len(ledger._ack_admission_generation) == _MAX_ACK_GENERATION_TURNS
+    # Oldest-first eviction: the most recent turns are the ones retained, so a
+    # chain that could still be in flight never loses its generation.
+    newest = f"turn-{_MAX_ACK_GENERATION_TURNS + 249}"
+    assert newest in ledger._ack_admission_generation
+    assert "turn-0" not in ledger._ack_admission_generation
+
+
+def test_reclaiming_a_turns_generation_still_increments_monotonically() -> None:
+    """The bound must not reset a live turn's counter: a later chain for the
+    same turn_id has to stay distinguishable from an earlier superseded one."""
+    from server.turn_ack_ledger import TurnAckLedger
+
+    ledger = TurnAckLedger(
+        feature_policy=lambda: None,
+        early_ack_text=lambda: "",
+        connection=lambda: None,
+        accepts=lambda _epoch: True,
+    )
+
+    first = ledger._claim_ack_admission_generation("turn-a")
+    second = ledger._claim_ack_admission_generation("turn-a")
+
+    assert (first, second) == (1, 2)

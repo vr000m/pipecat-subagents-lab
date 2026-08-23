@@ -918,3 +918,44 @@ def test_has_real_provider_stratum_accepts_an_allowlisted_pair() -> None:
     records = [_phase0_record(provider=provider, model=model)]
 
     assert module.has_real_provider_stratum(records) is True
+
+
+def test_relative_output_is_written_under_the_confined_root_not_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 confirm pass: all five evidence writers called
+    ``confined_output_path`` for its side effect only and then wrote to the
+    raw argparse ``Path``.
+
+    ``confined_output_path`` resolves a *relative* candidate against
+    ``allowed_root``, but ``os.open()`` resolves the same relative path
+    against the process cwd. Run from any cwd outside the repo,
+    ``--output report.json`` therefore validated as ``REPO_ROOT/report.json``
+    and passed the check, while the write landed in the unrelated cwd --
+    the check was adopted, the confinement was not.
+    """
+    module = pytest.importorskip("scripts.record_phase3_completion")
+    elsewhere = tmp_path.parent / f"{tmp_path.name}-cwd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    exit_code = module.main(
+        [
+            "--source-commit",
+            "a" * 40,
+            "--source-tree-hash",
+            "b" * 40,
+            "--command-digest",
+            "c" * 64,
+            "--output",
+            "reports/phase3.json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (tmp_path / "reports" / "phase3.json").exists(), (
+        "a relative --output must be written under the confined root"
+    )
+    assert not (elsewhere / "reports").exists(), (
+        "nothing may be written relative to the process cwd"
+    )

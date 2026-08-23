@@ -531,9 +531,12 @@ not project into RTVI or browser state.
 
 ## Scripts
 
-Every module in `scripts/` except `_evidence_common.py` (a shared helper) is a
-command-line entry point. Only the paid harnesses need hosted credentials;
-every gate and validator is credential-free.
+Every module in `scripts/` is a command-line entry point except the two shared
+helpers, `evidence_common.py` and `eval_common.py`, which define no `main()`
+and are never invoked directly. Only the paid harnesses need hosted
+credentials; every gate and validator is credential-free.
+`evidence_common.py` additionally has no `server`/pipecat import of its own, so
+the evidence gates stay importable without loading the runtime.
 
 Smoke and benchmark:
 

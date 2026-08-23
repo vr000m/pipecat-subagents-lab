@@ -143,3 +143,87 @@ def test_sha256_file_still_hashes_a_regular_file(tmp_path: Path) -> None:
     target = tmp_path / "real.bin"
     target.write_bytes(b"hello")
     assert sha256_file(target) == hashlib.sha256(b"hello").hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Round-2 confirm-pass findings: regressions introduced by the round-1 fixes.
+# ---------------------------------------------------------------------------
+
+
+# Only the separators JSON permits *unescaped* inside a string are asserted
+# here: \v, \f and \x1c-\x1e are control characters below U+0020, which
+# JSON forbids raw regardless of how the file is split.
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85"])
+def test_load_jsonl_treats_unicode_line_separators_as_record_content(
+    tmp_path: Path, separator: str
+) -> None:
+    """Round-2 confirm pass: the round-1 rewrite split on ``str.splitlines()``,
+    which also breaks on \\v, \\f, \\x1c-\\x1e, \\x85, U+2028 and U+2029 --
+    all legal *unescaped* inside a JSON string. A single physical line
+    carrying one either failed to parse (a file that read fine before) or
+    split into two separately-accepted records, disagreeing with every other
+    line-oriented consumer of the same bytes.
+    """
+    target = tmp_path / "records.jsonl"
+    target.write_text(f'{{"text": "before{separator}after"}}\n', encoding="utf-8")
+
+    records = load_jsonl(target)
+
+    assert records == [{"text": f"before{separator}after"}], (
+        "a Unicode line separator inside a JSON string must stay one record"
+    )
+
+
+def test_load_jsonl_line_numbers_are_not_shifted_by_a_unicode_separator(tmp_path: Path) -> None:
+    """The same bug shifted every reported line number after the offending
+    record, so a caller's per-line diagnostics pointed at the wrong line."""
+    target = tmp_path / "records.jsonl"
+    target.write_text('{"text": "a b"}\nnot json\n', encoding="utf-8")
+
+    with pytest.raises(EvidenceGateError, match=r"line 2: invalid JSON"):
+        load_jsonl(target)
+
+
+def test_load_json_wraps_a_mid_read_oserror(tmp_path: Path) -> None:
+    """``load_json``'s docstring promises *every* read failure collapses to
+    one ``EvidenceGateError``; only ``os.open`` was guarded, so an ``OSError``
+    raised by ``os.read`` (EIO, EBADF, an interrupted read) escaped raw."""
+    target = tmp_path / "record.json"
+    target.write_text('{"a": 1}')
+
+    with patch("scripts.evidence_common.os.read", side_effect=OSError(5, "Input/output error")):
+        with pytest.raises(EvidenceGateError, match="unreadable evidence input"):
+            load_json(target)
+
+
+def test_read_and_write_caps_are_separately_named_constants() -> None:
+    """Round-2 confirm pass: ``read_bytes_no_follow`` defaulted its input cap
+    to ``_MAX_EVIDENCE_OUTPUT_BYTES``, silently welding the artifact-write
+    bound to the evidence-read bound. ``server/config.py`` keeps the two
+    apart under exactly these names."""
+    import inspect as _inspect
+
+    from scripts.evidence_common import _MAX_EVIDENCE_INPUT_BYTES
+
+    default = _inspect.signature(read_bytes_no_follow).parameters["max_bytes"].default
+    assert default == _MAX_EVIDENCE_INPUT_BYTES
+    assert "_MAX_EVIDENCE_INPUT_BYTES" in _inspect.getsource(read_bytes_no_follow)
+
+
+def test_sha256_file_streams_instead_of_buffering_the_whole_artifact(tmp_path: Path) -> None:
+    """Round-2 confirm pass: routing ``sha256_file`` through
+    ``read_bytes_no_follow`` made it buffer the entire artifact in memory
+    just to digest it. It now streams the same hardened fd in chunks."""
+    import hashlib
+
+    payload = b"z" * (3 * (1 << 20) + 7)
+    target = tmp_path / "big.bin"
+    target.write_bytes(payload)
+
+    with patch(
+        "scripts.evidence_common.read_bytes_no_follow",
+        side_effect=AssertionError("sha256_file must not buffer the whole file"),
+    ):
+        digest = sha256_file(target)
+
+    assert digest == hashlib.sha256(payload).hexdigest()

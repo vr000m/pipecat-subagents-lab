@@ -87,6 +87,19 @@ def _configure_logging() -> None:
     including one a caller/host process installed on the shared ``logger``
     singleton before importing this module (see
     ``TestLoguruStartupConfiguration.test_import_preserves_preexisting_handler``).
+
+    Removing only handler ``0`` has a residual gap this function cannot close
+    on its own: if anything reconfigured loguru *before* this module was
+    imported -- Pipecat's own dev runner does exactly
+    ``logger.remove(); logger.add(sys.stderr, level=...)``, and ``add()``
+    defaults to ``diagnose=True``/``backtrace=True`` -- then id ``0`` no
+    longer exists and the surviving sink still renders local variables.
+    ``_warn_about_unhardened_handlers`` names every such sink at startup
+    rather than silently removing it: stripping a handler the host process
+    deliberately installed is the regression commit 5f5541a exists to
+    prevent, so the residual risk is surfaced to the operator (who can
+    re-add the sink with ``backtrace=False, diagnose=False``) instead of
+    being traded for a different one.
     """
     global _logging_configured
     if _logging_configured:
@@ -94,7 +107,54 @@ def _configure_logging() -> None:
     _logging_configured = True
     with suppress(ValueError):
         _loguru_logger.remove(0)
+    _warn_about_unhardened_handlers()
     _loguru_logger.add(sys.stderr, backtrace=False, diagnose=False)
+
+
+def _reset_logging_configuration() -> None:
+    """Clear the idempotence latch so a later ``_configure_logging()`` runs again.
+
+    ``_logging_configured`` is process-global and, without this, a one-way
+    latch for the process's whole lifetime: a caller that legitimately clears
+    loguru's handlers between two ``create_app()`` calls (tests do exactly
+    this) would silently get no hardened sink the second time. Exported as a
+    named seam rather than left to ``monkeypatch.setattr`` on a private
+    module global, so the reset is a supported operation with one definition.
+    """
+    global _logging_configured
+    _logging_configured = False
+
+
+def _unhardened_handler_ids() -> list[int]:
+    """Return the ids of installed loguru handlers that still render locals.
+
+    Reads loguru's private handler registry defensively (``getattr`` with
+    defaults throughout): this is best-effort diagnostics, and a loguru
+    version that renames these internals must degrade to "report nothing",
+    never to an exception on the startup path.
+    """
+    core = getattr(_loguru_logger, "_core", None)
+    handlers = getattr(core, "handlers", None) or {}
+    unhardened = []
+    for handler_id, handler in handlers.items():
+        # ``backtrace``/``diagnose`` are stored on the handler's exception
+        # formatter, which is also where tests/test_app.py asserts them.
+        formatter = getattr(handler, "_exception_formatter", None)
+        if getattr(formatter, "_backtrace", False) or getattr(formatter, "_diagnose", False):
+            unhardened.append(handler_id)
+    return unhardened
+
+
+def _warn_about_unhardened_handlers() -> None:
+    unhardened = _unhardened_handler_ids()
+    if not unhardened:
+        return
+    _loguru_logger.warning(
+        f"loguru handler id(s) {sorted(unhardened)} were installed by another component with "
+        "backtrace/diagnose enabled and are left in place; tracebacks rendered through them can "
+        "include local variable values (transcripts, provider payloads, credentials). Re-add "
+        "those sinks with backtrace=False, diagnose=False to close this."
+    )
 
 
 class _SpeechCompletionProcessor(FrameProcessor):

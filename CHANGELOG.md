@@ -285,6 +285,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer proceeds against an already-tombstoned generation, closing a race
   that could hold the global transport slot roughly tenfold longer than
   intended.
+- Review-gauntlet round 11 (`390b764`, `9b1155b`) closed a further batch of
+  logic and security findings, each with its own regression test:
+  - `server/turn_ack_ledger.py`: a per-turn admission-chain generation
+    counter stops a superseded ack chain's belated retry from re-entering
+    `start_next` after a later eligible sibling re-latched the same turn
+    under the identical `ack_work_item_id`. The counter is bounded
+    (oldest-turn-first) rather than retained for the process's lifetime.
+  - `server/session_state.py`: the diagnostic event log is a
+    `deque(maxlen=2000)` instead of an unbounded list, and a missing
+    `shared/work-status-retention.json` (a packaged install has no `shared/`
+    tree) falls back to that file's documented defaults instead of crashing
+    at import.
+  - `scripts/evidence_common.py`: evidence *reads* now go through the same
+    `O_NOFOLLOW`/`O_NONBLOCK` plus regular-file guard the writers already
+    used, so a symlink, FIFO, or device node planted at a predictable
+    evidence path can neither redirect nor hang a read; the write path
+    enforces its documented size cap and loops `os.write` to completion so a
+    short write cannot silently truncate an artifact.
+  - `server/config.py`: `_is_hex_hash` rejects uppercase hex, matching
+    `hexdigest()`'s own output alphabet.
+  - `server/speech_scheduler.py`: `start_next("")` no longer falls through a
+    truthiness check and scans every queue instead of the requested one;
+    resuming a paused ack settles the turn's ack latch through
+    `on_ack_terminal` instead of re-enqueueing it outside `TurnAckLedger`'s
+    bounded admission chain.
+  - `server/pipeline.py`: a search completing with a `None` result is
+    reported as "no reliable result" instead of being misclassified as a
+    busy service.
+  - `server/work_item_coordinator.py`: a late-result `on_complete` callback
+    is admitted past (and outside) the background-capacity budget, so
+    nothing in the at-least-once late-delivery path can be silently refused.
+  - `server/app.py`: the Loguru `diagnose`/`backtrace` hardening now also
+    runs from `create_app()`, so `uvicorn server.app:app` direct-ASGI
+    serving gets it; it strips only Loguru's own default handler rather
+    than every handler, and warns when a host-installed sink survives with
+    traceback-locals rendering still enabled.
+  - The five evidence-writing scripts confine `--output` to the repo tree
+    before writing, and write through the *confined* path rather than the
+    raw one.
+  - `server/handshake_gate.py`: a `CapabilityCarrier` Protocol replaces the
+    `Connection | ConnectionPipeline | None` union in handshake validation.
 - `scripts/eval_model_comparison.py`'s citations assertion no longer fails
   weather-query turns that were genuinely delegated and answered correctly:
   the hosted `web_search` tool answers weather via an internal `oai-weather`

@@ -31,13 +31,13 @@ from scripts.evidence_common import (
     EvidenceGateError,
     EvidenceStatus,
     FixtureIndex,
+    confined_output_path,
     load_jsonl,
     require_nonempty_str,
     sha256_file,
     validate_against_fixture,
     write_bytes_no_follow,
 )
-from scripts.eval_common import confined_output_path
 from scripts.run_query_context_experiment import load_fixture, scorer_hash, validate_raw_record
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -191,8 +191,14 @@ def main(argv: list[str] | None = None) -> int:
     # could point at an arbitrary destination such as .github/workflows/ci.yml
     # despite write_bytes_no_follow already blocking symlink/FIFO redirection
     # at the resolved path.
+    # The confined result is bound back onto ``args.output`` and is what
+    # every write below uses: the check resolves a relative --output against
+    # ``allowed_root``, but the raw argparse Path an os.open() would see
+    # resolves against the process cwd instead -- so dropping the return
+    # value validates one path and writes another, which is no confinement
+    # at all.
     try:
-        confined_output_path(args.output, allowed_root=REPO_ROOT)
+        args.output = confined_output_path(args.output, allowed_root=REPO_ROOT)
     except ValueError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

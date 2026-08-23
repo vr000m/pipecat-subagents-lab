@@ -41,6 +41,7 @@ SessionHost.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -66,6 +67,21 @@ turn's whole lifetime would otherwise retry forever at
 ``_ACK_ADMISSION_RETRY_DELAY_SECONDS`` cadence; past this many attempts the
 ack is abandoned (its queued item discarded, its latch cleared) rather than
 retried indefinitely."""
+
+_MAX_ACK_GENERATION_TURNS = 2048
+"""Cap on retained per-turn admission-chain generation counters.
+
+``_ack_admission_generation`` cannot be popped when a turn's latch clears
+(see its own comment: a re-latched turn restarting at generation 1 would be
+indistinguishable from an already-superseded chain), so it needs an explicit
+bound instead -- one ``TurnAckLedger`` lives for the whole ``SessionHost``,
+across every session the process serves. Eviction is oldest-turn-first, and
+turn ids are minted from a strictly increasing sequence, so the entries
+dropped are always the least recent. The collision this dict exists to
+prevent needs a *live* stale chain for the evicted turn, and a chain's whole
+lifetime is bounded by ``_ACK_ADMISSION_MAX_ATTEMPTS`` retries at
+``_ACK_ADMISSION_RETRY_DELAY_SECONDS`` (~1s); losing an entry therefore
+requires this many later turns to be latched inside that window."""
 
 
 class TurnAckLedger:
@@ -118,9 +134,11 @@ class TurnAckLedger:
         # turn's counter back to zero on clear would let a later chain for
         # the *same* turn_id collide with an earlier, already-superseded
         # chain's generation number instead of being distinguishable from
-        # it. Bounded by the number of turns the ledger has ever latched an
-        # ack for, not by anything within a single turn.
-        self._ack_admission_generation: dict[str, int] = {}
+        # it. Because it cannot be popped per turn, it is instead explicitly
+        # capped at ``_MAX_ACK_GENERATION_TURNS`` with oldest-turn-first
+        # eviction -- see that constant for why the cap cannot resurrect the
+        # collision it exists to prevent.
+        self._ack_admission_generation: OrderedDict[str, int] = OrderedDict()
         # Authoritative turn -> delegated-child-work-item registry. Ack
         # ownership and the sole-delegated-child cancellation decision are
         # answered from this map rather than by re-deriving the
@@ -341,6 +359,25 @@ class TurnAckLedger:
             attempt=1,
         )
 
+    def _claim_ack_admission_generation(self, turn_id: str) -> int:
+        """Supersede whatever admission chain previously held ``turn_id``.
+
+        The returned generation is strictly greater than any previously
+        issued for this turn, which is what lets ``_retry_or_abandon`` and
+        ``admit`` tell a stale chain's belated retry from the live one.
+        Enforces ``_MAX_ACK_GENERATION_TURNS`` here rather than at every
+        mutation site, so the bound has exactly one definition.
+        """
+        generation = self._ack_admission_generation.get(turn_id, 0) + 1
+        self._ack_admission_generation[turn_id] = generation
+        # Newest-first retention: a turn claiming a fresh chain becomes the
+        # most recently used entry, so the eviction below only ever discards
+        # turns whose chains are long finished.
+        self._ack_admission_generation.move_to_end(turn_id)
+        while len(self._ack_admission_generation) > _MAX_ACK_GENERATION_TURNS:
+            self._ack_admission_generation.popitem(last=False)
+        return generation
+
     def _schedule_ack_admission(
         self,
         origin: ConnectionPipeline,
@@ -392,8 +429,7 @@ class TurnAckLedger:
         chain that scheduled it -- see ``_retry_or_abandon``.
         """
         if generation is None:
-            generation = self._ack_admission_generation.get(turn_id, 0) + 1
-            self._ack_admission_generation[turn_id] = generation
+            generation = self._claim_ack_admission_generation(turn_id)
 
         def _retry_or_abandon(*, log_reason: str, needs_requeue: bool) -> None:
             # Shared by both admission-failure modes: an exception from

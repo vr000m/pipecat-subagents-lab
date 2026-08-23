@@ -1296,3 +1296,97 @@ def test_retain_late_task_suppresses_callback_once_shutdown_has_begun() -> None:
         await coordinator.shutdown()
 
     asyncio.run(run())
+
+
+def test_late_callback_task_does_not_consume_the_capacity_budget() -> None:
+    """Round-2 confirm pass: the late-callback fix force-adopted the
+    ``on_complete`` coroutine straight into ``_owned_tasks``, bypassing
+    ``_has_background_capacity``'s check *and* landing inside the set it
+    counts. At capacity, the owned set therefore grew past the cap and every
+    subsequent legitimate ``start_task``/retain admission was refused until
+    those callbacks finished.
+
+    The callback is now admitted through ``start_task(..., mandatory=True)``,
+    which keeps it outside the budget as well as past the gate.
+    """
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_background_tasks=1)
+        callback_release = asyncio.Event()
+        callback_started = asyncio.Event()
+
+        async def slow_callback(_late: object) -> None:
+            callback_started.set()
+            await callback_release.wait()
+
+        async def provider() -> dict:
+            return {"text": "done", "citations": []}
+
+        retained = asyncio.create_task(provider())
+        assert coordinator.retain_late_task(
+            retained,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=slow_callback,
+        )
+        await retained
+        await asyncio.sleep(0)
+        await callback_started.wait()
+
+        # The callback is owned (so it cannot be garbage-collected mid-flight)
+        # but is not charged against the one-task budget.
+        assert coordinator._mandatory_tasks, "the callback task must be tracked as mandatory"
+        assert coordinator._has_background_capacity(), (
+            "an in-flight mandatory callback must not exhaust the capacity budget"
+        )
+
+        follow_up = coordinator.start_task(provider())
+        assert follow_up is not None, "a later legitimate admission must not be starved"
+        await follow_up
+
+        callback_release.set()
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_late_callback_is_admitted_through_the_start_task_seam() -> None:
+    """The inline ``asyncio.create_task`` + ``_adopt_task(force=True)`` at the
+    call site duplicated ``start_task``'s body minus the capacity check, so a
+    coordinator subclass overriding ``start_task`` was silently not honoured
+    on this path (and the inline call lost ``start_task``'s ``operation.close()``
+    handling and its tolerance for non-coroutine awaitables)."""
+
+    admitted: list[bool] = []
+
+    class RecordingCoordinator(WorkItemCoordinator):
+        def start_task(self, operation, *, mandatory: bool = False):  # type: ignore[no-untyped-def]
+            admitted.append(mandatory)
+            return super().start_task(operation, mandatory=mandatory)
+
+    async def run() -> None:
+        coordinator = RecordingCoordinator(max_background_tasks=1)
+        seen: list[object] = []
+
+        async def callback(late: object) -> None:
+            seen.append(late)
+
+        async def provider() -> dict:
+            return {"text": "done", "citations": []}
+
+        retained = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            retained,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=callback,
+        )
+        await retained
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert admitted == [True], "the late callback must route through the start_task seam"
+        assert len(seen) == 1
+        await coordinator.shutdown()
+
+    asyncio.run(run())
