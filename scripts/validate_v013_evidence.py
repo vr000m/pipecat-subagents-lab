@@ -614,25 +614,40 @@ def write_manifest(
         else None
     )
 
-    inputs: dict[str, dict[str, str]] = {
-        "phase0": {
-            "path": _repo_relative_evidence_path(phase0_input),
-            "sha256": sha256_file(phase0_input),
-        },
-        "phase1": {
-            "path": _repo_relative_evidence_path(phase1_input),
-            "sha256": sha256_file(phase1_input),
-        },
-        "phase2": {
-            "path": _repo_relative_evidence_path(phase2_input),
-            "sha256": sha256_file(phase2_input),
-        },
+    # The phase bindings this manifest declares. Built from one mapping and
+    # then checked against the SAME `server.config` rosters `verify_manifest`
+    # (and `load_promotion_manifest`) require, rather than left as three
+    # literal keys pinned to nothing: deriving only the verifier's roster left
+    # the producer free to drift, so a phase added to
+    # MANIFEST_REQUIRED_FINAL_INPUTS would make every manifest this writer
+    # emits fail its own verifier -- the same one-side-migrated producer/
+    # consumer split the derivation was introduced to close
+    # (round 7 confirm pass 4, Architecture Important).
+    phase_inputs: dict[str, Path | None] = {
+        "phase0": phase0_input,
+        "phase1": phase1_input,
+        "phase2": phase2_input,
+        "phase3": phase3_input,
     }
-    if phase3_input is not None:
-        inputs["phase3"] = {
-            "path": _repo_relative_evidence_path(phase3_input),
-            "sha256": sha256_file(phase3_input),
+    inputs: dict[str, dict[str, str]] = {
+        phase: {
+            "path": _repo_relative_evidence_path(path),
+            "sha256": sha256_file(path),
         }
+        for phase, path in phase_inputs.items()
+        if path is not None
+    }
+    required_inputs = (
+        MANIFEST_REQUIRED_FINAL_INPUTS
+        if manifest_phase == "final"
+        else MANIFEST_REQUIRED_PROVISIONAL_INPUTS
+    )
+    if missing_inputs := sorted(required_inputs - set(inputs)):
+        raise EvidenceGateError(
+            f"--manifest-phase {manifest_phase} requires an input binding for "
+            f"{missing_inputs}; this writer emits {sorted(inputs)} and has no "
+            "CLI argument to supply the rest"
+        )
 
     phase4c_artifact_sha256: str | None = None
     if phase4c_input is not None:
@@ -1016,11 +1031,12 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     # literal, so this gate and the runtime consumer it speaks for cannot
     # silently drift apart on which phases a manifest must declare (round-5
     # restart, Architecture finding). The provisional roster is likewise a
-    # named `server.config` constant rather than an inline `- {"phase3"}`
-    # here: expressing it as "the final roster minus one name typed at this
-    # call site" reintroduced the same drift one level down, since a phase
-    # later added to the `final` roster would start being required of
-    # provisional manifests too (round 6 confirm pass 3, Architecture Minor).
+    # named `server.config` constant -- and an independent literal there, not
+    # `FINAL - {"phase3"}`: either spelling of that subtraction, here or in
+    # `server.config`, makes a phase added to the `final` roster start being
+    # required of provisional manifests automatically (round 7 confirm pass 4,
+    # Logic Minor). `write_manifest` checks its own output against these same
+    # two constants, so producer and consumer cannot disagree either.
     required_phases = set(
         MANIFEST_REQUIRED_FINAL_INPUTS
         if manifest_phase == "final"

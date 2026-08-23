@@ -652,6 +652,75 @@ class TestVerifyManifestDriftCheck:
         )
         return tmp_path / "promotion-manifest.json"
 
+    def test_the_provisional_roster_is_an_independent_literal(self) -> None:
+        """Round 7 confirm pass 4, Logic Minor: the provisional roster was
+        ``MANIFEST_REQUIRED_FINAL_INPUTS - {"phase3"}``, so a phase added to
+        the final roster silently widened the provisional one -- the exact
+        propagation naming the constant separately was meant to stop. Moving
+        that subtraction from the gate into ``server.config`` only changed
+        which file it lived in.
+
+        Both rosters are pinned by name here, so widening ``final`` is a
+        change this test forces a human to look at rather than one that
+        propagates on its own. The module-level assertion in ``server.config``
+        covers the other direction (narrowing ``final`` below the provisional
+        roster, which would be incoherent)."""
+        from server.config import (
+            MANIFEST_REQUIRED_FINAL_INPUTS,
+            MANIFEST_REQUIRED_PROVISIONAL_INPUTS,
+        )
+
+        assert MANIFEST_REQUIRED_FINAL_INPUTS == {"phase0", "phase1", "phase2", "phase3"}
+        assert MANIFEST_REQUIRED_PROVISIONAL_INPUTS == {"phase0", "phase1", "phase2"}
+        assert MANIFEST_REQUIRED_PROVISIONAL_INPUTS <= MANIFEST_REQUIRED_FINAL_INPUTS
+        # Phase 3 is in flight while a provisional manifest is written, so it
+        # is the one binding provisional deliberately does not require.
+        assert "phase3" not in MANIFEST_REQUIRED_PROVISIONAL_INPUTS
+
+    def test_the_writer_emits_every_phase_the_verifier_requires(self, tmp_path: Path) -> None:
+        """Round 7 confirm pass 4, Architecture Important: only the VERIFIER's
+        roster was derived from ``server.config``; ``write_manifest`` still
+        built its ``inputs`` from three literal keys pinned to nothing, so a
+        phase added to ``MANIFEST_REQUIRED_FINAL_INPUTS`` would make every
+        manifest this writer emits fail its own verifier. The writer now checks
+        its own output against the same two constants, and this pins that the
+        real writer path satisfies them rather than only that the check
+        exists."""
+        from server.config import MANIFEST_REQUIRED_FINAL_INPUTS
+
+        manifest = json.loads(self._written_manifest(tmp_path).read_text())
+
+        assert MANIFEST_REQUIRED_FINAL_INPUTS <= set(manifest["inputs"])
+
+    def test_the_writer_refuses_a_phase_it_cannot_bind(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Widening the required roster must fail LOUDLY at the writer rather
+        than producing a manifest the verifier will reject downstream."""
+        module = _validator()
+        monkeypatch.setattr(
+            module, "MANIFEST_REQUIRED_FINAL_INPUTS", frozenset({"phase0", "phase1", "phase99"})
+        )
+        phase0, phase1, phase2, phase3 = _full_valid_inputs_with_phase3(tmp_path)
+
+        exit_code = module.main(
+            _write_manifest_final_argv(
+                tmp_path,
+                phase0=phase0,
+                phase1=phase1,
+                phase2=phase2,
+                phase3=phase3,
+                feature_policy_fingerprint=_real_feature_policy_fingerprint(),
+            )
+        )
+
+        assert exit_code != 0
+        assert "phase99" in capsys.readouterr().err
+        assert not (tmp_path / "promotion-manifest.json").exists()
+
     def test_a_freshly_written_manifest_verifies_clean(self, tmp_path: Path) -> None:
         module = _validator()
         manifest_path = self._written_manifest(tmp_path)
