@@ -2243,18 +2243,56 @@ class TestReasoningEffortInheritance:
         Important).
 
         The family keys are deliberately in NEITHER constant: they resolve
-        against the raw per-layer mappings through _family_layers rather than
-        through _record_layer's provenance dict, so a hand-written roster of
-        them can no longer drift from the member tuples load_config actually
-        resolves (round 6 confirm pass 3, Architecture Minor)."""
+        against the raw per-layer mappings rather than through _record_layer's
+        provenance dict, so a hand-written roster of them can no longer drift
+        from the member tuples load_config actually resolves (round 6 confirm
+        pass 3, Architecture Minor).
+
+        The roster iterates the `_families()` registry rather than naming the
+        two endpoint constants by hand: the hand-written version left the
+        alias families unpinned and would have left a third endpoint family
+        added later outside the assertion too (round 7 confirm pass 4,
+        Architecture Minor)."""
         import server.config as _config_module
 
         assert set(_config_module._EMPTY_MEANS_ABSENT_KEYS) <= set(_config_module._PROVENANCE_KEYS)
-        family_keys = set(_config_module._family_keys(_config_module._STT_ENDPOINT_MEMBERS)) | set(
-            _config_module._family_keys(_config_module._TTS_ENDPOINT_MEMBERS)
-        )
+        families = _config_module._families()
+        family_keys = {
+            key for _name, members in families for key in _config_module._family_keys(members)
+        }
+        # Pins that the registry actually covers all three kinds of family --
+        # otherwise an empty/partial registry would satisfy the disjointness
+        # assertions below vacuously.
+        assert {"WEBSEARCH_STT_ENDPOINT", "WEBSEARCH_TTS_WS_PORT"} <= family_keys
+        assert {"WEBSEARCH_DEEPGRAM_API_KEY", "DEEPGRAM_API_KEY"} <= family_keys
+        assert {"WEBSEARCH_OPENAI_API_KEY", "OPENAI_API_KEY"} <= family_keys
         assert not family_keys & set(_config_module._PROVENANCE_KEYS)
         assert not family_keys & set(_config_module._EMPTY_MEANS_ABSENT_KEYS)
+
+    def test_alias_family_registry_covers_every_alias_config_field(self) -> None:
+        """`_alias_families` is the single roster load_config iterates, so a
+        credential alias added to `_ALIAS_FAMILY_SPELLINGS` reaches resolution
+        without a second edit -- and every field it names must be a real
+        Config field (round 7 confirm pass 4, Architecture Minor)."""
+        import dataclasses
+
+        import server.config as _config_module
+
+        field_names = {f.name for f in dataclasses.fields(_config_module.Config)}
+        alias_fields = {field for field, _members in _config_module._alias_families()}
+        assert alias_fields <= field_names
+        assert "openai_api_key" in alias_fields
+
+    def test_runtime_named_openai_key_joins_the_same_registry(self) -> None:
+        """The runtime-named bare spelling replaces the default one in the
+        registry rather than being assembled as a one-off pair."""
+        import server.config as _config_module
+
+        families = dict(_config_module._alias_families("MY_OPENAI_KEY"))
+        assert _config_module._family_keys(families["openai_api_key"]) == (
+            "WEBSEARCH_OPENAI_API_KEY",
+            "MY_OPENAI_KEY",
+        )
 
 
 class TestDefaultReasoningEffortForModel:
@@ -2421,31 +2459,46 @@ class TestEndpointFamilyLayerPrecedence:
             load_config(config_file=config_file, env={})
 
 
-class TestAliasFamilyLayerPrecedence:
-    """Round 6 confirm pass 3, Architecture Important: the vendor-credential
-    alias families kept the hardcoded `scoped or bare` chain after the endpoint
-    families moved to layer-aware resolution, so a scoped spelling at a lower
-    layer silently beat a bare spelling the operator exported."""
+class TestAliasFamilyPrecedence:
+    """Round 7 confirm pass 4, Logic Minor: the vendor-credential aliases were
+    given the endpoint families' layer-first rule in round 6, which let an
+    AMBIENT shell `OPENAI_API_KEY`/`DEEPGRAM_API_KEY` -- generic vendor names a
+    developer machine carries for unrelated reasons -- silently outrank the
+    `WEBSEARCH_`-scoped credential deliberately written into the project's env
+    file, and ship the wrong key to a vendor API.
 
-    def test_process_env_bare_voice_id_beats_env_file_scoped_voice_id(self) -> None:
+    The endpoint families can take layer-first safely because every one of
+    their spellings is `WEBSEARCH_`-prefixed. The alias families' bare
+    spellings are deliberately NOT, so the scoped spelling wins at any layer.
+    """
+
+    def test_env_file_scoped_voice_id_beats_ambient_process_env_bare_voice_id(self) -> None:
         config = load_config(
             env_file={"WEBSEARCH_CARTESIA_VOICE_ID": "from-env-file"},
-            env={"CARTESIA_VOICE_ID": "from-process-env"},
+            env={"CARTESIA_VOICE_ID": "ambient"},
         )
 
-        assert config.cartesia_voice_id == "from-process-env"
+        assert config.cartesia_voice_id == "from-env-file"
 
-    def test_process_env_bare_deepgram_key_beats_env_file_scoped_key(self) -> None:
+    def test_env_file_scoped_deepgram_key_beats_ambient_process_env_bare_key(self) -> None:
         config = load_config(
             env_file={"WEBSEARCH_DEEPGRAM_API_KEY": "from-env-file"},
-            env={"DEEPGRAM_API_KEY": "from-process-env"},
+            env={"DEEPGRAM_API_KEY": "ambient"},
         )
 
-        assert config.deepgram_api_key == "from-process-env"
+        assert config.deepgram_api_key == "from-env-file"
 
-    def test_scoped_spelling_still_wins_a_same_layer_tie(self) -> None:
-        """The documented WEBSEARCH_-prefixed-wins rule survives as the
-        within-layer tie-break; only cross-layer precedence changed."""
+    def test_env_file_scoped_openai_key_beats_ambient_process_env_bare_key(self) -> None:
+        """The headline case: a developer's shell almost always carries an
+        `OPENAI_API_KEY` set for something else entirely."""
+        config = load_config(
+            env_file={"WEBSEARCH_OPENAI_API_KEY": "from-env-file"},
+            env={"OPENAI_API_KEY": "ambient"},
+        )
+
+        assert config.openai_api_key == "from-env-file"
+
+    def test_scoped_spelling_wins_a_same_layer_tie(self) -> None:
         config = load_config(
             env={
                 "WEBSEARCH_CARTESIA_API_KEY": "scoped",
@@ -2455,19 +2508,45 @@ class TestAliasFamilyLayerPrecedence:
 
         assert config.cartesia_api_key == "scoped"
 
+    def test_bare_key_is_used_when_the_scoped_spelling_is_unset(self) -> None:
+        """The bare spellings exist so an operator can reuse standard vendor
+        env vars; scoped-wins must not make them unreachable."""
+        config = load_config(env={"DEEPGRAM_API_KEY": "bare-only"})
+
+        assert config.deepgram_api_key == "bare-only"
+
+    def test_empty_scoped_spelling_falls_through_to_the_bare_key(self) -> None:
+        """An erased scoped override supplies nothing, so it must not block
+        the bare spelling the way a real value does."""
+        config = load_config(
+            env_file={"WEBSEARCH_DEEPGRAM_API_KEY": "   "},
+            env={"DEEPGRAM_API_KEY": "bare"},
+        )
+
+        assert config.deepgram_api_key == "bare"
+
     def test_runtime_named_openai_key_env_participates_in_the_family(self) -> None:
         """The OpenAI family's bare key is named by WEBSEARCH_OPENAI_API_KEY_ENV
-        at runtime, so it can carry no static provenance entry -- it resolves
-        against the raw per-layer mappings like every other family key."""
+        at runtime; it resolves under the same scoped-beats-bare rule."""
+        config = load_config(
+            env={
+                "WEBSEARCH_OPENAI_API_KEY_ENV": "MY_OPENAI_KEY",
+                "MY_OPENAI_KEY": "from-redirected-key",
+            },
+        )
+
+        assert config.openai_api_key == "from-redirected-key"
+
+    def test_scoped_openai_key_beats_the_runtime_named_bare_key(self) -> None:
         config = load_config(
             env_file={"WEBSEARCH_OPENAI_API_KEY": "from-env-file"},
             env={
                 "WEBSEARCH_OPENAI_API_KEY_ENV": "MY_OPENAI_KEY",
-                "MY_OPENAI_KEY": "from-process-env",
+                "MY_OPENAI_KEY": "ambient",
             },
         )
 
-        assert config.openai_api_key == "from-process-env"
+        assert config.openai_api_key == "from-env-file"
 
     def test_lower_layer_scoped_key_is_used_when_no_bare_key_is_set(self) -> None:
         config = load_config(

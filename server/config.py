@@ -416,14 +416,22 @@ MANIFEST_REQUIRED_FIELDS = frozenset(
 # Every phase a `final` manifest must carry an `inputs` binding for.
 MANIFEST_REQUIRED_FINAL_INPUTS = frozenset({"phase0", "phase1", "phase2", "phase3"})
 
-# ...and what a *provisional* manifest must cover: the same roster minus the
-# Phase 3 binding, which is by definition not yet available while Phase 3 is
-# in flight. Named here rather than left as an inline `- {"phase3"}` at the
-# one consumer (scripts/validate_v013_evidence.py's manifest-drift gate), so
-# that adding a phase to the `final` roster is a deliberate decision about
-# BOTH manifest phases instead of silently widening the provisional one too
-# (round 6 confirm pass 3, Architecture Minor).
-MANIFEST_REQUIRED_PROVISIONAL_INPUTS = MANIFEST_REQUIRED_FINAL_INPUTS - {"phase3"}
+# ...and what a *provisional* manifest must cover. Spelled as its own literal,
+# NOT as `MANIFEST_REQUIRED_FINAL_INPUTS - {"phase3"}`: a subtraction makes
+# every phase added to the `final` roster silently widen the provisional one
+# too, which is exactly the coupling naming this constant was meant to break.
+# Moving that subtraction from the consumer into this module (round 6 confirm
+# pass 3) relocated the drift rather than removing it. The parity assertion
+# below is what keeps the two rosters honest: widening `final` still passes,
+# but *narrowing* it without narrowing this one fails at import
+# (round 7 confirm pass 4, Logic Minor).
+MANIFEST_REQUIRED_PROVISIONAL_INPUTS = frozenset({"phase0", "phase1", "phase2"})
+
+# A provisional manifest is a final manifest still missing its in-flight
+# bindings, never a manifest required to declare a phase `final` does not.
+assert MANIFEST_REQUIRED_PROVISIONAL_INPUTS <= MANIFEST_REQUIRED_FINAL_INPUTS, (
+    "MANIFEST_REQUIRED_PROVISIONAL_INPUTS must stay a subset of MANIFEST_REQUIRED_FINAL_INPUTS"
+)
 
 
 # Lowercase-only, matching scripts/evidence_common.py's HEX64_RE: every
@@ -1102,11 +1110,12 @@ def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[st
     "medium"``, so the "baseline" request carried a ``reasoning`` param the
     real baseline never sends.
 
-    The STT/TTS endpoint families and the vendor-key alias families carry the
-    same "a higher layer overriding one related key should beat an inherited
-    sibling" shape; they resolve it through ``_winning_family_member`` rather
-    than by deletion, because there the sibling keys are alternative spellings
-    of one setting, not a dependent pair.
+    The STT/TTS endpoint families carry the same "a higher layer overriding
+    one related key should beat an inherited sibling" shape; they resolve it
+    through ``_winning_family_member`` rather than by deletion, because there
+    the sibling keys are alternative spellings of one setting, not a dependent
+    pair. The vendor-key alias families look like that shape but deliberately
+    do not take the rule -- see ``_winning_alias_key``.
     """
     for model_key, effort_key in _ROLE_MODEL_EFFORT_KEYS:
         if effort_key not in values:
@@ -1132,19 +1141,65 @@ _TTS_ENDPOINT_MEMBERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("socket", ("WEBSEARCH_TTS_WS_SOCKET",)),
     ("host_port", ("WEBSEARCH_TTS_WS_HOST", "WEBSEARCH_TTS_WS_PORT")),
 )
-#: The vendor-credential alias families: ``(scoped_key, bare_key)``. The
-#: scoped ``WEBSEARCH_``-prefixed spelling is declared first, so it keeps
-#: winning a same-layer tie exactly as the old ``or``-chain did -- but it no
-#: longer beats a bare spelling set at a HIGHER layer, which the ``or`` chain
-#: silently did (round 6 confirm pass 3, Architecture Important). The OpenAI
-#: family's bare key is not listed here: it is named at runtime by
-#: ``WEBSEARCH_OPENAI_API_KEY_ENV``, so ``load_config`` builds that pair once
-#: the layers are merged and resolves it through the same helper.
-_ALIAS_FAMILIES: tuple[tuple[str, str, str], ...] = (
+#: The env var naming the OpenAI family's bare spelling when the operator has
+#: not redirected it with ``WEBSEARCH_OPENAI_API_KEY_ENV``.
+_DEFAULT_OPENAI_KEY_ENV = "OPENAI_API_KEY"
+
+#: The vendor-credential alias families, ``(config field, members)`` -- the
+#: same ``(name, members)`` shape the endpoint families use, so
+#: :func:`_family_keys` derives their key roster too and nothing hand-writes a
+#: second copy (round 7 confirm pass 4, Architecture Minor).
+#:
+#: Their members are always a single key each, and they resolve through
+#: :func:`_winning_alias_key`, NOT :func:`_winning_family_member` -- see that
+#: function for why credential aliases do not take the endpoint families'
+#: layer-first rule.
+_ALIAS_FAMILY_SPELLINGS: tuple[tuple[str, str, str], ...] = (
+    ("openai_api_key", "WEBSEARCH_OPENAI_API_KEY", _DEFAULT_OPENAI_KEY_ENV),
     ("deepgram_api_key", "WEBSEARCH_DEEPGRAM_API_KEY", "DEEPGRAM_API_KEY"),
     ("cartesia_api_key", "WEBSEARCH_CARTESIA_API_KEY", "CARTESIA_API_KEY"),
     ("cartesia_voice_id", "WEBSEARCH_CARTESIA_VOICE_ID", "CARTESIA_VOICE_ID"),
 )
+
+
+def _alias_families(
+    openai_bare_key: str = _DEFAULT_OPENAI_KEY_ENV,
+) -> tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ...]:
+    """The alias families in ``(field, members)`` form.
+
+    A function rather than a constant because the OpenAI family's bare
+    spelling is named at runtime by ``WEBSEARCH_OPENAI_API_KEY_ENV``: passing
+    that name in here keeps the runtime-named key inside the same registry
+    every other family key is derived from, instead of assembling a one-off
+    pair inline in ``load_config``.
+    """
+    return tuple(
+        (
+            field_name,
+            (
+                ("scoped", (scoped_key,)),
+                ("bare", (openai_bare_key if field_name == "openai_api_key" else bare_key,)),
+            ),
+        )
+        for field_name, scoped_key, bare_key in _ALIAS_FAMILY_SPELLINGS
+    )
+
+
+def _families() -> tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ...]:
+    """Every declared family, for callers that need the whole key roster.
+
+    Key enumeration only -- the two kinds of family resolve by different
+    rules (see :func:`_winning_alias_key`), so this is not a dispatch table.
+    Its point is that a family added to this registry is automatically covered
+    by the parity test pinning "family keys carry no provenance entry", rather
+    than needing a second hand-written enumeration to be remembered
+    (round 7 confirm pass 4, Architecture Minor).
+    """
+    return (
+        ("stt_endpoint", _STT_ENDPOINT_MEMBERS),
+        ("tts_endpoint", _TTS_ENDPOINT_MEMBERS),
+        *_alias_families(),
+    )
 
 
 def _family_key_set(value: object) -> bool:
@@ -1181,11 +1236,12 @@ def _family_layers(
     """Highest precedence layer that set each of ``keys``, or ``-1``.
 
     Computed from the RAW per-layer mappings rather than from the merged
-    ``layers`` provenance dict, for two reasons: family keys use
-    :func:`_family_key_set` rather than ``_record_layer``'s stricter
-    truthiness, and the OpenAI alias family's bare key name is only known at
-    resolution time (``WEBSEARCH_OPENAI_API_KEY_ENV``), so no static
-    ``_PROVENANCE_KEYS`` roster could cover it.
+    ``layers`` provenance dict: family keys use :func:`_family_key_set` rather
+    than ``_record_layer``'s stricter truthiness, so the provenance dict does
+    not record them at all. (The OpenAI alias family's bare key name is not
+    even known until resolution time -- ``WEBSEARCH_OPENAI_API_KEY_ENV`` names
+    it -- so no static ``_PROVENANCE_KEYS`` roster could cover the families
+    either way.)
 
     A key a higher layer *erased* (``WEBSEARCH_TTS_WS_PORT=""``) reports
     ``-1``, not the lower layer that last carried a value: family keys are
@@ -1214,16 +1270,19 @@ def _winning_family_member(
 ) -> str | None:
     """Pick which member of a family supplies the setting.
 
-    A family is several mutually-exclusive spellings of one setting: the
-    STT/TTS endpoints (``WEBSEARCH_TTS_ENDPOINT`` / ``_WS_URI`` / ``_WS_SOCKET``
-    / ``_WS_HOST`` + ``_WS_PORT``) and the vendor-credential aliases
-    (``WEBSEARCH_CARTESIA_API_KEY`` / ``CARTESIA_API_KEY``). Resolving either
-    by hardcoded key priority ignored the layered precedence system entirely: a
-    config.toml ``tts_ws_uri`` (layer 0) beat a ``WEBSEARCH_TTS_WS_SOCKET``
-    exported in the process environment (layer 2), so the operator's
-    highest-precedence override was silently discarded and the service
-    connected to the TOML endpoint (round-5 restart, Logic Important; extended
-    to the alias families in round 6 confirm pass 3).
+    Resolves the ENDPOINT families -- the mutually-exclusive spellings of one
+    STT/TTS endpoint (``WEBSEARCH_TTS_ENDPOINT`` / ``_WS_URI`` / ``_WS_SOCKET``
+    / ``_WS_HOST`` + ``_WS_PORT``). Resolving them by hardcoded key priority
+    ignored the layered precedence system entirely: a config.toml
+    ``tts_ws_uri`` (layer 0) beat a ``WEBSEARCH_TTS_WS_SOCKET`` exported in the
+    process environment (layer 2), so the operator's highest-precedence
+    override was silently discarded and the service connected to the TOML
+    endpoint (round-5 restart, Logic Important).
+
+    The vendor-credential aliases are a family too but resolve through
+    ``_winning_alias_key`` instead: every spelling here is ``WEBSEARCH_``-
+    prefixed, and that safety property is what makes layer-first correct --
+    the aliases do not have it.
 
     The winner is the present member set at the highest precedence layer; the
     declaration order of ``members`` (the documented key priority) breaks a
@@ -1240,6 +1299,44 @@ def _winning_family_member(
     if not present:
         return None
     return max(present, key=lambda member: member[1])[0]
+
+
+def _winning_alias_key(
+    values: Mapping[str, object],
+    members: Sequence[tuple[str, tuple[str, ...]]],
+) -> str | None:
+    """Pick which spelling of a vendor credential supplies the value.
+
+    Declaration order decides -- the scoped ``WEBSEARCH_``-prefixed spelling
+    beats the bare one whatever layer either was set at -- and the layer is
+    consulted only to break a tie *within* a group, of which these families
+    have none (one key per member).
+
+    This is deliberately NOT :func:`_winning_family_member`'s layer-first rule,
+    even though the two look like the same shape. The endpoint families can
+    take that rule safely because every one of their spellings is
+    ``WEBSEARCH_``-prefixed: nothing outside this app's own configuration can
+    accidentally join the family. The credential aliases are the opposite by
+    design -- their bare spellings (``OPENAI_API_KEY``, ``DEEPGRAM_API_KEY``,
+    ``CARTESIA_*``) are the ubiquitous vendor names, offered precisely so an
+    operator can reuse standard credentials. Under a layer-first rule an
+    ambient ``OPENAI_API_KEY`` in a developer's shell -- never set for this app
+    -- outranks the ``WEBSEARCH_OPENAI_API_KEY`` deliberately written into the
+    project's env file, and the wrong credential leaves the process for a
+    vendor API. Round 6 ported the layer-first rule here on the strength of
+    the shape match; the ``WEBSEARCH_`` prefix exists to disambiguate FROM
+    ambient vendor vars, so the scoped spelling must keep winning
+    (round 7 confirm pass 4, Logic Minor).
+
+    A caller can still put a bare credential on top: unset the scoped one.
+    """
+    for _name, keys in members:
+        # Alias members are single-key by construction (_alias_families); the
+        # multi-key member shape exists for the endpoint families.
+        (key,) = keys
+        if _family_key_set(values.get(key)):
+            return key
+    return None
 
 
 def _winning_family_layer(
@@ -1313,24 +1410,14 @@ def load_config(
     # effort along -- see _clear_inherited_reasoning_effort's docstring.
     _clear_inherited_reasoning_effort(values, layers)
     kwargs: dict[str, object] = {}
-    # The vendor-credential aliases are families, not a key-priority chain:
-    # `values.get(scoped) or values.get(bare)` let a scoped spelling in
-    # config.toml/the env file silently beat a bare spelling exported in the
-    # process environment -- the same silent precedence violation the endpoint
-    # families were migrated off. Scoped-wins survives as the WITHIN-layer
-    # tie-break (declaration order), which is the documented behaviour
-    # (round 6 confirm pass 3, Architecture Important).
-    key_name = str(values.get("WEBSEARCH_OPENAI_API_KEY_ENV") or "OPENAI_API_KEY")
-    for field_name, scoped_key, bare_key in (
-        ("openai_api_key", "WEBSEARCH_OPENAI_API_KEY", key_name),
-        *_ALIAS_FAMILIES,
-    ):
-        alias_members = (("scoped", (scoped_key,)), ("bare", (bare_key,)))
-        alias_member = _winning_family_member(
-            values, _family_layers(values, layer_maps, (scoped_key, bare_key)), alias_members
-        )
-        if alias_member is not None:
-            kwargs[field_name] = values[scoped_key if alias_member == "scoped" else bare_key]
+    # The vendor-credential aliases resolve by declaration order (scoped beats
+    # bare at any layer), not by the endpoint families' layer-first rule -- see
+    # _winning_alias_key for why the two families cannot share that rule.
+    key_name = str(values.get("WEBSEARCH_OPENAI_API_KEY_ENV") or _DEFAULT_OPENAI_KEY_ENV)
+    for field_name, alias_members in _alias_families(key_name):
+        alias_key = _winning_alias_key(values, alias_members)
+        if alias_key is not None:
+            kwargs[field_name] = values[alias_key]
     # Membership, not truthiness, and every conversion wrapped: TOML supplies
     # real ints, so an explicit `max_citations = 0` / `multi_intent_wait_timeout_ms
     # = 0` is falsy and a truthiness walrus dropped the key outright -- the

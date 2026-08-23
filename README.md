@@ -124,11 +124,23 @@ half-specified pair is the spelling that would otherwise have won — a leftover
 `[tts] tts_ws_host` in `config.toml` is simply not consulted once a
 higher-layer spelling supplies the endpoint, and does not block startup.
 
-The vendor-credential aliases resolve by the same rule. `CARTESIA_API_KEY`,
-`DEEPGRAM_API_KEY`, `CARTESIA_VOICE_ID` and the variable named by
-`WEBSEARCH_OPENAI_API_KEY_ENV` are alternative spellings of their
-`WEBSEARCH_`-prefixed counterparts: the highest layer that sets either spelling
-wins, and the `WEBSEARCH_`-prefixed name wins only a tie *within* one layer.
+The vendor-credential aliases are families too, but they resolve by a
+*different* rule. `CARTESIA_API_KEY`, `DEEPGRAM_API_KEY`, `CARTESIA_VOICE_ID`
+and the variable named by `WEBSEARCH_OPENAI_API_KEY_ENV` are alternative
+spellings of their `WEBSEARCH_`-prefixed counterparts, and the
+`WEBSEARCH_`-prefixed spelling wins **whatever layer either was set at** — a
+`WEBSEARCH_OPENAI_API_KEY` in your env file beats an `OPENAI_API_KEY` exported
+in your shell, not the other way round.
+
+That is deliberate, and it is why the endpoint rule above does not apply here:
+every endpoint spelling is `WEBSEARCH_`-prefixed, so nothing outside this app's
+own configuration can join those families. The credential aliases are the
+opposite by design — the bare spellings are the ubiquitous vendor names,
+offered so you can reuse standard credentials. Under a layer-first rule an
+ambient `OPENAI_API_KEY` in your shell, set for something else entirely, would
+silently outrank the key you deliberately scoped to this app and the wrong
+credential would go to the vendor. To use a bare spelling, leave the
+`WEBSEARCH_`-prefixed one unset (or set it to an empty value).
 
 `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
 semantic-turn fallback. After Smart Turn reports an incomplete turn, each new
