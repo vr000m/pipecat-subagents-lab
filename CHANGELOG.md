@@ -480,6 +480,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     manifest rosters `scripts/` imports became public names, and the slice
     import-boundary test discovers its roster from `server/*.py` instead of
     listing 6 of ~19 modules.
+- Restart-gauntlet round 7 (confirm pass 4) fixed all 9 findings a 4-lens
+  confirm pass over round 6's fix diff raised (2 logic, 2 security,
+  5 architecture) — the smallest round of the loop:
+  - **Behaviour change:** the vendor-credential aliases no longer resolve by
+    configuration layer. Round 6 gave them the endpoint families' layer-first
+    rule on the strength of the shape match, which let an ambient
+    `OPENAI_API_KEY`/`DEEPGRAM_API_KEY` in a developer's shell — set for
+    something else entirely — silently outrank the `WEBSEARCH_`-scoped
+    credential in the project's env file and ship the wrong key to a vendor
+    API. Every endpoint spelling is `WEBSEARCH_`-prefixed, which is what makes
+    layer-first safe there; the credential aliases' bare spellings are
+    deliberately not, so the scoped spelling now wins at any layer. Unset the
+    scoped spelling to use a bare one.
+  - The manifest producer/consumer split round 6 closed on the verifier side
+    was still open on the writer side: `write_manifest` built its `inputs`
+    from three literal phase keys while `verify_manifest` derived its roster
+    from `server.config`. The writer now checks its own output against the
+    same two constants. `MANIFEST_REQUIRED_PROVISIONAL_INPUTS` is a real
+    independent literal rather than `FINAL - {"phase3"}`, with a parity
+    assertion — round 6 moved that subtraction to a different file instead of
+    removing the coupling it was meant to break.
+  - The alias families adopted the endpoint families' `(name, members)` shape,
+    and both kinds are now enumerated by one `_families()` registry that
+    `load_config` and the provenance parity test share, so a family added
+    later cannot land in only one of them.
+  - Round 6's parsed-`ci.yml` drift check still passed on a job or step
+    disabled with `if: false` and on a manifest path appearing only inside a
+    quoted `echo` or a run-script comment — two of the three bypasses its own
+    docstring claimed to have closed. It now rejects a conditional job, rejects
+    a roster whose every referencing step is conditional, and matches the path
+    as a whole shell word of a comment-stripped command. `check_release_metadata.py`'s
+    `pyproject.toml` read is hardened like its siblings, and all three decode
+    sites report `FAIL` rather than a traceback on non-UTF-8 input.
+  - The Phase 2 `source_anchor` URL check anchored the version to a whole path
+    segment in round 6 but left its *position* free, so
+    `.../blob/refs/pull/9999/head/1.10.6/index.js` — a tree any outside
+    contributor can populate — still validated. The version must now be the
+    segment a recognised ref-introducing keyword introduces, in one of four
+    named layouts.
+  - The slice import-boundary test's roster was widened in round 6 while its
+    detection stayed narrow: `from .workers import web_search` names the
+    concrete worker as an imported *name*, not in the module path, and was
+    missed. Detection is now a named, directly tested helper.
 - `scripts/eval_model_comparison.py`'s citations assertion no longer fails
   weather-query turns that were genuinely delegated and answered correctly:
   the hosted `web_search` tool answers weather via an internal `oai-weather`
