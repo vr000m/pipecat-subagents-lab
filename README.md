@@ -119,7 +119,16 @@ beats `WEBSEARCH_TTS_WS_URI`, which beats `WEBSEARCH_TTS_WS_SOCKET`, which beats
 
 `WEBSEARCH_TTS_WS_HOST` and `WEBSEARCH_TTS_WS_PORT` must be set together;
 setting one without the other is a startup error rather than a silent fallback
-to the packaged default endpoint.
+to the packaged default endpoint. That error is raised only when the
+half-specified pair is the spelling that would otherwise have won — a leftover
+`[tts] tts_ws_host` in `config.toml` is simply not consulted once a
+higher-layer spelling supplies the endpoint, and does not block startup.
+
+The vendor-credential aliases resolve by the same rule. `CARTESIA_API_KEY`,
+`DEEPGRAM_API_KEY`, `CARTESIA_VOICE_ID` and the variable named by
+`WEBSEARCH_OPENAI_API_KEY_ENV` are alternative spellings of their
+`WEBSEARCH_`-prefixed counterparts: the highest layer that sets either spelling
+wins, and the `WEBSEARCH_`-prefixed name wins only a tie *within* one layer.
 
 `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
 semantic-turn fallback. After Smart Turn reports an incomplete turn, each new

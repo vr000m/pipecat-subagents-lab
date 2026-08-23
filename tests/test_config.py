@@ -2238,18 +2238,23 @@ class TestReasoningEffortInheritance:
 
     def test_empty_means_absent_keys_are_a_subset_of_provenance_keys(self) -> None:
         """Every key that treats an empty override as "absent" must also carry
-        provenance -- otherwise _clear_inherited_reasoning_effort and
-        _winning_endpoint_member would reason about a layer number that was
-        never recorded. The reverse does not hold: _ENDPOINT_FAMILY_KEYS carry
-        provenance without adopting the empty-means-absent rule (round-5
-        restart, Logic Important)."""
+        provenance -- otherwise _clear_inherited_reasoning_effort would reason
+        about a layer number that was never recorded (round-5 restart, Logic
+        Important).
+
+        The family keys are deliberately in NEITHER constant: they resolve
+        against the raw per-layer mappings through _family_layers rather than
+        through _record_layer's provenance dict, so a hand-written roster of
+        them can no longer drift from the member tuples load_config actually
+        resolves (round 6 confirm pass 3, Architecture Minor)."""
         import server.config as _config_module
 
         assert set(_config_module._EMPTY_MEANS_ABSENT_KEYS) <= set(_config_module._PROVENANCE_KEYS)
-        assert set(_config_module._ENDPOINT_FAMILY_KEYS) <= set(_config_module._PROVENANCE_KEYS)
-        assert not set(_config_module._ENDPOINT_FAMILY_KEYS) & set(
-            _config_module._EMPTY_MEANS_ABSENT_KEYS
+        family_keys = set(_config_module._family_keys(_config_module._STT_ENDPOINT_MEMBERS)) | set(
+            _config_module._family_keys(_config_module._TTS_ENDPOINT_MEMBERS)
         )
+        assert not family_keys & set(_config_module._PROVENANCE_KEYS)
+        assert not family_keys & set(_config_module._EMPTY_MEANS_ABSENT_KEYS)
 
 
 class TestDefaultReasoningEffortForModel:
@@ -2365,3 +2370,109 @@ class TestEndpointFamilyLayerPrecedence:
     def test_tts_port_without_host_is_loud(self) -> None:
         with pytest.raises(ConfigError, match="must be set together"):
             load_config(env={"WEBSEARCH_TTS_WS_PORT": "9100"})
+
+    def test_stray_toml_host_no_longer_breaks_a_higher_layer_endpoint(self, tmp_path) -> None:
+        """Round 6 confirm pass 3, Logic Important: the pairing check fired
+        before family resolution, so a leftover half-pair at a LOWER layer --
+        never consulted, before or after the round-5 fix -- turned a config
+        that booted fine into a hard startup failure."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[tts]\ntts_ws_host = "legacy.example.test"\n')
+
+        config = load_config(
+            config_file=config_file,
+            env={"WEBSEARCH_TTS_ENDPOINT": "ws://tts.example.test:9002"},
+        )
+
+        assert config.tts_endpoint == ("ws", "tts.example.test:9002")
+
+    def test_same_layer_stray_host_loses_to_key_priority_instead_of_failing(self, tmp_path) -> None:
+        """A half-pair beside a higher-priority spelling in the SAME layer is
+        resolved by the documented key priority, exactly as a complete pair
+        would be -- it is not consulted, so it is not malformed input."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[tts]\ntts_ws_uri = "wss://tts.example.test:9443"\ntts_ws_host = "orphan"\n'
+        )
+
+        config = load_config(config_file=config_file, env={})
+
+        assert config.tts_endpoint == ("wss", "tts.example.test:9443")
+
+    def test_half_pair_above_the_winning_member_is_still_loud(self, tmp_path) -> None:
+        """The loudness the round-5 fix added survives where it matters: a
+        half-pair at a HIGHER layer than the winner is the operator's
+        highest-precedence intent, and it is incomplete."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[tts]\ntts_ws_uri = "wss://tts.example.test:9443"\n')
+
+        with pytest.raises(ConfigError, match="must be set together"):
+            load_config(config_file=config_file, env={"WEBSEARCH_TTS_WS_HOST": "127.0.0.1"})
+
+    def test_explicit_zero_port_reaches_the_range_validator(self, tmp_path) -> None:
+        """Round 6 confirm pass 3, Logic Minor: TOML supplies real integers, so
+        a truthiness presence test read an explicit `tts_ws_port = 0` as an
+        unset port -- reporting a factually wrong "must be set together"
+        instead of the field-named range error."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[tts]\ntts_ws_host = "127.0.0.1"\ntts_ws_port = 0\n')
+
+        with pytest.raises(ConfigError, match="between 1 and 65535"):
+            load_config(config_file=config_file, env={})
+
+
+class TestAliasFamilyLayerPrecedence:
+    """Round 6 confirm pass 3, Architecture Important: the vendor-credential
+    alias families kept the hardcoded `scoped or bare` chain after the endpoint
+    families moved to layer-aware resolution, so a scoped spelling at a lower
+    layer silently beat a bare spelling the operator exported."""
+
+    def test_process_env_bare_voice_id_beats_env_file_scoped_voice_id(self) -> None:
+        config = load_config(
+            env_file={"WEBSEARCH_CARTESIA_VOICE_ID": "from-env-file"},
+            env={"CARTESIA_VOICE_ID": "from-process-env"},
+        )
+
+        assert config.cartesia_voice_id == "from-process-env"
+
+    def test_process_env_bare_deepgram_key_beats_env_file_scoped_key(self) -> None:
+        config = load_config(
+            env_file={"WEBSEARCH_DEEPGRAM_API_KEY": "from-env-file"},
+            env={"DEEPGRAM_API_KEY": "from-process-env"},
+        )
+
+        assert config.deepgram_api_key == "from-process-env"
+
+    def test_scoped_spelling_still_wins_a_same_layer_tie(self) -> None:
+        """The documented WEBSEARCH_-prefixed-wins rule survives as the
+        within-layer tie-break; only cross-layer precedence changed."""
+        config = load_config(
+            env={
+                "WEBSEARCH_CARTESIA_API_KEY": "scoped",
+                "CARTESIA_API_KEY": "bare",
+            },
+        )
+
+        assert config.cartesia_api_key == "scoped"
+
+    def test_runtime_named_openai_key_env_participates_in_the_family(self) -> None:
+        """The OpenAI family's bare key is named by WEBSEARCH_OPENAI_API_KEY_ENV
+        at runtime, so it can carry no static provenance entry -- it resolves
+        against the raw per-layer mappings like every other family key."""
+        config = load_config(
+            env_file={"WEBSEARCH_OPENAI_API_KEY": "from-env-file"},
+            env={
+                "WEBSEARCH_OPENAI_API_KEY_ENV": "MY_OPENAI_KEY",
+                "MY_OPENAI_KEY": "from-process-env",
+            },
+        )
+
+        assert config.openai_api_key == "from-process-env"
+
+    def test_lower_layer_scoped_key_is_used_when_no_bare_key_is_set(self) -> None:
+        config = load_config(
+            env_file={"WEBSEARCH_CARTESIA_VOICE_ID": "from-env-file"},
+            env={},
+        )
+
+        assert config.cartesia_voice_id == "from-env-file"

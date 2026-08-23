@@ -355,12 +355,15 @@ def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
 def effective_feature_policy_fingerprint(config: Config) -> str:
     """`feature_policy_fingerprint(FeaturePolicy.from_config(config))`, named.
 
-    Two independent callers -- ``scripts/emit_v013_deployment_metadata.py``
-    (the writer, which stamps this into the release-metadata shell exports)
-    and ``scripts/validate_v013_evidence.py`` (the verifier, which re-derives
-    it to check manifest drift) -- must resolve this composition identically
-    by construction, not by both happening to spell the same three-call chain
-    the same way. Previously the writer wrapped it in a script-local
+    ``load_promotion_manifest`` below is the authority: its comparison is the
+    one that decides whether a manifest is stale. Two independent callers --
+    ``scripts/emit_v013_deployment_metadata.py`` (the writer, which stamps
+    this into the release-metadata shell exports) and
+    ``scripts/validate_v013_evidence.py`` (the verifier, which re-derives it
+    to check manifest drift) -- exist to predict that comparison, so all
+    three must resolve this composition identically by construction, not by
+    each happening to spell the same three-call chain the same way.
+    Previously the writer wrapped it in a script-local
     ``feature_policy_fingerprint_value()`` (with a function-local
     ``server.config`` import) while the verifier spelled the same composition
     inline; this is the one home for it, since both the writer and the
@@ -393,7 +396,7 @@ class PromotionManifest:
     generated_at_utc: str | None = None
 
 
-_MANIFEST_REQUIRED_FIELDS = frozenset(
+MANIFEST_REQUIRED_FIELDS = frozenset(
     {
         "manifest_phase",
         "promotion_eligible",
@@ -411,7 +414,16 @@ _MANIFEST_REQUIRED_FIELDS = frozenset(
 
 
 # Every phase a `final` manifest must carry an `inputs` binding for.
-_MANIFEST_REQUIRED_FINAL_INPUTS = frozenset({"phase0", "phase1", "phase2", "phase3"})
+MANIFEST_REQUIRED_FINAL_INPUTS = frozenset({"phase0", "phase1", "phase2", "phase3"})
+
+# ...and what a *provisional* manifest must cover: the same roster minus the
+# Phase 3 binding, which is by definition not yet available while Phase 3 is
+# in flight. Named here rather than left as an inline `- {"phase3"}` at the
+# one consumer (scripts/validate_v013_evidence.py's manifest-drift gate), so
+# that adding a phase to the `final` roster is a deliberate decision about
+# BOTH manifest phases instead of silently widening the provisional one too
+# (round 6 confirm pass 3, Architecture Minor).
+MANIFEST_REQUIRED_PROVISIONAL_INPUTS = MANIFEST_REQUIRED_FINAL_INPUTS - {"phase3"}
 
 
 # Lowercase-only, matching scripts/evidence_common.py's HEX64_RE: every
@@ -425,7 +437,7 @@ _HEX_HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 # Manifest keys whose value must be a JSON string. `reason` is deliberately
 # excluded: it is required to be present but is null on an eligible manifest.
-_MANIFEST_STRING_FIELDS = (
+MANIFEST_STRING_FIELDS = (
     "manifest_phase",
     "schema_hash",
     "source_commit",
@@ -686,11 +698,11 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     if not isinstance(manifest, dict):
         return _unavailable("manifest_malformed")
 
-    missing = _MANIFEST_REQUIRED_FIELDS - set(manifest)
+    missing = MANIFEST_REQUIRED_FIELDS - set(manifest)
     if missing:
         return _unavailable("manifest_schema_invalid")
 
-    if any(not isinstance(manifest[name], str) for name in _MANIFEST_STRING_FIELDS):
+    if any(not isinstance(manifest[name], str) for name in MANIFEST_STRING_FIELDS):
         return _unavailable("manifest_schema_invalid")
     if not isinstance(manifest["promotion_eligible"], bool):
         return _unavailable("manifest_schema_invalid")
@@ -761,7 +773,7 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         return replace(identity, reason="phase3_binding_mismatch")
     # A *final* manifest attests the whole evidence chain, so every earlier
     # phase must be bound too; only a provisional manifest may lack them.
-    if not _MANIFEST_REQUIRED_FINAL_INPUTS <= set(manifest["inputs"]):
+    if not MANIFEST_REQUIRED_FINAL_INPUTS <= set(manifest["inputs"]):
         return replace(identity, reason="incomplete_final_manifest")
     # Unlike Phase 4C (byte-verified below), the Phase 0/1/2/3 `inputs`
     # entries were previously only shape-checked (a non-empty path string, a
@@ -769,7 +781,7 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
     # actual file on disk, so a `final` manifest's declared evidence hashes
     # were never actually proven to describe the files they name. Making the
     # Phase 4C byte-check the rule rather than the exception closes that gap.
-    for _phase_name in _MANIFEST_REQUIRED_FINAL_INPUTS:
+    for _phase_name in MANIFEST_REQUIRED_FINAL_INPUTS:
         _phase_entry = manifest["inputs"][_phase_name]
         _phase_path = _resolve_confined_evidence_path(_phase_entry["path"])
         if _phase_path is None:
@@ -786,8 +798,11 @@ def _load_promotion_manifest(config: Config) -> PromotionManifest:
         if _actual_phase_hash != _phase_entry["sha256"]:
             return replace(identity, reason="evidence_mismatch")
 
-    policy = FeaturePolicy.from_config(config)
-    expected_fingerprint = feature_policy_fingerprint(policy)
+    # Through the named helper, not the three-call chain spelled inline: this
+    # loader is the authority the writer and the verifier both exist to
+    # predict, so it must resolve the composition by the same construction
+    # they do (round 6 confirm pass 3, Architecture Minor).
+    expected_fingerprint = effective_feature_policy_fingerprint(config)
     if manifest["feature_policy_fingerprint"] != expected_fingerprint:
         return replace(identity, reason="policy_fingerprint_mismatch")
     # Unconditional identity binding: an unset Config field cannot prove the
@@ -899,10 +914,8 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
     ("WEBSEARCH_WORKER_MODEL", "WEBSEARCH_WORKER_REASONING_EFFORT"),
 )
 # Two names because they encode two different rules with two different
-# justifications. _EMPTY_MEANS_ABSENT_KEYS is now a strict SUBSET of
-# _PROVENANCE_KEYS -- the divergence the comment below anticipated arrived when
-# the endpoint-family keys started carrying provenance without adopting the
-# empty-means-absent rule:
+# justifications. They are currently equal by construction, and the comment
+# below anticipates that they may diverge:
 #   _PROVENANCE_KEYS: which keys carry per-layer provenance, so
 #   _clear_inherited_reasoning_effort can tell "a higher layer set the model"
 #   from "the model came along with the effort".
@@ -919,34 +932,21 @@ _ROLE_MODEL_EFFORT_KEYS: tuple[tuple[str, str], ...] = (
 #   tests/test_config.py's constant-parity test -- adding a key here cannot
 #   happen without a human edit that trips that test (round 6, Architecture A2).
 # A key that satisfies one rule but not the other is added to that constant
-# alone -- which is exactly what _ENDPOINT_FAMILY_KEYS below does. What
-# matters, and what
+# alone. What matters, and what
 # TestProvenanceKeysAloneDriveLayerRecording /
 # TestEmptyMeansAbsentKeysAloneDriveTheEmptyOverrideSkip in tests/test_config.py
 # pin, is that each constant is read by exactly one function: _PROVENANCE_KEYS
 # by _record_layer, _EMPTY_MEANS_ABSENT_KEYS by _apply_layer (round 5
 # restart2, Architecture A6).
-# The STT/TTS endpoint-family keys: several mutually-exclusive spellings of one
-# setting, resolved across layers by _winning_endpoint_member. They carry
-# provenance for the same reason the role keys do -- without it the family
-# resolved by hardcoded key priority alone and a config.toml spelling (layer 0)
-# silently beat a process-env spelling (layer 2). They are deliberately NOT in
-# _EMPTY_MEANS_ABSENT_KEYS: an empty override of one spelling must still be a
-# write that erases a lower layer's value for THAT SAME KEY, since the family's
-# other spellings remain available to supply the endpoint (round-5 restart,
-# Logic Important).
-_ENDPOINT_FAMILY_KEYS = (
-    "WEBSEARCH_STT_ENDPOINT",
-    "WEBSEARCH_STT_WS_SOCKET",
-    "WEBSEARCH_TTS_ENDPOINT",
-    "WEBSEARCH_TTS_WS_URI",
-    "WEBSEARCH_TTS_WS_SOCKET",
-    "WEBSEARCH_TTS_WS_HOST",
-    "WEBSEARCH_TTS_WS_PORT",
-)
-_PROVENANCE_KEYS = (
-    tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair) + _ENDPOINT_FAMILY_KEYS
-)
+# The STT/TTS endpoint keys are deliberately NOT here: they are alternative
+# spellings of one setting rather than a dependent pair, and they resolve
+# against the raw per-layer mappings through _family_layers -- see
+# _winning_family_member. Routing them through _record_layer instead needed a
+# hand-written key roster mirroring the member tuples 400 lines away (nothing
+# pinned the two together), and inherited _effectively_set's truthiness, under
+# which an explicit `tts_ws_port = 0` recorded no layer at all (round 6
+# confirm pass 3, Architecture/Logic Minor).
+_PROVENANCE_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
 _EMPTY_MEANS_ABSENT_KEYS = tuple(k for pair in _ROLE_MODEL_EFFORT_KEYS for k in pair)
 # The model half of _ROLE_MODEL_EFFORT_KEYS alone -- used by _record_layer to
 # decide *whether to compare* a key's incoming value against its incumbent
@@ -1102,10 +1102,11 @@ def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[st
     "medium"``, so the "baseline" request carried a ``reasoning`` param the
     real baseline never sends.
 
-    The STT/TTS endpoint families carry the same "a higher layer overriding one
-    related key should beat an inherited sibling" shape; they resolve it through
-    ``_winning_endpoint_member`` rather than by deletion, because there the
-    sibling keys are alternative spellings of one setting, not a dependent pair.
+    The STT/TTS endpoint families and the vendor-key alias families carry the
+    same "a higher layer overriding one related key should beat an inherited
+    sibling" shape; they resolve it through ``_winning_family_member`` rather
+    than by deletion, because there the sibling keys are alternative spellings
+    of one setting, not a dependent pair.
     """
     for model_key, effort_key in _ROLE_MODEL_EFFORT_KEYS:
         if effort_key not in values:
@@ -1114,20 +1115,115 @@ def _clear_inherited_reasoning_effort(values: dict[str, object], layers: dict[st
             del values[effort_key]
 
 
-def _winning_endpoint_member(
+#: A "family" is several mutually-exclusive spellings of ONE setting, resolved
+#: by :func:`_winning_family_member`. Declared here, once, rather than as
+#: literals inside ``load_config``: the resolver needs the same key names twice
+#: (to test presence and to compute each member's layer), and a spelling added
+#: to one copy but not the other used to fail silently.
+_STT_ENDPOINT_MEMBERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("endpoint", ("WEBSEARCH_STT_ENDPOINT",)),
+    ("socket", ("WEBSEARCH_STT_WS_SOCKET",)),
+)
+#: Declaration order is the README's documented within-layer key priority:
+#: ``ENDPOINT`` > ``WS_URI`` > ``WS_SOCKET`` > ``WS_HOST``+``WS_PORT``.
+_TTS_ENDPOINT_MEMBERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("endpoint", ("WEBSEARCH_TTS_ENDPOINT",)),
+    ("uri", ("WEBSEARCH_TTS_WS_URI",)),
+    ("socket", ("WEBSEARCH_TTS_WS_SOCKET",)),
+    ("host_port", ("WEBSEARCH_TTS_WS_HOST", "WEBSEARCH_TTS_WS_PORT")),
+)
+#: The vendor-credential alias families: ``(scoped_key, bare_key)``. The
+#: scoped ``WEBSEARCH_``-prefixed spelling is declared first, so it keeps
+#: winning a same-layer tie exactly as the old ``or``-chain did -- but it no
+#: longer beats a bare spelling set at a HIGHER layer, which the ``or`` chain
+#: silently did (round 6 confirm pass 3, Architecture Important). The OpenAI
+#: family's bare key is not listed here: it is named at runtime by
+#: ``WEBSEARCH_OPENAI_API_KEY_ENV``, so ``load_config`` builds that pair once
+#: the layers are merged and resolves it through the same helper.
+_ALIAS_FAMILIES: tuple[tuple[str, str, str], ...] = (
+    ("deepgram_api_key", "WEBSEARCH_DEEPGRAM_API_KEY", "DEEPGRAM_API_KEY"),
+    ("cartesia_api_key", "WEBSEARCH_CARTESIA_API_KEY", "CARTESIA_API_KEY"),
+    ("cartesia_voice_id", "WEBSEARCH_CARTESIA_VOICE_ID", "CARTESIA_VOICE_ID"),
+)
+
+
+def _family_key_set(value: object) -> bool:
+    """Whether a family member key carries a real value.
+
+    Presence-and-non-emptiness, deliberately NOT :func:`_effectively_set`'s
+    truthiness: a family key's value can be a typed TOML integer, and an
+    explicit ``[tts] tts_ws_port = 0`` is a value the operator set -- one that
+    must reach the range validator that names the field, not be silently
+    treated as absent and replaced by the packaged default. Same
+    truthiness-vs-membership bug class as ``max_citations = 0`` (round 6
+    confirm pass 3, Logic Minor). ``""`` and whitespace-only stay absent: an
+    empty override erases its own key without supplying an endpoint, leaving
+    the family's other spellings to answer.
+    """
+    return value is not None and str(value).strip() != ""
+
+
+def _family_keys(members: Sequence[tuple[str, tuple[str, ...]]]) -> tuple[str, ...]:
+    """Every key named by ``members``, in declaration order.
+
+    The single derivation of a family's key roster: nothing hand-maintains a
+    second copy that a newly added spelling could be forgotten from (round 6
+    confirm pass 3, Architecture Minor).
+    """
+    return tuple(key for _name, keys in members for key in keys)
+
+
+def _family_layers(
+    values: Mapping[str, object],
+    layer_maps: Sequence[tuple[int, Mapping[str, object]]],
+    keys: Sequence[str],
+) -> dict[str, int]:
+    """Highest precedence layer that set each of ``keys``, or ``-1``.
+
+    Computed from the RAW per-layer mappings rather than from the merged
+    ``layers`` provenance dict, for two reasons: family keys use
+    :func:`_family_key_set` rather than ``_record_layer``'s stricter
+    truthiness, and the OpenAI alias family's bare key name is only known at
+    resolution time (``WEBSEARCH_OPENAI_API_KEY_ENV``), so no static
+    ``_PROVENANCE_KEYS`` roster could cover it.
+
+    A key a higher layer *erased* (``WEBSEARCH_TTS_WS_PORT=""``) reports
+    ``-1``, not the lower layer that last carried a value: family keys are
+    deliberately outside the empty-means-absent rule, so the erase is a real
+    write and the surviving merged value is empty. Reporting the overwritten
+    layer would let a key that supplies nothing still decide which member
+    wins.
+    """
+    return {
+        key: (
+            max(
+                (layer for layer, mapping in layer_maps if _family_key_set(mapping.get(key))),
+                default=-1,
+            )
+            if _family_key_set(values.get(key))
+            else -1
+        )
+        for key in keys
+    }
+
+
+def _winning_family_member(
     values: Mapping[str, object],
     layers: Mapping[str, int],
     members: Sequence[tuple[str, tuple[str, ...]]],
 ) -> str | None:
-    """Pick which member of an endpoint family (STT/TTS) supplies the endpoint.
+    """Pick which member of a family supplies the setting.
 
-    An endpoint family is several mutually-exclusive spellings of one setting
-    (``WEBSEARCH_TTS_ENDPOINT`` / ``_WS_URI`` / ``_WS_SOCKET`` / ``_WS_HOST`` +
-    ``_WS_PORT``). Resolving it by hardcoded key priority ignored the layered
-    precedence system entirely: a config.toml ``tts_ws_uri`` (layer 0) beat a
-    ``WEBSEARCH_TTS_WS_SOCKET`` exported in the process environment (layer 2),
-    so the operator's highest-precedence override was silently discarded and the
-    service connected to the TOML endpoint (round-5 restart, Logic Important).
+    A family is several mutually-exclusive spellings of one setting: the
+    STT/TTS endpoints (``WEBSEARCH_TTS_ENDPOINT`` / ``_WS_URI`` / ``_WS_SOCKET``
+    / ``_WS_HOST`` + ``_WS_PORT``) and the vendor-credential aliases
+    (``WEBSEARCH_CARTESIA_API_KEY`` / ``CARTESIA_API_KEY``). Resolving either
+    by hardcoded key priority ignored the layered precedence system entirely: a
+    config.toml ``tts_ws_uri`` (layer 0) beat a ``WEBSEARCH_TTS_WS_SOCKET``
+    exported in the process environment (layer 2), so the operator's
+    highest-precedence override was silently discarded and the service
+    connected to the TOML endpoint (round-5 restart, Logic Important; extended
+    to the alias families in round 6 confirm pass 3).
 
     The winner is the present member set at the highest precedence layer; the
     declaration order of ``members`` (the documented key priority) breaks a
@@ -1139,11 +1235,23 @@ def _winning_endpoint_member(
     present = [
         (name, max(layers.get(key, -1) for key in keys))
         for name, keys in members
-        if all(values.get(key) for key in keys)
+        if all(_family_key_set(values.get(key)) for key in keys)
     ]
     if not present:
         return None
     return max(present, key=lambda member: member[1])[0]
+
+
+def _winning_family_layer(
+    layers: Mapping[str, int],
+    members: Sequence[tuple[str, tuple[str, ...]]],
+    winner: str | None,
+) -> int:
+    """The layer ``winner`` won at, or ``-1`` when no member won."""
+    if winner is None:
+        return -1
+    keys = next(keys for name, keys in members if name == winner)
+    return max(layers.get(key, -1) for key in keys)
 
 
 def _parse_strict_bool(raw: object, *, field: str) -> bool:
@@ -1177,9 +1285,15 @@ def load_config(
             except tomllib.TOMLDecodeError as exc:
                 raise ConfigError(f"invalid TOML config: {path}") from exc
     layers: dict[str, int] = {}
+    # The raw per-layer mappings, kept alongside the merged `values` because
+    # family resolution needs to know WHICH layer set each spelling -- see
+    # _family_layers for why the merged `layers` provenance dict cannot answer
+    # that for family keys.
+    layer_maps: list[tuple[int, Mapping[str, object]]] = []
     toml_backed: dict[str, object] = {}
     _load_toml_values(toml_backed, toml_values)
     _apply_layer(values, toml_backed, layers, 0)
+    layer_maps.append((0, toml_backed))
     if env_file:
         if isinstance(env_file, (str, Path)):
             env_file_values: dict[str, object] = {}
@@ -1190,22 +1304,33 @@ def load_config(
         else:
             env_file_values = dict(env_file)
         _apply_layer(values, env_file_values, layers, 1)
+        layer_maps.append((1, env_file_values))
     env_values = os.environ if env is None else env
     _apply_layer(values, env_values, layers, 2)
+    layer_maps.append((2, env_values))
     # Overriding only a role's *model* at a higher-precedence layer than the
     # one that set its *effort* must not silently carry that inherited
     # effort along -- see _clear_inherited_reasoning_effort's docstring.
     _clear_inherited_reasoning_effort(values, layers)
     kwargs: dict[str, object] = {}
-    key_name = values.get("WEBSEARCH_OPENAI_API_KEY_ENV", "OPENAI_API_KEY")
-    if key := values.get("WEBSEARCH_OPENAI_API_KEY") or values.get(key_name):
-        kwargs["openai_api_key"] = key
-    if key := values.get("WEBSEARCH_DEEPGRAM_API_KEY") or values.get("DEEPGRAM_API_KEY"):
-        kwargs["deepgram_api_key"] = key
-    if key := values.get("WEBSEARCH_CARTESIA_API_KEY") or values.get("CARTESIA_API_KEY"):
-        kwargs["cartesia_api_key"] = key
-    if voice := values.get("WEBSEARCH_CARTESIA_VOICE_ID") or values.get("CARTESIA_VOICE_ID"):
-        kwargs["cartesia_voice_id"] = voice
+    # The vendor-credential aliases are families, not a key-priority chain:
+    # `values.get(scoped) or values.get(bare)` let a scoped spelling in
+    # config.toml/the env file silently beat a bare spelling exported in the
+    # process environment -- the same silent precedence violation the endpoint
+    # families were migrated off. Scoped-wins survives as the WITHIN-layer
+    # tie-break (declaration order), which is the documented behaviour
+    # (round 6 confirm pass 3, Architecture Important).
+    key_name = str(values.get("WEBSEARCH_OPENAI_API_KEY_ENV") or "OPENAI_API_KEY")
+    for field_name, scoped_key, bare_key in (
+        ("openai_api_key", "WEBSEARCH_OPENAI_API_KEY", key_name),
+        *_ALIAS_FAMILIES,
+    ):
+        alias_members = (("scoped", (scoped_key,)), ("bare", (bare_key,)))
+        alias_member = _winning_family_member(
+            values, _family_layers(values, layer_maps, (scoped_key, bare_key)), alias_members
+        )
+        if alias_member is not None:
+            kwargs[field_name] = values[scoped_key if alias_member == "scoped" else bare_key]
     # Membership, not truthiness, and every conversion wrapped: TOML supplies
     # real ints, so an explicit `max_citations = 0` / `multi_intent_wait_timeout_ms
     # = 0` is falsy and a truthiness walrus dropped the key outright -- the
@@ -1355,37 +1480,41 @@ def load_config(
             label: str(raw) for label in _registered_policy_labels(kwargs, "worker_model_policy")
         }
     # Endpoint families resolve by LAYER precedence first, key priority second
-    # -- see _winning_endpoint_member. Key priority alone let `[stt] stt_ws_uri`
+    # -- see _winning_family_member. Key priority alone let `[stt] stt_ws_uri`
     # in config.toml (layer 0) beat `WEBSEARCH_STT_WS_SOCKET` exported in the
     # process environment (layer 2), silently connecting to the endpoint the
     # operator's highest-precedence override had replaced. This closes the gap
     # _clear_inherited_reasoning_effort's docstring signposted.
-    stt_member = _winning_endpoint_member(
-        values,
-        layers,
-        (("endpoint", ("WEBSEARCH_STT_ENDPOINT",)), ("socket", ("WEBSEARCH_STT_WS_SOCKET",))),
-    )
+    stt_layers = _family_layers(values, layer_maps, _family_keys(_STT_ENDPOINT_MEMBERS))
+    stt_member = _winning_family_member(values, stt_layers, _STT_ENDPOINT_MEMBERS)
     if stt_member == "endpoint":
         kwargs["stt_endpoint"] = parse_endpoint(str(values["WEBSEARCH_STT_ENDPOINT"]))
     elif stt_member == "socket":
         kwargs["stt_endpoint"] = ("uds", _expand_socket(str(values["WEBSEARCH_STT_WS_SOCKET"])))
     tts_host = values.get("WEBSEARCH_TTS_WS_HOST")
     tts_port = values.get("WEBSEARCH_TTS_WS_PORT")
-    if bool(tts_host) != bool(tts_port):
+    tts_layers = _family_layers(values, layer_maps, _family_keys(_TTS_ENDPOINT_MEMBERS))
+    tts_member = _winning_family_member(values, tts_layers, _TTS_ENDPOINT_MEMBERS)
+    if _family_key_set(tts_host) != _family_key_set(tts_port):
         # Half a pair is malformed input, and every other malformed endpoint
         # input here is loud (non-integer port, out-of-range port). Falling
         # through the chain silently substituted the dataclass default endpoint.
-        raise ConfigError("WEBSEARCH_TTS_WS_HOST and WEBSEARCH_TTS_WS_PORT must be set together")
-    tts_member = _winning_endpoint_member(
-        values,
-        layers,
-        (
-            ("endpoint", ("WEBSEARCH_TTS_ENDPOINT",)),
-            ("uri", ("WEBSEARCH_TTS_WS_URI",)),
-            ("socket", ("WEBSEARCH_TTS_WS_SOCKET",)),
-            ("host_port", ("WEBSEARCH_TTS_WS_HOST", "WEBSEARCH_TTS_WS_PORT")),
-        ),
-    )
+        #
+        # Raised only when the half-pair would otherwise have WON the family --
+        # i.e. it sits at a strictly higher layer than the winning member (a
+        # same-layer stray loses to the documented key priority, exactly as a
+        # complete pair would). Firing unconditionally turned a config that
+        # booted fine into a startup failure: a leftover `[tts] tts_ws_host` in
+        # config.toml is simply not consulted once `WEBSEARCH_TTS_ENDPOINT` is
+        # exported in the environment, and never was (round 6 confirm pass 3,
+        # Logic Important).
+        half_pair_layer = max(
+            tts_layers["WEBSEARCH_TTS_WS_HOST"], tts_layers["WEBSEARCH_TTS_WS_PORT"]
+        )
+        if half_pair_layer > _winning_family_layer(tts_layers, _TTS_ENDPOINT_MEMBERS, tts_member):
+            raise ConfigError(
+                "WEBSEARCH_TTS_WS_HOST and WEBSEARCH_TTS_WS_PORT must be set together"
+            )
     if tts_member == "endpoint":
         kwargs["tts_endpoint"] = parse_endpoint(str(values["WEBSEARCH_TTS_ENDPOINT"]))
     elif tts_member == "uri":
