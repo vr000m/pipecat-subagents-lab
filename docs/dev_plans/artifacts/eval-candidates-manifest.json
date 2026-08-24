@@ -1,0 +1,916 @@
+{
+  "manifest_version": 1,
+  "source_commit": "84561490e3caad1cedde17ad122a4221da2660de",
+  "verified_at_utc": "2026-08-21T16:07:15Z",
+  "results": [
+    {
+      "kind": "model_existence",
+      "model": "gpt-5",
+      "effort": null,
+      "tools": [],
+      "request_kwargs": {
+        "model": "gpt-5"
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": null
+    },
+    {
+      "kind": "model_existence",
+      "model": "gpt-5-mini",
+      "effort": null,
+      "tools": [],
+      "request_kwargs": {
+        "model": "gpt-5-mini"
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": null
+    },
+    {
+      "kind": "model_existence",
+      "model": "gpt-5.6-luna",
+      "effort": null,
+      "tools": [],
+      "request_kwargs": {
+        "model": "gpt-5.6-luna"
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": null
+    },
+    {
+      "kind": "model_existence",
+      "model": "gpt-5.6-sol",
+      "effort": null,
+      "tools": [],
+      "request_kwargs": {
+        "model": "gpt-5.6-sol"
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": null
+    },
+    {
+      "kind": "model_existence",
+      "model": "gpt-5.6-terra",
+      "effort": null,
+      "tools": [],
+      "request_kwargs": {
+        "model": "gpt-5.6-terra"
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": null
+    },
+    {
+      "kind": "router",
+      "model": "gpt-5-mini",
+      "effort": "minimal",
+      "tools": [
+        "text"
+      ],
+      "request_kwargs": {
+        "model": "gpt-5-mini",
+        "input": "Route the user transcript using only this immutable catalogue and these rules. Do not use tools. Do not invent existing worker IDs. Classify conversational intent before selecting a worker. Greetings, thanks, acknowledgements, goodbyes, and casual conversation that does not need external data are direct: return no worker fields and put a concise response in prose. Do not create a worker for those requests. A public factual, current, or historical request is available through the public_web capability. Select an existing matching worker only when its topic matches the request; otherwise return action=new_worker, worker_id=null, worker_type=web_search, capability=public_web, capability_available=true, and model_policy=deep. For existing_worker, copy worker_id, worker_type, topic, and model_policy verbatim from the matching catalogue entry. The topic is immutable worker metadata, not the current transcript; never change an existing worker's topic to match a new request. Use unsupported only for a capability that is genuinely unavailable, such as private account data. For direct, unsupported, or clarify, worker_id, worker_type, topic, and model_policy must all be null. catalogue_version=verify-eval-candidates-1; workers=(); capabilities=('public_web',); model_policies=('deep',); transcript=Hi.",
+        "store": false,
+        "timeout": 12.0,
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "router_envelope",
+            "strict": true,
+            "schema": {
+              "$defs": {
+                "RoutingDecision": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "action": {
+                      "enum": [
+                        "direct",
+                        "unsupported",
+                        "clarify",
+                        "existing_worker",
+                        "new_worker"
+                      ],
+                      "title": "Action",
+                      "type": "string"
+                    },
+                    "worker_id": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Id"
+                    },
+                    "worker_type": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Type"
+                    },
+                    "topic": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Topic"
+                    },
+                    "capability": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Capability"
+                    },
+                    "capability_available": {
+                      "title": "Capability Available",
+                      "type": "boolean"
+                    },
+                    "model_policy": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Model Policy"
+                    },
+                    "catalogue_version": {
+                      "title": "Catalogue Version",
+                      "type": "string"
+                    },
+                    "catalogue_worker_ids": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "title": "Catalogue Worker Ids",
+                      "type": "array"
+                    },
+                    "origin_epoch": {
+                      "anyOf": [
+                        {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Origin Epoch"
+                    }
+                  },
+                  "required": [
+                    "action",
+                    "worker_id",
+                    "worker_type",
+                    "topic",
+                    "capability",
+                    "capability_available",
+                    "model_policy",
+                    "catalogue_version",
+                    "catalogue_worker_ids",
+                    "origin_epoch"
+                  ],
+                  "title": "RoutingDecision",
+                  "type": "object"
+                }
+              },
+              "additionalProperties": false,
+              "properties": {
+                "decision": {
+                  "$ref": "#/$defs/RoutingDecision"
+                },
+                "prose": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Prose"
+                }
+              },
+              "required": [
+                "decision",
+                "prose"
+              ],
+              "title": "RouterEnvelope",
+              "type": "object"
+            }
+          }
+        },
+        "reasoning": {
+          "effort": "minimal"
+        }
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "resp_05d3b8c1f62b0614016a887788319487d298e12aef75608c80"
+    },
+    {
+      "kind": "router",
+      "model": "gpt-5.6-luna",
+      "effort": "high",
+      "tools": [
+        "text"
+      ],
+      "request_kwargs": {
+        "model": "gpt-5.6-luna",
+        "input": "Route the user transcript using only this immutable catalogue and these rules. Do not use tools. Do not invent existing worker IDs. Classify conversational intent before selecting a worker. Greetings, thanks, acknowledgements, goodbyes, and casual conversation that does not need external data are direct: return no worker fields and put a concise response in prose. Do not create a worker for those requests. A public factual, current, or historical request is available through the public_web capability. Select an existing matching worker only when its topic matches the request; otherwise return action=new_worker, worker_id=null, worker_type=web_search, capability=public_web, capability_available=true, and model_policy=deep. For existing_worker, copy worker_id, worker_type, topic, and model_policy verbatim from the matching catalogue entry. The topic is immutable worker metadata, not the current transcript; never change an existing worker's topic to match a new request. Use unsupported only for a capability that is genuinely unavailable, such as private account data. For direct, unsupported, or clarify, worker_id, worker_type, topic, and model_policy must all be null. catalogue_version=verify-eval-candidates-1; workers=(); capabilities=('public_web',); model_policies=('deep',); transcript=Hi.",
+        "store": false,
+        "timeout": 12.0,
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "router_envelope",
+            "strict": true,
+            "schema": {
+              "$defs": {
+                "RoutingDecision": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "action": {
+                      "enum": [
+                        "direct",
+                        "unsupported",
+                        "clarify",
+                        "existing_worker",
+                        "new_worker"
+                      ],
+                      "title": "Action",
+                      "type": "string"
+                    },
+                    "worker_id": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Id"
+                    },
+                    "worker_type": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Type"
+                    },
+                    "topic": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Topic"
+                    },
+                    "capability": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Capability"
+                    },
+                    "capability_available": {
+                      "title": "Capability Available",
+                      "type": "boolean"
+                    },
+                    "model_policy": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Model Policy"
+                    },
+                    "catalogue_version": {
+                      "title": "Catalogue Version",
+                      "type": "string"
+                    },
+                    "catalogue_worker_ids": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "title": "Catalogue Worker Ids",
+                      "type": "array"
+                    },
+                    "origin_epoch": {
+                      "anyOf": [
+                        {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Origin Epoch"
+                    }
+                  },
+                  "required": [
+                    "action",
+                    "worker_id",
+                    "worker_type",
+                    "topic",
+                    "capability",
+                    "capability_available",
+                    "model_policy",
+                    "catalogue_version",
+                    "catalogue_worker_ids",
+                    "origin_epoch"
+                  ],
+                  "title": "RoutingDecision",
+                  "type": "object"
+                }
+              },
+              "additionalProperties": false,
+              "properties": {
+                "decision": {
+                  "$ref": "#/$defs/RoutingDecision"
+                },
+                "prose": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Prose"
+                }
+              },
+              "required": [
+                "decision",
+                "prose"
+              ],
+              "title": "RouterEnvelope",
+              "type": "object"
+            }
+          }
+        },
+        "reasoning": {
+          "effort": "high"
+        }
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "resp_06c7aedf33b36ea2016a88778aa14087d296498037952d4bbe"
+    },
+    {
+      "kind": "router",
+      "model": "gpt-5.6-luna",
+      "effort": "medium",
+      "tools": [
+        "text"
+      ],
+      "request_kwargs": {
+        "model": "gpt-5.6-luna",
+        "input": "Route the user transcript using only this immutable catalogue and these rules. Do not use tools. Do not invent existing worker IDs. Classify conversational intent before selecting a worker. Greetings, thanks, acknowledgements, goodbyes, and casual conversation that does not need external data are direct: return no worker fields and put a concise response in prose. Do not create a worker for those requests. A public factual, current, or historical request is available through the public_web capability. Select an existing matching worker only when its topic matches the request; otherwise return action=new_worker, worker_id=null, worker_type=web_search, capability=public_web, capability_available=true, and model_policy=deep. For existing_worker, copy worker_id, worker_type, topic, and model_policy verbatim from the matching catalogue entry. The topic is immutable worker metadata, not the current transcript; never change an existing worker's topic to match a new request. Use unsupported only for a capability that is genuinely unavailable, such as private account data. For direct, unsupported, or clarify, worker_id, worker_type, topic, and model_policy must all be null. catalogue_version=verify-eval-candidates-1; workers=(); capabilities=('public_web',); model_policies=('deep',); transcript=Hi.",
+        "store": false,
+        "timeout": 12.0,
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "router_envelope",
+            "strict": true,
+            "schema": {
+              "$defs": {
+                "RoutingDecision": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "action": {
+                      "enum": [
+                        "direct",
+                        "unsupported",
+                        "clarify",
+                        "existing_worker",
+                        "new_worker"
+                      ],
+                      "title": "Action",
+                      "type": "string"
+                    },
+                    "worker_id": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Id"
+                    },
+                    "worker_type": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Type"
+                    },
+                    "topic": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Topic"
+                    },
+                    "capability": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Capability"
+                    },
+                    "capability_available": {
+                      "title": "Capability Available",
+                      "type": "boolean"
+                    },
+                    "model_policy": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Model Policy"
+                    },
+                    "catalogue_version": {
+                      "title": "Catalogue Version",
+                      "type": "string"
+                    },
+                    "catalogue_worker_ids": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "title": "Catalogue Worker Ids",
+                      "type": "array"
+                    },
+                    "origin_epoch": {
+                      "anyOf": [
+                        {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Origin Epoch"
+                    }
+                  },
+                  "required": [
+                    "action",
+                    "worker_id",
+                    "worker_type",
+                    "topic",
+                    "capability",
+                    "capability_available",
+                    "model_policy",
+                    "catalogue_version",
+                    "catalogue_worker_ids",
+                    "origin_epoch"
+                  ],
+                  "title": "RoutingDecision",
+                  "type": "object"
+                }
+              },
+              "additionalProperties": false,
+              "properties": {
+                "decision": {
+                  "$ref": "#/$defs/RoutingDecision"
+                },
+                "prose": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Prose"
+                }
+              },
+              "required": [
+                "decision",
+                "prose"
+              ],
+              "title": "RouterEnvelope",
+              "type": "object"
+            }
+          }
+        },
+        "reasoning": {
+          "effort": "medium"
+        }
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "resp_01cf6e184bb2e710016a88778d7eac87d2aa496c373fa8abb8"
+    },
+    {
+      "kind": "router",
+      "model": "gpt-5.6-terra",
+      "effort": "low",
+      "tools": [
+        "text"
+      ],
+      "request_kwargs": {
+        "model": "gpt-5.6-terra",
+        "input": "Route the user transcript using only this immutable catalogue and these rules. Do not use tools. Do not invent existing worker IDs. Classify conversational intent before selecting a worker. Greetings, thanks, acknowledgements, goodbyes, and casual conversation that does not need external data are direct: return no worker fields and put a concise response in prose. Do not create a worker for those requests. A public factual, current, or historical request is available through the public_web capability. Select an existing matching worker only when its topic matches the request; otherwise return action=new_worker, worker_id=null, worker_type=web_search, capability=public_web, capability_available=true, and model_policy=deep. For existing_worker, copy worker_id, worker_type, topic, and model_policy verbatim from the matching catalogue entry. The topic is immutable worker metadata, not the current transcript; never change an existing worker's topic to match a new request. Use unsupported only for a capability that is genuinely unavailable, such as private account data. For direct, unsupported, or clarify, worker_id, worker_type, topic, and model_policy must all be null. catalogue_version=verify-eval-candidates-1; workers=(); capabilities=('public_web',); model_policies=('deep',); transcript=Hi.",
+        "store": false,
+        "timeout": 12.0,
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "router_envelope",
+            "strict": true,
+            "schema": {
+              "$defs": {
+                "RoutingDecision": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "action": {
+                      "enum": [
+                        "direct",
+                        "unsupported",
+                        "clarify",
+                        "existing_worker",
+                        "new_worker"
+                      ],
+                      "title": "Action",
+                      "type": "string"
+                    },
+                    "worker_id": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Id"
+                    },
+                    "worker_type": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Worker Type"
+                    },
+                    "topic": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Topic"
+                    },
+                    "capability": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Capability"
+                    },
+                    "capability_available": {
+                      "title": "Capability Available",
+                      "type": "boolean"
+                    },
+                    "model_policy": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Model Policy"
+                    },
+                    "catalogue_version": {
+                      "title": "Catalogue Version",
+                      "type": "string"
+                    },
+                    "catalogue_worker_ids": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "title": "Catalogue Worker Ids",
+                      "type": "array"
+                    },
+                    "origin_epoch": {
+                      "anyOf": [
+                        {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Origin Epoch"
+                    }
+                  },
+                  "required": [
+                    "action",
+                    "worker_id",
+                    "worker_type",
+                    "topic",
+                    "capability",
+                    "capability_available",
+                    "model_policy",
+                    "catalogue_version",
+                    "catalogue_worker_ids",
+                    "origin_epoch"
+                  ],
+                  "title": "RoutingDecision",
+                  "type": "object"
+                }
+              },
+              "additionalProperties": false,
+              "properties": {
+                "decision": {
+                  "$ref": "#/$defs/RoutingDecision"
+                },
+                "prose": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Prose"
+                }
+              },
+              "required": [
+                "decision",
+                "prose"
+              ],
+              "title": "RouterEnvelope",
+              "type": "object"
+            }
+          }
+        },
+        "reasoning": {
+          "effort": "low"
+        }
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "resp_07cf29708c21677f016a88778eb90487d29f4fb79fd4953b95"
+    },
+    {
+      "kind": "worker",
+      "model": "gpt-5",
+      "effort": null,
+      "tools": [
+        "web_search"
+      ],
+      "request_kwargs": {
+        "model": "gpt-5",
+        "tools": [
+          {
+            "type": "web_search"
+          }
+        ],
+        "tool_choice": "required",
+        "include": [
+          "web_search_call.action.sources"
+        ],
+        "instructions": "Use hosted web search to answer the current request. Return a complete, normal readable answer in display_text and a concise standalone version for text-to-speech in spoken_text. spoken_text must be plain speech, use at most 80 words and 600 characters, and contain no Markdown, URLs, citation markers, source lists, tables, headings, or stage directions. Preserve names, dates, quantities, qualifications, and uncertainty needed to answer the request accurately. Every claim in spoken_text must also be supported by display_text and the same web-search sources; never introduce a fact only in the spoken projection. Prefer three to six authoritative sources and avoid exhaustive source lists.",
+        "input": "What is the current weather in London?",
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "web_search_answer",
+            "strict": true,
+            "schema": {
+              "additionalProperties": false,
+              "description": "One sourced answer with separate reading and speech projections.",
+              "properties": {
+                "display_text": {
+                  "title": "Display Text",
+                  "type": "string"
+                },
+                "spoken_text": {
+                  "title": "Spoken Text",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "display_text",
+                "spoken_text"
+              ],
+              "title": "WebSearchAnswer",
+              "type": "object"
+            }
+          }
+        },
+        "store": false
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "resp_0096d7d2617b304a016a887790c34487d2b2e32d4ef8f79e75"
+    },
+    {
+      "kind": "worker",
+      "model": "gpt-5.6-terra",
+      "effort": "medium",
+      "tools": [
+        "web_search"
+      ],
+      "request_kwargs": {
+        "model": "gpt-5.6-terra",
+        "tools": [
+          {
+            "type": "web_search"
+          }
+        ],
+        "tool_choice": "required",
+        "include": [
+          "web_search_call.action.sources"
+        ],
+        "instructions": "Use hosted web search to answer the current request. Return a complete, normal readable answer in display_text and a concise standalone version for text-to-speech in spoken_text. spoken_text must be plain speech, use at most 80 words and 600 characters, and contain no Markdown, URLs, citation markers, source lists, tables, headings, or stage directions. Preserve names, dates, quantities, qualifications, and uncertainty needed to answer the request accurately. Every claim in spoken_text must also be supported by display_text and the same web-search sources; never introduce a fact only in the spoken projection. Prefer three to six authoritative sources and avoid exhaustive source lists.",
+        "input": "What is the current weather in London?",
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "web_search_answer",
+            "strict": true,
+            "schema": {
+              "additionalProperties": false,
+              "description": "One sourced answer with separate reading and speech projections.",
+              "properties": {
+                "display_text": {
+                  "title": "Display Text",
+                  "type": "string"
+                },
+                "spoken_text": {
+                  "title": "Spoken Text",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "display_text",
+                "spoken_text"
+              ],
+              "title": "WebSearchAnswer",
+              "type": "object"
+            }
+          }
+        },
+        "store": false,
+        "reasoning": {
+          "effort": "medium"
+        }
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "resp_0cc801ac808c9b45016a8877ab0e2887d28877bee6c7207509"
+    },
+    {
+      "kind": "worker",
+      "model": "gpt-5.6-sol",
+      "effort": "low",
+      "tools": [
+        "web_search"
+      ],
+      "request_kwargs": {
+        "model": "gpt-5.6-sol",
+        "tools": [
+          {
+            "type": "web_search"
+          }
+        ],
+        "tool_choice": "required",
+        "include": [
+          "web_search_call.action.sources"
+        ],
+        "instructions": "Use hosted web search to answer the current request. Return a complete, normal readable answer in display_text and a concise standalone version for text-to-speech in spoken_text. spoken_text must be plain speech, use at most 80 words and 600 characters, and contain no Markdown, URLs, citation markers, source lists, tables, headings, or stage directions. Preserve names, dates, quantities, qualifications, and uncertainty needed to answer the request accurately. Every claim in spoken_text must also be supported by display_text and the same web-search sources; never introduce a fact only in the spoken projection. Prefer three to six authoritative sources and avoid exhaustive source lists.",
+        "input": "What is the current weather in London?",
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "web_search_answer",
+            "strict": true,
+            "schema": {
+              "additionalProperties": false,
+              "description": "One sourced answer with separate reading and speech projections.",
+              "properties": {
+                "display_text": {
+                  "title": "Display Text",
+                  "type": "string"
+                },
+                "spoken_text": {
+                  "title": "Spoken Text",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "display_text",
+                "spoken_text"
+              ],
+              "title": "WebSearchAnswer",
+              "type": "object"
+            }
+          }
+        },
+        "store": false,
+        "reasoning": {
+          "effort": "low"
+        }
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "resp_07877ed471f2c4a8016a8877aeec6887d29273ade2d82dff21"
+    },
+    {
+      "kind": "judge",
+      "model": "gpt-5-mini",
+      "effort": null,
+      "tools": [],
+      "request_kwargs": {
+        "model": "gpt-5-mini",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with exactly the single word: ok"
+          }
+        ],
+        "max_completion_tokens": 32,
+        "reasoning_effort": "minimal"
+      },
+      "accepted": true,
+      "error": null,
+      "response_id": "chatcmpl-EFM3v39DMdTcgxAWlSh9J5okKzGJY"
+    }
+  ]
+}

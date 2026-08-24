@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .contracts import (
     CONTRACT_VERSION,
@@ -15,6 +15,7 @@ from .contracts import (
     SpeechProgress,
     TranscriptEntry,
     WorkerState,
+    WorkStatus,
 )
 
 RTVI_MESSAGE_KINDS = (
@@ -25,6 +26,7 @@ RTVI_MESSAGE_KINDS = (
     "routing",
     "user_transcript",
     "bot_transcript",
+    "work_status",
 )
 RTVIMessageKind = Literal[
     "runtime_snapshot",
@@ -34,6 +36,7 @@ RTVIMessageKind = Literal[
     "routing",
     "user_transcript",
     "bot_transcript",
+    "work_status",
 ]
 
 _PAYLOAD_MODELS = {
@@ -44,6 +47,7 @@ _PAYLOAD_MODELS = {
     "routing": RoutingState,
     "user_transcript": TranscriptEntry,
     "bot_transcript": TranscriptEntry,
+    "work_status": WorkStatus,
 }
 
 
@@ -55,6 +59,7 @@ class RTVIMessage(BaseModel):
     kind: RTVIMessageKind
     data: dict[str, Any]
     origin_epoch: int = Field(ge=0)
+    _payload: Any = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def validate_versioned_payload(self) -> RTVIMessage:
@@ -74,10 +79,68 @@ class RTVIMessage(BaseModel):
             if payload.snapshot_sequence != self.sequence:
                 raise ValueError("snapshot_sequence must match envelope sequence")
         self.data = payload.model_dump(mode="json")
+        self._payload = payload
         return self
+
+    def wire_payload(self, *, include_work_status: bool) -> dict[str, Any]:
+        """Serialize the envelope for the wire.
+
+        Payload-level field projection is delegated to the validated payload
+        model -- see :meth:`RuntimeSnapshot.wire_payload` -- so the decision
+        about which fields reach the wire lives on the typed model and never
+        as an ad-hoc key removal at the call site.
+
+        ``include_work_status`` deliberately has no default, mirroring the
+        model it delegates to: the choke point exists to force every caller to
+        *decide*, and a default of ``True`` would silently re-materialize
+        ``work_status: []`` for a legacy client that never negotiated the
+        capability -- a schema break, not a harmless extra key.
+        """
+        frame = self.model_dump(mode="json")
+        if isinstance(self._payload, RuntimeSnapshot):
+            frame["data"] = self._payload.wire_payload(include_work_status=include_work_status)
+        return frame
+
+
+def _empty_snapshot_data(session_id: str, origin_epoch: int) -> dict[str, Any]:
+    """Shape the publisher's no-snapshot-yet payload from ``RuntimeSnapshot`` itself.
+
+    ``model_construct``, never a validating ``RuntimeSnapshot(...)`` call:
+    ``validate_version_and_monotonicity`` reads *and writes* the class-level
+    ``_highest_by_session`` watermark on every construction, so building a
+    throwaway ``snapshot_sequence=0`` model here would (a) raise
+    ``ValidationError: snapshot_sequence must be monotonic`` for any session
+    that has already produced a higher-sequenced snapshot since the
+    publisher's ``reset_monotonicity`` call, and (b) advance a shared,
+    process-global watermark for a model that is discarded a line later --
+    ``snapshot()`` overwrites ``snapshot_sequence`` with the real allocation
+    before the payload ever reaches the wire.
+
+    The point of deriving the shape from the model rather than hand-writing a
+    dict literal is that a new ``RuntimeSnapshot`` field cannot silently go
+    missing from this fallback; ``model_construct`` still fills every field
+    default (and default factory), it just skips the validators.
+    """
+    return RuntimeSnapshot.model_construct(
+        contract_version=CONTRACT_VERSION,
+        session_id=session_id,
+        snapshot_sequence=0,
+        origin_epoch=origin_epoch,
+    ).model_dump(mode="json")
 
 
 class RTVIMessagePublisher:
+    """Serializes RTVI envelopes for one connection.
+
+    ``_watermark`` is a watermark, not an allocator. :meth:`incremental`
+    never allocates a sequence: it serializes the caller-supplied sequence
+    verbatim (``RuntimeObserver`` owns the connection-projected counter) and
+    only clamps the watermark upward to it. :meth:`set_snapshot` likewise
+    only clamps upward from authoritative session state. :meth:`snapshot` is
+    the sole allocation point, and it allocates from ``_sequence_provider``
+    when one is installed, falling back to the watermark otherwise.
+    """
+
     def __init__(
         self,
         session_id: str,
@@ -86,36 +149,30 @@ class RTVIMessagePublisher:
     ) -> None:
         self.session_id, self.active_epoch = session_id, active_epoch
         RuntimeSnapshot.reset_monotonicity(session_id)
-        self._sequence = 0
+        self._watermark = 0
         self._sequence_provider = sequence_provider
         self._ready = False
         self._snapshot: RuntimeSnapshot | None = None
 
-    def _message(
-        self, kind: RTVIMessageKind, data: dict[str, Any], origin_epoch: int
+    def incremental(
+        self, kind: RTVIMessageKind, data: dict[str, Any], *, sequence: int, origin_epoch: int
     ) -> RTVIMessage | None:
+        """Serialize an already-sequenced typed event (Phase 3 observer path).
+
+        Sequence ownership is described once in this class's docstring.
+        Returns ``None`` for a stale (non-active-epoch) origin, matching
+        every other publisher method's epoch fence.
+        """
         if origin_epoch != self.active_epoch:
             return None
-        self._sequence = (
-            self._sequence_provider() if self._sequence_provider is not None else self._sequence + 1
-        )
+        self._watermark = max(self._watermark, sequence)
         return RTVIMessage(
             session_id=self.session_id,
-            sequence=self._sequence,
+            sequence=sequence,
             kind=kind,
             data=data,
             origin_epoch=origin_epoch,
         )
-
-    def result(self, result: GroundedResult, *, origin_epoch: int) -> RTVIMessage | None:
-        if result.origin_epoch is None:
-            result = result.model_copy(update={"origin_epoch": origin_epoch})
-        return self._message("result", result.model_dump(mode="json"), origin_epoch)
-
-    def speech_progress(self, progress: SpeechProgress, *, origin_epoch: int) -> RTVIMessage | None:
-        if progress.origin_epoch is None:
-            progress = progress.model_copy(update={"origin_epoch": origin_epoch})
-        return self._message("speech_progress", progress.model_dump(mode="json"), origin_epoch)
 
     def client_ready(self, *, epoch: int) -> None:
         if epoch != self.active_epoch:
@@ -128,7 +185,7 @@ class RTVIMessagePublisher:
         self._snapshot = snapshot
         # Snapshot sequence is authoritative session state, not a publisher
         # sequence. Repeated snapshots do not invent state events.
-        self._sequence = max(self._sequence, snapshot.snapshot_sequence)
+        self._watermark = max(self._watermark, snapshot.snapshot_sequence)
 
     def snapshot(self) -> RTVIMessage | None:
         if not self._ready:
@@ -136,22 +193,13 @@ class RTVIMessagePublisher:
         data = (
             self._snapshot.model_dump(mode="json")
             if self._snapshot
-            else {
-                "contract_version": CONTRACT_VERSION,
-                "session_id": self.session_id,
-                "workers": [],
-                "results": [],
-                "speech_progress": [],
-                "routing": None,
-                "transcript": [],
-                "origin_epoch": self.active_epoch,
-            }
+            else _empty_snapshot_data(self.session_id, self.active_epoch)
         )
         sequence = (
-            self._sequence_provider() if self._sequence_provider is not None else self._sequence
+            self._sequence_provider() if self._sequence_provider is not None else self._watermark
         )
         data["snapshot_sequence"] = sequence
-        self._sequence = sequence
+        self._watermark = sequence
         return RTVIMessage(
             session_id=self.session_id,
             sequence=sequence,

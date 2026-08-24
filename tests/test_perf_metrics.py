@@ -55,6 +55,7 @@ from server.perf_metrics import (
     CONTROL_ACTIONS,
     CONTROL_OUTCOMES,
     EVENT_REGISTRY,
+    LATE_DELIVERY_DISPOSITIONS,
     METRIC_KINDS,
     SPEECH_OUTCOMES,
     WORK_ITEM_OUTCOMES,
@@ -66,6 +67,7 @@ from server.perf_metrics import (
     ConsoleMeasurementSink,
     ControlAction,
     ControlOutcome,
+    LateDeliveryDisposition,
     MetricKind,
     PerfConnectionContext,
     PerfMetricError,
@@ -95,6 +97,7 @@ _ALIAS_TO_FROZENSET = (
     (WorkOutcome, WORK_OUTCOMES),
     (CommitOutcome, COMMIT_OUTCOMES),
     (SpeechOutcome, SPEECH_OUTCOMES),
+    (LateDeliveryDisposition, LATE_DELIVERY_DISPOSITIONS),
 )
 
 # Every ``enum`` field in the closed registry, mapped to the vocabulary it is
@@ -109,6 +112,7 @@ _ENUM_FIELD_VOCABULARY = {
     ("work_item_background", "work_outcome"): WORK_OUTCOMES,
     ("work_item_background", "commit_outcome"): COMMIT_OUTCOMES,
     ("work_item_background", "speech_outcome"): SPEECH_OUTCOMES,
+    ("work_item_background", "delivery_disposition"): LATE_DELIVERY_DISPOSITIONS,
 }
 
 
@@ -781,6 +785,25 @@ class TestObserverCallbackFactories:
         assert record.fields["duration_ms"] == pytest.approx(duration_secs * 1000, abs=0.05)
         assert record.fields["duration_ms"] != pytest.approx(duration_secs, abs=0.05)
 
+    def test_turn_ended_clamps_negative_duration_secs_to_zero(self) -> None:
+        """TurnTrackingObserver can report a negative duration_secs when an
+        interruption's frame timestamp races a delayed turn-end timer
+        (frame-push timestamps come from independently-scheduled pipeline
+        tasks). The "ms" field validator rejects negative values outright, so
+        this handler must clamp rather than let build_record drop the whole
+        pipecat_turn_end record."""
+        sink = CollectingMeasurementSink()
+        ctx = PerfConnectionContext(
+            session_id="session-1", origin_epoch=1, connection_worker="browser-1"
+        )
+        _on_started, on_turn_ended = make_turn_tracking_handlers(ctx, sink)
+
+        asyncio.run(on_turn_ended(object(), 5, -1.383593833, False))
+
+        record = sink.records[0]
+        assert record.event == "pipecat_turn_end"
+        assert record.fields["duration_ms"] == 0.0
+
     def test_startup_report_total_ms_converts_from_total_duration_secs(self) -> None:
         sink = CollectingMeasurementSink()
         ctx = PerfConnectionContext(
@@ -1334,3 +1357,142 @@ def test_work_item_finalize_degrades_unrecognized_outcome_to_failed() -> None:
     assert result == "failed"
     assert len(sink.records) == 1
     assert sink.records[0].fields["outcome"] == "failed"
+
+
+# --------------------------------------------------------------------------
+# v0.1.3 evidence-schema field additions (Phase 0A)
+#
+# These fields exist so the v0.1.3 evidence fixture (see
+# tests/test_v013_perf_scenarios.py) can derive query_chars, context_chars,
+# provider/model, acknowledgement, delivery_disposition, and scenario
+# dimensions from real PERF_METRIC records rather than inventing them. This
+# is a benign, additive log-schema change: no existing field, required-ness,
+# or emission call site changes.
+# --------------------------------------------------------------------------
+
+
+def test_delivery_disposition_frozenset_matches_its_literal_alias() -> None:
+    assert LATE_DELIVERY_DISPOSITIONS == frozenset(get_args(LateDeliveryDisposition))
+
+
+def test_app_turn_foreground_accepts_scenario_and_acknowledgement() -> None:
+    line = build_record(
+        "app_turn_foreground",
+        session_id="session-1",
+        origin_epoch=1,
+        turn_id="turn-1",
+        outcome="completed",
+        total_ms=10.0,
+        child_count=1,
+        direct_count=0,
+        unsupported_count=0,
+        completed_count=1,
+        retained_count=0,
+        clarification_count=0,
+        declined_count=0,
+        failed_count=0,
+        cancelled_count=0,
+        scenario="delegated_complete",
+        acknowledgement=True,
+    ).line
+    assert 'scenario="delegated_complete"' in line
+    assert "acknowledgement=true" in line
+
+
+def test_work_item_foreground_accepts_query_context_provider_model() -> None:
+    line = build_record(
+        "work_item_foreground",
+        session_id="session-1",
+        origin_epoch=1,
+        turn_id="turn-1",
+        work_item_id="work-1",
+        outcome="completed",
+        total_ms=10.0,
+        query_chars=42,
+        context_chars=128,
+        provider="unavailable",
+        model="unavailable",
+    ).line
+    assert "query_chars=42" in line
+    assert "context_chars=128" in line
+    assert 'provider="unavailable"' in line
+    assert 'model="unavailable"' in line
+
+
+def test_work_item_background_accepts_provider_model_delivery_disposition() -> None:
+    line = build_record(
+        "work_item_background",
+        session_id="session-1",
+        origin_epoch=1,
+        turn_id="turn-1",
+        work_item_id="work-1",
+        app_worker_id="worker-1",
+        background_ms=10.0,
+        work_outcome="completed",
+        commit_outcome="committed",
+        speech_outcome="queued",
+        provider="unavailable",
+        model="unavailable",
+        delivery_disposition="display_only",
+    ).line
+    assert 'provider="unavailable"' in line
+    assert 'model="unavailable"' in line
+    assert "delivery_disposition=display_only" in line
+
+
+def test_app_turn_recorder_finalize_forwards_scenario_and_acknowledgement() -> None:
+    sink = CollectingMeasurementSink()
+    recorder = AppTurnRecorder(sink, session_id="session-1", origin_epoch=1, turn_id="turn-1")
+
+    recorder.finalize(outcome="direct", scenario="direct", acknowledgement=False)
+
+    record = sink.records[0]
+    assert record.fields["scenario"] == "direct"
+    assert record.fields["acknowledgement"] is False
+
+
+def test_work_item_recorder_finalize_forwards_query_context_provider_model() -> None:
+    sink = CollectingMeasurementSink()
+    recorder = WorkItemRecorder(
+        sink, session_id="session-1", origin_epoch=1, turn_id="turn-1", work_item_id="work-1"
+    )
+
+    recorder.finalize(
+        outcome="completed",
+        query_chars=17,
+        context_chars=53,
+        provider="unavailable",
+        model="unavailable",
+    )
+
+    record = sink.records[0]
+    assert record.fields["query_chars"] == 17
+    assert record.fields["context_chars"] == 53
+    assert record.fields["provider"] == "unavailable"
+    assert record.fields["model"] == "unavailable"
+
+
+def test_retained_recorder_finalize_forwards_provider_model_delivery_disposition() -> None:
+    sink = CollectingMeasurementSink()
+    recorder = RetainedRecorder(
+        sink,
+        session_id="session-1",
+        origin_epoch=1,
+        turn_id="turn-1",
+        work_item_id="work-1",
+        app_worker_id="worker-1",
+    )
+    recorder.claim("completed")
+    recorder.record_commit("committed")
+
+    recorder.finalize(
+        speech_outcome="queued",
+        provider="unavailable",
+        model="unavailable",
+        delivery_disposition="display_only",
+    )
+
+    record = sink.records[0]
+    assert record.fields["provider"] == "unavailable"
+    assert record.fields["model"] == "unavailable"
+    assert record.fields["delivery_disposition"] == "display_only"

@@ -1,0 +1,5 @@
+{
+  "$comment": "Single source of truth for the work-status ledger's numeric retention bounds. Loaded by both server/session_state.py (WORK_STATUS_TTL_SECONDS, _MAX_WORK_STATUS_KEYS) and web/src/state.js (WORK_STATUS_TERMINAL_TTL_MS, WORK_STATUS_MAX_KEYS). Changing either value here changes both implementations at once; the eligibility/ordering RULES (terminal-only eviction, terminal-first/oldest-first tiebreak) are not numeric and stay hand-implemented per language -- see shared/protocol.md's 'Progressive work status' retention section and the parity tests in tests/test_session_state.py and web/test/state.test.js.",
+  "ttl_seconds": 300,
+  "max_keys": 256
+}

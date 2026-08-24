@@ -39,6 +39,14 @@ class FakeRunner:
         pass
 
 
+class _FakePipecatWorker:
+    def __init__(self) -> None:
+        self.frames: list[object] = []
+
+    async def queue_frame(self, frame: object) -> None:
+        self.frames.append(frame)
+
+
 def _decision(catalogue, action: str, **overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "action": action,
@@ -148,7 +156,7 @@ def test_persistence_grounding_reconnect_and_interruption_hold_together() -> Non
             "https://weather.example/forecast"
         ]
 
-        host = SessionHost(registry=registry, runner_factory=FakeRunner)
+        host = SessionHost(registry=registry, runner_factory=FakeRunner, tts=object())
         host.state.set_worker(
             WorkerState(
                 worker_id=weather.worker_id,
@@ -165,6 +173,7 @@ def test_persistence_grounding_reconnect_and_interruption_hold_together() -> Non
                 "snapshot_sequence": 0,
             }
         )
+        first.worker = _FakePipecatWorker()
         host.state.append_result(result, origin_epoch=1)
         item = first.scheduler.enqueue(
             result_id=result.result_id,
@@ -218,3 +227,58 @@ def test_replacement_fences_old_client_and_snapshot_waits_for_client_ready() -> 
     assert publisher.snapshot() is None
     publisher.client_ready(epoch=new.epoch)
     assert publisher.snapshot() is not None
+
+
+# --- Phase 3: end-to-end capability handshake through the real FastAPI app -
+
+
+def test_new_browser_capabilities_query_param_reaches_the_live_app_boundary() -> None:
+    """A query-preserving ingress (this TestClient, standing in for an
+    ingress adapter that neither strips, duplicates, nor rewrites the query)
+    must let a new-browser POST with a well-formed `capabilities` array
+    reach past identity validation; a proxy that mangles the query is a
+    separate failing fixture, not this one."""
+    from fastapi.testclient import TestClient
+
+    from server.app import create_app
+
+    host = SessionHost(runner_factory=FakeRunner)
+    handshake = host.session_handshake()
+    with TestClient(create_app(host)) as client:
+        response = client.post(
+            "/api/rtc?session_id={}&resume_token={}&proposed_epoch={}"
+            "&snapshot_sequence=0&capabilities=%5B%22work_status_v1%22%5D".format(
+                handshake["session_id"], handshake["resume_token"], handshake["proposed_epoch"]
+            ),
+            json={"sdp": "v=0", "type": "offer"},
+            headers={"origin": "http://127.0.0.1:7860"},
+        )
+
+    # Whatever the eventual disposition of the SDP negotiation itself, a
+    # well-formed capabilities array must not be rejected as an invalid
+    # handshake (401) or a malformed query (400) at the app boundary.
+    assert response.status_code not in (400, 401)
+
+
+def test_asgi_boundary_rejects_malformed_percent_encoding_before_query_params_decode() -> None:
+    """Direct ASGI raw-query injection: a percent sign not followed by two
+    ASCII hex digits in the `capabilities` value must be rejected with the
+    existing 400 handshake error at the app-layer raw-scope check, not
+    surfaced as an unrelated 500 from the framework's own decoder."""
+    from fastapi.testclient import TestClient
+
+    from server.app import create_app
+
+    host = SessionHost(runner_factory=FakeRunner)
+    handshake = host.session_handshake()
+    with TestClient(create_app(host)) as client:
+        response = client.post(
+            "/api/rtc?session_id={}&resume_token={}&proposed_epoch={}"
+            "&snapshot_sequence=0&capabilities=%zz".format(
+                handshake["session_id"], handshake["resume_token"], handshake["proposed_epoch"]
+            ),
+            json={"sdp": "v=0", "type": "offer"},
+            headers={"origin": "http://127.0.0.1:7860"},
+        )
+
+    assert response.status_code == 400

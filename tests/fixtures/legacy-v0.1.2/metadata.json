@@ -1,0 +1,10 @@
+{
+  "description": "Pre-Phase-3 (v0.1.2-shipped) browser protocol/reducer/render bundle and runtime-snapshot schema, pinned before any Phase 3 browser or server edit for backward-compatibility fixtures.",
+  "files": {
+    "protocol.js": "57f972342bbfa89165ad80ba02bb684ed6ac01b2af304f563c59df641140cd2b",
+    "render.js": "45e31e4461e81e97b68cffa0a7c0edd6d8df9c275410bb07fa5220bc5c72785d",
+    "runtime-snapshot.json": "c98e946ae3de7d0e48c83ac7d05b621a51511f80875e02f1ee0975b4ffa19d9c",
+    "state.js": "2b1494673e7cf18c89bd342272087324429e51b49684be3b7b67655f70a1a0dd"
+  },
+  "source_commit": "86abe425610201924ec9d99345d8b73958c7802b"
+}

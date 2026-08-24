@@ -1,0 +1,6715 @@
+"""Offline, mocked tests for the eval-suite runner (plan Phase 2, dev plan
+``docs/dev_plans/20260817-feature-router-worker-model-eval-suite.md``).
+
+Design intent under test (not just surface behaviour): a single command runs
+the default sweep matrix (or the full cross product under ``--full-matrix``)
+against the live provider, refuses to run any (model, effort) combination
+Phase 0's manifest didn't confirm (or a manifest stale relative to the current
+commit), drives each turn through a real connected ``SessionHost``, and
+produces one aggregate pass/fail + latency report distinguishing semantic
+failure from infrastructure failure -- and no live call happens without the
+operator seeing the total call count, cost estimate, and (if
+``--max-calls``/``--max-cost`` would be exceeded) an explicit confirmation
+prompt.
+
+This file is OFFLINE-ONLY: no real network access, no real OpenAI client, no
+real ``SessionHost`` connection lifecycle. Everything that could reach the
+network is mocked or monkeypatched, and the dry-run tests actively assert
+that touching those mocked seams raises rather than silently succeeding, so a
+live call sneaking into ``--dry-run`` (or into the offline unit tests
+generally) fails loudly instead of passing quietly.
+
+Reconciled (round 1) against the real implementation
+(``scripts/eval_model_comparison.py``, ``scripts/eval_common.py``,
+``evals/scenarios.py``): the real API differs from the pre-implementation
+guesses this file originally shipped with (e.g. ``default_sweep_pairs()``/
+``full_matrix_pairs()`` instead of a guessed ``build_matrix()``,
+``load_manifest_status()``/``candidate_accepted()``/
+``require_manifest_ok_for_live_run()`` instead of a guessed
+``load_manifest()``/``require_manifest_coverage()``/
+``require_manifest_freshness()``, and no standalone
+``check_latency_budget()``/``check_citations()``/``feed_turn_to_judge()``/
+``classify_judge_verdict()``/``aggregate_report()`` helpers -- that logic
+lives inline in ``run_cell()``/``build_report()``). Tests below exercise the
+real names/shapes directly, driving ``run_cell()`` end-to-end with the
+``SessionHost``/``EvalJudge``/latency-metrics seams faked out where the
+behaviour under test only lives inside that function.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass, replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, ClassVar, get_args
+
+import pytest
+
+pytest.importorskip(
+    "scripts.eval_model_comparison",
+    reason="Phase 2 implementation not yet landed (offline test written against the plan's contract)",
+)
+
+import scripts.eval_model_comparison as eval_runner
+from evals import scenarios as eval_scenarios
+from evals.scenarios import Scenario, Turn
+from scripts import eval_common
+
+# ---------------------------------------------------------------------------
+# Shared fixtures / fakes
+# ---------------------------------------------------------------------------
+
+
+def _write_manifest(tmp_path: Path, *, source_commit: str, results: list[dict[str, Any]]) -> Path:
+    manifest = {
+        "manifest_version": 1,
+        "source_commit": source_commit,
+        "verified_at_utc": "2026-08-17T22:53:47Z",
+        "results": results,
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    return path
+
+
+def _accepted_router_entry(model: str, effort: str | None) -> dict[str, Any]:
+    # request_kwargs mirrors the shape _request_kwargs_shape_ok() (round 7
+    # gauntlet, Codex finding 1) requires for a router entry -- store=False,
+    # a structured-output `text` format, and a non-empty `input` -- so this
+    # fixture keeps passing the manifest's own shape gate, not just its
+    # (kind, model, effort) membership check. `model` and `reasoning` (round
+    # 8 gauntlet, Codex P1 finding 2) mirror the entry's own recorded
+    # (model, effort) -- using the EFFECTIVE effort
+    # (effective_router_reasoning_effort), matching what
+    # LazyRouterProvider.__call__ actually sends on the wire.
+    effective_effort = eval_runner.effective_router_reasoning_effort(model, effort)
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "store": False,
+        "text": {"format": {"type": "json_schema"}},
+        "input": "probe transcript",
+    }
+    if effective_effort is not None:
+        request_kwargs["reasoning"] = {"effort": effective_effort}
+    return {
+        "kind": "router",
+        "model": model,
+        "effort": effort,
+        "tools": ["text"],
+        "request_kwargs": request_kwargs,
+        "accepted": True,
+        "error": None,
+        "response_id": "resp-1",
+    }
+
+
+def _accepted_worker_entry(model: str, effort: str | None) -> dict[str, Any]:
+    # See _accepted_router_entry(): shape must also satisfy
+    # _request_kwargs_shape_ok()'s worker branch -- store=False,
+    # tool_choice="required", a `text` format, and a `web_search` tool.
+    # `model`/`reasoning` (round 8 gauntlet, Codex P1 finding 2) mirror the
+    # entry's own recorded (model, effort) directly -- unlike the router, the
+    # worker has no "unset effort defaults to minimal" resolution rule.
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "store": False,
+        "tool_choice": "required",
+        "text": {"format": {"type": "json_schema"}},
+        "tools": [{"type": "web_search"}],
+    }
+    if effort is not None:
+        request_kwargs["reasoning"] = {"effort": effort}
+    return {
+        "kind": "worker",
+        "model": model,
+        "effort": effort,
+        "tools": ["web_search"],
+        "request_kwargs": request_kwargs,
+        "accepted": True,
+        "error": None,
+        "response_id": "resp-2",
+    }
+
+
+def _accepted_judge_entry(model: str) -> dict[str, Any]:
+    # See _accepted_router_entry(): shape must also satisfy
+    # _request_kwargs_shape_ok()'s judge branch -- a non-empty `messages`
+    # list of role/content dicts, plus whatever reasoning_effort production
+    # actually sends for this model (round 3 confirming pass, Codex P2
+    # finding: the judge branch didn't used to cross-check this at all).
+    request_kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": "probe"}],
+        **eval_runner.judge_extra_kwargs(model),
+    }
+    return {
+        "kind": "judge",
+        "model": model,
+        "effort": None,
+        "tools": [],
+        "request_kwargs": request_kwargs,
+        "accepted": True,
+        "error": None,
+    }
+
+
+class _NetworkAccessError(AssertionError):
+    """Raised by a mocked seam that must never be reached in these tests."""
+
+
+class _RaisingSessionHost:
+    """Stands in for ``server.pipeline.SessionHost``: any lifecycle method
+    touching a live connection raises, so a test that accidentally drives a
+    real turn fails loudly instead of hanging or reaching the network.
+    """
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        raise _NetworkAccessError("SessionHost must not be constructed in an offline/dry-run test")
+
+
+def _raise_network_access(*_args: Any, **_kwargs: Any) -> Any:
+    raise _NetworkAccessError("no live call is permitted in this test")
+
+
+# ---------------------------------------------------------------------------
+# ``run_cell`` harness: fakes the SessionHost lifecycle, the per-turn stage
+# metrics, and the EvalJudge, so the latency-budget and judge-scoring logic
+# that lives inline inside ``run_cell`` can be exercised end-to-end without
+# any network access or real connection lifecycle.
+# ---------------------------------------------------------------------------
+
+
+class _FakeRouting:
+    def __init__(self, action: str | None, turn_id: str = "turn-1") -> None:
+        self.action = action
+        # Mirrors server/contracts.py's RoutingState, which is turn-scoped:
+        # run_cell()'s stale-routing-read guard compares this against the
+        # current turn's result.turn_id (also "turn-1" by default in
+        # _run_cell's _result_factory), so a fixture that omits it would
+        # always read as "prior turn's stale decision" and silently defeat
+        # every routing_action-driven assertion below.
+        self.turn_id = turn_id
+
+
+class _FakeState:
+    def __init__(self, routing_action: str | None = None, routing_turn_id: str = "turn-1") -> None:
+        self.session_id = "session-1"
+        self.resume_token = "resume-1"
+        # None reproduces the pre-finding-12 default (no `routing` signal at
+        # all -- getattr(host.state, "routing", None) falls back to None
+        # either way); a caller exercising the worker-presence assertion
+        # passes the routing action it wants run_cell to observe.
+        self.routing = (
+            _FakeRouting(routing_action, routing_turn_id) if routing_action is not None else None
+        )
+
+
+class _FakeRegistry:
+    workers: ClassVar[list[Any]] = []
+
+
+@dataclass
+class _FakeResult:
+    ui_text: str
+    spoken_text: str
+    citations: list[Any]
+    turn_id: str
+    # Defaults to "main" (the direct-answer path's worker_id) so every
+    # existing single-result fixture is unaffected; a multi-intent test
+    # overrides this to exercise delegated_action's worker_id fallback
+    # (round 7 gauntlet, Logic lens finding 6).
+    worker_id: str = "main"
+
+
+class _FakeHost:
+    def __init__(
+        self,
+        result_factory: Any,
+        *,
+        routing_action: str | None = None,
+        routing_turn_id: str = "turn-1",
+    ) -> None:
+        self.state = _FakeState(routing_action, routing_turn_id)
+        self.registry = _FakeRegistry()
+        self._result_factory = result_factory
+
+    async def start(self) -> None:
+        pass
+
+    async def connect(self, _handshake: dict[str, Any]) -> str:
+        return "connection-1"
+
+    async def _handle_transcript(self, query: str, *, origin: Any) -> Any:
+        del origin
+        return self._result_factory(query)
+
+    async def shutdown(self) -> None:
+        pass
+
+
+def _make_stub_judge_class(verdicts: list[Any], recorder: list[Any] | None) -> type:
+    """Builds a fresh stand-in for ``pipecat.evals.judge.EvalJudge`` bound to
+    a caller-supplied verdict queue, so ``run_cell``'s ``judge.evaluate()``
+    call never reaches a real LLM.
+    """
+
+    class _StubEvalJudge:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.user_messages: list[str] = []
+            self.assistant_messages: list[str] = []
+            self.init_kwargs = _kwargs
+            if recorder is not None:
+                recorder.append(self)
+
+        def add_user_message(self, text: str) -> None:
+            self.user_messages.append(text)
+
+        def add_assistant_message(self, text: str) -> None:
+            self.assistant_messages.append(text)
+
+        async def evaluate(self, _criterion: str) -> Any:
+            if not verdicts:
+                raise AssertionError("evaluate() called with no canned verdict queued")
+            return verdicts.pop(0)
+
+    return _StubEvalJudge
+
+
+def _run_cell(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pair: Any,
+    turns: tuple[Turn, ...],
+    ui_text: str = "a distinctly non-fallback reply",
+    spoken_text: str = "a distinctly non-fallback spoken reply",
+    citations: list[Any] | None = None,
+    routing_ms: float = 100.0,
+    total_ms: float = 100.0,
+    verdicts: list[Any] | None = None,
+    judge_recorder: list[Any] | None = None,
+    routing_action: str | None = None,
+    routing_turn_id: str = "turn-1",
+    result_factory: Any | None = None,
+) -> Any:
+    from server.config import Config
+
+    result_citations = citations if citations is not None else []
+
+    def _default_result_factory(_query: str) -> Any:
+        return _FakeResult(
+            ui_text=ui_text, spoken_text=spoken_text, citations=result_citations, turn_id="turn-1"
+        )
+
+    # result_factory lets a caller return a tuple of _FakeResult (mirroring
+    # server/pipeline.py's `_handle_multi_intent` -> `tuple(committed)` shape)
+    # instead of the default single-result stand-in, so multi-intent
+    # regressions (round 7 gauntlet, Logic lens finding 6) can be exercised
+    # without a new, parallel harness.
+    active_result_factory = (
+        result_factory if result_factory is not None else _default_result_factory
+    )
+
+    def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+        del measurement_sink
+        return _FakeHost(
+            active_result_factory, routing_action=routing_action, routing_turn_id=routing_turn_id
+        )
+
+    def _fake_stage_metrics(_sink: Any, _elapsed_ms: float, _turn_id: str) -> dict[str, float]:
+        return {"routing_ms": routing_ms, "search_ms": 0.0, "total_ms": total_ms}
+
+    monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+    monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _fake_stage_metrics)
+    monkeypatch.setattr(
+        "pipecat.evals.judge.EvalJudge", _make_stub_judge_class(verdicts or [], judge_recorder)
+    )
+    # run_cell() builds the judge's LLM service via build_judge_llm_service()
+    # (threading the resolved credential through explicitly -- see its
+    # docstring), not the library's openai_service() factory -- patch the
+    # former so no real OpenAILLMService/credential check is reached.
+    monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+
+    scenario = Scenario(name="fixture-scenario", turns=turns)
+    config = Config()
+
+    return asyncio.run(
+        eval_runner.run_cell(
+            pair,
+            scenario,
+            config,
+            judge_model="gpt-5-mini",
+            max_routing_seconds=15.0,
+            max_latency_seconds=15.0,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Matrix-building
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixBuilding:
+    """Default sweep set vs --full-matrix must produce the documented set of
+    (router_config, worker_config) pairs: baseline x baseline, each router
+    candidate x baseline worker, baseline router x each worker candidate --
+    NOT the full cross product unless --full-matrix is passed.
+    """
+
+    def test_default_sweep_is_not_the_full_cross_product(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        # baseline x baseline (1) + N router candidates x baseline worker
+        # + baseline router x M worker candidates -- no shipped x shipped
+        # cell (round-4 restart, Architecture finding 2: build_report()
+        # annotates the shipped cells instead of running a live joint
+        # cell) -- not the (N+1)*(M+1) full cross product full_matrix_pairs()
+        # would produce.
+        expected = 1 + len(eval_runner.ROUTER_CANDIDATES) + len(eval_runner.WORKER_CANDIDATES)
+        assert len(pairs) == expected
+        full_matrix_size = (1 + len(eval_runner.ROUTER_CANDIDATES)) * (
+            1 + len(eval_runner.WORKER_CANDIDATES)
+        )
+        assert len(pairs) < full_matrix_size
+
+    def test_default_sweep_contains_baseline_by_baseline(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        baseline_keys = {eval_runner._pair_cell_key(p) for p in pairs}
+        assert (
+            eval_runner._pair_cell_key(
+                eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+            )
+            in baseline_keys
+        )
+
+    def test_default_sweep_varies_router_only_against_baseline_worker(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        keys = {eval_runner._pair_cell_key(p) for p in pairs}
+        for candidate in eval_runner.ROUTER_CANDIDATES:
+            assert (
+                eval_runner._pair_cell_key(
+                    eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE)
+                )
+                in keys
+            )
+            # A router candidate must never be paired with a worker candidate
+            # in the default (non-full-matrix) sweep.
+            for worker_candidate in eval_runner.WORKER_CANDIDATES:
+                assert (
+                    eval_runner._pair_cell_key(eval_runner.RunPair(candidate, worker_candidate))
+                    not in keys
+                )
+
+    def test_default_sweep_varies_worker_only_against_baseline_router(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        keys = {eval_runner._pair_cell_key(p) for p in pairs}
+        for candidate in eval_runner.WORKER_CANDIDATES:
+            assert (
+                eval_runner._pair_cell_key(
+                    eval_runner.RunPair(eval_runner.ROUTER_BASELINE, candidate)
+                )
+                in keys
+            )
+
+    def test_full_matrix_is_the_full_cross_product(self) -> None:
+        pairs = eval_runner.full_matrix_pairs()
+        routers = (eval_runner.ROUTER_BASELINE, *eval_runner.ROUTER_CANDIDATES)
+        workers = (eval_runner.WORKER_BASELINE, *eval_runner.WORKER_CANDIDATES)
+        assert len(pairs) == len(routers) * len(workers)
+        keys = {eval_runner._pair_cell_key(p) for p in pairs}
+        for router in routers:
+            for worker in workers:
+                assert eval_runner._pair_cell_key(eval_runner.RunPair(router, worker)) in keys
+
+    def test_full_matrix_is_a_strict_superset_of_the_default_sweep(self) -> None:
+        # No shipped anchor to exclude any more (round-4 restart, Architecture
+        # finding 2) -- the default sweep's cells are exactly a subset of the
+        # full matrix's cells.
+        default_keys = {eval_runner._pair_cell_key(p) for p in eval_runner.default_sweep_pairs()}
+        full_keys = {eval_runner._pair_cell_key(p) for p in eval_runner.full_matrix_pairs()}
+        assert default_keys <= full_keys
+        assert default_keys != full_keys
+
+    def test_full_matrix_dedupes_wire_identical_cells(self, monkeypatch: Any) -> None:
+        """Round 5 restart2, Logic L4: full_matrix_pairs() must route through
+        _dedupe_pairs() exactly like default_sweep_pairs() does, so a
+        wire-identical candidate cannot silently double-run and double-bill.
+
+        SUPERSEDES round 5's Case 1 expectation (round 6 gauntlet, Logic G /
+        Architecture A3). Round 5 deliberately derived
+        `_is_historical_baseline_pair` from OBJECT identity while
+        `_pair_cell_key`/`_dedupe_pairs` key on WIRE identity, and asserted
+        that the resulting disagreement -- a wire-identical clone of the
+        baseline lands in the same `_pair_cell_key` bucket as the real
+        baseline cell but gets `enforce_latency_budget=False` since it
+        `is not ROUTER_BASELINE` -- "must raise": Case 1 previously asserted
+        `pytest.raises(ValueError, match="disagrees on enforce_latency_budget")`
+        for exactly this clone, on the rationale that a wire-identical cell
+        disagreeing on enforcement is a real configuration bug.
+
+        Round 6 found the disagreement is not a configuration bug but a
+        self-inflicted skew: two different functions computing "is this the
+        same cell?" two different ways. `_is_historical_baseline_pair` now
+        keys on wire identity too (via the shared `candidate_wire_key`
+        helper), so the clone's `enforce_latency_budget` agrees with the real
+        baseline's, and the two cells dedupe CLEANLY into one enforced cell
+        instead of raising beside it. `_dedupe_pairs`'s ValueError guard
+        itself is untouched and stays reachable via any future second
+        `enforce=True` caller -- this only removes the one way the guard could
+        fire on a skew the codebase created for itself.
+        """
+        # Case 1: a router candidate wire-identical to ROUTER_BASELINE now
+        # dedupes into the single enforced baseline cell instead of raising --
+        # `_is_historical_baseline_pair` recognizes the clone as the
+        # historical baseline by wire identity, so both the real baseline
+        # pair and the clone pair agree on enforce_latency_budget=True, and
+        # `_dedupe_pairs` collapses them into one.
+        baseline_clone = eval_runner.Candidate(
+            label="baseline-clone",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        monkeypatch.setattr(
+            eval_runner, "ROUTER_CANDIDATES", (baseline_clone, *eval_runner.ROUTER_CANDIDATES)
+        )
+        pairs = eval_runner.full_matrix_pairs()
+        baseline_key = eval_runner._pair_cell_key(
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        )
+        matching = [p for p in pairs if eval_runner._pair_cell_key(p) == baseline_key]
+        assert len(matching) == 1
+        assert matching[0].enforce_latency_budget is True
+        monkeypatch.undo()
+
+        # Case 2: two non-baseline candidates wire-identical to EACH OTHER --
+        # neither is the baseline, so enforcement agrees (both False) and the
+        # collision dedupes without raising.
+        twin_a = eval_runner.Candidate(label="twin-a", role="router", model="gpt-5", effort="low")
+        twin_b = eval_runner.Candidate(label="twin-b", role="router", model="gpt-5", effort="low")
+        monkeypatch.setattr(
+            eval_runner, "ROUTER_CANDIDATES", (twin_a, twin_b, *eval_runner.ROUTER_CANDIDATES)
+        )
+        pairs = eval_runner.full_matrix_pairs()
+        keys = [eval_runner._pair_cell_key(p) for p in pairs]
+        assert len(keys) == len(set(keys))
+
+    def test_default_sweep_dedupes_a_wire_identical_baseline_clone(self, monkeypatch: Any) -> None:
+        """Round 6 gauntlet, Architecture A3 follow-up (verifier blocking
+        finding #1): the same wire-identical-baseline-clone dedupe that
+        `test_full_matrix_dedupes_wire_identical_cells` Case 1 pins for
+        `full_matrix_pairs()` must also hold on the DEFAULT CLI path,
+        `default_sweep_pairs()`. The round-6 implementer's first pass fixed
+        `full_matrix_pairs()` (and `_is_historical_baseline_pair` itself) but
+        left `default_sweep_pairs()`'s two candidate-pair list comprehensions
+        silently defaulting `enforce_latency_budget=False`, so a clone still
+        collided with the real baseline pair's `enforce_latency_budget=True`
+        and `_dedupe_pairs` still raised `ValueError` on the one path an
+        operator actually runs by default.
+        """
+        baseline_clone = eval_runner.Candidate(
+            label="baseline-clone",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        monkeypatch.setattr(
+            eval_runner, "ROUTER_CANDIDATES", (baseline_clone, *eval_runner.ROUTER_CANDIDATES)
+        )
+        pairs = eval_runner.default_sweep_pairs()
+        baseline_key = eval_runner._pair_cell_key(
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        )
+        matching = [p for p in pairs if eval_runner._pair_cell_key(p) == baseline_key]
+        assert len(matching) == 1
+        assert matching[0].enforce_latency_budget is True
+
+    def test_is_historical_baseline_pair_keys_on_wire_identity_not_object_identity(
+        self,
+    ) -> None:
+        """Round 6 gauntlet, Architecture A3: pins the predicate-level
+        semantics directly -- a candidate that is wire-identical to
+        ROUTER_BASELINE/WORKER_BASELINE (same model, same effective effort)
+        but is a DIFFERENT object must still be recognized as the historical
+        baseline pair.
+        """
+        router_clone = eval_runner.Candidate(
+            label="router-clone",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        worker_clone = eval_runner.Candidate(
+            label="worker-clone",
+            role="worker",
+            model=eval_runner.WORKER_BASELINE.model,
+            effort=eval_runner.WORKER_BASELINE.effort,
+        )
+        assert router_clone is not eval_runner.ROUTER_BASELINE
+        assert worker_clone is not eval_runner.WORKER_BASELINE
+        assert eval_runner._is_historical_baseline_pair(router_clone, worker_clone) is True
+
+
+class TestEveryPairEnforcesExactlyWhatIsHistoricalBaselinePairSays:
+    """Round 11 gauntlet, Architecture finding 6 -- optional invariant guard
+    the softened `_is_historical_baseline_pair` docstring actually promises:
+    `RunPair.enforce_latency_budget` still defaults to `False` (not removed),
+    but every pair this module actually constructs must agree with
+    `_is_historical_baseline_pair` on the value, not merely with the
+    default.
+    """
+
+    def test_default_sweep_and_full_matrix_pairs_all_agree(self) -> None:
+        for pair in (*eval_runner.default_sweep_pairs(), *eval_runner.full_matrix_pairs()):
+            assert pair.enforce_latency_budget == eval_runner._is_historical_baseline_pair(
+                pair.router, pair.worker
+            )
+
+
+class TestLatencyEnforcementIsExplicitNotLabelDerived:
+    """Regression for round-4 restart, Architecture finding 1 / Logic finding
+    2: RunPair.enforce_latency_budget is an explicit field, not derived from
+    Candidate.label (the old `is_baseline` property compared
+    router.label == "baseline" and worker.label == "baseline"). Only the
+    historical baseline x baseline cell is enforced, regardless of what
+    config.toml happens to ship.
+    """
+
+    def test_only_the_historical_baseline_cell_is_enforced(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        enforced = [p for p in pairs if p.enforce_latency_budget]
+        assert len(enforced) == 1
+        assert enforced[0].router is eval_runner.ROUTER_BASELINE
+        assert enforced[0].worker is eval_runner.WORKER_BASELINE
+
+    def test_enforcement_does_not_depend_on_config_toml_coincidence(self, monkeypatch: Any) -> None:
+        # The bug reproduction: pre-fix, enforcement was derived from
+        # Candidate.label == "baseline", so a shipped-config coincidence with
+        # the historical baseline silently changed which cells got enforced.
+        # build_report()'s shipped-cell annotation (F2) reads shipped_candidates()
+        # independently of default_sweep_pairs()'s enforcement, so monkeypatching
+        # it here exercises the same "coincidence must not matter" property
+        # the old is_baseline property broke.
+        coincident = (
+            replace(eval_runner.ROUTER_BASELINE, label="shipped"),
+            replace(eval_runner.WORKER_BASELINE, label="shipped"),
+        )
+        divergent = (
+            replace(eval_runner.ROUTER_CANDIDATES[0], label="shipped"),
+            replace(eval_runner.WORKER_CANDIDATES[0], label="shipped"),
+        )
+
+        def _enforced_keys() -> set[tuple[str, str | None, str, str | None]]:
+            return {
+                eval_runner._pair_cell_key(p)
+                for p in eval_runner.default_sweep_pairs()
+                if p.enforce_latency_budget
+            }
+
+        monkeypatch.setattr(eval_runner, "shipped_candidates", lambda: coincident)
+        coincident_enforced = _enforced_keys()
+        monkeypatch.setattr(eval_runner, "shipped_candidates", lambda: divergent)
+        divergent_enforced = _enforced_keys()
+
+        assert coincident_enforced == divergent_enforced
+
+    def test_selected_baseline_pair_is_enforced(self) -> None:
+        from argparse import Namespace
+
+        baseline_args = Namespace(router="baseline", worker="baseline")
+        (pair,) = eval_runner._resolve_pairs(baseline_args)
+        assert pair.enforce_latency_budget is True
+
+        candidate_args = Namespace(router=eval_runner.ROUTER_CANDIDATES[0].label, worker="baseline")
+        (pair,) = eval_runner._resolve_pairs(candidate_args)
+        assert pair.enforce_latency_budget is False
+
+
+class TestPairCellKeyUsesEffectiveEffort:
+    """Regression for round-4 restart, Logic finding 1: _pair_cell_key() must
+    key on effective_effort_for_manifest_lookup(), not the raw declared
+    effort -- ("gpt-5-mini", None) and ("gpt-5-mini", "minimal") are ONE wire
+    request under two spellings.
+    """
+
+    def test_unset_and_explicit_minimal_dedupe_to_one_cell(self) -> None:
+        router_a = eval_runner.Candidate(label="a", role="router", model="gpt-5-mini", effort=None)
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 1
+
+    def test_genuinely_different_efforts_stay_distinct(self) -> None:
+        router_a = eval_runner.Candidate(
+            label="a", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="high"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 2
+
+    def test_non_gpt5_model_unset_vs_minimal_effort_stays_distinct(self) -> None:
+        # Pins that the fix delegates to the shared resolver rather than
+        # hardcoding "unset defaults to minimal" for every model.
+        router_a = eval_runner.Candidate(
+            label="a", role="router", model="not-a-gpt-5-model", effort=None
+        )
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="not-a-gpt-5-model", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 2
+
+
+class TestDedupePairsGuardsEnforcementConsistency:
+    """Regression for round-4 restart verification follow-up: two RunPairs
+    that collide on wire identity but disagree on enforce_latency_budget
+    must be caught loudly, not silently first-wins resolved. Unreachable
+    today by construction (only one caller ever sets True), but a future
+    construction site could reintroduce F1's original bug in a new shape."""
+
+    def test_agreeing_enforcement_dedupes_silently(self) -> None:
+        router_a = eval_runner.Candidate(label="a", role="router", model="gpt-5-mini", effort=None)
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [
+            eval_runner.RunPair(router_a, worker, enforce_latency_budget=True),
+            eval_runner.RunPair(router_b, worker, enforce_latency_budget=True),
+        ]
+
+        assert len(eval_runner._dedupe_pairs(pairs)) == 1
+
+    def test_disagreeing_enforcement_raises(self) -> None:
+        router_a = eval_runner.Candidate(label="a", role="router", model="gpt-5-mini", effort=None)
+        router_b = eval_runner.Candidate(
+            label="b", role="router", model="gpt-5-mini", effort="minimal"
+        )
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [
+            eval_runner.RunPair(router_a, worker, enforce_latency_budget=True),
+            eval_runner.RunPair(router_b, worker, enforce_latency_budget=False),
+        ]
+
+        with pytest.raises(ValueError, match="disagrees on enforce_latency_budget"):
+            eval_runner._dedupe_pairs(pairs)
+
+
+class TestSpendEstimateIsWorstCase:
+    """Regression: scenario_call_counts() (the spend-confirmation gate's
+    estimate function) must count every turn as a potential worker call, not
+    just turns marked expect_delegated=True. ROUTING_REGRESSION's first turn
+    is expect_delegated=False (a greeting), but if the router actually
+    misroutes it -- a routing regression, the exact failure mode this
+    scenario exists to catch -- the run makes a billed worker call anyway.
+    An estimate that only counted expect_delegated=True turns would
+    under-count and could silently let a run exceed --max-calls/--max-cost
+    without triggering the confirmation prompt.
+    """
+
+    def test_worker_estimate_counts_every_turn_not_just_expect_delegated(self) -> None:
+        scenario = eval_scenarios.ROUTING_REGRESSION
+        assert scenario.turns[0].expect_delegated is False
+        router_calls, worker_calls, _judge_calls = eval_runner.scenario_call_counts(scenario)
+        assert router_calls == len(scenario.turns)
+        # Worst case: every turn, including the non-expect_delegated one,
+        # counts as a potential worker call.
+        assert worker_calls == len(scenario.turns)
+
+    def test_worker_estimate_exceeds_the_expect_delegated_only_count(self) -> None:
+        scenario = eval_scenarios.ROUTING_REGRESSION
+        expect_delegated_only = sum(1 for turn in scenario.turns if turn.expect_delegated)
+        _router_calls, worker_calls, _judge_calls = eval_runner.scenario_call_counts(scenario)
+        assert worker_calls > expect_delegated_only
+
+
+class TestMatrixAccountingIncludesProviderRetryWorstCase:
+    """Regression for round-5 gauntlet finding 11: the OpenAI SDK clients
+    this runner drives leave the SDK's client-level max_retries=2 default in
+    place, so a transient 429/5xx/timeout can issue up to 3 real requests
+    for what this runner counts as 1 nominal call. matrix_call_accounting()
+    (not scenario_call_counts(), which stays a pure per-scenario nominal
+    count) must inflate the --max-calls/--max-cost estimate by the SDK's
+    retry worst case, or the confirmation gate can authorize a run that ends
+    up costing more than approved.
+    """
+
+    def test_accounting_multiplies_nominal_counts_by_the_retry_worst_case(self) -> None:
+        pairs = (eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),)
+        scenarios = (eval_scenarios.SINGLE_TURN_DEFAULT,)
+        nominal_router, nominal_worker, nominal_judge = eval_runner.scenario_call_counts(
+            scenarios[0]
+        )
+
+        accounting = eval_runner.matrix_call_accounting(pairs, scenarios)
+
+        assert accounting.router_calls == nominal_router * eval_runner._RETRY_WORST_CASE_MULTIPLIER
+        assert accounting.worker_calls == nominal_worker * eval_runner._RETRY_WORST_CASE_MULTIPLIER
+        assert accounting.judge_calls == nominal_judge * eval_runner._RETRY_WORST_CASE_MULTIPLIER
+
+    def test_retry_worst_case_multiplier_reflects_the_sdk_default(self) -> None:
+        assert (
+            eval_runner._RETRY_WORST_CASE_MULTIPLIER
+            == 1 + eval_runner._OPENAI_SDK_DEFAULT_MAX_RETRIES
+        )
+        assert eval_runner._RETRY_WORST_CASE_MULTIPLIER > 1
+
+
+class TestWaitForBudgetExceedsTheHostsOwnWorstCaseTimeout:
+    """Regression for round 8 gauntlet, Logic lens finding 3: run_cell()'s
+    per-turn ``asyncio.wait_for`` budget previously matched
+    ``config.provider_timeout_seconds + 5`` exactly (110s at defaults, the
+    same as the host's own worst-case internal timeout), so a boundary race
+    could abort the whole cell via this wait_for's ``TimeoutError`` instead
+    of letting the host's own graceful per-turn timeout fire first. The
+    budget is now derived from ``router_timeout_seconds +
+    foreground_search_timeout_seconds + margin``, which must always exceed
+    ``provider_timeout_seconds``.
+    """
+
+    def test_wait_for_timeout_strictly_exceeds_provider_timeout_seconds_at_cli_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, float] = {}
+        real_wait_for = asyncio.wait_for
+
+        async def _capturing_wait_for(coro: Any, *, timeout: float) -> Any:
+            captured["timeout"] = timeout
+            return await real_wait_for(coro, timeout=timeout)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner.asyncio, "wait_for", _capturing_wait_for)
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner,
+            "latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+                max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+            )
+        )
+
+        config = eval_runner._per_run_config(
+            eval_runner.Config(),
+            pair,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert "timeout" in captured
+        assert captured["timeout"] > config.provider_timeout_seconds
+
+
+# ---------------------------------------------------------------------------
+# Budget-checking
+# ---------------------------------------------------------------------------
+
+
+class TestLatencyBudgetChecking:
+    """Baseline latency budget is blocking (``latency_budget_enforced``);
+    candidate latency budget is report-only (not enforced). There is no
+    standalone ``check_latency_budget()`` helper in the real implementation
+    -- this logic lives inline in ``run_cell()`` -- so these tests drive
+    ``run_cell()`` end-to-end with the ``SessionHost``/judge/stage-metrics
+    seams faked out.
+    """
+
+    def test_baseline_over_budget_is_enforced_and_flagged_exceeded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(
+            eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE, enforce_latency_budget=True
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="hi"),),
+            routing_ms=20_000.0,
+            total_ms=20_000.0,
+        )
+        assert outcome.status == "ok"
+        turn = outcome.turns[0]
+        assert turn.latency_budget_enforced is True
+        assert turn.latency_budget_exceeded is True
+
+    def test_baseline_within_budget_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pair = eval_runner.RunPair(
+            eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE, enforce_latency_budget=True
+        )
+        outcome = _run_cell(
+            monkeypatch, pair=pair, turns=(Turn(query="hi"),), routing_ms=100.0, total_ms=100.0
+        )
+        turn = outcome.turns[0]
+        assert turn.latency_budget_enforced is True
+        assert turn.latency_budget_exceeded is False
+
+    def test_candidate_over_budget_is_report_only_not_blocking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="hi"),),
+            routing_ms=20_000.0,
+            total_ms=20_000.0,
+        )
+        turn = outcome.turns[0]
+        # A slow candidate is annotated as over-budget for reporting, but
+        # latency_budget_enforced must be False -- higher reasoning effort
+        # structurally increases latency, so this budget is not a fair
+        # pass/fail gate for non-baseline configs.
+        assert turn.latency_budget_exceeded is True
+        assert turn.latency_budget_enforced is False
+
+    def test_candidate_within_budget_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch, pair=pair, turns=(Turn(query="hi"),), routing_ms=100.0, total_ms=100.0
+        )
+        turn = outcome.turns[0]
+        assert turn.latency_budget_exceeded is False
+        assert turn.latency_budget_enforced is False
+
+
+# ---------------------------------------------------------------------------
+# Report-aggregation logic
+# ---------------------------------------------------------------------------
+
+
+class TestReportAggregation:
+    """``build_report()`` -- the real report-shaping function -- keeps
+    ``TurnOutcome.status`` (ok/provider-error/timeout/setup-error) and
+    ``judge_verdict`` (yes/no/judge-error/None) as separate fields per turn,
+    so a downstream reader can never conflate "the model gave a bad answer"
+    with "the run broke", and the report is labeled with the n=1-per-cell
+    repetition count. There is no standalone ``aggregate_report()`` helper or
+    pre-computed ``outcome_counts`` dict in the real implementation -- the
+    report is the full per-turn breakdown; the plan's checklist (line 169)
+    calls for exactly that, not summary counts.
+    """
+
+    def _turn(self, **overrides: Any) -> Any:
+        base: dict[str, Any] = {"query": "q", "status": "ok", "judge_verdict": None}
+        base.update(overrides)
+        return eval_runner.TurnOutcome(**base)
+
+    def test_semantic_and_infra_outcomes_are_distinct_fields_not_folded(self) -> None:
+        cell = eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="s",
+            status="ok",
+            turns=[
+                self._turn(status="ok", judge_verdict="yes"),
+                self._turn(status="ok", judge_verdict="no"),
+                self._turn(status="ok", judge_verdict="judge-error"),
+                self._turn(status="provider-error"),
+                self._turn(status="timeout"),
+                self._turn(status="setup-error"),
+            ],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini")
+        turns = report["cells"][0]["turns"]
+        assert [t["status"] for t in turns] == [
+            "ok",
+            "ok",
+            "ok",
+            "provider-error",
+            "timeout",
+            "setup-error",
+        ]
+        assert [t["judge_verdict"] for t in turns] == ["yes", "no", "judge-error", None, None, None]
+
+    def test_infrastructure_failures_carry_no_semantic_judge_verdict(self) -> None:
+        cell = eval_runner.CellOutcome(
+            pair_label="p",
+            scenario_name="s",
+            status="setup-error",
+            turns=[
+                self._turn(status="provider-error"),
+                self._turn(status="timeout"),
+                self._turn(status="setup-error"),
+            ],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini")
+        # None of the infrastructure/error statuses should carry a semantic
+        # judge_verdict -- a provider/timeout/setup problem is not evidence
+        # the model gave a bad answer.
+        for turn in report["cells"][0]["turns"]:
+            assert turn["judge_verdict"] is None
+
+    def test_report_labels_n_equals_one_repetition_per_cell(self) -> None:
+        report = eval_runner.build_report([], judge_model="gpt-5-mini")
+        # The plan requires the report to be "explicitly labeled with the
+        # per-cell repetition count -- n=1 per cell in v1".
+        assert report["repetition_count_per_cell"] == 1
+        assert "repetition_note" in report
+
+    def test_call_accounting_is_persisted_into_the_report(self) -> None:
+        # Regression for round 9 gauntlet, Codex P2 finding 3: the
+        # spend-confirmation estimate was only printed to the console,
+        # unavailable to a caller auditing the persisted report file.
+        accounting = eval_runner.CallAccounting(router_calls=3, worker_calls=2, judge_calls=1)
+        report = eval_runner.build_report([], judge_model="gpt-5-mini", call_accounting=accounting)
+        assert report["call_accounting"] == {
+            "router_calls": 3,
+            "worker_calls": 2,
+            "judge_calls": 1,
+            "total_calls": 6,
+            "estimated_cost_usd": accounting.estimated_cost_usd,
+        }
+
+    def test_call_accounting_defaults_to_none_when_omitted(self) -> None:
+        report = eval_runner.build_report([], judge_model="gpt-5-mini")
+        assert report["call_accounting"] is None
+
+    def test_shipped_config_cells_key_is_absent_when_no_shipped_pair_is_supplied(self) -> None:
+        """Round 5 restart2, Architecture A1: `shipped_config_cells` follows
+        the same optional-key rule `_serialize_cell` already applies to
+        `repeats` -- a key that never existed in the pre-`shipped` report
+        shape must only be added when it carries a real value, not emitted
+        unconditionally as `None`."""
+        report = eval_runner.build_report([], judge_model="gpt-5-mini")
+        assert "shipped_config_cells" not in report
+
+    def test_shipped_config_cells_key_is_present_when_a_shipped_pair_is_supplied(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+        report = eval_runner.build_report(
+            outcomes,
+            judge_model="gpt-5-mini",
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE), pairs=pairs
+            ),
+        )
+        assert "shipped_config_cells" in report
+        assert report["shipped_config_cells"] is not None
+
+    # test_build_report_rejects_shipped_without_pairs deleted (round 7 F3):
+    # `shipped`/`pairs` were two correlated-optional keyword arguments with a
+    # runtime ValueError guarding "shipped without pairs". They are now one
+    # ShippedCellsInput(shipped, pairs) value object, which makes that illegal
+    # state unrepresentable -- there is no longer a runtime check to pin.
+
+    def test_annotation_helper_itself_still_raises_on_an_outcome_whose_pair_is_not_in_pairs(
+        self,
+    ) -> None:
+        """Round 5 restart2, Architecture A2: the direct regression for the
+        silent-drop path _parse_pair_label's `.get()`-based lookup used to
+        take -- an outcome whose pair_label has no matching RunPair in
+        `pairs` is a caller bug. `_shipped_config_cells_annotation` itself
+        still raises loudly rather than silently dropping the outcome (round
+        6 gauntlet, Logic G3 moved WHERE this is handled -- see
+        `test_build_report_degrades_instead_of_discarding_a_paid_run_on_annotation_failure`
+        below for build_report()'s non-destructive wrapping of this same
+        raise -- but did not remove the raise itself)."""
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(
+                pair_label="router=nonexistent/worker=nonexistent", scenario_name="s", status="ok"
+            )
+        ]
+        with pytest.raises(ValueError, match="nonexistent"):
+            eval_runner._shipped_config_cells_annotation(
+                outcomes,
+                (eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+                pairs,
+            )
+
+    def test_build_report_degrades_instead_of_discarding_a_paid_run_on_annotation_failure(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Round 6 gauntlet, Logic G3: round 5's L5 fix moved
+        shipped_candidates() ahead of the paid run precisely because a
+        post-run raise on this path would discard an already-billed
+        `outcomes` list -- but build_report()'s own call into
+        _shipped_config_cells_annotation was a second, later raise on the
+        same path that L5 didn't cover. An outcome whose pair_label has no
+        matching RunPair (a caller bug) must now degrade the report instead
+        of throwing it away: no exception, an `error` key naming the missing
+        label, `overall_status` flipped to the failing value, and every
+        already-billed outcome still present in `report["cells"]`.
+
+        Round 7 F1: this degrade shape (`{"error": ...}`) is one of the two
+        `shipped_config_cells` shapes -- print_report_summary() previously
+        indexed it unconditionally with `shipped_cells['router'][...]` and
+        raised KeyError on exactly this report, discarding the console
+        record of an already-billed run. Also exercises that path here: it
+        must not raise, and must name the missing label on the console.
+        """
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pairs[0].label, scenario_name="s", status="ok"),
+            eval_runner.CellOutcome(
+                pair_label="router=nonexistent/worker=nonexistent", scenario_name="s", status="ok"
+            ),
+        ]
+
+        report = eval_runner.build_report(
+            outcomes,
+            judge_model="gpt-5-mini",
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE), pairs=pairs
+            ),
+        )
+
+        assert "nonexistent" in report["shipped_config_cells"]["error"]
+        assert report["overall_status"] == "FAIL"
+        assert len(report["cells"]) == len(outcomes)
+        assert {c["pair"] for c in report["cells"]} == {o.pair_label for o in outcomes}
+        # Round 7 F1/F2: build_report's single verdict rule -- overall_status
+        # is derived from the FULL reason list, which must contain both
+        # compute_pass_fail's own reasons and the annotation-failure reason,
+        # not one silently overwriting the other.
+        assert any("shipped-cell annotation failed" in r for r in report["failure_reasons"])
+
+        eval_runner.print_report_summary(report)  # must not raise (F1 repro)
+        captured = capsys.readouterr()
+        assert "nonexistent" in captured.err
+
+
+class TestShippedConfigCellsAnnotationMarksUnmatchedRoles:
+    """Round 6 gauntlet, Architecture A4: `_registered_label`
+    (eval_common.py) returns the sentinel "shipped" when config.toml ships a
+    (model, effort) no registered eval candidate covers -- deliberately
+    absent from `*_SELECTABLE_BY_LABEL`. In that state
+    `_shipped_config_cells_annotation` previously produced `cells: []` for
+    the affected role with no error and no marker, while
+    `default_sweep_pairs()`'s docstring and the README both tell the operator
+    to run `--router <shipped-label> --worker <shipped-label>` explicitly --
+    unexecutable, since no such selector key exists. `unmatched_roles` makes
+    the degraded state visible in the persisted artifact.
+    """
+
+    def test_a_role_whose_shipped_config_matches_no_pair_is_marked_unmatched(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+        no_match_router = eval_runner.Candidate(
+            label="shipped", role="router", model="no-registered-candidate-covers-this", effort=None
+        )
+
+        annotation = eval_runner._shipped_config_cells_annotation(
+            outcomes, (no_match_router, eval_runner.WORKER_BASELINE), pairs
+        )
+
+        assert annotation["unmatched_roles"] == ["router"]
+        assert annotation["router"]["cells"] == []
+        assert "no registered eval candidate covers" in annotation["note"]
+
+    def test_the_normal_all_matched_case_has_no_unmatched_roles_key(self) -> None:
+        """Pins the optional-key convention: the key must be ABSENT (not
+        present-and-empty) when every role's shipped config matches a pair,
+        so a strict-key-set consumer of an older report is unaffected."""
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+
+        annotation = eval_runner._shipped_config_cells_annotation(
+            outcomes, (eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE), pairs
+        )
+
+        assert "unmatched_roles" not in annotation
+
+    def test_print_report_summary_mirrors_unmatched_roles_to_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Round 7 F1/F2: the console mirror of `unmatched_roles` moved out
+        of `build_report` (a pure serializer, no console side effects) and
+        into `print_report_summary` (the console-facing half of this
+        module). Pins both halves of the relocation: `build_report` alone
+        emits nothing on stderr, and `print_report_summary` prints the
+        `WARNING` line for a report whose annotation carries
+        `unmatched_roles`."""
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+        no_match_router = eval_runner.Candidate(
+            label="shipped", role="router", model="no-registered-candidate-covers-this", effort=None
+        )
+
+        report = eval_runner.build_report(
+            outcomes,
+            judge_model="gpt-5-mini",
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(no_match_router, eval_runner.WORKER_BASELINE), pairs=pairs
+            ),
+        )
+        assert capsys.readouterr().err == ""
+
+        eval_runner.print_report_summary(report)
+        assert "WARNING" in capsys.readouterr().err
+
+    def test_a_targeted_single_pair_run_does_not_mark_a_registered_role_unmatched(self) -> None:
+        """Round 9, Codex F1: `--router`/`--worker` returns ONE RunPair, so a
+        shipped role that IS registered can legitimately have no cell in
+        this run. Empty `cells` must not be reported as `unmatched_roles` (a
+        registry gap) -- that would conflate "not part of this targeted
+        run" with "not in the registry at all"."""
+        pair = eval_runner.RunPair(
+            router=eval_runner.ROUTER_SELECTABLE_BY_LABEL["terra-low"],
+            worker=eval_runner.WORKER_SELECTABLE_BY_LABEL["baseline"],
+        )
+        outcomes = [eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")]
+        shipped = eval_common.shipped_candidates()
+
+        annotation = eval_runner._shipped_config_cells_annotation(outcomes, shipped, (pair,))
+
+        assert "unmatched_roles" not in annotation
+        assert annotation["router"]["cells"] == []
+        assert annotation["worker"]["cells"] == []
+        assert "no registered eval candidate covers" not in annotation["note"]
+
+
+class TestCandidateWireKeySharedAcrossModules:
+    """Round 11 gauntlet, Architecture finding 5: `candidate_wire_key`
+    (moved to `scripts/eval_common.py`, round 11) is the single source for
+    "same candidate" at the wire level, now shared by
+    `_pair_cell_key`/`_is_historical_baseline_pair`
+    (`scripts/eval_model_comparison.py`) AND
+    `is_registered_candidate`/`_registered_label`/
+    `_shipped_config_cells_annotation` -- previously each hand-spelled the
+    same `(model, effective_effort_for_manifest_lookup(...))` tuple
+    independently, a drift surface the round-6 A3 collision already showed
+    is real once two call sites disagree.
+    """
+
+    def test_a_wire_identical_clone_with_a_different_label_annotates_under_the_shipped_role(
+        self,
+    ) -> None:
+        # A hand-built candidate wire-identical to ROUTER_BASELINE but with
+        # a different label/object identity -- the exact shape the round-6
+        # A3 collision was about.
+        clone_router = eval_runner.Candidate(
+            label="clone-of-baseline",
+            role="router",
+            model=eval_runner.ROUTER_BASELINE.model,
+            effort=eval_runner.ROUTER_BASELINE.effort,
+        )
+        assert clone_router.label != eval_runner.ROUTER_BASELINE.label
+
+        # eval_common.py's is_registered_candidate()/_registered_label()
+        # agree with this: the clone resolves to the REGISTERED label, not
+        # its own.
+        assert eval_common.is_registered_candidate(clone_router, eval_common.ALL_ROUTER_CANDIDATES)
+        assert (
+            eval_common._registered_label(clone_router, eval_common.ALL_ROUTER_CANDIDATES)
+            == eval_runner.ROUTER_BASELINE.label
+        )
+
+        # And _shipped_config_cells_annotation() (eval_model_comparison.py)
+        # agrees too: a pair built from the REAL ROUTER_BASELINE object
+        # still lists under the clone's "shipped" role, because both keys
+        # resolve through the same candidate_wire_key().
+        pair = eval_runner.RunPair(
+            router=eval_runner.ROUTER_BASELINE, worker=eval_runner.WORKER_BASELINE
+        )
+        outcomes = [eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")]
+
+        annotation = eval_runner._shipped_config_cells_annotation(
+            outcomes, (clone_router, eval_runner.WORKER_BASELINE), (pair,)
+        )
+
+        assert pair.label in annotation["router"]["cells"]
+
+
+# ---------------------------------------------------------------------------
+# --repeat: majority-vote aggregation across independent repetitions.
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixCallAccountingRepeatMultiplier:
+    """matrix_call_accounting()'s repeat_count must multiply the whole
+    worst-case estimate -- run_matrix() calls run_cell() repeat_count times
+    per (pair, scenario), and every one of those is a real, separately
+    billed live call. The spend-confirmation gate reads this estimate before
+    any call is made, so an under-counted --repeat run could blow past an
+    operator's --max-calls/--max-cost without ever tripping the gate.
+    """
+
+    def test_repeat_count_one_is_unchanged_from_the_pre_repeat_estimate(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        scenarios = eval_runner.SCENARIOS
+        default = eval_runner.matrix_call_accounting(pairs, scenarios)
+        explicit = eval_runner.matrix_call_accounting(pairs, scenarios, repeat_count=1)
+        assert explicit.total_calls == default.total_calls
+        assert explicit.estimated_cost_usd == default.estimated_cost_usd
+
+    def test_repeat_count_three_triples_every_call_count(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        scenarios = eval_runner.SCENARIOS
+        base = eval_runner.matrix_call_accounting(pairs, scenarios, repeat_count=1)
+        repeated = eval_runner.matrix_call_accounting(pairs, scenarios, repeat_count=3)
+        assert repeated.router_calls == base.router_calls * 3
+        assert repeated.worker_calls == base.worker_calls * 3
+        assert repeated.judge_calls == base.judge_calls * 3
+        assert repeated.estimated_cost_usd == pytest.approx(base.estimated_cost_usd * 3)
+
+
+class TestMajorityBool:
+    def test_strict_majority_true(self) -> None:
+        assert eval_runner._majority_bool([True, True, False]) is True
+
+    def test_strict_majority_false(self) -> None:
+        assert eval_runner._majority_bool([True, False, False]) is False
+
+    def test_tie_resolves_to_false(self) -> None:
+        assert eval_runner._majority_bool([True, False]) is False
+
+    def test_none_entries_are_ignored_not_counted(self) -> None:
+        # 2 real votes (both True) plus a never-evaluated repeat -- the
+        # never-evaluated repeat must not count as a "no" vote.
+        assert eval_runner._majority_bool([True, True, None]) is True
+
+    def test_all_none_is_none(self) -> None:
+        assert eval_runner._majority_bool([None, None]) is None
+
+
+class TestCleanOutcomeRequiresStrictMajority:
+    """Regression for round-4 restart, Codex P2: _majority_with_tiebreak()'s
+    `clean` outcome must require a STRICT majority, not merely a plurality --
+    with --repeat 4, (ok, ok, timeout, provider-error) is a 2/4 plurality for
+    "ok", but half the repetitions did not complete cleanly.
+    """
+
+    def test_codexs_exact_case(self) -> None:
+        # Pre-fix returns "ok".
+        result = eval_runner._majority_with_tiebreak(
+            ["ok", "ok", "timeout", "provider-error"],
+            eval_runner._TURN_STATUS_TIE_PRIORITY,
+            "ok",
+        )
+        assert result == "provider-error"
+
+    def test_judge_case(self) -> None:
+        # Pre-fix returns "yes".
+        result = eval_runner._majority_with_tiebreak(
+            ["yes", "yes", "no", "judge-error"],
+            eval_runner._JUDGE_VERDICT_TIE_PRIORITY,
+            "yes",
+        )
+        assert result == "judge-error"
+
+    def test_strict_majority_still_passes(self) -> None:
+        assert (
+            eval_runner._majority_with_tiebreak(
+                ["ok", "ok", "timeout"], eval_runner._TURN_STATUS_TIE_PRIORITY, "ok"
+            )
+            == "ok"
+        )
+        assert (
+            eval_runner._majority_with_tiebreak(
+                ["yes", "yes", "yes", "no"], eval_runner._JUDGE_VERDICT_TIE_PRIORITY, "yes"
+            )
+            == "yes"
+        )
+
+    def test_single_value(self) -> None:
+        assert (
+            eval_runner._majority_with_tiebreak(["ok"], eval_runner._TURN_STATUS_TIE_PRIORITY, "ok")
+            == "ok"
+        )
+
+    def test_two_two_clean_dirty_tie_is_unchanged(self) -> None:
+        # Already correct pre-fix (a genuine tie, not a plurality) -- pins no
+        # regression.
+        assert (
+            eval_runner._majority_with_tiebreak(
+                ["ok", "ok", "timeout", "timeout"], eval_runner._TURN_STATUS_TIE_PRIORITY, "ok"
+            )
+            == "timeout"
+        )
+
+    def test_end_to_end_repeat_4_cell_fails(self) -> None:
+        """The finding as actually stated: the cell can pass with only half
+        of its repetitions completing cleanly."""
+        turn_repeats = [
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="yes"),
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="yes"),
+            eval_runner.TurnOutcome(query="q", status="timeout"),
+            eval_runner.TurnOutcome(query="q", status="provider-error"),
+        ]
+        aggregated_turn = eval_runner._aggregate_turn_repeats(
+            turn_repeats,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated_turn.status == "provider-error"
+
+        cell_repeats = [
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="ok", turns=[turn_repeats[0]]
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="ok", turns=[turn_repeats[1]]
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="timeout", turns=[turn_repeats[2]]
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p", scenario_name="s", status="provider-error", turns=[turn_repeats[3]]
+            ),
+        ]
+        aggregated_cell = eval_runner._aggregate_cell_repeats(
+            "p",
+            "s",
+            cell_repeats,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated_cell])
+        assert overall_status == "FAIL"
+
+    def test_agg_reason_names_both_the_judged_and_total_repeat_denominators(self) -> None:
+        """Round 7 F10: agg_reason's denominator (len(verdicts), judged
+        repeats only) deliberately differs from agg_error's sibling
+        denominator (len(turn_repeats), ALL repeats) -- one provider-error
+        repeat among 3 means only 2 repeats reached a judge verdict. The
+        unlabeled 2 in the old "1/2 repeats judged yes" string was easy to
+        misread as "1/2 of all repeats", when it actually meant "1/2 of the
+        2 that were judged, out of 3 total". Both denominators must now be
+        visible in the rendered string.
+        """
+        turn_repeats = [
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="yes"),
+            eval_runner.TurnOutcome(query="q", status="ok", judge_verdict="no"),
+            eval_runner.TurnOutcome(query="q", status="provider-error"),
+        ]
+        aggregated_turn = eval_runner._aggregate_turn_repeats(
+            turn_repeats,
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated_turn.judge_reason is not None
+        assert "of 3" in aggregated_turn.judge_reason
+        assert "1/2" in aggregated_turn.judge_reason
+
+
+class TestAggregateTurnRepeatsQuerySamplesFirstNonEmpty:
+    """Round 11 gauntlet, Logic finding 3: `_aggregate_turn_repeats` used to
+    sample `query` from repeat index 0 unconditionally, unlike its sibling
+    fold-based fields (`latency_budget_enforced`, `router_timeout_seconds`).
+    If repeat 0 is the padding placeholder
+    (`TurnOutcome(query="", status="skipped")`), the aggregated turn's query
+    renders as "", losing turn identity in the report/summary. Fixed to the
+    first non-empty query among the repeats.
+    """
+
+    def test_empty_repeat_zero_falls_back_to_the_first_non_empty_query(self) -> None:
+        aggregated = eval_runner._aggregate_turn_repeats(
+            [
+                eval_runner.TurnOutcome(query="", status="skipped"),
+                eval_runner.TurnOutcome(query="real q", status="ok"),
+            ],
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated.query == "real q"
+
+    def test_all_empty_queries_yields_empty_string_not_none(self) -> None:
+        aggregated = eval_runner._aggregate_turn_repeats(
+            [
+                eval_runner.TurnOutcome(query="", status="skipped"),
+                eval_runner.TurnOutcome(query="", status="skipped"),
+            ],
+            max_routing_seconds=eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+            max_latency_seconds=eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+        )
+        assert aggregated.query == ""
+
+
+class TestTieBreakPrioritiesCoverTheirLiteralVocabulary:
+    """Round 5 restart2, Logic L3: _majority_with_tiebreak()'s fallback loop
+    (`for candidate in priority: if candidate != clean and candidate in
+    counts: return candidate`) silently falls through to `return winner` --
+    the PLURALITY winner, inverting round-4 F4's strict-majority invariant --
+    if an observed non-clean value is missing from its priority tuple. All
+    three tuples are complete today (checked member-by-member), but nothing
+    enforced that a future literal addition keeps them that way. A module-
+    level `assert` would vanish under -O (see L2/A3, same file); a test
+    always runs under pytest and catches the omission at the only moment it
+    can be introduced: when a Literal alias gains a member.
+    """
+
+    @pytest.mark.parametrize(
+        ("priority", "literal"),
+        [
+            (eval_runner._CELL_STATUS_TIE_PRIORITY, eval_runner.CellStatus),
+            (eval_runner._TURN_STATUS_TIE_PRIORITY, eval_runner.TurnStatus),
+            (eval_runner._JUDGE_VERDICT_TIE_PRIORITY, eval_runner.JudgeVerdict),
+        ],
+    )
+    def test_every_literal_member_has_a_tie_break_rank(self, priority: Any, literal: Any) -> None:
+        assert set(priority) == set(get_args(literal))
+        assert len(priority) == len(set(priority))  # no duplicate ranks
+
+    def test_cell_and_turn_tie_priorities_agree_on_shared_statuses(self) -> None:
+        """Round 9 gauntlet, Logic F13: a cell's status is DERIVED from its
+        turns' statuses, so `_CELL_STATUS_TIE_PRIORITY` must agree with
+        `_TURN_STATUS_TIE_PRIORITY` on the relative order of every status
+        they share -- previously `timeout` and `provider-error` were
+        swapped between the two, letting a cell report `timeout` on an
+        exact tie while its own turns reported `provider-error`."""
+        shared = set(eval_runner._CELL_STATUS_TIE_PRIORITY) & set(
+            eval_runner._TURN_STATUS_TIE_PRIORITY
+        )
+        cell_order = [s for s in eval_runner._CELL_STATUS_TIE_PRIORITY if s in shared]
+        turn_order = [s for s in eval_runner._TURN_STATUS_TIE_PRIORITY if s in shared]
+        assert cell_order == turn_order
+
+
+class TestAggregateCellRepeats:
+    """_aggregate_cell_repeats() majority-votes N independent run_cell()
+    results for the SAME (pair, scenario) into one summary CellOutcome. The
+    len==1 case is a strict identity (round-trips the exact same object) so
+    the --repeat 1 default reproduces the pre-existing single-run report
+    shape byte-for-byte.
+    """
+
+    def _turn(self, **overrides: Any) -> Any:
+        base: dict[str, Any] = {"query": "q", "status": "ok", "judge_verdict": None}
+        base.update(overrides)
+        return eval_runner.TurnOutcome(**base)
+
+    def _cell(
+        self, *, status: eval_runner.CellStatus = "ok", turns: list[Any] | None = None
+    ) -> Any:
+        return eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="s",
+            status=status,
+            turns=turns if turns is not None else [self._turn()],
+        )
+
+    def _aggregate(
+        self,
+        cells: list[Any],
+        *,
+        max_routing_seconds: float = eval_runner.DEFAULT_MAX_ROUTING_SECONDS,
+        max_latency_seconds: float = eval_runner.DEFAULT_MAX_LATENCY_SECONDS,
+    ) -> Any:
+        return eval_runner._aggregate_cell_repeats(
+            "p",
+            "s",
+            cells,
+            max_routing_seconds=max_routing_seconds,
+            max_latency_seconds=max_latency_seconds,
+        )
+
+    def test_single_repeat_returns_the_same_object_unchanged(self) -> None:
+        cell = self._cell()
+        aggregated = self._aggregate([cell])
+        assert aggregated is cell
+        assert aggregated.repeats is None
+
+    def test_raw_repeats_are_attached_for_audit(self) -> None:
+        cells = [self._cell(), self._cell(), self._cell()]
+        aggregated = self._aggregate(cells)
+        assert aggregated.repeats == cells
+
+    def test_majority_yes_verdict_wins(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(judge_verdict="yes")]),
+            self._cell(turns=[self._turn(judge_verdict="yes")]),
+            self._cell(turns=[self._turn(judge_verdict="no")]),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].judge_verdict == "yes"
+        assert "2/3" in (aggregated.turns[0].judge_reason or "")
+
+    def test_tied_verdict_resolves_toward_the_failure_outcome(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(judge_verdict="yes")]),
+            self._cell(turns=[self._turn(judge_verdict="no")]),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].judge_verdict == "no"
+
+    def test_a_partially_short_repeat_is_padded_not_returned_verbatim(self) -> None:
+        """Round 9 gauntlet, Logic F14: the padding invariant that keeps
+        every repeat's `turns` list the same length lives in run_cell(), not
+        here. This test deliberately violates it (one repeat's `turns` is
+        shorter than the others') to exercise the degrade path directly.
+        Unreachable under today's run_cell() invariant -- exists to keep the
+        documented degrade contract honest if that invariant ever breaks.
+
+        Before the fix, index 2's turn_repeats list came out as length 1
+        (only the two full-length cells contributed; the short cell was
+        skipped entirely rather than padded), and
+        `_aggregate_turn_repeats`'s `len == 1` identity shortcut returned
+        that lone turn VERBATIM -- a raw single repeat masquerading as an
+        N-repeat majority-voted summary, with no error and no marker. After
+        the fix, index 2 gets a skipped placeholder for the short cell, so
+        the list is full-width (length 3) and goes through the real
+        aggregation path instead.
+        """
+        full_a = self._cell(turns=[self._turn(), self._turn(), self._turn(query="q2")])
+        full_b = self._cell(turns=[self._turn(), self._turn(), self._turn(query="q2")])
+        short_c = self._cell(turns=[self._turn(), self._turn()])  # missing index 2
+
+        aggregated = self._aggregate([full_a, full_b, short_c])
+
+        assert aggregated.turns is not None
+        assert len(aggregated.turns) == 3
+        third = aggregated.turns[2]
+        # The verbatim-passthrough path (pre-fix) would have no `error` and
+        # no way to distinguish it from a genuine single-repeat aggregate.
+        # The real aggregation path names the padded-in failure explicitly.
+        assert third.error is not None
+        assert "1/3 repeats failed" in third.error
+        assert "skipped" in third.error
+
+    def test_majority_ok_status_reports_ok(self) -> None:
+        cells = [self._cell(status="ok"), self._cell(status="ok"), self._cell(status="timeout")]
+        aggregated = self._aggregate(cells)
+        assert aggregated.status == "ok"
+        # A minority infra failure still surfaces in `error` even though the
+        # majority-voted status is "ok" -- see
+        # test_minority_infra_failure_surfaces_in_error_without_flipping_status
+        # (round 10 gauntlet, Logic finding 8). This test's own concern is the
+        # STATUS vote, not error content.
+        assert aggregated.error is not None
+        assert "1/3" in aggregated.error
+
+    def test_majority_infra_failure_reports_the_failure_with_a_summary(self) -> None:
+        cells = [
+            self._cell(status="timeout"),
+            self._cell(status="timeout"),
+            self._cell(status="ok"),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.status == "timeout"
+        assert aggregated.error is not None
+        assert "2/3" in aggregated.error
+
+    def test_minority_infra_failure_surfaces_in_error_without_flipping_status(self) -> None:
+        """Round 10 gauntlet, Logic finding 8: a minority provider-error
+        repeat is real evidence about a live paid run and must survive into
+        the aggregate's `error` field even when the majority voted "ok" --
+        previously agg_error was gated on agg_status == "ok" and silently
+        dropped it. Purely a reporting change: compute_pass_fail() gates on
+        status, not error, so the verdict must stay PASS."""
+        cells = [
+            self._cell(status="ok"),
+            self._cell(status="ok"),
+            self._cell(status="provider-error"),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.status == "ok"
+        assert aggregated.error is not None
+        assert "1/3" in aggregated.error
+        assert "provider-error" in aggregated.error
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "PASS"
+
+    def test_infra_failed_repeats_do_not_pollute_the_semantic_vote(self) -> None:
+        # A judge=no from a genuinely-ok repeat outvotes... but an
+        # infra-failed repeat's None judge_verdict must not count as a "no"
+        # vote at all -- only the 2 ok repeats' real verdicts matter.
+        cells = [
+            self._cell(turns=[self._turn(status="ok", judge_verdict="yes")]),
+            self._cell(turns=[self._turn(status="ok", judge_verdict="yes")]),
+            self._cell(status="provider-error", turns=[self._turn(status="provider-error")]),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].judge_verdict == "yes"
+        assert "2/2" in (aggregated.turns[0].judge_reason or "")
+
+    def test_latency_ms_fields_are_averaged_across_ok_repeats(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(total_ms=100.0)]),
+            self._cell(turns=[self._turn(total_ms=200.0)]),
+            self._cell(turns=[self._turn(total_ms=300.0)]),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].total_ms == pytest.approx(200.0)
+
+    # --- Round 10 gauntlet, Logic findings 5 and 6: latency_budget_exceeded
+    # is recomputed from the aggregated means, not majority-voted, so it can
+    # never disagree with the total_ms/routing_ms the same report publishes.
+
+    def test_tied_latency_budget_exceeded_resolves_to_exceeded(self) -> None:
+        """Finding 5: a 1-1 split, where a hand-voted tie-break would have
+        applied, must not resolve to "not exceeded" via _majority_bool's
+        tie-to-False rule -- the aggregate is instead recomputed from the
+        mean, which this case is deliberately over budget."""
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=100_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=50_000.0,
+                        latency_budget_exceeded=False,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+        ]
+        # mean = 75,000 ms, over the 60s budget.
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_exceeded is True
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+
+    def test_majority_not_exceeded_but_mean_over_budget_is_still_exceeded(self) -> None:
+        """Finding 6: a 2/3 majority voting 'not exceeded' must not outvote
+        a mean that is provably over budget -- the aggregate's
+        latency_budget_exceeded and its own total_ms must stay consistent."""
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=200_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=5_000.0,
+                        latency_budget_exceeded=False,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=5_000.0,
+                        latency_budget_exceeded=False,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+        ]
+        # 2/3 repeats voted "not exceeded" -- the OLD majority-vote behavior
+        # would have reported False here. The mean (70,000 ms) is over the
+        # 60s budget, so the recomputed field must be True and must agree
+        # with the total_ms this same aggregate publishes.
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.latency_budget_exceeded is True
+        assert turn.total_ms is not None and turn.total_ms > 60.0 * 1000
+
+    def test_a_failed_repeat_zero_does_not_disable_the_enforced_budget_gate(self) -> None:
+        """Round 11 gauntlet, Logic finding 1: latency_budget_enforced is only
+        written on run_cell()'s measured path, so a repeat that failed before
+        measuring carries the False default. Sampling repeat 0 let that False
+        outvote two surviving repeats that measured a real baseline breach --
+        compute_pass_fail()'s `enforced and exceeded` gate never fired and the
+        cell reported PASS."""
+        cells = [
+            self._cell(
+                status="provider-error",
+                turns=[self._turn(status="provider-error")],  # enforced defaults False
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=200_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        total_ms=200_000.0,
+                        latency_budget_exceeded=True,
+                        latency_budget_enforced=True,
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.status == "ok"  # 2/3 majority
+        assert turn.latency_budget_exceeded is True
+        assert turn.latency_budget_enforced is True
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any("enforced latency budget exceeded" in r for r in reasons)
+
+    def test_timeouts_survive_a_setup_failed_first_repeat(self) -> None:
+        """Round 5 restart2, Logic L1: router_timeout_seconds/
+        foreground_search_timeout_seconds are config-derived and only
+        USUALLY uniform -- run_cell() returns both as None when setup raised
+        before _per_run_config() built a Config. Sampling repeats[0] reported
+        None for the whole aggregate whenever repeat 0 happened to be the one
+        that failed during setup, even though surviving repeats ran against a
+        real timeout."""
+        cells = [
+            eval_runner.CellOutcome(
+                pair_label="p",
+                scenario_name="s",
+                status="setup-error",
+                turns=[self._turn(status="setup-error")],
+                router_timeout_seconds=None,
+                foreground_search_timeout_seconds=None,
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p",
+                scenario_name="s",
+                status="ok",
+                turns=[self._turn()],
+                router_timeout_seconds=8.0,
+                foreground_search_timeout_seconds=8.0,
+            ),
+            eval_runner.CellOutcome(
+                pair_label="p",
+                scenario_name="s",
+                status="ok",
+                turns=[self._turn()],
+                router_timeout_seconds=8.0,
+                foreground_search_timeout_seconds=8.0,
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.router_timeout_seconds == 8.0
+        assert aggregated.foreground_search_timeout_seconds == 8.0
+
+    def test_a_non_baseline_pairs_budget_stays_report_only(self) -> None:
+        """any() must not manufacture enforcement: no repeat of a non-baseline
+        pair ever sets latency_budget_enforced, so the aggregate stays False and
+        an over-budget mean is reported without failing the run."""
+        cells = [
+            self._cell(turns=[self._turn(total_ms=200_000.0, latency_budget_exceeded=True)]),
+            self._cell(turns=[self._turn(total_ms=200_000.0, latency_budget_exceeded=True)]),
+        ]
+        aggregated = self._aggregate(cells, max_latency_seconds=60.0)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_enforced is False
+        assert eval_runner.compute_pass_fail([aggregated])[0] == "PASS"
+
+    def test_routing_leg_over_budget_is_exceeded_even_when_total_ms_is_fine(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(routing_ms=20_000.0, total_ms=10.0)]),
+        ]
+        aggregated = self._aggregate(
+            [cells[0], cells[0]], max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_exceeded is True
+
+    def test_no_latency_metrics_stays_none_not_false(self) -> None:
+        cells = [
+            self._cell(turns=[self._turn(routing_ms=None, total_ms=None)]),
+            self._cell(turns=[self._turn(routing_ms=None, total_ms=None)]),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].latency_budget_exceeded is None
+
+    # --- Round 10 gauntlet, Logic finding 7: deterministic_action_unevaluated
+    # _reason is majority-gated, matching its sibling deterministic_action_pass,
+    # instead of propagating on any single unevaluated repeat.
+
+    def test_minority_unevaluated_repeat_does_not_fail_a_clean_majority(self) -> None:
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.deterministic_action_unevaluated_reason is None
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "PASS"
+        assert turn.error is not None
+        assert "routing_action was unavailable" in turn.error
+
+    def test_majority_unevaluated_repeats_fail_the_run(self) -> None:
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        turn = aggregated.turns[0]
+        assert turn.deterministic_action_unevaluated_reason is not None
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any(reason.startswith("infra:") and "unevaluated" in reason for reason in reasons)
+
+    def test_exact_tie_is_not_a_strict_majority(self) -> None:
+        cells = [
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=None,
+                        deterministic_action_unevaluated_reason="routing_action was unavailable",
+                    )
+                ]
+            ),
+            self._cell(
+                turns=[
+                    self._turn(
+                        deterministic_action_pass=True, deterministic_action_unevaluated_reason=None
+                    )
+                ]
+            ),
+        ]
+        aggregated = self._aggregate(cells)
+        assert aggregated.turns is not None
+        assert aggregated.turns[0].deterministic_action_unevaluated_reason is None
+
+    # --- Round 10 gauntlet, Logic finding 10: CellOutcome.repeats is
+    # depth-1 -- an already-aggregated cell must never be fed back in as a
+    # raw input repeat.
+
+    def test_rejects_an_already_aggregated_cell_as_an_input_repeat(self) -> None:
+        already_aggregated = self._aggregate([self._cell(), self._cell()])
+        assert already_aggregated.repeats is not None
+
+        with pytest.raises(ValueError, match="depth-1"):
+            self._aggregate([already_aggregated, self._cell()])
+
+    def test_a_normal_aggregates_repeats_are_all_depth_one(self) -> None:
+        aggregated = self._aggregate([self._cell(), self._cell(), self._cell()])
+        assert aggregated.repeats is not None
+        assert all(repeat.repeats is None for repeat in aggregated.repeats)
+
+    def test_an_already_aggregated_lone_cell_is_rejected_not_round_tripped(self) -> None:
+        """Round 11 gauntlet, Minor A: the depth-1 guard ran after the len==1
+        identity return, so a single already-aggregated cell was returned
+        unchanged and _serialize_cell would emit depth-2 `repeats`."""
+        nested = self._aggregate([self._cell(), self._cell(), self._cell()])
+        assert nested.repeats is not None
+        with pytest.raises(ValueError, match="depth-1"):
+            self._aggregate([nested])
+
+
+class TestRepeatVerdictRequiresAWhollyCleanMajority:
+    """Round 5 restart2, Codex P1 / C1: compute_pass_fail() must gate an
+    aggregated cell's verdict on repeat-LEVEL cleanliness, not just on every
+    field independently having a clean majority. _aggregate_cell_repeats /
+    _aggregate_turn_repeats vote each field independently across repeats,
+    which is a cross-product: three repeats, each failing a DIFFERENT turn,
+    gives every field a 2/3 clean majority while 0/3 repeats were actually
+    clean end-to-end. Without this gate that aggregate silently read PASS.
+    """
+
+    def _turn(self, query: str, **overrides: Any) -> Any:
+        base: dict[str, Any] = {
+            "query": query,
+            "status": "ok",
+            "judge_verdict": "yes",
+            "deterministic_action_pass": True,
+        }
+        base.update(overrides)
+        return eval_runner.TurnOutcome(**base)
+
+    def _cell(self, turns: list[Any]) -> Any:
+        return eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="routing-regression",
+            status="ok",
+            turns=turns,
+        )
+
+    def _aggregate(self, cells: list[Any]) -> Any:
+        return eval_runner._aggregate_cell_repeats(
+            "router=baseline/worker=baseline",
+            "routing-regression",
+            cells,
+            max_routing_seconds=15,
+            max_latency_seconds=60,
+        )
+
+    def test_no_repeat_passing_all_turns_fails_even_when_every_field_has_a_majority(
+        self,
+    ) -> None:
+        # Repeat 1 fails "greeting" (deterministic action), repeat 2 fails
+        # "riga" (judge=no), repeat 3 fails "helsinki" (judge=no). Every
+        # single turn/field has a 2/3 clean majority across repeats, but NO
+        # repeat is clean end-to-end -- 0/3.
+        repeat_1 = self._cell(
+            [
+                self._turn("greeting", deterministic_action_pass=False),
+                self._turn("riga"),
+                self._turn("helsinki"),
+            ]
+        )
+        repeat_2 = self._cell(
+            [
+                self._turn("greeting"),
+                self._turn("riga", judge_verdict="no"),
+                self._turn("helsinki"),
+            ]
+        )
+        repeat_3 = self._cell(
+            [
+                self._turn("greeting"),
+                self._turn("riga"),
+                self._turn("helsinki", judge_verdict="no"),
+            ]
+        )
+        aggregated = self._aggregate([repeat_1, repeat_2, repeat_3])
+        assert aggregated.turns is not None
+
+        # (a) Per-field reporting is unchanged by the fix -- the aggregate's
+        # per-field summary is still the clean cross-product.
+        assert [t.judge_verdict for t in aggregated.turns] == ["yes", "yes", "yes"]
+        assert [t.deterministic_action_pass for t in aggregated.turns] == [True, True, True]
+
+        # (b) The VERDICT must be FAIL: this assertion fails on pre-fix HEAD
+        # (returns "PASS") and only passes after the fix.
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any("0/3" in reason for reason in reasons)
+
+    def test_a_strict_majority_of_wholly_clean_repeats_still_passes(self) -> None:
+        clean_1 = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        clean_2 = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        dirty = self._cell(
+            [
+                self._turn("greeting", deterministic_action_pass=False),
+                self._turn("riga"),
+                self._turn("helsinki"),
+            ]
+        )
+        aggregated = self._aggregate([clean_1, clean_2, dirty])
+        overall_status, _reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "PASS"
+
+    def test_two_of_four_clean_repeats_is_not_a_strict_majority(self) -> None:
+        clean = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        dirty = self._cell(
+            [
+                self._turn("greeting", deterministic_action_pass=False),
+                self._turn("riga"),
+                self._turn("helsinki"),
+            ]
+        )
+        aggregated = self._aggregate([clean, clean, dirty, dirty])
+        overall_status, reasons = eval_runner.compute_pass_fail([aggregated])
+        assert overall_status == "FAIL"
+        assert any("2/4" in reason for reason in reasons)
+
+    def test_single_run_cells_are_unaffected(self) -> None:
+        cell = self._cell([self._turn("greeting"), self._turn("riga"), self._turn("helsinki")])
+        assert cell.repeats is None
+        overall_status, reasons = eval_runner.compute_pass_fail([cell])
+        assert overall_status == "PASS"
+        assert not any(reason.startswith("repeat:") for reason in reasons)
+
+    def test_clean_repeat_counting_does_not_recurse_into_nested_repeats(self) -> None:
+        """Round 7 F8: clean-repeat counting must be non-recursive BY
+        CONSTRUCTION. Before the fix, compute_pass_fail() scored each repeat
+        via `compute_pass_fail([repeat])[0] == "PASS"` -- a self-recursive
+        call that would, on a repeat carrying its OWN non-None `.repeats`,
+        re-enter the same "clean_repeats * 2 <= len(cell.repeats)" branch a
+        second time and let that nested repeat's own repeat-level verdict
+        leak into whether the OUTER repeat counts as clean. Today this is
+        unreachable (run_cell() never nests repeats past depth 1), but the
+        old code's correctness silently depended on that external invariant
+        rather than being true by its own structure. Construct exactly the
+        depth-2 shape run_cell() never produces -- a repeat whose own
+        `.repeats` holds only FAILING nested outcomes -- and assert the
+        OUTER verdict is governed solely by the repeat's own turns, entirely
+        unaffected by what its nested `.repeats` says.
+        """
+        clean_turns = [self._turn("greeting"), self._turn("riga"), self._turn("helsinki")]
+        # A repeat whose own turns are all clean, but whose `.repeats` field
+        # (never read by _cell_failure_reasons/compute_pass_fail's per-repeat
+        # scoring) holds only failing nested outcomes -- if the old
+        # self-recursion's dependency on "repeats is always None at depth 1"
+        # were ever violated, this nested failure would corrupt the count.
+        nested_failing = [
+            self._cell([self._turn("greeting", deterministic_action_pass=False)]),
+            self._cell([self._turn("greeting", deterministic_action_pass=False)]),
+        ]
+        clean_repeat_with_dirty_nesting = eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="routing-regression",
+            status="ok",
+            turns=clean_turns,
+            repeats=nested_failing,
+        )
+        another_clean_repeat = self._cell(clean_turns)
+        dirty_repeat = self._cell([self._turn("greeting", deterministic_action_pass=False)])
+
+        outer_cell = eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="routing-regression",
+            status="ok",
+            turns=clean_turns,
+            repeats=[clean_repeat_with_dirty_nesting, another_clean_repeat, dirty_repeat],
+        )
+
+        overall_status, reasons = eval_runner.compute_pass_fail([outer_cell])
+
+        # 2/3 repeats are clean (the third is genuinely dirty) -- a strict
+        # majority, so this passes. If the self-recursion's dependency on
+        # depth-1 had been reinstated and mis-scored the nested-repeats
+        # repeat as dirty too (because of its OWN nested failing repeats),
+        # this would read 1/3 -- not a strict majority -- and FAIL instead.
+        assert overall_status == "PASS"
+        assert not any(reason.startswith("repeat:") for reason in reasons)
+
+
+class TestRunMatrixRepeatWiring:
+    """run_matrix()'s repeat_count param must call run_cell() that many
+    times per (pair, scenario) and feed the results through
+    _aggregate_cell_repeats() -- not just the first result.
+    """
+
+    def test_repeat_count_default_calls_run_cell_once_per_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[Any] = []
+
+        async def _fake_run_cell(pair: Any, scenario: Any, *_a: Any, **_k: Any) -> Any:
+            calls.append((pair, scenario))
+            return eval_runner.CellOutcome(
+                pair_label=pair.label, scenario_name=scenario.name, status="ok", turns=[]
+            )
+
+        monkeypatch.setattr(eval_runner, "run_cell", _fake_run_cell)
+        monkeypatch.setattr(eval_runner, "candidate_accepted", lambda *_a, **_k: True)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (scenario,),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+            )
+        )
+
+        assert len(calls) == 1
+        assert outcomes[0].repeats is None
+
+    def test_repeat_count_three_calls_run_cell_three_times_and_aggregates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        call_count = 0
+
+        async def _fake_run_cell(pair: Any, scenario: Any, *_a: Any, **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            status: eval_runner.CellStatus = "ok" if call_count != 2 else "timeout"
+            return eval_runner.CellOutcome(
+                pair_label=pair.label, scenario_name=scenario.name, status=status, turns=[]
+            )
+
+        monkeypatch.setattr(eval_runner, "run_cell", _fake_run_cell)
+        monkeypatch.setattr(eval_runner, "candidate_accepted", lambda *_a, **_k: True)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (scenario,),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+                repeat_count=3,
+            )
+        )
+
+        assert call_count == 3
+        assert len(outcomes) == 1
+        # 2/3 ok -> majority is "ok" despite one timeout repeat.
+        assert outcomes[0].status == "ok"
+        assert outcomes[0].repeats is not None
+        assert len(outcomes[0].repeats) == 3
+
+
+class TestRunMatrixRejectsANonPositiveRepeatCount:
+    """Round 10 gauntlet, Logic finding 9: run_matrix(repeat_count=0) built
+    repeats=[], skipped _aggregate_cell_repeats' len==1 shortcut, and crashed
+    inside _majority_with_tiebreak's max() on an empty Counter with a bare,
+    unphraseable ValueError. run_matrix() is a public coroutine callable
+    directly, bypassing the CLI's --repeat _positive_int() guard -- as the
+    other tests in this file already do -- so it must validate itself.
+    """
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, *, repeat_count: int) -> list[Any]:
+        calls: list[Any] = []
+
+        async def _fake_run_cell(pair: Any, scenario: Any, *_a: Any, **_k: Any) -> Any:
+            calls.append((pair, scenario))
+            return eval_runner.CellOutcome(
+                pair_label=pair.label, scenario_name=scenario.name, status="ok", turns=[]
+            )
+
+        monkeypatch.setattr(eval_runner, "run_cell", _fake_run_cell)
+        monkeypatch.setattr(eval_runner, "candidate_accepted", lambda *_a, **_k: True)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        with pytest.raises(ValueError, match="repeat_count must be at least 1"):
+            asyncio.run(
+                eval_runner.run_matrix(
+                    (pair,),
+                    (scenario,),
+                    eval_runner.Config(),
+                    judge_model="gpt-5-mini",
+                    max_routing_seconds=15.0,
+                    max_latency_seconds=15.0,
+                    manifest_status=status,
+                    repeat_count=repeat_count,
+                )
+            )
+        return calls
+
+    def test_zero_repeat_count_raises_before_any_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._run(monkeypatch, repeat_count=0)
+        assert calls == []
+
+    def test_negative_repeat_count_raises_before_any_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._run(monkeypatch, repeat_count=-1)
+        assert calls == []
+
+    def test_majority_with_tiebreak_rejects_an_empty_sequence(self) -> None:
+        with pytest.raises(ValueError):
+            eval_runner._majority_with_tiebreak([], eval_runner._CELL_STATUS_TIE_PRIORITY, "ok")
+
+
+class TestBuildReportRepeatCount:
+    def test_repeat_count_one_matches_the_pre_repeat_note(self) -> None:
+        report = eval_runner.build_report([], judge_model="gpt-5-mini")
+        assert report["repetition_count_per_cell"] == 1
+        assert "n=1 per cell" in report["repetition_note"]
+
+    def test_repeat_count_three_is_labeled_and_serializes_raw_repeats(self) -> None:
+        cell = eval_runner.CellOutcome(
+            pair_label="p",
+            scenario_name="s",
+            status="ok",
+            turns=[eval_runner.TurnOutcome(query="q", status="ok")],
+            repeats=[
+                eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[]),
+                eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[]),
+                eval_runner.CellOutcome(
+                    pair_label="p", scenario_name="s", status="timeout", turns=[]
+                ),
+            ],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=3)
+        assert report["repetition_count_per_cell"] == 3
+        assert "majority vote" in report["repetition_note"]
+        serialized_repeats = report["cells"][0]["repeats"]
+        assert serialized_repeats is not None
+        assert len(serialized_repeats) == 3
+        assert [r["status"] for r in serialized_repeats] == ["ok", "ok", "timeout"]
+
+    def test_a_cell_with_no_repeats_omits_the_repeats_key(self) -> None:
+        # Round-10 gauntlet confirming pass, Codex P2: a single-run
+        # (--repeat 1, the default) cell must not gain a "repeats" key at
+        # all -- this predates the --repeat feature entirely, so a consumer
+        # doing strict schema/key-set comparison against the pre-feature
+        # shape must see no new key, not a new key holding None.
+        cell = eval_runner.CellOutcome(
+            pair_label="p",
+            scenario_name="s",
+            status="ok",
+            turns=[eval_runner.TurnOutcome(query="q", status="ok")],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini")
+        assert "repeats" not in report["cells"][0]
+
+
+class TestBuildReportReconcilesRepeatCount:
+    """Round 10 gauntlet, Architecture F5: ``repeat_count`` and each cell's
+    own ``repeats`` length are two authorities on one fact; build_report()
+    must reconcile them rather than trust the parameter blindly. This is
+    the tripwire that would have caught F1 (the manifest-rejection path
+    that used to skip repeat aggregation) had it existed first.
+    """
+
+    def _cell_with_n_repeats(self, n: int) -> eval_runner.CellOutcome:
+        repeats = None
+        if n != 1:
+            repeats = [
+                eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[])
+                for _ in range(n)
+            ]
+        return eval_runner.CellOutcome(
+            pair_label="p",
+            scenario_name="s",
+            status="ok",
+            turns=[eval_runner.TurnOutcome(query="q", status="ok")],
+            repeats=repeats,
+        )
+
+    def test_matching_repeat_count_has_no_mismatch_key(self) -> None:
+        cell = self._cell_with_n_repeats(3)
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=3)
+        assert "repetition_count_mismatch" not in report
+        assert report["overall_status"] == "PASS"
+
+    def test_mismatched_repeat_count_flips_status_to_fail(self) -> None:
+        cell = self._cell_with_n_repeats(3)
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=2)
+        assert report["repetition_count_mismatch"] == {"declared": 2, "observed": [3]}
+        assert report["overall_status"] == "FAIL"
+        assert any("repeat_count mismatch" in reason for reason in report["failure_reasons"])
+
+    def test_empty_outcomes_has_no_mismatch_key(self) -> None:
+        report = eval_runner.build_report([], judge_model="gpt-5-mini", repeat_count=3)
+        assert "repetition_count_mismatch" not in report
+
+    def test_print_report_summary_does_not_raise_on_a_degraded_report(self) -> None:
+        cell = self._cell_with_n_repeats(3)
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini", repeat_count=2)
+        eval_runner.print_report_summary(report)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Dry-run: zero live calls invariant
+# ---------------------------------------------------------------------------
+
+
+class TestDryRunMakesZeroLiveCalls:
+    """A live call sneaking into --dry-run must fail the test loudly, not
+    silently pass. The OpenAI client construction and SessionHost lifecycle
+    methods are patched to raise if invoked at all.
+    """
+
+    def test_dry_run_never_constructs_a_session_host(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+
+        eval_runner.main(["--dry-run"])
+
+        out = capsys.readouterr().out
+        assert out  # something was printed -- the matrix/cost preview
+
+    def test_dry_run_never_touches_the_openai_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import openai
+
+        monkeypatch.setattr(openai, "OpenAI", _raise_network_access)
+        monkeypatch.setattr(openai, "AsyncOpenAI", _raise_network_access)
+
+        # Must not raise _NetworkAccessError: dry-run must never reach an
+        # OpenAI client constructor.
+        eval_runner.main(["--dry-run"])
+
+    def test_dry_run_prints_total_call_count_and_cost_estimate(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        eval_runner.main(["--dry-run"])
+        out = capsys.readouterr().out.lower()
+        assert "call" in out
+        assert "cost" in out or "$" in out
+
+
+# ---------------------------------------------------------------------------
+# --max-calls / --max-cost confirmation gate
+# ---------------------------------------------------------------------------
+
+
+class TestSpendConfirmationGate:
+    """A run that would exceed --max-calls or --max-cost must prompt/block
+    without explicit confirmation, and must not proceed to any live call
+    without it.
+    """
+
+    def _patch_for_spend_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # main() itself returns an int (never raises SystemExit -- only the
+        # __main__ guard does that), so these tests assert on the return
+        # code directly. Bypass the two gates that run *before* the spend
+        # check -- manifest freshness (the committed manifest's
+        # source_commit predates the current checkout in this environment)
+        # and the OPENAI_API_KEY credential check -- so a --max-calls/
+        # --max-cost refusal isn't confounded with an unrelated earlier gate.
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: "n")
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+
+    def test_exceeding_max_calls_without_confirmation_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An absurdly low --max-calls guarantees the estimated matrix
+        # exceeds it; stdin is not a tty and no --yes/--confirm is passed,
+        # so the runner must refuse rather than silently proceeding to a
+        # live call.
+        self._patch_for_spend_gate(monkeypatch)
+
+        exit_code = eval_runner.main(["--max-calls", "1", "--i-know-the-manifest-is-stale"])
+        assert exit_code != 0
+
+    def test_exceeding_max_cost_without_confirmation_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_for_spend_gate(monkeypatch)
+
+        exit_code = eval_runner.main(["--max-cost", "0.0001", "--i-know-the-manifest-is-stale"])
+        assert exit_code != 0
+
+    def test_confirmation_gate_is_bypassed_by_dry_run(self) -> None:
+        # --dry-run makes zero live calls regardless of --max-calls, so a
+        # tiny --max-calls under --dry-run must not need confirmation at all.
+        eval_runner.main(["--dry-run", "--max-calls", "1"])
+
+
+class TestSpendEstimateShownBeforeLiveRun:
+    """Regression: on a normal live invocation where no spend limit is
+    exceeded, the operator must still see the total-call-count/cost estimate
+    before any live call happens -- _confirm_spend() itself returns silently
+    when under budget, so main() must print the preview unconditionally on
+    the live-run path, not only when a limit would be exceeded.
+    """
+
+    def test_preview_is_printed_on_a_normal_live_run_within_limits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+        # This run completes the full flow (through report persistence) --
+        # redirect the default report location into tmp_path so the test
+        # doesn't write into the real repo tree's .review-plan/.
+        monkeypatch.setattr(eval_runner, "DEFAULT_REPORT_DIR", tmp_path / "eval-reports")
+
+        # No --max-calls/--max-cost passed at all -- nothing to exceed, so
+        # _confirm_spend() alone would print nothing.
+        eval_runner.main(
+            [
+                "--router",
+                "baseline",
+                "--worker",
+                "baseline",
+                "--scenario",
+                "single-turn-default",
+                "--i-know-the-manifest-is-stale",
+            ]
+        )
+
+        out = capsys.readouterr().out.lower()
+        assert "call" in out
+        assert "cost" in out or "$" in out
+
+    def test_shipped_candidates_resolved_before_any_paid_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 5 restart2, Logic L5: shipped_candidates() does its own
+        load_config() against the repo-tracked config.toml -- evaluating it
+        as a build_report() argument (its previous position, AFTER
+        asyncio.run(run_matrix(...)) completed) meant a raise there discarded
+        an already-paid-for matrix run. It must be resolved before any paid
+        call, so a raise here must prevent run_matrix from ever being
+        called."""
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+
+        def _raise_shipped() -> Any:
+            raise RuntimeError("shipped_candidates exploded")
+
+        monkeypatch.setattr(eval_runner, "shipped_candidates", _raise_shipped)
+
+        called = {"run_matrix": False}
+
+        async def _fake_run_matrix(*_args: Any, **_kwargs: Any) -> list[Any]:
+            called["run_matrix"] = True
+            return []
+
+        monkeypatch.setattr(eval_runner, "run_matrix", _fake_run_matrix)
+
+        with pytest.raises(RuntimeError, match="shipped_candidates exploded"):
+            eval_runner.main(
+                [
+                    "--router",
+                    "baseline",
+                    "--worker",
+                    "baseline",
+                    "--scenario",
+                    "single-turn-default",
+                    "--i-know-the-manifest-is-stale",
+                ]
+            )
+
+        assert called["run_matrix"] is False
+
+
+# ---------------------------------------------------------------------------
+# Manifest-staleness / absence refusal
+# ---------------------------------------------------------------------------
+
+
+class TestManifestGate:
+    """A (model, effort) combination absent from Phase 0's manifest -- or a
+    manifest whose source_commit is stale relative to the current commit --
+    is refused, not silently run. The real API is
+    ``load_manifest_status()``/``candidate_accepted()``/
+    ``require_manifest_ok_for_live_run()`` (never raises on load; the
+    presence/freshness/acceptance checks are combined into one preflight
+    gate), not the guessed ``load_manifest()``/``require_manifest_coverage()``/
+    ``require_manifest_freshness()`` split.
+    """
+
+    def _full_manifest_results(self) -> list[dict[str, Any]]:
+        results = [_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")]
+        results += [
+            _accepted_router_entry(c.model, c.effort) for c in eval_runner.ROUTER_CANDIDATES
+        ]
+        results.append(
+            _accepted_worker_entry(
+                eval_runner.WORKER_BASELINE.model, eval_runner.WORKER_BASELINE.effort
+            )
+        )
+        results += [
+            _accepted_worker_entry(c.model, c.effort) for c in eval_runner.WORKER_CANDIDATES
+        ]
+        results.append(_accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL))
+        return results
+
+    def test_manifest_missing_file_is_refused(self, tmp_path: Path) -> None:
+        missing_path = tmp_path / "does-not-exist.json"
+        status = eval_runner.load_manifest_status(missing_path)
+        assert status.exists is False
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=False,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_undecodable_manifest_is_treated_as_malformed_not_raised(self, tmp_path: Path) -> None:
+        # Path.read_text() raises UnicodeDecodeError for a non-UTF-8 byte
+        # sequence -- this is NOT a subclass of json.JSONDecodeError, so a
+        # guard written as `except (OSError, json.JSONDecodeError)` misses
+        # it. main() calls load_manifest_status() before the guarded
+        # live-run path, so an uncaught UnicodeDecodeError here would
+        # surface as a raw traceback instead of the documented fail-closed
+        # status.
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_bytes(b"\xff\xfe\x00\x81not valid utf-8")
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.exists is True
+        assert status.stale is True
+        assert status.accepted == frozenset()
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=False,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_manifest_fifo_is_refused_instead_of_blocking(self, tmp_path: Path) -> None:
+        """Round-3 restart gauntlet, Security finding: the manifest read was
+        ``exists()`` + ``read_text()``.
+
+        ``--manifest-path`` defaults to a predictable, repo-relative artifact
+        path. A FIFO planted there made ``read_text()`` block the eval run
+        indefinitely, and the surrounding ``except (OSError,
+        json.JSONDecodeError, UnicodeDecodeError)`` could not catch it -- a
+        blocking open never returns to raise. This test must complete
+        promptly, and must degrade to the documented fail-closed status rather
+        than raising.
+        """
+        import os
+
+        manifest_path = tmp_path / "manifest.json"
+        os.mkfifo(manifest_path)
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+        assert status.accepted == frozenset()
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=False,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_manifest_symlink_is_not_read_through(self, tmp_path: Path) -> None:
+        """``O_NOFOLLOW`` half of the same finding: a symlink planted at the
+        predictable manifest path must not silently redirect the read to its
+        target, even when that target is a perfectly valid manifest."""
+        real = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=self._full_manifest_results(),
+        )
+        link = tmp_path / "linked-manifest.json"
+        link.symlink_to(real)
+
+        # Read directly: valid and accepted.
+        assert eval_runner.load_manifest_status(real).accepted != frozenset()
+        # Read through the symlink: refused, with no accepted entries.
+        linked_status = eval_runner.load_manifest_status(link)
+        assert linked_status.stale is True
+        assert linked_status.accepted == frozenset()
+
+    def test_combination_absent_from_manifest_is_refused(self, tmp_path: Path) -> None:
+        # Manifest only covers the baseline, not the router candidates.
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is False
+
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=True,  # isolate the missing-combination failure from staleness
+                candidates=(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_combination_present_and_accepted_is_allowed(self, tmp_path: Path) -> None:
+        manifest_path = _write_manifest(
+            tmp_path, source_commit="deadbeef", results=self._full_manifest_results()
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        # Must not raise: every candidate named here is present and accepted.
+        eval_runner.require_manifest_ok_for_live_run(
+            status,
+            allow_stale=True,
+            candidates=(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_CANDIDATES[0]),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+        )
+
+    def test_rejected_combination_is_refused_even_if_present(self, tmp_path: Path) -> None:
+        rejected = _accepted_router_entry(
+            eval_runner.ROUTER_CANDIDATES[0].model, eval_runner.ROUTER_CANDIDATES[0].effort
+        )
+        rejected["accepted"] = False
+        rejected["error"] = "model rejected this effort level"
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[
+                _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal"),
+                rejected,
+            ],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is False
+
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=True,
+                candidates=(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_stale_manifest_source_commit_is_refused_without_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            eval_runner,
+            "git_head",
+            lambda: "ffffffffffffffffffffffffffffffffffffffff",
+        )
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="0000000000000000000000000000000000000000",
+            results=self._full_manifest_results(),
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        assert status.stale is True
+
+        with pytest.raises(eval_runner.ManifestError):
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=False,
+                candidates=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+    def test_stale_manifest_is_allowed_with_explicit_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            eval_runner,
+            "git_head",
+            lambda: "ffffffffffffffffffffffffffffffffffffffff",
+        )
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="0000000000000000000000000000000000000000",
+            results=self._full_manifest_results(),
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        assert status.stale is True
+
+        # Must not raise when the operator has explicitly acknowledged staleness.
+        eval_runner.require_manifest_ok_for_live_run(
+            status,
+            allow_stale=True,
+            candidates=(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+        )
+
+    def test_real_phase0_manifest_shape_is_readable(self) -> None:
+        """Sanity check against Phase 0's real, committed manifest -- confirms
+        the loader accepts the actual on-disk shape, not just a synthetic
+        fixture. No network access; this is a static file read.
+        """
+        real_manifest_path = Path("docs/dev_plans/artifacts/eval-candidates-manifest.json")
+        assert real_manifest_path.exists(), "Phase 0's manifest must be committed to the repo"
+        status = eval_runner.load_manifest_status(real_manifest_path)
+        assert status.exists is True
+        assert status.source_commit is not None
+        assert status.accepted
+
+
+# ---------------------------------------------------------------------------
+# Judge scoring semantics
+# ---------------------------------------------------------------------------
+
+
+class TestJudgeScoringSemantics:
+    """Citations are checked deterministically (never via a judge criterion,
+    since spoken_text forbids citation markers); display_text (``ui_text``)
+    -- not spoken_text -- is what gets fed to the judge as the assistant
+    reply; and judge-error classification collapses a call-failure reason
+    into ``"judge-error"`` while a genuine yes/no verdict passes through
+    as-is. This logic lives inline in ``run_cell()`` (no standalone
+    ``check_citations()``/``feed_turn_to_judge()``/``classify_judge_verdict()``
+    helpers exist), so these tests drive ``run_cell()`` end-to-end with the
+    ``SessionHost``/judge seams faked out.
+    """
+
+    def test_citation_pass_flag_is_deterministic_not_a_judge_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True, expect_citations=True),),
+            citations=["citation-1"],
+            verdicts=[],
+        )
+        assert outcome.turns[0].citations_pass is True
+
+    def test_no_citations_fails_the_deterministic_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True, expect_citations=True),),
+            citations=[],
+            verdicts=[],
+        )
+        assert outcome.turns[0].citations_pass is False
+
+    def test_delegated_turn_without_expect_citations_leaves_the_check_unevaluated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: citations_pass used to be driven by expect_delegated
+        alone, so a genuinely delegated turn whose hosted worker cannot
+        yield a citable URL (e.g. a weather query answered via the
+        web_search tool's internal oai-weather sub-tool, confirmed via a
+        live probe) always failed this check regardless of the reply's
+        actual quality. expect_citations now gates it independently --
+        expect_delegated=True with expect_citations left at its False
+        default must leave citations_pass unevaluated (None), not compute a
+        spurious False from empty citations.
+        """
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            citations=[],
+            verdicts=[],
+        )
+        assert outcome.turns[0].citations_pass is None
+
+    def test_judge_is_fed_display_text_not_spoken_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?"),),
+            ui_text="display projection",
+            spoken_text="spoken projection",
+            verdicts=[],
+            judge_recorder=recorder,
+        )
+        judge = recorder[0]
+        assert judge.assistant_messages == ["display projection"]
+        assert "spoken projection" not in judge.assistant_messages
+
+    def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 10 gauntlet, Logic finding 3: the EvalJudge cap and
+        ``build_judge_request_kwargs``'s default must be the same constant,
+        not two independently-maintained literals."""
+        from scripts import eval_common
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?"),),
+            verdicts=[],
+            judge_recorder=recorder,
+        )
+        judge = recorder[0]
+        assert judge.init_kwargs["max_tokens"] == eval_common.JUDGE_MAX_TOKENS
+
+    def test_judge_call_failed_reason_is_classified_as_judge_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no", reason="judge call failed: RateLimitError", raw_response=""
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        assert outcome.turns[0].judge_verdict == "judge-error"
+
+    def test_empty_judge_response_is_classified_as_judge_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no", reason="judge returned empty response", raw_response=""
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        assert outcome.turns[0].judge_verdict == "judge-error"
+
+    def test_unparsable_judge_response_is_classified_as_judge_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no",
+            reason="could not parse judge response: 'garbage, not json'",
+            raw_response="garbage, not json",
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        assert outcome.turns[0].judge_verdict == "judge-error"
+
+    def test_genuine_yes_verdict_passes_through_as_yes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="yes", reason="names a specific temperature for Riga", raw_response="{}"
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        assert outcome.turns[0].judge_verdict == "yes"
+
+    def test_genuine_no_verdict_is_a_semantic_fail_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no", reason="does not mention a temperature or condition", raw_response="{}"
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        assert outcome.turns[0].judge_verdict == "no"
+
+    def test_continue_verdict_passes_through_uncollapsed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The plan's checklist vocabulary for judge_verdict is
+        # yes/no/judge-error (plan line 169); "continue" is preserved as-is
+        # rather than collapsed into a pass/fail bucket. There is no
+        # aggregate pass/fail rollup anywhere in this runner --
+        # build_report()/print_report_summary() print the raw per-turn
+        # verdict for a human to read -- so "continue" is not reclassified
+        # as "fail" by run_cell().
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(verdict="continue", reason="interim filler reply", raw_response="{}")
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        assert outcome.turns[0].judge_verdict == "continue"
+
+
+class TestGenuineUnsupportedIsDistinctFromInfraFailure:
+    """Regression for round-5 gauntlet finding 10: a genuine, on-topic
+    `action="unsupported"` routing decision renders through the exact same
+    SAFE_FALLBACKS text (`_CAPABILITY_UNAVAILABLE_TEXT`) as a true
+    infrastructure failure (dispatch raising RoutingValidationError/
+    UnsupportedWorkerType) -- text alone can't tell them apart. Only the
+    latter should short-circuit as `provider-error`; the former must reach
+    judge scoring so the model is held accountable for the misrouting.
+    """
+
+    _CAPABILITY_UNAVAILABLE_TEXT = "I cannot access that capability here."
+
+    def test_genuine_unsupported_action_reaches_judge_scoring(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no", reason="wrongly declined an answerable request", raw_response="{}"
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(
+                Turn(
+                    query="what's the weather in Riga?",
+                    judge_criterion="names a specific weather condition or temperature",
+                ),
+            ),
+            ui_text=self._CAPABILITY_UNAVAILABLE_TEXT,
+            routing_action="unsupported",
+            verdicts=[verdict],
+        )
+        # Reached judge scoring (a real, non-infra outcome) rather than
+        # being short-circuited as a provider-error before the judge ever
+        # saw it.
+        assert outcome.status == "ok"
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[0].judge_verdict == "no"
+
+    def test_capability_unavailable_text_without_unsupported_action_is_still_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="what's the weather in Riga?", expect_delegated=True),),
+            ui_text=self._CAPABILITY_UNAVAILABLE_TEXT,
+            # A dispatch failure after a new_worker/existing_worker decision
+            # -- not "unsupported" -- still renders the same fallback text,
+            # and must still short-circuit as an infra failure.
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+
+    def test_prior_turn_stale_unsupported_routing_is_not_trusted_for_this_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for round-6 gauntlet finding: host.state.routing can
+        still hold a PRIOR turn's decision if this turn's own routing/
+        dispatch call fails before ever assigning a new one (server/
+        pipeline.py only calls state.set_routing() after a successful
+        routed outcome). A stale action="unsupported" read from turn N-1
+        must not be trusted for turn N's genuine infra failure -- it must
+        still short-circuit as provider-error, not be misread as the
+        prior turn's semantic "unsupported" outcome.
+        """
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="what's the weather in Riga?", expect_delegated=True),),
+            ui_text=self._CAPABILITY_UNAVAILABLE_TEXT,
+            # host.state.routing carries action="unsupported", but for
+            # "turn-0" -- a stale read left over from a prior turn, not the
+            # current turn's result ("turn-1", _run_cell's default).
+            routing_action="unsupported",
+            routing_turn_id="turn-0",
+            verdicts=[],
+        )
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+
+
+class TestInfraFailureReasonIsSeparateFromJudgeReason:
+    """Regression for round 8 gauntlet, Architecture finding 9:
+    ``TurnOutcome.judge_reason`` previously doubled as a catch-all for every
+    non-judge infra failure (provider error, safe-fallback text, ...), so a
+    reader couldn't tell "the judge said this" from "the judge never ran,
+    this is why". Non-judge infra failures now write into the dedicated
+    ``error`` field, leaving ``judge_reason`` populated only by an actual
+    judge call.
+    """
+
+    def test_a_provider_error_populates_error_and_leaves_judge_reason_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="what's the weather in Riga?", expect_delegated=True),),
+            ui_text="I cannot access that capability here.",
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        turn = outcome.turns[0]
+        assert turn.error == "host returned a safe fallback"
+        assert turn.judge_reason is None
+
+    def test_a_judge_error_populates_judge_reason_and_leaves_error_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        verdict = JudgeVerdict(
+            verdict="no", reason="judge call failed: RateLimitError", raw_response=""
+        )
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+        )
+        turn = outcome.turns[0]
+        assert turn.judge_verdict == "judge-error"
+        assert "judge call failed" in (turn.judge_reason or "")
+        assert turn.error is None
+
+
+class TestWorkerPresenceAssertionCatchesRoutingRegressions:
+    """Regression for round-5 gauntlet finding 12: the routing-regression
+    scenario previously only asserted `action == expect_action` for the
+    greeting turn and citations for delegated turns -- a turn that
+    delegates when it should have answered directly (or vice versa) could
+    still pass with a superficially valid reply. `worker_presence_pass` now
+    catches that directly from the routing action, independent of reply
+    text or judge verdict.
+    """
+
+    def test_should_be_direct_turn_that_actually_delegates_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            citations=["citation-1"],
+            # Routing regression: the router misrouted a plain greeting to
+            # the worker instead of answering directly.
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        assert outcome.turns[0].worker_presence_pass is False
+
+    def test_delegated_turn_that_actually_stays_direct_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            routing_action="direct",
+            verdicts=[],
+        )
+        assert outcome.turns[0].worker_presence_pass is False
+
+    def test_correctly_routed_turns_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        direct_outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            routing_action="direct",
+            verdicts=[],
+        )
+        assert direct_outcome.turns[0].worker_presence_pass is True
+
+        delegated_outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            citations=["citation-1"],
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        assert delegated_outcome.turns[0].worker_presence_pass is True
+
+    def test_worker_presence_failure_fails_the_matrix_via_compute_pass_fail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            citations=["citation-1"],
+            routing_action="new_worker",
+            verdicts=[],
+        )
+        overall_status, reasons = eval_runner.compute_pass_fail([outcome])
+        assert overall_status == "FAIL"
+        assert any("worker presence/absence assertion failed" in reason for reason in reasons)
+
+
+class TestMultiIntentRoutingSignalGap:
+    """Regression for round-7 gauntlet, Logic lens finding 6: multi_intent and
+    continue_pending turns return via server/pipeline.py's `_handle_multi_intent`/
+    `_handle_pending` and never reach the `isinstance(outcome.decision,
+    RoutingDecision)` branch that sets `host.state.routing` -- so `routing_action`
+    reads as None for these turns even though real delegation happened. Three
+    distinct bugs stemmed from that gap: (a) a multi-item result tuple was
+    misclassified as a provider error, (b) worker_presence_pass fell back to
+    routing_action alone and always failed a delegated multi-intent turn, and
+    (c) deterministic_action_pass was scored False (not left unevaluated) when
+    routing_action was None and turn.expect_action was set.
+    """
+
+    def test_multi_item_result_tuple_is_not_misclassified_as_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _multi_intent_result_factory(_query: str) -> Any:
+            return (
+                _FakeResult(
+                    ui_text="reply one",
+                    spoken_text="reply one",
+                    citations=["citation-1"],
+                    turn_id="turn-1-0",
+                    worker_id="worker-a",
+                ),
+                _FakeResult(
+                    ui_text="reply two",
+                    spoken_text="reply two",
+                    citations=["citation-2"],
+                    turn_id="turn-1-1",
+                    worker_id="worker-b",
+                ),
+            )
+
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga and Helsinki?", expect_delegated=True),),
+            verdicts=["yes"],
+            result_factory=_multi_intent_result_factory,
+        )
+
+        assert outcome.turns[0].status == "ok"
+
+    def test_empty_result_tuple_is_still_a_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            result_factory=lambda _query: (),
+        )
+        assert outcome.turns[0].status == "provider-error"
+
+    def test_worker_presence_pass_reflects_delegation_via_worker_id_when_routing_action_is_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _multi_intent_result_factory(_query: str) -> Any:
+            return (
+                _FakeResult(
+                    ui_text="reply one",
+                    spoken_text="reply one",
+                    citations=["citation-1"],
+                    turn_id="turn-1-0",
+                    worker_id="worker-a",
+                ),
+            )
+
+        # routing_action left at its default (None) -- host.state.routing is
+        # never set on the multi_intent/continue_pending return paths.
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", expect_delegated=True),),
+            verdicts=["yes"],
+            result_factory=_multi_intent_result_factory,
+        )
+
+        assert outcome.turns[0].worker_presence_pass is True
+
+    def test_deterministic_action_pass_is_none_not_false_when_routing_action_is_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            verdicts=[],
+            # routing_action left at its default (None).
+        )
+        assert outcome.turns[0].deterministic_action_pass is None
+
+    def test_unevaluated_reason_is_recorded_and_surfaced_distinctly_from_not_applicable(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Regression for round 8 gauntlet, Logic lens finding 2:
+        ``deterministic_action_pass=None`` alone can't distinguish "no
+        assertion was requested" from "the assertion was requested but never
+        ran" -- the latter must be visible in the report/summary.
+        """
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi.", expect_action="direct", expect_delegated=False),),
+            verdicts=[],
+            # routing_action left at its default (None).
+        )
+        turn = outcome.turns[0]
+        assert turn.deterministic_action_pass is None
+        assert turn.deterministic_action_unevaluated_reason is not None
+
+        report = eval_runner.build_report([outcome], judge_model="gpt-5-mini")
+        report_turn = report["cells"][0]["turns"][0]
+        assert report_turn["deterministic_action_pass"] is None
+        assert report_turn["deterministic_action_unevaluated_reason"] is not None
+
+        eval_runner.print_report_summary(report)
+        captured = capsys.readouterr().out
+        assert "action_unevaluated=" in captured
+        assert report_turn["deterministic_action_unevaluated_reason"] in captured
+
+    def test_no_unevaluated_reason_when_no_action_assertion_was_requested(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="Hi."),),  # no expect_action at all
+            verdicts=[],
+        )
+        turn = outcome.turns[0]
+        assert turn.deterministic_action_pass is None
+        assert turn.deterministic_action_unevaluated_reason is None
+
+
+class TestUnevaluatedDeterministicActionFailsTheRun:
+    """Regression for round 9 gauntlet, merged Codex P1 + Logic lens
+    finding 3: ``deterministic_action_unevaluated_reason`` (round 8) made a
+    requested-but-never-run assertion visible in the per-turn report, but
+    ``compute_pass_fail()`` only rejected ``deterministic_action_pass is
+    False`` -- a ``None`` value (whether "not applicable" or "requested but
+    unevaluated") still aggregated to PASS, the exact class of gap round 8
+    fixed for the latency-budget gate.
+    """
+
+    def _cell_with_unevaluated_action(self) -> Any:
+        turn = eval_runner.TurnOutcome(
+            query="Hi.",
+            status="ok",
+            deterministic_action_pass=None,
+            deterministic_action_unevaluated_reason=(
+                "routing_action was unavailable for this turn"
+            ),
+        )
+        return eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="s",
+            status="ok",
+            turns=[turn],
+        )
+
+    def test_a_requested_but_unevaluated_action_assertion_fails_the_run(self) -> None:
+        overall_status, reasons = eval_runner.compute_pass_fail(
+            [self._cell_with_unevaluated_action()]
+        )
+        assert overall_status == "FAIL"
+        assert any("unevaluated" in reason for reason in reasons)
+
+    def test_reason_is_classified_infra_not_semantic(self) -> None:
+        _overall_status, reasons = eval_runner.compute_pass_fail(
+            [self._cell_with_unevaluated_action()]
+        )
+        assert any(reason.startswith("infra:") and "unevaluated" in reason for reason in reasons)
+
+    def test_a_not_applicable_none_action_still_passes(self) -> None:
+        # deterministic_action_pass=None with NO unevaluated_reason means "no
+        # assertion was requested" -- must still pass, not regress into a
+        # false failure for every turn without an expect_action.
+        turn = eval_runner.TurnOutcome(
+            query="Hi.",
+            status="ok",
+            deterministic_action_pass=None,
+            deterministic_action_unevaluated_reason=None,
+        )
+        cell = eval_runner.CellOutcome(pair_label="p", scenario_name="s", status="ok", turns=[turn])
+        overall_status, _reasons = eval_runner.compute_pass_fail([cell])
+        assert overall_status == "PASS"
+
+
+class TestPrintReportSummaryShowsBothActionPassAndUnevaluatedNote:
+    """Round 6 gauntlet, Logic G1: `_aggregate_turn_repeats` sets
+    `deterministic_action_unevaluated_reason` on a STRICT MAJORITY of
+    unevaluated repeats, while the sibling `deterministic_action_pass` is
+    `_majority_bool`'s vote over the non-None repeats alone -- e.g. 2/3
+    repeats unevaluated + 1/3 judged True yields BOTH fields non-None at
+    once (`deterministic_action_pass=True` from the one real vote,
+    `deterministic_action_unevaluated_reason` from the 2/3 majority).
+    `print_report_summary`'s old `if`/`elif` only ever showed one side,
+    so this state printed a clean `action_pass=True` for a cell
+    `compute_pass_fail` was independently failing on the unevaluated
+    reason. Both facts must now print.
+    """
+
+    def test_both_the_pass_value_and_the_unevaluated_marker_are_printed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        turn = eval_runner.TurnOutcome(
+            query="Hi.",
+            status="ok",
+            deterministic_action_pass=True,
+            deterministic_action_unevaluated_reason=(
+                "2/3 repeats: routing_action was unavailable for this turn"
+            ),
+        )
+        cell = eval_runner.CellOutcome(
+            pair_label="router=baseline/worker=baseline",
+            scenario_name="s",
+            status="ok",
+            turns=[turn],
+        )
+        report = eval_runner.build_report([cell], judge_model="gpt-5-mini")
+
+        eval_runner.print_report_summary(report)
+
+        captured = capsys.readouterr().out
+        assert "action_pass=True" in captured
+        assert "action_unevaluated=" in captured
+        assert "2/3 repeats: routing_action was unavailable for this turn" in captured
+        # Round 11 gauntlet, R1 follow-up: pin the exact rendering so a
+        # revert back to the old `UNEVALUATED (<reason>)` sentinel form
+        # fails this test instead of slipping through on the substring
+        # checks above, which both forms satisfy.
+        assert f"action_unevaluated={turn.deterministic_action_unevaluated_reason!r}" in captured
+        assert "UNEVALUATED" not in captured
+
+
+class TestMissingTurnMetricsIsNotSilentlySwallowed:
+    """Regression for round 8 gauntlet, merged Codex P1 + Logic lens finding 4:
+    round 7 added ``except RuntimeError: stage_metrics = None`` around
+    ``latest_turn_stage_metrics()`` to handle a multi-intent item's
+    suffixed ``turn_id`` (``f"{turn_id}-{index}"``, which never matches the
+    parent ``app_turn_foreground`` record). But that same catch also
+    swallowed a genuinely-missing metrics record on an ordinary turn --
+    ``latency_budget_enforced``/``latency_budget_exceeded`` silently stayed
+    at their False/None defaults, so a baseline cell could report PASS with
+    no latency evidence at all. Fixed by positively identifying the
+    multi-intent item-suffix shape (``_is_multi_intent_item_turn_id``)
+    before swallowing; any other RuntimeError now re-raises and surfaces as
+    ``turn-error``.
+    """
+
+    def test_genuinely_missing_metrics_on_an_ordinary_turn_is_a_turn_error_not_a_silent_pass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        def _stage_metrics_never_recorded(
+            _sink: Any, _elapsed_ms: float, turn_id: str
+        ) -> dict[str, float]:
+            raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics_never_recorded)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # Must NOT be a silent "ok" turn with latency_budget_enforced left
+        # False -- that would let compute_pass_fail() report PASS with no
+        # latency evidence at all. THIS turn is classified turn-error; the
+        # cell itself stays "ok" (round 9 gauntlet, Logic lens finding 7 --
+        # see TestMissingMetricsDoesNotAbortTheCell below for why the cell
+        # must not abort over a single ordinary turn's metrics gap).
+        assert outcome.turns[0].status == "turn-error"
+        assert outcome.turns[0].error is not None
+        assert "app_turn_foreground" in outcome.turns[0].error
+        # The cell itself completes ("ok") rather than aborting -- a single
+        # ordinary turn's metrics gap must not discard the rest of a paid
+        # scenario's turns (round 9 gauntlet, Logic lens finding 7).
+        assert outcome.status == "ok"
+
+    def test_multi_intent_item_suffixed_turn_id_is_still_a_recognized_gap_not_a_turn_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from server.perf_metrics import MeasurementRecord
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any) -> Any:
+            # Simulate the parent app_turn_foreground record production
+            # actually emits for the (unsuffixed) turn -- the shape
+            # _is_multi_intent_item_turn_id positively checks for. Appended
+            # directly to the sink's internal list (not via emit()/
+            # build_record(), which validate the full production field set
+            # this synthetic record doesn't need) since only .event/.fields
+            # matter to the helper under test.
+            measurement_sink._records.append(
+                MeasurementRecord(
+                    event="app_turn_foreground", fields={"turn_id": "turn-1"}, line=""
+                )
+            )
+            return _FakeHost(
+                lambda _q: (
+                    _FakeResult(
+                        ui_text="reply one",
+                        spoken_text="reply one",
+                        citations=["citation-1"],
+                        turn_id="turn-1-0",
+                        worker_id="worker-a",
+                    ),
+                )
+            )
+
+        def _stage_metrics_fails_for_item_suffix(
+            _sink: Any, _elapsed_ms: float, turn_id: str
+        ) -> dict[str, float]:
+            raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class(["yes"], None))
+        monkeypatch.setattr(
+            eval_runner, "latest_turn_stage_metrics", _stage_metrics_fails_for_item_suffix
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(
+            name="s", turns=(Turn(query="weather in Riga and Helsinki?", expect_delegated=True),)
+        )
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[0].routing_ms is None
+        assert outcome.turns[0].latency_budget_enforced is False
+
+
+class TestLatencyBudgetPredicateUsesPublishedRoundedValues:
+    """Round 9 gauntlet, Logic F12: run_cell() stored `round(stage_metrics[
+    ...], 1)` into the outcome but fed the RAW stage_metrics floats to
+    `_latency_budget_exceeded`, while `_aggregate_turn_repeats` recomputes
+    from the already-rounded stored means. At the exact boundary the two
+    paths could disagree by up to 0.05ms -- a persisted report could show
+    `routing_ms` at exactly the budget beside a contradictory
+    `latency_budget_exceeded=True`. Fixed by rounding once in run_cell()
+    and feeding the SAME rounded values to both the outcome and the
+    predicate."""
+
+    def test_a_raw_value_just_inside_the_rounding_window_does_not_exceed_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        def _stage_metrics(_sink: Any, _elapsed_ms: float, _turn_id: str) -> dict[str, float]:
+            # Raw routing_ms is strictly ABOVE the 1000.0ms budget
+            # (max_routing_seconds=1.0), but rounds DOWN to exactly 1000.0 --
+            # the published value must be what the predicate is judged
+            # against, not the raw one.
+            return {"routing_ms": 1000.04, "search_ms": 0.0, "total_ms": 1000.04}
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=1.0,
+                max_latency_seconds=60.0,
+            )
+        )
+
+        turn = outcome.turns[0]
+        assert turn.routing_ms == 1000.0
+        # The published (rounded) routing_ms is exactly the budget, not
+        # above it -- must not be reported as exceeded.
+        assert turn.latency_budget_exceeded is False
+
+        # The self-consistency invariant that matters: recomputing the
+        # predicate directly from the outcome's own published fields must
+        # reproduce the outcome's own verdict. This is what
+        # `_latency_budget_exceeded`'s "must stay identical" docstring
+        # contract promises.
+        assert (
+            eval_runner._latency_budget_exceeded(
+                turn.routing_ms,
+                turn.total_ms,
+                max_routing_seconds=1.0,
+                max_latency_seconds=60.0,
+            )
+            == turn.latency_budget_exceeded
+        )
+
+
+class TestMissingMetricsDoesNotAbortTheCell:
+    """Regression for round 9 gauntlet, Logic lens finding 7: round 8's
+    ``raise`` (on a genuinely-missing, non-multi-intent metrics gap) escaped
+    the whole ``for turn in scenario.turns`` loop -- discarding the
+    already-computed ``outcome`` fields for that turn (worker_presence_pass/
+    citations_pass/routing data, overwritten by a fresh ``TurnOutcome`` in
+    the outer handler) and aborting the entire cell, marking every remaining
+    turn "skipped" even though this is an ordinary single-turn metrics gap,
+    not a real infrastructure failure. The fix marks THIS turn turn-error
+    and continues to the next turn.
+    """
+
+    def test_a_turn_after_the_missing_metrics_turn_still_runs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+
+            def _result_factory(query: str) -> Any:
+                calls.append(query)
+                return _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+
+            return _FakeHost(_result_factory)
+
+        def _stage_metrics_fails_once(
+            _sink: Any, _elapsed_ms: float, turn_id: str
+        ) -> dict[str, float]:
+            if len(calls) == 1:
+                raise RuntimeError(
+                    f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}"
+                )
+            return {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0}
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics_fails_once)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="first"), Turn(query="second")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # Both turns actually ran (were billed) -- the second was not
+        # skipped, and the cell completed rather than aborting.
+        assert calls == ["first", "second"]
+        assert outcome.status == "ok"
+        assert len(outcome.turns) == 2
+        assert outcome.turns[0].status == "turn-error"
+        assert outcome.turns[1].status == "ok"
+        # The second turn's own outcome data was not discarded/overwritten.
+        assert outcome.turns[1].routing_ms == 10.0
+
+
+class TestIsMultiIntentItemTurnId:
+    """Unit coverage for the positive-identification helper itself."""
+
+    def test_true_for_a_suffixed_id_with_a_matching_parent_record(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink, MeasurementRecord
+
+        sink = CollectingMeasurementSink()
+        sink._records.append(
+            MeasurementRecord(event="app_turn_foreground", fields={"turn_id": "turn-1"}, line="")
+        )
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn-1-0") is True
+
+    def test_false_when_no_matching_parent_record_exists(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink
+
+        sink = CollectingMeasurementSink()
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn-1-0") is False
+
+    def test_false_for_a_non_digit_suffix(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink, MeasurementRecord
+
+        sink = CollectingMeasurementSink()
+        sink._records.append(
+            MeasurementRecord(event="app_turn_foreground", fields={"turn_id": "turn-abc"}, line="")
+        )
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn-abc-x") is False
+
+    def test_false_when_there_is_no_hyphen_at_all(self) -> None:
+        from server.perf_metrics import CollectingMeasurementSink
+
+        sink = CollectingMeasurementSink()
+        assert eval_runner._is_multi_intent_item_turn_id(sink, "turn1") is False
+
+
+# ---------------------------------------------------------------------------
+# Scenario definitions
+# ---------------------------------------------------------------------------
+
+
+class TestScenarioDefinitions:
+    """2 in-scope scenarios, each an ordered list of turns with per-turn
+    judge criteria where applicable; routing-regression reuses
+    ROUTING_REGRESSION_QUERIES verbatim (3 turns, not 2) with a deterministic
+    assertion on turn 1 and time-robust judge criteria on turns 2/3; the
+    ack-ordering scenario is explicitly excluded from this matrix.
+    """
+
+    def test_two_scenarios_are_defined(self) -> None:
+        assert len(eval_scenarios.SCENARIOS) == 2
+
+    def test_at_least_one_turn_sets_expect_citations(self) -> None:
+        """Round 10 gauntlet, Architecture finding 6: ``Turn.expect_citations``
+        defaults to opt-out (``False``) -- decoupled from ``expect_delegated``
+        because weather turns route through ``oai-weather``, whose sources
+        carry ``url: null`` and so can't pass a citations check. That
+        decoupling is correct, but the opt-out default means a scenario
+        author who forgets to set it silently loses citation coverage
+        entirely. This is the tripwire: if a future scenario refactor drops
+        the last citation-checked turn, this fails loudly instead of the
+        citations check silently retiring.
+        """
+        assert any(
+            turn.expect_citations
+            for scenario in eval_scenarios.SCENARIOS
+            for turn in scenario.turns
+        )
+
+    def test_evals_package_does_not_import_scripts(self) -> None:
+        """Regression for round-2 gauntlet finding 8: evals/scenarios.py used
+        to import its query constants from scripts/eval_common.py, making
+        scripts <-> evals bidirectionally coupled at the package level (since
+        scripts/eval_model_comparison.py already imports evals.scenarios).
+        The constants now live in evals/queries.py, so evals/ has no
+        dependency on scripts/ at all.
+        """
+        import ast
+        from pathlib import Path
+
+        evals_dir = Path(eval_scenarios.__file__).parent
+        for py_file in evals_dir.glob("*.py"):
+            tree = ast.parse(py_file.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    assert not node.module.startswith("scripts"), (
+                        f"{py_file.name} imports from {node.module!r} -- "
+                        "evals/ must not depend on scripts/"
+                    )
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        assert not alias.name.startswith("scripts"), (
+                            f"{py_file.name} imports {alias.name!r} -- "
+                            "evals/ must not depend on scripts/"
+                        )
+
+    def test_ack_ordering_scenario_is_excluded(self) -> None:
+        names = [s.name for s in eval_scenarios.SCENARIOS]
+        assert not any("ack" in name.lower() for name in names)
+
+    def test_routing_regression_scenario_has_three_turns_not_two(self) -> None:
+        from scripts.smoke_conversation import ROUTING_REGRESSION_QUERIES
+
+        assert len(ROUTING_REGRESSION_QUERIES) == 3
+        routing_regression = next(
+            s for s in eval_scenarios.SCENARIOS if "routing" in s.name.lower()
+        )
+        assert len(routing_regression.turns) == 3
+        assert [t.query for t in routing_regression.turns] == list(ROUTING_REGRESSION_QUERIES)
+
+    def test_routing_regression_first_turn_is_deterministic_not_judge_scored(self) -> None:
+        routing_regression = next(
+            s for s in eval_scenarios.SCENARIOS if "routing" in s.name.lower()
+        )
+        first_turn = routing_regression.turns[0]
+        # Turn 1 ("Hi.") is a deterministic action==direct/no-worker-created
+        # assertion, not a judge criterion.
+        assert first_turn.judge_criterion is None
+
+    def test_routing_regression_weather_turns_have_judge_criteria(self) -> None:
+        routing_regression = next(
+            s for s in eval_scenarios.SCENARIOS if "routing" in s.name.lower()
+        )
+        for turn in routing_regression.turns[1:]:
+            assert turn.judge_criterion
+            assert isinstance(turn.judge_criterion, str)
+            # Judge criteria must be time-robust ("names a specific weather
+            # condition or temperature"), never asserting the *correct*
+            # current weather -- ground truth would drift and isn't checkable.
+            assert "correct current weather" not in turn.judge_criterion.lower()
+
+    def test_all_scenario_criteria_are_written_verbatim_not_placeholders(self) -> None:
+        placeholder_markers = {"todo", "tbd", "placeholder", "fixme", "xxx"}
+        for scenario in eval_scenarios.SCENARIOS:
+            for turn in scenario.turns:
+                if turn.judge_criterion:
+                    lowered = turn.judge_criterion.lower()
+                    assert not any(marker in lowered for marker in placeholder_markers)
+
+
+class TestExpectCitationsRequiresExpectDelegated:
+    """Round 11 gauntlet, Architecture finding 7: ``expect_citations=True,
+    expect_delegated=False`` is representable but meaningless -- citations
+    only ever arrive from a worker result, so that combination is a
+    guaranteed-fail assertion, not a real signal. ``Turn.__post_init__``
+    now rejects it.
+    """
+
+    def test_expect_citations_without_expect_delegated_raises(self) -> None:
+        with pytest.raises(ValueError, match="expect_citations"):
+            Turn(query="q", expect_citations=True)
+
+    def test_expect_delegated_true_expect_citations_false_still_constructs(self) -> None:
+        turn = Turn(query="q", expect_delegated=True, expect_citations=False)
+        assert turn.expect_delegated is True
+        assert turn.expect_citations is False
+
+    def test_both_true_still_constructs(self) -> None:
+        turn = Turn(query="q", expect_delegated=True, expect_citations=True)
+        assert turn.expect_delegated is True
+        assert turn.expect_citations is True
+
+
+# ---------------------------------------------------------------------------
+# Round-1 review-gauntlet regression tests.
+# ---------------------------------------------------------------------------
+
+
+class _RaisingOnFirstTurnHost:
+    """A ``SessionHost`` stand-in whose first turn times out (or errors) so a
+    cell that never gets a real result must not still report ``status="ok"``.
+    """
+
+    def __init__(self, *, failure: BaseException) -> None:
+        self.state = _FakeState()
+        self.registry = _FakeRegistry()
+        self._failure = failure
+        self.calls = 0
+
+    async def start(self) -> None:
+        pass
+
+    async def connect(self, _handshake: dict[str, Any]) -> str:
+        return "connection-1"
+
+    async def _handle_transcript(self, query: str, *, origin: Any) -> Any:
+        del origin, query
+        self.calls += 1
+        raise self._failure
+
+    async def shutdown(self) -> None:
+        pass
+
+
+class TestTurnFailurePropagatesToCellAndReport:
+    """Regression for finding 1: a turn that times out or raises must not
+    leave the cell reporting ``status="ok"`` -- and ``compute_pass_fail()``
+    must itself notice a non-"ok" turn status, not just a non-"ok" cell
+    status, since a fully-failed run's every symptom lives on its turns.
+    """
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, *, failure: BaseException) -> Any:
+        host = _RaisingOnFirstTurnHost(failure=failure)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return host
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(
+            name="two-turn-fixture",
+            turns=(Turn(query="turn one"), Turn(query="turn two")),
+        )
+        config = eval_runner.Config()
+        return asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                config,
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+    def test_a_timed_out_turn_marks_the_cell_status_non_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=TimeoutError())
+        assert outcome.status == "timeout"
+        assert outcome.turns[0].status == "timeout"
+        # Regression for round 9 gauntlet, Logic lens finding 8: every
+        # sibling infra-failure break path sets outcome.error; the
+        # wait_for-TimeoutError path previously only set cell_error, leaving
+        # this turn's own `error` detail blank.
+        assert outcome.turns[0].error is not None
+        assert "wait_for budget" in outcome.turns[0].error
+
+    def test_a_provider_error_turn_marks_the_cell_status_non_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=RuntimeError("boom"))
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+
+    def test_the_unattempted_second_turn_is_recorded_as_skipped_not_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=TimeoutError())
+        assert len(outcome.turns) == 2
+        assert outcome.turns[1].query == "turn two"
+        assert outcome.turns[1].status == "skipped"
+
+    def test_compute_pass_fail_fails_the_run_and_names_the_turn_status(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._run(monkeypatch, failure=RuntimeError("boom"))
+        report = eval_runner.build_report([outcome], judge_model="gpt-5-mini")
+
+        assert report["overall_status"] == "FAIL"
+        assert any(
+            "turn one" in reason and "status='provider-error'" in reason
+            for reason in report["failure_reasons"]
+        )
+
+    def test_a_fully_failed_billed_run_never_reports_pass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact scenario finding 1 named: every turn errors, and the
+        report must not read PASS / exit 0 as a result."""
+        outcome = self._run(monkeypatch, failure=RuntimeError("every turn fails"))
+        report = eval_runner.build_report([outcome], judge_model="gpt-5-mini")
+        assert report["overall_status"] == "FAIL"
+
+
+class TestMidTurnFailureIsNotMisclassifiedAsSetupError:
+    """Regression for round-2 gauntlet finding 12: an exception raised mid-loop
+    AFTER at least one turn already completed and was billed previously
+    landed in the outer handler that unconditionally set
+    ``cell_status = "setup-error"`` -- misreporting a mid-turn failure as if
+    nothing had run yet. Fixed by checking whether ``turns`` already has
+    entries: "turn-error" if so, "setup-error" only if the exception happened
+    before any turn completed.
+
+    The failure is injected via ``latest_turn_stage_metrics()`` raising, but
+    NOT via ``RuntimeError`` -- round 7 gauntlet, Logic lens finding 6 made a
+    ``RuntimeError`` from that call site an expected, non-fatal "per-item
+    latency genuinely unavailable" signal (a multi-intent commit's item-
+    suffixed turn_id never matches the parent metric record), so these tests
+    use ``ValueError`` instead to keep exercising a genuine uncaught
+    mid-execution failure.
+    """
+
+    def test_failure_after_a_completed_turn_is_turn_error_not_setup_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        calls = {"n": 0}
+
+        def _stage_metrics_fails_on_second_turn(
+            _sink: Any, _elapsed_ms: float, _turn_id: str
+        ) -> dict[str, float]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0}
+            raise ValueError("stage metrics lookup broke in a way that must not be swallowed")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner, "latest_turn_stage_metrics", _stage_metrics_fails_on_second_turn
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "turn-error"
+        # The first turn actually ran and was billed -- it must be recorded
+        # as "ok", not swallowed into the failure.
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[0].query == "turn one"
+
+    def test_failure_before_any_turn_completes_is_still_setup_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            eval_runner,
+            "build_session_for_run",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no host for you")),
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+
+    def test_failure_mid_execution_of_the_first_turn_is_turn_error_not_setup_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for round-3 gauntlet finding 1: ``cell_status = "turn-error"
+        if turns else "setup-error"`` previously inferred "did any turn
+        complete" from ``len(turns)`` -- but a ``TurnOutcome`` is only
+        appended at the END of a turn's iteration, so a turn that fails mid-
+        execution (paid call succeeded, something after it raised) on the
+        FIRST turn left ``turns == []`` even though that turn actually ran
+        and was billed. It was misclassified "setup-error" (implying nothing
+        was attempted) and the skipped-turn backfill mislabeled the
+        already-billed, already-run turn as "skipped". Fixed by a
+        ``turn_started`` flag set immediately before the paid call, used to
+        append an in-flight ``TurnOutcome(status="turn-error")`` for the turn
+        that was mid-execution before the backfill runs.
+
+        Uses ``ValueError`` (not ``RuntimeError``) to inject the mid-execution
+        failure -- see class docstring: round 7 gauntlet, Logic lens finding 6
+        made a ``RuntimeError`` from ``latest_turn_stage_metrics()`` an
+        expected, non-fatal signal.
+        """
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        def _stage_metrics_always_fails(
+            _sink: Any, _elapsed_ms: float, _turn_id: str
+        ) -> dict[str, float]:
+            raise ValueError("stage metrics lookup broke in a way that must not be swallowed")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "latest_turn_stage_metrics", _stage_metrics_always_fails)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "turn-error"
+        # The first turn actually ran (and was billed) -- it must be recorded
+        # as "turn-error", not as "setup-error" and not silently dropped into
+        # the "skipped" backfill.
+        assert len(outcome.turns) == 2
+        assert outcome.turns[0].query == "turn one"
+        assert outcome.turns[0].status == "turn-error"
+        assert outcome.turns[1].query == "turn two"
+        assert outcome.turns[1].status == "skipped"
+
+
+class TestSkippedTurnBackfillDedupesByIndexNotQueryText:
+    """Regression for round-2 gauntlet finding 11: the skipped-turn backfill
+    previously deduped on query TEXT (``{t.query for t in turns}``), so a
+    scenario with a repeated query string under-reported which turns were
+    skipped -- a trailing duplicate query was silently absent from the
+    backfill instead of being marked "skipped". Fixed by backfilling by
+    INDEX (``scenario.turns[len(turns):]``) since ``turns`` is appended
+    strictly in scenario order.
+    """
+
+    def test_a_repeated_query_after_the_failure_is_still_backfilled_as_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _FailsOnSecondCallHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def start(self) -> None:
+                pass
+
+            async def connect(self, _handshake: dict[str, Any]) -> str:
+                return "connection-1"
+
+            async def _handle_transcript(self, query: str, *, origin: Any) -> Any:
+                del origin, query
+                self.calls += 1
+                if self.calls == 1:
+                    return _FakeResult(
+                        ui_text="a distinctly non-fallback reply",
+                        spoken_text="a distinctly non-fallback spoken reply",
+                        citations=[],
+                        turn_id="turn-1",
+                    )
+                raise RuntimeError("second turn fails")
+
+            async def shutdown(self) -> None:
+                pass
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FailsOnSecondCallHost()
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner,
+            "latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        # Turns 1 and 3 share the same query text -- a text-based dedup would
+        # wrongly treat turn 3 as "already attempted" (because turn 1's query
+        # matches it) and silently drop it from the backfill.
+        scenario = Scenario(
+            name="repeated-query-fixture",
+            turns=(
+                Turn(query="same query"),
+                Turn(query="a different query"),
+                Turn(query="same query"),
+            ),
+        )
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert len(outcome.turns) == 3
+        assert outcome.turns[0].status == "ok"
+        assert outcome.turns[1].status == "provider-error"
+        assert outcome.turns[2].query == "same query"
+        assert outcome.turns[2].status == "skipped"
+
+
+class TestHostLifecycleExceptionsDontCrashTheMatrix:
+    """Regression for finding 2: an exception from host.start()/connect(), or
+    from judge.evaluate(), must be classified into a CellOutcome rather than
+    escaping run_cell() uncaught (which would abort run_matrix() and discard
+    every already-billed cell with no report ever written).
+    """
+
+    def test_host_start_failure_still_shuts_down_and_returns_a_cell_outcome(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        shutdown_calls: list[bool] = []
+
+        class _FailingStartHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            async def start(self) -> None:
+                raise RuntimeError("startup exploded")
+
+            async def connect(self, _h: Any) -> str:
+                raise AssertionError("connect() must not be reached if start() failed")
+
+            async def _handle_transcript(self, *_a: Any, **_k: Any) -> Any:
+                raise AssertionError("a turn must not run if start() failed")
+
+            async def shutdown(self) -> None:
+                shutdown_calls.append(True)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FailingStartHost()
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"),))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "startup exploded" in (outcome.error or "")
+        # The whole point of finding 2: shutdown() still runs even though
+        # start() never succeeded, so cached provider clients are released.
+        assert shutdown_calls == [True]
+
+    def test_judge_evaluate_raising_is_classified_as_judge_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _RaisingJudge:
+            def __init__(self, *_a: Any, **_k: Any) -> None:
+                pass
+
+            def add_user_message(self, _text: str) -> None:
+                pass
+
+            def add_assistant_message(self, _text: str) -> None:
+                pass
+
+            async def evaluate(self, _criterion: str) -> Any:
+                raise RuntimeError("judge backend unreachable")
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+        )
+        del outcome  # the _run_cell helper already queues a stub judge class
+
+        # Re-run with a judge whose evaluate() itself raises, proving
+        # run_cell() classifies that as judge-error for the turn instead of
+        # letting the exception propagate out of run_cell()/run_matrix().
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+
+            def _result_factory(_q: str) -> Any:
+                return _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+
+            return _FakeHost(_result_factory)
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(
+            eval_runner,
+            "latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _RaisingJudge)
+
+        result = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="weather in Riga?", judge_criterion="x"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # The cell completed (run_cell did not raise) and the turn is
+        # classified as judge-error, not silently absent from the report.
+        assert result.status == "ok"
+        assert result.turns[0].judge_verdict == "judge-error"
+        assert "judge backend unreachable" in (result.turns[0].judge_reason or "")
+
+
+class TestJudgeEvaluateIsBoundedByATimeout:
+    """Regression for round 9 gauntlet, Codex P2 finding 1: a stalled/
+    unreachable judge endpoint previously had no bound at all and could hold
+    the whole matrix for minutes.
+    """
+
+    def test_a_hanging_judge_call_is_classified_as_judge_error_not_hung_forever(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _HangingJudge:
+            def __init__(self, *_a: Any, **_k: Any) -> None:
+                pass
+
+            def add_user_message(self, _text: str) -> None:
+                pass
+
+            def add_assistant_message(self, _text: str) -> None:
+                pass
+
+            async def evaluate(self, _criterion: str) -> Any:
+                await asyncio.sleep(10)
+                raise AssertionError("should have timed out before completing")
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(
+            eval_runner,
+            "latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _HangingJudge)
+        # Keep the test fast: the timeout mechanism, not the specific bound,
+        # is under test here.
+        monkeypatch.setattr(eval_runner, "_JUDGE_EVALUATE_TIMEOUT_SECONDS", 0.05)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        result = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="weather in Riga?", judge_criterion="x"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert result.status == "ok"
+        assert result.turns[0].judge_verdict == "judge-error"
+        assert "timeout" in (result.turns[0].judge_reason or "").lower()
+
+
+class TestManifestStalenessFailsClosed:
+    """Regression for finding 5: an unverifiable identity -- a manifest
+    missing source_commit, or a current-commit lookup that itself failed --
+    must be treated as stale (fail closed), not silently accepted as fresh.
+    """
+
+    def test_missing_source_commit_is_treated_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "abc123")
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "manifest_version": 1,
+                    "source_commit": None,
+                    "results": [],
+                }
+            )
+        )
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+
+    def test_unresolvable_current_commit_is_treated_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(eval_runner, "git_head", lambda: None)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+
+    def test_matching_verifiable_identity_is_not_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: False)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is False
+
+    def test_dirty_source_tree_is_treated_as_stale_despite_matching_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: a matching HEAD alone must not clear staleness if the
+        manifest-attested source files (server/router.py,
+        server/workers/web_search.py, server/config.py) carry uncommitted
+        edits -- ``git rev-parse HEAD`` would still match the manifest even
+        though the tree it describes is no longer the tree in front of the
+        runner.
+        """
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: True)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+
+    def test_unverifiable_dirty_check_is_treated_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail-closed: a broken git invocation for the dirty-tree check
+        (``_source_tree_dirty()`` returning ``None``) must not be read as
+        "clean", mirroring ``git_head()`` returning ``None``.
+        """
+        monkeypatch.setattr(eval_runner, "git_head", lambda: "deadbeef")
+        monkeypatch.setattr(eval_runner, "_source_tree_dirty", lambda: None)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.stale is True
+
+
+class TestSourceTreeDirtyCheckIsWholeTreeAttested:
+    """Regression for round 9 gauntlet, Architecture lens finding 15: round
+    7, 8, and 9 of the review gauntlet each independently found one more
+    file a hand-enumerated ``_MANIFEST_ATTESTED_PATHS`` tuple was missing.
+    Replaced with whole-tree attestation over ``server/``, ``scripts/`` and
+    ``evals/`` -- a dirty file under any of those, not just a
+    previously-enumerated subset, must now be detected.
+    """
+
+    def test_attested_paths_cover_the_whole_server_tree_not_an_enumerated_subset(self) -> None:
+        assert eval_runner._MANIFEST_ATTESTED_PATHS == (
+            "server/",
+            "scripts/",
+            "evals/",
+        )
+
+    def test_every_attested_entry_is_a_directory_not_a_single_file(self) -> None:
+        """Round-3 restart gauntlet, Architecture finding: round 9's "whole
+        tree" fix left ``scripts/eval_common.py`` as a lone *file* entry.
+
+        The round-1/2 consolidation then moved shared helpers out of
+        eval_common.py into ``scripts/evidence_common.py`` -- which
+        eval_common.py imports but which no attested path covered -- so
+        uncommitted edits to that dependency stopped marking the manifest
+        stale. That is the enumerate-and-miss failure the whole-tree
+        attestation exists to end, recurring one level down in the import
+        graph. Requiring every entry to be a directory prefix makes it
+        unrepresentable: a new shared module under an attested tree is covered
+        the day it lands.
+        """
+        for entry in eval_runner._MANIFEST_ATTESTED_PATHS:
+            assert entry.endswith("/"), (
+                f"{entry!r} attests a single file; a file entry cannot cover a "
+                "module that file later grows a dependency on -- attest its "
+                "directory instead"
+            )
+
+    def test_a_dirty_shared_scripts_module_marks_the_tree_dirty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The concrete gap: ``scripts/evidence_common.py`` is not
+        ``scripts/eval_common.py``, so under the old tuple a dirty
+        evidence_common.py read as a clean tree."""
+        captured: dict[str, list[str]] = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return SimpleNamespace(
+                returncode=0, stdout=" M scripts/evidence_common.py\n", stderr=""
+            )
+
+        monkeypatch.setattr(eval_runner.subprocess, "run", _fake_run)
+
+        assert eval_runner._source_tree_dirty() is True
+        # The pathspec actually handed to git must be the directory, not the
+        # single file -- otherwise git would never have reported the above.
+        assert "scripts/" in captured["cmd"]
+        assert "scripts/eval_common.py" not in captured["cmd"]
+
+    def test_git_status_is_invoked_with_the_broadened_attested_paths(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, list[str]] = {}
+        real_run = eval_runner.subprocess.run
+
+        def _capturing_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return real_run(["git", "status", "--porcelain"], **kwargs)
+
+        monkeypatch.setattr(eval_runner.subprocess, "run", _capturing_run)
+
+        eval_runner._source_tree_dirty()
+
+        for attested_path in eval_runner._MANIFEST_ATTESTED_PATHS:
+            assert attested_path in captured["cmd"]
+        # Previously-enumerated single files (e.g. server/registry.py) are no
+        # longer named individually -- the whole "server/" directory covers
+        # them instead, which is exactly the point: a file this list never
+        # enumerated (e.g. server/app.py) is covered too.
+        assert "server/registry.py" not in captured["cmd"]
+
+
+class TestManifestWorkerEntryRequiresWebSearchTool:
+    """Regression for finding 10: a worker candidate's manifest entry must
+    declare the web_search tool it was actually probed with -- a
+    hand-edited/future-schema manifest that marks a worker tuple accepted
+    without it must not be treated as covering a live worker run.
+    """
+
+    def test_worker_entry_missing_web_search_tool_is_not_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_worker_entry(
+            eval_runner.WORKER_CANDIDATES[0].model, eval_runner.WORKER_CANDIDATES[0].effort
+        )
+        entry["tools"] = []  # hand-edited: declares no tools at all
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.WORKER_CANDIDATES[0], status) is False
+
+    def test_wrong_manifest_version_is_rejected_wholesale(self, tmp_path: Path) -> None:
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "manifest_version": 999,
+                    "source_commit": "deadbeef",
+                    "results": [
+                        _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+                    ],
+                }
+            )
+        )
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert status.accepted == frozenset()
+
+
+class TestManifestEntryRejectsMalformedEffortAndMissingRequestKwargs:
+    """Regression for round-5 gauntlet finding 9: a manifest entry whose
+    `effort` field is present but not a string/null must be rejected
+    outright, not silently coerced to None (which would make it read as the
+    verified unset-effort baseline); an entry missing `request_kwargs` (or
+    carrying a non-dict value) has no evidence Phase 0 actually probed it and
+    must also be rejected.
+    """
+
+    def test_malformed_effort_value_is_rejected_not_coerced_to_none(self, tmp_path: Path) -> None:
+        entry = _accepted_worker_entry(eval_runner.WORKER_CANDIDATES[0].model, None)
+        entry["effort"] = 0  # hand-edited: not a string, not null
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        # Must NOT be readable as the unset-effort (None) baseline entry.
+        assert ("worker", eval_runner.WORKER_CANDIDATES[0].model, None) not in status.accepted
+        assert status.accepted == frozenset()
+
+    def test_missing_request_kwargs_is_rejected(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        del entry["request_kwargs"]
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
+
+    def test_non_dict_request_kwargs_is_rejected(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        entry["request_kwargs"] = "not-a-dict"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
+
+
+class TestRequestKwargsRequiredKeysAreDerivedFromProductionBuilders:
+    """Regression for round 9 gauntlet, Architecture lens finding 16: the
+    required-key set ``_request_kwargs_shape_ok()`` enforces must be DERIVED
+    from ``build_router_request_kwargs``/``build_worker_request_kwargs``
+    (the production builders), not a hand-written literal -- so a new
+    load-bearing kwarg added to a builder is automatically required here
+    too, instead of this validator silently staying behind the builder it's
+    supposed to mirror.
+    """
+
+    def test_a_new_key_added_to_the_router_builder_is_now_required(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_builder = eval_runner.build_router_request_kwargs
+
+        def _builder_with_extra_key(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            kwargs_out = real_builder(*args, **kwargs)
+            kwargs_out["a_new_load_bearing_kwarg"] = "x"
+            return kwargs_out
+
+        monkeypatch.setattr(eval_runner, "build_router_request_kwargs", _builder_with_extra_key)
+
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        # A previously-fully-valid entry, missing only the NEW key the
+        # builder now emits.
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "router", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is False
+        )
+
+        entry["request_kwargs"]["a_new_load_bearing_kwarg"] = "x"
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "router", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is True
+        )
+
+    def test_a_new_key_added_to_the_worker_builder_is_now_required(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_builder = eval_runner.build_worker_request_kwargs
+
+        def _builder_with_extra_key(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            kwargs_out = real_builder(*args, **kwargs)
+            kwargs_out["a_new_load_bearing_kwarg"] = "x"
+            return kwargs_out
+
+        monkeypatch.setattr(eval_runner, "build_worker_request_kwargs", _builder_with_extra_key)
+
+        entry = _accepted_worker_entry(eval_runner.WORKER_CANDIDATES[0].model, "medium")
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "worker", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is False
+        )
+
+        entry["request_kwargs"]["a_new_load_bearing_kwarg"] = "x"
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "worker", entry["model"], entry["effort"], entry["request_kwargs"]
+            )
+            is True
+        )
+
+    def test_judge_required_keys_track_the_builder(self) -> None:
+        """Round-4 restart, Architecture Minor #6: the judge branch used to
+        hand-list model/reasoning_effort/messages instead of deriving them
+        from build_judge_request_kwargs(), unlike the router/worker branches
+        above -- so a new key added to the builder silently went unchecked.
+        """
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        required = set(
+            eval_runner.build_judge_request_kwargs(
+                entry["model"], messages=[{"role": "user", "content": "p"}]
+            )
+        ) - {"max_completion_tokens"}
+        assert required, "the judge builder produced no required keys -- fixture likely broken"
+
+        for key in required:
+            entry_missing_key = dict(entry["request_kwargs"])
+            del entry_missing_key[key]
+            assert (
+                eval_runner._request_kwargs_shape_ok(
+                    "judge", entry["model"], entry["effort"], entry_missing_key
+                )
+                is False
+            ), f"removing {key!r} should have failed the judge shape check"
+
+    def test_existing_fixtures_still_pass_with_the_derived_required_set(self) -> None:
+        # The router/worker fixtures already used throughout this file must
+        # not regress -- confirms the derived required set didn't
+        # accidentally widen to include "timeout"/"instructions"/"include",
+        # which this function's own docstring documents as non-load-bearing.
+        router_entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "router",
+                router_entry["model"],
+                router_entry["effort"],
+                router_entry["request_kwargs"],
+            )
+            is True
+        )
+        worker_entry = _accepted_worker_entry(eval_runner.WORKER_CANDIDATES[0].model, "medium")
+        assert (
+            eval_runner._request_kwargs_shape_ok(
+                "worker",
+                worker_entry["model"],
+                worker_entry["effort"],
+                worker_entry["request_kwargs"],
+            )
+            is True
+        )
+
+
+class TestManifestEntryRequestKwargsMustMatchItsOwnModelAndEffort:
+    """Regression for round 8 gauntlet, Codex P1 finding 2: an entry's
+    ``request_kwargs`` must actually name the same ``model``/effective
+    ``reasoning.effort`` as the entry's own recorded ``(model, effort)``
+    fields -- not just satisfy the shape check with some other candidate's
+    values. Without this, a malformed/stale entry could claim acceptance for
+    one (model, effort) pair while its ``request_kwargs`` evidence actually
+    describes a different one (or omits ``reasoning`` entirely), authorizing
+    a live paid run against a request shape Phase 0 never actually probed
+    for that candidate.
+    """
+
+    def test_router_entry_with_a_disagreeing_request_kwargs_model_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_router_entry(
+            eval_runner.ROUTER_CANDIDATES[0].model, eval_runner.ROUTER_CANDIDATES[0].effort
+        )
+        entry["request_kwargs"]["model"] = "some-other-model"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is False
+
+    def test_router_entry_missing_reasoning_for_a_non_minimal_effort_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_router_entry(
+            eval_runner.ROUTER_CANDIDATES[0].model, eval_runner.ROUTER_CANDIDATES[0].effort
+        )
+        del entry["request_kwargs"]["reasoning"]
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is False
+
+    def test_worker_entry_with_a_disagreeing_request_kwargs_effort_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_worker_entry(
+            eval_runner.WORKER_CANDIDATES[0].model, eval_runner.WORKER_CANDIDATES[0].effort
+        )
+        entry["request_kwargs"]["reasoning"] = {"effort": "an-unrelated-effort"}
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.WORKER_CANDIDATES[0], status) is False
+
+    def test_worker_entry_with_an_unset_effort_but_a_reasoning_kwarg_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_worker_entry(eval_runner.WORKER_BASELINE.model, None)
+        entry["request_kwargs"]["reasoning"] = {"effort": "high"}
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.WORKER_BASELINE, status) is False
+
+    def test_a_correctly_matching_entry_is_still_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(
+            eval_runner.ROUTER_CANDIDATES[0].model, eval_runner.ROUTER_CANDIDATES[0].effort
+        )
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_CANDIDATES[0], status) is True
+
+    def test_judge_entry_with_a_disagreeing_request_kwargs_model_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for round 9 gauntlet, Codex P2 finding 2: the router
+        and worker branches already cross-checked request_kwargs["model"]
+        against the entry's own recorded model (round 8); the judge branch
+        didn't, so a malformed/stale judge entry could carry a different
+        model's request_kwargs and still pass validation.
+        """
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        entry["request_kwargs"]["model"] = "some-other-judge-model"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is False
+
+    def test_a_correctly_matching_judge_entry_is_still_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is True
+
+    def test_judge_entry_missing_reasoning_effort_is_rejected(self, tmp_path: Path) -> None:
+        """Regression for round 3 confirming pass, Codex P2 finding: the judge
+        branch never cross-checked request_kwargs["reasoning_effort"] against
+        what production actually sends for this model, so a hand-edited or
+        stale-overridden manifest entry could authorize a live run against a
+        gpt-5* judge request that was never probed with an effort pin at all
+        -- the exact request-shape gap the round-3 reasoning_effort fix
+        introduced without a manifest-side check for it.
+        """
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        del entry["request_kwargs"]["reasoning_effort"]
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is False
+
+    def test_judge_entry_with_a_disagreeing_reasoning_effort_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        entry = _accepted_judge_entry(eval_runner.DEFAULT_JUDGE_MODEL)
+        entry["request_kwargs"]["reasoning_effort"] = "high"
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.judge_accepted(eval_runner.DEFAULT_JUDGE_MODEL, status) is False
+
+
+class TestManifestGateRunMatrixDirectly:
+    """Regression for finding 15: run_matrix()'s own per-cell manifest check
+    is reachable independently of main()'s preflight -- a direct caller that
+    skips require_manifest_ok_for_live_run() still gets a manifest-rejected
+    cell instead of an unguarded live call.
+    """
+
+    def test_run_matrix_rejects_an_uncovered_candidate_without_a_preflight_call(
+        self, tmp_path: Path
+    ) -> None:
+        # Manifest only covers the baseline -- no preflight call was made.
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (Scenario(name="s", turns=(Turn(query="hi"),)),),
+                eval_runner.Config(),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+            )
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "manifest-rejected"
+
+    def test_rejected_cell_is_repeat_shaped_at_repeat_count_above_one(self, tmp_path: Path) -> None:
+        """Round 10 gauntlet, Codex F1: a manifest-rejected cell must carry
+        the same N-long ``repeats`` shape as every accepted cell so
+        ``build_report(..., repeat_count=N)`` doesn't advertise repetitions
+        the rejected cell never produced.
+        """
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (Scenario(name="s", turns=(Turn(query="hi"),)),),
+                eval_runner.Config(),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+                repeat_count=3,
+            )
+        )
+
+        assert len(outcomes) == 1
+        outcome = outcomes[0]
+        assert outcome.status == "manifest-rejected"
+        assert outcome.repeats is not None
+        assert len(outcome.repeats) == 3
+        for repeat in outcome.repeats:
+            assert repeat.status == "manifest-rejected"
+            assert repeat.error == "one or both candidates are absent from the manifest"
+
+        report = eval_runner.build_report(
+            outcomes, judge_model=eval_runner.DEFAULT_JUDGE_MODEL, repeat_count=3
+        )
+        assert "repetition_count_mismatch" not in report
+
+    def test_rejected_cell_at_repeat_count_one_preserves_repeats_none(self, tmp_path: Path) -> None:
+        """Identity-preserved shape at repeat_count=1 (default path):
+        _aggregate_cell_repeats returns repeats[0] unchanged, so the
+        rejected cell must still carry repeats=None, matching the pre-F1
+        behaviour exactly.
+        """
+        manifest_path = _write_manifest(
+            tmp_path,
+            source_commit="deadbeef",
+            results=[_accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")],
+        )
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_CANDIDATES[0], eval_runner.WORKER_BASELINE)
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (Scenario(name="s", turns=(Turn(query="hi"),)),),
+                eval_runner.Config(),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=status,
+                repeat_count=1,
+            )
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "manifest-rejected"
+        assert outcomes[0].repeats is None
+
+
+class TestOutputPathConfinement:
+    """Regression for finding 6: a ``--out`` path must not escape the repo
+    tree via ``..`` traversal, and must not follow an existing symlink.
+    """
+
+    def test_traversal_outside_the_repo_root_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            eval_runner.confined_output_path("../../etc/passwd", allowed_root=tmp_path)
+
+    def test_absolute_path_outside_the_repo_root_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            eval_runner.confined_output_path(Path("/etc/passwd"), allowed_root=tmp_path)
+
+    def test_a_path_within_the_root_is_accepted(self, tmp_path: Path) -> None:
+        resolved = eval_runner.confined_output_path("reports/out.json", allowed_root=tmp_path)
+        assert resolved == (tmp_path / "reports/out.json").resolve()
+
+    def test_an_existing_symlink_at_the_target_is_rejected(self, tmp_path: Path) -> None:
+        real_target = tmp_path / "real-secret.txt"
+        real_target.write_text("do not overwrite me")
+        symlink_path = tmp_path / "out.json"
+        symlink_path.symlink_to(real_target)
+
+        with pytest.raises(ValueError):
+            eval_runner.confined_output_path(symlink_path, allowed_root=tmp_path)
+
+    def test_write_no_follow_refuses_an_existing_symlink(self, tmp_path: Path) -> None:
+        real_target = tmp_path / "real-secret.txt"
+        real_target.write_text("do not overwrite me")
+        symlink_path = tmp_path / "out.json"
+        symlink_path.symlink_to(real_target)
+
+        with pytest.raises(OSError):
+            eval_runner.write_no_follow(symlink_path, "clobbered")
+        assert real_target.read_text() == "do not overwrite me"
+
+    def test_write_no_follow_refuses_a_fifo_instead_of_blocking(self, tmp_path: Path) -> None:
+        """Round-3 restart gauntlet, Architecture finding: ``write_no_follow``
+        was a fifth, already-diverged copy of the no-follow write primitive.
+
+        It opened with ``O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW`` and no
+        ``O_NONBLOCK`` and no regular-file check on the held fd -- so a FIFO
+        planted at this predictable, repo-relative ``--out`` path made the
+        open (and then the write) block the eval run indefinitely, the exact
+        gap ``evidence_common.write_bytes_no_follow`` documents ``O_NOFOLLOW``
+        as not covering. This test must complete promptly, not hang.
+        """
+        import os
+
+        from scripts.evidence_common import EvidenceGateError
+
+        fifo_path = tmp_path / "out.json"
+        os.mkfifo(fifo_path)
+
+        with pytest.raises((EvidenceGateError, OSError)):
+            eval_runner.write_no_follow(fifo_path, "payload")
+
+    def test_write_no_follow_still_writes_a_regular_file(self, tmp_path: Path) -> None:
+        """The delegation must not regress the ordinary path, including the
+        ``mkdir(parents=True)`` this wrapper keeps (the shared byte-level
+        writer does not create directories)."""
+        out_path = tmp_path / "nested" / "deeper" / "out.json"
+        eval_runner.write_no_follow(out_path, '{"ok": true}')
+        assert out_path.read_text(encoding="utf-8") == '{"ok": true}'
+
+
+class TestReportIsPersistedByDefault:
+    """Regression for round 8 gauntlet, Codex P2 finding 2: the dev plan's
+    Architecture & Call Flow table requires the aggregate report to persist
+    to a file, not just print a summary. A run with no ``--out`` must still
+    write a report file (to a timestamped default path), not silently
+    discard it.
+    """
+
+    def _run_to_completion(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, extra_args: list[str]
+    ) -> tuple[int, Path]:
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+        # confined_output_path() confines the write to REPO_ROOT -- patch it
+        # to tmp_path too, alongside DEFAULT_REPORT_DIR, so the default
+        # timestamped path passes confinement without writing into the real
+        # repo tree.
+        monkeypatch.setattr(eval_runner, "REPO_ROOT", tmp_path)
+        report_dir = tmp_path / "eval-reports"
+        monkeypatch.setattr(eval_runner, "DEFAULT_REPORT_DIR", report_dir)
+        exit_code = eval_runner.main(
+            [
+                "--router",
+                "baseline",
+                "--worker",
+                "baseline",
+                "--scenario",
+                "single-turn-default",
+                "--i-know-the-manifest-is-stale",
+                *extra_args,
+            ]
+        )
+        return exit_code, report_dir
+
+    def test_a_run_with_no_out_flag_still_writes_a_report_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _exit_code, report_dir = self._run_to_completion(monkeypatch, tmp_path, extra_args=[])
+
+        written = list(report_dir.glob("eval-report-*.json"))
+        assert len(written) == 1
+        report = json.loads(written[0].read_text())
+        assert "overall_status" in report
+
+    def test_an_explicit_out_flag_still_wins_over_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # confined_output_path() confines --out to REPO_ROOT -- patch it to
+        # tmp_path too so an explicit tmp_path-relative --out passes
+        # confinement without writing into the real repo tree.
+        monkeypatch.setattr(eval_runner, "REPO_ROOT", tmp_path)
+        explicit_path = tmp_path / "my-report.json"
+        _exit_code, report_dir = self._run_to_completion(
+            monkeypatch, tmp_path, extra_args=["--out", str(explicit_path)]
+        )
+
+        assert explicit_path.exists()
+        assert not report_dir.exists()
+
+    def test_two_runs_within_the_same_second_do_not_collide(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Regression for round 9 gauntlet, Codex P2 finding 4: a bare
+        seconds-resolution default filename let a second run finishing
+        within the same UTC second silently overwrite the first run's
+        report via write_no_follow()'s O_TRUNC.
+        """
+
+        class _FrozenDatetime(eval_runner.datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return cls(2026, 8, 19, 12, 0, 0, tzinfo=tz)
+
+        monkeypatch.setattr(eval_runner, "datetime", _FrozenDatetime)
+
+        self._run_to_completion(monkeypatch, tmp_path, extra_args=[])
+        self._run_to_completion(monkeypatch, tmp_path, extra_args=[])
+
+        report_dir = tmp_path / "eval-reports"
+        written = list(report_dir.glob("eval-report-*.json"))
+        assert len(written) == 2
+        assert written[0].name != written[1].name
+
+
+class TestReportWriteFailureNeverDiscardsTheConsoleSummary:
+    """Round 11 gauntlet, Logic finding 2: round 8's persist-before-
+    summarize reorder closed one data-loss path but opened the mirror-
+    image one -- a rejected/failed report write ``return 1``'d before
+    ``print_report_summary(report)`` ever ran, discarding the already-billed
+    run's only remaining record. Two independent fixes: a pre-flight check
+    of ``--out`` before any paid call, and printing the summary on the
+    residual write-failure path too.
+    """
+
+    def test_an_out_path_outside_repo_root_is_rejected_before_run_matrix_is_ever_called(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def _run_matrix_must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("run_matrix() must not be reached -- pre-flight must fire first")
+
+        monkeypatch.setattr(eval_runner, "run_matrix", _run_matrix_must_not_be_called)
+
+        # tmp_path is outside the real REPO_ROOT (unpatched here on purpose --
+        # the pre-flight must fire using the real confinement root, before
+        # anything else runs).
+        outside_path = tmp_path / "outside-report.json"
+
+        exit_code = eval_runner.main(["--out", str(outside_path)])
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "refusing to write report" in captured.err
+
+    def test_a_write_failure_after_the_run_still_prints_the_console_summary(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(eval_common, "build_session_for_run", _raise_network_access)
+        monkeypatch.setattr(
+            eval_runner, "build_session_for_run", _raise_network_access, raising=False
+        )
+        monkeypatch.setattr(
+            eval_runner, "load_config", lambda: eval_runner.Config(openai_api_key="test-key")
+        )
+        monkeypatch.setattr(eval_runner, "REPO_ROOT", tmp_path)
+        monkeypatch.setattr(eval_runner, "DEFAULT_REPORT_DIR", tmp_path / "eval-reports")
+
+        def _write_no_follow_raises(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(eval_runner, "write_no_follow", _write_no_follow_raises)
+
+        exit_code = eval_runner.main(
+            [
+                "--router",
+                "baseline",
+                "--worker",
+                "baseline",
+                "--scenario",
+                "single-turn-default",
+                "--i-know-the-manifest-is-stale",
+            ]
+        )
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "refusing to write report" in captured.err
+        # The already-billed run's console record must still print, in the
+        # same place a successful run would print it -- not silently
+        # discarded alongside the file this run failed to write.
+        assert "overall:" in captured.out
+
+
+class TestSpendLimitValidation:
+    """Regression for finding 12: --max-cost must reject non-finite (NaN/inf)
+    values -- a NaN spend limit makes every comparison in _confirm_spend's
+    `exceeds` check false, so it would otherwise be silently treated as an
+    unbounded budget instead of the intended cap. --max-calls must reject
+    negative values too.
+    """
+
+    def test_max_cost_rejects_nan(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-cost", "nan"])
+
+    def test_max_cost_rejects_infinity(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-cost", "inf"])
+
+    def test_max_cost_rejects_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-cost", "-1.0"])
+
+    def test_max_calls_rejects_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-calls", "-1"])
+
+    def test_max_cost_accepts_a_normal_value(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        args = parser.parse_args(["--max-cost", "5.0"])
+        assert args.max_cost == 5.0
+
+
+class TestRoutingBudgetRejectsNonFinite:
+    """Regression: --max-routing-seconds must reject NaN/inf the same way
+    --max-cost/--max-calls do. run_cell()'s blocking-budget check
+    (`routing_ms > max_routing_seconds * 1000`) is false for both nan and
+    inf, so an unvalidated NaN/inf value silently disables routing-budget
+    enforcement instead of erroring on bad input.
+    """
+
+    def test_rejects_nan(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "nan"])
+
+    def test_rejects_infinity(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "inf"])
+
+    def test_rejects_zero_or_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "0"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "-1.0"])
+
+    def test_accepts_a_normal_value(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        args = parser.parse_args(["--max-routing-seconds", "15.0"])
+        assert args.max_routing_seconds == 15.0
+
+
+class TestFullMatrixConflictsWithSingleCellSelection:
+    """Regression for finding 14: --full-matrix silently losing to --router/
+    --worker (rather than erroring) would make a typo'd or copy-pasted
+    --full-matrix flag look accepted but have no effect."""
+
+    def test_full_matrix_with_router_flag_errors_explicitly(self) -> None:
+        with pytest.raises(SystemExit):
+            eval_runner.main(["--full-matrix", "--router", "baseline", "--dry-run"])
+
+    def test_full_matrix_with_worker_flag_errors_explicitly(self) -> None:
+        with pytest.raises(SystemExit):
+            eval_runner.main(["--full-matrix", "--worker", "baseline", "--dry-run"])
+
+    def test_full_matrix_alone_is_still_allowed(self) -> None:
+        # Must not raise: no --router/--worker present.
+        exit_code = eval_runner.main(["--full-matrix", "--dry-run"])
+        assert exit_code == 0
+
+
+class TestMainPreflightsDuplicatePairLabels:
+    """Round 6 gauntlet, Logic G3: a duplicate pair label in the resolved
+    matrix is the one way `_shipped_config_cells_annotation`'s
+    `pair_label -> RunPair` lookup can lose track of a pair, and it is fully
+    knowable before any paid call. main() must catch it pre-flight (before
+    print_matrix_preview / --dry-run's own preview) rather than let a paid
+    matrix run reach build_report()'s annotation and only degrade there.
+
+    Round 7 F6: the uniqueness check itself moved into `_dedupe_pairs`
+    (raised as `ValueError`, see its own tests in
+    `TestDedupePairsRejectsCollidingLabels`); main() is now just a
+    try/except ValueError wrapper around `_resolve_pairs()` that reports the
+    error and exits 1 before any spend, same operator-visible contract as
+    before (`refusing to run: ...` on stderr, exit code 1) but sourced from
+    the shared invariant instead of a second, main()-local check.
+    """
+
+    def test_duplicate_pair_labels_are_refused_before_any_paid_call(
+        self, monkeypatch: Any, capsys: Any
+    ) -> None:
+        baseline = eval_runner.default_sweep_pairs()[0]
+
+        def _resolve_pairs_raises(args: Any) -> tuple[eval_runner.RunPair, ...]:
+            # What _dedupe_pairs (called internally by default_sweep_pairs()/
+            # full_matrix_pairs()) actually raises on a colliding pair label
+            # -- simulated here via monkeypatch rather than constructing a
+            # real registry collision, matching the prior test's shape.
+            # Round 8 gauntlet (Architecture finding 2): _dedupe_pairs raises
+            # PairInvariantError, not a bare ValueError, so main()'s catch can
+            # tell a pair-invariant violation apart from an unrelated
+            # ValueError/ConfigError; this monkeypatch must match that type or
+            # it stops pinning the real catch-and-report contract.
+            raise eval_runner.PairInvariantError(
+                f"colliding pair label(s) ['{baseline.label}']: two wire-distinct "
+                "cells share a report identity"
+            )
+
+        monkeypatch.setattr(eval_runner, "_resolve_pairs", _resolve_pairs_raises)
+
+        exit_code = eval_runner.main(["--dry-run"])
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "refusing to run" in captured.err
+        assert baseline.label in captured.err
+
+    def test_unique_pair_labels_are_unaffected(self) -> None:
+        # Sanity: the normal, non-colliding matrix still dry-runs cleanly.
+        exit_code = eval_runner.main(["--dry-run"])
+        assert exit_code == 0
+
+
+class TestDedupePairsRejectsCollidingLabels:
+    """Round 7 F6: pair-LABEL uniqueness -- previously enforced only in
+    main()'s pre-flight -- now lives in `_dedupe_pairs` itself, so a
+    programmatic caller of `default_sweep_pairs()`/`full_matrix_pairs()`
+    (not only the CLI) gets the full invariant
+    `_shipped_config_cells_annotation` depends on.
+    """
+
+    def test_dedupe_pairs_rejects_wire_distinct_pairs_sharing_a_label(self) -> None:
+        # Two pairs that are wire-DISTINCT (different router models, so
+        # _pair_cell_key differs and neither collapses in the dedup loop)
+        # but share a Candidate.label -- the only way a label collision
+        # survives past the wire-key dedup above it.
+        router_a = eval_runner.Candidate(label="dup", role="router", model="model-a", effort=None)
+        router_b = eval_runner.Candidate(label="dup", role="router", model="model-b", effort=None)
+        worker = eval_runner.WORKER_BASELINE
+        pairs = [eval_runner.RunPair(router_a, worker), eval_runner.RunPair(router_b, worker)]
+
+        with pytest.raises(ValueError, match="colliding pair label"):
+            eval_runner._dedupe_pairs(pairs)
+
+    def test_dedupe_pairs_allows_wire_distinct_pairs_with_distinct_labels(self) -> None:
+        # Sanity: the new check must not fire on the normal, non-colliding
+        # case -- pins that it is additive, not a regression on the existing
+        # wire-key dedup behavior.
+        pairs = eval_runner.default_sweep_pairs()
+        assert len(eval_runner._dedupe_pairs(list(pairs))) == len(pairs)
+
+
+class TestJudgeInputSanitization:
+    """Regression for finding 17: light defense-in-depth sanitization before
+    worker-sourced text reaches the judge's context."""
+
+    def test_control_characters_are_stripped(self) -> None:
+        dirty = "hello\x00\x07world"
+        assert eval_runner._sanitize_for_judge(dirty) == "helloworld"
+
+    def test_newlines_and_tabs_are_preserved(self) -> None:
+        text = "line one\nline two\ttabbed"
+        assert eval_runner._sanitize_for_judge(text) == text
+
+    def test_length_is_capped(self) -> None:
+        long_text = "a" * 10_000
+        assert len(eval_runner._sanitize_for_judge(long_text, max_len=100)) == 100
+
+
+class TestRunCellSetupExceptionsDontCrashTheMatrix:
+    """Regression for round-2 gauntlet finding 2: run_cell()'s own setup work
+    (config resolution, host/judge construction) previously sat OUTSIDE the
+    function's try/finally -- an exception there would propagate out of
+    run_cell() uncaught, and run_matrix() doesn't catch it either, so it
+    would abort the whole matrix and discard every already-billed cell with
+    no report ever written. Setup work is now inside the try, with a `host =
+    None` sentinel so the finally block only shuts down a host that was
+    actually constructed.
+    """
+
+    def test_per_run_config_raising_is_classified_setup_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            eval_runner,
+            "_per_run_config",
+            lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad config")),
+        )
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "bad config" in (outcome.error or "")
+
+    def test_judge_construction_raising_after_host_built_still_shuts_down_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Secondary bug in the same finding: host is constructed BEFORE the
+        # judge, so an exception during judge construction must not leak the
+        # already-constructed host -- shutdown() must still run.
+        shutdown_calls: list[bool] = []
+
+        class _TrackedHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            async def start(self) -> None:
+                raise AssertionError("start() must not be reached if judge construction failed")
+
+            async def connect(self, _h: Any) -> str:
+                raise AssertionError("connect() must not be reached")
+
+            async def _handle_transcript(self, *_a: Any, **_k: Any) -> Any:
+                raise AssertionError("a turn must not run")
+
+            async def shutdown(self) -> None:
+                shutdown_calls.append(True)
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", lambda *_a, **_k: _TrackedHost())
+        monkeypatch.setattr(
+            eval_runner,
+            "build_judge_llm_service",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("judge service unavailable")),
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "judge service unavailable" in (outcome.error or "")
+        assert shutdown_calls == [True]
+
+    def test_shutdown_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A shutdown() failure itself must not crash run_matrix or mask a
+        # genuinely "ok" cell's outcome by raising out of run_cell().
+        #
+        # Regression for round-3 gauntlet finding 3: this branch is only
+        # reachable when every turn already ran and succeeded (cell_status ==
+        # "ok" going into the finally block) -- shutdown() runs strictly
+        # after every turn, so "setup-error" was self-contradictory alongside
+        # N "ok" turns. Fixed to report "turn-error" instead (both are
+        # already infra-failure statuses, so no pass/fail behavior change).
+        class _FailingShutdownHost(_FakeHost):
+            async def shutdown(self) -> None:
+                raise RuntimeError("shutdown exploded")
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FailingShutdownHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(
+            eval_runner,
+            "latest_turn_stage_metrics",
+            lambda *_a, **_k: {"routing_ms": 10.0, "search_ms": 0.0, "total_ms": 10.0},
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "turn-error"
+        assert "shutdown exploded" in (outcome.error or "")
+
+
+class _FakeJudgeClient:
+    def __init__(self, *, raise_on_close: bool = False) -> None:
+        self.close_calls = 0
+        self._raise_on_close = raise_on_close
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self._raise_on_close:
+            raise RuntimeError("judge client close exploded")
+
+
+class _FakeJudgeService:
+    def __init__(self, client: _FakeJudgeClient) -> None:
+        self._client = client
+
+
+class TestRunCellClosesJudgeService:
+    """Round 10 gauntlet, Logic finding 2: run_cell() built a fresh judge
+    LLM service (and its AsyncOpenAI/httpx connection pool) every call but
+    never closed it -- ``--repeat`` multiplies the leak. The judge client
+    must now be closed in run_cell()'s existing finally, alongside
+    host.shutdown(), with the same never-mask-the-outcome guard.
+    """
+
+    def test_judge_client_is_closed_exactly_once_on_a_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient()
+        service = _FakeJudgeService(client)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+        assert client.close_calls == 1
+
+    def test_judge_client_is_still_closed_when_the_host_path_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient()
+        service = _FakeJudgeService(client)
+
+        class _RaisingHost:
+            state = _FakeState()
+            registry = _FakeRegistry()
+
+            async def start(self) -> None:
+                raise RuntimeError("host start exploded")
+
+            async def connect(self, _h: Any) -> str:
+                raise AssertionError("connect() must not be reached")
+
+            async def _handle_transcript(self, *_a: Any, **_k: Any) -> Any:
+                raise AssertionError("a turn must not run")
+
+            async def shutdown(self) -> None:
+                pass
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", lambda *_a, **_k: _RaisingHost())
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert "host start exploded" in (outcome.error or "")
+        assert client.close_calls == 1
+
+    def test_judge_close_failure_is_reported_on_an_otherwise_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient(raise_on_close=True)
+        service = _FakeJudgeService(client)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # An otherwise-clean cell must not silently stay "ok" once the
+        # judge-close cleanup itself fails.
+        assert outcome.status == "turn-error"
+        assert "judge client close exploded" in (outcome.error or "")
+
+    def test_judge_close_failure_does_not_overwrite_an_already_failed_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeJudgeClient(raise_on_close=True)
+        service = _FakeJudgeService(client)
+
+        monkeypatch.setattr(
+            eval_runner,
+            "_per_run_config",
+            lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad config")),
+        )
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: service)
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # judge_service is never constructed on this path (the exception
+        # fires before build_judge_llm_service is called), so the original
+        # setup-error outcome must survive untouched.
+        assert outcome.status == "setup-error"
+        assert "bad config" in (outcome.error or "")
+        assert client.close_calls == 0
+
+    def test_build_judge_llm_service_returning_none_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+
+
+class _RecordingProviderClient:
+    def __init__(self, *, raise_on_close: bool = False) -> None:
+        self.close_calls = 0
+        self._raise_on_close = raise_on_close
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self._raise_on_close:
+            raise RuntimeError("provider client close exploded")
+
+
+class _FakeHostWithProviderClients(_FakeHost):
+    """Extends the shared ``_FakeHost`` harness with the same
+    ``registry.responses._client`` / ``coordinator.router._call._responses.
+    _client`` shape ``close_session_provider_clients()`` reaches through, so
+    ``run_cell()`` can be exercised end-to-end without a real SDK client.
+    """
+
+    def __init__(self, result_factory: Any, *, worker_client: Any, router_client: Any) -> None:
+        super().__init__(result_factory)
+        self.registry = SimpleNamespace(
+            workers=[], responses=SimpleNamespace(_client=worker_client)
+        )
+        router_call = SimpleNamespace(_responses=SimpleNamespace(_client=router_client))
+        self.coordinator = SimpleNamespace(router=SimpleNamespace(_call=router_call))
+
+
+class TestRunCellClosesSessionProviderClients:
+    """Round 11 gauntlet, Codex F1: run_cell() closed the judge client
+    (round 10 F2) but never the router/worker Responses clients
+    build_session_for_run() constructs per cell -- SessionHost.shutdown()
+    never touches them either. Both must now be closed in run_cell()'s
+    existing finally, alongside host.shutdown() and the judge close, with
+    the same never-mask-the-outcome guard.
+    """
+
+    def test_both_provider_clients_are_closed_on_a_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_client = _RecordingProviderClient()
+        router_client = _RecordingProviderClient()
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHostWithProviderClients(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                ),
+                worker_client=worker_client,
+                router_client=router_client,
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+        assert worker_client.close_calls == 1
+        assert router_client.close_calls == 1
+
+    def test_a_missing_hop_is_a_clean_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The plain _FakeHost harness has no registry.responses/coordinator
+        # shape at all -- close_session_provider_clients() must no-op
+        # through every missing hop rather than raising.
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                )
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "ok"
+
+    def test_a_provider_close_failure_is_reported_on_an_otherwise_clean_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_client = _RecordingProviderClient()
+        router_client = _RecordingProviderClient(raise_on_close=True)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHostWithProviderClients(
+                lambda _q: _FakeResult(
+                    ui_text="a distinctly non-fallback reply",
+                    spoken_text="a distinctly non-fallback spoken reply",
+                    citations=[],
+                    turn_id="turn-1",
+                ),
+                worker_client=worker_client,
+                router_client=router_client,
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # An otherwise-clean cell must not silently stay "ok" once the
+        # provider-close cleanup itself fails; the pre-existing "ok" status
+        # is downgraded, not overwritten by a status that already explains
+        # a real failure (see the sibling test below).
+        assert outcome.status == "turn-error"
+        assert "close_session_provider_clients() raised" in (outcome.error or "")
+        assert "provider client close exploded" in (outcome.error or "")
+
+    def test_a_provider_close_failure_does_not_overwrite_an_already_failed_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_client = _RecordingProviderClient()
+        router_client = _RecordingProviderClient(raise_on_close=True)
+
+        class _RaisingHost(_FakeHostWithProviderClients):
+            async def _handle_transcript(self, query: str, *, origin: Any) -> Any:
+                del query, origin
+                raise RuntimeError("turn exploded")
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _RaisingHost(
+                lambda _q: _FakeResult(
+                    ui_text="unused",
+                    spoken_text="unused",
+                    citations=[],
+                    turn_id="turn-1",
+                ),
+                worker_client=worker_client,
+                router_client=router_client,
+            )
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        # "provider-error" (a real turn failure), not "turn-error" -- the
+        # never-mask-the-outcome guard only downgrades an "ok" cell; a cell
+        # that already failed for a real reason keeps that reason.
+        assert outcome.status == "provider-error"
+        assert "turn exploded" in (outcome.error or "")
+        assert "close_session_provider_clients() raised" not in (outcome.error or "")
+        assert router_client.close_calls == 1
+
+
+class TestNeverRanCellsAreBackfilledConsistently:
+    """Regression for round-3 gauntlet finding 2: cells that never ran any
+    turn were reported inconsistently depending on which code path produced
+    them. The router-config-mismatch early return and the manifest-rejected
+    early return in ``run_matrix()`` both left ``turns`` at its default
+    (rendering as ``[]`` in the report), while the exception-path fallback
+    backfilled ``N`` "skipped" ``TurnOutcome``s. Fixed by routing every
+    "never ran" producer through the shared ``_never_ran_cell()``/
+    ``_skipped_turn_outcomes()`` helpers.
+    """
+
+    def test_router_config_mismatch_backfills_all_turns_as_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Force the pre-call router assertion to fail by making the resolved
+        # model diverge from what the candidate claims -- no real Config
+        # subclassing needed, just monkeypatch resolve_router_model.
+        monkeypatch.setattr(
+            eval_runner.Config,
+            "resolve_router_model",
+            lambda self, _label: "some-other-model",
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                scenario,
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "setup-error"
+        assert len(outcome.turns) == 2
+        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
+        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
+        # The per-run Config had already been resolved by the time the
+        # mismatch was caught -- its provider timeouts must still be threaded
+        # into the CellOutcome, not dropped.
+        assert outcome.router_timeout_seconds is not None
+        assert outcome.foreground_search_timeout_seconds is not None
+
+    def test_manifest_rejected_cell_backfills_all_turns_as_skipped(self) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="turn one"), Turn(query="turn two")))
+        empty_status = eval_runner.ManifestStatus(
+            path=Path("/nonexistent"),
+            exists=True,
+            source_commit="deadbeef",
+            current_commit="deadbeef",
+            stale=False,
+            accepted=frozenset(),
+        )
+
+        outcomes = asyncio.run(
+            eval_runner.run_matrix(
+                (pair,),
+                (scenario,),
+                eval_runner.Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+                manifest_status=empty_status,
+            )
+        )
+
+        assert len(outcomes) == 1
+        outcome = outcomes[0]
+        assert outcome.status == "manifest-rejected"
+        assert len(outcome.turns) == 2
+        assert [t.status for t in outcome.turns] == ["skipped", "skipped"]
+        assert [t.query for t in outcome.turns] == ["turn one", "turn two"]
+
+
+class TestManifestDiagnosticsPrintEffectiveEffort:
+    """Regression for round-2 gauntlet finding 13: the "absent from manifest"
+    error and the dry-run matrix preview must print the EFFECTIVE (resolved)
+    effort, not the raw candidate.effort -- for the router baseline,
+    candidate.effort is None but the manifest lookup actually resolved and
+    checked "minimal" (server.router.effective_router_reasoning_effort's
+    gpt-5* conditional). Printing the raw None would show an operator a
+    combination that isn't the one actually looked up.
+    """
+
+    def test_missing_baseline_error_names_the_effective_effort_not_none(
+        self, tmp_path: Path
+    ) -> None:
+        # Manifest exists but doesn't cover the router baseline at all.
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        with pytest.raises(eval_runner.ManifestError) as excinfo:
+            eval_runner.require_manifest_ok_for_live_run(
+                status,
+                allow_stale=True,
+                candidates=(eval_runner.ROUTER_BASELINE,),
+                judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            )
+
+        message = str(excinfo.value)
+        assert "@minimal" in message
+        assert "@None" not in message
+
+    def test_dry_run_preview_prints_effective_effort_for_the_baseline_pair(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (Scenario(name="s", turns=(Turn(query="hi"),)),),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+        )
+
+        out = capsys.readouterr().out
+        assert "router=gpt-5-mini@minimal" in out
+        assert "router=gpt-5-mini@None" not in out
+
+
+# ---------------------------------------------------------------------------
+# Round 4 gauntlet regressions.
+# ---------------------------------------------------------------------------
+
+
+class TestLatencyBudgetRejectsNonFinite:
+    """Regression for round-4 finding 1: --max-latency-seconds must reject
+    NaN/inf/non-positive the same way --max-routing-seconds does. run_cell()'s
+    blocking-budget check (`total_ms > max_latency_seconds * 1000`) is false
+    for nan/inf, and even 0/-1 make every measured result exceed the limit.
+    """
+
+    def test_rejects_nan(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "nan"])
+
+    def test_rejects_infinity(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "inf"])
+
+    def test_rejects_zero_or_negative(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "0"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "-1000"])
+
+    def test_accepts_a_normal_value(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        args = parser.parse_args(["--max-latency-seconds", "60.0"])
+        assert args.max_latency_seconds == 60.0
+
+    def test_error_message_names_the_correct_flag(self) -> None:
+        parser = eval_runner.build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-latency-seconds", "not-a-number"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--max-routing-seconds", "not-a-number"])
+
+
+class TestForegroundTimeoutIsClassifiedAsTimeoutNotSemanticFailure:
+    """Regression for round-4 finding 2: the foreground-search-timeout
+    placeholder text must be classified as a "timeout" infra outcome, not
+    scored as a semantic judge/citations failure -- previously only 3 of 7
+    degraded/failure texts were covered by SAFE_FALLBACK_TEXTS.
+    """
+
+    def test_timeout_placeholder_marks_the_turn_status_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text=("That is taking longer than expected; I will continue in the background."),
+        )
+
+        assert outcome.status == "timeout"
+        assert outcome.turns[0].status == "timeout"
+
+    def test_timeout_placeholder_never_reaches_the_judge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text=("That is taking longer than expected; I will continue in the background."),
+            judge_recorder=recorder,
+        )
+
+        assert all(not judge.assistant_messages for judge in recorder)
+
+    def test_other_safe_fallback_texts_are_still_provider_error_not_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather?", judge_criterion="names a temperature"),),
+            ui_text="The search service is busy; please try again shortly.",
+        )
+
+        assert outcome.status == "provider-error"
+
+    def test_safe_fallbacks_and_timeout_fallbacks_are_re_exported_and_disjoint(self) -> None:
+        assert eval_common.SAFE_FALLBACKS.isdisjoint(eval_common.TIMEOUT_FALLBACKS)
+        assert (
+            "That is taking longer than expected; I will continue in the background."
+            in eval_common.TIMEOUT_FALLBACKS
+        )
+
+
+class TestManifestRouterEntryRequiresTextTool:
+    """Regression for round-4 finding 4: a router candidate's manifest entry
+    must declare the structured-output `text` shape it was actually probed
+    with -- kind/model/effort alone would authorize a request shape Phase 0
+    never verified for a hand-edited or faulty-verifier-produced manifest.
+    """
+
+    def test_router_entry_missing_text_tool_is_not_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        entry["tools"] = []  # hand-edited: declares no tools at all
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is False
+
+    def test_router_entry_with_text_tool_is_accepted(self, tmp_path: Path) -> None:
+        entry = _accepted_router_entry(eval_runner.ROUTER_BASELINE.model, "minimal")
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[entry])
+
+        status = eval_runner.load_manifest_status(manifest_path)
+
+        assert eval_runner.candidate_accepted(eval_runner.ROUTER_BASELINE, status) is True
+
+
+class TestNoneOrBareStrResultIsDiagnosedNotAnUncaughtAttributeError:
+    """Regression for round-4 finding 5: _handle_transcript() has documented
+    return paths that return None (background-status-only retained work item)
+    or a bare str transcript -- neither carries .ui_text, and previously the
+    bare AttributeError from accessing it escaped to the outer handler as an
+    undiagnostic generic "turn-error".
+    """
+
+    def test_none_result_produces_a_diagnostic_provider_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(lambda _query: None)
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+
+        from server.config import Config
+
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "provider-error"
+        assert outcome.turns[0].status == "provider-error"
+        assert "NoneType" in outcome.error
+
+    def test_bare_str_result_produces_a_diagnostic_provider_error_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+
+        def _fake_build_session_for_run(_config: Any, *, measurement_sink: Any = None) -> Any:
+            del measurement_sink
+            return _FakeHost(lambda _query: "a bare str transcript")
+
+        monkeypatch.setattr(eval_runner, "build_session_for_run", _fake_build_session_for_run)
+        monkeypatch.setattr("pipecat.evals.judge.EvalJudge", _make_stub_judge_class([], None))
+        monkeypatch.setattr(eval_runner, "build_judge_llm_service", lambda *_a, **_k: None)
+
+        from server.config import Config
+
+        outcome = asyncio.run(
+            eval_runner.run_cell(
+                pair,
+                Scenario(name="s", turns=(Turn(query="hi"),)),
+                Config(),
+                judge_model="gpt-5-mini",
+                max_routing_seconds=15.0,
+                max_latency_seconds=15.0,
+            )
+        )
+
+        assert outcome.status == "provider-error"
+        assert "str" in outcome.error
+
+
+class TestConfirmSpendHandlesEOFError:
+    """Regression for round-4 finding 6: a tty that receives EOF (Ctrl-D)
+    raises EOFError from input(), uncaught -- sys.stdin.isatty() doesn't rule
+    this out (it's a real tty, just one that got EOF). Must be treated as an
+    explicit decline, matching the "n" answer's return value.
+    """
+
+    def test_eof_error_is_treated_as_decline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        accounting = eval_runner.CallAccounting(router_calls=100, worker_calls=100, judge_calls=100)
+        monkeypatch.setattr(eval_runner.sys.stdin, "isatty", lambda: True)
+
+        def _raise_eof(_prompt: str) -> str:
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", _raise_eof)
+
+        result = eval_runner._confirm_spend(
+            accounting, max_calls=1, max_cost=None, assume_yes=False
+        )
+
+        assert result is False
+
+    def test_explicit_no_answer_returns_the_same_value_as_eof(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        accounting = eval_runner.CallAccounting(router_calls=100, worker_calls=100, judge_calls=100)
+        monkeypatch.setattr(eval_runner.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+        result = eval_runner._confirm_spend(
+            accounting, max_calls=1, max_cost=None, assume_yes=False
+        )
+
+        assert result is False
+
+
+class TestErrorTextStripsControlCharacters:
+    """Regression for round-4 finding 7: error_text() must strip ASCII
+    control characters (e.g. ANSI escape sequences a provider-exception body
+    could carry) before the text reaches a raw print() sink -- previously
+    only redaction/truncation were applied, and this filter existed only as
+    eval_model_comparison.py's local _sanitize_for_judge(), unused by
+    error_text()'s own raw-print call sites.
+    """
+
+    def test_ansi_escape_sequence_is_stripped(self) -> None:
+        exc = ValueError("bad response \x1b[31mRED\x1b[0m text")
+
+        text = eval_common.error_text(exc)
+
+        assert "\x1b" not in text
+        assert "RED" in text
+
+    def test_newline_and_tab_are_preserved(self) -> None:
+        exc = ValueError("line one\nline two\ttabbed")
+
+        text = eval_common.error_text(exc)
+
+        assert "\n" in text
+        assert "\t" in text
+
+    def test_strip_control_chars_is_shared_with_sanitize_for_judge(self) -> None:
+        raw = "clean\x07bell\x1b[2Jclear"
+
+        assert eval_common.strip_control_chars(raw) == eval_runner._sanitize_for_judge(raw)
+
+    def test_c1_control_range_is_stripped(self) -> None:
+        # Regression for round-5 gauntlet finding 8: the original pattern
+        # only covered ASCII C0 + DEL, not the C1 range (U+0080-U+009F) --
+        # mainstream terminals honor some of these too.
+        raw = "before\x9bmiddle\x85after"
+
+        text = eval_common.strip_control_chars(raw)
+
+        assert "\x9b" not in text
+        assert "\x85" not in text
+        assert "before" in text and "middle" in text and "after" in text
+
+    def test_bidi_override_characters_are_stripped(self) -> None:
+        # Regression for round-5 gauntlet finding 8: Unicode bidirectional
+        # overrides (U+202A-U+202E, U+2066-U+2069) could visually reorder an
+        # operator-facing error/report line in a terminal that honors them.
+        # Expressed as \N{...} escapes, not literal characters, so this
+        # source file never itself embeds an invisible/control code point.
+        rle = "\N{RIGHT-TO-LEFT EMBEDDING}"
+        pdf = "\N{POP DIRECTIONAL FORMATTING}"
+        lri = "\N{LEFT-TO-RIGHT ISOLATE}"
+        pdi = "\N{POP DIRECTIONAL ISOLATE}"
+        raw = f"safe{rle}evil{pdf}reversed{lri}iso{pdi}end"
+
+        text = eval_common.strip_control_chars(raw)
+
+        for bidi_char in (rle, pdf, lri, pdi):
+            assert bidi_char not in text
+        assert "safe" in text and "evil" in text and "reversed" in text
+
+
+# ---------------------------------------------------------------------------
+# Round 3 confirming pass regressions.
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixPreviewLabelsPerScenarioScope:
+    """Regression for round-3 confirming pass, Logic finding 2:
+    print_matrix_preview()'s per-scenario breakdown printed raw per-cell,
+    pre-retry counts right above the grand "Total calls:" line with nothing
+    naming the scope difference -- an operator approving spend from this
+    output could read the per-scenario numbers as summing to the total.
+    matrix_call_accounting() actually multiplies by len(pairs), by
+    repeat_count, AND by _RETRY_WORST_CASE_MULTIPLIER, so no single-factor
+    rescale would have made them line up; the fix relabels rather than
+    rescaling.
+    """
+
+    def test_per_scenario_breakdown_is_labelled_with_its_scope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"), Turn(query="there")))
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (scenario,),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+            repeat_count=3,
+        )
+
+        out = capsys.readouterr().out
+        assert "one config pair, one repeat, before retry worst case" in out
+
+    def test_per_scenario_router_count_is_unscaled(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"), Turn(query="there")))
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (scenario,),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+            repeat_count=3,
+        )
+
+        out = capsys.readouterr().out
+        router_calls, _worker_calls, _judge_calls = eval_runner.scenario_call_counts(scenario)
+        assert f"router={router_calls} " in out
+        assert router_calls == len(scenario.turns)
+
+    def test_total_calls_line_still_matches_matrix_call_accounting(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_path = _write_manifest(tmp_path, source_commit="deadbeef", results=[])
+        status = eval_runner.load_manifest_status(manifest_path)
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        scenario = Scenario(name="s", turns=(Turn(query="hi"), Turn(query="there")))
+
+        eval_runner.print_matrix_preview(
+            (pair,),
+            (scenario,),
+            judge_model=eval_runner.DEFAULT_JUDGE_MODEL,
+            status=status,
+            repeat_count=3,
+        )
+
+        out = capsys.readouterr().out
+        accounting = eval_runner.matrix_call_accounting((pair,), (scenario,), repeat_count=3)
+        assert f"total={accounting.total_calls}" in out
+
+
+class TestLatencyBudgetExceededPredicate:
+    """Regression for round-3 confirming pass, Architecture finding 5:
+    run_cell()'s per-turn live budget check and _aggregate_turn_repeats()'
+    recomputation from the aggregated means duplicated the same boolean
+    expression at two call sites -- a future edit to one (e.g. a `>=` vs `>`
+    fix) could silently desync from the other, contradicting round 10's
+    Logic finding 6 invariant that both must agree.
+    """
+
+    def test_returns_none_when_nothing_measured(self) -> None:
+        result = eval_runner._latency_budget_exceeded(
+            None, None, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert result is None
+
+    def test_returns_false_when_only_one_side_measured_and_within_budget(self) -> None:
+        result = eval_runner._latency_budget_exceeded(
+            None, 100.0, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert result is False
+
+    def test_boundary_is_strictly_greater(self) -> None:
+        at_budget = eval_runner._latency_budget_exceeded(
+            None, 60_000.0, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+        over_budget = eval_runner._latency_budget_exceeded(
+            None, 60_000.1, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert at_budget is False
+        assert over_budget is True
+
+    def test_routing_alone_can_exceed(self) -> None:
+        result = eval_runner._latency_budget_exceeded(
+            20_000.0, 100.0, max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert result is True
+
+    def test_run_cell_and_aggregate_use_the_same_predicate(self, monkeypatch: Any) -> None:
+        sentinel = object()
+        monkeypatch.setattr(
+            eval_runner, "_latency_budget_exceeded", lambda *args, **kwargs: sentinel
+        )
+        turn = eval_runner.TurnOutcome(
+            query="q",
+            status="ok",
+            routing_ms=10.0,
+            total_ms=20.0,
+        )
+
+        aggregated = eval_runner._aggregate_turn_repeats(
+            [turn, turn], max_routing_seconds=15.0, max_latency_seconds=60.0
+        )
+
+        assert aggregated.latency_budget_exceeded is sentinel
+
+    def test_run_cell_itself_also_uses_the_patched_predicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 11 gauntlet, Logic finding 4 (test-coverage gap): the test
+        above only ever exercised `_aggregate_turn_repeats()`'s use of
+        `_latency_budget_exceeded` -- `run_cell()` was never called, so the
+        "same predicate" claim this class's docstring makes was unpinned on
+        the `run_cell()` side. `run_cell()` only *stores* the predicate's
+        result (it never branches on its truthiness), so a non-bool sentinel
+        cannot distort control flow here -- safe to patch the same way.
+        """
+        sentinel = object()
+        monkeypatch.setattr(
+            eval_runner, "_latency_budget_exceeded", lambda *args, **kwargs: sentinel
+        )
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        outcome = _run_cell(monkeypatch, pair=pair, turns=(Turn(query="hi"),))
+
+        assert outcome.turns[0].latency_budget_exceeded is sentinel
+
+
+class TestDefaultSweepAnchorsOnShippedConfig:
+    """Regression for round-4 restart, Architecture finding 2: the sweep
+    varies one role at a time, so the production anchor for a router
+    candidate is (shipped_router x WORKER_BASELINE) -- already guaranteed
+    present by TestShippedConfigHasAnEvalCandidateCell -- not a live joint
+    shipped x shipped cell. default_sweep_pairs() no longer runs that joint
+    cell; build_report() names which already-present cells carry the shipped
+    router/worker instead.
+    """
+
+    @staticmethod
+    def _shipped_pair() -> tuple[eval_runner.Candidate, eval_runner.Candidate]:
+        # Same construction as tests/test_eval_common.py's
+        # TestShippedConfigHasAnEvalCandidateCell -- the repo-tracked
+        # config.toml, loaded with env={} so the anchor is the same on every
+        # machine.
+        return eval_runner.shipped_candidates()
+
+    def test_default_sweep_has_no_joint_shipped_cell(self) -> None:
+        shipped_router, shipped_worker = self._shipped_pair()
+        router_key = (
+            shipped_router.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_router),
+        )
+        worker_key = (
+            shipped_worker.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_worker),
+        )
+        baseline_router_key = (
+            eval_runner.ROUTER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.ROUTER_BASELINE),
+        )
+        baseline_worker_key = (
+            eval_runner.WORKER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.WORKER_BASELINE),
+        )
+        if router_key == baseline_router_key and worker_key == baseline_worker_key:
+            pytest.skip("shipped pair coincides with the historical baseline on this checkout")
+
+        pairs = eval_runner.default_sweep_pairs()
+
+        for pair in pairs:
+            pair_router_key = (
+                pair.router.model,
+                eval_runner.effective_effort_for_manifest_lookup(pair.router),
+            )
+            pair_worker_key = (
+                pair.worker.model,
+                eval_runner.effective_effort_for_manifest_lookup(pair.worker),
+            )
+            assert not (pair_router_key == router_key and pair_worker_key == worker_key)
+
+    def test_shipped_router_and_worker_each_have_a_one_role_varied_cell(self) -> None:
+        shipped_router, shipped_worker = self._shipped_pair()
+        router_key = (
+            shipped_router.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_router),
+        )
+        worker_key = (
+            shipped_worker.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_worker),
+        )
+        baseline_worker_key = (
+            eval_runner.WORKER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.WORKER_BASELINE),
+        )
+        baseline_router_key = (
+            eval_runner.ROUTER_BASELINE.model,
+            eval_runner.effective_effort_for_manifest_lookup(eval_runner.ROUTER_BASELINE),
+        )
+
+        pairs = eval_runner.default_sweep_pairs()
+
+        assert any(
+            (pair.router.model, eval_runner.effective_effort_for_manifest_lookup(pair.router))
+            == router_key
+            and (pair.worker.model, eval_runner.effective_effort_for_manifest_lookup(pair.worker))
+            == baseline_worker_key
+            for pair in pairs
+        )
+        assert any(
+            (pair.router.model, eval_runner.effective_effort_for_manifest_lookup(pair.router))
+            == baseline_router_key
+            and (pair.worker.model, eval_runner.effective_effort_for_manifest_lookup(pair.worker))
+            == worker_key
+            for pair in pairs
+        )
+
+    def test_report_annotates_the_shipped_cells(self) -> None:
+        shipped_router, shipped_worker = self._shipped_pair()
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+
+        report = eval_runner.build_report(
+            outcomes,
+            judge_model="judge",
+            shipped_cells=eval_runner.ShippedCellsInput(
+                shipped=(shipped_router, shipped_worker), pairs=pairs
+            ),
+        )
+
+        shipped_cells = report["shipped_config_cells"]
+        assert shipped_cells is not None
+        router_key = (
+            shipped_router.model,
+            eval_runner.effective_effort_for_manifest_lookup(shipped_router),
+        )
+        expected_router_cells = [
+            pair.label
+            for pair in pairs
+            if (pair.router.model, eval_runner.effective_effort_for_manifest_lookup(pair.router))
+            == router_key
+        ]
+        assert sorted(shipped_cells["router"]["cells"]) == sorted(expected_router_cells)
+        assert expected_router_cells  # sanity: the guaranteeing invariant actually holds here
+
+    def test_default_sweep_pairs_does_no_file_io(self, monkeypatch: Any) -> None:
+        # The dry-run contract reproduction: default_sweep_pairs() must not
+        # call load_config() (directly or via shipped_candidates()) -- that
+        # call now lives on the live-run-only path in main().
+        def _raise(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("default_sweep_pairs() must not read config.toml")
+
+        monkeypatch.setattr(eval_common, "load_config", _raise)
+
+        eval_runner.default_sweep_pairs()
+
+    def test_shipped_anchor_does_not_disturb_the_existing_sweep(self) -> None:
+        pairs = eval_runner.default_sweep_pairs()
+        expected_prefix_len = (
+            1 + len(eval_runner.ROUTER_CANDIDATES) + len(eval_runner.WORKER_CANDIDATES)
+        )
+
+        expected_prefix = [
+            eval_runner.RunPair(
+                eval_runner.ROUTER_BASELINE,
+                eval_runner.WORKER_BASELINE,
+                enforce_latency_budget=True,
+            )
+        ]
+        expected_prefix += [
+            eval_runner.RunPair(candidate, eval_runner.WORKER_BASELINE)
+            for candidate in eval_runner.ROUTER_CANDIDATES
+        ]
+        expected_prefix += [
+            eval_runner.RunPair(eval_runner.ROUTER_BASELINE, candidate)
+            for candidate in eval_runner.WORKER_CANDIDATES
+        ]
+
+        assert list(pairs[:expected_prefix_len]) == expected_prefix

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/v013-transport-browser-contract.json",
+  "title": "V013TransportBrowserContract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "reason",
+    "promotion_eligible",
+    "source_commit",
+    "source_tree_hash",
+    "package_version",
+    "package_integrity",
+    "source_anchor",
+    "fake_route_artifact_sha256",
+    "audibility"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "promotion_eligible",
+        "evidence_unavailable",
+        "blocked",
+        "not_run",
+        "real_stratum_missing",
+        "contaminated",
+        "malformed",
+        "unverified_source",
+        "invalid_fake_route",
+        "audibility_unverified"
+      ]
+    },
+    "reason": { "type": ["string", "null"] },
+    "promotion_eligible": { "type": "boolean" },
+    "source_commit": { "type": "string", "minLength": 1 },
+    "source_tree_hash": { "type": "string", "minLength": 1 },
+    "package_version": { "type": "string", "minLength": 1 },
+    "package_integrity": { "type": "string", "minLength": 1 },
+    "source_anchor": { "type": "string", "minLength": 1 },
+    "fake_route_artifact_sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "audibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["audibility_verified", "audibility_unverified"] },
+        "browser_name": { "type": "string", "minLength": 1 },
+        "browser_version": { "type": "string", "minLength": 1 },
+        "os_device_name": { "type": "string", "minLength": 1 },
+        "output_route": { "type": "string", "minLength": 1 },
+        "prior_user_gesture": { "type": "boolean" },
+        "check_method": { "type": "string", "minLength": 1 },
+        "checked_at_utc": { "type": "string", "format": "date-time" },
+        "runner_identity": { "type": "string", "minLength": 1 },
+        "checked_source_commit": { "type": "string", "minLength": 1 },
+        "checked_source_tree_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "route_artifact_sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "package_version": { "type": "string", "minLength": 1 },
+        "package_integrity": { "type": "string", "minLength": 1 },
+        "play_result": { "enum": ["resolved", "rejected", "not_attempted"] }
+      }
+    }
+  }
+}

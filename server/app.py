@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -34,28 +35,126 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import WorkerParams
 
-from .config import Config, load_config
+from .composition import build_session_host
+from .config import Config, load_config, load_promotion_manifest
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
+from .frames import SnapshotBarrierFlushFrame
+from .observers import ProjectedEvent, SnapshotBarrier
 from .perf_metrics import MeasurementSink, PerfConnectionContext, attach_framework_observers
-from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge
+from .pipeline import CanonicalResultAdapter, SessionHost, framework_bridge, resolve_bus
 from .preflight import ConfiguredServiceProbe, Probe, run_preflight
-from .registry import WorkerRegistry
-from .router import LazyRouterProvider, Router
+from .router import Router
 from .rtvi_messages import RTVIMessagePublisher
 from .services.factory import create_stt, create_tts
-from .speech_lifecycle import GenericProviderErrorObserver, TransportSpeechLifecycleProcessor
+from .speech_lifecycle import (
+    GenericProviderErrorObserver,
+    TransportSpeechLifecycleProcessor,
+)
 from .turns import FinalTurnTranscriptProcessor, smart_turn_processor
-from .work_item_coordinator import WorkItemCoordinator
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# Bounds on the URL-carried `capabilities` array: the handshake is a short
+# fixed vocabulary of capability names, so an oversized array or an
+# oversized name is malformed input, not a large-but-valid handshake.
+_MAX_CAPABILITY_ENTRIES = 16
+_MAX_CAPABILITY_NAME_LENGTH = 64
+# The widest well-formed field is a JSON array of the maximum number of
+# maximum-length names: brackets, one pair of quotes per name, and the commas
+# between them. Bounding the raw string keeps pathological input (deep nesting,
+# megabyte payloads) away from the parser rather than relying on the parser's
+# own limits.
+_MAX_CAPABILITY_FIELD_LENGTH = 2 + _MAX_CAPABILITY_ENTRIES * (_MAX_CAPABILITY_NAME_LENGTH + 3)
+
+
+_logging_configured = False
 
 
 def _configure_logging() -> None:
     """Disable Loguru's diagnose/backtrace rendering so tracebacks never dump
-    local variable values (transcripts, provider payloads, API keys) to logs."""
-    _loguru_logger.remove()
+    local variable values (transcripts, provider payloads, API keys) to logs.
+
+    Called from both ``create_app()`` (so ``uvicorn server.app:app`` direct-
+    ASGI serving -- which never runs ``main()`` -- still gets this hardening)
+    and ``main()`` (the CLI entrypoint, for processes that construct the app
+    some other way). Idempotent via ``_logging_configured`` so the second
+    call is a no-op rather than re-adding a duplicate hardened sink on every
+    request-serving process that happens to call both.
+
+    Removes only Loguru's own default handler (id ``0``, auto-installed with
+    ``diagnose=True``/``backtrace=True`` the moment ``loguru`` is imported),
+    never a blanket ``logger.remove()``: that used to strip every handler,
+    including one a caller/host process installed on the shared ``logger``
+    singleton before importing this module (see
+    ``TestLoguruStartupConfiguration.test_import_preserves_preexisting_handler``).
+
+    Removing only handler ``0`` has a residual gap this function cannot close
+    on its own: if anything reconfigured loguru *before* this module was
+    imported -- Pipecat's own dev runner does exactly
+    ``logger.remove(); logger.add(sys.stderr, level=...)``, and ``add()``
+    defaults to ``diagnose=True``/``backtrace=True`` -- then id ``0`` no
+    longer exists and the surviving sink still renders local variables.
+    ``_warn_about_unhardened_handlers`` names every such sink at startup
+    rather than silently removing it: stripping a handler the host process
+    deliberately installed is the regression commit 5f5541a exists to
+    prevent, so the residual risk is surfaced to the operator (who can
+    re-add the sink with ``backtrace=False, diagnose=False``) instead of
+    being traded for a different one.
+    """
+    global _logging_configured
+    if _logging_configured:
+        return
+    _logging_configured = True
+    with suppress(ValueError):
+        _loguru_logger.remove(0)
+    _warn_about_unhardened_handlers()
     _loguru_logger.add(sys.stderr, backtrace=False, diagnose=False)
+
+
+def _reset_logging_configuration() -> None:
+    """Clear the idempotence latch so a later ``_configure_logging()`` runs again.
+
+    ``_logging_configured`` is process-global and, without this, a one-way
+    latch for the process's whole lifetime: a caller that legitimately clears
+    loguru's handlers between two ``create_app()`` calls (tests do exactly
+    this) would silently get no hardened sink the second time. Exported as a
+    named seam rather than left to ``monkeypatch.setattr`` on a private
+    module global, so the reset is a supported operation with one definition.
+    """
+    global _logging_configured
+    _logging_configured = False
+
+
+def _unhardened_handler_ids() -> list[int]:
+    """Return the ids of installed loguru handlers that still render locals.
+
+    Reads loguru's private handler registry defensively (``getattr`` with
+    defaults throughout): this is best-effort diagnostics, and a loguru
+    version that renames these internals must degrade to "report nothing",
+    never to an exception on the startup path.
+    """
+    core = getattr(_loguru_logger, "_core", None)
+    handlers = getattr(core, "handlers", None) or {}
+    unhardened = []
+    for handler_id, handler in handlers.items():
+        # ``backtrace``/``diagnose`` are stored on the handler's exception
+        # formatter, which is also where tests/test_app.py asserts them.
+        formatter = getattr(handler, "_exception_formatter", None)
+        if getattr(formatter, "_backtrace", False) or getattr(formatter, "_diagnose", False):
+            unhardened.append(handler_id)
+    return unhardened
+
+
+def _warn_about_unhardened_handlers() -> None:
+    unhardened = _unhardened_handler_ids()
+    if not unhardened:
+        return
+    _loguru_logger.warning(
+        f"loguru handler id(s) {sorted(unhardened)} were installed by another component with "
+        "backtrace/diagnose enabled and are left in place; tracebacks rendered through them can "
+        "include local variable values (transcripts, provider payloads, credentials). Re-add "
+        "those sinks with backtrace=False, diagnose=False to close this."
+    )
 
 
 class _SpeechCompletionProcessor(FrameProcessor):
@@ -99,6 +198,32 @@ class _SpeechCompletionProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class _SnapshotBarrierConsumer(FrameProcessor):
+    """Resolves a `SnapshotBarrierFlushFrame`'s acknowledge handle.
+
+    Not literally the last processor before `transport.output()` --
+    `GenericProviderErrorObserver` and `TransportSpeechLifecycleProcessor`
+    are appended after it when a TTS/lifecycle pair is configured (see the
+    invariant comment at this class's call site in `_attach_connection`).
+    That position is still correct because both this frame and every RTVI
+    incremental (`RTVIServerMessageFrame`) are pipecat `SystemFrame`
+    instances, which pipecat routes through a dedicated per-processor queue
+    that bypasses the ordinary `DataFrame` queue entirely -- so relative
+    order between an incremental queued before this frame and one queued
+    after stays intact end-to-end regardless of how slow or stuck any
+    downstream `DataFrame`-only stage (e.g. TTS audio synthesis) is. The
+    frame is private and never reaches transport output.
+    """
+
+    async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, SnapshotBarrierFlushFrame):
+            if callable(frame.acknowledge):
+                frame.acknowledge()
+            return
+        await self.push_frame(frame, direction)
+
+
 def _tts_processors(host: SessionHost, runtime: Any) -> tuple[Any, ...]:
     """Choose exactly one completion signal for the configured TTS service."""
     if hasattr(runtime.tts, "on_event"):
@@ -106,8 +231,70 @@ def _tts_processors(host: SessionHost, runtime: Any) -> tuple[Any, ...]:
     return (runtime.tts, _SpeechCompletionProcessor(host, runtime))
 
 
+def _validate_raw_percent_encoding(raw_query_string: bytes) -> None:
+    """App-layer defense on the raw ASGI scope bytes (before any framework
+    decoding): reject a percent sign not followed by two ASCII hex digits.
+
+    Whether a malformed percent sequence even survives uvicorn's own HTTP
+    parser to reach ``scope["query_string"]`` is unverified parser behavior
+    (see the dev plan's Phase 3 uvicorn-probe bullet); this check is this
+    app's own defense for whatever bytes do arrive there.
+    """
+    text = raw_query_string.decode("latin-1")
+    index = 0
+    length = len(text)
+    hex_digits = "0123456789abcdefABCDEF"
+    while index < length:
+        if text[index] == "%":
+            pair = text[index + 1 : index + 3]
+            if len(pair) != 2 or pair[0] not in hex_digits or pair[1] not in hex_digits:
+                raise HTTPException(
+                    status_code=400, detail="invalid Small WebRTC session handshake"
+                )
+            index += 3
+        else:
+            index += 1
+
+
+def _decode_capabilities(request: Request) -> tuple[tuple[str, ...], bool]:
+    """Decode the canonical single URL-encoded JSON-array `capabilities` field.
+
+    Absent means omission (inherit-on-PATCH / unsupported-on-POST); present
+    but malformed is a 400, matching every other handshake field. The field
+    decodes through Starlette's ``QueryParams`` exactly like every other
+    handshake field -- one decoder per request -- and ``getlist`` (unlike
+    ``get``/``[]``) preserves duplicate keys, so a duplicate `capabilities`
+    key is rejected rather than silently collapsed. Duplicate entries inside
+    the single JSON array remain deduplicated by
+    ``SnapshotHandshake.validate_capabilities``.
+    """
+    matches = request.query_params.getlist("capabilities")
+    if not matches:
+        return (), False
+    if len(matches) > 1:
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    if len(matches[0]) > _MAX_CAPABILITY_FIELD_LENGTH:
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    try:
+        decoded = json.loads(matches[0])
+    except (TypeError, ValueError, RecursionError):
+        # RecursionError derives from RuntimeError, not ValueError: without it
+        # deeply nested input escapes as an uncaught 500 instead of a 400.
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    if not isinstance(decoded, list) or len(decoded) > _MAX_CAPABILITY_ENTRIES:
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    if any(
+        not isinstance(item, str) or not item or len(item) > _MAX_CAPABILITY_NAME_LENGTH
+        for item in decoded
+    ):
+        raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
+    return tuple(decoded), True
+
+
 def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandshake:
     """Parse a short-lived browser handshake token carried by the URL."""
+    _validate_raw_percent_encoding(request.scope.get("query_string", b""))
+    capabilities, capabilities_present = _decode_capabilities(request)
     try:
         value = SnapshotHandshake(
             contract_version=request.query_params.get("contract_version", CONTRACT_VERSION),
@@ -115,6 +302,8 @@ def _handshake_from_query(host: SessionHost, request: Request) -> SnapshotHandsh
             resume_token=request.query_params["resume_token"],
             proposed_epoch=int(request.query_params["proposed_epoch"]),
             snapshot_sequence=int(request.query_params.get("snapshot_sequence", "0")),
+            capabilities=capabilities,
+            capabilities_present=capabilities_present,
         )
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid Small WebRTC session handshake")
@@ -166,6 +355,29 @@ def _require_local_origin(request: Request, config: Config) -> None:
         raise HTTPException(status_code=403, detail="origin is not allowed for the local server")
 
 
+async def _close_setup_connection(connection: SmallWebRTCConnection) -> None:
+    """Best-effort close of the raw peer connection when setup aborts.
+
+    Neither ``ConnectionPipeline.shutdown`` nor the pipecat SmallWebRTC
+    request handler closes this on our behalf here: ``handle_web_request``
+    only logs an exception propagated from the connection callback (it never
+    calls ``connection.disconnect()`` itself), and ``shutdown()``'s worker
+    cancellation only reaches transport teardown once ``worker.run(...)``
+    has actually started consuming pipeline frames -- which none of the
+    three setup-failure paths in ``_attach_connection`` can guarantee. Only
+    a direct ``disconnect()`` call closes the peer connection in every case.
+    Calling it here is safe even when the transport later performs its own
+    teardown: ``SmallWebRTCClient.disconnect`` guards on
+    ``is_connected``/``is_closing`` and no-ops if already closed.
+    """
+    try:
+        await connection.disconnect()
+    except Exception:  # noqa: BLE001  # best-effort cleanup; never mask the original setup failure
+        _loguru_logger.exception(
+            "failed to close the Small WebRTC connection during setup teardown"
+        )
+
+
 async def _attach_connection(
     host: SessionHost,
     connection: SmallWebRTCConnection,
@@ -177,7 +389,8 @@ async def _attach_connection(
         if runtime.tts is not None and hasattr(runtime.tts, "connect"):
             await runtime.tts.connect()
         if not host.accepts(runtime.epoch):
-            await runtime.shutdown(reason="connection replaced during setup")
+            await runtime.shutdown(reason="connection replaced during setup", reconnect=True)
+            await _close_setup_connection(connection)
             return
         output_sample_rate = getattr(runtime.tts, "sample_rate", 24000)
         params = TransportParams(
@@ -187,13 +400,9 @@ async def _attach_connection(
             audio_out_sample_rate=output_sample_rate,
         )
         transport = SmallWebRTCTransport(connection, params)
-        bus = getattr(host.runner, "bus", None)
-        if bus is None:
-            from .pipeline import _ProbeBus
-
-            bus = _ProbeBus() if _ProbeBus is not None else None
+        bus = resolve_bus(getattr(host.runner, "bus", None))
         bridge = framework_bridge(bus=bus, worker_name=f"browser-{runtime.epoch}") if bus else None
-        config = getattr(host.registry, "config", None) or Config()
+        config = host.config
         processors = [transport.input()]
         if runtime.stt is not None:
             processors.extend(
@@ -208,7 +417,25 @@ async def _attach_connection(
                 )
             )
         if bridge is not None:
-            processors.extend((bridge, CanonicalResultAdapter()))
+            processors.extend(
+                (
+                    bridge,
+                    # This connection's own work_status_v1 entitlement, read at
+                    # frame time -- so the adapter's re-serialization asks the
+                    # single capability predicate instead of reconstructing it
+                    # from the already-serialized payload (round-5 restart,
+                    # Architecture Important).
+                    CanonicalResultAdapter(lambda: runtime.supports_work_status),
+                )
+            )
+        # Placed here, not after TransportSpeechLifecycleProcessor: that
+        # processor must remain the sole processor immediately before
+        # transport.output() (Phase 1 invariant). RTVIServerMessageFrame-type
+        # frames -- both this barrier frame and every status incremental --
+        # are queued directly onto the worker and pass straight through the
+        # TTS/lifecycle processors below untouched, so this position still
+        # proves every frame queued ahead of the barrier has drained past it.
+        processors.append(_SnapshotBarrierConsumer())
         if runtime.tts is not None:
             if runtime.lifecycle is not None:
                 processors.append(GenericProviderErrorObserver(runtime.lifecycle, runtime.tts))
@@ -253,8 +480,9 @@ async def _attach_connection(
             sink=host.measurement_sink,
         )
     except BaseException:
-        host.abort_connection(runtime)
-        await runtime.shutdown(reason="connection setup failed")
+        host.abort_connection(runtime, reconnect=False)
+        await runtime.shutdown(reason="connection setup failed", reconnect=False)
+        await _close_setup_connection(connection)
         raise
     try:
         publisher = RTVIMessagePublisher(
@@ -264,16 +492,50 @@ async def _attach_connection(
         runtime.worker = worker
         runtime.output_teardown = getattr(connection, "disconnect", None)
         if not host.accepts(runtime.epoch):
-            await runtime.shutdown(reason="connection replaced during setup")
+            await runtime.shutdown(reason="connection replaced during setup", reconnect=True)
+            await _close_setup_connection(connection)
             return
 
-        async def emit_frame(frame: Any) -> None:
-            if host.accepts(runtime.epoch):
-                await worker.queue_frame(frame)
+        # Seed the connection-projected sequence at the current snapshot
+        # watermark before subscribing, so the first delivered incremental
+        # is contiguous with whatever snapshot the client requests next
+        # (Phase 3 barrier ordering; see RuntimeObserver.seed, and
+        # RTVIMessagePublisher's docstring for who owns which sequence).
+        runtime.observer.seed(host.state.sequence)
+
+        async def emit_frame(projected: ProjectedEvent) -> None:
+            if not host.accepts(runtime.epoch):
+                return
+            message = publisher.incremental(
+                projected.kind,
+                projected.data,
+                sequence=projected.sequence,
+                origin_epoch=projected.origin_epoch,
+            )
+            if message is not None:
+                await worker.queue_frame(
+                    RTVIServerMessageFrame(data=message.model_dump(mode="json"))
+                )
 
         runtime.observer.subscribe(emit_frame)
 
         client_ready_sent = False
+        # Guards SnapshotBarrier construction-through-flush below: two
+        # concurrent snapshot-request messages on the same connection would
+        # otherwise open two barriers against the same observer/state pair
+        # and corrupt each other's watermark/buffer.
+        snapshot_lock = asyncio.Lock()
+        # Set by a snapshot-request that got coalesced away (found the lock
+        # already held) instead of simply being dropped. If the in-flight
+        # attempt fails without ever delivering a snapshot -- install_baseline
+        # raises, or publisher.snapshot() returns None -- a dropped coalesced
+        # request would otherwise strand the client: it already set
+        # snapshotRequestPending and discards every incremental until a
+        # snapshot arrives, and never retries on its own while that flag is
+        # set (web/src/state.js). The lock holder consults this flag after
+        # its own attempt and retries once if it is set, rather than queuing
+        # unboundedly for every coalesced request.
+        snapshot_recheck_requested = False
 
         @worker.rtvi.event_handler("on_client_ready")
         async def on_client_ready(_rtvi: Any) -> None:
@@ -284,8 +546,101 @@ async def _attach_connection(
                 client_ready_sent = True
                 publisher.client_ready(epoch=runtime.epoch)
 
+        async def attempt_snapshot_delivery() -> bool:
+            """One snapshot-delivery attempt under ``snapshot_lock``.
+
+            Returns ``True`` iff a snapshot was actually delivered to the
+            client, ``False`` on a failure that left nothing delivered (a
+            retry may be warranted). ``asyncio.CancelledError`` propagates
+            uncaught -- cancellation means this task itself is being torn
+            down, not a candidate for an in-place retry.
+            """
+            # Pause the observer before reading any state so no incremental
+            # captured from here on can be dispatched (via the emitter's
+            # asyncio.create_task scheduling) ahead of the snapshot -- the
+            # barrier owns synchronous SessionState._emit() callbacks between
+            # this point and install_baseline() below.
+            barrier = SnapshotBarrier(observer=runtime.observer, state=host.state)
+            barrier.subscribe_paused()
+            try:
+                publisher.set_snapshot(runtime.observer.snapshot())
+                snapshot = publisher.snapshot()
+            except asyncio.CancelledError:
+                barrier.cancel()
+                raise
+            except Exception:  # noqa: BLE001  # intentional catch-all: mirrors install_baseline's own must-not-leave-paused guarantee below
+                barrier.cancel()
+                _loguru_logger.warning(
+                    "snapshot construction failed; incremental delivery resumed "
+                    "without a new watermark"
+                )
+                return False
+            if snapshot is None:
+                barrier.cancel()
+                return False
+            # install_baseline() reseeds the observer's projected sequence at
+            # snapshot.sequence only after the barrier frame is acknowledged.
+            # The observer's projected sequence only advances for events
+            # visible to *this* connection, while the snapshot is stamped
+            # from the global SessionState watermark, which also advances
+            # for invisible events (a capability-gated work_status on a
+            # connection that never advertised work_status_v1). Reseeding
+            # from the value actually stamped on the wire -- publisher.snapshot()
+            # re-reads the sequence provider -- keeps the client's
+            # lastAppliedSequence and the observer's counter identical by
+            # construction, so the next incremental is snapshot_sequence + 1.
+            #
+            # Non-capable projections omit the status section entirely
+            # (field absent, not an empty array) so the frozen
+            # pre-Phase-3 runtime-snapshot schema still validates this
+            # connection's snapshots (Requirements). The exclusion is
+            # owned by RuntimeSnapshot.wire_payload, not by this caller.
+            # Read the entitlement off the observer, which is also what
+            # decides snapshot *content* (RuntimeObserver.snapshot() calls
+            # SessionState.snapshot(include_work_status=self.supports_work_status)).
+            # The content gate and this wire-presence gate are therefore
+            # provably one source, not two booleans kept in agreement by
+            # convention via ConnectionPipeline's proxy property.
+            # The snapshot frame is written *by* install_baseline, between
+            # the barrier acknowledgement and the buffered replay, so a
+            # buffered incremental can never reach the client ahead of the
+            # snapshot that establishes the watermark it applies against.
+            # ``wire_payload()`` is deliberately inside this try too -- it can
+            # raise (e.g. a monotonicity assertion in the payload/envelope
+            # validators), and that must not leave the observer paused any
+            # more than a failure inside ``install_baseline`` itself would.
+            try:
+                frame_data = snapshot.wire_payload(
+                    include_work_status=runtime.observer.supports_work_status
+                )
+
+                async def write_snapshot() -> None:
+                    await worker.queue_frame(RTVIServerMessageFrame(data=frame_data))
+
+                await barrier.install_baseline(
+                    watermark=snapshot.sequence,
+                    flush_writer=worker.queue_frame,
+                    snapshot_writer=write_snapshot,
+                )
+            except asyncio.CancelledError:
+                # Cancellation between the write and the drain (worker
+                # replaced/torn down) must not leave the observer paused
+                # with an unbounded buffer and this lock's invariant
+                # silently broken.
+                barrier.cancel()
+                raise
+            except Exception:  # noqa: BLE001  # intentional catch-all: a failed snapshot install must never leave the observer paused
+                barrier.cancel()
+                _loguru_logger.warning(
+                    "snapshot barrier install failed; incremental delivery resumed "
+                    "without a new watermark"
+                )
+                return False
+            return True
+
         @worker.rtvi.event_handler("on_client_message")
         async def on_client_message(_rtvi: Any, message: Any) -> None:
+            nonlocal snapshot_recheck_requested
             data = getattr(message, "data", None)
             snapshot_requested = message.type == "snapshot-request" or (
                 message.type == "client-message"
@@ -294,12 +649,46 @@ async def _attach_connection(
             )
             if not snapshot_requested or not host.accepts(runtime.epoch):
                 return
-            publisher.set_snapshot(runtime.observer.snapshot())
-            snapshot = publisher.snapshot()
-            if snapshot is not None:
-                await worker.queue_frame(
-                    RTVIServerMessageFrame(data=snapshot.model_dump(mode="json"))
-                )
+            # Coalesce, don't queue, concurrent snapshot-request messages: at
+            # most one SnapshotBarrier may be open per connection at a time,
+            # or two barriers racing against the same observer/state pair
+            # could corrupt each other's watermark/buffer. A snapshot rebuild
+            # is idempotent, so an in-flight one already satisfies a
+            # concurrent request -- blocking on the lock instead would let a
+            # client spam this message and build an unbounded lock-waiter
+            # queue, each holding a task open for up to
+            # SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS.
+            if snapshot_lock.locked():
+                snapshot_recheck_requested = True
+                return
+            async with snapshot_lock:
+                # Retry at most once: the first pass is this request's own
+                # attempt, the second only runs if a coalesced request was
+                # flagged during that attempt and it did not deliver a
+                # snapshot. A request coalesced during the retry itself sets
+                # the flag again but is not chased further -- one extra
+                # attempt is enough to stop silently stranding a client
+                # without letting a spamming client build unbounded retries.
+                #
+                # Re-checking acceptance on every iteration (not just before
+                # the lock was acquired) matters because a single attempt can
+                # block for up to SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS awaiting
+                # its barrier ack: this connection can be superseded by a
+                # reconnect (or torn down) entirely within that window. A
+                # retry that ran anyway would call barrier.subscribe_paused()
+                # on this connection's (by then retired) observer, which
+                # re-attaches it to the still-live, shared SessionState event
+                # bus with nothing left to ever unsubscribe it again -- and
+                # would write the resulting frame through this closure's
+                # captured (by then cancelled) ``worker``.
+                for _attempt in range(2):
+                    if not host.accepts(runtime.epoch):
+                        break
+                    snapshot_recheck_requested = False
+                    if await attempt_snapshot_delivery():
+                        break
+                    if not snapshot_recheck_requested:
+                        break
 
         # WorkerRunner has no remove-workers API in the pinned wheel. Run each
         # connection worker through its real PipelineWorker lifecycle task so
@@ -319,7 +708,14 @@ async def _attach_connection(
                 except asyncio.CancelledError:
                     return
                 if error is not None:
-                    asyncio.create_task(runtime.shutdown(reason="Small WebRTC worker failed"))
+                    # Tracked, not fire-and-forget: an untracked task can be
+                    # collected mid-shutdown, and SessionHost.shutdown drains
+                    # exactly this set.
+                    host.track_background_shutdown(
+                        asyncio.create_task(
+                            runtime.shutdown(reason="Small WebRTC worker failed", reconnect=False)
+                        )
+                    )
 
             runtime.worker_task.add_done_callback(worker_finished)
         else:
@@ -330,8 +726,9 @@ async def _attach_connection(
             if hasattr(attached, "__await__"):
                 await attached
     except BaseException:
-        host.abort_connection(runtime)
-        await runtime.shutdown(reason="connection setup failed")
+        host.abort_connection(runtime, reconnect=False)
+        await runtime.shutdown(reason="connection setup failed", reconnect=False)
+        await _close_setup_connection(connection)
         raise
 
 
@@ -341,26 +738,31 @@ def _default_session_host(
     router_responses_factory: Callable[[], Any] | None = None,
     measurement_sink: MeasurementSink | None = None,
 ) -> SessionHost:
-    """Build the default host while keeping credentialed providers lazy."""
+    """Build the default host while keeping credentialed providers lazy.
+
+    Delegates the registry/router/coordinator/host wiring to
+    ``server.composition.build_session_host()`` -- the single composition
+    root also used by ``scripts.eval_common.build_session_for_run()`` -- and
+    layers only this call site's own concerns (STT/TTS creation, the
+    promotion manifest load) on top. See ``server/composition.py``'s module
+    docstring for why this used to be two independently-maintained wiring
+    call sites (round 5, Architecture lens finding 1).
+    """
     config = load_config()
-    registry = WorkerRegistry(config=config)
-    configured_router = router or Router(
-        call=LazyRouterProvider(config, router_responses_factory),
-        config=config,
-    )
-    coordinator = WorkItemCoordinator(
-        registry=registry,
-        router=configured_router,
-        config=config,
-    )
     stt = create_stt(config)
     tts = create_tts(config)
-    return SessionHost(
-        registry=registry,
+    # Resolved once per host, exactly like FeaturePolicy.from_config: a
+    # missing/unreadable/ineligible manifest degrades to display-only rather
+    # than raising, so this never blocks server boot.
+    promotion_manifest = load_promotion_manifest(config)
+    return build_session_host(
+        config,
+        router=router,
+        router_responses_factory=router_responses_factory,
+        measurement_sink=measurement_sink,
+        promotion_manifest=promotion_manifest,
         stt=stt,
         tts=tts,
-        coordinator=coordinator,
-        measurement_sink=measurement_sink,
     )
 
 
@@ -370,8 +772,9 @@ def create_app(
     preflight_probe: Probe | None = None,
 ) -> FastAPI:
     """Create the local FastAPI app and its Small WebRTC signaling routes."""
+    _configure_logging()
     session_host = host if host is not None else _default_session_host()
-    config = getattr(session_host.registry, "config", None) or Config()
+    config = session_host.config
     webrtc_handler = SmallWebRTCRequestHandler()
 
     @asynccontextmanager
@@ -445,6 +848,12 @@ def create_app(
         handshake = _handshake_from_query(session_host, http_request)
         if not session_host.accepts(handshake.proposed_epoch):
             raise HTTPException(status_code=409, detail="stale Small WebRTC connection epoch")
+        try:
+            session_host.validate_patch_handshake(handshake)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="capabilities cannot change after connection promotion"
+            )
         await webrtc_handler.handle_patch_request(request)
         return {"status": "success"}
 

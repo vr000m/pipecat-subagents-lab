@@ -1,5 +1,9 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { createApp } from "../src/app.js";
+import { WORK_STATUS_V1 } from "../src/protocol.js";
+
+const appEntrySource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8");
 
 class Element {
   constructor() { this.children = []; this.innerHTML = ""; this.disabled = false; this.hidden = false; }
@@ -340,4 +344,76 @@ test("onServerMessage rejects unsupported contracts before applying state", () =
     });
     expect(app.getState().lastAppliedSequence).toBe(2);
   });
+});
+
+// --- Phase 3: capability advertisement on the connection URL --------------
+//
+// Plan bullet 223 step (4): "advertise work_status_v1 from the browser only
+// after the server carrier/storage/observer path is live." The canonical
+// encoding (bullet 224) is one URL-encoded JSON array of strings in a
+// single `capabilities` query parameter, emitted by URLSearchParams as
+// JSON.stringify([...]) -- i.e. url.searchParams.set("capabilities",
+// JSON.stringify([...])), matching the existing per-field loop at
+// web/src/app.js:179 that already builds this same connection URL.
+
+test("browser entrypoint advertises the work_status_v1 capability on the connection URL", () => {
+  // The literal now lives in exactly one place (protocol.js); the entrypoint
+  // advertises it by importing that shared constant.
+  expect(WORK_STATUS_V1).toBe("work_status_v1");
+  expect(appEntrySource).toContain("WORK_STATUS_V1");
+  expect(appEntrySource).not.toContain('"work_status_v1"');
+  expect(appEntrySource).toMatch(/searchParams\.set\(\s*["']capabilities["']/);
+});
+
+// --- Real DOM-behavioral coverage for remote track playback ---------------
+//
+// Bun's test runtime has no built-in MediaStream, unlike a browser; the
+// fakeDocument()/Element fixtures above already substitute for the DOM the
+// same way, so this stub follows that existing pattern rather than pulling
+// in jsdom.
+class FakeMediaStream {
+  constructor(tracks) { this.tracks = tracks; }
+  getTracks() { return this.tracks; }
+}
+const previousMediaStream = globalThis.MediaStream;
+globalThis.MediaStream ??= FakeMediaStream;
+afterAll(() => {
+  if (previousMediaStream === undefined) delete globalThis.MediaStream;
+  else globalThis.MediaStream = previousMediaStream;
+});
+
+function fakeAudioTrack({ id = "track-1", kind = "audio" } = {}) {
+  return { id, kind, readyState: "live", muted: false, enabled: true, addEventListener: () => {} };
+}
+
+test("a remote audio track delivered via onTrackStarted actually plays through the real audio element", async () => {
+  const documentRef = fakeDocument();
+  const root = new Element();
+  const app = createApp({
+    root,
+    documentRef,
+    transportFactory: () => ({}),
+    clientFactory: (_transport, nextCallbacks) => ({
+      connect: async () => nextCallbacks.onTrackStarted(fakeAudioTrack(), { local: false }),
+      disconnect: async () => {},
+      enableMic: () => {},
+    }),
+  });
+
+  const playCalls = [];
+  const realPlay = app.audio.play.bind(app.audio);
+  app.audio.play = (...args) => {
+    playCalls.push(args);
+    return realPlay(...args);
+  };
+
+  await app.connect();
+
+  // connect() itself also calls audio.play() once as the user-gesture
+  // autoplay unlock (see the comment at web/src/app.js:216); the assertion
+  // here is that onTrackStarted's own delivery-triggered play() happened
+  // too, i.e. more than the single connect()-only call.
+  expect(playCalls.length).toBeGreaterThanOrEqual(2);
+  expect(app.audio.srcObject).toBeInstanceOf(FakeMediaStream);
+  expect(app.audio.srcObject.getTracks()).toHaveLength(1);
 });

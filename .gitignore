@@ -4,3 +4,5 @@ docs/_plan_view/_rich_manifest.json
 .deep-review/
 .gauntlet/
 /.review-plan
+.DS_Store
+/scratchpad

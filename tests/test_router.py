@@ -14,6 +14,7 @@ from server.router import (
     RoutingValidationError,
     WorkerCatalogue,
     WorkerCatalogueEntry,
+    effective_router_reasoning_effort,
 )
 
 
@@ -102,6 +103,88 @@ def test_lazy_router_provider_defers_credentials_and_provider_creation_until_rou
                 assert_strict_objects(child)
 
     assert_strict_objects(schema)
+
+
+class _RecordingResponses:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs: object) -> dict[str, str]:
+        self.calls.append(kwargs)
+        return {"output_text": json.dumps({"decision": decision_payload()})}
+
+
+def test_lazy_router_provider_omits_reasoning_for_non_gpt5_model_without_override() -> None:
+    """Default behavior unchanged: a router model that does not start with
+    'gpt-5' never gets a `reasoning` kwarg when no effort override is set."""
+    responses = _RecordingResponses()
+    config = Config(router_model_policy={"fast": "non-gpt-5-router-model"})
+    provider = LazyRouterProvider(config, lambda: responses)
+    router = Router(call=provider)
+
+    router.route("What is the weather in Riga?", catalogue())
+
+    assert responses.calls[0]["model"] == "non-gpt-5-router-model"
+    assert "reasoning" not in responses.calls[0]
+
+
+def test_lazy_router_provider_explicit_override_applies_unconditionally_for_non_gpt5_model() -> (
+    None
+):
+    """An explicit effort override is not gated by the `startswith("gpt-5")`
+    check -- it must apply even to a router model the conditional would
+    otherwise never touch."""
+    responses = _RecordingResponses()
+    config = Config(
+        router_model_policy={"fast": "non-gpt-5-router-model"},
+        router_reasoning_effort_policy={"fast": "high"},
+    )
+    provider = LazyRouterProvider(config, lambda: responses)
+    router = Router(call=provider)
+
+    router.route("What is the weather in Riga?", catalogue())
+
+    assert responses.calls[0]["model"] == "non-gpt-5-router-model"
+    assert responses.calls[0]["reasoning"] == {"effort": "high"}
+
+
+def test_lazy_router_provider_explicit_override_replaces_the_gpt5_default() -> None:
+    """A gpt-5* model with an explicit override gets the override value, not
+    the hardcoded 'minimal' default."""
+    responses = _RecordingResponses()
+    config = Config(router_reasoning_effort_policy={"fast": "xhigh"})
+    provider = LazyRouterProvider(config, lambda: responses)
+    router = Router(call=provider)
+
+    router.route("What is the weather in Riga?", catalogue())
+
+    assert responses.calls[0]["model"] == "gpt-5-mini"
+    assert responses.calls[0]["reasoning"] == {"effort": "xhigh"}
+
+
+class TestEffectiveRouterReasoningEffort:
+    """``effective_router_reasoning_effort`` is the single hoisted source of
+    truth for the "unset effort + gpt-5* model -> minimal" default -- both
+    ``LazyRouterProvider.__call__`` (exercised above via request-kwargs
+    assertions) and ``scripts/eval_model_comparison.py``'s manifest-lookup
+    call this same function rather than each hand-duplicating the rule."""
+
+    def test_explicit_effort_always_wins(self) -> None:
+        assert effective_router_reasoning_effort("gpt-5-mini", "high") == "high"
+        assert effective_router_reasoning_effort("claude-not-gpt5", "low") == "low"
+
+    def test_unset_effort_defaults_to_minimal_for_gpt5_models(self) -> None:
+        assert effective_router_reasoning_effort("gpt-5-mini", None) == "minimal"
+        assert effective_router_reasoning_effort("gpt-5.6-terra", None) == "minimal"
+
+    def test_unset_effort_omits_reasoning_for_non_gpt5_models(self) -> None:
+        assert effective_router_reasoning_effort("some-other-model", None) is None
+
+    def test_explicit_resolved_effort_still_wins_over_the_naming_default(self) -> None:
+        """Round 10 gauntlet, Architecture finding 4: after delegating the
+        naming rule to ``default_reasoning_effort_for_model``, the router's
+        own resolved-config precedence must still take priority over it."""
+        assert effective_router_reasoning_effort("gpt-5-mini", "high") == "high"
 
 
 def test_router_has_no_tools_and_passes_the_same_snapshot_to_model_and_validation() -> None:

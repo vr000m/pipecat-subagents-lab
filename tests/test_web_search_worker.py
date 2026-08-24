@@ -7,9 +7,8 @@ from typing import Any
 
 import pytest
 
-from server.workers.base import ContextWorker, WorkerMetadata
+from server.workers.base import ClarificationContext, ContextWorker, WorkerMetadata
 from server.workers.web_search import (
-    ClarificationContext,
     WebSearchWorker,
     WorkerClarify,
     WorkerDeclined,
@@ -69,6 +68,39 @@ def test_worker_sanitizes_query_and_requests_store_false_before_normalizing_resu
     assert result.text == result.ui_text == "The complete answer."
     assert result.spoken_text == "The short answer."
     assert result.citations[0].url == "https://example.com/a"
+
+
+def test_worker_omits_reasoning_kwarg_by_default() -> None:
+    """Default behavior unchanged: no reasoning-effort override means the
+    worker never sends a `reasoning` kwarg, same as before Phase 1."""
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    asyncio.run(worker.run("What is the weather in Riga?"))
+
+    assert "reasoning" not in provider.calls[0]
+
+
+def test_worker_applies_explicit_reasoning_effort_override() -> None:
+    provider = FakeResponses(answer_payload())
+    worker = WebSearchWorker(
+        responses=provider, model="verified-worker-model", reasoning_effort="medium"
+    )
+
+    asyncio.run(worker.run("What is the weather in Riga?"))
+
+    assert provider.calls[0]["reasoning"] == {"effort": "medium"}
+
+
+def test_worker_can_be_constructed_without_the_reasoning_effort_keyword_argument() -> None:
+    """Regression: `reasoning_effort` must stay keyword-only with a `None`
+    default so every pre-existing direct-construction call site (including
+    every other test in this module) keeps working unmodified."""
+    provider = FakeResponses(answer_payload())
+
+    worker = WebSearchWorker(responses=provider, model="verified-worker-model")
+
+    assert worker.model == "verified-worker-model"
 
 
 def test_worker_collects_object_sources_from_web_search_call_actions() -> None:
@@ -351,6 +383,68 @@ def test_same_worker_search_uses_prior_canonical_context() -> None:
 
     assert "Previous query: weather in Riga" in provider.calls[1]["input"]
     assert "Previous answer: The answer." in provider.calls[1]["input"]
+
+
+# --- Phase 4: query-context narrowing evidence is blocked/not-run in this
+# credential-free run, so `_contextual_input`'s production defaults --
+# history[-4:] and 1200-character truncation -- must remain completely
+# unchanged. See docs/dev_plans/20260728-feature-early-ack-background-
+# delivery-v0.1.3.md, Phase 4 bullet: "Blocked, not-run, or not-promoted
+# evidence must be tested to prove the runtime still uses the existing
+# history[-4:] and truncation behavior."
+
+
+def test_contextual_input_uses_only_the_last_four_history_entries() -> None:
+    worker = WebSearchWorker.__new__(WebSearchWorker)
+    worker.history = [{"query": f"q{i}", "text": f"a{i}"} for i in range(7)]
+
+    result = worker._contextual_input("current request")
+
+    assert result.count("Previous query:") == 4
+    for stale in ("q0", "q1", "q2"):
+        assert f"Previous query: {stale}" not in result
+    for kept in ("q3", "q4", "q5", "q6"):
+        assert f"Previous query: {kept}" in result
+    assert "Current request: current request" in result
+
+
+def test_contextual_input_truncates_each_prior_answer_to_1200_characters() -> None:
+    worker = WebSearchWorker.__new__(WebSearchWorker)
+    long_answer = "x" * 5000
+    worker.history = [{"query": "q0", "text": long_answer}]
+
+    result = worker._contextual_input("current request")
+
+    answer_line = next(line for line in result.splitlines() if line.startswith("Previous answer: "))
+    truncated = answer_line[len("Previous answer: ") :]
+    assert len(truncated) == 1200
+    assert truncated == long_answer[:1200]
+
+
+def test_contextual_input_is_query_unchanged_when_history_is_empty() -> None:
+    worker = WebSearchWorker.__new__(WebSearchWorker)
+    worker.history = []
+
+    assert worker._contextual_input("current request") == "current request"
+
+
+def test_web_search_worker_constructor_accepts_no_context_window_override_parameters() -> None:
+    """Plan: query-context narrowing is 'not to be implemented
+    speculatively' -- this run's evidence is blocked/not-run, so
+    WebSearchWorker must not have grown a context-window-size or
+    answer-char-limit constructor knob that could silently change
+    production defaults ahead of a promoted decision."""
+    import inspect
+
+    signature = inspect.signature(WebSearchWorker.__init__)
+    narrowing_param_names = {
+        "context_window_size",
+        "history_window",
+        "context_char_limit",
+        "answer_char_limit",
+        "context_window",
+    }
+    assert not (set(signature.parameters) & narrowing_param_names)
 
 
 def test_worker_rejects_invalid_or_oversized_spoken_projection() -> None:

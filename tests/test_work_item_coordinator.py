@@ -1,6 +1,8 @@
 """Bounded work items preserve accepted order and isolate worker contexts."""
 
 import asyncio
+import dataclasses
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,9 +10,17 @@ import pytest
 
 from server.config import Config
 from server.work_item_coordinator import (
+    OPTIONAL_COORDINATOR_MEMBERS,
+    CancelWork,
+    Coordinator,
+    CoordinatorDefaults,
+    CoordinatorView,
+    OptionalCoordinator,
     PendingDialogue,
+    StartTask,
     WorkItemCoordinator,
     WorkItemFailure,
+    coordinator_view,
 )
 
 
@@ -1079,6 +1089,390 @@ def test_shared_multi_intent_callback_receives_distinct_late_results_per_item() 
             else:
                 assert late.terminal_kind == "completed"
         assert len({id(late) for late in observed}) == len(observed)
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+# -- Phase 2: coordinator ownership boundary --------------------------------
+#
+# Plan bullet 213 / Integration Seams: "Keep commit ownership in
+# SessionHost/SessionState; the coordinator only owns task retention/
+# cancellation and callback delivery." WorkItemCoordinator must not gain a
+# commit-marking or disposition-computing API of its own -- that stays on
+# SessionHost.commit_late_result_once.
+
+
+def test_work_item_coordinator_has_no_commit_or_disposition_api() -> None:
+    """The coordinator remains delivery-only: it retains/cancels tasks and
+    invokes on_complete, but never itself decides autoplay vs. display-only
+    or performs a canonical commit."""
+    forbidden_names = {
+        "commit_late_result_once",
+        "commit_result",
+        "compute_disposition",
+        "commit_and_autoplay",
+    }
+    coordinator_api = set(dir(WorkItemCoordinator))
+    assert not (forbidden_names & coordinator_api)
+
+
+def test_retain_late_task_on_complete_callback_receives_delivery_only_late_result() -> None:
+    """The coordinator's on_complete callback is handed a plain LateResult
+    (work_item_id/worker_id/result/error/terminal_kind) -- no disposition or
+    commit-outcome field lives on that type; the host computes disposition
+    separately from the delivery payload the coordinator hands it."""
+    from server.work_item_coordinator import LateResult
+
+    late = LateResult(work_item_id="work-1", worker_id="worker-1", result=None)
+    disposition_like_fields = {"disposition", "commit_outcome", "autoplay"}
+    assert not (disposition_like_fields & set(late.__dataclass_fields__))
+
+
+def test_work_item_coordinator_satisfies_the_full_coordinator_surface() -> None:
+    """``WorkItemCoordinator`` implements both the required ``Coordinator``
+    members and the optional ``OptionalCoordinator`` members -- the combined
+    surface ``server/pipeline.py`` relies on, whether accessed directly or
+    through a ``getattr`` fallback."""
+    coordinator = WorkItemCoordinator()
+    for protocol in (Coordinator, OptionalCoordinator):
+        for member_name in protocol.__protocol_attrs__:
+            assert hasattr(coordinator, member_name), (
+                f"WorkItemCoordinator is missing {protocol.__name__}.{member_name}"
+            )
+
+
+def test_coordinator_defaults_matches_pipeline_getattr_fallbacks() -> None:
+    """``CoordinatorDefaults`` reproduces exactly the fallback values
+    ``server/pipeline.py`` uses today when a coordinator omits an optional
+    member, so a coordinator can opt into these defaults by subclassing
+    instead of relying on scattered ``getattr`` fallbacks."""
+    defaults = CoordinatorDefaults()
+    assert defaults.registry is None
+    assert defaults.config is None
+    # Single-sourced with WorkItemCoordinator's own declaration and with
+    # coordinator_view's fallback: an empty frozenset here would silently
+    # widen SessionHost's config-conflict check for any coordinator that
+    # followed this class's documented advice and subclassed it.
+    assert defaults.OWNED_CONFIG_FIELDS == WorkItemCoordinator.OWNED_CONFIG_FIELDS
+    assert coordinator_view(object()).OWNED_CONFIG_FIELDS == defaults.OWNED_CONFIG_FIELDS
+    assert defaults.live_work_item_ids() == frozenset()
+    assert defaults.cancel() == ()
+    assert defaults.cancel("work-1") == ()
+
+    async def run() -> None:
+        task = defaults.start_task(completed_worker("hi"))
+        assert isinstance(task, asyncio.Task)
+        assert await task == {"text": "hi", "citations": []}
+        await defaults.shutdown()
+
+    asyncio.run(run())
+
+
+def test_coordinator_view_resolves_bare_double_to_the_same_fallbacks() -> None:
+    """``coordinator_view`` on a coordinator double with none of the 7
+    optional members declared resolves to the same values the ``getattr``
+    fallbacks in ``server/pipeline.py`` produce today."""
+
+    class BareCoordinator:
+        pass
+
+    view = coordinator_view(BareCoordinator())
+    assert view.registry is None
+    assert view.config is None
+    assert view.OWNED_CONFIG_FIELDS == WorkItemCoordinator.OWNED_CONFIG_FIELDS
+    assert view.live_work_item_ids() == frozenset()
+    assert view.cancel() == ()
+
+    async def run() -> None:
+        task = view.start_task(completed_worker("hi"))
+        assert isinstance(task, asyncio.Task)
+        await task
+        await view.shutdown()
+
+    asyncio.run(run())
+
+
+def test_coordinator_view_prefers_a_conforming_coordinators_own_members() -> None:
+    """A coordinator that declares the optional members wins over
+    ``coordinator_view``'s fallbacks -- the view must not shadow a real
+    implementation with a default."""
+    coordinator = WorkItemCoordinator()
+    view = coordinator_view(coordinator)
+    assert view.registry is coordinator.registry
+    assert view.OWNED_CONFIG_FIELDS == coordinator.OWNED_CONFIG_FIELDS
+    assert view.cancel() == coordinator.cancel()
+
+
+def test_all_four_coordinator_boundary_declarations_carry_the_same_members() -> None:
+    """The four declarations of the coordinator boundary must agree on
+    *which* members exist.
+
+    They stay four declarations on purpose (see
+    ``OPTIONAL_COORDINATOR_MEMBERS``' docstring), but adding a member used to
+    take four coordinated edits with nothing catching a missed one -- and two
+    drifts had already landed that way. This pins all four against the single
+    roster, so a member added to three of them fails here instead of silently
+    resolving to a fallback in production.
+    """
+    # `__protocol_attrs__` is a `typing` implementation detail with no public
+    # equivalent and no cross-version stability guarantee (round-4 confirm
+    # pass, Architecture finding). It is still the only thing that can pin the
+    # Protocol leg of this four-way roster, so guard it rather than drop it: if
+    # a future CPython renames it or changes which members it collects, this
+    # assertion fails as an obvious breakage instead of the equality below
+    # silently comparing an empty or truncated set.
+    protocol_attrs = getattr(OptionalCoordinator, "__protocol_attrs__", None)
+    assert protocol_attrs, (
+        "typing.Protocol no longer exposes __protocol_attrs__ -- this roster check needs "
+        "a new way to enumerate OptionalCoordinator's members"
+    )
+    assert "live_work_item_ids" in protocol_attrs, (
+        "__protocol_attrs__ no longer collects the members this check assumes it does"
+    )
+    assert set(protocol_attrs) == set(OPTIONAL_COORDINATOR_MEMBERS)
+
+    for member_name in OPTIONAL_COORDINATOR_MEMBERS:
+        assert hasattr(CoordinatorDefaults, member_name), (
+            f"CoordinatorDefaults is missing {member_name}"
+        )
+
+    assert {field.name for field in dataclasses.fields(CoordinatorView)} == set(
+        OPTIONAL_COORDINATOR_MEMBERS
+    )
+
+    # coordinator_view resolves every one of them -- a member declared on the
+    # view but never populated by the factory would be a TypeError at call
+    # time, not a silent fallback, but a member the factory forgets to *read*
+    # off the coordinator would be.
+    coordinator = WorkItemCoordinator()
+    view = coordinator_view(coordinator)
+    for member_name in OPTIONAL_COORDINATOR_MEMBERS:
+        resolved = getattr(view, member_name)
+        declared = getattr(coordinator, member_name)
+        if callable(declared):
+            assert resolved == declared, f"coordinator_view shadowed {member_name}"
+        else:
+            assert resolved is declared, f"coordinator_view shadowed {member_name}"
+
+
+def test_coordinator_view_callables_keep_the_protocols_declared_signatures() -> None:
+    """``CoordinatorView``'s two callable members must stay signature-exact
+    with the Protocols that declare them.
+
+    They were typed ``Callable[..., ...]``, which erased ``start_task``'s
+    keyword-only ``mandatory`` on the *only* one of this module's four
+    boundary declarations production resolves through -- so a call site could
+    silently drop the keyword the Protocol fix added. They are now
+    ``StartTask``/``CancelWork`` Protocols; this test fails if a signature
+    change lands on ``Coordinator``/``OptionalCoordinator`` without being
+    mirrored onto the view's callable, which is the drift the ``...`` hid.
+    """
+
+    def call_signature(protocol: type) -> inspect.Signature:
+        return inspect.signature(protocol.__call__).replace(return_annotation=None)
+
+    def method_signature(protocol: type, name: str) -> inspect.Signature:
+        return inspect.signature(getattr(protocol, name)).replace(return_annotation=None)
+
+    assert call_signature(StartTask) == method_signature(Coordinator, "start_task")
+    assert call_signature(StartTask) == method_signature(OptionalCoordinator, "start_task")
+    assert call_signature(CancelWork) == method_signature(Coordinator, "cancel")
+    assert call_signature(CancelWork) == method_signature(OptionalCoordinator, "cancel")
+
+    # And the erased keyword really is reachable through the view.
+    assert coordinator_view(object()).cancel(work_item_id=None) == ()
+
+
+def test_wait_timeout_ms_override_applies_independently_of_max_work_items() -> None:
+    """``wait_timeout_ms`` must take effect on its own, and must never
+    clobber a caller-supplied ``Config.multi_intent_wait_timeout_ms`` just
+    because a *different* constructor override (``max_work_items_per_turn``)
+    was also passed."""
+    only_wait_timeout = WorkItemCoordinator(wait_timeout_ms=5)
+    assert only_wait_timeout.config.multi_intent_wait_timeout_ms == 5
+
+    preserves_caller_config = WorkItemCoordinator(
+        config=Config(multi_intent_wait_timeout_ms=7_000),
+        max_work_items_per_turn=3,
+    )
+    assert preserves_caller_config.config.multi_intent_wait_timeout_ms == 7_000
+
+
+def test_retain_late_task_force_schedules_callback_when_background_capacity_is_exhausted() -> None:
+    """The completion callback for a retained task must still run when
+    background capacity is exhausted, not be dropped into the
+    ``_late_results`` polling queue -- nothing in production drains that
+    queue (see ``drain_late_results``), so parking the callback there would
+    silently break the at-least-once late-delivery guarantee."""
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_background_tasks=1)
+
+        async def worker() -> dict:
+            return {"text": "hi", "citations": []}
+
+        callback_ran = asyncio.Event()
+
+        async def on_complete(_late: object) -> None:
+            callback_ran.set()
+
+        task = asyncio.create_task(worker())
+        assert coordinator.retain_late_task(
+            task,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=on_complete,
+        )
+
+        # Saturate background capacity right before the retained task
+        # completes, so the completion callback below has to schedule its
+        # on_complete coroutine with `_has_background_capacity()` false.
+        sentinel = asyncio.create_task(asyncio.sleep(60))
+        coordinator._owned_tasks.add(sentinel)
+        assert not coordinator._has_background_capacity()
+
+        await task
+        await asyncio.wait_for(callback_ran.wait(), timeout=1.0)
+
+        # The callback ran directly; nothing was left in the polling queue.
+        assert coordinator.drain_late_results() == ()
+
+        coordinator._owned_tasks.discard(sentinel)
+        sentinel.cancel()
+        await asyncio.gather(sentinel, return_exceptions=True)
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retain_late_task_suppresses_callback_once_shutdown_has_begun() -> None:
+    """Once shutdown has begun, a retained task's completion must not call
+    ``on_complete`` at all (the force-adopt fix must not resurrect delivery
+    after shutdown) -- there is no one left to observe it, so the result is
+    neither run through the callback nor queued."""
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator()
+
+        async def worker() -> dict:
+            return {"text": "hi", "citations": []}
+
+        callback_ran = asyncio.Event()
+
+        async def on_complete(_late: object) -> None:
+            callback_ran.set()
+
+        task = asyncio.create_task(worker())
+        assert coordinator.retain_late_task(
+            task,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=on_complete,
+        )
+
+        coordinator._shutdown = True
+        await task
+        await asyncio.sleep(0)
+
+        assert not callback_ran.is_set()
+        assert coordinator.drain_late_results() == ()
+
+        coordinator._shutdown = False
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_late_callback_task_does_not_consume_the_capacity_budget() -> None:
+    """Round-2 confirm pass: the late-callback fix force-adopted the
+    ``on_complete`` coroutine straight into ``_owned_tasks``, bypassing
+    ``_has_background_capacity``'s check *and* landing inside the set it
+    counts. At capacity, the owned set therefore grew past the cap and every
+    subsequent legitimate ``start_task``/retain admission was refused until
+    those callbacks finished.
+
+    The callback is now admitted through ``start_task(..., mandatory=True)``,
+    which keeps it outside the budget as well as past the gate.
+    """
+
+    async def run() -> None:
+        coordinator = WorkItemCoordinator(max_background_tasks=1)
+        callback_release = asyncio.Event()
+        callback_started = asyncio.Event()
+
+        async def slow_callback(_late: object) -> None:
+            callback_started.set()
+            await callback_release.wait()
+
+        async def provider() -> dict:
+            return {"text": "done", "citations": []}
+
+        retained = asyncio.create_task(provider())
+        assert coordinator.retain_late_task(
+            retained,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=slow_callback,
+        )
+        await retained
+        await asyncio.sleep(0)
+        await callback_started.wait()
+
+        # The callback is owned (so it cannot be garbage-collected mid-flight)
+        # but is not charged against the one-task budget.
+        assert coordinator._mandatory_tasks, "the callback task must be tracked as mandatory"
+        assert coordinator._has_background_capacity(), (
+            "an in-flight mandatory callback must not exhaust the capacity budget"
+        )
+
+        follow_up = coordinator.start_task(provider())
+        assert follow_up is not None, "a later legitimate admission must not be starved"
+        await follow_up
+
+        callback_release.set()
+        await coordinator.shutdown()
+
+    asyncio.run(run())
+
+
+def test_late_callback_is_admitted_through_the_start_task_seam() -> None:
+    """The inline ``asyncio.create_task`` + ``_adopt_task(force=True)`` at the
+    call site duplicated ``start_task``'s body minus the capacity check, so a
+    coordinator subclass overriding ``start_task`` was silently not honoured
+    on this path (and the inline call lost ``start_task``'s ``operation.close()``
+    handling and its tolerance for non-coroutine awaitables)."""
+
+    admitted: list[bool] = []
+
+    class RecordingCoordinator(WorkItemCoordinator):
+        def start_task(self, operation, *, mandatory: bool = False):  # type: ignore[no-untyped-def]
+            admitted.append(mandatory)
+            return super().start_task(operation, mandatory=mandatory)
+
+    async def run() -> None:
+        coordinator = RecordingCoordinator(max_background_tasks=1)
+        seen: list[object] = []
+
+        async def callback(late: object) -> None:
+            seen.append(late)
+
+        async def provider() -> dict:
+            return {"text": "done", "citations": []}
+
+        retained = asyncio.create_task(provider())
+        coordinator.retain_late_task(
+            retained,
+            work_item_id="work-1",
+            worker_id="worker-1",
+            on_complete=callback,
+        )
+        await retained
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert admitted == [True], "the late callback must route through the start_task seam"
+        assert len(seen) == 1
         await coordinator.shutdown()
 
     asyncio.run(run())

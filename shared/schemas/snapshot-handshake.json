@@ -3,5 +3,13 @@
   "$id": "https://pipecat-subagents-lab.local/schemas/v1/snapshot-handshake.json",
   "title": "SnapshotHandshake", "type": "object", "additionalProperties": false,
   "required": ["contract_version", "session_id", "resume_token", "proposed_epoch", "snapshot_sequence"],
-  "properties": {"contract_version": {"const": "v1.0"}, "session_id": {"type": "string"}, "resume_token": {"type": "string"}, "proposed_epoch": {"type": "integer", "minimum": 0}, "snapshot_sequence": {"type": "integer", "minimum": 0}}
+  "properties": {
+    "contract_version": {"const": "v1.0"},
+    "session_id": {"type": "string"},
+    "resume_token": {"type": "string"},
+    "proposed_epoch": {"type": "integer", "minimum": 0},
+    "snapshot_sequence": {"type": "integer", "minimum": 0},
+    "capabilities": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "capabilities_present": {"type": "boolean"}
+  }
 }

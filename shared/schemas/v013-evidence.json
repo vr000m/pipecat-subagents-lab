@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/v013-evidence.json",
+  "title": "V013EvidenceRecord", "type": "object", "additionalProperties": false,
+  "required": ["phase", "scenario", "turn_id", "provider", "model", "routing_phase_latency_ms", "outcome", "disposition", "sample_timestamp_ms", "run_id", "sample_index", "sample_count"],
+  "properties": {
+    "phase": {"enum": ["phase0", "phase1", "phase2", "phase3", "phase4"]},
+    "scenario": {"type": "string", "minLength": 1},
+    "turn_id": {"type": "string", "minLength": 1},
+    "work_item_id": {"type": ["string", "null"], "minLength": 1},
+    "provider": {"type": "string", "minLength": 1},
+    "model": {"type": "string", "minLength": 1},
+    "query_chars": {"type": ["integer", "null"], "minimum": 0},
+    "context_chars": {"type": ["integer", "null"], "minimum": 0},
+    "routing_phase_latency_ms": {"type": ["number", "null"], "minimum": 0},
+    "outcome": {"enum": ["direct", "unsupported", "control", "clarify", "completed", "mixed", "retained", "declined", "failed", "cancelled"]},
+    "disposition": {"enum": ["autoplay", "display_only", "suppressed", "not_applicable"]},
+    "sample_timestamp_ms": {"type": "integer", "minimum": 0},
+    "wall_clock_time": {"type": "string", "format": "date-time"},
+    "run_id": {"type": "string", "minLength": 1},
+    "sample_index": {"type": "integer", "minimum": 0},
+    "sample_count": {"type": "integer", "minimum": 1}
+  }
+}

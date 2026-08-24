@@ -4,6 +4,7 @@ import {
   createClientProtocol,
   RTVI_MESSAGE_KINDS,
   validateServerMessage,
+  WORK_STATUS_V1,
 } from "../src/protocol.js";
 
 const appSource = readFileSync(new URL("../src/app.js", import.meta.url), "utf8");
@@ -11,6 +12,9 @@ const indexSource = readFileSync(new URL("../index.html", import.meta.url), "utf
 const packageSource = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const messageSchema = JSON.parse(
   readFileSync(new URL("../../shared/schemas/rtvi-message.json", import.meta.url), "utf8"),
+);
+const workStatusSchema = JSON.parse(
+  readFileSync(new URL("../../shared/schemas/work-status.json", import.meta.url), "utf8"),
 );
 const result = (resultId, originEpoch = 1) => {
   const citations = [{ title: "Source", url: "https://example.com/source" }];
@@ -143,6 +147,49 @@ test("accepts a complete runtime snapshot with an envelope session id", () => {
     origin_epoch: 1,
     data: { contract_version: "v1.0", session_id: "session-1", snapshot_sequence: 3, workers: [], results: [], speech_progress: [], routing: null, transcript: [], origin_epoch: 1 },
 })).toBe(true);
+});
+
+// Round-5 restart, Architecture finding #19: `hasExactKeys` gained an
+// `optionalKeys` parameter so runtime_snapshot's one optional field
+// (`work_status`) is handled by the same shared mechanism every other
+// payload validator uses, instead of a bespoke extra/missing-key
+// comparison. These three cases pin the resulting behaviour: optional key
+// absent (accept), optional key present and well-formed (accept), and an
+// actually-unknown key alongside a well-formed optional key (still reject
+// -- proves `optionalKeys` doesn't widen into "anything goes").
+const baseSnapshotData = () => ({
+  contract_version: "v1.0",
+  session_id: "session-1",
+  snapshot_sequence: 5,
+  workers: [],
+  results: [],
+  speech_progress: [],
+  routing: null,
+  transcript: [],
+  origin_epoch: 1,
+});
+
+const snapshotMessage = (data) => ({
+  contract_version: "v1.0",
+  kind: "runtime_snapshot",
+  sequence: 5,
+  session_id: "session-1",
+  origin_epoch: 1,
+  data,
+});
+
+test("accepts a runtime snapshot that omits the optional work_status key entirely", () => {
+  expect(validateServerMessage(snapshotMessage(baseSnapshotData()))).toBe(true);
+});
+
+test("accepts a runtime snapshot carrying a well-formed work_status array", () => {
+  const data = { ...baseSnapshotData(), work_status: [workStatus()] };
+  expect(validateServerMessage(snapshotMessage(data))).toBe(true);
+});
+
+test("rejects a runtime snapshot with an unknown key even when work_status is well-formed", () => {
+  const data = { ...baseSnapshotData(), work_status: [workStatus()], unexpected_private_field: true };
+  expect(validateServerMessage(snapshotMessage(data))).toBe(false);
 });
 
 test("accepts a full display result with a separate concise spoken projection", () => {
@@ -487,4 +534,110 @@ test("requests a snapshot at each explicit readiness boundary, never during init
   await protocol.receive({ kind: "reconnected" });
 
   expect(snapshots).toEqual(["snapshot", "snapshot"]);
+});
+
+// --- Phase 3: work_status kind -------------------------------------------
+//
+// shared/schemas/rtvi-message.json extends its closed v1.0 kind enum with
+// "work_status"; RTVI_MESSAGE_KINDS must track the schema exactly (existing
+// test above already asserts RTVI_MESSAGE_KINDS === schema kind enum, so
+// once the schema lands "work_status", this constant must too).
+
+const workStatus = (overrides = {}) => ({
+  turn_id: "turn-1",
+  work_item_id: "work-1",
+  worker_id: null,
+  state: "routing",
+  event_sequence: 0,
+  terminal_reason: null,
+  origin_epoch: 1,
+  ...overrides,
+});
+
+test("rtvi-message.json's closed v1.0 kind enum includes work_status", () => {
+  expect(messageSchema.properties.kind.enum).toContain("work_status");
+});
+
+test("validateServerMessage accepts a well-formed work_status envelope for each coarse state", () => {
+  for (const state of ["routing", "searching", "background", "result_ready", "failed", "cancelled"]) {
+    const message = {
+      contract_version: "v1.0",
+      session_id: "session-1",
+      sequence: 1,
+      kind: "work_status",
+      data: workStatus({ state }),
+      origin_epoch: 1,
+    };
+    expect(validateServerMessage(message)).toBe(true);
+  }
+});
+
+test("validateServerMessage rejects a work_status payload carrying word-level progress fields", () => {
+  const message = {
+    contract_version: "v1.0",
+    session_id: "session-1",
+    sequence: 1,
+    kind: "work_status",
+    data: workStatus({ word_progress: "thinking about the weather" }),
+    origin_epoch: 1,
+  };
+  expect(validateServerMessage(message)).toBe(false);
+});
+
+// Regression: validWorkStatus rolled its own extra-keys-only check, so a
+// payload that simply omitted a key was judged against per-field rules that
+// disagreed with it -- an absent `terminal_reason` was rejected (undefined
+// !== null) while the key check had treated the key as optional. The wire
+// schema settles it: shared/schemas/work-status.json lists all seven keys as
+// `required`, nullable or not, so the check is now symmetric and the
+// per-field null tests are consistent with it.
+test("work_status key presence matches shared/schemas/work-status.json exactly", () => {
+  const envelope = (data) => ({
+    contract_version: "v1.0",
+    session_id: "session-1",
+    sequence: 1,
+    kind: "work_status",
+    data,
+    origin_epoch: 1,
+  });
+  const required = workStatusSchema.required;
+  expect(required).toEqual(Object.keys(workStatusSchema.properties));
+
+  // Every nullable-but-required key present as an explicit null is accepted.
+  expect(validateServerMessage(envelope(workStatus()))).toBe(true);
+
+  // Dropping any required key is rejected, including the nullable ones.
+  for (const key of required) {
+    const partial = workStatus();
+    delete partial[key];
+    expect(validateServerMessage(envelope(partial))).toBe(false);
+  }
+});
+
+test("validateServerMessage rejects work_status using the WorkItemEvent-reserved started/progress states", () => {
+  for (const reserved of ["started", "progress"]) {
+    const message = {
+      contract_version: "v1.0",
+      session_id: "session-1",
+      sequence: 1,
+      kind: "work_status",
+      data: workStatus({ state: reserved }),
+      origin_epoch: 1,
+    };
+    expect(validateServerMessage(message)).toBe(false);
+  }
+});
+
+
+// The capability name is a cross-language wire constant: nothing but this
+// assertion pair keeps the JS export and server/contracts.py's WORK_STATUS_V1
+// spelled the same way.
+test("the work_status capability constant matches the server contract constant", () => {
+  const contractsSource = readFileSync(
+    new URL("../../server/contracts.py", import.meta.url),
+    "utf8",
+  );
+  const match = contractsSource.match(/^WORK_STATUS_V1 = "([^"]+)"$/m);
+  expect(match).not.toBeNull();
+  expect(WORK_STATUS_V1).toBe(match[1]);
 });

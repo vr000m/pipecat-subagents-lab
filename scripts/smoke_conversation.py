@@ -12,49 +12,66 @@ import time
 from dataclasses import replace
 from typing import Any
 
-DEFAULT_QUERY = "What is the latest stable Pipecat release?"
-ROUTING_REGRESSION_QUERIES = (
-    "Hi.",
-    "Tell me the weather in Riga. For today.",
-    "Could you tell me the weather in Helsinki today?",
+# Hoisted to scripts/eval_common.py so scripts/eval_model_comparison.py and
+# this module can share the same session-construction helper and
+# latency-measurement pattern (in-memory sink) without either importing the
+# other as a library; re-exported here so existing imports (including
+# tests/test_smoke_conversation.py) keep working unchanged.
+# DEFAULT_QUERY/ROUTING_REGRESSION_QUERIES themselves live in
+# evals/queries.py -- imported directly from there (not via eval_common.py's
+# re-export of a re-export, a needless 3-hop chain: round 8 gauntlet,
+# Architecture finding 12), same as evals/scenarios.py already does.
+from evals.queries import DEFAULT_QUERY, ROUTING_REGRESSION_QUERIES
+from scripts.eval_common import (
+    SAFE_FALLBACKS,
+    CollectingMeasurementSink,
+    build_session_for_run,
+    latest_turn_stage_metrics,
+    turn_correlated_routing_action,
 )
+
+__all__ = [
+    "DEFAULT_QUERY",
+    "ROUTING_REGRESSION_QUERIES",
+    "SAFE_FALLBACKS",
+    "CollectingMeasurementSink",
+]
+
 RESULT_PREFIX = "SMOKE_RESULT="
 
+# Backward-compatible alias for this module's own previously-local
+# definition, now hoisted to scripts/eval_common.py's
+# turn_correlated_routing_action() so this script and
+# scripts/eval_model_comparison.py share one implementation instead of two
+# independently-maintained copies (round 9 gauntlet, Architecture lens
+# finding 17). Kept under the old leading-underscore name -- not in
+# __all__ -- since tests/test_smoke_conversation.py imports it by this name
+# directly. This smoke script has no "unevaluated" reporting channel (unlike
+# the eval runner) -- callers here already treat a ``None`` action as an
+# explicit failure (round 8 gauntlet, Logic lens finding 1).
+_turn_correlated_routing_action = turn_correlated_routing_action
 
-def _latest_turn_stage_metrics(sink: Any, elapsed_ms: float, turn_id: str) -> dict[str, float]:
-    """Read the given ``turn_id``'s correlated PERF_METRIC records.
 
-    Selecting by the caller's own ``turn_id`` (rather than the newest record
-    of each kind) is required so a turn that emits no ``work_item_foreground``
-    record -- any direct/unsupported/clarify router turn -- never silently
-    inherits a preceding delegated turn's ``search_ms``/``total_ms``.
+class _RecordingTTS:
+    """No-audio-synthesis TTS stand-in for the ack-ordering scenario -- lets
+    the scheduler treat the connection as TTS-capable (so it actually admits
+    the early ack) without paying for real speech synthesis. Module-level (not
+    nested in ``_run_ack_ordering``) so ``_run_child`` can construct it and
+    pass it into ``build_session_for_run(..., tts=...)`` at construction time,
+    rather than the post-hoc ``host.tts = ...`` reassignment
+    ``server.composition.build_session_host``'s own docstring warns leaves
+    ``SessionHost._tts_on_event`` stale.
     """
-    turn_records = [
-        record
-        for record in sink.records
-        if record.event == "app_turn_foreground" and record.fields.get("turn_id") == turn_id
-    ]
-    if not turn_records:
-        raise RuntimeError(f"no app_turn_foreground metric was emitted for turn_id={turn_id!r}")
-    turn_record = turn_records[-1]
-    work_records = [
-        record
-        for record in sink.records
-        if record.event == "work_item_foreground" and record.fields.get("turn_id") == turn_id
-    ]
-    work_record = work_records[-1] if work_records else None
-    return {
-        "routing_ms": float(turn_record.fields.get("routing_ms", 0)),
-        "search_ms": float(work_record.fields.get("search_ms", 0)) if work_record else 0.0,
-        "total_ms": float(turn_record.fields.get("total_ms", elapsed_ms)),
-    }
 
+    on_event = None
 
-SAFE_FALLBACKS = {
-    "Routing is temporarily unavailable. Please try that request again.",
-    "The web search is temporarily unavailable.",
-    "I could not find a reliable result for that request.",
-}
+    @staticmethod
+    def correlated_speak_frame(text: str, *, correlation_id: str, append_to_context: bool) -> Any:
+        from server.services.tts import CorrelatedTTSSpeakFrame
+
+        return CorrelatedTTSSpeakFrame(
+            text=text, correlation_id=correlation_id, append_to_context=append_to_context
+        )
 
 
 async def _run_child(
@@ -63,32 +80,64 @@ async def _run_child(
     max_latency_seconds: float,
     max_routing_seconds: float,
     routing_regression: bool,
+    ack_ordering: bool,
+    max_ack_seconds: float,
 ) -> dict[str, Any]:
-    from server.app import _default_session_host
+    from server.config import load_config, load_promotion_manifest
     from server.perf_metrics import CollectingMeasurementSink
 
     sink = CollectingMeasurementSink()
-    host = _default_session_host(measurement_sink=sink)
+    # Built via build_session_for_run(), not _default_session_host() + a
+    # post-hoc host.config reassignment: the router provider captures its
+    # Config reference at construction, so a later `host.config = tuned`
+    # never reaches it (see build_session_for_run's own docstring, and the
+    # dev plan's "Architecture & Call Flow / Injection seam" note). This
+    # smoke's model/effort is always the operator's configured default (no
+    # per-run candidate override the way the eval-suite runner has), but it
+    # shares the same construction seam so the two never drift apart.
+    base_config = load_config()
     # The semantic smoke waits longer than the interactive foreground path so
     # it validates the final provider result rather than the background-work
     # acknowledgement. The total latency budget remains independently enforced.
-    config = host.coordinator.config
     tuned = replace(
-        config,
+        base_config,
         foreground_search_timeout_seconds=max_latency_seconds,
         provider_timeout_seconds=max(
-            config.provider_timeout_seconds,
+            base_config.provider_timeout_seconds,
             max_latency_seconds + 15,
         ),
     )
-    host.coordinator.config = tuned
-    host.registry.config = tuned
-    # This smoke isolates the paid semantic path. Browser media and local speech
-    # have separate deterministic/live acceptance commands.
-    host.stt = None
-    host.tts = None
+    # Mirrors server/app.py's own _default_session_host() wiring: without this,
+    # SessionHost._promotion_eligible is permanently False for every host this
+    # helper builds (build_session_for_run()'s promotion_manifest defaults to
+    # None), which silently forces late_delivery_disposition() onto its
+    # "display_only" branch regardless of the real manifest -- this smoke's
+    # ack-ordering scenario is the live acceptance test for that predicate, so
+    # it must see the real disposition, not a hardcoded fallback.
+    promotion_manifest = load_promotion_manifest(tuned)
+    # The single-turn and routing-regression scenarios don't exercise speech
+    # at all, so they build with TTS disabled; only ack-ordering needs the
+    # recording TTS wired in (bound at construction -- see _RecordingTTS's
+    # own docstring for why a post-hoc reassignment isn't used instead).
+    host = build_session_for_run(
+        tuned,
+        measurement_sink=sink,
+        promotion_manifest=promotion_manifest,
+        tts=_RecordingTTS() if ack_ordering else None,
+    )
+    # This smoke isolates the paid semantic path. Browser media and local
+    # speech have separate deterministic/live acceptance commands.
     await host.start()
     try:
+        if ack_ordering:
+            return await _run_ack_ordering(
+                host,
+                query,
+                max_ack_seconds=max_ack_seconds,
+                max_latency_seconds=max_latency_seconds,
+                sink=sink,
+                max_routing_seconds=max_routing_seconds,
+            )
         connection = await host.connect(
             {
                 "session_id": host.state.session_id,
@@ -120,7 +169,7 @@ async def _run_child(
             raise RuntimeError("public-web smoke returned an invalid spoken projection")
         if not result.citations:
             raise RuntimeError("public-web smoke returned no normalized citations")
-        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+        stage_metrics = latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
         routing_ms = stage_metrics["routing_ms"]
         search_ms = stage_metrics["search_ms"]
         total_ms = stage_metrics["total_ms"]
@@ -147,6 +196,159 @@ async def _run_child(
         await host.shutdown()
 
 
+async def _drive_lifecycle(connection: Any, lease: Any) -> None:
+    """Stand in for what a real transport does to an admitted generation:
+    bind the marker token, observe synthesis start/stop, then the fieldless
+    upstream bot stop. Mirrors tests/test_pipeline.py's
+    release_lifecycle_slot, including awaiting the coordinator's
+    fire-and-forget on_terminal task so the transport slot is actually
+    released (and the next queued item admitted) before this returns --
+    without that, a caller that tears the connection down right after (as
+    _run_ack_ordering does, via host.shutdown()) can race the coordinator's
+    still-in-flight generation termination against shutdown's own interrupt,
+    corrupting the recorded disposition.
+    """
+    lifecycle = connection.lifecycle
+    utterance_id = lease.item.utterance_id
+    bound = lifecycle.bind_context(lease.token, utterance_id)
+    started = lifecycle.on_tts_started(utterance_id) if bound else False
+    stopped = lifecycle.on_tts_stopped(utterance_id) if started else False
+    if not (bound and started and stopped):
+        raise RuntimeError(
+            f"lifecycle wiring rejected the {lease.item.role} generation "
+            f"(bind={bound}, started={started}, stopped={stopped}, token={lease.token!r})"
+        )
+    terminal = lifecycle.on_transport_bot_stopped()
+    if terminal is not None:
+        await terminal
+
+
+async def _run_ack_ordering(
+    host: Any,
+    query: str,
+    *,
+    max_ack_seconds: float,
+    max_latency_seconds: float,
+    sink: Any,
+    max_routing_seconds: float,
+) -> dict[str, Any]:
+    """Prove the early ack is admitted for real speech while a live,
+    paid-provider delegated search is still in flight -- the externally
+    observable contract ``tests/test_pipeline.py::
+    test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch``
+    proves against a fake coordinator/worker. Relies on the caller (see
+    ``_run_child``) having built ``host`` with the module-level
+    ``_RecordingTTS`` (no audio synthesis, no extra cost) so the scheduler
+    treats this connection as TTS-capable and actually admits the ack,
+    instead of the ``tts=None`` isolation the other scenarios use.
+    """
+    from server.speech_scheduler import ROLE_ACK, ROLE_RESULT
+
+    class _RecordingWorker:
+        async def queue_frame(self, frame: object) -> None:
+            del frame
+
+        async def cancel(self, *, reason: str) -> None:
+            del reason
+
+    connection = await host.connect(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+        }
+    )
+    connection.worker = _RecordingWorker()
+    scheduler = connection.scheduler
+
+    started = time.perf_counter()
+    pending = asyncio.create_task(host._handle_transcript(query, origin=connection))
+
+    admissions: list[tuple[str, float]] = []
+    seen_tokens: set[str] = set()
+    ack_released = False
+    while True:
+        elapsed = time.perf_counter() - started
+        # Check admission before the done-check below: start_next() can admit
+        # the final result synchronously as the very last step of the task
+        # that _handle_transcript's own await resolves from, so a loop that
+        # exits on pending.done() without checking active one more time here
+        # would miss that admission entirely.
+        lease = scheduler.active
+        if lease is not None and lease.token not in seen_tokens:
+            seen_tokens.add(lease.token)
+            admissions.append((lease.item.role, elapsed * 1000))
+            try:
+                await _drive_lifecycle(connection, lease)
+            except RuntimeError:
+                pending.cancel()
+                raise
+            if lease.item.role == ROLE_ACK:
+                ack_released = True
+                if elapsed > max_ack_seconds:
+                    pending.cancel()
+                    raise RuntimeError(
+                        f"early ack was admitted late, at {elapsed:.1f}s "
+                        f"(budget {max_ack_seconds:.1f}s)"
+                    )
+        if pending.done():
+            break
+        if not ack_released and elapsed > max_ack_seconds:
+            pending.cancel()
+            raise RuntimeError(
+                f"early ack was not admitted for real speech within {max_ack_seconds:.1f}s "
+                f"(active={scheduler.active!r}, queued_roles={scheduler.queued_roles()})"
+            )
+        if elapsed > max_latency_seconds:
+            pending.cancel()
+            raise RuntimeError(f"ack-ordering smoke exceeded {max_latency_seconds:.1f}s budget")
+        await asyncio.sleep(0.01)
+
+    value = await pending
+    results = value if isinstance(value, tuple) else (value,)
+    if len(results) != 1:
+        raise RuntimeError(f"expected one result, received {len(results)}")
+    result = results[0]
+    if result.worker_id == "main":
+        raise RuntimeError("ack-ordering smoke fell back to the main responder")
+    if result.ui_text in SAFE_FALLBACKS:
+        raise RuntimeError("ack-ordering smoke returned a safe fallback")
+    if not result.spoken_text or len(result.spoken_text) > 600:
+        raise RuntimeError("ack-ordering smoke returned an invalid spoken projection")
+    if not result.citations:
+        raise RuntimeError("ack-ordering smoke returned no normalized citations")
+
+    roles_seen = [role for role, _ in admissions]
+    if roles_seen.count(ROLE_ACK) != 1:
+        raise RuntimeError(f"expected exactly one ack admission, saw {roles_seen}")
+    if ROLE_RESULT not in roles_seen:
+        raise RuntimeError(f"the final result was never admitted for speech: saw {roles_seen}")
+    if roles_seen.index(ROLE_ACK) > roles_seen.index(ROLE_RESULT):
+        raise RuntimeError(f"the ack was admitted after the result: {admissions}")
+
+    ack_ms = next(ms for role, ms in admissions if role == ROLE_ACK)
+    result_ms = next(ms for role, ms in admissions if role == ROLE_RESULT)
+    # No separate `ack_ms > max_ack_seconds * 1000` check here: the in-loop
+    # "early ack was admitted late" check above already raises at the same
+    # instant this value was captured, on the same elapsed-vs-max_ack_seconds
+    # comparison, so a second check on the same value can never fire.
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    stage_metrics = latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+    routing_ms = stage_metrics["routing_ms"]
+    if routing_ms > max_routing_seconds * 1000:
+        raise RuntimeError(
+            f"ack-ordering routing exceeded {max_routing_seconds:.1f}s budget: {routing_ms:.1f}ms"
+        )
+    return {
+        "scenario": "ack-ordering",
+        "worker": result.worker_id,
+        "ack_ms": round(ack_ms, 1),
+        "result_ms": round(result_ms, 1),
+        "routing_ms": round(routing_ms, 1),
+    }
+
+
 async def _run_routing_regression(
     host: Any,
     connection: Any,
@@ -167,7 +369,7 @@ async def _run_routing_regression(
             )
         result = results[0]
         routing = getattr(host.state, "routing", None)
-        action = getattr(routing, "action", None)
+        action = _turn_correlated_routing_action(routing, result.turn_id)
         if index == 0:
             if action != "direct" or result.worker_id != "main":
                 raise RuntimeError("greeting was not handled as a direct main response")
@@ -178,7 +380,7 @@ async def _run_routing_regression(
                 raise RuntimeError("weather turn returned a routing/search fallback")
             if action not in {"new_worker", "existing_worker"}:
                 raise RuntimeError(f"weather turn used unexpected routing action: {action!r}")
-        stage_metrics = _latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
+        stage_metrics = latest_turn_stage_metrics(sink, elapsed_ms, result.turn_id)
         routing_ms = stage_metrics["routing_ms"]
         total_ms = stage_metrics["total_ms"]
         if routing_ms > max_routing_seconds * 1000:
@@ -215,6 +417,8 @@ def _child(
     max_latency_seconds: float,
     max_routing_seconds: float,
     routing_regression: bool,
+    ack_ordering: bool,
+    max_ack_seconds: float,
 ) -> int:
     metrics = asyncio.run(
         _run_child(
@@ -222,6 +426,8 @@ def _child(
             max_latency_seconds=max_latency_seconds,
             max_routing_seconds=max_routing_seconds,
             routing_regression=routing_regression,
+            ack_ordering=ack_ordering,
+            max_ack_seconds=max_ack_seconds,
         )
     )
     print(RESULT_PREFIX + json.dumps(metrics, sort_keys=True))
@@ -234,6 +440,8 @@ def _parent(
     max_latency_seconds: float,
     max_routing_seconds: float,
     routing_regression: bool,
+    ack_ordering: bool,
+    max_ack_seconds: float,
 ) -> int:
     command = [
         sys.executable,
@@ -245,9 +453,13 @@ def _parent(
         str(max_latency_seconds),
         "--max-routing-seconds",
         str(max_routing_seconds),
+        "--max-ack-seconds",
+        str(max_ack_seconds),
     ]
     if routing_regression:
         command.append("--routing-regression")
+    if ack_ordering:
+        command.append("--ack-ordering")
     try:
         completed = subprocess.run(
             command,
@@ -281,6 +493,14 @@ def _parent(
             f"max_routing_ms={metrics['max_routing_ms']} "
             f"max_total_ms={metrics['max_total_ms']}"
         )
+    elif metrics.get("scenario") == "ack-ordering":
+        print(
+            "ack-ordering smoke passed: "
+            f"worker={metrics['worker']} "
+            f"ack_ms={metrics['ack_ms']} "
+            f"result_ms={metrics['result_ms']} "
+            f"routing_ms={metrics['routing_ms']}"
+        )
     else:
         print(
             "conversation smoke passed: "
@@ -306,6 +526,12 @@ def main() -> int:
         action="store_true",
         help="run the live Hi-then-weather routing regression sequence",
     )
+    parser.add_argument(
+        "--ack-ordering",
+        action="store_true",
+        help="prove the early ack is admitted for real speech before the delegated result",
+    )
+    parser.add_argument("--max-ack-seconds", type=float, default=15)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.query.strip():
@@ -316,6 +542,12 @@ def main() -> int:
         parser.error("--max-latency-seconds must be positive")
     if args.max_routing_seconds <= 0:
         parser.error("--max-routing-seconds must be positive")
+    if args.max_ack_seconds <= 0:
+        parser.error("--max-ack-seconds must be positive")
+    if args.ack_ordering and args.max_ack_seconds >= args.max_latency_seconds:
+        parser.error("--max-ack-seconds must be less than --max-latency-seconds")
+    if args.routing_regression and args.ack_ordering:
+        parser.error("--routing-regression and --ack-ordering are mutually exclusive")
     if args.timeout <= args.max_latency_seconds:
         parser.error("--timeout must exceed --max-latency-seconds")
     return (
@@ -324,6 +556,8 @@ def main() -> int:
             args.max_latency_seconds,
             args.max_routing_seconds,
             args.routing_regression,
+            args.ack_ordering,
+            args.max_ack_seconds,
         )
         if args.child
         else _parent(
@@ -332,6 +566,8 @@ def main() -> int:
             args.max_latency_seconds,
             args.max_routing_seconds,
             args.routing_regression,
+            args.ack_ordering,
+            args.max_ack_seconds,
         )
     )
 

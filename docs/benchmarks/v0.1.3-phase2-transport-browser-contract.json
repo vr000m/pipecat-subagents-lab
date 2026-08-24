@@ -1,0 +1,14 @@
+{
+  "audibility": {
+    "state": "audibility_unverified"
+  },
+  "fake_route_artifact_sha256": "08b81c00377c3a84ffa578ef9d69af9b152c4873f0c39769931d9cd0fbc2709f",
+  "package_integrity": "sha512-G+EnYNij9tByLIyr2a9YH5RjNxL+cGJbV15swZrFSHYmBYTLRvlgZPWT+G6v6Ull8jSuG7tzbUmy0VH+42ehfA==",
+  "package_version": "1.10.6",
+  "promotion_eligible": false,
+  "reason": "no named browser/device check has run against this source anchor; credential-free spike only",
+  "source_anchor": "@pipecat-ai/small-webrtc-transport@1.10.6 (web/bun.lock, web/package.json)",
+  "source_commit": "5fc2e61bff65ee765803d56cb392fa65c276fcf4",
+  "source_tree_hash": "824a06f4dd493634ead42630abf3db886c32cd0a1eb8eda4921844ec38b1c0d9",
+  "status": "audibility_unverified"
+}

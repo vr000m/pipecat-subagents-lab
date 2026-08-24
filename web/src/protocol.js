@@ -1,8 +1,12 @@
 import { applyMessage, createInitialState } from "./state.js";
 import groundedResultSchema from "../../shared/schemas/grounded-result.json";
 import runtimeSnapshotSchema from "../../shared/schemas/runtime-snapshot.json";
+import workStatusSchema from "../../shared/schemas/work-status.json";
 
 export const CONTRACT_VERSION = "v1.0";
+// Capability name gating the `work_status` wire kind. Must match
+// server/contracts.py's WORK_STATUS_V1 exactly (asserted in both suites).
+export const WORK_STATUS_V1 = "work_status_v1";
 const forbidden = ["raw_logs", "prompt", "context"];
 export const RTVI_MESSAGE_KINDS = Object.freeze([
   "runtime_snapshot",
@@ -12,10 +16,43 @@ export const RTVI_MESSAGE_KINDS = Object.freeze([
   "routing",
   "user_transcript",
   "bot_transcript",
+  "work_status",
 ]);
 const runtimeKinds = new Set(RTVI_MESSAGE_KINDS);
 const groundedResultKeys = Object.freeze(Object.keys(groundedResultSchema.properties));
-const runtimeSnapshotKeys = Object.freeze(Object.keys(runtimeSnapshotSchema.properties));
+// "work_status" is the one optional runtime-snapshot key: non-capable
+// projections omit it entirely (field absent, not an empty array). Named
+// once here and threaded through to `hasExactKeys` as its `optionalKeys`
+// argument below (round-5 restart, Architecture finding #19 -- this used to
+// be a bespoke extra/missing-key comparison with "work_status" hardcoded a
+// second time inside it).
+const RUNTIME_SNAPSHOT_OPTIONAL_KEYS = Object.freeze(["work_status"]);
+const runtimeSnapshotKeys = Object.freeze(
+  Object.keys(runtimeSnapshotSchema.properties).filter(
+    (key) => !RUNTIME_SNAPSHOT_OPTIONAL_KEYS.includes(key),
+  ),
+);
+// shared/schemas/work-status.json lists every one of these as `required`, so
+// the browser check is symmetric (no extra keys AND no missing keys) rather
+// than extra-keys-only. `terminal_reason` and `origin_epoch` are nullable but
+// still mandatory on the wire -- the Python side always emits them as literal
+// null -- so treating an absent key as acceptable would have quietly diverged
+// from the schema.
+const workStatusKeys = Object.freeze(Object.keys(workStatusSchema.properties));
+// Derived from the schema's own `enum` arrays, not hand-copied from them
+// (round-3 restart gauntlet, Architecture finding). This file already imported
+// work-status.json to derive `workStatusKeys` from `properties`, then
+// hand-wrote the two enums out of that same file -- so a state added to the
+// schema was picked up by the key check and silently rejected by the value
+// check. The Python side derives `WORK_STATUS_STATES`/`WORK_STATUS_TERMINAL`
+// from a single transitions table for the same reason.
+const workStatusStates = new Set(workStatusSchema.properties.state.enum);
+// `null` is a legal `terminal_reason` and is in the schema enum, but it is
+// handled by the explicit `!== null` check at the call site, so it is filtered
+// out here rather than being a member of the "named reason" set.
+const workStatusTerminalReasons = new Set(
+  workStatusSchema.properties.terminal_reason.enum.filter((reason) => reason !== null),
+);
 const deliveryStates = new Set([
   "displayed",
   "queued",
@@ -33,11 +70,19 @@ function validOrigin(value) {
   return value === undefined || value === null || (Number.isInteger(value) && value >= 0);
 }
 
-function hasExactKeys(value, expectedKeys) {
+// `optionalKeys` (round-5 restart, Architecture finding #19) covers fields
+// that may be entirely absent -- not present-but-nullable -- on the wire:
+// runtime_snapshot's `work_status` is the one case today (non-capable
+// projections omit it, they don't send an empty array). Every key not in
+// `requiredKeys` or `optionalKeys` is still rejected as extra, and every
+// `requiredKeys` entry must still be present -- only `optionalKeys` entries
+// are allowed to be missing.
+function hasExactKeys(value, requiredKeys, optionalKeys = []) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const allowedKeys = new Set([...requiredKeys, ...optionalKeys]);
   const actualKeys = Object.keys(value);
-  return actualKeys.length === expectedKeys.length &&
-    expectedKeys.every((key) => Object.hasOwn(value, key));
+  return actualKeys.every((key) => allowedKeys.has(key)) &&
+    requiredKeys.every((key) => Object.hasOwn(value, key));
 }
 
 function validTimestamp(value) {
@@ -124,6 +169,18 @@ function validTranscript(value) {
     Object.hasOwn(value, "origin_epoch") && validOrigin(value.origin_epoch);
 }
 
+function validWorkStatus(value) {
+  if (!hasExactKeys(value, workStatusKeys)) return false;
+  const optionalString = (item) => item === null || typeof item === "string";
+  if (typeof value.turn_id !== "string" || value.turn_id.length === 0) return false;
+  if (!optionalString(value.work_item_id) || !optionalString(value.worker_id)) return false;
+  if (!workStatusStates.has(value.state)) return false;
+  if (!Number.isInteger(value.event_sequence) || value.event_sequence < 0) return false;
+  if (value.terminal_reason !== null && !workStatusTerminalReasons.has(value.terminal_reason)) return false;
+  if (value.terminal_reason !== null && value.state !== "failed") return false;
+  return validOrigin(value.origin_epoch);
+}
+
 export function validateServerMessage(message) {
   if (!message || typeof message !== "object" || typeof message.kind !== "string") return false;
   const envelopeKeys = ["contract_version", "session_id", "sequence", "kind", "data", "origin_epoch"];
@@ -140,13 +197,17 @@ export function validateServerMessage(message) {
   if (message.kind === "speech_progress" && !validSpeech(data)) return false;
   if (message.kind === "worker" && !validWorker(data)) return false;
   if (message.kind === "routing" && !validRouting(data)) return false;
+  if (message.kind === "work_status" && !validWorkStatus(data)) return false;
   if (["user_transcript", "bot_transcript"].includes(message.kind)) {
     if (!validTranscript(data)) return false;
     if (message.kind === "user_transcript" && data.role !== "user") return false;
     if (message.kind === "bot_transcript" && data.role !== "assistant") return false;
   }
   if (message.kind === "runtime_snapshot") {
-    if (!hasExactKeys(data, runtimeSnapshotKeys)) return false;
+    if (!hasExactKeys(data, runtimeSnapshotKeys, RUNTIME_SNAPSHOT_OPTIONAL_KEYS)) return false;
+    if (Object.hasOwn(data, "work_status")) {
+      if (!Array.isArray(data.work_status) || !data.work_status.every(validWorkStatus)) return false;
+    }
     if (typeof data.session_id !== "string" || data.session_id.length === 0) return false;
     if (message.session_id !== data.session_id) return false;
     if (data.contract_version !== CONTRACT_VERSION || !validOrigin(data.origin_epoch)) return false;

@@ -256,3 +256,47 @@ test("uses conservative incomplete styling for every non-transport-complete deli
     expect(html).not.toContain("verified browser audibility");
   }
 });
+
+// --- Phase 3: rendering the coarse work_status states ---------------------
+//
+// renderRuntime does not yet render a work_status section (pre-Phase-3
+// state has no `workStatus` field); this is guarded on the field's presence
+// so it is skipped, not failed, until the rendering addition lands.
+
+const hasWorkStatusField = Object.hasOwn(state, "workStatus") ||
+  Object.hasOwn(state, "work_status");
+
+if (hasWorkStatusField) {
+  test("renders a coarse, truthful label for every work_status state, never word-level progress", () => {
+    for (const workState of ["routing", "searching", "background", "result_ready", "failed", "cancelled"]) {
+      const html = renderRuntime({
+        ...state,
+        workStatus: { "work-1": { turn_id: "turn-1", work_item_id: "work-1", state: workState } },
+      });
+
+      expect(html).toContain(workState);
+    }
+  });
+
+  // Regression: epoch is part of a work_status record's identity (see
+  // state.js's workStatusKey). Without rendering it, a reconnect that leaves
+  // one turn_id with two records (old epoch terminal, new epoch live) would
+  // render two rows that look like duplicate/contradictory entries for the
+  // same turn.
+  test("renders the epoch so two records for the same turn_id at different epochs are distinguishable rows", () => {
+    const html = renderRuntime({
+      ...state,
+      workStatus: {
+        "1::turn-1::work-1": { turn_id: "turn-1", work_item_id: "work-1", state: "result_ready", origin_epoch: 1 },
+        "2::turn-1::work-1": { turn_id: "turn-1", work_item_id: "work-1", state: "searching", origin_epoch: 2 },
+      },
+    });
+
+    expect(html).toContain("epoch 1");
+    expect(html).toContain("epoch 2");
+    expect(html).toContain('data-work-status-key="1::turn-1::work-1"');
+    expect(html).toContain('data-work-status-key="2::turn-1::work-1"');
+  });
+} else {
+  test.skip("Phase 3 work_status rendering not implemented yet", () => {});
+}

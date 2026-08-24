@@ -14,7 +14,8 @@
     "speech_progress": {"type": "array", "items": {"$ref": "#/$defs/speech_progress"}},
     "routing": {"oneOf": [{"$ref": "#/$defs/routing"}, {"type": "null"}]},
     "transcript": {"type": "array", "items": {"$ref": "#/$defs/transcript_entry"}},
-    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0},
+    "work_status": {"type": "array", "items": {"$ref": "work-status.json"}}
   },
   "$defs": {
     "origin_epoch": {"type": ["integer", "null"], "minimum": 0},

@@ -76,8 +76,10 @@ shutdown_grace_seconds = 2.0
 max_citations = 12
 
 [models]
-router_model = "gpt-5-mini"
-worker_model = "gpt-5"
+router_model = "gpt-5.6-luna"
+router_reasoning_effort = "medium"
+worker_model = "gpt-5.6-terra"
+worker_reasoning_effort = "medium"
 
 [tts]
 provider = "local"
@@ -103,9 +105,44 @@ export WEBSEARCH_TTS_ENDPOINT=uds:///path/to/tts.sock
 ```
 
 The equivalent overrides are `WEBSEARCH_STT_WS_SOCKET`,
-`WEBSEARCH_TTS_WS_SOCKET`, and `WEBSEARCH_TTS_WS_URI`; for TTS, URI takes
-precedence over socket, followed by `WEBSEARCH_TTS_WS_HOST` plus
-`WEBSEARCH_TTS_WS_PORT`. `WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
+`WEBSEARCH_TTS_WS_SOCKET`, and `WEBSEARCH_TTS_WS_URI`.
+
+These alternative spellings of one endpoint resolve by **configuration layer
+first, key priority second**. The layers, lowest to highest, are `config.toml`,
+the env file, and the process environment — so `WEBSEARCH_TTS_WS_SOCKET`
+exported in your shell beats a `[tts] tts_ws_uri` in `config.toml`, and the
+highest-precedence layer that names *any* member of the family wins. Key
+priority only breaks a tie *within* one layer: there, `WEBSEARCH_TTS_ENDPOINT`
+beats `WEBSEARCH_TTS_WS_URI`, which beats `WEBSEARCH_TTS_WS_SOCKET`, which beats
+`WEBSEARCH_TTS_WS_HOST` plus `WEBSEARCH_TTS_WS_PORT`. The STT pair
+(`WEBSEARCH_STT_ENDPOINT` / `WEBSEARCH_STT_WS_SOCKET`) follows the same rule.
+
+`WEBSEARCH_TTS_WS_HOST` and `WEBSEARCH_TTS_WS_PORT` must be set together;
+setting one without the other is a startup error rather than a silent fallback
+to the packaged default endpoint. That error is raised only when the
+half-specified pair is the spelling that would otherwise have won — a leftover
+`[tts] tts_ws_host` in `config.toml` is simply not consulted once a
+higher-layer spelling supplies the endpoint, and does not block startup.
+
+The vendor-credential aliases are families too, but they resolve by a
+*different* rule. `CARTESIA_API_KEY`, `DEEPGRAM_API_KEY`, `CARTESIA_VOICE_ID`
+and the variable named by `WEBSEARCH_OPENAI_API_KEY_ENV` are alternative
+spellings of their `WEBSEARCH_`-prefixed counterparts, and the
+`WEBSEARCH_`-prefixed spelling wins **whatever layer either was set at** — a
+`WEBSEARCH_OPENAI_API_KEY` in your env file beats an `OPENAI_API_KEY` exported
+in your shell, not the other way round.
+
+That is deliberate, and it is why the endpoint rule above does not apply here:
+every endpoint spelling is `WEBSEARCH_`-prefixed, so nothing outside this app's
+own configuration can join those families. The credential aliases are the
+opposite by design — the bare spellings are the ubiquitous vendor names,
+offered so you can reuse standard credentials. Under a layer-first rule an
+ambient `OPENAI_API_KEY` in your shell, set for something else entirely, would
+silently outrank the key you deliberately scoped to this app and the wrong
+credential would go to the vendor. To use a bare spelling, leave the
+`WEBSEARCH_`-prefixed one unset (or set it to an empty value).
+
+`WEBSEARCH_SMART_TURN_TIMEOUT_SECONDS` overrides the
 semantic-turn fallback. After Smart Turn reports an incomplete turn, each new
 speech boundary resets this timer; five silent seconds finalize the accumulated
 transcript by default. `WEBSEARCH_SMART_TURN_COMPLETE_GRACE_SECONDS` controls a
@@ -130,6 +167,13 @@ bound hosted routing and worker requests, while
 `WEBSEARCH_SHUTDOWN_GRACE_SECONDS` prevents cancellation-resistant work from
 blocking server shutdown. `WEBSEARCH_MAX_CITATIONS` caps the normalized source
 list. Their TOML equivalents use the same lowercase names under `[turn]`.
+
+An explicitly-set numeric value is always validated, never quietly replaced by
+the packaged default: `[turn] max_citations = 0`, a zero smart-turn timeout, or
+a non-numeric `WEBSEARCH_MAX_WORK_ITEMS_PER_TURN` each fail startup with a
+`ConfigError` naming the field, rather than starting under a configuration the
+operator did not ask for.
+
 `WEBSEARCH_MAX_WORK_ITEMS_PER_TURN` limits one routed turn to 2, 3, or 4 work
 items and defaults to 2. `WEBSEARCH_MULTI_INTENT_WAIT_TIMEOUT_MS` controls how
 long a multi-intent turn waits for all routed work before returning its
@@ -138,6 +182,62 @@ milliseconds. These two settings are environment-only and have no TOML
 equivalents.
 `WEBSEARCH_ROUTER_MODEL` and `WEBSEARCH_WORKER_MODEL` override the configured
 OpenAI model IDs without allowing model output to select an arbitrary model.
+Their TOML equivalents are `[models].router_model`/`[models].worker_model`
+(checked-in defaults above reflect the
+`docs/dev_plans/artifacts/router-worker-eval-shortlist-2026-08-20.md`
+comparison, machine-checked against
+`docs/dev_plans/artifacts/eval-candidates-manifest.json` — the shortlist is
+the human-facing decision record, the manifest is the machine-checked gate
+the paid runner refuses to run without). `WEBSEARCH_ROUTER_REASONING_EFFORT` and
+`WEBSEARCH_WORKER_REASONING_EFFORT` override the `reasoning.effort` value
+sent with router/worker requests (validated against the OpenAI SDK's
+`ReasoningEffort` literal: `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`); unset preserves current behavior (router keeps its
+`gpt-5*`-conditional `minimal` default, worker omits `reasoning` entirely),
+while an explicit override applies unconditionally regardless of model name.
+Overriding only a role's model at a higher-precedence layer than the one that
+set its effort clears that inherited effort, so an env-only model override
+does not silently keep a TOML effort default.
+Their TOML equivalents are `[models].router_reasoning_effort`/
+`[models].worker_reasoning_effort`.
+
+The v0.1.3 delivery behaviours are gated by feature flags whose TOML
+equivalents live under `[features]`. `WEBSEARCH_ENABLE_EARLY_ACK`
+(`[features].enable_early_ack`, default `true`) controls whether a routed turn
+speaks a short acknowledgement before its first result is ready.
+`WEBSEARCH_EARLY_ACK_TEXT` (`[features].early_ack_text`, default
+`One moment while I look into that.`) is the spoken text used for that
+acknowledgement and must not be empty.
+`WEBSEARCH_ENABLE_BACKGROUND_STATUS`
+(`[features].enable_background_status`, default `true`) gates server-side
+emission of the capability-gated `work_status` updates described below;
+when disabled, no `work_status` frame is produced and the legacy
+foreground-timeout notice applies instead.
+`WEBSEARCH_ENABLE_AUTOPLAY_POLICY` (`[features].enable_autoplay_policy`,
+default `true`) enables the browser autoplay-recovery policy that surfaces the
+page's audio action when playback is blocked.
+`WEBSEARCH_PROMOTION_MANIFEST_PATH`
+(`[features].promotion_manifest_path`, default
+`docs/benchmarks/v0.1.3-promotion-manifest.json`) points at the release
+promotion manifest that the server bind-checks at startup; it must not be
+empty. `WEBSEARCH_PHASE4C_ARTIFACT_PATH`
+(`[features].phase4c_artifact_path`, default unset) points at the Phase 4C
+completion artifact whose SHA-256 the manifest's `phase4c_artifact_sha256`
+field is checked against, when present; leaving it unset makes any manifest
+declaring that field resolve to a `phase4c_unresolvable` (display-only)
+verdict. `WEBSEARCH_RELEASE_VERSION` (`[features].release_version`, default
+the installed package version) overrides the release version the promotion
+manifest's own `release_version` field is bind-checked against; it must not be
+empty, and overriding it to a version the manifest was not cut for resolves to
+a display-only verdict. The three boolean flags are parsed strictly: only `true` or `false`
+(case-insensitive) is accepted, and any other value fails startup.
+
+Server deployment binding is controlled by three more env vars, with no TOML
+equivalents: `WEBSEARCH_BIND_HOST` (default `127.0.0.1`, must be a loopback
+address) and `WEBSEARCH_BIND_PORT` (default `7860`) configure the address
+Uvicorn binds the FastAPI app to; `WEBSEARCH_KNOWN_CLIENT_URL` (default
+`http://127.0.0.1:7860`) is the URL browser clients use to reach that bound
+server and is surfaced back to callers (e.g. in preflight/readiness output).
 
 The accepted endpoint forms are `uds://`, `tcp://`, `ws://`, and `wss://`.
 The default host opens these websocket endpoints with the versioned local STT
@@ -164,13 +264,31 @@ uv run pytest
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy
-gitleaks git --no-banner --redact
+gitleaks git --no-banner --redact --config .gitleaks.toml
 cd web
 bun install
 bun run build
 bun test
 bun run lint
 ```
+
+A `justfile` at the repo root wraps the Python half of these into `just
+sync` / `just py-check` / `just build` / `just web-test` / `just check` (the
+full compile+test pipeline) / `just run` (starts the real server, loading
+`~/.secrets/ai.env` or `$AI_ENV_FILE`) / `just all` (install, check, run).
+`just check` is the recommended local entrypoint before opening or updating
+a PR — it runs everything `just py-check`/`build`/`web-test` do in one command;
+the raw `uv`/`bun` commands above remain the reference for scripting or
+running a single check in isolation. Its `sync`/`build` recipes intentionally
+use the same `--frozen` / `--frozen-lockfile` flags as
+`.github/workflows/ci.yml` so a lockfile drift fails the same way locally and
+in CI. `tests/test_justfile_ci_parity.py` asserts every `uv run`/`bun`
+command CI executes in *any* pull-request-blocking job — not just the `test`
+job — is reachable from `just check`'s recipe closure, so the two files
+drifting out of sync now fails a test rather than depending on a developer
+noticing by hand. That widening is what brought the `promotion-manifest-drift`
+job under the guard and added the `just verify-manifest` recipe (also wired
+into `just check`) so it can be reproduced locally.
 
 `uv run mypy` checks every module under `server/` by default, so a newly added
 file is type-gated without anyone remembering to opt it in. The explicit
@@ -237,6 +355,32 @@ tag or publish 0.1.1 without a passing routing-regression run. This exercises th
 live OpenAI router and worker without requiring browser media or local STT/TTS
 services.
 
+For the 0.1.3 early-ack/background-delivery policy, the following paid live
+smoke proves the ack-ordering contract itself rather than only the final
+result:
+
+```sh
+uv run python scripts/smoke_conversation.py --ack-ordering
+```
+
+Prerequisites are the same as the paid smokes above and no more: an OpenAI
+credential in the environment (`set -a; source ~/.secrets/ai.env; set +a`) for
+the live router and search worker. It needs **no** browser media, no WebRTC
+transport, and no local or hosted STT/TTS service — the "recording TTS/worker"
+mentioned below are in-process test doubles the script installs itself
+(`scripts/smoke_conversation.py::_run_ack_ordering`), which record the frames
+handed to them and synthesize no audio, so the scenario adds no TTS cost beyond
+the router/worker calls.
+
+Unlike the other scenarios above, this one wires that recording TTS/worker into
+the connection so the scheduler actually admits speech, then drives a real
+delegated search and asserts the early ack is admitted before the delegated
+result — proving the externally observable early-ack behavior against a live
+provider, not just the fake-coordinator coverage in
+`tests/test_pipeline.py::test_early_ack_is_enqueued_immediately_after_delegated_search_dispatch`.
+Override the ack budget with `--max-ack-seconds` (default 15s) if routing
+latency is consistently tighter or looser than that.
+
 To compare the configured local services with Deepgram and Cartesia using the
 same text and PCM fixture:
 
@@ -301,6 +445,21 @@ speaker dropdown mid-session and confirm the browser's console log shows a
 rejected speaker switch (e.g. the device was removed) logs `Failed to switch
 speaker` and the dropdown reverts to the last device that was actually
 routed.
+
+A browser declares optional protocol capabilities with a single `capabilities`
+query parameter — one URL-encoded JSON array of capability names — on both the
+`POST /api/rtc` offer and the `PATCH /api/rtc` ICE-candidate request. The
+server normalizes, deduplicates, and sorts the declared set and binds it
+immutably to the promoted connection epoch; a `PATCH` either omits the field or
+repeats the identical set. A client that declares `work_status_v1` receives
+coarse `work_status` updates (`routing`, `searching`, `background`,
+`result_ready`, `failed`, `cancelled`) for delegated work, including in its
+reconnect snapshot; a client that declares nothing keeps the legacy behaviour
+with no `work_status` frames. `result_ready` means the canonical result is
+committed and display-ready, not that speech was queued, delivered, or heard.
+Emission is additionally gated server-side by
+`WEBSEARCH_ENABLE_BACKGROUND_STATUS`. See `shared/protocol.md` for the wire
+contract, transition rules, and parent aggregation semantics.
 
 For live STT, `Track audio received` proves only WebRTC negotiation. A complete
 utterance should also produce `VADProcessor: User started speaking`,
@@ -415,12 +574,184 @@ current turn's budget values. No record ever contains transcript, prompt,
 response, citation, or credential content — this stays console-only and does
 not project into RTVI or browser state.
 
+## Scripts
+
+Every module in `scripts/` is a command-line entry point except the two shared
+helpers, `evidence_common.py` and `eval_common.py`, which define no `main()`
+and are never invoked directly. Only the paid harnesses need hosted
+credentials; every gate and validator is credential-free.
+`evidence_common.py` additionally has no `server`/pipecat import of its own, so
+the evidence gates stay importable without loading the runtime.
+
+Smoke and benchmark:
+
+- `smoke_server.py` — starts the real server and verifies its credential-free
+  HTTP boundary.
+- `smoke_conversation.py` — bounded, paid router-to-web-search conversation
+  smoke. Useful when changing turn handling or delegation.
+- `benchmark_speech.py` — local speech smoke (credential-free) or paid
+  provider comparison over identical text and audio.
+
+Router/worker model evaluation (run in this order):
+
+- `verify_eval_candidates.py` — live-verifies every candidate (model, effort,
+  tools) tuple with production-equivalent request shapes and writes a
+  versioned manifest that gates the runner below. The manifest is written to
+  the tracked `docs/dev_plans/artifacts/eval-candidates-manifest.json`
+  (`DEFAULT_MANIFEST_RELATIVE_PATH` in `scripts/eval_common.py`) — unlike the
+  run reports below, this path IS git-tracked, since both the verifier and
+  the runner need to read it from a fresh checkout; overridable via `--out`
+  on this writer and `--manifest-path` on the runner. Its judge probe pins
+  `reasoning_effort="minimal"` (`scripts/eval_common.py`'s
+  `build_judge_request_kwargs`/`judge_extra_kwargs`) because the judge runs
+  the Chat Completions API on a `gpt-5*` reasoning model: without an explicit
+  low effort, hidden reasoning tokens can consume the entire
+  `max_completion_tokens` budget before any verdict text is emitted, unlike
+  the router/worker (Responses API), which already configures effort
+  explicitly per candidate.
+- `eval_model_comparison.py` — paid runner that drives `SessionHost` through
+  its real connect/turn lifecycle for each router/worker model+effort
+  candidate and scenario, scoring replies via `pipecat.evals.judge.EvalJudge`
+  and producing one aggregate pass/fail + latency report. Supports
+  `--dry-run` (zero live calls), `--router`/`--worker`/`--scenario` for a
+  single cheap smoke pair (valid `--router` labels: `baseline`, `luna-high`,
+  `luna-medium`, `terra-low`; valid `--worker` labels: `baseline`,
+  `terra-medium`, `sol-low` — these are `Candidate.label` values from
+  `ROUTER_CANDIDATES`/`WORKER_CANDIDATES` in `scripts/eval_common.py`, the
+  source of truth if this list drifts; `shipped` is NOT a selectable label,
+  see the `--router <shipped-label>` note below), `--max-calls`/`--max-cost`
+  spend gates, and `--i-know-the-manifest-is-stale` to proceed against a
+  manifest whose
+  recorded source commit no longer matches `HEAD` — the manifest's
+  `source_commit` is checked for exact equality, so any commit made after the
+  manifest was written trips staleness even when the commit is unrelated to
+  the OpenAI request shapes the manifest attests to; regenerate a fresh
+  manifest with `verify_eval_candidates.py` rather than reaching for the
+  override unless you've confirmed the intervening commits didn't touch
+  model IDs, effort values, or request-kwargs building. Every run's aggregate
+  report is always persisted (default: a timestamped file under
+  `.review-plan/eval-reports/`; override with `--out`), not only when `--out`
+  is passed.
+  - `--repeat N` (default 1) — run each (pair, scenario) cell N times live
+    and majority-vote the results into one summary, with every raw
+    repetition preserved on the report for audit. Live calls run at
+    `temperature=1.0`, so a single sample is noisy; this is the recommended
+    way to get a stable comparison signal for the default sweep. A
+    coin-flip tie always resolves toward the failing outcome, never a
+    silent pass.
+  - `--full-matrix` — opts into the full router x worker cross product
+    instead of the default one-at-a-time sweep (baseline x baseline, each
+    router candidate x baseline worker, baseline router x each worker
+    candidate). The router cannot influence worker output in this codebase
+    (no query/context flows from `RoutingDecision` into the worker
+    dispatch), so the cross product's non-baseline x non-baseline cells add
+    no comparison signal beyond `--repeat`'s resampling of the same
+    one-at-a-time cells — use it only to confirm two already-good
+    candidates work well together, not as the default comparison method. The
+    default sweep does not run a live shipped x shipped cell (config.toml's
+    current router/worker paired together) — the one-at-a-time sweep already
+    contains a cell for each shipped candidate against the historical
+    baseline, and the aggregate report's `shipped_config_cells` key names
+    which cells those are; run `--router <shipped-label> --worker
+    <shipped-label>` explicitly to measure the joint pairing.
+
+Phase 4 query-context narrowing experiment (run in this order):
+
+- `run_query_context_experiment.py` — bounded experiment runner producing raw
+  samples (Phase 4A).
+- `collect_query_context_latency.py` — normalizes raw samples into the
+  artifact the analyzer consumes (Phase 4A).
+- `analyze_query_context_latency.py` — deterministic, credential-free
+  promotion decision over the collected artifact (Phase 4B).
+
+Release and evidence gates:
+
+- `emit_v013_deployment_metadata.py` — derives the deployment identity
+  (`PIPECAT_SOURCE_COMMIT`, `PIPECAT_SOURCE_TREE_HASH`,
+  `PIPECAT_DEPLOYED_AT_UTC`, `PIPECAT_FEATURE_POLICY_FINGERPRINT`) from a
+  clean release checkout. Refuses a dirty or untracked tree.
+- `validate_v013_evidence.py` — validates evidence artifacts against their
+  schemas and phase minimums, and with `--write-manifest` writes the
+  promotion manifest.
+- `validate_phase2_transport_browser_contract.py` — validates the Phase 2
+  transport/browser contract artifact.
+- `record_phase3_completion.py` — records the exact Phase 3 command digest,
+  source commit, and tree hash after that phase's test command passes.
+- `check_release_metadata.py` — checks that `pyproject.toml` and
+  `CHANGELOG.md` agree on the release version and date. Run at release
+  finalization.
+
+## Promotion manifest
+
+`docs/benchmarks/v0.1.3-promotion-manifest.json` is the single artifact that
+decides whether the runtime may enable autoplay. It binds the accumulated
+evidence artifacts (their SHA-256 hashes plus the schema hash) to one
+deployment identity: release version, source commit, filtered source tree
+hash, `FeaturePolicy` fingerprint, and deployment timestamp. At startup
+`server.config.load_promotion_manifest()` re-verifies every binding against
+the running `Config` and **fails closed** — a missing, malformed, foreign, or
+stale manifest silently degrades to display-only rather than blocking boot.
+
+A `manifest_phase=provisional` manifest is permanently
+`promotion_eligible=false` and exists only for diagnostics; only a
+`manifest_phase=final` manifest bound to a Phase 3 completion record can make
+the runtime promotion-eligible.
+
+CI never writes the manifest — it *verifies* the committed one. The
+`promotion-manifest-drift` job (`.github/workflows/ci.yml`, on both pull
+requests and pushes) runs `validate_v013_evidence.py --verify-manifest
+docs/benchmarks/v0.1.3-promotion-manifest.json`, which re-derives every
+binding: each `inputs[*].sha256` against the bytes at its declared path, the
+schema hash, `release_version`, `feature_policy_fingerprint`, the
+`phase3_command_digest` provenance binding, and `promotion_eligible`/`reason`
+against what the evidence gates now conclude. Only the wall-clock stamps and
+the writing checkout's `source_commit`/`source_tree_hash` are exempt (a
+manifest committed at one commit can never match a regeneration at a later
+one). A failure means the committed manifest has drifted from its evidence;
+the fix is to regenerate it locally and commit the result. The separate
+`release-metadata` job (`main` pushes only) just derives and exports the
+deployment identity. The manifest path in that job carries the release version,
+so `scripts/check_release_metadata.py` additionally asserts the workflow still
+points at `docs/benchmarks/v{version}-promotion-manifest.json` for the current
+`pyproject.toml` version — a version bump that forgot the workflow would
+otherwise keep verifying the previous release's manifest and report green about
+a file nothing consumes. What it looks for is a genuine *use* of that path: the
+verifier, `--verify-manifest`, and the path must appear in one command's argv,
+so naming the path in a neighbouring `echo`/`ls`/heredoc does not satisfy the
+gate. It also rejects an `if:`/`continue-on-error:` on the drift job or its only
+verifying step, and an `if:` on any job the drift job transitively `needs:`
+(a skipped dependency skips the drift check). Reproduce the job locally with
+`just verify-manifest`.
+
+To regenerate locally, export the same identity from a clean checkout and run
+the writer by hand:
+
+```sh
+eval "$(uv run python scripts/emit_v013_deployment_metadata.py --shell-export)"
+uv run python scripts/validate_v013_evidence.py --write-manifest --manifest-phase provisional \
+  --phase0-input docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl \
+  --phase1-input docs/benchmarks/v0.1.3-phase1-ack-evidence.jsonl \
+  --phase2-input docs/benchmarks/v0.1.3-phase2-transport-browser-contract.json \
+  --source-commit "$PIPECAT_SOURCE_COMMIT" \
+  --source-tree-hash "$PIPECAT_SOURCE_TREE_HASH" \
+  --deployed-at-utc "$PIPECAT_DEPLOYED_AT_UTC" \
+  --feature-policy-fingerprint "$PIPECAT_FEATURE_POLICY_FINGERPRINT" \
+  --output docs/benchmarks/v0.1.3-promotion-manifest.json
+```
+
+Add `--manifest-phase final --phase3-input
+docs/benchmarks/v0.1.3-phase3-completion.json` (and optionally
+`--phase4c-input …`) to produce the final, activation-eligible manifest. A
+dirty tree makes the emitter refuse, so a locally-modified checkout cannot
+produce an eligible manifest.
+
 ## Repository layout
 
 ```text
 server/          Python and Pipecat runtime
 web/             Bun-managed plain HTML, JavaScript, and CSS RTVI client
 shared/          Shared message schemas and protocol documentation
+evals/           Router/worker model-comparison eval scenarios
 docs/architecture.md
                  Stable current-state architecture and design decisions
 docs/benchmarks/ Provider latency evidence

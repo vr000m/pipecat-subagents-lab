@@ -15,3 +15,38 @@
 - Use Bun for browser or future desktop dependency management and commands.
 - Stage explicit paths only; never use `git add .`, `git add -A`, or `git add --all`.
 - Run formatting, linting, tests, and a secret scan before pushing.
+- `just check` is the recommended local entrypoint (lint, types, tests, web
+  build, web tests, and a real-process smoke in one command); see
+  `README.md`'s "Verification commands" section for the underlying `uv`/`bun`
+  commands it wraps.
+
+## Review-gauntlet round labels
+
+Code comments and dev-plan status logs cite "round N" (e.g. "round 10
+gauntlet, Logic finding 3") to attribute a fix to the review pass that found
+it. These labels are **per-session**, not a single global index: multiple
+independent review-gauntlet sessions have run against this branch over its
+history, each restarting its own round count from 1. Two comments citing
+"round 3" may therefore refer to different sessions' round 3, with different
+findings and different commits — do not assume a shared timeline across
+comments, and do not renumber existing citations to force one (round 10
+gauntlet, Architecture finding 8: the citations are accurate to the session
+that wrote them, and renumbering would falsify that attribution). When
+writing a new comment, cite the round it was written in and leave earlier
+citations untouched.
+
+## Router/worker model evaluation
+
+`scripts/verify_eval_candidates.py` (candidate verification, writes a
+manifest) then `scripts/eval_model_comparison.py` (paid comparison runner)
+are the eval suite; see `README.md`'s "Scripts" section for flags and the
+one-at-a-time-sweep vs `--full-matrix` rationale. Two conventions worth
+knowing before touching this code:
+- Model/reasoning-effort resolution follows a 3-layer precedence
+  (`config.toml` → env file → process env, see `README.md`'s env var section
+  for the exact override semantics) — overriding a role's model at a
+  higher-precedence layer clears that role's inherited effort default rather
+  than silently carrying it forward.
+- `scripts/eval_common.py`'s `ROUTER_BASELINE`/`WORKER_BASELINE` name a fixed
+  historical comparison anchor, not "config.toml's live default" — the two
+  can diverge (see `tests/test_eval_common.py::TestShippedConfigHasAnEvalCandidateCell`).

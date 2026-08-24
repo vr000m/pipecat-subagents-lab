@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, Literal, get_args
+from typing import Any, ClassVar, Literal, Protocol, get_args
 
 from loguru import logger
 
@@ -128,7 +128,299 @@ class Result:
     citations: tuple[Any, ...] = ()
 
 
+_OWNED_CONFIG_FIELDS: frozenset[str] = frozenset(
+    {"max_work_items_per_turn", "multi_intent_wait_timeout_ms"}
+)
+"""The one declaration of the ``Config`` fields a coordinator constructor may
+override onto whatever ``Config`` it was handed.
+
+Read by ``WorkItemCoordinator.OWNED_CONFIG_FIELDS`` (the canonical public
+name), by ``CoordinatorDefaults``, and by ``coordinator_view``'s fallback, so
+the three cannot drift. Declared at module scope because ``CoordinatorDefaults``
+is defined before ``WorkItemCoordinator`` and cannot reference it at class-body
+evaluation time."""
+
+
+class Coordinator(Protocol):
+    """The SessionHost <-> coordinator boundary, declared explicitly.
+
+    ``SessionHost`` previously typed its ``coordinator`` field as ``Any``
+    and duck-typed it via separate ``getattr(coordinator, ...)`` probes,
+    with production code defaulting to this concrete class's own
+    attributes to accommodate test doubles. This Protocol is the single
+    declaration of what a coordinator must provide, matching
+    ``WorkItemCoordinator``'s actual public surface as used by
+    ``server/pipeline.py``. Every member declared here is required and is
+    accessed directly (via ``_require_coordinator() -> Coordinator`` or an
+    explicit ``self.coordinator is not None`` guard), not through
+    ``getattr``, everywhere the coordinator's identity is already settled.
+    Every member is required except at the following call sites, which stay
+    behind ``getattr`` fallbacks on purpose: a large number of duck-typed
+    test-double coordinators across the suite construct without declaring
+    the full Protocol surface, and requiring full conformance from every
+    test double is out of scope for this pass (round 5 tried converting
+    these to required direct access and reverted it after the change broke
+    67 of ``tests/test_pipeline.py``'s tests).
+
+    - ``SessionHost.__init__`` (``server/pipeline.py``): ``registry``,
+      ``config``, and ``OWNED_CONFIG_FIELDS``.
+    - ``SessionHost.cancel_turn_or_child`` (``server/pipeline.py``):
+      ``live_work_item_ids`` (also not a required Protocol member -- see
+      ``live_work_item_ids``'s own note).
+    - ``SessionHost._dispatch_search_task``, ``SessionHost._cancel_work``,
+      and ``SessionHost.shutdown`` (``server/pipeline.py``): ``start_task``,
+      ``cancel``, and ``shutdown`` respectively, at their call sites outside
+      ``__init__``.
+
+    Method names, not line numbers, are the source of truth here; each site
+    also carries its own inline comment documenting the exemption in case
+    this docstring goes stale.
+    """
+
+    registry: WorkerRegistry | None
+    router: Router | None
+    config: Config
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]]
+
+    def arbitrate(self, session_id: str, transcript: str) -> DispatchOutcome: ...
+
+    def dispatch(
+        self,
+        decision: RoutingDecision,
+        operation: Callable[[Any], Any] | None = None,
+        catalogue: WorkerCatalogue | None = None,
+    ) -> Any: ...
+
+    def start_task(
+        self, operation: Any, *, mandatory: bool = False
+    ) -> asyncio.Task[Any] | None: ...
+
+    async def submit(
+        self,
+        turn_id: str,
+        items: list[tuple[str, str]],
+        worker: Callable[[str, str], Any],
+        *,
+        on_late_complete: Callable[[LateResult], Any] | None = None,
+        work_item_ids: list[str] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
+    ) -> SubmittedOutcome: ...
+
+    def retain_late_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        work_item_id: str,
+        worker_id: str,
+        on_complete: Callable[[LateResult], Any] | None = None,
+        on_late_terminal: Callable[[str, TerminalKind], Any] | None = None,
+    ) -> bool: ...
+
+    def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
+
+    async def shutdown(self) -> None: ...
+
+    def add_worker_clarification(
+        self,
+        *,
+        session_id: str,
+        worker_id: str,
+        turn_id: str,
+        result_id: str,
+        original_query: str,
+        question: str,
+    ) -> None: ...
+
+
+OPTIONAL_COORDINATOR_MEMBERS: frozenset[str] = frozenset(
+    {
+        "registry",
+        "config",
+        "OWNED_CONFIG_FIELDS",
+        "live_work_item_ids",
+        "start_task",
+        "cancel",
+        "shutdown",
+    }
+)
+"""The one roster of the optional coordinator members, named once.
+
+This module states the coordinator boundary four times on purpose --
+``OptionalCoordinator`` (the spec an implementer reads), ``CoordinatorDefaults``
+(the concrete fallbacks an implementer can subclass), ``CoordinatorView`` (the
+resolved, statically-typed shape production calls through) and
+``coordinator_view`` (the resolution itself). Each says something the others
+cannot, so they are not collapsible; a view generated from
+``OptionalCoordinator.__annotations__`` would have to be dynamically
+constructed, which would erase exactly the per-member typing
+:class:`StartTask`/:class:`CancelWork` exist to restore.
+
+What is *not* deliberate is that adding a member requires four coordinated
+edits with nothing catching a missed one -- two such drifts have already
+happened (see ``CoordinatorDefaults.OWNED_CONFIG_FIELDS``' note and
+``start_task``'s keyword). This frozenset is the single roster all four are
+pinned against by a test, so a member added to three of them fails the suite
+instead of silently taking a fallback in production."""
+
+
+class OptionalCoordinator(Protocol):
+    """The 7 ``Coordinator`` members accessed via ``getattr`` fallbacks.
+
+    ``registry``, ``config``, and ``OWNED_CONFIG_FIELDS`` are also declared
+    on ``Coordinator`` itself (they are required there); this Protocol
+    re-declares them alongside ``live_work_item_ids``, ``start_task``,
+    ``cancel``, and ``shutdown`` as the canonical spec for what a
+    coordinator implementer should provide to get more than
+    ``CoordinatorDefaults``' fallback behaviour. See ``Coordinator``'s
+    docstring for exactly which ``server/pipeline.py`` call sites read
+    these members through ``getattr`` instead of direct access, and why.
+    """
+
+    registry: WorkerRegistry | None
+    config: Config | None
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]]
+
+    def live_work_item_ids(self) -> frozenset[str]: ...
+
+    def start_task(
+        self, operation: Any, *, mandatory: bool = False
+    ) -> asyncio.Task[Any] | None: ...
+
+    def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
+
+    async def shutdown(self) -> None: ...
+
+
+class CoordinatorDefaults:
+    """Concrete ``OptionalCoordinator`` implementation matching today's fallbacks.
+
+    Each member here reproduces, exactly, the fallback behaviour of the
+    corresponding ``getattr(coordinator, ..., default)`` call site in
+    ``server/pipeline.py`` documented on ``Coordinator``. A coordinator
+    implementation can subclass this to opt into the same defaults instead
+    of leaving the member undeclared.
+    """
+
+    registry: WorkerRegistry | None = None
+    config: Config | None = None
+    #: Single-sourced with ``WorkItemCoordinator.OWNED_CONFIG_FIELDS`` and
+    #: with ``coordinator_view``'s fallback. These three previously declared
+    #: the same default twice over and had already drifted: an empty frozenset
+    #: here versus the coordinator's real field set in ``coordinator_view``
+    #: meant a coordinator that followed this class's documented advice and
+    #: subclassed it would silently change ``SessionHost``'s config-conflict
+    #: check.
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = _OWNED_CONFIG_FIELDS
+
+    def live_work_item_ids(self) -> frozenset[str]:
+        return frozenset()
+
+    def start_task(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None:
+        # ``mandatory`` is accepted and ignored: this fallback has no capacity
+        # budget to exempt the task from, so every admission already behaves
+        # the way a mandatory one is asking for.
+        return asyncio.create_task(operation)
+
+    def cancel(self, work_item_id: str | None = None) -> tuple[str, ...]:
+        return ()
+
+    async def shutdown(self) -> None:
+        return None
+
+
+class StartTask(Protocol):
+    """The bound-method shape of ``Coordinator.start_task``.
+
+    Exists so ``CoordinatorView.start_task`` can carry the real signature
+    instead of ``Callable[..., asyncio.Task[Any] | None]``. ``...`` erased the
+    keyword-only ``mandatory`` that ``Coordinator``/``OptionalCoordinator``
+    declare, on the one boundary declaration production actually resolves
+    through, so a ``view.start_task(op, mandatory=True)`` call was unchecked.
+
+    This constrains the *call* side (and any typed value assigned to the
+    field). It cannot constrain what a coordinator supplies, because
+    ``coordinator_view`` reads members off an ``Any`` via ``getattr`` on
+    purpose -- the suite's duck-typed coordinator doubles do not conform to
+    the Protocol (see ``Coordinator``'s docstring). A coordinator whose
+    ``start_task`` omits ``mandatory`` still fails at runtime, not at
+    type-check time; what changed is that the call sites can no longer drop
+    the keyword unnoticed, and a signature change on the Protocols is pinned
+    against this one by a test.
+    """
+
+    def __call__(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None: ...
+
+
+class CancelWork(Protocol):
+    """The bound-method shape of ``Coordinator.cancel``; see :class:`StartTask`."""
+
+    def __call__(self, work_item_id: str | None = None) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True)
+class CoordinatorView:
+    """The 7 optional ``Coordinator`` members, resolved to concrete values.
+
+    Built by ``coordinator_view`` so a caller reads plain attributes and
+    calls plain methods instead of repeating ``getattr(coordinator, ...,
+    default)`` at each of the ``server/pipeline.py`` call sites documented on
+    ``Coordinator``.
+
+    Deliberately *not* cached: ``SessionHost._coordinator_view`` is a plain
+    property that rebuilds this view from ``self.coordinator`` on every
+    access, because tests reassign ``host.coordinator`` after construction and
+    a view captured at construction time would keep serving the replaced one.
+    The rebuild is seven ``getattr`` calls plus a frozen-dataclass
+    construction; it is on the per-search dispatch and cancel paths, which is
+    a knowingly accepted cost, not an oversight. Caching it would require
+    making ``coordinator`` a property whose setter rebuilds the view.
+    """
+
+    registry: WorkerRegistry | None
+    config: Config | None
+    OWNED_CONFIG_FIELDS: frozenset[str]
+    live_work_item_ids: Callable[[], frozenset[str]]
+    start_task: StartTask
+    cancel: CancelWork
+    shutdown: Callable[[], Any]
+
+
+def coordinator_view(coordinator: Any) -> CoordinatorView:
+    """Resolve ``coordinator``'s 7 optional members, applying today's fallbacks.
+
+    Mirrors each ``getattr(coordinator, "<member>", <default>)`` call site
+    documented on ``Coordinator`` exactly once. This is the only one of the
+    four boundary declarations in this module that production reads:
+    ``SessionHost`` resolves all seven optional members through it
+    (``server/pipeline.py``) and has no remaining ``getattr(coordinator, ...)``
+    probes of its own. Every fallback below is taken from
+    ``CoordinatorDefaults`` rather than restated, so the concrete class a
+    coordinator implementer is told to subclass and the fallbacks a
+    non-conforming coordinator actually gets cannot disagree.
+    """
+    defaults = CoordinatorDefaults()
+    return CoordinatorView(
+        registry=getattr(coordinator, "registry", defaults.registry),
+        config=getattr(coordinator, "config", defaults.config),
+        OWNED_CONFIG_FIELDS=getattr(
+            coordinator, "OWNED_CONFIG_FIELDS", defaults.OWNED_CONFIG_FIELDS
+        ),
+        live_work_item_ids=getattr(coordinator, "live_work_item_ids", defaults.live_work_item_ids),
+        start_task=getattr(coordinator, "start_task", None) or defaults.start_task,
+        cancel=getattr(coordinator, "cancel", None) or defaults.cancel,
+        shutdown=getattr(coordinator, "shutdown", None) or defaults.shutdown,
+    )
+
+
 class WorkItemCoordinator:
+    #: The ``Config`` fields this constructor is allowed to override onto
+    #: whatever ``Config`` it was handed (see ``__init__``'s ``replace`` call
+    #: below). ``SessionHost`` reconciles its own ``Config`` against a
+    #: coordinator's by excluding exactly these fields, so the two components
+    #: read one declaration instead of duplicating a literal list that can
+    #: silently drift when a field is added or removed here.
+    OWNED_CONFIG_FIELDS: ClassVar[frozenset[str]] = _OWNED_CONFIG_FIELDS
+
     def __init__(
         self,
         registry: WorkerRegistry | None = None,
@@ -148,12 +440,21 @@ class WorkItemCoordinator:
             clock,
         )
         max_work_items = max_work_items if max_work_items is not None else max_work_items_per_turn
+        # Each override is applied independently, keyed only by "was this
+        # constructor param passed at all" (``is not None``). Nesting
+        # ``wait_timeout_ms`` inside the ``max_work_items`` branch previously
+        # meant it was silently dropped unless a work-item-count override was
+        # *also* passed, and ``wait_timeout_ms or 10_000`` treated an explicit
+        # ``wait_timeout_ms=0`` the same as "unset" and clobbered a
+        # caller-supplied ``Config.multi_intent_wait_timeout_ms`` even when
+        # only a work-item-count override was requested.
+        overrides: dict[str, Any] = {}
         if max_work_items is not None:
-            self.config = replace(
-                self.config,
-                max_work_items_per_turn=max_work_items,
-                multi_intent_wait_timeout_ms=wait_timeout_ms or 10_000,
-            )
+            overrides["max_work_items_per_turn"] = max_work_items
+        if wait_timeout_ms is not None:
+            overrides["multi_intent_wait_timeout_ms"] = wait_timeout_ms
+        if overrides:
+            self.config = replace(self.config, **overrides)
         self.speech_scheduler = speech_scheduler
         self._pending: dict[str, PendingDialogue] = {}
         self._pending_lock = threading.RLock()
@@ -170,6 +471,9 @@ class WorkItemCoordinator:
         self._callback_tasks: set[asyncio.Task[Any]] = set()
         self._cancelling_tasks: set[asyncio.Task[Any]] = set()
         self._owned_tasks: set[asyncio.Task[Any]] = set()
+        #: Owned tasks admitted with ``start_task(..., mandatory=True)``:
+        #: excluded from the capacity budget by ``_has_background_capacity``.
+        self._mandatory_tasks: set[asyncio.Task[Any]] = set()
         self._submission_tasks: set[asyncio.Task[Any]] = set()
         self._submit_tasks: set[asyncio.Task[Any]] = set()
         self._provider_tasks: set[asyncio.Task[Any]] = set()
@@ -182,7 +486,16 @@ class WorkItemCoordinator:
             raise RuntimeError("work item coordinator is shut down")
 
     def _has_background_capacity(self) -> bool:
-        return len(self._owned_tasks) < self._max_background_tasks
+        # Mandatory tasks are deliberately outside the budget rather than
+        # merely exempt from the gate. They are admitted past the cap by
+        # definition, so counting them would let a burst of them starve every
+        # subsequent legitimate admission until they finished -- the cap would
+        # then be measuring work it never had the option to refuse.
+        # Set difference, not a length subtraction: the two done-callbacks
+        # that drop a finished mandatory task from ``_owned_tasks`` and from
+        # ``_mandatory_tasks`` are scheduled separately, so between them the
+        # counts disagree and an arithmetic difference would under-report.
+        return len(self._owned_tasks - self._mandatory_tasks) < self._max_background_tasks
 
     @staticmethod
     def _consume_task_exception(task: asyncio.Task[Any]) -> None:
@@ -212,15 +525,34 @@ class WorkItemCoordinator:
         task.add_done_callback(completed)
         return True
 
-    def start_task(self, operation: Any) -> asyncio.Task[Any] | None:
-        """Start an awaitable only after reserving bounded coordinator capacity."""
-        if self._shutdown or not self._has_background_capacity():
+    def start_task(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None:
+        """Start an awaitable only after reserving bounded coordinator capacity.
+
+        ``mandatory=True`` is the seam for work the coordinator has no option
+        to refuse -- today, the late-result ``on_complete`` callback, whose
+        refusal would silently break the at-least-once late-delivery
+        guarantee (nothing in production drains ``_late_results``). Such a
+        task skips the capacity gate *and* stays outside the capacity budget
+        (see ``_has_background_capacity``), so admitting one never starves a
+        later refusable admission. It exists as a parameter on this seam
+        rather than as an inline ``_adopt_task(..., force=True)`` at the call
+        site so that a coordinator subclass or injected double overriding
+        ``start_task`` is still honoured on every task-adoption path, and so
+        that this method's ``operation.close()`` handling and its ``Any``
+        tolerance for non-coroutine awaitables are not silently lost there.
+
+        ``_shutdown`` still refuses everything, mandatory included.
+        """
+        if self._shutdown or (not mandatory and not self._has_background_capacity()):
             close = getattr(operation, "close", None)
             if close is not None:
                 close()
             return None
         task = asyncio.create_task(operation)
         self._adopt_task(task, force=True)
+        if mandatory:
+            self._mandatory_tasks.add(task)
+            task.add_done_callback(self._mandatory_tasks.discard)
         return task
 
     def _track_cancelling_task(self, task: asyncio.Task[Any]) -> None:
@@ -356,7 +688,25 @@ class WorkItemCoordinator:
                 return
             callback_result = on_complete(late)
             if inspect.isawaitable(callback_result):
-                callback_task = self.start_task(callback_result)
+                # ``start_task``'s capacity gate must not be allowed to
+                # refuse this coroutine: nothing in production drains
+                # ``_late_results`` (see ``drain_late_results``), so parking
+                # a refused ``late`` there silently broke the at-least-once
+                # late-delivery guarantee -- neither the caller's async
+                # callback nor any poller would ever see it. This callback
+                # is a bounded, fire-and-forget bookkeeping coroutine
+                # invoked at most once per retained task, so it is admitted
+                # through ``start_task``'s ``mandatory`` seam -- which skips
+                # the gate *and* keeps the task out of the capacity budget,
+                # so a burst of these cannot starve later refusable
+                # admissions. Routing through the seam rather than an inline
+                # ``_adopt_task(..., force=True)`` keeps one task-adoption
+                # path, so a coordinator subclass overriding ``start_task``
+                # is still honoured here. The ``self._shutdown`` check above
+                # already suppresses this entire branch once shutdown has
+                # begun; ``start_task`` re-checks it and returns ``None``
+                # regardless, which the guard below tolerates.
+                callback_task = self.start_task(callback_result, mandatory=True)
                 if callback_task is not None:
                     self._track_callback_task(callback_task)
 
@@ -386,6 +736,7 @@ class WorkItemCoordinator:
         self._callback_tasks.clear()
         self._cancelling_tasks.clear()
         self._owned_tasks.clear()
+        self._mandatory_tasks.clear()
         self._submission_tasks.clear()
         self._submit_tasks.clear()
         self._provider_tasks.clear()
@@ -454,6 +805,20 @@ class WorkItemCoordinator:
         for item_id in selected:
             self._work_tasks[item_id].cancel()
         return selected
+
+    def live_work_item_ids(self) -> frozenset[str]:
+        """Work items the coordinator still owns a live task for.
+
+        Covers coordinator-retained background work (``retain_late_task``)
+        that a caller's own local turn/work-task bookkeeping does not track
+        once a turn handler has returned -- see ``SessionHost.
+        cancel_turn_or_child``'s sole-child liveness check. Deliberately not
+        declared on the ``Coordinator`` Protocol: it is brand new and no
+        existing duck-typed test-double coordinator implements it, so the
+        one call site probes it with ``getattr`` and tolerates its absence,
+        same as any other genuinely optional member.
+        """
+        return frozenset(self._work_tasks)
 
     @staticmethod
     def pending_intent(transcript: str) -> str:

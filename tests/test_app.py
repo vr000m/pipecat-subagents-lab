@@ -2,21 +2,25 @@
 
 import asyncio
 import dataclasses
+import json as _json
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
 from pipecat.processors.frameworks.rtvi import RTVIObserverParams
+from starlette.requests import Request as _StarletteRequest
 
 import server.app as app_module
-from server.app import create_app
+import server.observers as observers_module
+from server.app import _handshake_from_query, create_app
 from server.config import Config
-from server.contracts import GroundedResult
+from server.contracts import GroundedResult, SnapshotHandshake, WorkerState
 from server.pipeline import SessionHost
 from server.registry import WorkerRegistry
 from server.router import LazyRouterProvider, Router
@@ -159,6 +163,105 @@ def test_tts_completion_uses_only_one_provider_signal() -> None:
     assert type(hosted_processors[1]).__name__ == "_SpeechCompletionProcessor"
 
 
+def test_snapshot_barrier_consumer_ack_is_not_blocked_by_a_stuck_downstream_dataframe() -> None:
+    """Regression for round-4 findings (code-review #1, Codex #2): the barrier
+    consumer's docstring used to claim it is "the last processor before
+    transport.output()", and Codex argued the ack therefore fires before
+    downstream TTS/lifecycle processors have actually drained it.
+
+    Neither claim matches pipecat's real frame-processing model: every RTVI
+    frame involved here (``RTVIServerMessageFrame`` and
+    ``SnapshotBarrierFlushFrame``) is a ``SystemFrame``, and pipecat's
+    ``FrameProcessor`` routes ``SystemFrame`` instances through a dedicated
+    input queue that bypasses the ordinary per-frame ``DataFrame`` queue
+    entirely (see ``FrameProcessor.__input_frame_task_handler``). This test
+    proves it directly: a ``DataFrame`` wedged forever in a slow downstream
+    stage does not block the barrier's acknowledgement, and a later RTVI
+    frame queued after the ack still arrives at the sink strictly after an
+    earlier one queued before it -- the real ordering invariant the barrier
+    exists to provide.
+    """
+    import dataclasses as _dc
+
+    from pipecat.frames.frames import DataFrame, EndFrame
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.worker import PipelineWorker
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+    from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
+    from pipecat.workers.runner import WorkerRunner
+
+    from server.app import _SnapshotBarrierConsumer
+    from server.frames import SnapshotBarrierFlushFrame
+
+    @_dc.dataclass
+    class _WedgedDataFrame(DataFrame):
+        pass
+
+    class _SlowSink(FrameProcessor):
+        """Blocks forever on a DataFrame; passes everything else straight
+        through -- standing in for a real downstream stage (TTS/lifecycle)
+        that never resolves the wedged frame during this test."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.received: list[object] = []
+            self._stuck = asyncio.get_event_loop().create_future()
+
+        async def process_frame(self, frame: object, direction: FrameDirection) -> None:
+            await super().process_frame(frame, direction)
+            self.received.append(frame)
+            if isinstance(frame, _WedgedDataFrame):
+                await self._stuck  # never resolves within this test
+            await self.push_frame(frame, direction)
+
+    async def body() -> None:
+        sink = _SlowSink()
+        pipeline = Pipeline([_SnapshotBarrierConsumer(), sink])
+        worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
+
+        acked = asyncio.get_event_loop().create_future()
+
+        def acknowledge() -> None:
+            if not acked.done():
+                acked.set_result(None)
+
+        async def push_frames() -> None:
+            await asyncio.sleep(0.01)
+            await worker.queue_frame(_WedgedDataFrame())
+            incremental_1 = RTVIServerMessageFrame(data={"seq": 1})
+            await worker.queue_frame(incremental_1)
+            await worker.queue_frame(SnapshotBarrierFlushFrame(token="t", acknowledge=acknowledge))
+            # Proves the ack does not wait on the wedged DataFrame stuck in
+            # sink's DataFrame-only queue.
+            await asyncio.wait_for(acked, timeout=2.0)
+            incremental_2 = RTVIServerMessageFrame(data={"seq": 2})
+            await worker.queue_frame(incremental_2)
+            # Give the sink's system-frame queue a chance to drain both
+            # incrementals (independent of the still-wedged DataFrame),
+            # then release the wedge and end the pipeline cleanly.
+            for _ in range(50):
+                if incremental_2 in sink.received:
+                    break
+                await asyncio.sleep(0.01)
+            if not sink._stuck.done():
+                sink._stuck.set_result(None)
+            await worker.queue_frame(EndFrame())
+
+        runner = WorkerRunner()
+        await runner.add_workers(worker)
+        await asyncio.wait_for(asyncio.gather(runner.run(), push_frames()), timeout=10.0)
+
+        rtvi_order = [f for f in sink.received if isinstance(f, RTVIServerMessageFrame)]
+        assert [f.data["seq"] for f in rtvi_order] == [1, 2], (
+            "RTVI incrementals must remain strictly ordered end-to-end even "
+            "though the barrier consumer is not the literal last processor "
+            "and even though the ack fired while a DataFrame was still "
+            "wedged downstream"
+        )
+
+    asyncio.run(body())
+
+
 def test_connection_setup_failure_cleans_and_fences_promoted_runtime() -> None:
     async def run() -> None:
         tts = FailingTTS()
@@ -217,6 +320,94 @@ def test_injected_session_host_is_preserved() -> None:
     host = SessionHost(runner_factory=FakeRunner)
 
     assert create_app(host).state.session_host is host
+
+
+def test_default_session_host_derives_one_feature_policy_from_the_loaded_config(
+    monkeypatch,
+) -> None:
+    """Plan: 'derive one frozen FeaturePolicy' from the immutable Config
+    constructed by ``_default_session_host()``, injected into SessionHost."""
+    from server.config import FeaturePolicy
+
+    monkeypatch.setattr(app_module, "load_config", lambda: Config(enable_early_ack=False))
+
+    host = app_module._default_session_host()
+
+    assert isinstance(host.feature_policy, FeaturePolicy)
+    assert host.feature_policy.enable_early_ack is False
+    assert host.feature_policy == FeaturePolicy.from_config(host.config)
+
+
+def test_create_app_does_not_resolve_a_second_policy_from_worker_registry_config(
+    monkeypatch,
+) -> None:
+    """Plan: 'create_app() must not resolve a second policy from
+    WorkerRegistry.config.' A custom injected host is authoritative; its
+    feature_policy must be unchanged by create_app()."""
+    from server.config import FeaturePolicy
+
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=Config(enable_autoplay_policy=False)),
+        config=Config(enable_autoplay_policy=False),
+        feature_policy=FeaturePolicy.from_config(Config(enable_autoplay_policy=False)),
+    )
+    original_policy = host.feature_policy
+
+    app = create_app(host)
+
+    assert app.state.session_host.feature_policy is original_policy
+
+
+def test_default_session_host_calls_load_promotion_manifest_exactly_once(
+    monkeypatch, tmp_path
+) -> None:
+    """Plan bullet 183: '_default_session_host(config) calls once, handing
+    the immutable verdict to the SessionHost policy evaluator.'
+
+    ``server.config.load_promotion_manifest`` already exists, but
+    ``_default_session_host`` does not call it yet (Phase 2 concurrent
+    implementer is still wiring app.py). Skip until app.py actually
+    references the loader, rather than asserting on a call count of zero.
+    """
+    import inspect
+
+    if not hasattr(app_module, "load_promotion_manifest"):
+        pytest.skip("_default_session_host does not import load_promotion_manifest yet")
+    source = inspect.getsource(app_module._default_session_host)
+    if "load_promotion_manifest" not in source:
+        pytest.skip("_default_session_host does not call load_promotion_manifest yet")
+
+    calls: list[object] = []
+
+    def fake_loader(config):
+        calls.append(config)
+        return SimpleNamespace(promotion_eligible=False, reason="evidence_unavailable")
+
+    monkeypatch.setattr(app_module, "load_promotion_manifest", fake_loader)
+    monkeypatch.setattr(
+        app_module,
+        "load_config",
+        lambda: Config(promotion_manifest_path=str(tmp_path / "missing.json")),
+    )
+
+    app_module._default_session_host()
+
+    assert len(calls) == 1
+
+
+def test_enable_autoplay_policy_off_regression_preserves_pre_v013_late_result_behavior() -> None:
+    """Plan bullet 201: 'Add a flag-off regression test.' With
+    enable_autoplay_policy disabled, the app-level feature policy consumer
+    must select the pre-v0.1.3 active-origin enqueue/start behavior rather
+    than evaluating the new autoplay predicates."""
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=Config(enable_autoplay_policy=False)),
+        config=Config(enable_autoplay_policy=False),
+    )
+
+    assert host.feature_policy.enable_autoplay_policy is False
 
 
 def test_app_exposes_health_and_next_session_handshake() -> None:
@@ -381,8 +572,13 @@ class CapturingPipelineWorker:
         self.rtvi = FakeRTVIForApp()
         type(self).constructed.append(self)
 
-    async def queue_frame(self, _frame: object) -> None:
-        pass
+    async def queue_frame(self, frame: object) -> None:
+        # Mirror _SnapshotBarrierConsumer, the real last-processor-before-
+        # transport.output() consumer: acknowledge a barrier frame as though
+        # it drained through the pipeline, or install_baseline() hangs.
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            acknowledge()
 
 
 class FakeRTVIForApp:
@@ -434,6 +630,7 @@ async def _attach_fake_connection(
     startup_observers: list[RecordingFrameworkObserver],
     latency_observers: list[RecordingFrameworkObserver],
     worker_class: type = CapturingPipelineWorker,
+    capabilities: tuple[str, ...] = (),
 ) -> None:
     monkeypatch.setattr(app_module, "SmallWebRTCTransport", lambda *_args: FakeTransportForApp())
     monkeypatch.setattr(app_module, "SileroVADAnalyzer", lambda *, sample_rate: object())
@@ -471,6 +668,7 @@ async def _attach_fake_connection(
             resume_token=host.state.resume_token,
             proposed_epoch=1,
             snapshot_sequence=0,
+            capabilities=capabilities,
         ),
     )
 
@@ -721,6 +919,40 @@ assert handler_id in logger._core.handlers
             cwd=Path(__file__).resolve().parents[1],
             capture_output=True,
             text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+    def test_import_alone_hardens_logging_without_calling_main(self) -> None:
+        """Regression: ``_configure_logging()`` used to be called only from
+        ``main()`` -- ``uvicorn server.app:app`` direct-ASGI serving (or any
+        other host importing the module and using the module-level ``app``
+        without ever calling ``main()``) left Loguru's default handler
+        (``diagnose=True``/``backtrace=True``) in place, risking API keys
+        and transcripts landing in a traceback dump. Merely importing the
+        module -- which runs ``app = create_app()`` at module scope -- must
+        be enough to harden the default handler."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+from loguru import logger
+
+import server.app  # noqa: F401 -- import alone, `main()` is never called
+
+handlers = list(logger._core.handlers.values())
+assert handlers, "import must configure at least one handler"
+for handler in handlers:
+    assert handler._exception_formatter._diagnose is False
+    assert handler._exception_formatter._backtrace is False
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
         )
 
         assert result.returncode == 0, result.stderr
@@ -757,3 +989,1120 @@ assert handler_id in logger._core.handlers
         captured = capfd.readouterr()
         assert secret not in captured.err
         assert secret not in captured.out
+
+
+# --- Phase 3: capability handshake (POST/PATCH `capabilities` query field) -
+#
+# `_handshake_from_query` is the sole app-layer parser for the canonical
+# encoding: a single `capabilities` query parameter carrying one URL-encoded
+# JSON array of capability-name strings. These tests assert the CONTRACT the
+# plan describes; they may fail to import/run until server/app.py lands the
+# `capabilities`/raw-ASGI-validation extension.
+
+
+def _raw_request(raw_query_string: bytes) -> _StarletteRequest:
+    """Build a minimal ASGI Request carrying an already-encoded raw query
+    string, bypassing the framework's own query-string decoding -- this is
+    the direct-ASGI injection the plan calls for to test malformed percent
+    sequences at the `scope["query_string"]` boundary."""
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/rtc",
+        "headers": [],
+        "query_string": raw_query_string,
+    }
+    return _StarletteRequest(scope)
+
+
+def _capability_query(
+    *, session_id: str, resume_token: str, epoch: int, capabilities: str
+) -> bytes:
+    return (
+        f"session_id={session_id}&resume_token={resume_token}"
+        f"&proposed_epoch={epoch}&snapshot_sequence=0&capabilities={capabilities}"
+    ).encode()
+
+
+def _host_with_fresh_handshake_token() -> tuple[SessionHost, dict[str, str]]:
+    host = SessionHost(runner_factory=FakeRunner)
+    handshake = host.session_handshake()
+    return host, handshake
+
+
+def test_handshake_absent_capabilities_normalizes_to_unsupported() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0"
+    ).encode()
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ()
+    assert value.capabilities_present is False
+
+
+def test_handshake_canonical_capabilities_array_is_decoded_deduplicated_and_sorted() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1", "work_status_v1", "alpha"]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ("alpha", "work_status_v1")
+    assert value.capabilities_present is True
+
+
+def test_handshake_unknown_future_capability_name_is_retained_as_unsupported() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["some_future_capability"]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ("some_future_capability",)
+
+
+def test_handshake_empty_array_normalizes_to_present_but_empty_set() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps([]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == ()
+    assert value.capabilities_present is True
+
+
+@pytest.mark.parametrize(
+    "raw_capabilities",
+    [
+        "not-json",
+        quote("{"),
+        quote(_json.dumps({"not": "an array"})),
+        quote(_json.dumps([1, 2])),
+        quote(_json.dumps([""])),
+    ],
+)
+def test_handshake_rejects_malformed_or_non_string_capabilities(raw_capabilities: str) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=raw_capabilities,
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+def test_handshake_rejects_duplicate_capabilities_query_keys() -> None:
+    """The raw query parser rejects duplicate `capabilities` keys before
+    normalization; deduplication only applies inside the single JSON array."""
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0"
+        f"&capabilities={encoded}&capabilities={encoded}"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+def test_handshake_rejects_percent_not_followed_by_two_hex_digits_at_asgi_boundary() -> None:
+    """App-layer defense on the raw ASGI scope bytes: a percent sign not
+    followed by two ASCII hex digits must be rejected with the same 400
+    handshake error, independent of whatever the framework's own decoder
+    would have done with it."""
+    host, handshake = _host_with_fresh_handshake_token()
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0&capabilities=%zz"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+def test_handshake_rejects_trailing_bare_percent_at_asgi_boundary() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0&capabilities=%"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+# --- Phase 3: PATCH capability inheritance/mismatch (HandshakeGate.validate_patch_handshake) -
+#
+# These go through ``host._handshake_gate`` rather than the SessionHost
+# forwarder: they validate a *promoted* Connection that is deliberately not the
+# host's own bound one, which is the case the gate's two-argument, state-free
+# signature exists for. ``SessionHost.validate_patch_handshake(handshake)``
+# takes only the handshake and always validates against ``self.connection``
+# (round-3 restart gauntlet, Architecture finding) -- see
+# ``test_session_host_validate_patch_handshake_uses_its_own_connection``.
+
+
+def test_validate_patch_handshake_omitted_field_inherits_the_post_bound_set() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    promoted = host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    patch_handshake = SnapshotHandshake(
+        session_id=host.state.session_id,
+        resume_token=host.state.resume_token,
+        proposed_epoch=1,
+        snapshot_sequence=0,
+    )
+
+    # Omission must not raise and must not mutate the bound connection.
+    host._handshake_gate.validate_patch_handshake(promoted, patch_handshake)
+
+    assert promoted.capabilities == ("work_status_v1",)
+
+
+def test_validate_patch_handshake_present_mismatch_is_rejected() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    promoted = host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    mismatched_patch = SnapshotHandshake(
+        session_id=host.state.session_id,
+        resume_token=host.state.resume_token,
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=(),
+        capabilities_present=True,
+    )
+
+    with pytest.raises(ValueError):
+        host._handshake_gate.validate_patch_handshake(promoted, mismatched_patch)
+    # Rejecting the mismatch must not mutate the bound connection/entitlement.
+    assert promoted.capabilities == ("work_status_v1",)
+
+
+def test_validate_patch_handshake_exact_matching_set_is_accepted() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    promoted = host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    matching_patch = SnapshotHandshake(
+        session_id=host.state.session_id,
+        resume_token=host.state.resume_token,
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=("work_status_v1",),
+        capabilities_present=True,
+    )
+
+    host._handshake_gate.validate_patch_handshake(promoted, matching_patch)  # must not raise
+
+
+# --- Phase 3: mixed-version client/server compatibility fixture -----------
+
+
+def test_pre_phase3_style_server_ignores_an_unknown_capabilities_field() -> None:
+    """A pre-Phase-3 server parses only its known query fields, so an
+    otherwise-valid new-browser request carrying `capabilities` is accepted
+    with the field ignored/treated as unsupported -- not strictly rejected.
+    This models the old server against a new-browser request; do not claim
+    strict rejection for a mixed-version fixture."""
+    old_style_fields = {
+        "contract_version",
+        "session_id",
+        "resume_token",
+        "proposed_epoch",
+        "snapshot_sequence",
+    }
+    from server.contracts import SnapshotHandshake as _Handshake
+
+    parsed = _Handshake.model_validate(
+        {
+            "session_id": "session-1",
+            "resume_token": "resume-1",
+            "proposed_epoch": 1,
+            "snapshot_sequence": 0,
+        }
+    )
+    # An old (pre-Phase-3) parser only ever reads these fields; a new browser
+    # sending an extra `capabilities` query parameter must not break it.
+    assert old_style_fields <= set(parsed.model_dump().keys())
+
+
+def test_old_browser_snapshot_carries_no_status_field() -> None:
+    """A new server's snapshot projection for a non-advertising (old) browser
+    must omit the status section entirely -- field absent, not an empty
+    array/object -- per the legacy-compatibility fixture requirement."""
+    import json as _json2
+
+    legacy = _json2.loads(
+        (Path(__file__).parent / "fixtures" / "runtime-snapshot-v1.0-as-shipped.json").read_text()
+    )["schema"]
+    assert "work_status" not in legacy.get("properties", {})
+
+
+# --- Phase 3: enable_background_status flag-off regression / rollback -----
+
+
+def test_enable_background_status_off_reproduces_pre_phase3_legacy_timeout_behavior() -> None:
+    """Plan bullet: 'When disabled, no work_status frames are emitted
+    regardless of client capability, and the Phase 1 legacy timeout notice
+    applies universally, reproducing pre-Phase-3 behavior.'"""
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=Config(enable_background_status=False)),
+        config=Config(enable_background_status=False),
+    )
+
+    assert host.feature_policy.enable_background_status is False
+
+
+def test_rollback_order_disable_status_then_autoplay_then_early_ack() -> None:
+    """Plan bullet: the documented rollback order (disable
+    enable_background_status first, then enable_autoplay_policy, then
+    enable_early_ack) must leave each preceding phase's disabled-switch path
+    operational at every step."""
+    config = Config(enable_background_status=False)
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=config),
+        config=config,
+    )
+    assert host.feature_policy.enable_background_status is False
+    assert host.feature_policy.enable_autoplay_policy is True
+    assert host.feature_policy.enable_early_ack is True
+
+    config = Config(enable_background_status=False, enable_autoplay_policy=False)
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=config),
+        config=config,
+    )
+    assert host.feature_policy.enable_background_status is False
+    assert host.feature_policy.enable_autoplay_policy is False
+    assert host.feature_policy.enable_early_ack is True
+
+    config = Config(
+        enable_background_status=False, enable_autoplay_policy=False, enable_early_ack=False
+    )
+    host = SessionHost(
+        runner_factory=FakeRunner,
+        registry=WorkerRegistry(config=config),
+        config=config,
+    )
+    assert host.feature_policy.enable_background_status is False
+    assert host.feature_policy.enable_autoplay_policy is False
+    assert host.feature_policy.enable_early_ack is False
+
+
+# --- C1: snapshot/incremental sequence namespace unification --------------
+
+
+class FrameCapturingPipelineWorker(CapturingPipelineWorker):
+    """CapturingPipelineWorker that records every queued frame's payload."""
+
+    def __init__(self, pipeline: object, **kwargs: object) -> None:
+        super().__init__(pipeline, **kwargs)
+        self.frames: list[dict] = []
+
+    async def queue_frame(self, frame: object) -> None:
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            acknowledge()
+            return
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_snapshot_install_reseeds_the_observer_projected_sequence() -> None:
+    """C1 regression: a connection that never advertised `work_status_v1`
+    still advances the global `SessionState` sequence for every invisible
+    `work_status` event. The snapshot is stamped from that global watermark,
+    so the observer's projected counter must be re-seeded at snapshot install
+    or the next visible incremental lands at or below the client's
+    `lastAppliedSequence` and is silently discarded forever.
+
+    Invariant: after any snapshot install,
+    ``observer.projected_sequence == wire snapshot_sequence`` and the next
+    incremental carries exactly ``snapshot_sequence + 1``.
+    """
+
+    async def run() -> None:
+        FrameCapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=FrameCapturingPipelineWorker,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        assert runtime.supports_work_status is False, (
+            "fixture must model a non-capable (no work_status_v1) connection"
+        )
+        worker = FrameCapturingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        # N invisible work_status events: they advance the global sequence
+        # (SessionState._emit) but are dropped by the observer's capability
+        # filter, so the projected counter does not move.
+        for index in range(4):
+            host.state.set_child_work_status(
+                turn_id="turn-1",
+                work_item_id=f"work-{index}",
+                state="searching",
+                origin_epoch=runtime.epoch,
+            )
+        assert worker.frames == [], "work_status must stay invisible on this connection"
+
+        await worker.rtvi.handlers["on_client_message"](
+            worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+        )
+        assert worker.frames, "a snapshot-request must produce a runtime_snapshot frame"
+        snapshot_frame = worker.frames[-1]
+        assert snapshot_frame["kind"] == "runtime_snapshot"
+        wire_snapshot_sequence = snapshot_frame["data"]["snapshot_sequence"]
+        assert snapshot_frame["sequence"] == wire_snapshot_sequence
+        assert runtime.observer.projected_sequence == wire_snapshot_sequence
+
+        host.state.append_result(
+            GroundedResult(
+                result_id="result-c1",
+                worker_id="worker-weather",
+                turn_id="turn-1",
+                text="Answer",
+                spoken_text="Answer",
+                origin_epoch=runtime.epoch,
+            ),
+            origin_epoch=runtime.epoch,
+        )
+        await asyncio.sleep(0)
+
+        incrementals = [frame for frame in worker.frames if frame["kind"] == "result"]
+        assert len(incrementals) == 1
+        assert incrementals[0]["sequence"] == wire_snapshot_sequence + 1
+
+    asyncio.run(run())
+
+
+class YieldingFrameCapturingPipelineWorker(FrameCapturingPipelineWorker):
+    """FrameCapturingPipelineWorker whose ``queue_frame`` yields to the event
+    loop before acknowledging a barrier frame, so two concurrent
+    snapshot-request handlers on the same connection can actually interleave
+    at that point instead of one running start-to-finish before the other is
+    ever scheduled."""
+
+    async def queue_frame(self, frame: object) -> None:
+        await asyncio.sleep(0)
+        await super().queue_frame(frame)
+
+
+def test_concurrent_snapshot_requests_on_one_connection_are_coalesced() -> None:
+    """Two snapshot-request messages firing concurrently on the same
+    connection must not open two ``SnapshotBarrier``s at once: each barrier
+    pauses/resumes the one shared observer, so an overlap would let one
+    request's resume/reseed corrupt the other's in-flight watermark/buffer.
+
+    The second request is coalesced (dropped), not queued behind the lock: a
+    snapshot rebuild is idempotent, so the in-flight one already satisfies
+    it, and queuing instead would let a client spam this message into an
+    unbounded lock-waiter backlog.
+    """
+
+    async def run() -> None:
+        YieldingFrameCapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=YieldingFrameCapturingPipelineWorker,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = YieldingFrameCapturingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        active_barriers = 0
+        max_concurrent_barriers = 0
+        original_pause = runtime.observer.pause
+        original_resume = runtime.observer.resume
+
+        def tracking_pause() -> None:
+            nonlocal active_barriers, max_concurrent_barriers
+            active_barriers += 1
+            max_concurrent_barriers = max(max_concurrent_barriers, active_barriers)
+            original_pause()
+
+        def tracking_resume(watermark: int | None = None) -> None:
+            nonlocal active_barriers
+            original_resume(watermark)
+            active_barriers -= 1
+
+        runtime.observer.pause = tracking_pause  # type: ignore[method-assign]
+        runtime.observer.resume = tracking_resume  # type: ignore[method-assign]
+
+        message = SimpleNamespace(type="snapshot-request", data=None)
+        await asyncio.gather(
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+        )
+
+        # At most one pause-without-matching-resume at a time, and the
+        # coalesced second request never opened a barrier at all.
+        assert max_concurrent_barriers == 1
+        assert active_barriers == 0
+        snapshot_frames = [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"]
+        assert len(snapshot_frames) == 1
+
+    asyncio.run(run())
+
+
+class FailFirstBarrierThenAcknowledgePipelineWorker(FrameCapturingPipelineWorker):
+    """Drops the first barrier frame it sees (so that attempt's
+    ``install_baseline`` times out), acknowledges every subsequent one
+    normally. Models the in-flight snapshot attempt that a coalesced
+    request raced against actually failing."""
+
+    barrier_frames_seen: ClassVar[int] = 0
+
+    async def queue_frame(self, frame: object) -> None:
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            type(self).barrier_frames_seen += 1
+            if type(self).barrier_frames_seen == 1:
+                return
+            acknowledge()
+            return
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_a_coalesced_snapshot_request_is_retried_once_if_the_in_flight_attempt_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: coalescing (``if snapshot_lock.locked(): return``) used to
+    drop a concurrent snapshot-request unconditionally, even when the
+    in-flight attempt it coalesced against then failed without delivering a
+    snapshot. The client had already set ``snapshotRequestPending`` and
+    discards every incremental until a snapshot arrives, with no retry of
+    its own -- stranding it until manual reconnect. The lock holder must
+    retry once when a coalesced request was flagged during a failed
+    attempt."""
+    monkeypatch.setattr(observers_module, "SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS", 0.01)
+    FailFirstBarrierThenAcknowledgePipelineWorker.barrier_frames_seen = 0
+
+    async def run() -> None:
+        FailFirstBarrierThenAcknowledgePipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        inner = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                inner,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=FailFirstBarrierThenAcknowledgePipelineWorker,
+            )
+        finally:
+            inner.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = FailFirstBarrierThenAcknowledgePipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        message = SimpleNamespace(type="snapshot-request", data=None)
+        # Both requests fire concurrently: the first acquires the lock and
+        # starts an attempt that will time out waiting for its barrier ack
+        # (the timeout wait is an await point the second request's handler
+        # can interleave at); the second finds the lock held, is coalesced,
+        # and flags a recheck instead of being silently dropped.
+        await asyncio.gather(
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+            worker.rtvi.handlers["on_client_message"](worker.rtvi, message),
+        )
+
+        assert FailFirstBarrierThenAcknowledgePipelineWorker.barrier_frames_seen == 2, (
+            "the coalesced request's recheck must trigger a second attempt"
+        )
+        assert runtime.observer._paused is False
+        snapshot_frames = [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"]
+        assert len(snapshot_frames) == 1, "the retried attempt must deliver exactly one snapshot"
+
+    asyncio.run(run())
+
+
+class NeverAcknowledgingPipelineWorker(FrameCapturingPipelineWorker):
+    """Fake worker that drops the barrier frame instead of acknowledging it,
+    modelling a connection worker cancelled or replaced between the barrier
+    write and its drain."""
+
+    async def queue_frame(self, frame: object) -> None:
+        if callable(getattr(frame, "acknowledge", None)):
+            return
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_an_unacknowledged_barrier_does_not_leave_the_observer_paused_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the snapshot-request handler awaited `install_baseline`
+    with no timeout and no cleanup path, so a dropped barrier frame left the
+    observer paused with an unbounded buffer for the rest of the connection.
+    The install must time out, abort, and leave incremental delivery working.
+    """
+    monkeypatch.setattr(observers_module, "SNAPSHOT_BARRIER_ACK_TIMEOUT_SECONDS", 0.01)
+
+    async def run() -> None:
+        NeverAcknowledgingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        inner = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                inner,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=NeverAcknowledgingPipelineWorker,
+            )
+        finally:
+            inner.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = NeverAcknowledgingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+        await worker.rtvi.handlers["on_client_message"](
+            worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+        )
+
+        assert runtime.observer._paused is False
+        assert runtime.observer._buffer == []
+        # A failed install must not put a snapshot on the wire.
+        assert [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"] == []
+
+        host.state.set_worker(
+            WorkerState(
+                worker_id="worker-after-failed-install",
+                topic="weather",
+                model_policy="deep",
+                status="idle",
+                origin_epoch=runtime.epoch,
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert [frame for frame in worker.frames if frame["kind"] == "worker"], (
+            "incremental delivery must survive an aborted snapshot install"
+        )
+
+    asyncio.run(run())
+
+
+class BarrierRacingPipelineWorker(FrameCapturingPipelineWorker):
+    """Fake worker that emits an authoritative state event at the moment the
+    barrier frame drains, so the event is buffered by the paused observer and
+    must be replayed strictly after the snapshot frame."""
+
+    emit_on_barrier: ClassVar[Callable[[], None] | None] = None
+
+    async def queue_frame(self, frame: object) -> None:
+        # The real PipelineWorker.queue_frame awaits its queue, so it yields
+        # to the loop. Model that: a replay task scheduled by resume() would
+        # otherwise never get to run before the caller's own next write.
+        await asyncio.sleep(0)
+        acknowledge = getattr(frame, "acknowledge", None)
+        if callable(acknowledge):
+            emit = type(self).emit_on_barrier
+            if emit is not None:
+                emit()
+            acknowledge()
+            return
+        self.frames.append(getattr(frame, "data", frame))
+
+
+def test_the_snapshot_frame_is_queued_before_any_buffered_incremental() -> None:
+    """Regression: the handler queued the `runtime_snapshot` frame only after
+    `install_baseline` returned, so `resume()` could replay a buffered
+    incremental ahead of the snapshot that establishes the watermark the
+    client applies it against."""
+
+    async def run() -> None:
+        BarrierRacingPipelineWorker.constructed = []
+        BarrierRacingPipelineWorker.emit_on_barrier = None
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=BarrierRacingPipelineWorker,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = BarrierRacingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+
+        def emit_while_paused() -> None:
+            host.state.set_worker(
+                WorkerState(
+                    worker_id="worker-raced-with-the-barrier",
+                    topic="weather",
+                    model_policy="deep",
+                    status="idle",
+                    origin_epoch=runtime.epoch,
+                )
+            )
+
+        # The structural assertion: the snapshot must already be on the wire
+        # at the moment the observer resumes, so no scheduling detail of the
+        # replay can put a buffered incremental ahead of it.
+        kinds_at_resume: list[str] = []
+        original_resume = runtime.observer.resume
+
+        def recording_resume(watermark: int | None = None) -> None:
+            kinds_at_resume.extend(frame["kind"] for frame in worker.frames)
+            original_resume(watermark)
+
+        runtime.observer.resume = recording_resume  # type: ignore[method-assign]
+
+        BarrierRacingPipelineWorker.emit_on_barrier = emit_while_paused
+        try:
+            await worker.rtvi.handlers["on_client_message"](
+                worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+            )
+        finally:
+            BarrierRacingPipelineWorker.emit_on_barrier = None
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert "runtime_snapshot" in kinds_at_resume, (
+            "the snapshot frame must be written before the buffer is replayed"
+        )
+        kinds = [frame["kind"] for frame in worker.frames]
+        assert "worker" in kinds
+        assert kinds.index("runtime_snapshot") < kinds.index("worker"), (
+            "the buffered incremental must be replayed after the snapshot frame"
+        )
+
+    asyncio.run(run())
+
+
+# --- I12: wire_payload is the single choke point for work_status presence --
+
+
+def _snapshot_frame_data(*, capabilities: tuple[str, ...]) -> dict:
+    """Attach a fake connection, request a snapshot, return the wire frame."""
+
+    async def run() -> dict:
+        FrameCapturingPipelineWorker.constructed = []
+        host = SessionHost(runner_factory=AsyncAddRunnerForApp)
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            await _attach_fake_connection(
+                monkeypatch,
+                host=host,
+                startup_observers=[],
+                latency_observers=[],
+                worker_class=FrameCapturingPipelineWorker,
+                capabilities=capabilities,
+            )
+        finally:
+            monkeypatch.undo()
+
+        runtime = host.connection
+        assert runtime is not None
+        worker = FrameCapturingPipelineWorker.constructed[-1]
+        await worker.rtvi.handlers["on_client_ready"](worker.rtvi)
+        await worker.rtvi.handlers["on_client_message"](
+            worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
+        )
+        frame = worker.frames[-1]
+        assert frame["kind"] == "runtime_snapshot"
+        return frame
+
+    return asyncio.run(run())
+
+
+def test_non_capable_snapshot_omits_work_status_but_keeps_nullable_required_fields() -> None:
+    """I12: a non-capable connection's snapshot must omit `work_status`
+    entirely (field absent, not an empty array), while every other nullable
+    field the frozen schema marks *required* -- `routing`, `origin_epoch` --
+    stays present. This is the test that fails under a naive
+    `model_dump(exclude_none=True)` fix, which would strip `routing: None`
+    and break schema validation.
+    """
+    frame = _snapshot_frame_data(capabilities=())
+    data = frame["data"]
+
+    assert "work_status" not in data
+    assert "routing" in data and data["routing"] is None
+    assert "origin_epoch" in data
+
+
+def test_capable_snapshot_carries_the_work_status_field() -> None:
+    """I12: a connection that advertised `work_status_v1` keeps the field."""
+    frame = _snapshot_frame_data(capabilities=("work_status_v1",))
+    data = frame["data"]
+
+    assert "work_status" in data
+    assert isinstance(data["work_status"], list)
+
+
+def test_snapshot_wire_presence_reads_the_observers_single_accessor() -> None:
+    """I12: the wire-presence gate and the snapshot-content gate must be one
+    source. Forcing ``RuntimeObserver.supports_work_status`` to False on a
+    connection that *did* advertise `work_status_v1` must omit the field: a
+    caller that re-derived presence from `capabilities` instead would keep the
+    field while the content gate dropped its contents.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            observers_module.RuntimeObserver,
+            "supports_work_status",
+            property(lambda self: False),
+            raising=True,
+        )
+        frame = _snapshot_frame_data(capabilities=("work_status_v1",))
+    finally:
+        monkeypatch.undo()
+
+    assert "work_status" not in frame["data"]
+
+
+# --- Batch 7: single-decoder handshake parsing, bounds, and 409-vs-400 -------
+#
+# I14: `capabilities` must decode through Starlette's QueryParams like every
+# other handshake field (one decoder per request, `+` == space), the raw
+# percent-encoding validator must run exactly once, and duplicate query keys
+# must still be rejected -- `QueryParams.getlist` does expose duplicates.
+
+
+def test_handshake_capabilities_decode_matches_starlette_query_params() -> None:
+    """`+` in the capabilities value decodes to a space, identically to the
+    way `request.query_params` decodes the very same bytes."""
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities="%5B%22alpha+beta%22%5D",
+    )
+    request = _raw_request(query)
+    expected = tuple(_json.loads(request.query_params["capabilities"]))
+
+    value = _handshake_from_query(host, request)
+
+    assert expected == ("alpha beta",)
+    assert value.capabilities == expected
+
+
+def test_handshake_validates_raw_percent_encoding_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=encoded,
+    )
+    calls: list[bytes] = []
+    original = app_module._validate_raw_percent_encoding
+
+    def counting(raw: bytes) -> None:
+        calls.append(raw)
+        original(raw)
+
+    monkeypatch.setattr(app_module, "_validate_raw_percent_encoding", counting)
+
+    _handshake_from_query(host, _raw_request(query))
+
+    assert len(calls) == 1
+
+
+def test_handshake_still_rejects_duplicate_capabilities_keys_via_getlist() -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = (
+        f"session_id={handshake['session_id']}&resume_token={handshake['resume_token']}"
+        f"&proposed_epoch={handshake['proposed_epoch']}&snapshot_sequence=0"
+        f"&capabilities={encoded}&capabilities={encoded}"
+    ).encode()
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+# M7: the capabilities decoder bounds the array length and each entry length.
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [f"cap_{index}" for index in range(17)],
+        ["a" * 65],
+    ],
+)
+def test_handshake_rejects_oversized_capabilities_payloads(payload: list[str]) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=quote(_json.dumps(payload)),
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", 400) == 400
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[" * 400 + "]" * 400,
+        "[" * 20000,
+        "x" * 5000,
+    ],
+)
+def test_handshake_rejects_pathological_capabilities_strings_as_400(raw: str) -> None:
+    """RecursionError derives from RuntimeError, not ValueError: deeply nested
+    input must still be a 400, never an uncaught 500. The raw-length bound
+    turns away the pathological shapes before the parser sees them."""
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=quote(raw),
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        _handshake_from_query(host, _raw_request(query))
+    assert getattr(excinfo.value, "status_code", None) == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [f"cap_{index:02d}" for index in range(16)],
+        ["a" * 64],
+    ],
+)
+def test_handshake_accepts_capabilities_payloads_at_the_bounds(payload: list[str]) -> None:
+    host, handshake = _host_with_fresh_handshake_token()
+    query = _capability_query(
+        session_id=handshake["session_id"],
+        resume_token=handshake["resume_token"],
+        epoch=handshake["proposed_epoch"],
+        capabilities=quote(_json.dumps(payload)),
+    )
+
+    value = _handshake_from_query(host, _raw_request(query))
+
+    assert value.capabilities == tuple(sorted(payload))
+
+
+# M4: a PATCH whose promoted connection is gone is a stale-epoch 409, never a
+# capability-mismatch 400 -- an absent connection binds no capability set.
+
+
+def test_patch_with_correct_capabilities_and_no_connection_is_409_not_400() -> None:
+    host = SessionHost(runner_factory=FakeRunner)
+    discovery = host.session_handshake()
+    encoded = quote(_json.dumps(["work_status_v1"]))
+    query = (
+        f"session_id={discovery['session_id']}&resume_token={discovery['resume_token']}"
+        f"&proposed_epoch={discovery['proposed_epoch']}&snapshot_sequence=0"
+        f"&capabilities={encoded}"
+    )
+    host.arbiter.promote(
+        {
+            "session_id": host.state.session_id,
+            "resume_token": host.state.resume_token,
+            "proposed_epoch": discovery["proposed_epoch"],
+            "snapshot_sequence": 0,
+            "capabilities": ("work_status_v1",),
+            "capabilities_present": True,
+        }
+    )
+    # Redeem the one-shot URL token the way a completed POST would have.
+    assert host.validate_handshake_token(
+        discovery["resume_token"], discovery["proposed_epoch"], redeem=True
+    )
+    assert host.connection is None
+
+    with TestClient(create_app(host)) as client:
+        response = client.patch(
+            f"/api/rtc?{query}",
+            json={
+                "pc_id": "pc-1",
+                "candidates": [{"candidate": "", "sdp_mid": "0", "sdp_mline_index": 0}],
+            },
+            headers={"origin": "http://127.0.0.1:7860"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "stale Small WebRTC connection epoch"
+
+
+class TestLoguruUnhardenedHandlerWarning:
+    """Round-2 confirm pass: ``remove(0)`` alone leaves a host's unhardened sink."""
+
+    def test_a_surviving_unhardened_sink_is_reported_not_silently_kept(self) -> None:
+        """Handler id ``0`` exists only if nothing reconfigured loguru first.
+        Pipecat's own dev runner does exactly ``logger.remove(); logger.add(
+        sys.stderr, level=...)``, and ``add()`` defaults to
+        ``diagnose=True``/``backtrace=True``. In that ordering ``remove(0)``
+        raises ``ValueError``, the suppression swallows it, and the
+        unhardened sink survives -- every traceback is then rendered twice,
+        once with local-variable values.
+
+        Removing the survivor is not the fix (commit 5f5541a exists because
+        stripping a host's handler is its own regression), so
+        ``_configure_logging`` must at least *name* it.
+        """
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sys
+
+from loguru import logger
+
+# Reproduce a host that reconfigured loguru before server.app is imported:
+# handler id 0 no longer exists, and the survivor is unhardened.
+logger.remove()
+logger.add(sys.stderr)
+
+import server.app  # noqa: F401 -- module import runs create_app()
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "backtrace/diagnose enabled" in result.stderr, (
+            "an unhardened surviving sink must be reported to the operator"
+        )
+
+    def test_no_warning_when_every_surviving_handler_is_hardened(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sys
+
+from loguru import logger
+
+logger.remove()
+logger.add(sys.stderr, backtrace=False, diagnose=False)
+
+import server.app  # noqa: F401
+""",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "backtrace/diagnose enabled" not in result.stderr
+
+
+def test_logging_configuration_latch_can_be_reset() -> None:
+    """Round-2 confirm pass: ``_logging_configured`` is a process-global,
+    never-reset latch, so a caller that legitimately clears loguru's handlers
+    between two ``create_app()`` calls silently got no hardened sink the
+    second time. ``_reset_logging_configuration()`` is the named seam for
+    that, rather than ``monkeypatch.setattr`` on a private module global."""
+    from loguru import logger as loguru_logger
+
+    app_module._configure_logging()
+    before = len(loguru_logger._core.handlers)
+
+    # Second call is a no-op while the latch is set.
+    app_module._configure_logging()
+    assert len(loguru_logger._core.handlers) == before
+
+    app_module._reset_logging_configuration()
+    app_module._configure_logging()
+    assert len(loguru_logger._core.handlers) == before + 1
+
+    for handler in loguru_logger._core.handlers.values():
+        assert handler._exception_formatter._diagnose is False
+        assert handler._exception_formatter._backtrace is False

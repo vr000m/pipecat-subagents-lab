@@ -13,6 +13,11 @@ class Connection:
     epoch: int
     session_id: str
     resume_token: str
+    # Normalized (deduplicated, lexically sorted) capability tuple bound
+    # immutably to this promoted epoch (Phase 3). Absent/unknown
+    # capabilities are never inferred; only the handshake's validated set
+    # is stored here, in the same tuple shape as SnapshotHandshake.capabilities.
+    capabilities: tuple[str, ...] = ()
 
 
 class ConnectionArbiter:
@@ -39,7 +44,12 @@ class ConnectionArbiter:
         if self._active is not None and value.proposed_epoch <= self._epoch:
             raise ValueError("connection epoch is stale")
         self._epoch = value.proposed_epoch
-        self._active = Connection(self._epoch, self.session_id, self.resume_token)
+        self._active = Connection(
+            self._epoch,
+            self.session_id,
+            self.resume_token,
+            capabilities=value.capabilities,
+        )
         return self._active
 
     def accepts(self, epoch: int | None) -> bool:

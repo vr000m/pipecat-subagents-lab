@@ -1,6 +1,7 @@
 """Versioned Python contract invariants for the browser protocol."""
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -8,19 +9,24 @@ import pytest
 
 from server.contracts import (
     CONTRACT_VERSION,
+    WORK_STATUS_V1,
     DeliveryState,
     GroundedResult,
     InterruptionEvent,
     RoutingDecision,
     RoutingState,
     RuntimeSnapshot,
+    SnapshotHandshake,
     SpeechProgress,
     TranscriptEntry,
     WorkerState,
     WorkItemEvent,
     WorkItemState,
+    WorkStatus,
+    resolve_work_status_wire_presence,
     validate_contract,
 )
+from server.contracts import WORK_STATUS_STATES as _IMPL_WORK_STATUS_STATES
 
 GROUNDED_RESULT_SCHEMA = json.loads(
     (Path(__file__).parents[1] / "shared" / "schemas" / "grounded-result.json").read_text()
@@ -430,3 +436,371 @@ def test_snapshot_is_versioned_monotonic_and_excludes_raw_prompts_or_logs() -> N
         RuntimeSnapshot(**{**payload, "snapshot_sequence": 11})
     with pytest.raises(ValueError):
         RuntimeSnapshot(**{**payload, "unexpected_private_field": True})
+
+
+# --- Phase 3: progressive RTVI status -------------------------------------
+#
+# Plan bullet (shared/protocol.md, shared/schemas/rtvi-message.json,
+# shared/schemas/work-status.json): a strict `work_status` kind is added to
+# the closed v1.0 kind list; capability handshake gets a strict `capabilities`
+# field. These tests assert the CONTRACT the plan describes -- they may not
+# import successfully until server/contracts.py lands the new symbols.
+
+WORK_STATUS_STATES = {"routing", "searching", "background", "result_ready", "failed", "cancelled"}
+LEGAL_TRANSITIONS = {
+    "routing": {"searching", "failed", "cancelled"},
+    "searching": {"background", "result_ready", "failed", "cancelled"},
+    "background": {"result_ready", "failed", "cancelled"},
+    "result_ready": set(),
+    "failed": set(),
+    "cancelled": set(),
+}
+
+
+def _work_status(**overrides: object) -> "WorkStatus":
+    assert WorkStatus is not None, "server.contracts.WorkStatus is not implemented yet"
+    fields = {
+        "turn_id": "turn-1",
+        "work_item_id": "work-1",
+        "state": "routing",
+        "event_sequence": 0,
+        "origin_epoch": 1,
+    }
+    fields.update(overrides)
+    return WorkStatus(**fields)
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_state_set_is_the_coarse_six_state_set() -> None:
+    assert set(_IMPL_WORK_STATUS_STATES) == WORK_STATUS_STATES
+
+
+def _work_status_schema() -> dict:
+    """Load `shared/schemas/work-status.json`, the contract the assertions below
+    pin the server's and client's work-status vocabularies against."""
+    import json
+    from pathlib import Path
+
+    schema_path = Path(__file__).resolve().parents[1] / "shared" / "schemas" / "work-status.json"
+    return json.loads(schema_path.read_text(encoding="utf-8"))
+
+
+def test_schema_state_enum_matches_the_python_state_vocabulary() -> None:
+    """Round-3 restart gauntlet, Architecture finding: web/src/protocol.js
+    imported shared/schemas/work-status.json to derive the *key* set, then
+    hand-wrote the *state* enum out of that same file.
+
+    protocol.js now derives `workStatusStates` from
+    `properties.state.enum`. This pins the other end: that enum must equal
+    Python's state vocabulary, so schema and server cannot drift while the
+    browser silently follows only one of them.
+    """
+    assert set(_work_status_schema()["properties"]["state"]["enum"]) == WORK_STATUS_STATES
+
+
+def test_schema_terminal_states_match_the_transitions_table() -> None:
+    """`x-terminal-states` exists so web/src/state.js can read terminality
+    from one place instead of hand-copying it.
+
+    JSON Schema cannot express terminality, so the array is declared beside
+    the enum it is a subset of -- but `server/contracts.py` remains the
+    authority, deriving `WORK_STATUS_TERMINAL` from `_WORK_STATUS_TRANSITIONS`
+    (a state with no successors is terminal). This test is what stops the
+    declared array from becoming a third, drifting source of truth.
+    """
+    schema = _work_status_schema()
+    declared_terminal = set(schema["x-terminal-states"])
+
+    derived_terminal = {state for state, successors in LEGAL_TRANSITIONS.items() if not successors}
+    assert declared_terminal == derived_terminal
+
+    # And every declared terminal state must actually be a legal state.
+    assert declared_terminal <= set(schema["properties"]["state"]["enum"])
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_schema_terminal_states_match_the_server_implementation() -> None:
+    """The same assertion against the *implementation*, not the test's own copy
+    of the transitions table -- otherwise both could drift together."""
+    from server.contracts import WORK_STATUS_TERMINAL
+
+    assert set(_work_status_schema()["x-terminal-states"]) == set(WORK_STATUS_TERMINAL)
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_schema_terminal_reason_enum_matches_the_python_literal() -> None:
+    """Round-5 restart gauntlet, Architecture Important: the third work-status
+    enum was the one with no Python<->schema parity assertion.
+
+    Its two siblings are pinned above (`properties.state.enum` against
+    `WORK_STATUS_STATES`, `x-terminal-states` against `WORK_STATUS_TERMINAL`).
+    `web/src/protocol.js` derives `workStatusTerminalReasons` from this enum
+    and `validWorkStatus` returns false on an unknown reason, so adding a third
+    `TerminalReason` in Python without touching the schema would silently make
+    the browser drop every frame carrying it -- exactly the failure mode the
+    schema's own `x-terminal-states-comment` says the state-enum pinning
+    exists to prevent.
+
+    `null` is excluded on the schema side: it encodes the optionality that
+    Python spells as `TerminalReason | None` on the field, not a member of the
+    reason vocabulary itself.
+    """
+    from typing import get_args
+
+    from server.contracts import TerminalReason
+
+    declared = set(_work_status_schema()["properties"]["terminal_reason"]["enum"])
+
+    assert None in declared, "the schema must keep encoding terminal_reason's optionality"
+    assert declared - {None} == set(get_args(TerminalReason))
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize("state", sorted(WORK_STATUS_STATES))
+def test_work_status_accepts_every_coarse_state(state: str) -> None:
+    status = _work_status(state=state)
+    validate_contract(status)
+    assert status.state == state
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_rejects_word_level_progress_fields() -> None:
+    """shared/protocol.md:80 reserves word-level progress; this phase's
+    coarse work_status must not accept a word-level progress payload."""
+    with pytest.raises(ValueError):
+        _work_status(word_progress="the model is thinking about weather")
+    with pytest.raises(ValueError):
+        _work_status(partial_text="Austin is currently")
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_rejects_work_item_event_reserved_states_as_values() -> None:
+    """WorkItemEvent's reserved started/progress states (shared/protocol.md:
+    109-115) must not become legal work_status values -- the two state
+    machines are independent seams."""
+    with pytest.raises(ValueError):
+        _work_status(state="started")
+    with pytest.raises(ValueError):
+        _work_status(state="progress")
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(s, e) for s, targets in LEGAL_TRANSITIONS.items() for e in targets],
+)
+def test_work_status_legal_transitions_are_accepted(start: str, end: str) -> None:
+    # A transition is exercised through two sequential events sharing a key;
+    # both individual payloads must be independently contract-valid.
+    validate_contract(_work_status(state=start, event_sequence=0))
+    validate_contract(_work_status(state=end, event_sequence=1))
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize("terminal_state", ["result_ready", "failed", "cancelled"])
+def test_work_status_terminal_states_have_no_legal_successor(terminal_state: str) -> None:
+    assert LEGAL_TRANSITIONS[terminal_state] == set()
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+@pytest.mark.parametrize("terminal_reason", ["missing_worker", "retention_rejected"])
+def test_work_status_failed_carries_terminal_reason(terminal_reason: str) -> None:
+    status = _work_status(state="failed", terminal_reason=terminal_reason)
+    validate_contract(status)
+    assert status.terminal_reason == terminal_reason
+
+
+@pytest.mark.skipif(WorkStatus is None, reason="server.contracts.WorkStatus not implemented yet")
+def test_work_status_terminal_reason_only_legal_alongside_failed() -> None:
+    with pytest.raises(ValueError):
+        _work_status(state="routing", terminal_reason="missing_worker")
+
+
+# --- Phase 3: SnapshotHandshake capabilities field -------------------------
+
+
+def test_snapshot_handshake_absent_capabilities_normalizes_to_empty_and_unpresent() -> None:
+    handshake = SnapshotHandshake(
+        session_id="session-1", resume_token="resume-1", proposed_epoch=1, snapshot_sequence=0
+    )
+    assert handshake.capabilities == ()
+    assert handshake.capabilities_present is False
+
+
+def test_snapshot_handshake_explicit_empty_array_is_present_but_empty() -> None:
+    handshake = SnapshotHandshake(
+        session_id="session-1",
+        resume_token="resume-1",
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=(),
+        capabilities_present=True,
+    )
+    assert handshake.capabilities == ()
+    assert handshake.capabilities_present is True
+
+
+def test_snapshot_handshake_unknown_capability_names_are_retained_as_unsupported() -> None:
+    """Absent/unknown means unsupported -- the strict model itself does not
+    reject a well-formed but unrecognized future capability name; rejection
+    of malformed entries only applies to non-string/empty-string entries."""
+    handshake = SnapshotHandshake(
+        session_id="session-1",
+        resume_token="resume-1",
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=("work_status_v1", "some_future_capability"),
+        capabilities_present=True,
+    )
+    assert handshake.capabilities == ("some_future_capability", "work_status_v1")
+
+
+def test_snapshot_handshake_capabilities_are_deduplicated_and_lexicographically_sorted() -> None:
+    handshake = SnapshotHandshake(
+        session_id="session-1",
+        resume_token="resume-1",
+        proposed_epoch=1,
+        snapshot_sequence=0,
+        capabilities=("work_status_v1", "work_status_v1", "alpha"),
+        capabilities_present=True,
+    )
+    assert handshake.capabilities == ("alpha", "work_status_v1")
+
+
+def test_snapshot_handshake_rejects_non_string_or_empty_capability_entries() -> None:
+    with pytest.raises(ValueError):
+        SnapshotHandshake(
+            session_id="session-1",
+            resume_token="resume-1",
+            proposed_epoch=1,
+            snapshot_sequence=0,
+            capabilities=("work_status_v1", ""),
+            capabilities_present=True,
+        )
+    with pytest.raises(ValueError):
+        SnapshotHandshake(
+            session_id="session-1",
+            resume_token="resume-1",
+            proposed_epoch=1,
+            snapshot_sequence=0,
+            capabilities=(1,),  # type: ignore[arg-type]
+            capabilities_present=True,
+        )
+
+
+def test_work_status_capability_constant_matches_the_browser_constant() -> None:
+    """The capability name is a cross-language wire constant: nothing but this
+    assertion pair keeps `server/contracts.py` and `web/src/protocol.js`
+    spelled the same way."""
+    source = (Path(__file__).resolve().parents[1] / "web" / "src" / "protocol.js").read_text()
+    match = re.search(r'^export const WORK_STATUS_V1 = "([^"]+)";$', source, re.MULTILINE)
+
+    assert match is not None
+    assert WORK_STATUS_V1 == match.group(1)
+
+
+def test_resolve_work_status_wire_presence_is_the_single_capability_gate() -> None:
+    """`resolve_work_status_wire_presence` must be the sole capability-gate
+    implementation. `RuntimeObserver.supports_work_status` calls it by name and
+    is the one accessor every consumer reads; no other module may re-test
+    `WORK_STATUS_V1 in capabilities` for itself. app.py in particular routes
+    the snapshot wire-presence decision through the observer accessor, so the
+    content gate and the wire gate are provably one source."""
+    import inspect
+
+    import server.app as app_module
+    import server.observers as observers_module
+
+    assert resolve_work_status_wire_presence(frozenset({"work_status_v1"})) is True
+    assert resolve_work_status_wire_presence(frozenset()) is False
+
+    observer_source = inspect.getsource(observers_module.RuntimeObserver.supports_work_status.fget)
+    assert "resolve_work_status_wire_presence" in observer_source
+
+    app_source = inspect.getsource(app_module)
+    assert "runtime.observer.supports_work_status" in app_source
+    assert f"{WORK_STATUS_V1!r} in" not in app_source
+    assert f'"{WORK_STATUS_V1}" in' not in app_source
+
+
+def test_snapshot_monotonicity_watermarks_are_bounded_per_process() -> None:
+    """Round-5 restart gauntlet, Logic Minor: ``_highest_by_session`` is a
+    process-lifetime ClassVar with one entry per session id that ever emitted a
+    snapshot. ``reset_monotonicity`` only clears the INCOMING session's key
+    (``SessionState.__init__``), never the outgoing one, so nothing ever
+    evicted a retired session -- unlike every sibling cache on this branch
+    (``HandshakeGate._MAX_HANDSHAKE_TOKENS``, ``_MAX_ACK_GENERATION_TURNS``,
+    the work-status 256-key cap), which are all explicitly bounded."""
+    from server.contracts import CONTRACT_VERSION, RuntimeSnapshot
+
+    cap = RuntimeSnapshot._MAX_WATERMARK_SESSIONS
+    saved = RuntimeSnapshot._highest_by_session.copy()
+    RuntimeSnapshot._highest_by_session.clear()
+    try:
+        for index in range(cap + 50):
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=f"session-bound-{index}",
+                snapshot_sequence=1,
+                origin_epoch=1,
+            )
+
+        assert len(RuntimeSnapshot._highest_by_session) == cap
+        # Least-recently-watermarked-first: the newest sessions -- the ones
+        # whose monotonicity still needs enforcing -- are the ones retained.
+        assert f"session-bound-{cap + 49}" in RuntimeSnapshot._highest_by_session
+        assert "session-bound-0" not in RuntimeSnapshot._highest_by_session
+    finally:
+        RuntimeSnapshot._highest_by_session.clear()
+        RuntimeSnapshot._highest_by_session.update(saved)
+
+
+def test_a_re_emitting_session_keeps_its_watermark_against_unrelated_traffic() -> None:
+    """The LRU refresh is what makes the bound safe: a session that keeps
+    emitting snapshots must not be evicted just because it was *first* seen a
+    long time ago, or its monotonicity check would silently go unenforced
+    while it is still live."""
+    from server.contracts import CONTRACT_VERSION, RuntimeSnapshot
+
+    cap = RuntimeSnapshot._MAX_WATERMARK_SESSIONS
+    saved = RuntimeSnapshot._highest_by_session.copy()
+    RuntimeSnapshot._highest_by_session.clear()
+    try:
+        live = "session-still-live"
+        RuntimeSnapshot(
+            contract_version=CONTRACT_VERSION,
+            session_id=live,
+            snapshot_sequence=5,
+            origin_epoch=1,
+        )
+        # Twice the cap in unrelated sessions, so eviction really does run --
+        # a first-seen-order (non-LRU) bound would have dropped ``live`` long
+        # before this loop ended.
+        noise_sessions = cap * 2
+        for index in range(noise_sessions):
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=f"session-noise-{index}",
+                snapshot_sequence=1,
+                origin_epoch=1,
+            )
+            # The live session re-emits, refreshing its recency.
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=live,
+                snapshot_sequence=5 + index + 1,
+                origin_epoch=1,
+            )
+
+        assert len(RuntimeSnapshot._highest_by_session) == cap
+        assert RuntimeSnapshot._highest_by_session[live] == 5 + noise_sessions
+        with pytest.raises(ValueError):
+            RuntimeSnapshot(
+                contract_version=CONTRACT_VERSION,
+                session_id=live,
+                snapshot_sequence=1,
+                origin_epoch=1,
+            )
+    finally:
+        RuntimeSnapshot._highest_by_session.clear()
+        RuntimeSnapshot._highest_by_session.update(saved)

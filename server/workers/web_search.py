@@ -7,7 +7,6 @@ import inspect
 import re
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -15,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from ..contracts import GroundedResult
 from ..results import canonical_result, normalize_citations
 from ..structured_outputs import structured_text_format
-from .base import ContextWorker, WorkerMetadata
+from .base import ClarificationContext, ContextWorker, WorkerMetadata
 
 
 class WorkerDeclined(Exception):
@@ -28,25 +27,6 @@ class WorkerClarify(Exception):
     def __init__(self, question: str) -> None:
         super().__init__(question)
         self.question = question
-
-
-@dataclass(frozen=True)
-class ClarificationContext:
-    """Typed continuation data rendered only at the provider boundary."""
-
-    original_query: str
-    question: str
-    answer: str
-
-    def provider_query(self) -> str:
-        def bounded(value: str, limit: int) -> str:
-            return " ".join(value.strip().split())[:limit]
-
-        return (
-            f"Original request: {bounded(self.original_query, 650)}\n"
-            f"Clarification asked: {bounded(self.question, 400)}\n"
-            f"User answer: {bounded(self.answer, 800)}"
-        )
 
 
 def default_web_clarification(query: str) -> str | None:
@@ -201,6 +181,33 @@ _WEB_SEARCH_INSTRUCTIONS = (
 )
 
 
+def build_worker_request_kwargs(
+    model: str, effort: str | None, *, query: str, instructions: str = _WEB_SEARCH_INSTRUCTIONS
+) -> dict[str, Any]:
+    """The exact request-kwargs shape sent to the Responses API for a worker
+    search call.
+
+    Hoisted out of ``WebSearchWorker.search``'s ``execute()`` closure (round
+    8 gauntlet, Architecture finding 8) so ``scripts/verify_eval_candidates.py``'s
+    probe builder can call this SAME function instead of hand-mirroring the
+    shape independently -- see ``build_router_request_kwargs`` in
+    ``server/router.py`` for the matching router-side rationale.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "required",
+        "include": ["web_search_call.action.sources"],
+        "instructions": instructions,
+        "input": query,
+        "text": structured_text_format(WebSearchAnswer, "web_search_answer"),
+        "store": False,
+    }
+    if effort is not None:
+        kwargs["reasoning"] = {"effort": effort}
+    return kwargs
+
+
 def _value(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
@@ -300,6 +307,7 @@ class WebSearchWorker(ContextWorker):
         model: str,
         responses: Any,
         model_policy: str | None = None,
+        reasoning_effort: str | None = None,
         decline: Callable[[str], bool] | None = None,
         can_satisfy: Callable[[str], bool] | None = None,
         needs_clarification: Callable[[str], str | None] | None = None,
@@ -316,6 +324,7 @@ class WebSearchWorker(ContextWorker):
         )
         super().__init__(metadata)
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.responses = responses
         self.decline = decline or (
             lambda query: can_satisfy(query) is False if can_satisfy else False
@@ -364,16 +373,9 @@ class WebSearchWorker(ContextWorker):
             # Build the contextual request inside the mailbox. This keeps a
             # same-worker turn from observing a history snapshot captured
             # before an earlier queued turn has committed its result.
-            kwargs = {
-                "model": self.model,
-                "tools": [{"type": "web_search"}],
-                "tool_choice": "required",
-                "include": ["web_search_call.action.sources"],
-                "instructions": _WEB_SEARCH_INSTRUCTIONS,
-                "input": self._contextual_input(refined),
-                "text": structured_text_format(WebSearchAnswer, "web_search_answer"),
-                "store": False,
-            }
+            kwargs = build_worker_request_kwargs(
+                self.model, self.reasoning_effort, query=self._contextual_input(refined)
+            )
             create = self.responses.create
             async with asyncio.timeout(self.provider_timeout_seconds):
                 if inspect.iscoroutinefunction(create):

@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .config import Config
+from .config import Config, default_reasoning_effort_for_model
 from .contracts import RoutingDecision
 from .structured_outputs import structured_text_format
 
@@ -36,6 +36,49 @@ def build_openai_async_responses_client(api_key: str, *, timeout: float = 75.0) 
     from openai import AsyncOpenAI
 
     return AsyncOpenAI(api_key=api_key, timeout=timeout).responses
+
+
+def effective_router_reasoning_effort(model: str, resolved_effort: str | None) -> str | None:
+    """The reasoning-effort value ``LazyRouterProvider.__call__`` actually sends
+    for the ROUTER.
+
+    Router-specific: it layers the router's resolved-config precedence over
+    the model-naming default. A caller that needs to *predict* the router's
+    wire-level effort without making the call (the eval runner's
+    manifest-lookup) uses this; a caller that only wants the model-naming
+    default for some OTHER role must call
+    ``default_reasoning_effort_for_model`` directly rather than borrowing this
+    function's router contract (round 10 gauntlet, Architecture finding 4).
+    """
+    if resolved_effort is not None:
+        return resolved_effort
+    return default_reasoning_effort_for_model(model)
+
+
+def build_router_request_kwargs(
+    model: str, effort: str | None, *, prompt: str, timeout: float
+) -> dict[str, Any]:
+    """The exact request-kwargs shape sent to the Responses API for a router
+    call.
+
+    Hoisted out of ``LazyRouterProvider.__call__`` (round 8 gauntlet,
+    Architecture finding 8) so ``scripts/verify_eval_candidates.py``'s probe
+    builder can call this SAME function instead of hand-mirroring the shape
+    independently -- a production kwarg change previously left the manifest
+    verifier free to keep reproducing the OLD shape and re-certify it as
+    still production-equivalent.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "input": prompt,
+        "store": False,
+        "timeout": timeout,
+        "text": structured_text_format(RouterEnvelope, "router_envelope"),
+    }
+    effective_effort = effective_router_reasoning_effort(model, effort)
+    if effective_effort is not None:
+        kwargs["reasoning"] = {"effort": effective_effort}
+    return kwargs
 
 
 def _response_text(response: Any) -> str:
@@ -82,15 +125,10 @@ class LazyRouterProvider:
 
     def __call__(self, prompt: str) -> dict[str, Any]:
         model = self._config.resolve_router_model("fast")
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "input": prompt,
-            "store": False,
-            "timeout": self._config.router_timeout_seconds,
-            "text": structured_text_format(RouterEnvelope, "router_envelope"),
-        }
-        if model.startswith("gpt-5"):
-            kwargs["reasoning"] = {"effort": "minimal"}
+        effort = self._config.resolve_router_reasoning_effort("fast")
+        kwargs = build_router_request_kwargs(
+            model, effort, prompt=prompt, timeout=self._config.router_timeout_seconds
+        )
         response = self._get_responses().create(**kwargs)
         try:
             payload = json.loads(_response_text(response))

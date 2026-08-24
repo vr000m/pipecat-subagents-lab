@@ -138,6 +138,9 @@ SpeechOutcome = Literal[
 ]
 SPEECH_OUTCOMES: frozenset[str] = frozenset(get_args(SpeechOutcome))
 
+LateDeliveryDisposition = Literal["autoplay", "display_only", "suppressed", "not_applicable"]
+LATE_DELIVERY_DISPOSITIONS: frozenset[str] = frozenset(get_args(LateDeliveryDisposition))
+
 _APP_TURN_COUNTER_FIELDS = (
     "direct_count",
     "unsupported_count",
@@ -307,6 +310,8 @@ EVENT_REGISTRY: Mapping[str, EventSpec] = MappingProxyType(
                 _enum("control_outcome", CONTROL_OUTCOMES),
                 _ms("routing_ms"),
                 _ms("commit_ms"),
+                _id("scenario", maxlen=64),
+                _bool("acknowledgement"),
             ),
             validate=_validate_app_turn_foreground,
         ),
@@ -319,7 +324,16 @@ EVENT_REGISTRY: Mapping[str, EventSpec] = MappingProxyType(
                 _enum("outcome", WORK_ITEM_OUTCOMES),
                 _ms("total_ms"),
             ),
-            optional=(_id("app_worker_id"), _id("result_id"), _ms("search_ms"), _ms("commit_ms")),
+            optional=(
+                _id("app_worker_id"),
+                _id("result_id"),
+                _ms("search_ms"),
+                _ms("commit_ms"),
+                _int("query_chars"),
+                _int("context_chars"),
+                _id("provider", maxlen=64),
+                _id("model", maxlen=64),
+            ),
         ),
         "work_item_background": EventSpec(
             required=(
@@ -333,7 +347,12 @@ EVENT_REGISTRY: Mapping[str, EventSpec] = MappingProxyType(
                 _enum("commit_outcome", COMMIT_OUTCOMES),
                 _enum("speech_outcome", SPEECH_OUTCOMES),
             ),
-            optional=(_id("result_id"),),
+            optional=(
+                _id("result_id"),
+                _id("provider", maxlen=64),
+                _id("model", maxlen=64),
+                _enum("delivery_disposition", LATE_DELIVERY_DISPOSITIONS),
+            ),
         ),
     }
 )
@@ -605,7 +624,20 @@ def make_turn_tracking_handlers(
     ) -> None:
         fields = context.base_fields()
         fields["pipecat_turn"] = turn_count
-        fields["duration_ms"] = duration_secs * 1000
+        duration_ms = duration_secs * 1000
+        # Pipecat's TurnTrackingObserver derives duration from frame push
+        # timestamps recorded by independently-scheduled pipeline tasks
+        # (e.g. an interruption's UserStartedSpeakingFrame racing a delayed
+        # turn-end timer); under that race the end timestamp can land before
+        # the recorded start timestamp, yielding a negative duration. Clamp
+        # rather than let the "ms" field validator drop the whole record.
+        if not math.isfinite(duration_ms) or duration_ms < 0:
+            logger.warning(
+                f"pipecat_turn_end: turn={turn_count} got a non-finite or negative "
+                f"duration_ms={duration_ms!r} from TurnTrackingObserver; clamping to 0.0"
+            )
+            duration_ms = 0.0
+        fields["duration_ms"] = duration_ms
         fields["interrupted"] = bool(was_interrupted)
         _safe_emit(sink, "pipecat_turn_end", fields)
 
@@ -792,6 +824,8 @@ class AppTurnRecorder:
         outcome: AppTurnOutcome | None = None,
         control_action: ControlAction | None = None,
         control_outcome: ControlOutcome | None = None,
+        scenario: str | None = None,
+        acknowledgement: bool | None = None,
     ) -> None:
         if self._finalized:
             return
@@ -871,6 +905,10 @@ class AppTurnRecorder:
             fields["routing_ms"] = self._routing_ms
         if self._commit_ms is not None:
             fields["commit_ms"] = self._commit_ms
+        if scenario is not None:
+            fields["scenario"] = scenario
+        if acknowledgement is not None:
+            fields["acknowledgement"] = acknowledgement
         _safe_emit(self._sink, "app_turn_foreground", fields)
 
 
@@ -916,6 +954,10 @@ class WorkItemRecorder:
         result_id: str | None = None,
         search_ms: float | None = None,
         commit_ms: float | None = None,
+        query_chars: int | None = None,
+        context_chars: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> WorkItemOutcome:
         """Emit once, notify the owning turn, and return ``outcome``.
 
@@ -955,6 +997,14 @@ class WorkItemRecorder:
             fields["search_ms"] = search_ms
         if commit_ms is not None:
             fields["commit_ms"] = commit_ms
+        if query_chars is not None:
+            fields["query_chars"] = query_chars
+        if context_chars is not None:
+            fields["context_chars"] = context_chars
+        if provider is not None:
+            fields["provider"] = provider
+        if model is not None:
+            fields["model"] = model
         _safe_emit(self._sink, "work_item_foreground", fields)
         if self._on_finalize is not None:
             try:
@@ -1046,6 +1096,9 @@ class RetainedRecorder:
         commit_outcome: CommitOutcome | None = None,
         speech_outcome: SpeechOutcome | None = None,
         result_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        delivery_disposition: LateDeliveryDisposition | None = None,
     ) -> bool:
         """Emit the terminal ``work_item_background`` record and close the recorder.
 
@@ -1087,5 +1140,11 @@ class RetainedRecorder:
         }
         if self.result_id is not None:
             fields["result_id"] = self.result_id
+        if provider is not None:
+            fields["provider"] = provider
+        if model is not None:
+            fields["model"] = model
+        if delivery_disposition is not None:
+            fields["delivery_disposition"] = delivery_disposition
         _safe_emit(self._sink, "work_item_background", fields)
         return True

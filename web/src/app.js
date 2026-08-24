@@ -1,6 +1,6 @@
 import { PipecatClient } from "@pipecat-ai/client-js";
 import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
-import { validateServerMessage } from "./protocol.js";
+import { validateServerMessage, WORK_STATUS_V1 } from "./protocol.js";
 import {
   applyServerMessage,
   createInitialState,
@@ -179,6 +179,10 @@ export function createApp({ root, documentRef = globalThis.document, webrtcUrl =
           for (const key of ["contract_version", "session_id", "resume_token", "proposed_epoch", "snapshot_sequence"]) {
             if (handshake[key] !== undefined) url.searchParams.set(key, String(handshake[key]));
           }
+          // Canonical capability encoding: one URL-encoded JSON array of
+          // strings in a single `capabilities` query parameter, bound
+          // immutably to the promoted connection epoch server-side.
+          url.searchParams.set("capabilities", JSON.stringify([WORK_STATUS_V1]));
           connectionUrl = url.toString();
         } catch (error) {
           report(`Session discovery failed: ${error?.message || error}`);

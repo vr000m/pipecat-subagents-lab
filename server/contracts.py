@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, ClassVar, Literal
@@ -191,7 +192,45 @@ class RuntimeSnapshot(StrictModel):
     routing: RoutingState | None = None
     transcript: list[TranscriptEntry] = Field(default_factory=list)
     origin_epoch: int | None = Field(default=None, ge=0)
-    _highest_by_session: ClassVar[dict[str, int]] = {}
+    # Two distinct gates govern this field, and they are not interchangeable:
+    #   * *content* -- ``SessionState.snapshot(include_work_status=...)``
+    #     decides whether the ledger is computed at all (a non-capable
+    #     projection carries an empty list on the model).
+    #   * *wire presence* -- :meth:`wire_payload` is the sole mechanism that
+    #     drops the key from the serialized frame, so a non-capable
+    #     connection's snapshot still validates against the frozen
+    #     pre-Phase-3 runtime-snapshot schema, which does not know the field.
+    # The model itself always has the attribute; never assume absence here.
+    work_status: list[WorkStatus] = Field(default_factory=list)
+    # Per-session snapshot-sequence watermark backing the monotonicity
+    # assertion below. Bounded like every other long-lived cache on this
+    # branch (``HandshakeGate._MAX_HANDSHAKE_TOKENS``,
+    # ``_MAX_ACK_GENERATION_TURNS``, the work-status 256-key cap): this is a
+    # process-lifetime ClassVar, and ``reset_monotonicity`` only ever clears
+    # the INCOMING session's key (``SessionState.__init__``), never the
+    # outgoing one -- so every session that ever emitted a snapshot left a
+    # permanent entry behind (round-5 restart, Logic Minor).
+    #
+    # Eviction is least-recently-watermarked-first. Losing a still-live
+    # session's entry weakens the monotonicity check to "unchecked" for that
+    # session rather than making it wrong, and requires
+    # ``_MAX_WATERMARK_SESSIONS`` other sessions to emit snapshots in between,
+    # which is the same trade the sibling caps accept.
+    _MAX_WATERMARK_SESSIONS: ClassVar[int] = 256
+    _highest_by_session: ClassVar[OrderedDict[str, int]] = OrderedDict()
+
+    def wire_payload(self, *, include_work_status: bool) -> dict[str, Any]:
+        """Serialize for the wire, dropping ``work_status`` when not negotiated.
+
+        The single choke point for snapshot serialization. ``work_status`` is
+        excluded by name rather than via ``exclude_none``/``exclude_defaults``:
+        ``routing`` and ``origin_epoch`` are nullable but *required* by
+        shared/schemas/runtime-snapshot.json, so a blanket exclusion would
+        strip them and break schema validation.
+        """
+        return self.model_dump(
+            mode="json", exclude=None if include_work_status else {"work_status"}
+        )
 
     @classmethod
     def reset_monotonicity(cls, session_id: str) -> None:
@@ -201,10 +240,14 @@ class RuntimeSnapshot(StrictModel):
     def validate_version_and_monotonicity(self) -> RuntimeSnapshot:
         if self.contract_version != CONTRACT_VERSION:
             raise ValueError(f"unsupported contract version: {self.contract_version}")
-        previous = type(self)._highest_by_session.get(self.session_id)
+        watermarks = type(self)._highest_by_session
+        previous = watermarks.get(self.session_id)
         if previous is not None and self.snapshot_sequence < previous:
             raise ValueError("snapshot_sequence must be monotonic")
-        type(self)._highest_by_session[self.session_id] = max(previous or 0, self.snapshot_sequence)
+        watermarks[self.session_id] = max(previous or 0, self.snapshot_sequence)
+        watermarks.move_to_end(self.session_id)
+        while len(watermarks) > type(self)._MAX_WATERMARK_SESSIONS:
+            watermarks.popitem(last=False)
         return self
 
 
@@ -237,12 +280,120 @@ class InterruptionEvent(StrictModel):
     origin_epoch: int | None = Field(default=None, ge=0)
 
 
+# The single spelling of the capability name that gates the `work_status`
+# wire kind. The browser mirrors it in `web/src/protocol.js`; the two literals
+# must agree exactly (asserted in tests/test_contracts.py).
+WORK_STATUS_V1 = "work_status_v1"
+
+
+def resolve_work_status_wire_presence(capabilities: frozenset[str]) -> bool:
+    """Single source for the work_status capability gate.
+
+    ``RuntimeObserver.supports_work_status`` is the sole caller, by design:
+    both snapshot *content* (SessionState.snapshot(include_work_status=...))
+    and *wire presence* (RuntimeSnapshot.wire_payload(include_work_status=...))
+    read that property rather than testing WORK_STATUS_V1 membership
+    themselves, so the literal appears in exactly one predicate.
+    """
+    return WORK_STATUS_V1 in capabilities
+
+
+WorkStatusState = Literal[
+    "routing", "searching", "background", "result_ready", "failed", "cancelled"
+]
+TerminalReason = Literal["missing_worker", "retention_rejected"]
+_WORK_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
+    "routing": frozenset({"searching", "failed", "cancelled"}),
+    "searching": frozenset({"background", "result_ready", "failed", "cancelled"}),
+    "background": frozenset({"result_ready", "failed", "cancelled"}),
+    "result_ready": frozenset(),
+    "failed": frozenset(),
+    "cancelled": frozenset(),
+}
+# Derived from _WORK_STATUS_TRANSITIONS so the state vocabulary has a single
+# hand-written source; WorkStatusState stays hand-written separately because
+# pydantic needs a literal type, which cannot be derived at type-check time.
+WORK_STATUS_STATES = tuple(_WORK_STATUS_TRANSITIONS)
+WORK_STATUS_TERMINAL = frozenset(
+    state for state, successors in _WORK_STATUS_TRANSITIONS.items() if not successors
+)
+# States a work item may be recorded at with no prior status of its own.
+# ``failed`` is cold-startable because failure can precede routing (a missing
+# worker or missing search capability fails a child that was never routed),
+# and the parent join must still terminalize. ``cancelled`` is deliberately
+# NOT cold-startable: a cancel that sweeps an entire delegated child set must
+# be a no-op for children that never had a status, rather than inventing a
+# terminal record for work that was never started.
+WORK_STATUS_COLD_START = frozenset({"routing", "searching", "background", "result_ready", "failed"})
+
+
+def legal_work_status_transition(previous: str | None, state: str) -> bool:
+    """Return whether ``state`` may legally follow ``previous`` (or start cold)."""
+    if previous is None:
+        return state in WORK_STATUS_COLD_START
+    if previous == state:
+        return False
+    return state in _WORK_STATUS_TRANSITIONS.get(previous, frozenset())
+
+
+class WorkStatus(StrictModel):
+    """Per-work-item Phase 3 progress record gated by ``work_status_v1``.
+
+    Tracks one delegated child (or the parent join) through the coarse
+    ``routing -> searching -> background -> result_ready|failed|cancelled``
+    state machine enforced by :func:`legal_work_status_transition`; a record
+    may also start cold at any non-``cancelled`` state via
+    ``WORK_STATUS_COLD_START``. ``event_sequence`` is scoped per
+    ``(origin_epoch, turn_id, parent work item)`` and must strictly increase.
+    ``terminal_reason`` (``missing_worker`` or ``retention_rejected``) is only
+    ever set alongside ``state == "failed"``, enforced below.
+
+    The parent aggregate over a turn's delegated children is *not* a member
+    of this transition table in its own right -- it is a pure recomputation
+    over the current child set on every change (``routing`` while any child
+    is routing; ``searching`` while any child is searching and none is
+    routing; ``background`` while no child is active and at least one is
+    retained; once every child is terminal, ``failed`` wins over
+    ``cancelled`` wins over ``result_ready``). See shared/protocol.md
+    "Progressive work status" for the full wire contract, including the
+    five-minute / 256-key terminal-record retention rules.
+    """
+
+    turn_id: str = Field(min_length=1)
+    work_item_id: str | None = None
+    worker_id: str | None = None
+    state: WorkStatusState
+    event_sequence: int = Field(ge=0)
+    terminal_reason: TerminalReason | None = None
+    origin_epoch: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_terminal_reason(self) -> WorkStatus:
+        if self.terminal_reason is not None and self.state != "failed":
+            raise ValueError("terminal_reason may only be set for the failed state")
+        return self
+
+
 class SnapshotHandshake(StrictModel):
     contract_version: str = CONTRACT_VERSION
     session_id: str
     resume_token: str
     proposed_epoch: int = Field(ge=0)
     snapshot_sequence: int = Field(ge=0)
+    # Capability negotiation (Phase 3): a normalized, deduplicated, lexically
+    # sorted set of capability names the browser declares support for.
+    # ``capabilities_present`` distinguishes an explicitly-empty/all-unknown
+    # array from omission, so PATCH inheritance-vs-mismatch can be decided
+    # without conflating the two (see SessionHost.validate_patch_handshake).
+    capabilities: tuple[str, ...] = ()
+    capabilities_present: bool = False
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not isinstance(item, str) or not item for item in value):
+            raise ValueError("capabilities must be non-empty strings")
+        return tuple(sorted(set(value)))
 
 
 def validate_contract(value: Any) -> Any:

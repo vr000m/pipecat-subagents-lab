@@ -22,11 +22,14 @@ import asyncio
 
 import pytest
 
+from server.frames import CONNECTION_LOCAL_FRAMES, SnapshotBarrierFlushFrame
 from server.speech_lifecycle import (
     DeliveryDisposition,
+    EventLoopTimerScheduler,
     GenerationIdentity,
     GenerationPhase,
     ManualTimerScheduler,
+    PreAdmissionAdmit,
     SpeechLifecycleCoordinator,
 )
 
@@ -234,7 +237,7 @@ def test_teardown_complete_releases_the_slot_after_output_submitted_expiry() -> 
 
 def test_fieldless_transport_stopped_is_the_normal_slot_release() -> None:
     async def body() -> None:
-        coordinator, clock = make_coordinator()
+        coordinator, _clock = make_coordinator()
         generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
         coordinator.bind_context(generation.token, "utt-1")
         coordinator.on_tts_started("utt-1")
@@ -445,7 +448,7 @@ def test_missing_post_tts_ack_escalates_to_verified_connection_teardown() -> Non
         assert teardown_calls == [generation.token]
         assert generation.terminalized is True
         assert coordinator.occupied is False
-        assert coordinator.connection_epoch == 1
+        assert coordinator._teardown_generation == 1
 
     run(body)
 
@@ -687,6 +690,131 @@ def test_barge_in_never_automatically_admits_the_next_generation() -> None:
     # decide to admit the next generation.
     assert coordinator.occupied is True
     assert coordinator.slot_token == generation_a.token
+
+
+def test_uncontexted_interruption_fences_the_slot_until_cleanup_dispatch_completes() -> None:
+    """An interruption with no bound TTS context must fence the slot exactly
+    like the bound-context path (``test_barge_in_never_automatically_admits_
+    the_next_generation``), not free it synchronously.
+
+    Before the fix, ``record_interruption`` called ``_terminalize_state``
+    synchronously in this branch, freeing the slot before its
+    fire-and-forget cleanup dispatch had a chance to run. A replacement item
+    could then be admitted -- and its own frames queued -- ahead of the old
+    generation's own queued stop/cleanup frame, so a later-dispatched
+    interruption frame could land after the replacement's frames and
+    interrupt it instead.
+    """
+
+    async def body() -> None:
+        coordinator, _ = make_coordinator()
+        generation_a = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+        # No TTS context is ever bound to generation_a.
+
+        coordinator.record_interruption(generation_a.token, pause=False)
+
+        # The slot must still be fenced (occupied) immediately after the
+        # call returns -- the scheduled cleanup dispatch has not run yet.
+        assert coordinator.try_admit(identity("work-2", "utt-b")) is None
+        assert coordinator.occupied is True
+        assert coordinator.slot_token == generation_a.token
+
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        # Only once the scheduled cleanup dispatch has actually run does the
+        # slot free and the next generation get to admit.
+        generation_b = coordinator.try_admit(identity("work-2", "utt-b"))
+        assert generation_b is not None
+
+    run(body)
+
+
+def test_uncontexted_interruption_with_no_running_loop_terminalizes_synchronously() -> None:
+    """Regression: the no-running-loop branch of ``record_interruption`` must
+    still run ``dispatch_cleanup`` and ``on_terminal`` -- production wires
+    ``on_terminal`` to the scheduler's own queue-advance
+    (``pipeline.scheduler.start_next()``) and ``dispatch_cleanup`` to speech
+    teardown, so silently skipping them (a round-6 fix's over-correction for
+    a theoretical ``asyncio.run()``-throwaway-loop hazard) would leave the
+    scheduler with no notification the slot freed. This branch is only
+    reachable with no event loop running anywhere on this thread at all --
+    in practice a synchronous caller, not live concurrent production traffic
+    on a second loop -- so running the finalize coroutine via
+    ``asyncio.run()`` is not racing a second loop that exists at the same
+    time; it is the only loop in play. ``record_interruption`` still
+    terminalizes synchronously in the sense that matters to the caller: by
+    the time it returns, the slot is already free and both callbacks have
+    already run."""
+    cleanup_calls: list[str] = []
+    terminal_calls: list[str] = []
+
+    async def dispatch_cleanup(token: str, _identity: GenerationIdentity) -> None:
+        cleanup_calls.append(token)
+
+    async def on_terminal(
+        token: str, _identity: GenerationIdentity, _disposition: DeliveryDisposition
+    ) -> None:
+        terminal_calls.append(token)
+
+    coordinator, _ = make_coordinator(
+        dispatch_cleanup=dispatch_cleanup, on_terminal=on_terminal, auto_ack_cleanup=False
+    )
+    generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+    # No TTS context is ever bound to this generation, and this call happens
+    # with no asyncio event loop running at all (this test is not `async def`
+    # and is not wrapped in `asyncio.run`).
+
+    coordinator.record_interruption(generation.token, pause=False)
+
+    # Terminalized synchronously: the slot frees immediately, unlike the
+    # with-a-running-loop path (test_uncontexted_interruption_fences_the_
+    # slot_until_cleanup_dispatch_completes), which stays fenced until the
+    # scheduled task actually runs.
+    assert coordinator.occupied is False
+    assert coordinator.generation_for_token(generation.token) is None
+    # Both async callbacks must still run -- via asyncio.run(), not dropped.
+    assert cleanup_calls == [generation.token]
+    assert terminal_calls == [generation.token]
+
+
+def test_uncontexted_interruption_cleanup_dispatch_failure_escalates_to_teardown() -> None:
+    """Regression for round-4 Codex finding #3: before the fix,
+    ``_finalize_uncontexted_interruption`` awaited ``_dispatch_cleanup``
+    with no try/except. A raise there skipped ``_terminalize`` entirely,
+    leaving the slot fenced forever with no timer armed and no teardown
+    fallback -- unlike the bound-context path
+    (``test_cleanup_dispatch_failure_escalates_to_verified_connection_teardown``),
+    which already caught the same failure and fell back to teardown.
+    """
+
+    async def body() -> None:
+        teardown_calls: list[str] = []
+
+        async def cleanup_failed(_token: str, _identity: GenerationIdentity) -> None:
+            raise RuntimeError("queueing interruption failed")
+
+        async def teardown(token: str, _identity: GenerationIdentity) -> None:
+            teardown_calls.append(token)
+            await coordinator.teardown_complete(token)
+
+        coordinator, _ = make_coordinator(
+            dispatch_cleanup=cleanup_failed,
+            dispatch_teardown=teardown,
+        )
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-a")
+        # No TTS context is ever bound to generation.
+
+        coordinator.record_interruption(generation.token, pause=False)
+
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert teardown_calls == [generation.token]
+        assert generation.terminalized is True
+        assert coordinator.occupied is False
+
+    run(body)
 
 
 def test_pause_records_paused_disposition_and_retains_the_barrier() -> None:
@@ -969,7 +1097,7 @@ async def _terminalize_generation_a(
     directly, exactly as barge-in does. Reconnect and shutdown share the
     drain/teardown path because the coordinator exposes no reconnect- or
     shutdown-specific hook: a fresh connection-scoped lane is this same
-    coordinator's post-``teardown_complete`` state (``connection_epoch``
+    coordinator's post-``teardown_complete`` state (``_teardown_generation``
     bump), per the plan's fallback sequence diagram and
     ``server/pipeline.py``'s per-connection ``lifecycle`` field.
     """
@@ -1346,3 +1474,411 @@ def test_timeout_driven_cleanup_tombstones_before_dispatch_races_a_late_start_fr
         assert generation.tombstoned is True
 
     run(body)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: GenerationIdentity role/turn_id/ack_id and pre-admission disposition
+# ---------------------------------------------------------------------------
+
+
+def test_generation_identity_carries_role_turn_id_and_nullable_ack_id() -> None:
+    """Plan: 'Extend GenerationIdentity with explicit role, turn_id, and
+    nullable ack_id fields ... result identities carry role="result"/
+    result_id, while ack identities carry role="ack"/ack_id.'"""
+    result_identity = GenerationIdentity(
+        "utt-1", "work-1", role="result", turn_id="turn-1", ack_id=None
+    )
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    assert result_identity.role == "result"
+    assert result_identity.ack_id is None
+    assert ack_identity.role == "ack"
+    assert ack_identity.ack_id == "ack-turn-1"
+    assert ack_identity.turn_id == "turn-1"
+
+
+def test_generation_identity_role_defaults_to_result_for_backward_compatibility() -> None:
+    """Every non-ack call site in this repo (and every existing test)
+    constructs ``GenerationIdentity(utterance_id, work_item_id,
+    origin_epoch)`` positionally; the new fields must not force those call
+    sites to change."""
+    plain = identity("work-1", "utt-1")
+
+    assert plain.role == "result"
+    assert plain.ack_id is None
+
+
+def test_pre_admission_terminal_reason_is_a_closed_no_tts_unavailable_transport_enum() -> None:
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    assert {member.value for member in PreAdmissionTerminalReason} == {
+        "no_tts",
+        "unavailable_transport",
+        "connection_closed",
+        "cancelled",
+    }
+
+
+def test_pre_admission_disposition_is_busy_not_terminal_when_the_slot_is_occupied() -> None:
+    """Regression: ``PreAdmissionBusy`` (added so the scheduler's isinstance
+    chain is actually type-checked, replacing a bare ``None`` sentinel) must
+    be returned -- not a terminal disposition and not ``PreAdmissionAdmit``
+    -- when the sole transport slot is already occupied by another
+    generation."""
+    from server.speech_lifecycle import PreAdmissionBusy
+
+    coordinator, _clock = make_coordinator()
+    first = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+    assert isinstance(first, PreAdmissionAdmit)
+    assert coordinator.occupied is True
+
+    second = coordinator.pre_admission_disposition(identity("work-2", "utt-2"))
+
+    assert isinstance(second, PreAdmissionBusy)
+
+
+def test_pre_admission_disposition_is_terminal_not_busy_after_connection_closed() -> None:
+    """Regression: ``connection_closed()`` clears ``_slot_token`` alongside
+    ``_connection_closed``, so the free-slot top-of-method guard in
+    ``SpeechScheduler.start_next`` cannot detect this case -- only
+    ``try_admit``'s own ``_connection_closed`` check refuses. Before this
+    fix that refusal surfaced as ``PreAdmissionBusy`` ("retry later, not
+    terminal"), so a caller that trusts the type's stated contract and
+    retries (e.g. a deferred ack-admission retry) would spin against a
+    connection that can never admit again instead of terminalizing. It must
+    surface as a ``PreAdmissionTerminal(CONNECTION_CLOSED)`` instead, the
+    same as every other permanent pre-admission rejection."""
+    from server.speech_lifecycle import PreAdmissionTerminal, PreAdmissionTerminalReason
+
+    coordinator, _clock = make_coordinator()
+    coordinator.connection_closed()
+
+    disposition = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+
+    assert isinstance(disposition, PreAdmissionTerminal)
+    assert disposition.reason == PreAdmissionTerminalReason.CONNECTION_CLOSED
+
+
+def test_pre_admission_disposition_admits_a_normal_ack_when_tts_and_transport_are_available() -> (
+    None
+):
+    coordinator, _clock = make_coordinator()
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    disposition = coordinator.pre_admission_disposition(ack_identity)
+
+    assert isinstance(disposition, PreAdmissionAdmit)
+    assert coordinator.occupied is True
+
+
+def test_pre_admission_disposition_is_terminal_with_no_tts_and_allocates_no_transport_token() -> (
+    None
+):
+    """Plan: 'A Terminal result records the reason in the lifecycle terminal
+    ledger but does not allocate a transport token.'"""
+    coordinator, _clock = make_coordinator(tts_available=False)
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    disposition = coordinator.pre_admission_disposition(ack_identity)
+
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    reason = getattr(disposition, "reason", disposition)
+    assert reason == PreAdmissionTerminalReason.NO_TTS or reason == "no_tts"
+    assert coordinator.occupied is False
+
+
+def test_pre_admission_disposition_is_terminal_when_transport_acceptance_predicate_rejects() -> (
+    None
+):
+    coordinator, _clock = make_coordinator(transport_acceptance=lambda: False)
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    disposition = coordinator.pre_admission_disposition(ack_identity)
+
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    reason = getattr(disposition, "reason", disposition)
+    assert reason == PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT or (
+        reason == "unavailable_transport"
+    )
+    assert coordinator.occupied is False
+
+
+def test_pre_admission_disposition_is_terminal_for_a_result_when_no_tts_lane_exists() -> None:
+    """I2: with no TTS lane the scheduler's ``speak`` callable is ``None``,
+    so an admitted result can never be handed to a provider and would sit in
+    the sole transport slot until ``speech_start_timeout_seconds`` expired.
+    The no-TTS gate is therefore role-independent: a result identity is
+    terminal before admission too, allocating no token and arming no timer.
+    """
+    coordinator, _clock = make_coordinator(tts_available=False)
+
+    disposition = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+
+    from server.speech_lifecycle import PreAdmissionTerminalReason
+
+    assert getattr(disposition, "reason", None) == PreAdmissionTerminalReason.NO_TTS
+    assert coordinator.occupied is False
+    assert coordinator._timer_handles == {}
+
+
+def test_pre_admission_disposition_still_admits_a_result_when_transport_is_unacceptable() -> None:
+    """The transport-acceptance gate stays ack-specific: a result identity
+    keeps admitting and terminalizes through the normal delivery path, so
+    only the structurally impossible no-TTS case is short-circuited."""
+    coordinator, _clock = make_coordinator(transport_acceptance=lambda: False)
+
+    disposition = coordinator.pre_admission_disposition(identity("work-1", "utt-1"))
+
+    assert isinstance(disposition, PreAdmissionAdmit)
+    assert coordinator.occupied is True
+
+
+def test_release_generation_records_an_explicit_completed_disposition() -> None:
+    """M1: a clean delivery must not be recorded as DELIVERY_UNKNOWN in the
+    coordinator's own terminal ledger."""
+
+    async def body() -> None:
+        terminal_calls: list[DeliveryDisposition] = []
+
+        def on_terminal(token, identity_, disposition) -> None:
+            terminal_calls.append(disposition)
+
+        coordinator, _clock = make_coordinator(on_terminal=on_terminal)
+        generation = admit_and_hand_to_tts(coordinator, "work-1", "utt-1")
+
+        coordinator.release_generation(
+            generation.token, disposition=DeliveryDisposition.DELIVERY_COMPLETED
+        )
+        await asyncio.sleep(0)
+
+        assert generation.disposition == DeliveryDisposition.DELIVERY_COMPLETED
+        assert terminal_calls == [DeliveryDisposition.DELIVERY_COMPLETED]
+        assert coordinator.occupied is False
+
+    run(body)
+
+
+def test_coordinator_constructed_with_no_tts_never_arms_the_start_timeout() -> None:
+    """Plan: 'start/grace timers must never arm for a generation that
+    terminalizes via pre_admission_disposition before any timer would be
+    scheduled.'"""
+    coordinator, _clock = make_coordinator(tts_available=False)
+    ack_identity = GenerationIdentity(
+        "ack-turn-1", "ack-turn-1", role="ack", turn_id="turn-1", ack_id="ack-turn-1"
+    )
+
+    coordinator.pre_admission_disposition(ack_identity)
+
+    assert coordinator._timer_handles == {}
+
+
+def test_dispatch_callbacks_are_no_ops_when_constructed_without_tts() -> None:
+    """Plan: 'each becomes a no-op (or receives a null-transport adapter)
+    when no TTS/transport lane exists.' Constructing the coordinator with no
+    TTS must not itself raise, and it must not have armed any live
+    generation for a normal-path dispatch_cleanup/dispatch_teardown call."""
+    coordinator, _clock = make_coordinator(tts_available=False)
+
+    assert coordinator.occupied is False
+
+
+# --- Phase 3: SnapshotBarrierFlushFrame registration and shape ------------
+
+
+def test_snapshot_barrier_flush_frame_is_registered_in_connection_local_frames() -> None:
+    """It must never cross a bus bridge -- BusBridgeProcessor forwards a
+    frame locally only if its type is listed in CONNECTION_LOCAL_FRAMES."""
+    assert SnapshotBarrierFlushFrame in CONNECTION_LOCAL_FRAMES
+
+
+def test_snapshot_barrier_flush_frame_carries_only_token_and_acknowledge_handle() -> None:
+    frame = SnapshotBarrierFlushFrame(token="connection-generation-1", acknowledge=lambda: None)
+
+    assert frame.token == "connection-generation-1"
+    assert callable(frame.acknowledge)
+
+
+def test_snapshot_barrier_flush_frame_defaults_are_empty_token_and_no_handle() -> None:
+    frame = SnapshotBarrierFlushFrame()
+
+    assert frame.token == ""
+    assert frame.acknowledge is None
+
+
+def test_schedule_retains_a_strong_reference_to_every_in_flight_transition() -> None:
+    """Regression (#10): ``_schedule`` was a staticmethod that returned
+    ``asyncio.ensure_future(...)`` and kept no reference. Three of its five
+    call sites discard the returned future entirely (``record_interruption``'s
+    uncontexted-generation branch, ``release_generation``'s notify path, and
+    the timer arm). CPython's event loop holds only a weak reference to a
+    running task, so an unreferenced transition suspended at an await can be
+    collected and silently never finish -- leaving the transport slot never
+    freed (``_terminalize_state`` never runs) and ``on_terminal``'s queue
+    re-probe never fired, stalling the scheduler for the rest of the
+    connection. Every sibling in this codebase (``SpeechScheduler``'s
+    ``_advance_tasks``, ``TurnAckLedger._ack_admission_tasks``,
+    ``RuntimeObserver._emit_tasks``) already retains its tasks this way.
+    """
+
+    async def run() -> None:
+        coordinator, _clock = make_coordinator()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_transition() -> None:
+            started.set()
+            await release.wait()
+
+        future = coordinator._schedule(slow_transition())
+        await started.wait()
+
+        assert future in coordinator._transition_tasks
+        # The set is the only strong reference: dropping the local one must
+        # not make the transition collectable.
+        del future
+        assert len(coordinator._transition_tasks) == 1
+
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # The done-callback drains the set, so retention is bounded by
+        # in-flight transitions, not by connection lifetime.
+        assert coordinator._transition_tasks == set()
+
+    asyncio.run(run())
+
+
+def test_schedule_without_a_running_loop_still_closes_the_coroutine() -> None:
+    """The no-event-loop branch must stay a clean no-op: it returns ``None``
+    and leaves nothing retained."""
+    coordinator, _clock = make_coordinator()
+
+    async def never_runs() -> None:  # pragma: no cover - deliberately not awaited
+        return None
+
+    assert coordinator._schedule(never_runs()) is None
+    assert coordinator._transition_tasks == set()
+
+
+def test_connection_closed_cancels_and_clears_in_flight_transitions() -> None:
+    """Regression (Round 9, #17): round 8 added ``_transition_tasks`` and
+    documented it as mirroring ``SpeechScheduler._advance_tasks``, but
+    ``connection_closed()`` cleared every other connection-scoped container
+    (``_timer_handles``, ``_context_tokens``, ``_context_tombstones``,
+    ``_generations``, ``_slot_token``) and left this one untouched.
+
+    It is the only container holding *running* work, so the omission was the
+    consequential one: an in-flight transition survived the close, kept the
+    coordinator reachable, and resumed against the wiped state. The sibling it
+    claims to mirror cancels its tasks on teardown.
+    """
+
+    async def run() -> None:
+        coordinator, _clock = make_coordinator()
+        started = asyncio.Event()
+        resumed: list[str] = []
+
+        async def slow_transition() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise
+            resumed.append("ran-past-close")
+
+        future = coordinator._schedule(slow_transition())
+        assert future is not None
+        await started.wait()
+        assert future in coordinator._transition_tasks
+
+        coordinator.connection_closed()
+
+        assert coordinator._transition_tasks == set()
+        await asyncio.sleep(0)
+        assert future.cancelled()
+        assert resumed == []
+
+    asyncio.run(run())
+
+
+def test_event_loop_scheduler_reads_its_delay_off_the_injected_clock() -> None:
+    """Regression (Round 10, #20): ``EventLoopTimerScheduler.call_at`` computed
+    its wall delay against ``time.monotonic()`` while every deadline handed to
+    it comes from the coordinator's injectable ``Clock``.
+
+    The two only share a time base when the injected clock *is* a
+    ``MonotonicClock``. A fake clock starting near zero made ``when -
+    time.monotonic()`` hugely negative, ``max(0.0, ...)`` clamped it to a zero
+    delay, and every timer fired on the next loop tick -- so a coordinator
+    built with a fake clock but the default scheduler had no working timeouts
+    at all.
+    """
+
+    async def run() -> None:
+        clock = ManualTimerScheduler(start=0.0)
+        scheduler = EventLoopTimerScheduler(clock)
+        fired: list[str] = []
+
+        # Ten seconds out on the injected clock, which has not advanced.
+        scheduler.call_at(clock.now() + 10.0, lambda: fired.append("early"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert fired == []
+
+    asyncio.run(run())
+
+
+def test_coordinator_default_scheduler_shares_the_injected_clock() -> None:
+    """Companion to #20: the coordinator must hand its own clock to the
+    scheduler it constructs by default, or the two desynchronise exactly as
+    above the moment a caller injects a clock without also injecting timers."""
+    clock = ManualTimerScheduler(start=0.0)
+    coordinator = SpeechLifecycleCoordinator(clock=clock)
+
+    assert isinstance(coordinator._timers, EventLoopTimerScheduler)
+    assert coordinator._timers._clock is clock
+
+
+def test_mark_handed_to_tts_refuses_a_tombstoned_generation() -> None:
+    """Regression (Round 10, #21): ``mark_handed_to_tts`` did not reject a
+    tombstoned generation, unlike its sibling transitions.
+
+    On the race where a cancel tombstones the generation between admission and
+    the TTS hand-off, it advanced the phase anyway and armed the ten-second
+    start timeout -- holding the global transport slot for ten seconds instead
+    of the one-second transport grace the teardown path uses, roughly a
+    tenfold extension of slot occupancy.
+    """
+
+    async def run() -> None:
+        coordinator, clock = make_coordinator(auto_ack_cleanup=False)
+        generation = coordinator.try_admit(identity())
+        assert generation is not None
+
+        coordinator.record_interruption(generation.token)
+        assert coordinator.generation_for_token(generation.token).tombstoned
+
+        coordinator.mark_handed_to_tts(generation.token)
+
+        assert coordinator.generation_for_token(generation.token).phase != (
+            GenerationPhase.HANDED_TO_TTS
+        )
+        # No ten-second start timeout was armed on top of the cleanup deadline:
+        # the slot resolves on the one-second grace, not at t=10.
+        await tick(clock, 1.0)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not coordinator.occupied
+
+    asyncio.run(run())

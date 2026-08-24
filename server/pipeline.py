@@ -6,24 +6,28 @@ import asyncio
 import inspect
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
-from uuid import uuid4
 
 from loguru import logger
 from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
-from .config import Config
+from .config import Config, FeaturePolicy, PromotionManifest
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     GroundedResult,
     RoutingDecision,
     RoutingState,
+    SnapshotHandshake,
+    TerminalReason,
     TranscriptEntry,
-    WorkerState,
+    WorkStatusState,
 )
+from .frames import CONNECTION_LOCAL_FRAMES
+from .handshake_gate import HandshakeGate
 from .observers import RuntimeObserver
 from .perf_metrics import (
     AppTurnRecorder,
@@ -31,6 +35,7 @@ from .perf_metrics import (
     ConsoleMeasurementSink,
     ControlAction,
     ControlOutcome,
+    LateDeliveryDisposition,
     MeasurementSink,
     RetainedRecorder,
     SpeechOutcome,
@@ -38,30 +43,51 @@ from .perf_metrics import (
     WorkItemRecorder,
     WorkOutcome,
 )
+from .recorder_factory import RecorderFactory, make_late_terminal_handler
 from .registry import UnsupportedWorkerType, WorkerRegistry
 from .results import canonical_result
 from .router import RoutingValidationError
 from .rtvi_messages import RTVIMessage
+from .runner_supervisor import RunnerSupervisor
 from .session_state import SessionState
 from .speech_lifecycle import (
-    CONNECTION_LOCAL_FRAMES,
     DeliveryDisposition,
     EventLoopTimerScheduler,
     GenerationIdentity,
     MonotonicClock,
+    PreAdmissionTerminalReason,
     SpeechGenerationFlushAckFrame,
     SpeechGenerationMarkerFrame,
     SpeechLifecycleCoordinator,
 )
 from .speech_scheduler import (
+    ROLE_ACK,
     ROLE_RESULT,
     ROLE_TIMEOUT_NOTICE,
+    SpeechItem,
     SpeechRole,
     SpeechScheduler,
-    UtteranceLease,
 )
-from .work_item_coordinator import FAILURE_KINDS, LateResult, WorkItemFailure
-from .workers.web_search import ClarificationContext, WorkerClarify, WorkerDeclined
+from .turn_ack_ledger import TurnAckLedger
+from .work_item_coordinator import (
+    FAILURE_KINDS,
+    Coordinator,
+    CoordinatorView,
+    LateResult,
+    WorkItemFailure,
+    coordinator_view,
+)
+from .work_status_publisher import (
+    WorkStatusPublisher,
+    child_work_status_after_dispatch,
+    late_commit_work_status,
+    work_status_after_commit_failure,
+    work_status_for_outcome,
+)
+from .work_task_ledger import WorkTaskLedger
+from .worker_projection import WorkerProjection
+from .workers.base import ClarificationContext
+from .workers.web_search import WorkerClarify, WorkerDeclined
 
 
 class _FallbackBridge:
@@ -112,14 +138,25 @@ they are separate tables so neither key type has to widen to ``str | None``.
 """
 
 
+def resolve_bus(preferred: Any = None) -> Any:
+    """Return ``preferred`` if given, else the dependency-free probe bus (or ``None``).
+
+    Public seam for callers (e.g. ``server.app``) that need a bus and would
+    otherwise have to reach into the leading-underscore ``_ProbeBus`` name
+    directly. ``_ProbeBus`` stays private; this is the sanctioned entry point.
+    """
+    if preferred is not None:
+        return preferred
+    return _ProbeBus() if _ProbeBus is not None else None
+
+
 def framework_bridge(*, bus: Any, worker_name: str, **kwargs: Any) -> Any:
     """Construct the pinned framework bridge with connection-local output frames."""
     if getattr(BusBridgeProcessor, "framework_fallback", False):
         return _FallbackBridge()
     excluded = kwargs.pop("exclude_frames", ())
     # The authoritative set of connection-local frame types lives in
-    # CONNECTION_LOCAL_FRAMES (server/speech_lifecycle.py); extend it there,
-    # not here.
+    # CONNECTION_LOCAL_FRAMES (server/frames.py); extend it there, not here.
     kwargs["exclude_frames"] = tuple(dict.fromkeys((*CONNECTION_LOCAL_FRAMES, *excluded)))
     return BusBridgeProcessor(bus=bus, worker_name=worker_name, **kwargs)
 
@@ -131,19 +168,34 @@ def _contract_bridge() -> Any:
     )
 
 
-try:
-    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-except ImportError:  # pragma: no cover - dependency-free contract fallback
-    FrameProcessor = object  # type: ignore[assignment,misc]
-    FrameDirection = Any  # type: ignore[misc,assignment]
-
-
 class CanonicalResultAdapter(FrameProcessor):
     """Gate result envelopes without interrupting Pipecat frame lifecycles."""
 
-    def __init__(self) -> None:
+    def __init__(self, supports_work_status: Callable[[], bool] | None = None) -> None:
+        """``supports_work_status`` is this connection's work_status_v1
+        entitlement, read at frame time.
+
+        The adapter is constructed once per connection (``app.py``'s
+        ``_attach_connection``), so it can hold the connection's own
+        entitlement thunk -- the same narrow-callable pattern the SessionHost
+        slices use. Without it the re-serialization gate below had to
+        reconstruct the entitlement by sniffing whether ``work_status`` was
+        present in the already-serialized inbound payload: a third derivation
+        of a decision ``server/contracts.py`` documents as living in exactly
+        one predicate (``resolve_work_status_wire_presence``, whose sole
+        caller is ``RuntimeObserver.supports_work_status`` by design), plus a
+        bare ``True`` fallback for any non-dict payload (round-5 restart,
+        Architecture Important).
+
+        ``None`` is for the connection-less constructions -- ``LabPipeline``'s
+        contract-test pipeline and the direct unit-test constructions -- which
+        have no connection to ask. Those fall back to mirroring the inbound
+        payload's own wire presence, which is what the entitlement produced
+        upstream anyway; see ``process_frame``.
+        """
         if FrameProcessor is not object:
             super().__init__()
+        self._supports_work_status = supports_work_status
 
     @staticmethod
     def _normalized_result(frame: Any) -> dict[str, Any] | None:
@@ -207,7 +259,39 @@ class CanonicalResultAdapter(FrameProcessor):
         if not self.accepts(frame):
             return
         if isinstance(frame, RTVIServerMessageFrame):
-            frame.data = RTVIMessage.model_validate(data).model_dump(mode="json")
+            # Re-serialize through ``RTVIMessage.wire_payload``, not
+            # ``model_dump``: a runtime-snapshot envelope whose payload
+            # deliberately omitted ``work_status`` (a connection that never
+            # negotiated ``work_status_v1`` -- see
+            # ``RuntimeSnapshot.wire_payload``) would otherwise have the
+            # field re-materialized here at its ``[]`` model default, and the
+            # pinned pre-Phase-3 runtime-snapshot schema is
+            # ``additionalProperties: false``, so a legacy client rejects the
+            # frame. Wire presence on the way out mirrors wire presence on the
+            # way in; this adapter normalizes envelopes, it does not decide
+            # capability projection.
+            #
+            # When this adapter was given its connection's entitlement thunk
+            # (the real ``app.py`` path), ask that authority rather than
+            # re-deriving the same boolean from wire bytes. The two agree by
+            # construction -- the payload lacks the key precisely because the
+            # entitlement was false upstream -- but only one of them is the
+            # documented single predicate.
+            if self._supports_work_status is not None:
+                include_work_status = self._supports_work_status()
+            else:
+                # No connection to ask (LabPipeline / unit-test constructions):
+                # mirror the payload's own wire presence. A non-dict payload
+                # is never a RuntimeSnapshot, so ``wire_payload`` ignores this
+                # value entirely for it; ``False`` keeps the no-authority
+                # default from being the one that can re-materialize a field.
+                inbound_payload = data.get("data")
+                include_work_status = (
+                    "work_status" in inbound_payload if isinstance(inbound_payload, dict) else False
+                )
+            frame.data = RTVIMessage.model_validate(data).wire_payload(
+                include_work_status=include_work_status
+            )
         if isinstance(getattr(frame, "data", frame), dict) and (
             getattr(frame, "data", frame).get("kind") == "canonical_result"
             or all(
@@ -283,18 +367,55 @@ class ConnectionPipeline:
     on_transcript: Callable[[str], Any] | None = None
     active: bool = True
 
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Normalized capability set bound immutably to this connection's
+        promoted epoch (Phase 3).
+
+        Read straight off the ``RuntimeObserver`` constructed from the
+        promoted ``Connection``'s set, so entitlement lives in exactly one
+        place: a mirrored copy here could drift from the set the observer
+        actually filters with.
+        """
+        return self.observer.capabilities
+
+    @property
+    def supports_work_status(self) -> bool:
+        """Whether this connection negotiated the ``work_status_v1`` capability.
+
+        Delegates to the ``RuntimeObserver`` rather than testing
+        ``capabilities`` directly, so the single capability-gate predicate in
+        ``resolve_work_status_wire_presence`` stays the sole arbiter of
+        entitlement (Phase 3).
+        """
+        return self.observer.supports_work_status
+
     def deactivate(self, *, reconnect: bool = True) -> None:
         self.active = False
-        self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect)
+        # full_stop=True: deactivate() always means this connection is being
+        # retired for good (shutdown or reconnect-promotion), so its queued
+        # and paused speech items must be swept regardless of `reconnect`'s
+        # value -- not just on a genuine reconnect (server/speech_scheduler.py
+        # SpeechScheduler.interrupt docstring).
+        self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect, full_stop=True)
 
-    async def shutdown(self, *, reason: str = "connection replaced") -> None:
+    async def shutdown(self, *, reason: str = "connection replaced", reconnect: bool) -> None:
         """Fence this connection and stop its Pipecat worker, if attached.
 
         Always forces scheduler cleanup, even if something upstream (e.g. a
         failed output teardown) already set ``active = False`` directly
         without releasing the scheduler's active lease.
+
+        ``reconnect`` is an explicit, caller-supplied classification -- not
+        inferred from ``reason``. ``reason`` is a free-text diagnostic string
+        with no stable set of reconnect-implying values (e.g. "connection
+        replaced during setup" is just as much a reconnect as "connection
+        replaced", but would not match an exact-string check); inferring
+        ``reconnect`` from it silently mis-classifies any call site whose
+        wording doesn't match exactly, dropping a still-active utterance's
+        origin-epoch fencing (see ``SpeechScheduler.interrupt``).
         """
-        self.deactivate(reconnect=reason == "connection replaced")
+        self.deactivate(reconnect=reconnect)
         if self.worker is not None:
             cancel = getattr(self.worker, "cancel", None)
             if cancel is not None:
@@ -330,6 +451,75 @@ class ConnectionPipeline:
 
 SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "retention_rejected"]
 
+# Every degraded/placeholder response `text=` this module ever sends --
+# routing unavailable, worker search unavailable, no-reliable-result, plus
+# the busy/incomplete/unsupported-capability variants below -- hoisted to
+# named constants (referenced at every `text=` call site below) so
+# scripts/eval_common.py's SAFE_FALLBACKS guard (used by the eval-suite
+# runner and the live smoke CLI to detect a host that silently fell back
+# instead of producing a real result) can import SAFE_FALLBACK_TEXTS instead
+# of hand-duplicating the literals. A wording change here now updates that
+# guard automatically instead of silently turning it into a no-op false PASS.
+_ROUTING_UNAVAILABLE_TEXT = "Routing is temporarily unavailable. Please try that request again."
+_SEARCH_UNAVAILABLE_TEXT = "The web search is temporarily unavailable."
+_NO_RELIABLE_RESULT_TEXT = "I could not find a reliable result for that request."
+_SEARCH_BUSY_TEXT = "The search service is busy; please try again shortly."
+_PENDING_REQUEST_INCOMPLETE_TEXT = "The pending web request could not be completed."
+_CAPABILITY_UNAVAILABLE_TEXT = "I cannot access that capability here."
+SAFE_FALLBACK_TEXTS = frozenset(
+    {
+        _ROUTING_UNAVAILABLE_TEXT,
+        _SEARCH_UNAVAILABLE_TEXT,
+        _NO_RELIABLE_RESULT_TEXT,
+        _SEARCH_BUSY_TEXT,
+        _PENDING_REQUEST_INCOMPLETE_TEXT,
+        _CAPABILITY_UNAVAILABLE_TEXT,
+    }
+)
+
+# The foreground-search-timeout placeholder is deliberately kept OUT of
+# SAFE_FALLBACK_TEXTS and given its own frozenset: unlike the
+# SAFE_FALLBACK_TEXTS members above (routing/worker infrastructure genuinely
+# unavailable), this text means a candidate's search was *still running* when
+# the foreground budget elapsed -- a distinct failure mode ("too slow", not
+# "broken") that a caller scoring latency/timeout separately from
+# infrastructure availability needs to tell apart. See
+# scripts/eval_model_comparison.py's run_cell(), which maps this to a
+# "timeout" TurnOutcome rather than "provider-error".
+_FOREGROUND_TIMEOUT_TEXT = "That is taking longer than expected; I will continue in the background."
+TIMEOUT_FALLBACK_TEXTS = frozenset({_FOREGROUND_TIMEOUT_TEXT})
+
+
+def multi_intent_item_turn_id(turn_id: str, index: int) -> str:
+    """The per-item turn/work-item id ``_handle_multi_intent`` mints for a
+    compound turn's ``index``-th work item: ``f"{turn_id}-{index}"``.
+
+    A thin, deliberately trivial wrapper -- its value is being the one
+    callable name both a producer (this module's own ``_handle_multi_intent``,
+    which is free to keep using the raw f-string at its ~12 call sites since
+    it's the one minting the convention) and a consumer that has to *parse*
+    the convention back out (``scripts/eval_model_comparison.py``'s
+    multi-intent-item classification) can reference, so a future format
+    change has exactly one round-trip pair to keep in sync (round 9 gauntlet,
+    Architecture lens finding 14).
+    """
+    return f"{turn_id}-{index}"
+
+
+def split_multi_intent_turn_id(candidate_turn_id: str) -> tuple[str, int] | None:
+    """Inverse of :func:`multi_intent_item_turn_id`.
+
+    Returns ``(parent_turn_id, index)`` if ``candidate_turn_id`` has the
+    ``f"{parent}-{index}"`` shape (a non-empty prefix, a literal ``-``, and a
+    digit-only suffix), else ``None``. Only confirms the *shape* -- callers
+    that need to confirm the parent turn actually exists (e.g. by checking
+    for a correlated metric record) still do that themselves.
+    """
+    base, sep, suffix = candidate_turn_id.rpartition("-")
+    if not sep or not base or not suffix.isdigit():
+        return None
+    return base, int(suffix)
+
 
 @dataclass(frozen=True)
 class SearchExecution:
@@ -339,10 +529,70 @@ class SearchExecution:
     result: GroundedResult | None = None
 
 
+@dataclass(frozen=True)
+class LateDeliveryContext:
+    """Immutable identity captured at late-task dispatch, consumed at commit.
+
+    Retained across the coordinator's ``on_complete`` closure boundary
+    (``retain_late_task``'s callback is already a caller-supplied closure --
+    see ``WorkItemCoordinator.retain_late_task``/``:_search_with_timeout`` --
+    so this rides that existing closure rather than adding a parameter to
+    the coordinator's callback contract). ``accepted_turn_sequence`` is
+    ``SessionHost._turn_sequence`` as observed at dispatch time; comparing it
+    against the live counter at commit time is how ``commit_late_result_once``
+    detects that a newer semantic turn has since been accepted.
+    """
+
+    turn_id: str
+    work_item_id: str
+    origin_epoch: int
+    ack_timestamp: float | None
+    accepted_turn_sequence: int
+    # The turn-level parent work item for a multi-intent child, so a late
+    # child's work_status keys off the same WorkStatusKey as its siblings
+    # (SessionState.set_child_work_status falls back to work_item_id when
+    # this is None, which is correct for a single-intent turn where the
+    # dispatched work item *is* the parent).
+    parent_work_item_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DelegationRequest:
+    """Input to ``SessionHost._begin_delegation``.
+
+    ``worker_id_override`` and ``parent_work_item_id`` are unused by the
+    single-intent call site (``_handle_transcript_impl``) but are defined
+    now so the pending-dialogue and multi-intent call sites can adopt the
+    same shared surface in later steps without changing it again.
+    """
+
+    turn_id: str
+    work_item_id: str
+    worker: Any
+    origin_epoch: int
+    worker_id_override: str | None = None
+    parent_work_item_id: str | None = None
+
+
+@dataclass
+class DelegatedChild:
+    """A work item that has been fully set up for delegation.
+
+    Returned by ``SessionHost._begin_delegation`` once a worker and its
+    search callable are confirmed present, the child recorder is created,
+    and the item is registered as both a known work item and a member of
+    its owning turn -- all before any ack for it is admitted.
+    """
+
+    work_item_id: str
+    worker_id: str
+    search: Callable[..., Any]
+    child: WorkItemRecorder
+    retained_recorder: RetainedRecorder | None = None
+
+
 class SessionHost:
     """Process-lifetime host; persistent workers outlive connection pipelines."""
-
-    _MAX_HANDSHAKE_TOKENS = 32
 
     def __init__(
         self,
@@ -350,40 +600,98 @@ class SessionHost:
         runner_factory: Callable[[], Any] | None = None,
         stt: Any | None = None,
         tts: Any | None = None,
-        coordinator: Any | None = None,
+        coordinator: Coordinator | None = None,
         *,
         measurement_sink: MeasurementSink | None = None,
+        config: Config | None = None,
+        feature_policy: FeaturePolicy | None = None,
+        promotion_manifest: PromotionManifest | None = None,
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
-        coordinator_registry = getattr(coordinator, "registry", None)
+        # Assigned this early (well before the rest of __init__'s other
+        # attributes) so ``self._coordinator_view`` below -- and every other
+        # site in this class -- can read ``self.coordinator`` uniformly, in
+        # particular ``registry``/``config`` resolution just below, which
+        # needs it during construction itself.
+        self.coordinator = coordinator
+        coordinator_registry = self._coordinator_view.registry
         if registry is None and coordinator_registry is not None:
             registry = coordinator_registry
-        self.registry = registry or WorkerRegistry()
+        # The fallback registry is built from the caller's own Config, not a
+        # default one: constructing WorkerRegistry() here and then comparing
+        # its default Config against ``config`` below rejected every
+        # non-default config as "conflicting" with a registry this
+        # constructor had just invented.
+        self.registry = registry or WorkerRegistry(config=config)
         if coordinator_registry is not None and coordinator_registry is not self.registry:
             raise ValueError("SessionHost and coordinator must share one WorkerRegistry")
-        self.runner_factory = runner_factory
+        registry_config = getattr(self.registry, "config", None)
+        if config is not None and registry_config is not None and registry_config != config:
+            raise ValueError("SessionHost config conflicts with the registry's Config")
+        self.config = config or registry_config or Config()
+        # The coordinator is the other config holder in this object graph; a
+        # divergent one is a split-brain, since the host reads every switch
+        # (timeouts included) off ``self.config``. Fail fast at construction
+        # rather than letting two Configs drive one session. The coordinator's
+        # own constructor is allowed to override a declared set of fields onto
+        # whatever Config it was given, so those coordinator-owned fields are
+        # excluded from this comparison; every other field must still match.
+        # The set is read from the coordinator itself (falling back to
+        # WorkItemCoordinator's declaration for duck-typed test coordinators
+        # that construct without declaring the Coordinator Protocol's
+        # required OWNED_CONFIG_FIELDS ClassVar, resolved above onto
+        # ``self._coordinator_view``) rather than re-listed here, so adding
+        # or removing a coordinator-owned field cannot silently turn every
+        # construction into a boot-time ValueError raised from the wrong
+        # component.
+        coordinator_config = self._coordinator_view.config
+        if coordinator_config is not None:
+            owned_fields = self._coordinator_view.OWNED_CONFIG_FIELDS
+            comparable_coordinator_config = replace(
+                coordinator_config,
+                **{field_name: getattr(self.config, field_name) for field_name in owned_fields},
+            )
+            if comparable_coordinator_config != self.config:
+                raise ValueError("SessionHost config conflicts with the coordinator's Config")
+        self.feature_policy = feature_policy or FeaturePolicy.from_config(self.config)
+        # ``feature_policy`` goes in as a thunk, not the object: it is a frozen
+        # dataclass this host replaces wholesale, so a snapshot taken here
+        # would diverge from what TurnAckLedger (below) enforces the moment a
+        # kill switch is flipped after construction.
+        self._work_status_publisher = WorkStatusPublisher(
+            state=self.state, feature_policy=lambda: self.feature_policy
+        )
+        # The immutable evidence-gate verdict handed in by _default_session_host
+        # (via server.config.load_promotion_manifest); missing/None is treated
+        # exactly like a manifest that failed to load -- fail-closed to
+        # display-only, never a boot-time error.
+        self._promotion_manifest = promotion_manifest
+        self._promotion_eligible: bool = bool(
+            promotion_manifest is not None and promotion_manifest.promotion_eligible
+        )
+        self._runner_supervisor = RunnerSupervisor(runner_factory=runner_factory)
         self.stt, self.tts = stt, tts
-        self.coordinator = coordinator
         self._tts_on_event = getattr(tts, "on_event", None)
-        self.runner: Any = None
-        self._runner_handles: dict[str, Any] = {}
-        self._runner_registered: set[str] = set()
-        self._runner_registrations: dict[str, asyncio.Task[None]] = {}
-        self._runner_task: asyncio.Task[Any] | None = None
         self.connection: ConnectionPipeline | None = None
         self._background_shutdowns: set[asyncio.Task[None]] = set()
-        self._handshake_tokens: dict[str, tuple[int, float, bool]] = {}
-        self._turn_sequence = 0
-        self._inflight_turn_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._inflight_work_tasks: dict[str, set[asyncio.Task[Any]]] = {}
-        self._known_work_items: set[str] = set()
-        self._cancelled_work_items: set[str] = set()
-        self._clarification_candidates: dict[str, dict[str, str]] = {}
-        self._retained_recorders: dict[str, RetainedRecorder] = {}
+        self._handshake_gate = HandshakeGate()
+        self._work_ledger = WorkTaskLedger()
+        self._worker_projection = WorkerProjection(state=self.state)
         self._measurement_sink: MeasurementSink = measurement_sink or ConsoleMeasurementSink()
+        self._recorder_factory = RecorderFactory(sink=self._measurement_sink, state=self.state)
         self._closing = False
         self.started = False
+        # Turn-ack latch, turn-work-item registry, turn-id sequence, and the
+        # ack-admission retry chain -- see server/turn_ack_ledger.py. Reads
+        # the live connection/acceptance through callables since both are
+        # swapped out from under this ledger on every reconnect/promotion.
+        self._turn_ack_ledger = TurnAckLedger(
+            feature_policy=lambda: self.feature_policy,
+            early_ack_text=lambda: self.config.early_ack_text,
+            connection=lambda: self.connection,
+            accepts=self.accepts,
+        )
 
     @property
     def measurement_sink(self) -> MeasurementSink:
@@ -394,77 +702,66 @@ class SessionHost:
         """
         return self._measurement_sink
 
+    # ------------------------------------------------------------------
+    # Forwarders onto the extracted collaborators.
+    #
+    # The RunnerSupervisor/HandshakeGate extractions moved the state, not the
+    # public surface: ``runner``, ``runner_factory``,
+    # ``validate_handshake_token`` and ``validate_patch_handshake`` were part
+    # of SessionHost's API before the extraction and out-of-package callers
+    # (``server/app.py``) use them. Keeping them here as thin forwarders --
+    # the same strategy every other extraction on this branch used -- is what
+    # stops app.py from doing a two-level private reach-through
+    # (``host._runner_supervisor.runner``) into a collaborator that is an
+    # implementation detail of this class.
+    # ------------------------------------------------------------------
+
+    @property
+    def runner(self) -> Any:
+        return self._runner_supervisor.runner
+
+    @runner.setter
+    def runner(self, value: Any) -> None:
+        self._runner_supervisor.runner = value
+
+    @property
+    def runner_factory(self) -> Callable[[], Any] | None:
+        return self._runner_supervisor.runner_factory
+
+    @runner_factory.setter
+    def runner_factory(self, value: Callable[[], Any] | None) -> None:
+        self._runner_supervisor.runner_factory = value
+
+    def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
+        return self._handshake_gate.validate_handshake_token(token, proposed_epoch, redeem=redeem)
+
+    def validate_patch_handshake(self, handshake: SnapshotHandshake) -> None:
+        """Validate `handshake` against *this host's own* bound connection.
+
+        Takes only the handshake (round-3 restart gauntlet, Architecture
+        finding). It used to take the connection too, so the sole production
+        caller read `session_host.validate_patch_handshake(
+        session_host.connection, handshake)` -- handing the host back a piece
+        of its own state for it to forward on. The parameter existed because
+        ``HandshakeGate`` is deliberately state-free, but that is the gate's
+        constraint, not the host's: the host owns ``self.connection``
+        (see ``__init__``), so it is the one object that never needs to be
+        told which connection it is validating for.
+
+        ``HandshakeGate.validate_patch_handshake`` keeps its two-argument
+        signature -- the arbiter-level tests validate a *promoted*
+        ``Connection`` that is not the host's bound one, and go through the
+        gate directly for exactly that reason.
+        """
+        self._handshake_gate.validate_patch_handshake(self.connection, handshake)
+
     async def start(self) -> None:
         if self.started:
             return
         self._closing = False
-        if self.runner_factory is not None:
-            self.runner = self.runner_factory()
-        else:
-            from pipecat.pipeline.runner import WorkerRunner
-
-            self.runner = WorkerRunner(name="websearch-session", handle_sigint=False)
-        await self._register_persistent_workers()
-        start = getattr(self.runner, "start", None)
-        if start is not None:
-            result = start()
-            if hasattr(result, "__await__"):
-                await result
-        else:
-            run = getattr(self.runner, "run", None)
-            if run is not None:
-                self._runner_task = asyncio.create_task(run(auto_end=False))
+        await self._runner_supervisor.start(lambda: self.registry.workers)
         self.state.active_epoch = None
         self.started = True
-
-    async def _register_persistent_workers(self) -> None:
-        """Register durable contexts with the runner when the API can accept them.
-
-        Pipecat 1.6.0 does not expose the planned ``LLMContextWorker`` module;
-        the lab's ContextWorker uses the pinned BaseWorker bus lifecycle instead.
-        Test registries and runners without ``add_workers`` are left untouched.
-        """
-        add_workers = getattr(self.runner, "add_workers", None)
-        if add_workers is None:
-            return
-        try:
-            from pipecat.workers.base_worker import BaseWorker
-        except ImportError:
-            return
-
-        for registered in self.registry.workers:
-            if isinstance(registered.worker, BaseWorker):
-                await self._register_runner_worker(registered.worker)
-
-    async def _register_runner_worker(self, worker: Any) -> None:
-        metadata = getattr(worker, "metadata", None)
-        worker_id = getattr(metadata, "worker_id", None) or getattr(worker, "name", None)
-        if not isinstance(worker_id, str) or not worker_id:
-            return
-        if worker_id in self._runner_registered:
-            return
-        add_workers = getattr(self.runner, "add_workers", None)
-        if add_workers is None:
-            return
-        registration = self._runner_registrations.get(worker_id)
-        if registration is None:
-
-            async def register() -> None:
-                result = add_workers(worker)
-                if inspect.isawaitable(result):
-                    await result
-                self._runner_handles[worker_id] = worker
-                self._runner_registered.add(worker_id)
-
-            registration = asyncio.create_task(register())
-            self._runner_registrations[worker_id] = registration
-
-            def completed(completed_task: asyncio.Task[Any]) -> None:
-                if self._runner_registrations.get(worker_id) is completed_task:
-                    self._runner_registrations.pop(worker_id, None)
-
-            registration.add_done_callback(completed)
-        await asyncio.shield(registration)
 
     async def connect(self, handshake: Any) -> ConnectionPipeline:
         if self._closing:
@@ -530,9 +827,9 @@ class SessionHost:
                 await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
 
         def schedule_pipeline_shutdown(reason: str) -> None:
-            task = asyncio.create_task(pipeline.shutdown(reason=reason))
-            self._background_shutdowns.add(task)
-            task.add_done_callback(self._background_shutdowns.discard)
+            self.track_background_shutdown(
+                asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
+            )
 
         async def on_lifecycle_terminal(
             token: str, identity: GenerationIdentity, disposition: DeliveryDisposition
@@ -577,29 +874,35 @@ class SessionHost:
                 await pipeline.lifecycle.teardown_complete(token)
             schedule_pipeline_shutdown("speech output teardown")
 
-        connection_config = getattr(self.registry, "config", None) or Config()
-        lifecycle = (
-            SpeechLifecycleCoordinator(
-                clock=MonotonicClock(),
-                timers=EventLoopTimerScheduler(),
-                speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
-                speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
-                on_terminal=on_lifecycle_terminal,
-                dispatch_cleanup=dispatch_lifecycle_cleanup,
-                dispatch_teardown=dispatch_lifecycle_teardown,
-            )
-            if connection_tts is not None
-            else None
+        def transport_acceptable() -> bool:
+            return self.connection is pipeline and pipeline.active
+
+        connection_config = self.config
+        # Every connection constructs one SpeechLifecycleCoordinator,
+        # including when connection_tts is None: the no-TTS/unavailable-
+        # transport cases are decided by pre_admission_disposition() rather
+        # than by never constructing a coordinator at all.
+        lifecycle = SpeechLifecycleCoordinator(
+            clock=MonotonicClock(),
+            timers=EventLoopTimerScheduler(),
+            speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
+            speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
+            on_terminal=on_lifecycle_terminal,
+            dispatch_cleanup=dispatch_lifecycle_cleanup,
+            dispatch_teardown=dispatch_lifecycle_teardown,
+            tts_available=connection_tts is not None,
+            transport_acceptance=transport_acceptable,
         )
 
         pipeline = ConnectionPipeline(
             connection.epoch,
-            RuntimeObserver(self.state, connection.epoch),
+            RuntimeObserver(self.state, connection.epoch, frozenset(connection.capabilities)),
             SpeechScheduler(
                 self.state,
                 speak=queue_speech if connection_tts is not None else None,
                 stop=stop_speech if connection_tts is not None else None,
                 lifecycle=lifecycle,
+                on_ack_terminal=self.on_ack_terminal,
             ),
             lifecycle=lifecycle,
             stt=connection_stt,
@@ -623,7 +926,7 @@ class SessionHost:
                         callback_result = await callback_result
                 current = self.connection is pipeline and pipeline.active
                 has_lifecycle = pipeline.lifecycle is not None
-                if event == "synthesis_started":
+                if event == "synthesis_started" and current:
                     pipeline.scheduler.provider_started(context_id)
                 elif event == "synthesis_ended" and current:
                     pipeline.scheduler.provider_synthesis_ended(context_id)
@@ -663,10 +966,12 @@ class SessionHost:
         self.connection = pipeline
         if old_connection is not None:
             old_connection.deactivate()
-            task = asyncio.create_task(old_connection.shutdown(reason="connection replaced"))
-            self._background_shutdowns.add(task)
-            task.add_done_callback(self._background_shutdowns.discard)
-        await self._register_persistent_workers()
+            self.track_background_shutdown(
+                asyncio.create_task(
+                    old_connection.shutdown(reason="connection replaced", reconnect=True)
+                )
+            )
+        await self._runner_supervisor.register_persistent_workers(lambda: self.registry.workers)
         return pipeline
 
     @staticmethod
@@ -677,56 +982,11 @@ class SessionHost:
         return factory() if factory is not None else service
 
     def _next_turn_id(self) -> str:
-        self._turn_sequence += 1
-        return f"turn-{self._turn_sequence}"
+        return self._turn_ack_ledger.next_turn_id()
 
-    def _new_app_turn_recorder(self, *, origin_epoch: int, turn_id: str) -> AppTurnRecorder:
-        return AppTurnRecorder(
-            self.measurement_sink,
-            session_id=self.state.session_id,
-            origin_epoch=origin_epoch,
-            turn_id=turn_id,
-        )
-
-    def _new_retained_recorder(
-        self, *, origin_epoch: int, turn_id: str, work_item_id: str, app_worker_id: str
-    ) -> RetainedRecorder:
-        return RetainedRecorder(
-            self.measurement_sink,
-            session_id=self.state.session_id,
-            origin_epoch=origin_epoch,
-            turn_id=turn_id,
-            work_item_id=work_item_id,
-            app_worker_id=app_worker_id,
-        )
-
-    def _register_retained_recorder_if_open(
-        self, work_item_id: str, recorder: RetainedRecorder
-    ) -> None:
-        """Register a provisional retained recorder only if it has not already
-        raced to completion between dispatch and accepted retention."""
-        if not recorder.finalized:
-            self._retained_recorders[work_item_id] = recorder
-
-    @staticmethod
-    def _make_late_terminal_handler(
-        recorders: Mapping[str, RetainedRecorder],
-    ) -> Callable[[str, WorkOutcome], None]:
-        """Build a coordinator ``on_late_terminal`` callback that claims the
-        matching retained recorder, if any, for a late-completing work item.
-
-        Typed against the wider ``WorkOutcome`` rather than the coordinator's
-        narrower ``TerminalKind``: by contravariance this still satisfies the
-        coordinator's hook type, while remaining assignable wherever a full
-        work outcome (including ``invalid_result``) is claimed.
-        """
-
-        def on_late_terminal(item_id: str, terminal_kind: WorkOutcome) -> None:
-            recorder = recorders.get(item_id)
-            if recorder is not None:
-                recorder.claim(terminal_kind)
-
-        return on_late_terminal
+    @property
+    def _turn_sequence(self) -> int:
+        return self._turn_ack_ledger.turn_sequence
 
     @staticmethod
     def _failure_child_outcome(failure: WorkItemFailure) -> WorkItemOutcome:
@@ -752,34 +1012,334 @@ class SessionHost:
         )
         return "failed"
 
-    def validate_handshake_token(self, token: str, proposed_epoch: int, *, redeem: bool) -> bool:
-        self._prune_handshake_tokens()
-        entry = self._handshake_tokens.get(token)
-        if entry is None:
-            return False
-        epoch, expires_at, redeemed = entry
-        if expires_at <= time.monotonic() or epoch != proposed_epoch:
-            self._handshake_tokens.pop(token, None)
-            return False
-        if redeem:
-            if redeemed:
-                return False
-            self._handshake_tokens[token] = (epoch, expires_at, True)
-            return True
-        return redeemed
+    def track_background_shutdown(self, task: asyncio.Task[None]) -> asyncio.Task[None]:
+        """Retain a fire-and-forget connection-shutdown task until it finishes.
 
-    def abort_connection(self, pipeline: ConnectionPipeline) -> None:
-        """Fence a promoted connection whose transport setup did not complete."""
+        The single entry point for scheduling a shutdown nobody awaits
+        inline. Without a strong reference the task can be garbage collected
+        mid-flight (the loop holds only a weak one), and ``shutdown()`` has no
+        way to drain it -- ``SessionHost.shutdown`` awaits exactly this set.
+        Callers outside this module (``server/app.py``'s Small-WebRTC
+        worker-failure handler) route through here rather than reaching into
+        ``_background_shutdowns``.
+        """
+        self._background_shutdowns.add(task)
+        task.add_done_callback(self._background_shutdowns.discard)
+        return task
+
+    def abort_connection(self, pipeline: ConnectionPipeline, *, reconnect: bool = True) -> None:
+        """Fence a promoted connection whose transport setup did not complete.
+
+        ``reconnect`` is forwarded to ``ConnectionPipeline.deactivate`` so
+        callers that immediately follow this with ``pipeline.shutdown(...,
+        reconnect=...)`` get a single, consistent classification instead of
+        this call's default sweeping the scheduler's queues as a reconnect
+        before ``shutdown`` ever runs (leaving nothing for it to classify).
+        """
         if self.connection is pipeline:
-            pipeline.deactivate()
+            pipeline.deactivate(reconnect=reconnect)
             self.connection = None
             self.state.active_epoch = None
 
-    def _require_coordinator(self) -> Any:
+    @staticmethod
+    def _ack_work_item_id(turn_id: str) -> str:
+        """The one synthetic scheduler key this turn's ack is enqueued under."""
+        return TurnAckLedger.ack_work_item_id(turn_id)
+
+    def _clear_ack_latch(self, turn_id: str) -> None:
+        self._turn_ack_ledger.clear_ack_latch(turn_id)
+
+    def _settle_turn_ack(
+        self, scheduler: Any, turn_id: str, *, cancel_admitted: bool = False
+    ) -> None:
+        """Retract this turn's ack and close its admission-retry chain.
+
+        See ``TurnAckLedger.settle_turn_ack`` for the full rationale.
+        """
+        self._turn_ack_ledger.settle_turn_ack(scheduler, turn_id, cancel_admitted=cancel_admitted)
+
+    def _register_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
+        """Record one delegated child as belonging to ``turn_id``.
+
+        See ``TurnAckLedger.register_turn_work_item`` for the full rationale.
+        """
+        self._turn_ack_ledger.register_turn_work_item(turn_id, work_item_id)
+
+    def _begin_delegation(
+        self,
+        request: DelegationRequest,
+        *,
+        turn_recorder: AppTurnRecorder,
+        delegated_children: dict[str, str | None],
+        finalize_turn_on_failure: bool = True,
+    ) -> DelegatedChild | None:
+        """Set up one child work item for delegation to a worker's search.
+
+        Shared by every "delegate to a child work item" call site
+        (single-intent, pending-dialogue, multi-intent-per-item). Runs, in
+        order: missing-worker rejection, missing-search rejection,
+        ``_project_worker(running)``, child-recorder creation, registration
+        in both ``delegated_children`` and the work ledger's known-ids (the
+        latter alongside ``_register_turn_work_item``, before any ack for
+        this item can be admitted), and the ``routing`` status emit.
+
+        ``finalize_turn_on_failure`` controls whether a missing-worker/
+        missing-search rejection also finalizes ``turn_recorder`` as
+        ``"failed"``. Single-intent and pending-dialogue delegate exactly one
+        child per turn, so that child's rejection *is* the turn's outcome and
+        the default (``True``) finalizes it here, matching those call sites'
+        pre-conversion behavior. Multi-intent delegates N children under one
+        shared ``turn_recorder`` and finalizes it itself, once, after every
+        child (including any dispatched-but-not-delegated ones from routing
+        failures) has been accounted for -- finalizing here on the first
+        rejected child would latch the whole turn's outcome early and silently
+        drop every sibling still to come, since ``AppTurnRecorder.finalize``
+        is a one-shot latch. Multi-intent passes ``False`` and finalizes once
+        at the end of its own loop instead.
+
+        Returns ``None`` after fully handling a rejection -- the caller
+        should return/continue without further processing that item -- or a
+        ``DelegatedChild`` on success.
+        """
+        worker = request.worker
+        if worker is None:
+            child = turn_recorder.new_child(work_item_id=request.work_item_id)
+            child.finalize(outcome="missing_worker")
+            if finalize_turn_on_failure:
+                turn_recorder.finalize(outcome="failed")
+            self._emit_work_status(
+                turn_id=request.turn_id,
+                work_item_id=request.work_item_id,
+                parent_work_item_id=request.parent_work_item_id,
+                state="failed",
+                origin_epoch=request.origin_epoch,
+                terminal_reason="missing_worker",
+            )
+            return None
+        self._worker_projection.project(worker, origin_epoch=request.origin_epoch, status="running")
+        search = getattr(worker, "search", None)
+        worker_id: str = request.worker_id_override or str(
+            getattr(getattr(worker, "metadata", None), "worker_id", "main")
+        )
+        if search is None:
+            child = turn_recorder.new_child(work_item_id=request.work_item_id)
+            child.finalize(outcome="missing_search", app_worker_id=worker_id)
+            if finalize_turn_on_failure:
+                turn_recorder.finalize(outcome="failed")
+            self._emit_work_status(
+                turn_id=request.turn_id,
+                work_item_id=request.work_item_id,
+                parent_work_item_id=request.parent_work_item_id,
+                worker_id=worker_id,
+                state="failed",
+                origin_epoch=request.origin_epoch,
+            )
+            return None
+        child = turn_recorder.new_child(work_item_id=request.work_item_id)
+        delegated_children[request.work_item_id] = worker_id
+        self._register_turn_work_item(request.turn_id, request.work_item_id)
+        # Registered in the ledger before this item's routing status/ack, so
+        # a whole-turn/whole-connection cancel racing in before the ack is
+        # admitted still sees this child as known.
+        self._work_ledger.register_known(request.work_item_id)
+        self._emit_work_status(
+            turn_id=request.turn_id,
+            work_item_id=request.work_item_id,
+            parent_work_item_id=request.parent_work_item_id,
+            worker_id=worker_id,
+            state="routing",
+            origin_epoch=request.origin_epoch,
+        )
+        return DelegatedChild(
+            work_item_id=request.work_item_id,
+            worker_id=worker_id,
+            search=search,
+            child=child,
+        )
+
+    def _mark_delegation_searching(
+        self,
+        child: DelegatedChild,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        parent_work_item_id: str | None = None,
+    ) -> None:
+        """Emit the ``searching`` status for a delegated child.
+
+        Kept separate from ``_begin_delegation`` since callers differ on
+        exact timing relative to search-task creation.
+        """
+        self._emit_work_status(
+            turn_id=turn_id,
+            work_item_id=child.work_item_id,
+            parent_work_item_id=parent_work_item_id,
+            worker_id=child.worker_id,
+            state="searching",
+            origin_epoch=origin_epoch,
+        )
+
+    def _release_all_turn_work_items(self, turn_id: str) -> None:
+        """Release every delegated child of ``turn_id`` and settle its ack latch.
+
+        See ``TurnAckLedger.release_all_turn_work_items`` for the full
+        rationale.
+        """
+        self._turn_ack_ledger.release_all_turn_work_items(turn_id)
+
+    def _release_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
+        """Release one delegated child, keeping the turn's ack alive for siblings.
+
+        See ``TurnAckLedger.release_turn_work_item`` for the full rationale.
+        """
+        self._turn_ack_ledger.release_turn_work_item(turn_id, work_item_id)
+
+    def _ack_turn_for_work_item(self, work_item_id: str) -> str | None:
+        """The latched semantic turn that owns ``work_item_id``, if any.
+
+        See ``TurnAckLedger.ack_turn_for_work_item`` for the full rationale.
+        """
+        return self._turn_ack_ledger.ack_turn_for_work_item(work_item_id)
+
+    def on_ack_terminal(
+        self, identity: GenerationIdentity, reason: PreAdmissionTerminalReason
+    ) -> None:
+        """Idempotent sole mutator for the pre-admission-terminal ack path.
+
+        See ``TurnAckLedger.on_ack_terminal`` for the full rationale.
+        """
+        self._turn_ack_ledger.on_ack_terminal(identity, reason)
+
+    async def _emit_early_ack(
+        self,
+        origin: ConnectionPipeline,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        dispatched: bool,
+        search_task: asyncio.Task[Any] | None = None,
+    ) -> None:
+        """Enqueue this turn's one delegation-confirmed ack.
+
+        See ``TurnAckLedger.emit_early_ack`` for the full rationale, including
+        the ``dispatched``/``search_task`` contract.
+        """
+        await self._turn_ack_ledger.emit_early_ack(
+            origin,
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+            dispatched=dispatched,
+            search_task=search_task,
+        )
+
+    async def cancel_turn_or_child(
+        self,
+        turn_id: str | None,
+        child_work_item_id: str | None = None,
+        *,
+        origin: ConnectionPipeline | None = None,
+        exclude_work_item_id: str | None = None,
+    ) -> tuple[tuple[str, ...], tuple[SpeechItem, ...]]:
+        """Host-owned atomic cancellation of a turn's ack and/or one child.
+
+        A child cancel never accidentally removes the parent ack unless it
+        was the turn's sole remaining delegated child; a whole-turn cancel
+        (``child_work_item_id is None``) removes the ack and every other
+        queued/active work item this connection is currently carrying.
+        Synchronous and non-awaiting apart from the scheduler's own stop
+        signalling, so nothing else can interleave between child removal and
+        the sole-child ack check.
+
+        ``exclude_work_item_id`` protects the caller's own in-flight turn task
+        from the sweep. Returns the ``(cancelled_work, cancelled_speech)``
+        pair for the *requested* target only: the parent ack is ephemeral and
+        never counts towards a caller's "did this cancel hit anything?"
+        decision.
+
+        ``turn_id`` is ``None`` when no latched ack owns the target: the
+        target's own work and speech are still cancelled, and only the
+        ack-settling half is skipped. Passing an unrelated turn instead (the
+        control turn, say) would settle *that* turn's ack.
+        """
+        origin = origin or self.connection
+        ack_work_item_id = self._ack_work_item_id(turn_id) if turn_id is not None else None
+        if origin is None:
+            if turn_id is not None:
+                self._clear_ack_latch(turn_id)
+            return (), ()
+        scheduler = origin.scheduler
+        if child_work_item_id is None:
+            cancelled_work = self._cancel_work(None, exclude_work_item_id=exclude_work_item_id)
+            cancelled_speech = scheduler.cancel(None)
+            if turn_id is not None:
+                self._clear_ack_latch(turn_id)
+            for item in cancelled_speech:
+                # A whole-turn sweep removes every live ack, including acks
+                # belonging to earlier turns; their latches go with them.
+                if item.role == ROLE_ACK and item.turn_id is not None:
+                    self._clear_ack_latch(item.turn_id)
+            return cancelled_work, cancelled_speech
+        cancelled_work = self._cancel_work(
+            child_work_item_id, exclude_work_item_id=exclude_work_item_id
+        )
+        cancelled_speech = scheduler.cancel(child_work_item_id)
+        if turn_id is None or ack_work_item_id is None:
+            return cancelled_work, cancelled_speech
+        # Sole-child determination is scoped to *this turn's own* delegated
+        # children. Reading the scheduler's connection-wide queues alone would
+        # let an unrelated turn's queued or admitted speech keep this turn's
+        # ack alive after its only child was cancelled -- and that ack could
+        # then still be admitted and spoken.
+        # "Still live" is positive evidence -- an in-flight work/turn task,
+        # queued/admitted speech, or a coordinator-retained background task
+        # (this host's own _inflight_* maps stop tracking a child once its
+        # turn handler has retained it as background) -- intersected with
+        # this turn's own delegated children, never the connection-wide
+        # scheduler view on its own.
+        own_work_items = self._turn_ack_ledger.turn_work_items(turn_id)
+        scheduler_live = set(scheduler.pending_work_item_ids(exclude=ack_work_item_id))
+        if scheduler.active is not None and scheduler.active.item.work_item_id != ack_work_item_id:
+            scheduler_live.add(scheduler.active.item.work_item_id)
+        coordinator_live = self._coordinator_view.live_work_item_ids()
+        # `live_ids()` folds in the ledger's `known_ids` alongside its
+        # locally tracked turn/work tasks -- the same "live" definition
+        # `_cancel_work(None)` and `shutdown` use -- so a child registered
+        # but not yet task-backed (the ack-to-registration window in
+        # `_handle_multi_intent`) still counts as live here too.
+        live = scheduler_live | self._work_ledger.live_ids() | coordinator_live
+        remaining = (live & own_work_items) - self._work_ledger.cancelled_ids
+        remaining.discard(child_work_item_id)
+        if not remaining:
+            scheduler.cancel(ack_work_item_id)
+            self._clear_ack_latch(turn_id)
+        return cancelled_work, cancelled_speech
+
+    def _require_coordinator(self) -> Coordinator:
         coordinator = self.coordinator
         if coordinator is None:
             raise RuntimeError("coordinator is required to execute work")
         return coordinator
+
+    @property
+    def _coordinator_view(self) -> CoordinatorView:
+        """Resolves the 7 ``Coordinator`` members this host reads through
+        ``getattr`` fallbacks rather than direct attribute access, even
+        though the Coordinator Protocol declares most of them required:
+        many duck-typed test-double coordinators across the suite construct
+        without declaring the full Protocol surface, and requiring full
+        conformance from every test double is out of scope (round 5 tried
+        converting these to required direct access and reverted it after
+        the change broke 67 of tests/test_pipeline.py's tests).
+
+        Computed fresh from ``self.coordinator`` on every access, not cached
+        at construction: several tests reassign ``host.coordinator`` after
+        ``__init__`` returns, and every call site here must see that
+        reassignment exactly as it would have via a bare
+        ``getattr(self.coordinator, ...)`` probe. See ``coordinator_view``
+        and ``Coordinator``'s own docstring in work_item_coordinator.py for
+        the full site-by-site rationale.
+        """
+        return coordinator_view(self.coordinator)
 
     async def _handle_transcript(
         self, transcript: str, *, origin: ConnectionPipeline | None = None
@@ -803,11 +1363,21 @@ class SessionHost:
         origin_epoch = origin.epoch
         turn_id = self._next_turn_id()
         work_item_id = f"work-{turn_id}"
-        turn_recorder = self._new_app_turn_recorder(origin_epoch=origin_epoch, turn_id=turn_id)
+        turn_recorder = self._recorder_factory.new_app_turn_recorder(
+            origin_epoch=origin_epoch, turn_id=turn_id
+        )
+        # Delegated children that have had a work_status emitted, so a
+        # cancellation of this turn can terminalize whichever are still open.
+        delegated_children: dict[str, str | None] = {}
+        # Set once this turn hands its child to the background: the ack latch
+        # and work-item registry must then outlive this handler so a cancel
+        # arriving before the late result can still resolve the child back to
+        # this turn's ack. ``commit_late_result_once`` releases them instead.
+        retained_still_open = False
         try:
             turn_task = asyncio.current_task()
             if turn_task is not None:
-                self._track_turn_task(work_item_id, turn_task)
+                self._work_ledger.register_turn_task(work_item_id, turn_task)
             self.state.append_transcript(
                 TranscriptEntry(
                     role="user",
@@ -832,7 +1402,7 @@ class SessionHost:
                     canonical_result(
                         worker_id="main",
                         turn_id=turn_id,
-                        text="Routing is temporarily unavailable. Please try that request again.",
+                        text=_ROUTING_UNAVAILABLE_TEXT,
                         origin_epoch=origin_epoch,
                     ),
                     origin,
@@ -843,6 +1413,7 @@ class SessionHost:
                 control_action: ControlAction | None = None
                 control_outcome: ControlOutcome | None = None
                 ack_override: str | None = None
+                target: str | None = None
                 if outcome.kind == "control":
                     # Explicit ``Any`` (not inferred): getattr's 3-arg overload with a
                     # literal ``None`` default types as ``Any | None``, and that ``| None``
@@ -858,13 +1429,8 @@ class SessionHost:
                             if outcome.work_items
                             else origin.scheduler.active.item.work_item_id
                         )
-                        active_lease: UtteranceLease | None = origin.scheduler.active
-                        if (
-                            origin.lifecycle is not None
-                            and active_lease is not None
-                            and active_lease.item.work_item_id == target
-                        ):
-                            origin.lifecycle.record_interruption(active_lease.token, pause=True)
+                        # Do not also call lifecycle.record_interruption here
+                        # -- see the contract on SpeechScheduler.pause().
                         origin.scheduler.pause(target)
                         await origin.scheduler.wait_for_stops()
                         control_outcome = "applied"
@@ -876,18 +1442,27 @@ class SessionHost:
                             control_outcome = "applied"
                     elif action in {"cancel", "stop"}:
                         target = outcome.work_items[0] if outcome.work_items else None
-                        cancelled_work = self._cancel_work(
+                        # cancel_turn_or_child routes through scheduler.cancel()
+                        # -- do not also call lifecycle.record_interruption
+                        # here; see the contract on SpeechScheduler.cancel().
+                        # Route every explicit cancel/stop through the host's
+                        # cancellation boundary so a targeted child cancel also
+                        # settles this turn's parent ack (and its latch) when
+                        # that child was the sole remaining delegated child --
+                        # an ack must never be spoken after the user cancelled
+                        # the work it was acknowledging.
+                        # A targeted cancel settles the *target's* owning turn
+                        # ack, or none at all. Falling back to this control
+                        # turn's own id would settle an unrelated turn's ack.
+                        cancel_turn_id = (
+                            self._ack_turn_for_work_item(target) if target is not None else turn_id
+                        )
+                        cancelled_work, cancelled_speech = await self.cancel_turn_or_child(
+                            cancel_turn_id,
                             target,
+                            origin=origin,
                             exclude_work_item_id=work_item_id,
                         )
-                        active_lease = origin.scheduler.active
-                        if (
-                            origin.lifecycle is not None
-                            and active_lease is not None
-                            and (target is None or active_lease.item.work_item_id == target)
-                        ):
-                            origin.lifecycle.record_interruption(active_lease.token, pause=False)
-                        cancelled_speech = origin.scheduler.cancel(target)
                         await origin.scheduler.wait_for_stops()
                         if not cancelled_work and not cancelled_speech:
                             control_outcome = (
@@ -971,64 +1546,142 @@ class SessionHost:
                         origin_epoch=origin_epoch,
                     ),
                     origin,
+                    require_tts=False,
                 )
                 turn_recorder.finalize(outcome=action)
                 return result
             try:
                 worker = self._dispatch(outcome.decision, getattr(outcome, "catalogue", None))
-                await self._register_runner_worker(worker)
+                await self._runner_supervisor.register_worker(worker)
             except (RoutingValidationError, UnsupportedWorkerType):
                 result = await self._commit_and_speak(
                     canonical_result(
                         worker_id="main",
                         turn_id=turn_id,
-                        text="I cannot access that capability here.",
+                        text=_CAPABILITY_UNAVAILABLE_TEXT,
                         origin_epoch=origin_epoch,
                     ),
                     origin,
                 )
                 turn_recorder.finalize(outcome="failed")
                 return result
-            if worker is None:
-                child = turn_recorder.new_child(work_item_id=work_item_id)
-                child.finalize(outcome="missing_worker")
-                turn_recorder.finalize(outcome="failed")
+            delegation = self._begin_delegation(
+                DelegationRequest(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker=worker,
+                    origin_epoch=origin_epoch,
+                ),
+                turn_recorder=turn_recorder,
+                delegated_children=delegated_children,
+            )
+            if delegation is None:
                 return outcome
-            self._project_worker(worker, origin_epoch=origin_epoch, status="running")
-            search = getattr(worker, "search", None)
-            worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
-            if search is None:
-                child = turn_recorder.new_child(work_item_id=work_item_id)
-                child.finalize(outcome="missing_search", app_worker_id=worker_id)
-                turn_recorder.finalize(outcome="failed")
-                return outcome
-            child = turn_recorder.new_child(work_item_id=work_item_id)
+            child = delegation.child
+            search = delegation.search
+            worker_id = delegation.worker_id
             try:
                 search_started = time.perf_counter()
+                search_task = self._dispatch_search_task(
+                    search, transcript, turn_id=turn_id, origin_epoch=origin_epoch
+                )
+                if search_task is not None:
+                    # Track before the first await below. `_emit_early_ack`
+                    # yields a scheduling tick to the search, and
+                    # `_search_with_timeout` only registers the task after
+                    # that; a cancel arriving inside the yield window reaches
+                    # the (tracked) turn task and unwinds this frame without
+                    # ever touching an untracked search task, which would keep
+                    # running with its result discarded.
+                    self._work_ledger.register_work_task(work_item_id, search_task)
+                self._mark_delegation_searching(
+                    delegation, turn_id=turn_id, origin_epoch=origin_epoch
+                )
+                # Dispatch before the ack: a search that resolves within the
+                # same tick (no real delegation latency) never gets an ack at
+                # all, and one still in flight only gets an ack admitted via
+                # a deferred task -- scheduled strictly after this search
+                # task's own first step -- so a reconnect racing in on the
+                # very same turn can still fence the still-queued ack before
+                # it ever reaches the old connection's transport. A refused
+                # dispatch (``search_task is None``) delegates nothing, so it
+                # acknowledges nothing -- see ``_emit_early_ack``'s
+                # ``dispatched`` contract.
+                await self._emit_early_ack(
+                    origin,
+                    turn_id=turn_id,
+                    origin_epoch=origin_epoch,
+                    dispatched=True,
+                    search_task=search_task,
+                )
                 execution = await self._search_with_timeout(
                     search,
                     transcript,
                     turn_id=turn_id,
                     origin_epoch=origin_epoch,
-                    timeout=getattr(
-                        getattr(self.coordinator, "config", None)
-                        or getattr(self.registry, "config", None),
-                        "foreground_search_timeout_seconds",
-                        15.0,
-                    ),
+                    timeout=self.config.foreground_search_timeout_seconds,
                     worker_id=worker_id,
                     work_item_id=work_item_id,
+                    task=search_task,
+                    task_dispatched=True,
                 )
                 search_ms = (time.perf_counter() - search_started) * 1000
                 child_outcome_label: WorkItemOutcome
                 if execution.status == "completed" and execution.result is not None:
                     result = execution.result
                     child_outcome_label = "completed"
-                elif execution.status == "retained":
+                elif execution.status == "completed":
+                    # A worker task that completes normally with no result
+                    # (``execution.result is None``) is not a capacity/busy
+                    # disposition -- the search actually ran and legitimately
+                    # found nothing. Falling through to the busy-text/"failed"
+                    # branch below misreported an empty result as a service
+                    # outage. Reuses the "declined" outcome/text: an explicit
+                    # ``WorkerDeclined`` and a completed-with-nothing search
+                    # are the same user-facing situation -- no reliable result
+                    # -- even though only one of them raised.
                     result = canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
-                        text="That is taking longer than expected; I will continue in the background.",
+                        text=_NO_RELIABLE_RESULT_TEXT,
+                        origin_epoch=origin_epoch,
+                    )
+                    child_outcome_label = "declined"
+                elif execution.status == "retained":
+                    # A retained work item is still working, so `background` is
+                    # its truthful status on every connection -- the observer,
+                    # not this call site, decides which connections may see it.
+                    # Deriving a status from the "retained" outcome label
+                    # instead (below) would publish `failed`, and a terminal
+                    # parent never regresses, so the late result could never
+                    # flip it to `result_ready`.
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state="background",
+                        origin_epoch=origin_epoch,
+                    )
+                    if self._work_status_publisher.replaces_legacy_result_for(origin):
+                        # Phase 3 capability-gated path: retain the work item
+                        # and let the `background` status stand alone instead
+                        # of speaking a second canonical timeout result or
+                        # writing a transcript/history entry (Requirements).
+                        #
+                        # Returns ``None``, not the internal ``SearchExecution``:
+                        # every sibling branch of this handler returns the
+                        # committed ``GroundedResult``, and this branch
+                        # deliberately commits nothing. ``None`` says exactly
+                        # that, instead of handing the caller a differently
+                        # shaped object behind an ``Any`` return type.
+                        child.finalize(outcome="retained", app_worker_id=worker_id)
+                        turn_recorder.finalize()
+                        retained_still_open = True
+                        return None
+                    result = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=turn_id,
+                        text=_FOREGROUND_TIMEOUT_TEXT,
                         origin_epoch=origin_epoch,
                     )
                     child_outcome_label = "retained"
@@ -1036,7 +1689,7 @@ class SessionHost:
                     result = canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
-                        text="The search service is busy; please try again shortly.",
+                        text=_SEARCH_BUSY_TEXT,
                         origin_epoch=origin_epoch,
                     )
                     child_outcome_label = (
@@ -1046,7 +1699,7 @@ class SessionHost:
                     )
             except WorkerClarify as exc:
                 search_ms = (time.perf_counter() - search_started) * 1000
-                result = self._worker_clarification_result(
+                result = self._worker_projection.clarification_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
                     question=exc.question,
@@ -1059,7 +1712,7 @@ class SessionHost:
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="I could not find a reliable result for that request.",
+                    text=_NO_RELIABLE_RESULT_TEXT,
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "declined"
@@ -1072,14 +1725,57 @@ class SessionHost:
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="The web search is temporarily unavailable.",
+                    text=_SEARCH_UNAVAILABLE_TEXT,
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "failed"
-            was_cancelled = f"work-{result.turn_id}" in self._cancelled_work_items
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            committed = await self._commit_and_speak(result, origin, role=speech_role)
+            self._settle_turn_ack(origin.scheduler, turn_id)
+            # A retained child is not terminal: its truthful `background`
+            # status was already emitted above and the coordinator terminalizes
+            # it when the late result lands. Only an actual cancellation
+            # settles it here.
+            retained_still_open = child_outcome_label == "retained" and not was_cancelled
+            derived = (
+                None
+                if retained_still_open
+                else work_status_for_outcome(
+                    child_outcome_label,
+                    cancelled=was_cancelled,
+                    terminal_kind=child_outcome_label,
+                )
+            )
+            # Terminal status is emitted only *after* the canonical commit
+            # succeeds. Emitting `result_ready` first would tell a capable
+            # client the result was committed and display-ready even when the
+            # commit then raised or the turn was cancelled before it ran; a
+            # commit failure settles the child to `failed` instead.
+            try:
+                committed = await self._commit_and_speak(result, origin, role=speech_role)
+            except Exception:
+                failure_status = work_status_after_commit_failure(derived)
+                if failure_status is not None:
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state=failure_status[0],
+                        origin_epoch=origin_epoch,
+                        terminal_reason=failure_status[1],
+                    )
+                raise
+            if derived is not None:
+                status_state, status_reason = derived
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state=status_state,
+                    origin_epoch=origin_epoch,
+                    terminal_reason=status_reason,
+                )
             commit_ms = (time.perf_counter() - commit_started) * 1000
             child.finalize(
                 outcome=child_outcome_label,
@@ -1090,7 +1786,7 @@ class SessionHost:
             )
             turn_recorder.record_commit(commit_ms)
             turn_recorder.finalize()
-            self._project_worker(
+            self._worker_projection.project(
                 worker,
                 origin_epoch=origin_epoch,
                 status="idle",
@@ -1098,13 +1794,28 @@ class SessionHost:
             )
             return committed
         except asyncio.CancelledError:
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="cancelled")
+            self._finalize_turn_exception(
+                cancelled=True,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
+            )
             raise
         except Exception:
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="failed")
+            self._finalize_turn_exception(
+                cancelled=False,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
+            )
             raise
+        finally:
+            if not retained_still_open:
+                self._release_all_turn_work_items(turn_id)
 
     async def _handle_pending(
         self,
@@ -1115,33 +1826,73 @@ class SessionHost:
         turn_recorder: AppTurnRecorder,
     ) -> Any:
         coordinator = self._require_coordinator()
+        origin_epoch = origin.epoch
+        delegated_children: dict[str, str | None] = {}
+        # See the single-intent handler: a retained child keeps this turn's ack
+        # ownership alive past the handler's own return.
+        retained_still_open = False
+        # Captured before the first await below, which may span other turns
+        # being accepted concurrently: this is the turn-sequence snapshot
+        # LateDeliveryContext needs to detect a newer-turn arrival.
+        dispatch_turn_sequence = self._turn_sequence
         try:
             pending = getattr(outcome, "pending_dialogue", None)
             owner_id = pending.owner_id if pending is not None else None
             if owner_id is None:
                 owner_id = outcome.work_items[0] if outcome.work_items else None
-            registered = coordinator.registry.get(owner_id) if owner_id else None
+            registered = (
+                coordinator.registry.get(owner_id)
+                if owner_id and coordinator.registry is not None
+                else None
+            )
             worker = registered.worker if registered is not None else None
-            search = getattr(worker, "search", None)
             work_item_id = f"work-{turn_id}"
-            if search is None:
-                child = turn_recorder.new_child(work_item_id=work_item_id)
-                child.finalize(outcome="missing_search", app_worker_id=owner_id)
-                turn_recorder.finalize(outcome="failed")
+            if worker is not None:
+                await self._runner_supervisor.register_worker(worker)
+            # S2 never derives the worker id from ``worker.metadata`` the way
+            # the single-intent path does -- it is always the pending
+            # dialogue's owner (or "main"), even when a worker is present.
+            # ``worker_id_override`` carries that so ``_begin_delegation``
+            # doesn't fall back to metadata for this call site.
+            delegation = self._begin_delegation(
+                DelegationRequest(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker=worker,
+                    origin_epoch=origin_epoch,
+                    worker_id_override=owner_id or "main",
+                ),
+                turn_recorder=turn_recorder,
+                delegated_children=delegated_children,
+            )
+            if delegation is None:
                 return outcome
-            await self._register_runner_worker(worker)
-            worker_id = owner_id or "main"
-            self._known_work_items.add(work_item_id)
-            clarification_context = self._clarification_context(pending, transcript)
-            child = turn_recorder.new_child(work_item_id=work_item_id)
-            retained_recorder = self._new_retained_recorder(
+            child = delegation.child
+            worker_id = delegation.worker_id
+            search = delegation.search
+            # Unlike the single-intent path, pending-dialogue builds its
+            # retained recorder eagerly, before submit -- ``_begin_delegation``
+            # doesn't build one for any caller, so it's built here and stashed
+            # on the returned ``DelegatedChild`` (not frozen) for callers that
+            # inspect ``delegation.retained_recorder`` later.
+            retained_recorder = self._recorder_factory.new_retained_recorder(
                 origin_epoch=origin.epoch,
                 turn_id=turn_id,
                 work_item_id=work_item_id,
                 app_worker_id=worker_id,
             )
+            delegation.retained_recorder = retained_recorder
+            # Dispatch happens inside ``coordinator.submit`` below, so there is
+            # no handle to inspect here; the plan requires the ack at the
+            # delegation decision, not after submission returns.
+            await self._emit_early_ack(
+                origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
+            )
+            clarification_context = self._worker_projection.clarification_context(
+                pending, transcript
+            )
             outcome_label: WorkItemOutcome = "completed"
-            on_late_terminal = self._make_late_terminal_handler({work_item_id: retained_recorder})
+            on_late_terminal = make_late_terminal_handler({work_item_id: retained_recorder})
 
             async def execute(_worker_id: str, query: str) -> GroundedResult:
                 nonlocal outcome_label
@@ -1157,7 +1908,7 @@ class SessionHost:
                     return result
                 except WorkerClarify as exc:
                     outcome_label = "clarify"
-                    return self._worker_clarification_result(
+                    return self._worker_projection.clarification_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
                         question=exc.question,
@@ -1169,15 +1920,22 @@ class SessionHost:
                     return canonical_result(
                         worker_id=worker_id,
                         turn_id=turn_id,
-                        text="I could not find a reliable result for that request.",
+                        text=_NO_RELIABLE_RESULT_TEXT,
                         origin_epoch=origin.epoch,
                     )
 
+            late_context = self._new_late_delivery_context(
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                origin_epoch=origin.epoch,
+                accepted_turn_sequence=dispatch_turn_sequence,
+            )
+            self._mark_delegation_searching(delegation, turn_id=turn_id, origin_epoch=origin_epoch)
             submitted = await coordinator.submit(
                 work_item_id,
                 [(worker_id, transcript)],
                 execute,
-                on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+                on_late_complete=lambda late: self.commit_late_result_once(late_context, late),
                 work_item_ids=[work_item_id],
                 on_late_terminal=on_late_terminal,
             )
@@ -1188,15 +1946,39 @@ class SessionHost:
                     outcome=outcome_label, app_worker_id=worker_id, result_id=result.result_id
                 )
             elif submitted.pending_work_item_ids:
+                child_outcome_label = "retained"
+                retained_still_open = True
+                child.finalize(outcome="retained", app_worker_id=worker_id)
+                self._recorder_factory.register_if_open(work_item_id, retained_recorder)
+                # A retained work item is still working, so `background` is
+                # its truthful status on every connection -- the observer,
+                # not this call site, decides which connections may see it
+                # (same rule as the single-intent path at ~pipeline.py:1752).
+                # This must run regardless of capability, or a non-capable
+                # connection leaves the session's shared ledger stranded at
+                # `searching` forever.
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state="background",
+                    origin_epoch=origin_epoch,
+                )
+                if self._work_status_publisher.replaces_legacy_result_for(origin):
+                    # Same capability-gated rule the single-intent path takes:
+                    # a capable client gets the `background` status alone, not
+                    # a second canonical timeout result plus its transcript and
+                    # result-history entries (Requirements). Without this early
+                    # return the status *and* the legacy result were both
+                    # delivered, duplicating the turn for capable clients.
+                    turn_recorder.finalize()
+                    return None
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="That is taking longer than expected; I will continue in the background.",
+                    text=_FOREGROUND_TIMEOUT_TEXT,
                     origin_epoch=origin.epoch,
                 )
-                child_outcome_label = "retained"
-                child.finalize(outcome="retained", app_worker_id=worker_id)
-                self._register_retained_recorder_if_open(work_item_id, retained_recorder)
             else:
                 failure_outcome: WorkItemOutcome = (
                     self._failure_child_outcome(submitted.failures[0])
@@ -1206,23 +1988,83 @@ class SessionHost:
                 result = canonical_result(
                     worker_id=worker_id,
                     turn_id=turn_id,
-                    text="The pending web request could not be completed.",
+                    text=_PENDING_REQUEST_INCOMPLETE_TEXT,
                     origin_epoch=origin.epoch,
                 )
                 child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            committed = await self._commit_and_speak(result, origin, role=speech_role)
+            # This turn's ack was enqueued at the delegation *decision*, before
+            # coordinator.submit could report whether the work was accepted at
+            # all. Nothing committed and nothing is still running here, so the
+            # ack promises a result that is never coming; retract it even if it
+            # already reached the transport (the multi-intent path's own
+            # "nothing accepted" branch does the same).
+            self._settle_turn_ack(
+                origin.scheduler,
+                turn_id,
+                cancel_admitted=not submitted.results and not submitted.pending_work_item_ids,
+            )
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
+            # A cancelled child is settled here and now, so its ack ownership
+            # does not have to survive for a late result that will not speak.
+            retained_still_open = retained_still_open and not was_cancelled
+            derived = child_work_status_after_dispatch(
+                child_outcome_label,
+                cancelled=was_cancelled,
+                terminal_kind=child_outcome_label,
+            )
+            # Terminal status only after the canonical commit succeeds; see the
+            # matching comment in the single-intent path.
+            try:
+                committed = await self._commit_and_speak(result, origin, role=speech_role)
+            except Exception:
+                failure_status = work_status_after_commit_failure(derived)
+                if failure_status is not None:
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        state=failure_status[0],
+                        origin_epoch=origin_epoch,
+                        terminal_reason=failure_status[1],
+                    )
+                raise
+            if derived is not None:
+                status_state, status_reason = derived
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    state=status_state,
+                    origin_epoch=origin_epoch,
+                    terminal_reason=status_reason,
+                )
             turn_recorder.finalize()
             return committed
         except asyncio.CancelledError:
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="cancelled")
+            self._finalize_turn_exception(
+                cancelled=True,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
+            )
             raise
         except Exception:
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="failed")
+            self._finalize_turn_exception(
+                cancelled=False,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={} if retained_still_open else delegated_children,
+                turn_recorder=turn_recorder,
+                origin=origin,
+            )
             raise
+        finally:
+            if not retained_still_open:
+                self._release_all_turn_work_items(turn_id)
 
     async def _handle_multi_intent(
         self,
@@ -1235,6 +2077,21 @@ class SessionHost:
         """Execute bounded compound work in the user's stated order."""
         del transcript
         coordinator = self._require_coordinator()
+        origin_epoch = origin.epoch
+        # Every delegated child of this turn aggregates under the one parent
+        # key the turn submits under, so a compound turn shows the client a
+        # single progressive record instead of one per item.
+        parent_work_item_id = f"work-{turn_id}"
+        delegated_children: dict[str, str | None] = {}
+        # Children handed to the background by this turn. They keep their
+        # registry entry (and with it the turn's ack ownership) past the
+        # handler's return; ``commit_late_result_once`` releases each one.
+        retained_work_items: set[str] = set()
+        # Captured before the first await below (route_envelope/_dispatch/
+        # _emit_early_ack per work item), which may span other turns being
+        # accepted concurrently: this is the turn-sequence snapshot
+        # LateDeliveryContext needs to detect a newer-turn arrival.
+        dispatch_turn_sequence = self._turn_sequence
         try:
             results: dict[int, Any] = {}
             runnable: list[tuple[str, str]] = []
@@ -1245,17 +2102,22 @@ class SessionHost:
             pending = getattr(outcome, "pending_dialogue", None)
             for index, item_text in enumerate(outcome.work_items):
                 item_work_item_id = f"work-{turn_id}-{index}"
-                child = turn_recorder.new_child(work_item_id=item_work_item_id)
-                child_recorders[index] = child
                 worker = None
                 if index == 0 and pending is not None:
-                    registered = coordinator.registry.get(pending.owner_id)
+                    registered = (
+                        coordinator.registry.get(pending.owner_id)
+                        if coordinator.registry is not None
+                        else None
+                    )
                     worker = registered.worker if registered is not None else None
                 else:
-                    catalogue = coordinator.registry.catalogue()
                     try:
+                        registry, router = coordinator.registry, coordinator.router
+                        if registry is None or router is None:
+                            raise RuntimeError("registry and router are required to route")
+                        catalogue = registry.catalogue()
                         envelope = await asyncio.to_thread(
-                            coordinator.router.route_envelope,
+                            router.route_envelope,
                             item_text,
                             catalogue,
                         )
@@ -1267,10 +2129,12 @@ class SessionHost:
                         results[index] = canonical_result(
                             worker_id="main",
                             turn_id=f"{turn_id}-{index}",
-                            text="Routing is temporarily unavailable. Please try that request again.",
+                            text=_ROUTING_UNAVAILABLE_TEXT,
                             origin_epoch=origin.epoch,
                         )
-                        child.finalize(outcome="failed")
+                        turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
+                            outcome="failed"
+                        )
                         continue
                     decision = envelope.decision
                     action = getattr(decision, "action", None)
@@ -1289,46 +2153,74 @@ class SessionHost:
                             text=text,
                             origin_epoch=origin.epoch,
                         )
-                        child.finalize(outcome=action)
+                        turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
+                            outcome=action
+                        )
                         continue
                     try:
                         worker = await asyncio.to_thread(self._dispatch, decision, catalogue)
-                        await self._register_runner_worker(worker)
+                        await self._runner_supervisor.register_worker(worker)
                     except (RoutingValidationError, UnsupportedWorkerType):
                         results[index] = canonical_result(
                             worker_id="main",
                             turn_id=f"{turn_id}-{index}",
-                            text="I cannot access that capability here.",
+                            text=_CAPABILITY_UNAVAILABLE_TEXT,
                             origin_epoch=origin.epoch,
                         )
-                        child.finalize(outcome="failed")
+                        turn_recorder.new_child(work_item_id=item_work_item_id).finalize(
+                            outcome="failed"
+                        )
                         continue
-                search = getattr(worker, "search", None)
-                if search is None:
+                # A worker has now been resolved (or confirmed absent, for the
+                # pending-dialogue index-0 case with no registered owner).
+                # ``_begin_delegation`` owns missing-worker/missing-search
+                # rejection, ``_project_worker(running)``, child-recorder
+                # creation, and known-ids/turn-work-item registration -- the
+                # same sequence single-intent and pending-dialogue already
+                # share. ``finalize_turn_on_failure=False`` because this
+                # turn_recorder is shared by every item in the fan-out: it is
+                # finalized once, after the whole loop, not on this one
+                # child's rejection (see the parameter's docstring).
+                delegation = self._begin_delegation(
+                    DelegationRequest(
+                        turn_id=turn_id,
+                        work_item_id=item_work_item_id,
+                        worker=worker,
+                        origin_epoch=origin_epoch,
+                        parent_work_item_id=parent_work_item_id,
+                    ),
+                    turn_recorder=turn_recorder,
+                    delegated_children=delegated_children,
+                    finalize_turn_on_failure=False,
+                )
+                if delegation is None:
+                    # The rejected child's own work-status/child-recorder
+                    # bookkeeping is already done inside ``_begin_delegation``;
+                    # unlike single-intent/pending-dialogue this turn does not
+                    # abort, so this item still owes the user a spoken result
+                    # for its slot, same text the pre-conversion code used.
                     results[index] = canonical_result(
                         worker_id="main",
                         turn_id=f"{turn_id}-{index}",
-                        text="I cannot access that capability here.",
+                        text=_CAPABILITY_UNAVAILABLE_TEXT,
                         origin_epoch=origin.epoch,
                     )
-                    worker_id_for_child = (
-                        getattr(getattr(worker, "metadata", None), "worker_id", None)
-                        if worker is not None
-                        else None
-                    )
-                    child.finalize(
-                        outcome="missing_worker" if worker is None else "missing_search",
-                        app_worker_id=worker_id_for_child,
-                    )
                     continue
-                worker_id = getattr(getattr(worker, "metadata", None), "worker_id", "main")
+                child_recorders[index] = delegation.child
+                worker_id = delegation.worker_id
                 runnable.append((worker_id, item_text))
                 runnable_indexes.append(index)
                 runnable_workers[index] = worker
                 contexts[index] = (
-                    self._clarification_context(pending, item_text)
+                    self._worker_projection.clarification_context(pending, item_text)
                     if index == 0 and pending is not None
                     else None
+                )
+                # Dispatch happens inside ``coordinator.submit`` below; the plan
+                # requires the parent ack at the first eligible child
+                # *decision*, so there is no handle to inspect here.
+                await self._emit_early_ack(
+                    origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
                 )
 
             index_to_worker_id = dict(zip(runnable_indexes, runnable, strict=True))
@@ -1340,7 +2232,25 @@ class SessionHost:
             outcome_labels: dict[int, WorkItemOutcome] = {}
 
             async def execute(worker_id: str, query: str) -> GroundedResult:
-                item_index = execution_indexes[(worker_id, query)].pop(0)
+                pending_indexes = execution_indexes.get((worker_id, query))
+                if not pending_indexes:
+                    # Mirrors the warn-and-skip guard the sibling echo-derived
+                    # lookups (index_for_item_turn_id, index_for_work_item_id)
+                    # use below: a coordinator invoking execute with an
+                    # unexpected pair, or more times than dispatched, must not
+                    # raise a bare KeyError/IndexError with no diagnostic
+                    # trail. The task this coroutine runs in still surfaces
+                    # the raise as a WorkItemFailure, same as any other
+                    # worker exception.
+                    # The user's spoken query is deliberately absent: log lines
+                    # never carry transcript text (see services/stt.py). It is
+                    # still on the KeyError raised below for diagnostics.
+                    logger.warning(
+                        f"multi-intent fan-in for {turn_id}: execute() invoked for "
+                        f"worker_id={worker_id!r} with no matching dispatched work item"
+                    )
+                    raise KeyError(f"no dispatched work item for {worker_id!r}/{query!r}")
+                item_index = pending_indexes.pop(0)
                 item_turn_id = f"{turn_id}-{item_index}"
                 search = runnable_workers[item_index].search
                 try:
@@ -1357,7 +2267,7 @@ class SessionHost:
                     outcome_labels[item_index] = "clarify"
                     context = contexts[item_index]
                     original_query = context.original_query if context is not None else query
-                    return self._worker_clarification_result(
+                    return self._worker_projection.clarification_result(
                         worker_id=worker_id,
                         turn_id=item_turn_id,
                         question=exc.question,
@@ -1369,14 +2279,16 @@ class SessionHost:
                     return canonical_result(
                         worker_id=worker_id,
                         turn_id=item_turn_id,
-                        text="I could not find a reliable result for that request.",
+                        text=_NO_RELIABLE_RESULT_TEXT,
                         origin_epoch=origin.epoch,
                     )
 
+            # `known_ids` registration for each runnable item now happens
+            # per-item, before its own early ack, in the loop above -- this
+            # list is still needed below for `coordinator.submit`.
             work_item_ids = [f"work-{turn_id}-{index}" for index in runnable_indexes]
-            self._known_work_items.update(work_item_ids)
             retained_recorders: dict[str, RetainedRecorder] = {
-                f"work-{turn_id}-{index}": self._new_retained_recorder(
+                f"work-{turn_id}-{index}": self._recorder_factory.new_retained_recorder(
                     origin_epoch=origin.epoch,
                     turn_id=turn_id,
                     work_item_id=f"work-{turn_id}-{index}",
@@ -1384,13 +2296,36 @@ class SessionHost:
                 )
                 for index in runnable_indexes
             }
-            on_late_terminal = self._make_late_terminal_handler(retained_recorders)
+            on_late_terminal = make_late_terminal_handler(retained_recorders)
 
+            def _multi_intent_late_context(late: LateResult) -> LateDeliveryContext:
+                return self._new_late_delivery_context(
+                    turn_id=turn_id,
+                    work_item_id=late.work_item_id,
+                    origin_epoch=origin.epoch,
+                    accepted_turn_sequence=dispatch_turn_sequence,
+                    # Same parent id the turn submits under, so a late
+                    # child's status aggregates with its siblings instead
+                    # of opening a second parent record.
+                    parent_work_item_id=f"work-{turn_id}",
+                )
+
+            for item_work_item_id, item_worker_id in delegated_children.items():
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=item_work_item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=item_worker_id,
+                    state="searching",
+                    origin_epoch=origin_epoch,
+                )
             submitted = await coordinator.submit(
                 f"work-{turn_id}",
                 runnable,
                 execute,
-                on_late_complete=lambda late: self._commit_late_result(late, origin.epoch),
+                on_late_complete=lambda late: self.commit_late_result_once(
+                    _multi_intent_late_context(late), late
+                ),
                 work_item_ids=work_item_ids,
                 on_late_terminal=on_late_terminal,
             )
@@ -1405,6 +2340,17 @@ class SessionHost:
                 f"work-{turn_id}-{index}": index for index in runnable_indexes
             }
             speech_roles: dict[int, SpeechRole] = {}
+            # Terminal per-child statuses are held here and emitted only after
+            # that child's canonical commit succeeds, so `result_ready` can
+            # never be published for a result whose commit then raised. Keyed
+            # by index -> (work_item_id, worker_id, state, terminal_reason).
+            deferred_status: dict[
+                int, tuple[str, str | None, WorkStatusState, TerminalReason | None]
+            ] = {}
+            # Every dispatched child that the coordinator accounted for in some
+            # fan-in bucket. Anything left over is reconciled to a terminal
+            # `failed` below, so the parent can never stay `searching` forever.
+            attributed_indexes: set[int] = set()
             # Two passes: settle last-wins content first, then attribute each
             # matched item exactly once from the result that actually commits.
             # Finalizing on first sight would name a discarded result_id in the
@@ -1428,11 +2374,27 @@ class SessionHost:
                 final_result_for_index[matched] = result
             for index, final_result in final_result_for_index.items():
                 worker_id = index_to_worker_id[index][0]
+                item_outcome = outcome_labels.get(index, "completed")
                 child_recorders[index].finalize(
-                    outcome=outcome_labels.get(index, "completed"),
+                    outcome=item_outcome,
                     app_worker_id=worker_id,
                     result_id=final_result.result_id,
                 )
+                item_work_item_id = f"work-{turn_id}-{index}"
+                attributed_indexes.add(index)
+                derived = work_status_for_outcome(
+                    item_outcome,
+                    cancelled=item_work_item_id in self._work_ledger.cancelled_ids,
+                    terminal_kind=item_outcome,
+                )
+                if derived is not None:
+                    status_state, status_reason = derived
+                    deferred_status[index] = (
+                        item_work_item_id,
+                        worker_id,
+                        status_state,
+                        status_reason,
+                    )
             for work_item_id in submitted.pending_work_item_ids:
                 matched = index_for_work_item_id.get(work_item_id)
                 if matched is None:
@@ -1442,18 +2404,49 @@ class SessionHost:
                     )
                     continue
                 item_index = matched
+                attributed_indexes.add(item_index)
+                if work_item_id not in self._work_ledger.cancelled_ids:
+                    retained_work_items.add(work_item_id)
                 worker_id = index_to_worker_id[item_index][0]
-                results[item_index] = canonical_result(
-                    worker_id=worker_id,
-                    turn_id=f"{turn_id}-{item_index}",
-                    text="That item is taking longer than expected; I will continue in the background.",
-                    origin_epoch=origin.epoch,
-                )
-                speech_roles[item_index] = ROLE_TIMEOUT_NOTICE
+                if not self._work_status_publisher.replaces_legacy_result_for(origin):
+                    # Capability-blind clients keep the legacy per-item timeout
+                    # notice. A capable client gets the `background` status
+                    # below and nothing else: committing and speaking the
+                    # notice as well would duplicate the canonical result,
+                    # transcript, and history the status is meant to replace
+                    # (same rule as the single-intent and pending paths).
+                    results[item_index] = canonical_result(
+                        worker_id=worker_id,
+                        turn_id=f"{turn_id}-{item_index}",
+                        text=(
+                            "That item is taking longer than expected; "
+                            "I will continue in the background."
+                        ),
+                        origin_epoch=origin.epoch,
+                    )
+                    speech_roles[item_index] = ROLE_TIMEOUT_NOTICE
                 child_recorders[item_index].finalize(outcome="retained", app_worker_id=worker_id)
+                # Retained is not terminal: `background` is the truthful state
+                # until the late result lands (same rule as the single-intent
+                # path); a `failed` here could never be flipped back.
+                derived = child_work_status_after_dispatch(
+                    "retained",
+                    cancelled=work_item_id in self._work_ledger.cancelled_ids,
+                )
+                if derived is not None:
+                    status_state, status_reason = derived
+                    self._emit_work_status(
+                        turn_id=turn_id,
+                        work_item_id=work_item_id,
+                        parent_work_item_id=parent_work_item_id,
+                        worker_id=worker_id,
+                        state=status_state,
+                        origin_epoch=origin_epoch,
+                        terminal_reason=status_reason,
+                    )
                 recorder = retained_recorders.get(work_item_id)
                 if recorder is not None:
-                    self._register_retained_recorder_if_open(work_item_id, recorder)
+                    self._recorder_factory.register_if_open(work_item_id, recorder)
             for failure in submitted.failures:
                 matched = index_for_work_item_id.get(failure.work_item_id)
                 if matched is None:
@@ -1463,68 +2456,252 @@ class SessionHost:
                     )
                     continue
                 item_index = matched
+                attributed_indexes.add(item_index)
                 results[item_index] = canonical_result(
                     worker_id=failure.worker_id,
                     turn_id=f"{turn_id}-{item_index}",
-                    text="The web search is temporarily unavailable.",
+                    text=_SEARCH_UNAVAILABLE_TEXT,
                     origin_epoch=origin.epoch,
                 )
+                failure_outcome = self._failure_child_outcome(failure)
                 child_recorders[item_index].finalize(
-                    outcome=self._failure_child_outcome(failure),
+                    outcome=failure_outcome,
                     app_worker_id=failure.worker_id,
                 )
-            committed = []
-            for index in sorted(results):
-                committed.append(
-                    await self._commit_and_speak(
-                        results[index], origin, role=speech_roles.get(index, ROLE_RESULT)
-                    )
+                derived = work_status_for_outcome(
+                    failure_outcome,
+                    cancelled=failure.work_item_id in self._work_ledger.cancelled_ids,
+                    terminal_kind=failure_outcome,
                 )
+                if derived is not None:
+                    status_state, status_reason = derived
+                    deferred_status[item_index] = (
+                        failure.work_item_id,
+                        failure.worker_id,
+                        status_state,
+                        status_reason,
+                    )
+            # Reconcile every dispatched child the coordinator never accounted
+            # for in any fan-in bucket. Without this a child whose result,
+            # pending record, or failure never came back (or came back with an
+            # unattributable id) leaves its work-status on `searching`, and the
+            # parent aggregate stays non-terminal forever for a capable client.
+            for index in runnable_indexes:
+                if index in attributed_indexes:
+                    continue
+                unmatched_work_item_id = f"work-{turn_id}-{index}"
+                logger.warning(
+                    f"multi-intent fan-in for {turn_id}: dispatched work item "
+                    f"{unmatched_work_item_id} was never accounted for; reconciling it "
+                    f"to a terminal failed status"
+                )
+                if not child_recorders[index].finalized:
+                    child_recorders[index].finalize(
+                        outcome="failed", app_worker_id=index_to_worker_id[index][0]
+                    )
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=unmatched_work_item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=index_to_worker_id[index][0],
+                    state="cancelled"
+                    if unmatched_work_item_id in self._work_ledger.cancelled_ids
+                    else "failed",
+                    origin_epoch=origin_epoch,
+                )
+                # Neither `_work_ledger.known_ids` nor `_work_ledger.cancelled_ids` is
+                # discarded here, unlike every other discard site: this fires
+                # when the child's fate is *unknown* (it may still be a
+                # coordinator-retained task whose late result hasn't arrived
+                # yet), not known-terminal like every sibling discard site.
+                #
+                # `_work_ledger.known_ids` feeds `_cancel_work(None)`'s whole-turn
+                # cancel set (line ~3332). Discarding it here would remove
+                # the *only* remaining registry that can still reach this id
+                # if a whole-turn cancel arrives *after* this reconcile loop
+                # runs but *before* (or instead of) a late result: by then
+                # the coordinator's own task has typically already completed
+                # and been popped from its live-task registry (that's part
+                # of why this id is unattributed here in the first place),
+                # so `coordinator.cancel(None)` cannot re-derive it either.
+                # Losing that reachability would silently commit and
+                # autoplay a result the user actually cancelled -- the exact
+                # failure this whole mechanism exists to prevent, just
+                # triggered by a cancel landing after reconcile instead of
+                # before it. `_work_ledger.cancelled_ids` must stay for the
+                # matching reason: a late callback that arrives for this id
+                # must still see it as cancelled if a whole-turn cancel
+                # landed (before *or* after this loop).
+                #
+                # The accepted cost is a leak of one short string per set,
+                # per multi-intent child, in the rare case that is reconciled
+                # here and *never* receives a late result at all (no cancel,
+                # no callback, ever) -- every other path that discards these
+                # ids fires exactly when that late result (or an explicit
+                # cancel) finally does arrive. Bounding that residual case
+                # would mean adopting the TTL/bounded-eviction pattern
+                # `shared/protocol.md` already documents for reconnect
+                # snapshot terminal records, which is a larger, separately
+                # scoped change.
+            if not attributed_indexes and not retained_work_items:
+                # No *delegated* child was accepted or retained: every one was
+                # rejected before dispatch or never accounted for by the
+                # coordinator. The ack was enqueued at the delegation decision
+                # and promises a search result that is never coming, so retract
+                # it in whatever state it is in -- a plain queued-ack discard
+                # cannot reach one already admitted to the transport.
+                #
+                # The test is deliberately ``attributed_indexes``, not
+                # ``results``: a mixed multi-intent turn whose direct half
+                # produced a result and whose delegated half was
+                # capacity-rejected has a non-empty ``results`` while nothing
+                # was delegated at all, which left the false-progress ack
+                # speakable. ``attributed_indexes`` holds exactly the runnable
+                # (delegated) indexes the coordinator accounted for in some
+                # fan-in bucket -- result, pending, or failure -- so it is the
+                # accepted/retained-delegated-work signal this decision needs.
+                # ``retained_work_items`` is a subset of it and is kept only to
+                # state the "still running" half of the condition explicitly.
+                self._settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=True)
+            else:
+                self._settle_turn_ack(origin.scheduler, turn_id)
+            committed = []
+            commit_exceptions: list[Exception] = []
+            for index in sorted(results):
+                # _commit_and_speak durably commits state before it ever
+                # attempts to speak, so a speak-time failure on one item must
+                # not abort the loop and drop already-computed sibling
+                # results; each item is isolated and the first failure is
+                # re-raised only after every item has been committed.
+                #
+                # Each item's terminal work-status is emitted only after its
+                # own commit returns, so `result_ready` is never published for
+                # a result whose commit raised.
+                #
+                # `deferred_status` was derived above from the cancel set as it
+                # stood *before* this loop. A cancel landing between then and
+                # this await makes _commit_and_speak silently skip the commit
+                # and return normally, so the pre-derived status has to be
+                # downgraded to the outcome that actually happened rather than
+                # published as-is.
+                suppressed: set[str] = set()
+                try:
+                    committed.append(
+                        await self._commit_and_speak(
+                            results[index],
+                            origin,
+                            role=speech_roles.get(index, ROLE_RESULT),
+                            suppressed_out=suppressed,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001  # isolate one item's speak failure from its siblings; re-raised below once all items are committed
+                    logger.exception(
+                        f"multi-intent commit for {turn_id}: item {index} failed after its "
+                        f"state was already committed; continuing with remaining items"
+                    )
+                    committed.append(results[index])
+                    commit_exceptions.append(exc)
+                    pending_status = deferred_status.pop(index, None)
+                    if pending_status is not None:
+                        failed_item_id, failed_worker_id, _state, _reason = pending_status
+                        self._emit_work_status(
+                            turn_id=turn_id,
+                            work_item_id=failed_item_id,
+                            parent_work_item_id=parent_work_item_id,
+                            worker_id=failed_worker_id,
+                            state="failed",
+                            origin_epoch=origin_epoch,
+                        )
+                else:
+                    pending_status = deferred_status.pop(index, None)
+                    if pending_status is not None:
+                        item_id, item_worker_id, status_state, status_reason = pending_status
+                        if item_id in suppressed:
+                            status_state, status_reason = "cancelled", None
+                        self._emit_work_status(
+                            turn_id=turn_id,
+                            work_item_id=item_id,
+                            parent_work_item_id=parent_work_item_id,
+                            worker_id=item_worker_id,
+                            state=status_state,
+                            origin_epoch=origin_epoch,
+                            terminal_reason=status_reason,
+                        )
+            # A deferred status whose index never reached the commit loop (its
+            # result was dropped from `results` between derivation and commit)
+            # still has to terminalize rather than strand the parent.
+            for item_id, item_worker_id, status_state, status_reason in deferred_status.values():
+                self._emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=item_worker_id,
+                    state=status_state,
+                    origin_epoch=origin_epoch,
+                    terminal_reason=status_reason,
+                )
+            deferred_status.clear()
+            if commit_exceptions:
+                raise commit_exceptions[0]
             turn_recorder.finalize()
             return tuple(committed)
         except asyncio.CancelledError:
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="cancelled")
+            self._finalize_turn_exception(
+                cancelled=True,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={
+                    k: v for k, v in delegated_children.items() if k not in retained_work_items
+                },
+                turn_recorder=turn_recorder,
+                origin=origin,
+                parent_work_item_id=parent_work_item_id,
+            )
             raise
         except Exception:
-            if not turn_recorder.finalized:
-                turn_recorder.finalize(outcome="failed")
+            self._finalize_turn_exception(
+                cancelled=False,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                children={
+                    k: v for k, v in delegated_children.items() if k not in retained_work_items
+                },
+                turn_recorder=turn_recorder,
+                origin=origin,
+                parent_work_item_id=parent_work_item_id,
+            )
             raise
+        finally:
+            if retained_work_items:
+                for item_work_item_id in delegated_children:
+                    if item_work_item_id not in retained_work_items:
+                        self._release_turn_work_item(turn_id, item_work_item_id)
+            else:
+                self._release_all_turn_work_items(turn_id)
 
-    def _worker_clarification_result(
+    def _dispatch_search_task(
         self,
+        search: Callable[..., Any],
+        query: str,
         *,
-        worker_id: str,
         turn_id: str,
-        question: str,
-        original_query: str,
-        origin_epoch: int | None,
-    ) -> GroundedResult:
-        """Record a worker's clarifying question as the next turn's pending candidate."""
-        result_id = f"result-{uuid4().hex}"
-        self._clarification_candidates[result_id] = {
-            "worker_id": worker_id,
-            "turn_id": turn_id,
-            "original_query": original_query,
-            "question": question,
-        }
-        return canonical_result(
-            worker_id=worker_id,
-            turn_id=turn_id,
-            text=question,
-            result_id=result_id,
-            origin_epoch=origin_epoch,
-        )
+        origin_epoch: int,
+        clarification_context: ClarificationContext | None = None,
+    ) -> asyncio.Task[Any] | None:
+        """Start the delegated search coroutine and return its task.
 
-    @staticmethod
-    def _clarification_context(pending: Any, transcript: str) -> ClarificationContext | None:
-        if pending is None or not pending.original_query:
-            return None
-        return ClarificationContext(
-            original_query=pending.original_query,
-            question=pending.question,
-            answer=transcript,
-        )
+        Split out of ``_search_with_timeout`` so a caller can dispatch the
+        search, give it exactly one scheduling tick, and only then decide
+        whether an early ack is still warranted (see ``_emit_early_ack``'s
+        ``search_task`` parameter).
+        """
+        kwargs: dict[str, Any] = {
+            "turn_id": turn_id,
+            "origin_epoch": origin_epoch,
+        }
+        if clarification_context is not None:
+            kwargs["clarification_context"] = clarification_context
+        return self._coordinator_view.start_task(search(query, **kwargs))
 
     async def _search_with_timeout(
         self,
@@ -1537,29 +2714,41 @@ class SessionHost:
         worker_id: str,
         work_item_id: str | None = None,
         clarification_context: ClarificationContext | None = None,
+        task: asyncio.Task[Any] | None = None,
+        task_dispatched: bool = False,
     ) -> SearchExecution:
+        """Wait out the foreground window for one delegated search.
+
+        ``task_dispatched`` states that the caller already attempted dispatch
+        and is passing the outcome as ``task``; a ``None`` task then means the
+        coordinator refused for lack of capacity and must not be retried here.
+        Re-dispatching would build a second search coroutine only to have the
+        coordinator close it again.
+        """
         coordinator = self._require_coordinator()
-        kwargs: dict[str, Any] = {
-            "turn_id": turn_id,
-            "origin_epoch": origin_epoch,
-        }
-        if clarification_context is not None:
-            kwargs["clarification_context"] = clarification_context
-        starter = getattr(self.coordinator, "start_task", None)
-        task = (
-            starter(search(query, **kwargs))
-            if starter is not None
-            else asyncio.create_task(search(query, **kwargs))
-        )
+        if task is None and task_dispatched:
+            return SearchExecution("capacity_rejected")
+        if task is None:
+            task = self._dispatch_search_task(
+                search,
+                query,
+                turn_id=turn_id,
+                origin_epoch=origin_epoch,
+                clarification_context=clarification_context,
+            )
         if task is None:
             return SearchExecution("capacity_rejected")
         work_item_id = work_item_id or f"work-{turn_id}"
-        self._track_work_task(work_item_id, task)
+        self._work_ledger.register_work_task(work_item_id, task)
+        # Captured before the foreground wait below, which may span other
+        # turns being accepted concurrently: this is the turn-sequence
+        # snapshot LateDeliveryContext needs to detect a newer-turn arrival.
+        dispatch_turn_sequence = self._turn_sequence
         # The provisional retained recorder is created here, at dispatch time,
         # before the foreground wait -- not only if it later times out -- so
         # background_ms always starts at work dispatch (Timing Boundaries).
         # It is discarded unregistered if the foreground wait completes first.
-        retained_recorder = self._new_retained_recorder(
+        retained_recorder = self._recorder_factory.new_retained_recorder(
             origin_epoch=origin_epoch,
             turn_id=turn_id,
             work_item_id=work_item_id,
@@ -1577,21 +2766,112 @@ class SessionHost:
         # callback to the coordinator, so it is always in the registry by the
         # time that callback could possibly run -- regardless of whether a
         # future refactor inserts an await between the two calls.
-        self._register_retained_recorder_if_open(work_item_id, retained_recorder)
+        self._recorder_factory.register_if_open(work_item_id, retained_recorder)
+        late_context = self._new_late_delivery_context(
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            origin_epoch=origin_epoch,
+            accepted_turn_sequence=dispatch_turn_sequence,
+        )
         accepted = coordinator.retain_late_task(
             task,
             work_item_id=work_item_id,
             worker_id=worker_id,
-            on_complete=lambda late: self._commit_late_result(late, origin_epoch),
-            on_late_terminal=self._make_late_terminal_handler({work_item_id: retained_recorder}),
+            on_complete=lambda late: self.commit_late_result_once(late_context, late),
+            on_late_terminal=make_late_terminal_handler({work_item_id: retained_recorder}),
         )
         if not accepted:
-            self._retained_recorders.pop(work_item_id, None)
+            self._recorder_factory.pop(work_item_id)
             return SearchExecution("retention_rejected")
         return SearchExecution("retained")
 
-    async def _commit_late_result(self, late: LateResult, origin_epoch: int) -> None:
-        """Commit a late result and defer speech on its still-active TTS epoch."""
+    def _new_late_delivery_context(
+        self,
+        *,
+        turn_id: str,
+        work_item_id: str,
+        origin_epoch: int,
+        accepted_turn_sequence: int | None = None,
+        parent_work_item_id: str | None = None,
+    ) -> LateDeliveryContext:
+        """Build the immutable context captured at late-task dispatch time.
+
+        ``accepted_turn_sequence`` defaults to the live ``_turn_sequence``
+        counter, but callers dispatching from a coroutine that may span
+        other turns being accepted concurrently pass an explicit snapshot
+        taken before any ``await``. ``parent_work_item_id`` is supplied only
+        by multi-intent dispatch, where the child work item is not itself
+        the turn's work-status parent.
+        """
+        return LateDeliveryContext(
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            origin_epoch=origin_epoch,
+            parent_work_item_id=parent_work_item_id,
+            ack_timestamp=time.monotonic(),
+            accepted_turn_sequence=(
+                accepted_turn_sequence
+                if accepted_turn_sequence is not None
+                else self._turn_sequence
+            ),
+        )
+
+    def _late_result_disposition(
+        self, context: LateDeliveryContext, *, origin: ConnectionPipeline
+    ) -> LateDeliveryDisposition:
+        """Autoplay-vs-display-only verdict for one still-committable late result.
+
+        ``enable_autoplay_policy=False`` is the strict rollback path: every
+        valid, non-cancelled result on its still-active connection is
+        spoken, exactly reproducing pre-v0.1.3 behavior. When the policy is
+        enabled, autoplay requires *all* of: promotion-eligible evidence
+        (schema validity alone is never sufficient -- see
+        ``server.config.load_promotion_manifest``), the originating epoch
+        still active, no newer same-epoch turn accepted since dispatch, and
+        no explicit pause in effect. Any predicate failing degrades to
+        ``"display_only"``; the result was already committed exactly once
+        by the caller regardless of this verdict.
+        """
+        if not self.feature_policy.enable_autoplay_policy:
+            return "autoplay"
+        if not self._promotion_eligible:
+            return "display_only"
+        if context.origin_epoch != origin.epoch:
+            return "display_only"
+        if self._turn_sequence != context.accepted_turn_sequence:
+            return "display_only"
+        if origin.scheduler.paused() is not None:
+            return "display_only"
+        return "autoplay"
+
+    async def commit_late_result_once(self, context: LateDeliveryContext, late: LateResult) -> None:
+        """The sole host-owned atomic API for a coordinator late-result callback.
+
+        Commits every valid result exactly once and separately computes the
+        autoplay-vs-display-only delivery disposition; a valid commit on an
+        otherwise-speakable connection additionally consults
+        ``_late_result_disposition`` before enqueuing speech.
+
+        Branch precedence is: worker error, then the three structural
+        fences -- not a ``GroundedResult``, foreign ``origin_epoch``,
+        already-committed ``result_id`` -- and only then cancellation,
+        followed by the normal commit-and-speak path. Cancellation is a
+        classification input rather than a fence of its own: a cancelled
+        work item whose result clears every fence still commits exactly
+        once (display-only, no speech), while a cancelled result that is
+        stale or duplicate is suppressed like any other, keeping
+        ``work_outcome="cancelled"`` alongside the suppressing
+        ``commit_outcome``. Ordering cancellation ahead of the fences would
+        let a foreign-epoch result reach authoritative state and would make
+        ``suppressed_duplicate`` unreachable for cancelled work.
+        Synchronous
+        and non-awaiting through the disposition decision itself, so
+        nothing can interleave between context capture and that verdict;
+        the network-facing enqueue/start_next calls below are the only
+        awaiting steps, matching the surrounding coordinator-callback
+        contract.
+        """
+        origin_epoch = context.origin_epoch
         # Popping (rather than peeking) makes a callback arriving after a
         # dispatch-registered recorder's finalization a structural no-op for
         # that recorder. Every retained work item registers its provisional
@@ -1600,15 +2880,29 @@ class SessionHost:
         # remainder of this method stays telemetry-silent rather than opening a
         # replacement recorder, whose start instant would be completion time
         # and whose `background_ms` would therefore be near zero.
-        recorder = self._retained_recorders.pop(late.work_item_id, None)
+        recorder = self._recorder_factory.pop(late.work_item_id)
         if recorder is not None and late.terminal_kind is not None:
             recorder.claim(late.terminal_kind)
 
         work_outcome: WorkOutcome | None = None
         commit_outcome: CommitOutcome | None = None
         speech_outcome: SpeechOutcome | None = None
+        delivery_disposition: LateDeliveryDisposition | None = None
         result_id: str | None = None
         pending_exception: Exception | None = None
+
+        # Cancellation is a *classification* input for every non-error branch
+        # below, never a branch of its own that could bypass the structural
+        # fences (invalid result / foreign origin_epoch / duplicate
+        # result_id). Snapshotting and clearing the marker once, here, keeps
+        # the marker's consumption independent of branch order; the error
+        # path keeps its pre-existing behavior of leaving the marker
+        # untouched.
+        was_cancelled = late.error is None and late.work_item_id in self._work_ledger.cancelled_ids
+        if was_cancelled:
+            self._work_ledger.clear_cancelled(late.work_item_id)
+            if isinstance(late.result, GroundedResult):
+                self._worker_projection.pop_clarification_candidate(late.result.result_id)
 
         # The recorder was already popped above, so it is only reachable from
         # this stack frame from here on. A CancelledError delivered during the
@@ -1622,7 +2916,7 @@ class SessionHost:
         # defaults for any outcome field still unset at that point.
         try:
             if late.error is not None:
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 # A worker task cancellation reaching this normal completion path
                 # is always a live "suppressed_cancelled" outcome. Pure
                 # shutdown-triggered cancellation never reaches here: the
@@ -1632,59 +2926,101 @@ class SessionHost:
                 work_outcome = late.terminal_kind or "failed"
                 if late.terminal_kind == "cancelled":
                     commit_outcome, speech_outcome = "suppressed_cancelled", "cancelled"
+                    delivery_disposition = "suppressed"
                 else:
                     commit_outcome, speech_outcome = "not_applicable", "not_applicable"
+                    delivery_disposition = "not_applicable"
                 logger.warning(
                     f"Late worker result failed for work_item={late.work_item_id} "
                     f"worker={late.worker_id}"
                 )
-            elif late.work_item_id in self._cancelled_work_items:
-                self._cancelled_work_items.discard(late.work_item_id)
-                self._known_work_items.discard(late.work_item_id)
-                if isinstance(late.result, GroundedResult):
-                    self._clarification_candidates.pop(late.result.result_id, None)
-                work_outcome, commit_outcome, speech_outcome = (
-                    "cancelled",
-                    "suppressed_cancelled",
-                    "cancelled",
-                )
             elif not isinstance(late.result, GroundedResult):
-                self._known_work_items.discard(late.work_item_id)
-                work_outcome, commit_outcome, speech_outcome = (
-                    "invalid_result",
-                    "not_applicable",
-                    "not_applicable",
-                )
+                self._work_ledger.retire(late.work_item_id)
+                if was_cancelled:
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "cancelled",
+                        "suppressed_cancelled",
+                        "cancelled",
+                    )
+                    delivery_disposition = "suppressed"
+                else:
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "invalid_result",
+                        "not_applicable",
+                        "not_applicable",
+                    )
+                    delivery_disposition = "not_applicable"
             elif late.result.origin_epoch != origin_epoch:
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
-                    "completed",
+                    "cancelled" if was_cancelled else "completed",
                     "suppressed_stale",
                     "not_applicable",
                 )
+                delivery_disposition = "not_applicable"
             elif any(
                 item.result_id == late.result.result_id for item in self.state.results.results
             ):
-                self._known_work_items.discard(late.work_item_id)
+                self._work_ledger.retire(late.work_item_id)
                 work_outcome, commit_outcome, speech_outcome = (
-                    "completed",
+                    "cancelled" if was_cancelled else "completed",
                     "suppressed_duplicate",
                     "not_applicable",
                 )
+                delivery_disposition = "not_applicable"
+            elif was_cancelled:
+                # Cancellation before/while-queued/while-admitted suppresses
+                # or reclassifies *speech delivery* only -- it no longer
+                # suppresses a valid canonical commit (dev plan Phase 2,
+                # cancellation matrix): a cancelled work item whose late
+                # result is otherwise valid *and past every structural fence
+                # above* is still committed exactly once, display-only, with
+                # no speech attempt.
+                self._work_ledger.retire(late.work_item_id)
+                cancelled_result = late.result
+                try:
+                    self._commit_result_state(cancelled_result)
+                except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "cancelled",
+                        "failed",
+                        "cancelled",
+                    )
+                    delivery_disposition = "not_applicable"
+                    pending_exception = exc
+                else:
+                    worker = self.state.workers.get(cancelled_result.worker_id)
+                    if worker is not None and worker.origin_epoch == origin_epoch:
+                        self.state.set_worker(
+                            worker.model_copy(
+                                update={
+                                    "status": "idle",
+                                    "latest_result_id": cancelled_result.result_id,
+                                }
+                            )
+                        )
+                    work_outcome, commit_outcome, speech_outcome = (
+                        "cancelled",
+                        "committed",
+                        "cancelled",
+                    )
+                    delivery_disposition = "display_only"
+                    result_id = cancelled_result.result_id
             else:
                 result = late.result
                 try:
                     self._commit_result_state(result)
                 except Exception as exc:  # noqa: BLE001 - preserves existing commit-failure re-raise behavior
-                    self._known_work_items.discard(late.work_item_id)
+                    self._work_ledger.retire(late.work_item_id)
                     work_outcome, commit_outcome, speech_outcome = (
                         "completed",
                         "failed",
                         "not_applicable",
                     )
+                    delivery_disposition = "not_applicable"
                     pending_exception = exc
                 else:
-                    self._known_work_items.discard(late.work_item_id)
+                    self._work_ledger.retire(late.work_item_id)
                     worker = self.state.workers.get(result.worker_id)
                     if worker is not None and worker.origin_epoch == origin_epoch:
                         self.state.set_worker(
@@ -1713,38 +3049,114 @@ class SessionHost:
                     work_outcome, commit_outcome = "completed", "committed"
                     result_id = result.result_id
                     if speakable is not None:
-                        try:
-                            # A retained result supersedes only its own
-                            # queued timeout notice, not other same-work
-                            # queued speech, and never an utterance that has
-                            # already been admitted to the transport slot.
-                            speakable.scheduler.discard_queued_notice(late.work_item_id)
-                            speakable.scheduler.enqueue(
-                                result_id=result.result_id,
-                                work_item_id=late.work_item_id,
-                                run_id=f"run-{result.turn_id}",
-                                text=result.spoken_text,
-                                origin_epoch=origin_epoch,
-                                role=ROLE_RESULT,
-                            )
-                        except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
-                            speech_outcome = "enqueue_failed"
-                            pending_exception = exc
+                        # Exactly-once commit is already done above; this
+                        # verdict only decides whether the committed result
+                        # is additionally spoken. A committed-but-not-spoken
+                        # result is still a fully valid, terminal outcome.
+                        policy_disposition = self._late_result_disposition(
+                            context, origin=speakable
+                        )
+                        # A retained result supersedes only its own queued
+                        # timeout notice, not other same-work queued speech,
+                        # and never an utterance already admitted to the
+                        # transport slot. This must run regardless of which
+                        # branch below is taken -- a display-only verdict
+                        # still leaves a still-queued (not yet admitted)
+                        # "taking longer" notice stale once the real result
+                        # has committed, and it would otherwise be spoken
+                        # later.
+                        speakable.scheduler.discard_queued_notice(late.work_item_id)
+                        if policy_disposition == "display_only":
+                            delivery_disposition = "display_only"
+                            speech_outcome = "not_applicable"
                         else:
+                            delivery_disposition = "autoplay"
+                            # The canonical result is committing now, so this
+                            # turn's queued ack (if any) is stale as of this
+                            # point -- settle it before admission instead of
+                            # relying on the `finally` block below, which only
+                            # runs after `start_next()` has already had a
+                            # chance to admit the stale ack from the queue.
+                            self._settle_turn_ack(speakable.scheduler, context.turn_id)
                             try:
-                                await speakable.scheduler.start_next()
-                            except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
-                                speech_outcome = "start_failed"
+                                speakable.scheduler.enqueue(
+                                    result_id=result.result_id,
+                                    work_item_id=late.work_item_id,
+                                    run_id=f"run-{result.turn_id}",
+                                    text=result.spoken_text,
+                                    origin_epoch=origin_epoch,
+                                    role=ROLE_RESULT,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
+                                speech_outcome = "enqueue_failed"
                                 pending_exception = exc
                             else:
-                                speech_outcome = "queued"
+                                try:
+                                    await speakable.scheduler.start_next(late.work_item_id)
+                                except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
+                                    speech_outcome = "start_failed"
+                                    pending_exception = exc
+                                else:
+                                    speech_outcome = "queued"
+                    else:
+                        delivery_disposition = "display_only"
         finally:
+            # This work item is terminal, so the turn handler's deferred
+            # release lands here: the last retained child of a turn settles
+            # its ack ownership. Any ack still queued for this turn is now
+            # stale -- every branch above has already decided this turn's
+            # outcome -- so discard it before releasing ownership, or an
+            # unrelated generation later freeing the transport lane could
+            # still speak it after the real result was already committed.
+            #
+            # Epoch-fenced on the TURN's own origin epoch, not on whatever
+            # connection happens to be live now. ``self.connection`` is
+            # re-pointed on every reconnect/epoch promotion, so a late result
+            # committed after a reconnect used to settle its ack against the
+            # NEW epoch's scheduler -- discarding a queued ack and releasing a
+            # latch that scheduler never set, while the retired scheduler's
+            # latch for this turn stayed set. Every other epoch-sensitive step
+            # in this method already fences on ``context``'s own epoch (the
+            # explicit foreign-epoch branch in the precedence chain above
+            # exists precisely because a late result can outlive its
+            # originating connection); this one did not (round-5 restart,
+            # Logic Minor).
+            #
+            # On a mismatch the retired connection's own teardown
+            # (``deactivate`` -> ``SpeechScheduler.interrupt(full_stop=True)``)
+            # already swept its queued/paused acks through
+            # ``_notify_ack_swept``, so there is no queued item left to
+            # discard -- but the host-level latch is connection-independent
+            # state, so clear that half directly rather than reaching for a
+            # foreign scheduler.
+            connection = self.connection
+            if connection is not None and connection.epoch == origin_epoch:
+                self._settle_turn_ack(connection.scheduler, context.turn_id)
+            else:
+                self._turn_ack_ledger.clear_ack_latch(context.turn_id)
+            self._release_turn_work_item(context.turn_id, context.work_item_id)
             if recorder is not None:
                 recorder.finalize(
                     work_outcome=work_outcome,
                     commit_outcome=commit_outcome,
                     speech_outcome=speech_outcome,
+                    delivery_disposition=delivery_disposition,
                     result_id=result_id,
+                )
+            derived = late_commit_work_status(
+                work_outcome,
+                commit_outcome=commit_outcome,
+                terminal_kind=late.terminal_kind,
+            )
+            if derived is not None:
+                status_state, status_reason = derived
+                self._emit_work_status(
+                    turn_id=context.turn_id,
+                    work_item_id=context.work_item_id,
+                    parent_work_item_id=context.parent_work_item_id,
+                    state=status_state,
+                    origin_epoch=origin_epoch,
+                    terminal_reason=status_reason,
                 )
         if pending_exception is not None:
             raise pending_exception
@@ -1759,7 +3171,7 @@ class SessionHost:
             )
         )
         self.state.append_result(result, origin_epoch=result.origin_epoch)
-        candidate = self._clarification_candidates.pop(result.result_id, None)
+        candidate = self._worker_projection.pop_clarification_candidate(result.result_id)
         if candidate is not None and self.accepts(result.origin_epoch):
             self._require_coordinator().add_worker_clarification(
                 session_id=self.state.session_id,
@@ -1773,19 +3185,38 @@ class SessionHost:
         origin: ConnectionPipeline,
         *,
         role: SpeechRole = ROLE_RESULT,
+        require_tts: bool = True,
+        suppressed_out: set[str] | None = None,
     ) -> GroundedResult:
-        """Commit a result and speak only when its originating epoch is active."""
+        """Commit a result and speak only when its originating epoch is active.
+
+        ``require_tts`` gates the no-TTS short-circuit: delegated worker
+        results stay history-only without a TTS lane (``require_tts=True``,
+        the default), while the main-responder direct/unsupported/clarify
+        replies still enqueue through the scheduler's no-TTS pre-admission
+        terminal path so their progress is recorded even with no transport.
+
+        The cancelled short-circuit below returns the result unchanged rather
+        than raising, and it consumes the cancel marker as it goes, so a
+        caller cannot tell after the fact that nothing was committed. A caller
+        whose own bookkeeping depends on that (the multi-intent commit loop,
+        which pre-derives each item's terminal work-status before the loop)
+        passes ``suppressed_out`` to receive the work_item_id of any commit
+        this call actually suppressed.
+        """
         origin_epoch = result.origin_epoch
         work_item_id = f"work-{result.turn_id}"
-        if work_item_id in self._cancelled_work_items:
-            self._cancelled_work_items.discard(work_item_id)
-            self._known_work_items.discard(work_item_id)
-            self._clarification_candidates.pop(result.result_id, None)
+        if work_item_id in self._work_ledger.cancelled_ids:
+            self._work_ledger.clear_cancelled(work_item_id)
+            self._work_ledger.retire(work_item_id)
+            self._worker_projection.pop_clarification_candidate(result.result_id)
+            if suppressed_out is not None:
+                suppressed_out.add(work_item_id)
             return result
         self._commit_result_state(result)
-        self._known_work_items.discard(work_item_id)
+        self._work_ledger.retire(work_item_id)
         if (
-            origin.tts is None
+            (require_tts and origin.tts is None)
             or self.connection is not origin
             or not origin.active
             or not self.accepts(origin_epoch)
@@ -1804,33 +3235,15 @@ class SessionHost:
 
     def session_handshake(self) -> dict[str, Any]:
         """Return the next browser handshake without mutating session state."""
-        self._prune_handshake_tokens()
-        token = uuid4().hex
-        self._handshake_tokens[token] = (
-            self.arbiter.epoch + 1,
-            time.monotonic() + 60,
-            False,
-        )
-        while len(self._handshake_tokens) > self._MAX_HANDSHAKE_TOKENS:
-            oldest = min(self._handshake_tokens, key=lambda item: self._handshake_tokens[item][1])
-            self._handshake_tokens.pop(oldest, None)
+        proposed_epoch = self.arbiter.epoch + 1
+        token = self._handshake_gate.issue_token(proposed_epoch)
         return {
             "contract_version": "v1.0",
             "session_id": self.state.session_id,
             "resume_token": token,
-            "proposed_epoch": self.arbiter.epoch + 1,
+            "proposed_epoch": proposed_epoch,
             "snapshot_sequence": self.state.sequence,
         }
-
-    def _prune_handshake_tokens(self) -> None:
-        now = time.monotonic()
-        expired = [
-            token
-            for token, (_epoch, expires_at, _redeemed) in self._handshake_tokens.items()
-            if expires_at <= now
-        ]
-        for token in expired:
-            self._handshake_tokens.pop(token, None)
 
     def _dispatch(self, decision: Any, catalogue: Any = None) -> Any:
         coordinator = self._require_coordinator()
@@ -1838,34 +3251,18 @@ class SessionHost:
             return coordinator.dispatch(decision)
         return coordinator.dispatch(decision, catalogue=catalogue)
 
-    def _track_work_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
-        self._known_work_items.add(work_item_id)
-        self._inflight_work_tasks.setdefault(work_item_id, set()).add(task)
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            tasks = self._inflight_work_tasks.get(work_item_id)
-            if tasks is None:
-                return
-            tasks.discard(completed_task)
-            if not tasks:
-                self._inflight_work_tasks.pop(work_item_id, None)
-
-        task.add_done_callback(completed)
-
-    def _track_turn_task(self, work_item_id: str, task: asyncio.Task[Any]) -> None:
-        self._known_work_items.add(work_item_id)
-        self._inflight_turn_tasks[work_item_id] = task
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            if self._inflight_turn_tasks.get(work_item_id) is not completed_task:
-                return
-            self._inflight_turn_tasks.pop(work_item_id, None)
-            if work_item_id not in self._inflight_work_tasks:
-                self._known_work_items.discard(work_item_id)
-                self._cancelled_work_items.discard(work_item_id)
-
-        task.add_done_callback(completed)
-
+    # ------------------------------------------------------------------
+    # Work/turn task bookkeeping. Storage *and* the tracking API both live on
+    # `self._work_ledger` (server/work_task_ledger.py, deep-review
+    # Architecture finding #3); call sites in this class reach the ledger
+    # directly (`self._work_ledger.known_ids`,
+    # `self._work_ledger.register_work_task`, ...) rather than through
+    # pass-through properties on the host, so there is exactly one API for
+    # this state. `_cancel_work` still needs the coordinator (which the ledger
+    # deliberately has no handle to -- see the ledger's module docstring),
+    # so it composes the ledger's local selection/cancellation with the
+    # coordinator's own cancel; the union logic itself is unchanged.
+    # ------------------------------------------------------------------
     def _cancel_work(
         self,
         work_item_id: str | None,
@@ -1874,61 +3271,112 @@ class SessionHost:
     ) -> tuple[str, ...]:
         selected = tuple(
             item_id
-            for item_id in dict.fromkeys((*self._inflight_turn_tasks, *self._inflight_work_tasks))
+            for item_id in self._work_ledger.local_ids()
             if (work_item_id is None or item_id == work_item_id) and item_id != exclude_work_item_id
         )
-        coordinator_cancel = getattr(self.coordinator, "cancel", None)
-        if coordinator_cancel is not None:
-            selected = tuple(dict.fromkeys((*selected, *coordinator_cancel(work_item_id))))
+        selected = tuple(dict.fromkeys((*selected, *self._coordinator_view.cancel(work_item_id))))
         if work_item_id is None:
-            selected = tuple(dict.fromkeys((*selected, *self._known_work_items)))
+            selected = tuple(dict.fromkeys((*selected, *self._work_ledger.known_ids)))
         selected = tuple(item for item in selected if item != exclude_work_item_id)
-        self._cancelled_work_items.update(selected)
-        for item_id in selected:
-            turn_task = self._inflight_turn_tasks.get(item_id)
-            if turn_task is not None:
-                turn_task.cancel()
-            for task in self._inflight_work_tasks.get(item_id, ()):
-                task.cancel()
+        self._work_ledger.cancel_selected(selected)
         return selected
 
-    def _project_worker(
+    def _emit_work_status(
         self,
-        worker: Any,
         *,
+        turn_id: str,
+        work_item_id: str,
+        parent_work_item_id: str | None = None,
+        worker_id: str | None = None,
+        state: WorkStatusState,
         origin_epoch: int,
-        status: str,
-        latest_result_id: str | None = None,
+        terminal_reason: TerminalReason | None = None,
     ) -> None:
-        metadata = getattr(worker, "metadata", None)
-        if metadata is None:
-            return
-        worker_id = getattr(metadata, "worker_id", None)
-        topic = getattr(metadata, "topic", None)
-        model_policy = getattr(metadata, "model_policy", None)
-        if (
-            not (isinstance(worker_id, str) and worker_id)
-            or not (isinstance(topic, str) and topic)
-            or not (isinstance(model_policy, str) and model_policy)
-        ):
-            return
-        previous = self.state.workers.get(worker_id)
-        self.state.set_worker(
-            WorkerState(
-                worker_id=worker_id,
-                topic=topic,
-                model_policy=model_policy,
-                status=status,
-                latest_result_id=(
-                    latest_result_id
-                    if latest_result_id is not None
-                    else previous.latest_result_id
-                    if previous is not None
-                    else None
-                ),
-                origin_epoch=origin_epoch,
-            )
+        """Record one delegated child's coarse status (Phase 3).
+
+        Thin delegator onto ``WorkStatusPublisher.emit`` -- kept as a
+        SessionHost method (rather than migrating every call site) because
+        this is a dozens-of-call-sites surface spanning single-intent,
+        pending-dialogue, multi-intent, and commit paths; see
+        ``WorkTaskLedger``'s precedent for the same call.
+        """
+        self._work_status_publisher.emit(
+            turn_id=turn_id,
+            work_item_id=work_item_id,
+            parent_work_item_id=parent_work_item_id,
+            worker_id=worker_id,
+            state=state,
+            origin_epoch=origin_epoch,
+            terminal_reason=terminal_reason,
         )
+
+    def _terminalize_child_work_statuses(
+        self,
+        *,
+        turn_id: str,
+        origin_epoch: int,
+        children: Mapping[str, str | None],
+        state: WorkStatusState,
+        parent_work_item_id: str | None = None,
+        terminal_reason: TerminalReason | None = None,
+    ) -> None:
+        """Terminalize every still-non-terminal delegated child as ``state``.
+
+        Thin delegator onto ``WorkStatusPublisher.terminalize_children`` --
+        see that method's docstring for the idempotency/cold-start contract.
+        """
+        self._work_status_publisher.terminalize_children(
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+            children=children,
+            state=state,
+            parent_work_item_id=parent_work_item_id,
+            terminal_reason=terminal_reason,
+        )
+
+    def _finalize_turn_exception(
+        self,
+        *,
+        cancelled: bool,
+        turn_id: str,
+        origin_epoch: int,
+        children: Mapping[str, str | None],
+        turn_recorder: AppTurnRecorder,
+        origin: Any = None,
+        parent_work_item_id: str | None = None,
+    ) -> None:
+        """Shared cleanup for a turn handler's ``CancelledError``/``Exception`` epilogue.
+
+        ``children`` must already exclude any delegated child the caller is
+        still keeping open for background completion (retained-and-not-
+        cancelled work): sweeping one of those to a terminal state here would
+        strand it there permanently, since ``background -> failed``/
+        ``cancelled`` is itself a legal transition and the late result could
+        then never terminalize it again.
+
+        Also discards this turn's still-queued early ack, if any: an
+        exception on this path means no result was ever committed and spoken
+        for the ack to precede, so a queued-but-not-yet-admitted ack left
+        behind here would otherwise be spoken later once an unrelated
+        generation frees the transport lane.
+        """
+        if origin is not None:
+            self._settle_turn_ack(origin.scheduler, turn_id)
+        # A blind sweep over the whole delegated child set is safe either
+        # way: a child that never had a status is skipped on the
+        # ``cancelled`` branch (not in ``WORK_STATUS_COLD_START``) and is a
+        # legal cold start on the ``failed`` branch, but every ``children``
+        # entry here already has a ``routing`` status by construction (see
+        # ``_terminalize_child_work_statuses``).
+        self._terminalize_child_work_statuses(
+            turn_id=turn_id,
+            origin_epoch=origin_epoch,
+            children=children,
+            state="cancelled" if cancelled else "failed",
+            parent_work_item_id=parent_work_item_id,
+        )
+        if not turn_recorder.finalized:
+            turn_recorder.finalize(outcome="cancelled" if cancelled else "failed")
 
     def accepts(self, epoch: int | None) -> bool:
         return (
@@ -1940,30 +3388,33 @@ class SessionHost:
 
     async def shutdown(self) -> None:
         self._closing = True
-        turn_tasks = tuple(self._inflight_turn_tasks.values())
-        for task in turn_tasks:
+        # Every locally tracked task -- turn tasks *and* delegated work
+        # tasks -- must be cancelled and awaited here; a work task with no
+        # turn task above it (e.g. a retained background child) used to be
+        # left running past shutdown because only `turn_tasks` was swept.
+        pending_tasks = self._work_ledger.pending_tasks()
+        for task in pending_tasks:
             task.cancel()
-        if turn_tasks:
-            await asyncio.gather(*turn_tasks, return_exceptions=True)
-        registrations = tuple(self._runner_registrations.values())
-        for task in registrations:
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        await self._runner_supervisor.cancel_registrations()
+        ack_admission_tasks = self._turn_ack_ledger.pending_admission_tasks()
+        for task in ack_admission_tasks:
             task.cancel()
-        if registrations:
-            await asyncio.gather(*registrations, return_exceptions=True)
+        if ack_admission_tasks:
+            await asyncio.gather(*ack_admission_tasks, return_exceptions=True)
         shutdowns = set(self._background_shutdowns)
         if self.connection is not None:
             connection = self.connection
             connection.deactivate(reconnect=False)
             self.connection = None
-            shutdowns.add(asyncio.create_task(connection.shutdown(reason="session shutdown")))
+            shutdowns.add(
+                asyncio.create_task(connection.shutdown(reason="session shutdown", reconnect=False))
+            )
         if shutdowns:
             done, pending = await asyncio.wait(
                 shutdowns,
-                timeout=getattr(
-                    getattr(self.coordinator, "config", None),
-                    "shutdown_grace_seconds",
-                    2.0,
-                ),
+                timeout=self.config.shutdown_grace_seconds,
             )
             for task in pending:
                 task.cancel()
@@ -1973,36 +3424,27 @@ class SessionHost:
             for task in done:
                 if not task.cancelled():
                     task.exception()
-        coordinator_shutdown = getattr(self.coordinator, "shutdown", None)
-        if coordinator_shutdown is not None:
-            result = coordinator_shutdown()
-            if inspect.isawaitable(result):
-                await result
+        # The Protocol declares ``shutdown`` as ``async def shutdown(self) ->
+        # None``, so a conforming coordinator's result is always awaitable;
+        # ``inspect.isawaitable`` only accommodates the non-conforming test
+        # doubles that happen to define a sync one (``self._coordinator_view``
+        # resolves the callable itself, matching every other member here).
+        result = self._coordinator_view.shutdown()
+        if inspect.isawaitable(result):
+            await result
         # Coordinator work/callback tasks have now settled. Finalize every
         # retained recorder still open: unclaimed work is shutdown-cancelled,
         # while claimed work uses its recorded terminal kind and whatever
         # commit/speech stage it had already reached.
-        for work_item_id, recorder in tuple(self._retained_recorders.items()):
-            recorder.finalize()
-            self._retained_recorders.pop(work_item_id, None)
-        stop = getattr(self.runner, "stop", None)
-        if stop is not None:
-            result = stop()
-            if hasattr(result, "__await__"):
-                await result
-        elif self.runner is not None:
-            cancel = getattr(self.runner, "cancel", None)
-            if cancel is not None:
-                result = cancel("session shutdown")
-                if hasattr(result, "__await__"):
-                    await result
-        if self._runner_task is not None:
-            self._runner_task.cancel()
-            try:
-                await self._runner_task
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._runner_task = None
+        self._recorder_factory.finalize_all()
+        # A retained child's ack ownership is released by its late-result
+        # callback, which shutdown suppresses. Drop what is left rather than
+        # carrying it for the process's remaining lifetime.
+        self._turn_ack_ledger.clear_all()
+        # Same reasoning for clarification candidates: a candidate is consumed
+        # on the commit path, and shutdown suppresses the commits that would
+        # have consumed them.
+        self._worker_projection.clear_all()
+        await self._runner_supervisor.shutdown()
         self.started = False
         self.state.active_epoch = None

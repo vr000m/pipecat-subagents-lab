@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipecat-subagents-lab.local/schemas/v1/runtime-snapshot.json",
+  "title": "RuntimeSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "session_id", "snapshot_sequence", "workers", "results", "speech_progress", "routing", "transcript", "origin_epoch"],
+  "properties": {
+    "contract_version": {"const": "v1.0"},
+    "session_id": {"type": "string", "minLength": 1},
+    "snapshot_sequence": {"type": "integer", "minimum": 0},
+    "workers": {"type": "array", "items": {"$ref": "#/$defs/worker"}},
+    "results": {"type": "array", "items": {"$ref": "grounded-result.json"}},
+    "speech_progress": {"type": "array", "items": {"$ref": "#/$defs/speech_progress"}},
+    "routing": {"oneOf": [{"$ref": "#/$defs/routing"}, {"type": "null"}]},
+    "transcript": {"type": "array", "items": {"$ref": "#/$defs/transcript_entry"}},
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0}
+  },
+  "$defs": {
+    "origin_epoch": {"type": ["integer", "null"], "minimum": 0},
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "topic", "model_policy", "status", "latest_result_id", "origin_epoch"],
+      "properties": {
+        "worker_id": {"type": "string", "minLength": 1},
+        "topic": {"type": "string"},
+        "model_policy": {"type": "string"},
+        "status": {"type": "string"},
+        "latest_result_id": {"type": ["string", "null"]},
+        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
+      }
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turn_id", "action", "worker_id", "worker_type", "topic", "model_policy", "origin_epoch"],
+      "properties": {
+        "turn_id": {"type": "string", "minLength": 1},
+        "action": {"enum": ["direct", "unsupported", "clarify", "existing_worker", "new_worker"]},
+        "worker_id": {"type": ["string", "null"]},
+        "worker_type": {"type": ["string", "null"]},
+        "topic": {"type": ["string", "null"]},
+        "model_policy": {"type": ["string", "null"]},
+        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
+      }
+    },
+    "transcript_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "text", "turn_id", "timestamp", "origin_epoch"],
+      "properties": {
+        "role": {"enum": ["user", "assistant"]},
+        "text": {"type": "string"},
+        "turn_id": {"type": "string", "minLength": 1},
+        "timestamp": {"type": "string", "format": "date-time"},
+        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
+      }
+    },
+    "speech_progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result_id", "work_item_id", "run_id", "utterance_id", "state", "origin_epoch"],
+      "properties": {
+        "result_id": {"type": "string", "minLength": 1},
+        "work_item_id": {"type": "string", "minLength": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "utterance_id": {"type": "string", "minLength": 1},
+        "state": {"enum": ["displayed", "queued", "started", "synthesis_ended", "delivery_completed", "delivery_unknown", "interrupted", "interrupted_by_reconnect", "paused", "resumed"]},
+        "origin_epoch": {"$ref": "#/$defs/origin_epoch"}
+      }
+    }
+  }
+}
