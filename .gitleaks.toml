@@ -1,0 +1,15 @@
+title = "pipecat-subagents-lab gitleaks config"
+
+[extend]
+useDefault = true
+
+# Known-safe test fixtures that match generic secret-shape regexes by
+# construction (they exist specifically to test credential-redaction logic)
+# but are never real credentials. Scoped to the exact fixture values, not a
+# path/file-wide allowlist, so a real secret accidentally added to the same
+# test file is still caught.
+[[allowlists]]
+description = "tests/test_verify_eval_candidates.py credential-redaction fixtures"
+regexes = [
+  '''a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2''',
+]

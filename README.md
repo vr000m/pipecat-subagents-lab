@@ -264,7 +264,7 @@ uv run pytest
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy
-gitleaks git --no-banner --redact
+gitleaks git --no-banner --redact --config .gitleaks.toml
 cd web
 bun install
 bun run build
