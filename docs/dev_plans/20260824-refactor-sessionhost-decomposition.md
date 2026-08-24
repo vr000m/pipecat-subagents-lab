@@ -90,7 +90,7 @@ Prior-decision pins to respect (do NOT re-litigate silently):
 **Test command:** `uv run pytest -q`
 **Goal:** One coordinator-boundary declaration, promotion-manifest logic out of config.py, and the OWNED_CONFIG_FIELDS + client-eviction questions decided rather than deferred a sixth time.
 
-- [ ] Extract promotion-manifest loading/validation to `server/promotion_manifest.py`; `config.py` re-exports nothing (callers update imports). Rebase note: P3 Phase 1 edits `server/config.py:1676-1708` — land order per program matrix.
+- [ ] Promotion-manifest logic in `config.py`: **check P1's Phase 1 decision first.** On P1-retire (the default expectation) the machinery is deleted by P1 Phase 2 and this bullet drops entirely; only if P1 chose invest does this phase extract it to `server/promotion_manifest.py` (callers update imports, `config.py` re-exports nothing). Do not start this phase before P1's retire commit has landed (program matrix). Rebase note: P3 Phase 1 edits `server/config.py:1676-1708` — land order per program matrix.
 - [ ] Delete the two production-dead boundary declarations; collapse the remaining two into one.
 - [ ] Decide `_OWNED_CONFIG_FIELDS` strictness (Requirement 5) — the Phase 0 doubles make the strict option testable for the first time.
 - [ ] Decide client eviction duplication (Requirement 8); implement the chosen form or add the parity test + rationale.

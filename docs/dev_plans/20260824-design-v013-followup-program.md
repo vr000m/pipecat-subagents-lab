@@ -50,7 +50,7 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 4 | `SessionHost.connect` — 210 lines, 8 nested closures | AD-r8/r10 | P2 Ph2 | open |
 | 5 | `ConnectionPipeline` should live in its own module (`server/pipeline.py:356`) | AD-r10 | P2 Ph2 | open |
 | 6 | `SessionHost`↔coordinator boundary declared 4× (two production-dead) | AD-r8/r10 | P2 Ph3 | open |
-| 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | P2 Ph3 | open |
+| 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | P1 Ph2 (deleted on retire) / P2 Ph3 (extracted, only if P1 chooses invest) | open |
 | 8 | `_OWNED_CONFIG_FIELDS` permissive default (`server/work_item_coordinator.py:131`) — deferred 5 consecutive rounds | AD-r5/7/8/9/10 | P2 Ph3 | open |
 | 9 | Fire-and-forget task-reference idiom hand-rolled in 5 classes | AD-r9/r10 | P2 Ph4 | open |
 | 10 | Ack-retry latch cannot distinguish its own latch from a sibling's re-latch (real, narrow race; needs new state-machine exit path) | AD-r10 | P2 Ph5 | open |
@@ -74,7 +74,7 @@ When an item closes, replace `open` with `fixed <short-sha>` or `retired: <one-l
 | Pair | Parallel-safe? | Why |
 |------|----------------|-----|
 | P1 ∥ P3 | **Yes** | Disjoint files. P1 touches `scripts/{run_query_context_experiment,collect_query_context_latency,analyze_query_context_latency,query_context_common}.py` + `docs/benchmarks/*`; P3 touches `server/config.py` (guard region), `scripts/check_release_metadata.py`, `tests/test_justfile_ci_parity.py`, `scripts/eval_*.py`. No overlap. |
-| P1 ∥ P2 | **Yes on the promote path; No on the retire path.** | Promotion is data-driven (manifest + evidence files only — no server code change). Retirement deletes gating code in `server/pipeline.py`, which P2 is actively restructuring. Rule: if P1's decision is *retire*, either land the deletion before P2 Phase 2 starts, or hand the deletion to P2 as an added phase — never delete in parallel. |
+| P1 ∥ P2 | **No on either path** (corrected 2026-08-24 after P1's plan review — the original "promote is data-only" claim was false). | *Retire* is a full-chain removal (pipeline gate → unconditional `commit_display_only`, `load_promotion_manifest`/`PromotionManifest` out of `server/config.py`, `app.py` call, manifest file) overlapping P2 Phases 2-3 — land P1's retire commit before P2 Phase 2 starts; P2 Phase 3's manifest-extraction bullet then drops. *Promote* (invest path, separate plan) requires serialization: the manifest's identity binding (`source_commit`/`tree_hash`) means it must be stamped after all concurrent work merges, or re-stamped post-merge. |
 | P2 ∥ P3 | **Mostly — one same-file caveat.** | P3 Ph1 (TTS half-pair guard) and P2 Ph3 (promotion-manifest extraction) both edit `server/config.py`, in different regions (~1676-1708 vs ~340-470/667-770). Semantically independent; merge conflict is mechanical. Rule: whichever lands second rebases; prefer landing P3 Ph1 first since it's small. Everything else is disjoint. |
 
 **Recommended schedule**: start P1 and P3 immediately in parallel worktrees.
