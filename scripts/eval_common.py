@@ -65,6 +65,7 @@ __all__ = [
     "JUDGE_MAX_TOKENS",
     "JUDGE_PROBE_MAX_TOKENS",
     "MANIFEST_VERSION",
+    "OPENAI_KEY_SOURCES",
     "REPO_ROOT",
     "ROUTER_BASELINE",
     "ROUTER_CANDIDATES",
@@ -76,6 +77,7 @@ __all__ = [
     "WORKER_MANIFEST_TOOLS",
     "Candidate",
     "CollectingMeasurementSink",
+    "CredentialResolutionError",
     "build_judge_llm_service",
     "build_judge_request_kwargs",
     "build_session_for_run",
@@ -89,6 +91,7 @@ __all__ = [
     "is_registered_candidate",
     "judge_extra_kwargs",
     "latest_turn_stage_metrics",
+    "resolve_openai_api_key",
     "sanitize_reason",
     "shipped_candidates",
     "strip_control_chars",
@@ -823,6 +826,42 @@ def write_no_follow(path: Path, content: str) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     write_bytes_no_follow(path, content.encode("utf-8"))
+
+
+#: The resolution order :func:`resolve_openai_api_key` walks, spelled once so
+#: every caller's operator-facing "no key" message names the same sources.
+OPENAI_KEY_SOURCES = "checked config.toml, env-file, WEBSEARCH_OPENAI_API_KEY, and OPENAI_API_KEY"
+
+
+class CredentialResolutionError(RuntimeError):
+    """Raised when the config the credential lives in cannot be read at all.
+
+    Distinct from "resolved, but there is no key" (which is
+    :func:`resolve_openai_api_key` returning ``None``): a malformed
+    ``config.toml`` or an out-of-range port anywhere in the file makes
+    ``load_config`` raise, and a credential gate must diagnose that rather
+    than let a traceback escape a function whose contract is to return an exit
+    code (round 9 confirm pass 6, Logic Minor).
+    """
+
+
+def resolve_openai_api_key() -> str | None:
+    """Resolve the OpenAI key the same way production does: TOML -> env-file ->
+    process environment, honouring ``WEBSEARCH_OPENAI_API_KEY(_ENV)`` overrides
+    -- not a raw ``os.environ["OPENAI_API_KEY"]`` read, which false-negatives
+    for an operator whose key only lives in config.toml or an env-file.
+
+    THE shared credential gate: ``scripts/verify_eval_candidates.py`` and
+    ``scripts/run_query_context_experiment.py`` both call this rather than
+    keeping private copies, and a third live path has something to import
+    (round 9 confirm pass 6, Architecture Minor).
+    """
+    try:
+        return load_config().openai_api_key
+    except Exception as exc:
+        raise CredentialResolutionError(
+            f"load_config() failed, so no OpenAI credential could be resolved: {exc}"
+        ) from exc
 
 
 def git_head(*, cwd: Path | None = None) -> str | None:

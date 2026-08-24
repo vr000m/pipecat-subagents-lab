@@ -559,6 +559,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the OpenAI key through `load_config()` like its sibling scripts, instead
     of reading the bare `OPENAI_API_KEY` env var and reporting
     `provider_unavailable` to an operator who configured the scoped spelling.
+- Review-gauntlet round 9 (confirm pass 6) — the consolidation and gate fixes
+  above, closed for real:
+  - **Behaviour change:** the `promotion-manifest-drift` gate now requires the
+    verifier, `--verify-manifest`, and the expected path to appear in ONE
+    command's argv. Testing them against the whole step's union of shell words
+    let CI verify the *previous* release's manifest in one command while a
+    second command merely named the current path (`ls`, `test -f`,
+    `/bin/echo`, `env echo`, a `cat <<EOF` body) — the exact mention-vs-use
+    bypass rounds 7 and 8 each set out to close. Reporting commands are now
+    identified through wrappers and path spellings (`/bin/echo`, `env echo`,
+    `LC_ALL=C echo`), heredoc bodies are not treated as commands, and
+    redirection targets are not treated as arguments.
+  - **Behaviour change:** the same gate rejects a drift job whose transitive
+    `needs:` ancestor carries an `if:`. GitHub skips a job when any job it
+    needs is skipped, so an ancestor's `if: false` switched the drift check off
+    while the job itself stayed unconditional and the gate stayed green.
+    `needs:` itself is still accepted — the real workflow's `needs: test` is
+    legitimate.
+  - **Behaviour change:** `source_anchor` rejects a ref ending in a *bare* `;`.
+    The round-8 fold-back was guarded by `if parsed.params:`, and an empty
+    `params` is falsy, so `.../tree/v1.10.6;` still validated against the
+    truncated `v1.10.6`. The validator uses `urlsplit`, which performs no
+    `params` splitting at all, so there is no reconstruction step to get wrong.
+  - `_ENDPOINT_FAMILIES` rows carry a builder, so `load_config` both resolves
+    and *consumes* the registry. Round 8 consolidated resolution only: a third
+    registered family resolved correctly and was then silently dropped, its
+    configured endpoint replaced by the dataclass default, with the
+    registration scan still green. The half-pair guard reads the members
+    stored by the resolution loop instead of naming `_TTS_ENDPOINT_MEMBERS`,
+    making the registry docstring's claim true.
+  - The OpenAI credential gate lives once, in `scripts/eval_common.py`
+    (`resolve_openai_api_key`), instead of as two private copies; a config
+    defect that makes `load_config()` raise is now diagnosed as
+    `BLOCKED: provider_unavailable` with exit 1 rather than tracebacking out of
+    `run_query_context_experiment.py`'s `run_live`.
 - `scripts/eval_model_comparison.py`'s citations assertion no longer fails
   weather-query turns that were genuinely delegated and answered correctly:
   the hosted `web_search` tool answers weather via an internal `oai-weather`

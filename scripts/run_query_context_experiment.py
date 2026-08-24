@@ -360,15 +360,36 @@ def run_live(*, output: Path) -> int:
     # environment, honouring WEBSEARCH_OPENAI_API_KEY(_ENV) -- not a raw
     # `os.environ["OPENAI_API_KEY"]` read, which false-negatives for an
     # operator whose key only lives in config.toml, an env-file, or the scoped
-    # spelling. Matches scripts/verify_eval_candidates.py's
-    # `_resolve_openai_api_key` (round 8 confirm pass 5, Architecture Minor).
-    from server.config import load_config
+    # spelling (round 8 confirm pass 5, Architecture Minor).
+    #
+    # THE shared helper, not a second copy of verify_eval_candidates.py's
+    # (round 9 confirm pass 6, Architecture Minor). Imported inside the
+    # function, as the previous `server.config` import was: this module's
+    # dry-run path must not pay for `scripts.eval_common`'s pipecat runtime
+    # import, and the eval-suite layering is only entered on the live path.
+    from scripts.eval_common import (
+        OPENAI_KEY_SOURCES,
+        CredentialResolutionError,
+        resolve_openai_api_key,
+    )
 
-    if not load_config().openai_api_key:
+    # load_config() parses config.toml and validates every endpoint/port in it,
+    # so an unrelated config defect raised out of a function whose contract is
+    # to return an exit code and print a diagnosed BLOCKED line -- the raw
+    # `os.environ` read it replaced could not fail (round 9 confirm pass 6,
+    # Logic Minor).
+    try:
+        api_key = resolve_openai_api_key()
+    except CredentialResolutionError as exc:
+        print(
+            f"BLOCKED: provider_unavailable -- {exc}; writing no fabricated records to {output}",
+            file=sys.stderr,
+        )
+        return 1
+    if not api_key:
         print(
             "BLOCKED: provider_unavailable -- no OpenAI API key resolved via load_config() "
-            "(checked config.toml, env-file, WEBSEARCH_OPENAI_API_KEY, and OPENAI_API_KEY); "
-            f"writing no fabricated records to {output}",
+            f"({OPENAI_KEY_SOURCES}); writing no fabricated records to {output}",
             file=sys.stderr,
         )
         return 1

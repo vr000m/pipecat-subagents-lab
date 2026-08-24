@@ -1961,8 +1961,31 @@ def test_runner_live_gate_honours_the_scoped_openai_key_spelling(
     ``load_config()`` like ``verify_eval_candidates.py`` does.
 
     Both branches still return 1 (the live path is unwired), so what this
-    pins is WHICH message the operator sees."""
+    pins is WHICH message the operator sees.
+
+    The resolution is isolated from ambient machine state (round 9 confirm
+    pass 6, Logic Minor): ``run_live`` calls a bare ``load_config()``, which
+    reads the repo's real ``config.toml`` and default env-file, so the second
+    phase's "no key" assertion passed only because the committed
+    ``config.toml`` happens to declare none -- a developer who legitimately
+    puts a key there would see this test fail with no code change. Pinning
+    ``load_config`` to the process environment alone (``env=`` non-None skips
+    the config.toml/env-file layers entirely, see
+    ``server/config.py::load_config``) keeps the real precedence logic under
+    test while making the ONLY input the two monkeypatched variables."""
+    import os
+
+    import server.config as server_config
+    from scripts import eval_common
+
     module = _runner()
+    real_load_config = server_config.load_config
+    monkeypatch.setattr(
+        eval_common,
+        "load_config",
+        lambda: real_load_config(env=dict(os.environ)),
+    )
+    monkeypatch.delenv("WEBSEARCH_OPENAI_API_KEY_ENV", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("WEBSEARCH_OPENAI_API_KEY", "sk-scoped-test-key")
 
@@ -1978,6 +2001,58 @@ def test_runner_live_gate_honours_the_scoped_openai_key_spelling(
     monkeypatch.delenv("WEBSEARCH_OPENAI_API_KEY", raising=False)
     assert module.run_live(output=tmp_path / "live.json") == 1
     assert "provider_unavailable" in capsys.readouterr().err
+
+
+def test_runner_live_gate_diagnoses_an_unloadable_config_instead_of_tracebacking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 9 confirm pass 6, Logic Minor: resolving the credential through
+    ``load_config()`` (rather than the raw ``os.environ`` read it replaced)
+    introduced a raising path this function had never had -- ``load_config``
+    parses config.toml and validates every endpoint/port in it, so an
+    unrelated config typo aborted the run with a stack trace instead of the
+    diagnosed BLOCKED line + exit 1 that is this function's contract."""
+    import server.config as server_config
+    from scripts import eval_common
+
+    module = _runner()
+    output = tmp_path / "live.json"
+
+    def _explode() -> object:
+        raise server_config.ConfigError("WEBSEARCH_TTS_WS_PORT must be an integer")
+
+    monkeypatch.setattr(eval_common, "load_config", _explode)
+
+    assert module.run_live(output=output) == 1
+    stderr = capsys.readouterr().err
+    assert "BLOCKED: provider_unavailable" in stderr
+    assert "WEBSEARCH_TTS_WS_PORT must be an integer" in stderr
+    assert not output.exists()
+
+
+def test_the_openai_credential_gate_is_shared_not_duplicated() -> None:
+    """Round 9 confirm pass 6, Architecture Minor: the gate had been copied
+    from ``scripts/verify_eval_candidates.py`` into
+    ``scripts/run_query_context_experiment.py``, cross-referenced by comment
+    rather than shared, with the dev plan calling it 'the template whoever
+    wires the live path will copy' -- and nothing for a third copy to import.
+    ``scripts/eval_common.py`` now owns the one definition."""
+    import scripts.verify_eval_candidates as verifier
+    from scripts import eval_common
+
+    assert verifier.resolve_openai_api_key is eval_common.resolve_openai_api_key
+    assert not hasattr(verifier, "_resolve_openai_api_key"), (
+        "the private copy must be gone, not shadowed by the shared one"
+    )
+    # run_query_context_experiment imports it inside run_live (the dry-run path
+    # must not pay for eval_common's pipecat runtime import), so the binding is
+    # pinned through the module source rather than an attribute.
+    source = Path(_runner().__file__).read_text(encoding="utf-8")
+    assert "from scripts.eval_common import" in source
+    assert "resolve_openai_api_key" in source
+    assert "load_config().openai_api_key" not in source, (
+        "a second inline copy of the resolution has reappeared"
+    )
 
 
 def test_runner_dry_run_refuses_to_write_through_a_symlinked_output(

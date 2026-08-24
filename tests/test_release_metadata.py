@@ -518,7 +518,8 @@ def test_accepts_a_continue_on_error_sibling_alongside_an_armed_step(tmp_path: P
 
 
 def test_accepts_a_verifying_step_written_with_line_continuations(tmp_path: Path) -> None:
-    """Round 8 confirm pass 5, Logic Minor: `_shell_words` shlex-split each
+    """Round 8 confirm pass 5, Logic Minor: the tokeniser (`_commands`, then
+    `_shell_words`) shlex-split each
     line independently, and a line ending in `\\` raises `ValueError: No
     escaped character` -- so a CORRECT workflow written in the standard
     continuation style lost the line carrying the manifest path and was
@@ -556,6 +557,146 @@ def test_a_reporting_command_after_a_separator_does_not_hide_a_real_invocation(
         "      - name: Verify the committed promotion manifest has not drifted\n"
         "        run: echo checking && uv run python scripts/validate_v013_evidence.py "
         "--verify-manifest docs/benchmarks/v0.1.3-promotion-manifest.json\n",
+        encoding="utf-8",
+    )
+
+    assert module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path) == "0.1.3"
+
+
+@pytest.mark.parametrize(
+    "second_command",
+    [
+        pytest.param("ls -l docs/benchmarks/v0.1.3-promotion-manifest.json", id="ls"),
+        pytest.param("test -f docs/benchmarks/v0.1.3-promotion-manifest.json", id="test-f"),
+        pytest.param(
+            "/bin/echo remember docs/benchmarks/v0.1.3-promotion-manifest.json",
+            id="absolute-echo",
+        ),
+        pytest.param(
+            "env echo remember docs/benchmarks/v0.1.3-promotion-manifest.json", id="env-echo"
+        ),
+        pytest.param(
+            "LC_ALL=C echo remember docs/benchmarks/v0.1.3-promotion-manifest.json",
+            id="assignment-echo",
+        ),
+        pytest.param("cp docs/benchmarks/v0.1.3-promotion-manifest.json /tmp/x", id="cp"),
+    ],
+)
+def test_rejects_a_step_verifying_the_previous_manifest_while_another_command_names_the_current(
+    tmp_path: Path, second_command: str
+) -> None:
+    """Round 9 confirm pass 6, Security Important: `_verifies_manifest` tested
+    set-membership over the WHOLE step's shell words, so the verifier, the
+    flag, and the expected path did not have to belong to the SAME command.
+    CI could verify the PREVIOUS release's manifest and merely mention the
+    current path in any non-`echo` command, and this gate stayed green -- the
+    exact mention-vs-use bypass rounds 7 and 8 each claimed to close. The
+    `_REPORTING_COMMANDS` denylist was argv[0]-literal, so `/bin/echo` and
+    `env echo` evaded it too."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      - name: Verify the committed promotion manifest has not drifted\n"
+        "        run: |\n"
+        "          uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.2-promotion-manifest.json\n"
+        f"          {second_command}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_heredoc_body_that_merely_spells_out_a_verifier_invocation(
+    tmp_path: Path,
+) -> None:
+    """Round 9 confirm pass 6, Security Important: a heredoc BODY is data the
+    command reads, not commands the shell runs, but it tokenised into a
+    perfectly qualifying argv."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        "jobs:\n"
+        "  promotion-manifest-drift:\n"
+        "    steps:\n"
+        "      - name: Write a note\n"
+        "        run: |\n"
+        "          cat <<'EOF' > notes.txt\n"
+        "          scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.3-promotion-manifest.json\n"
+        "          EOF\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_drift_job_whose_needs_ancestor_is_switched_off(tmp_path: Path) -> None:
+    """Round 9 confirm pass 6, Security Minor: GitHub skips a job when any job
+    in its `needs:` is skipped, so an ancestor's `if: false` disables the drift
+    check entirely -- strictly stronger than the drift job's own `if:`, which
+    this gate already rejected, and invisible to a check that only inspected
+    the drift job itself."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "  promotion-manifest-drift:\n",
+            "  kill-switch:\n    if: false\n    steps: []\n"
+            "  promotion-manifest-drift:\n    needs: kill-switch\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="transitively .needs."):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_rejects_a_drift_job_whose_indirect_needs_ancestor_is_switched_off(
+    tmp_path: Path,
+) -> None:
+    """The same evasion one hop further away: the walk is transitive."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "  promotion-manifest-drift:\n",
+            "  kill-switch:\n    if: false\n    steps: []\n"
+            "  middle:\n    needs: kill-switch\n    steps: []\n"
+            "  promotion-manifest-drift:\n    needs: [middle]\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ReleaseMetadataError, match="transitively .needs."):
+        module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
+
+
+def test_accepts_an_unconditional_needs_ancestor(tmp_path: Path) -> None:
+    """`needs:` itself must NOT be rejected -- the real workflow's
+    `needs: test` is legitimate and load-bearing."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(
+        VALID_CI_YML.replace(
+            "  promotion-manifest-drift:\n",
+            "  test:\n    continue-on-error: true\n    steps: []\n"
+            "  promotion-manifest-drift:\n    needs: test\n",
+        ),
         encoding="utf-8",
     )
 

@@ -42,6 +42,7 @@ from scripts.eval_common import (
     DEFAULT_MANIFEST_RELATIVE_PATH,
     JUDGE_PROBE_MAX_TOKENS,
     MANIFEST_VERSION,
+    OPENAI_KEY_SOURCES,
     REPO_ROOT,
     ROUTER_MANIFEST_TOOLS,
     WORKER_MANIFEST_TOOLS,
@@ -52,6 +53,7 @@ from scripts.eval_common import (
     confined_output_path,
     error_text,
     git_head,
+    resolve_openai_api_key,
     write_no_follow,
 )
 from scripts.evidence_common import now_utc
@@ -394,23 +396,20 @@ def probe_judge(judge_model: str, api_key: str | None) -> ProbeResult:
 # use git_head() directly.
 
 
-def _resolve_openai_api_key() -> str | None:
-    """Resolve the OpenAI key the same way production does: TOML -> env-file ->
-    process environment, honoring WEBSEARCH_OPENAI_API_KEY(_ENV) overrides --
-    not a raw `os.environ["OPENAI_API_KEY"]` read, which would false-negative
-    for an operator whose key only lives in config.toml or an env-file."""
-    from server.config import load_config
-
-    return load_config().openai_api_key
+# _resolve_openai_api_key() hoisted to scripts/eval_common.py's
+# resolve_openai_api_key() (round 9 confirm pass 6, Architecture Minor) -- it
+# had been copied into scripts/run_query_context_experiment.py's live gate,
+# with a comment cross-referencing this one instead of sharing code, and the
+# dev plan describes it as the template a third live path would copy. One
+# definition now backs all of them.
 
 
 def run_verification(*, judge_model: str) -> tuple[list[ProbeResult], float]:
     """Execute every probe against the live API. Makes real, billed calls."""
-    api_key = _resolve_openai_api_key()
+    api_key = resolve_openai_api_key()
     if not api_key:
         raise RuntimeError(
-            "No OpenAI API key resolved via load_config() "
-            "(checked config.toml, env-file, WEBSEARCH_OPENAI_API_KEY, and OPENAI_API_KEY); "
+            f"No OpenAI API key resolved via load_config() ({OPENAI_KEY_SOURCES}); "
             "cannot run live verification probes"
         )
 

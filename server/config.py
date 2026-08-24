@@ -7,7 +7,7 @@ import json
 import os
 import re
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
@@ -1150,17 +1150,63 @@ _TTS_ENDPOINT_MEMBERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("socket", ("WEBSEARCH_TTS_WS_SOCKET",)),
     ("host_port", ("WEBSEARCH_TTS_WS_HOST", "WEBSEARCH_TTS_WS_PORT")),
 )
-#: The endpoint families, ``(config field, members)``. THE roster ``load_config``
-#: iterates to resolve them -- it no longer names the two member constants
-#: directly, so a third endpoint family declared here reaches both resolution
-#: and :func:`_families` in one edit (round 8 confirm pass 5, Architecture
-#: Minor). Only the per-member ``kwargs`` branches (which know how to turn a
-#: winning member's keys into an endpoint tuple) stay hand-written; the
-#: drift-prone part -- pairing a family's key roster with its layer computation
-#: -- is derived from here.
-_ENDPOINT_FAMILIES: tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ...] = (
-    ("stt_endpoint", _STT_ENDPOINT_MEMBERS),
-    ("tts_endpoint", _TTS_ENDPOINT_MEMBERS),
+
+
+def _build_stt_endpoint(member: str | None, values: Mapping[str, object]) -> tuple[str, str] | None:
+    """The STT endpoint the winning family member names, or ``None`` for none."""
+    if member == "endpoint":
+        return parse_endpoint(str(values["WEBSEARCH_STT_ENDPOINT"]))
+    if member == "socket":
+        return ("uds", _expand_socket(str(values["WEBSEARCH_STT_WS_SOCKET"])))
+    return None
+
+
+def _build_tts_endpoint(member: str | None, values: Mapping[str, object]) -> tuple[str, str] | None:
+    """The TTS endpoint the winning family member names, or ``None`` for none.
+
+    Raises ``ConfigError`` for a ``host_port`` member whose port is not an
+    integer in range -- the same loud failure every other malformed endpoint
+    input here gets, rather than a silent fall-through to the packaged default.
+    """
+    if member == "endpoint":
+        return parse_endpoint(str(values["WEBSEARCH_TTS_ENDPOINT"]))
+    if member == "uri":
+        return parse_endpoint(str(values["WEBSEARCH_TTS_WS_URI"]))
+    if member == "socket":
+        return ("uds", _expand_socket(str(values["WEBSEARCH_TTS_WS_SOCKET"])))
+    if member == "host_port":
+        try:
+            port = int(str(values.get("WEBSEARCH_TTS_WS_PORT")))
+        except ValueError as exc:
+            raise ConfigError("WEBSEARCH_TTS_WS_PORT must be an integer") from exc
+        if not 1 <= port <= 65_535:
+            raise ConfigError("WEBSEARCH_TTS_WS_PORT must be between 1 and 65535")
+        return ("ws", f"{values.get('WEBSEARCH_TTS_WS_HOST')}:{port}")
+    return None
+
+
+#: The endpoint families, ``(config field, members, builder)``. THE roster
+#: ``load_config`` iterates to resolve them AND to consume the result -- it no
+#: longer names the member constants directly, so a third endpoint family
+#: declared here reaches resolution, consumption, and :func:`_families` in one
+#: edit (round 8 confirm pass 5 / round 9 confirm pass 6, Architecture).
+#:
+#: The builder is what closes the consumption half: with the per-member
+#: ``kwargs`` branches left hand-written, a newly registered family resolved
+#: correctly and was then silently dropped, because nothing read its entry back
+#: out and the operator's configured endpoint was replaced by the dataclass
+#: default. A row without a builder is now a declaration-site omission
+#: (a missing tuple element), not a silent runtime one.
+_ENDPOINT_FAMILIES: tuple[
+    tuple[
+        str,
+        tuple[tuple[str, tuple[str, ...]], ...],
+        Callable[[str | None, Mapping[str, object]], tuple[str, str] | None],
+    ],
+    ...,
+] = (
+    ("stt_endpoint", _STT_ENDPOINT_MEMBERS, _build_stt_endpoint),
+    ("tts_endpoint", _TTS_ENDPOINT_MEMBERS, _build_tts_endpoint),
 )
 
 #: The env var naming the OpenAI family's bare spelling when the operator has
@@ -1235,10 +1281,14 @@ def _families() -> tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ..
     this registry. ``test_every_endpoint_member_constant_is_registered``
     additionally scans the module for a ``_*_ENDPOINT_MEMBERS`` constant that
     never reached ``_ENDPOINT_FAMILIES`` (round 8 confirm pass 5,
-    Architecture Minor).
+    Architecture Minor), and
+    ``test_load_config_consumes_every_registered_endpoint_family`` pins that
+    every registered row's builder is invoked and its result reaches the
+    named Config field -- the half a naming-convention scan cannot see
+    (round 9 confirm pass 6, Architecture Important).
     """
     return (
-        *_ENDPOINT_FAMILIES,
+        *((field, members) for field, members, _build in _ENDPOINT_FAMILIES),
         *((field, _widen_members(members)) for field, members in _alias_families()),
     )
 
@@ -1614,27 +1664,31 @@ def load_config(
     # operator's highest-precedence override had replaced. This closes the gap
     # _clear_inherited_reasoning_effort's docstring signposted.
     #
-    # Resolved by iterating `_ENDPOINT_FAMILIES` rather than naming the two
-    # member constants here: pairing a family's key roster with its layer
-    # computation is the drift-prone step, so a third endpoint family declared
-    # in that registry is resolved without a second edit (round 8 confirm
-    # pass 5, Architecture Minor). Only the per-member branches below, which
-    # know how each member's keys become an endpoint tuple, stay explicit.
-    endpoint_resolution: dict[str, tuple[str | None, dict[str, int]]] = {}
-    for family_name, family_members in _ENDPOINT_FAMILIES:
+    # Both RESOLVED and CONSUMED by iterating `_ENDPOINT_FAMILIES` rather than
+    # naming the member constants here: pairing a family's key roster with its
+    # layer computation is one drift-prone step, and reading the resolved
+    # winner back out into `kwargs` is the other. A registry row resolved by
+    # the loop but consumed by a hand-written `kwargs["..."]` branch was
+    # silently dropped for any family whose branch nobody wrote (round 8
+    # confirm pass 5 / round 9 confirm pass 6, Architecture).
+    #
+    # The members are STORED alongside the winner, not re-fetched from the
+    # module constant: the half-pair guard below was the last consumer still
+    # naming `_TTS_ENDPOINT_MEMBERS` directly, contradicting the registry
+    # docstring (round 9 confirm pass 6, Architecture Minor).
+    endpoint_resolution: dict[
+        str, tuple[str | None, dict[str, int], tuple[tuple[str, tuple[str, ...]], ...]]
+    ] = {}
+    for family_name, family_members, _build in _ENDPOINT_FAMILIES:
         family_layers = _family_layers(values, layer_maps, _family_keys(family_members))
         endpoint_resolution[family_name] = (
             _winning_family_member(values, family_layers, family_members),
             family_layers,
+            family_members,
         )
-    stt_member, _stt_layers = endpoint_resolution["stt_endpoint"]
-    if stt_member == "endpoint":
-        kwargs["stt_endpoint"] = parse_endpoint(str(values["WEBSEARCH_STT_ENDPOINT"]))
-    elif stt_member == "socket":
-        kwargs["stt_endpoint"] = ("uds", _expand_socket(str(values["WEBSEARCH_STT_WS_SOCKET"])))
     tts_host = values.get("WEBSEARCH_TTS_WS_HOST")
     tts_port = values.get("WEBSEARCH_TTS_WS_PORT")
-    tts_member, tts_layers = endpoint_resolution["tts_endpoint"]
+    tts_member, tts_layers, tts_members = endpoint_resolution["tts_endpoint"]
     if _family_key_set(tts_host) != _family_key_set(tts_port):
         # Half a pair is malformed input, and every other malformed endpoint
         # input here is loud (non-integer port, out-of-range port). Falling
@@ -1651,24 +1705,14 @@ def load_config(
         half_pair_layer = max(
             tts_layers["WEBSEARCH_TTS_WS_HOST"], tts_layers["WEBSEARCH_TTS_WS_PORT"]
         )
-        if half_pair_layer > _winning_family_layer(tts_layers, _TTS_ENDPOINT_MEMBERS, tts_member):
+        if half_pair_layer > _winning_family_layer(tts_layers, tts_members, tts_member):
             raise ConfigError(
                 "WEBSEARCH_TTS_WS_HOST and WEBSEARCH_TTS_WS_PORT must be set together"
             )
-    if tts_member == "endpoint":
-        kwargs["tts_endpoint"] = parse_endpoint(str(values["WEBSEARCH_TTS_ENDPOINT"]))
-    elif tts_member == "uri":
-        kwargs["tts_endpoint"] = parse_endpoint(str(values["WEBSEARCH_TTS_WS_URI"]))
-    elif tts_member == "socket":
-        kwargs["tts_endpoint"] = ("uds", _expand_socket(str(values["WEBSEARCH_TTS_WS_SOCKET"])))
-    elif tts_member == "host_port":
-        try:
-            port = int(str(tts_port))
-        except ValueError as exc:
-            raise ConfigError("WEBSEARCH_TTS_WS_PORT must be an integer") from exc
-        if not 1 <= port <= 65_535:
-            raise ConfigError("WEBSEARCH_TTS_WS_PORT must be between 1 and 65535")
-        kwargs["tts_endpoint"] = ("ws", f"{tts_host}:{port}")
+    for family_name, _family_members, build_endpoint in _ENDPOINT_FAMILIES:
+        endpoint = build_endpoint(endpoint_resolution[family_name][0], values)
+        if endpoint is not None:
+            kwargs[family_name] = endpoint
     return Config(**kwargs)
 
 

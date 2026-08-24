@@ -18,7 +18,8 @@ import re
 import shlex
 import sys
 import tomllib
-from pathlib import Path
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -106,16 +107,37 @@ def check_no_hardcoded_version_literals(scripts_dir: Path, version: str) -> None
 
 
 #: Commands that report rather than consume: a path passed to one of these is
-#: a message about the manifest, never a use of it. Words belonging to such a
-#: command are discarded, because tokenising alone cannot tell a mention from a
-#: use -- ``echo Regenerate docs/benchmarks/...json when bumping`` (unquoted)
-#: yields the path as its own shell word and satisfied the gate
-#: (round 8 confirm pass 5, Security Minor).
+#: a message about the manifest, never a use of it. Such a command is skipped
+#: entirely, because tokenising alone cannot tell a mention from a use --
+#: ``echo Regenerate docs/benchmarks/...json when bumping`` (unquoted) yields
+#: the path as its own shell word and satisfied the gate
+#: (round 8 confirm pass 5, Security Minor). This is now defence in depth
+#: rather than the primary decision: :func:`_verifies_manifest` requires the
+#: verifier, its flag, and the path to belong to ONE command's argv, which an
+#: ``echo`` cannot satisfy without literally being handed all three
+#: (round 9 confirm pass 6, Security Important).
 _REPORTING_COMMANDS = frozenset({"echo", "printf", ":", "true", "false"})
+
+#: Wrapper programs that run another command: the *effective* command name is
+#: the first word past them (``env echo x`` is an ``echo``). Matched together
+#: with basename normalisation and ``VAR=value`` prefix skipping so
+#: ``/bin/echo``, ``env echo``, and ``LC_ALL=C echo`` are all recognised as
+#: ``echo`` (round 9 confirm pass 6, Security Important).
+_COMMAND_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "nohup", "time", "sudo"})
 
 #: Tokens ``shlex`` emits (with ``punctuation_chars``) that end one command and
 #: begin another, so ``echo hi && uv run x.py path`` keeps ``path``.
 _COMMAND_SEPARATORS = frozenset({";", "|", "||", "&", "&&", "(", ")"})
+
+#: Redirection operators: the word after one names a file the shell opens, not
+#: an argument the command was invoked with, so neither is part of the argv.
+_REDIRECTIONS = frozenset({"<", ">", ">>", "<<", "<<<", ">|", "<>", "&>", "&>>"})
+
+#: A heredoc introducer (``<<EOF``, ``<<-'EOF'``). Its BODY is data the command
+#: reads, not commands the shell runs -- a body line spelling out a verifier
+#: invocation would otherwise tokenise into a qualifying argv
+#: (round 9 confirm pass 6, Security Important).
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def _tokenise(text: str) -> list[str]:
@@ -128,16 +150,36 @@ def _tokenise(text: str) -> list[str]:
     return list(lexer)
 
 
-def _shell_words(command: str) -> set[str]:
-    """The shell words of a workflow ``run:`` script that a command consumes.
+def _without_heredoc_bodies(lines: list[str]) -> list[str]:
+    """``lines`` with every heredoc body dropped, introducer lines kept."""
+    kept: list[str] = []
+    delimiter: str | None = None
+    for line in lines:
+        if delimiter is not None:
+            if line.strip() == delimiter:
+                delimiter = None
+            continue
+        match = _HEREDOC_RE.search(line)
+        if match:
+            delimiter = match.group(2)
+        kept.append(line)
+    return kept
+
+
+def _commands(command: str) -> list[list[str]]:
+    """The argv lists of every command in a workflow ``run:`` script.
 
     Tokenising rather than substring-matching is what stops a ``#`` comment or
     a *quoted* ``echo`` message from satisfying the manifest-path gate: shlex
     drops comments outright, and a path mentioned inside a quoted sentence
-    comes back as one long word that cannot equal the path. Tokenising alone
-    does not close the *unquoted* spelling of the same reminder, though, so
-    words belonging to a command whose ``argv[0]`` is in
-    ``_REPORTING_COMMANDS`` are dropped as well.
+    comes back as one long word that cannot equal the path.
+
+    Returning one argv list PER COMMAND rather than a step-wide union of words
+    is what stops the three tokens the gate looks for from being contributed by
+    three different commands: verifying the *previous* release's manifest in
+    one command and merely naming the current path in a second (``ls``,
+    ``test -f``, ``/bin/echo``) satisfied the union form while the drift check
+    ran against the wrong file (round 9 confirm pass 6, Security Important).
 
     Line continuations are joined before tokenising: a ``run: |`` script
     written in the standard ``\\``-continued style put the manifest path on a
@@ -149,24 +191,51 @@ def _shell_words(command: str) -> set[str]:
     plain whitespace and would otherwise let one line's ``echo`` swallow the
     next line's command. A line shlex still cannot tokenise (an unbalanced
     quote -- including one legitimately opened on one line and closed on the
-    next) contributes no words rather than raising, so one malformed step
+    next) contributes nothing rather than raising, so one malformed step
     cannot mask a well-formed sibling that does reference the manifest.
     """
-    words: set[str] = set()
-    for line in command.replace("\\\n", " ").splitlines():
+    commands: list[list[str]] = []
+    lines = _without_heredoc_bodies(command.replace("\\\n", " ").splitlines())
+    for line in lines:
         try:
             tokens = _tokenise(line)
         except ValueError:
             continue
         argv: list[str] = []
+        drop_next = False
         for token in [*tokens, ";"]:
+            if drop_next:
+                drop_next = False
+                continue
+            if token in _REDIRECTIONS:
+                drop_next = True
+                continue
             if token in _COMMAND_SEPARATORS:
-                if argv and argv[0] not in _REPORTING_COMMANDS:
-                    words.update(argv)
+                if argv:
+                    commands.append(argv)
                 argv = []
             else:
                 argv.append(token)
-    return words
+    return commands
+
+
+def _command_name(argv: list[str]) -> str:
+    """The basename of the program ``argv`` actually invokes, or ``""``.
+
+    ``VAR=value`` assignment prefixes, wrapper programs (:data:`_COMMAND_WRAPPERS`)
+    and their flags are stepped over, and the result is basenamed, so
+    ``/bin/echo``, ``env -i echo`` and ``LC_ALL=C echo`` all answer ``echo``.
+    """
+    for token in argv:
+        if "=" in token and token.split("=", 1)[0].isidentifier():
+            continue
+        if token.startswith("-"):
+            continue
+        name = PurePosixPath(token).name
+        if name in _COMMAND_WRAPPERS:
+            continue
+        return name
+    return ""
 
 
 #: The script (and its flag) whose invocation is what actually proves the
@@ -194,9 +263,54 @@ def _is_truthy(raw: object) -> bool:
 
 
 def _verifies_manifest(command: str, expected: str) -> bool:
-    """Whether ``command`` actually runs the drift verifier against ``expected``."""
-    words = _shell_words(command)
-    return {_MANIFEST_VERIFIER, _VERIFY_MANIFEST_FLAG, expected} <= words
+    """Whether ``command`` actually runs the drift verifier against ``expected``.
+
+    The verifier, its flag, and the expected path must co-occur in ONE
+    command's argv. Testing set-membership against the step-wide union of
+    words let the three be supplied by three different commands: a step that
+    verified the *previous* release's manifest and then merely named the
+    current path in a second command passed, while the drift check ran against
+    the wrong file (round 9 confirm pass 6, Security Important).
+    """
+    required = {_MANIFEST_VERIFIER, _VERIFY_MANIFEST_FLAG, expected}
+    return any(
+        _command_name(argv) not in _REPORTING_COMMANDS
+        and required <= {word.removeprefix("./") for word in argv}
+        for argv in _commands(command)
+    )
+
+
+def _conditional_needs_ancestor(jobs: Mapping[str, object], job_name: str) -> str | None:
+    """The name of a transitive ``needs:`` ancestor of ``job_name`` that is
+    itself switchable (carries an ``if:``), or is missing from the workflow.
+
+    GitHub skips a job when any job in its ``needs:`` is skipped, so an
+    ancestor's ``if: false`` disables the drift gate as completely as the drift
+    job's own would -- and the job still exists, unconditional, so the
+    job-level checks stay green (round 9 confirm pass 6, Security Minor).
+
+    ``needs:`` itself is emphatically NOT rejected: the real workflow's
+    ``needs: test`` is legitimate and load-bearing. Only ancestor
+    *conditionality* is. ``continue-on-error`` on an ancestor is likewise
+    fine -- it makes the ancestor succeed, which lets the dependent run.
+    """
+    seen: set[str] = set()
+    pending = [job_name]
+    while pending:
+        current = pending.pop()
+        job = jobs.get(current)
+        needs = job.get("needs") if isinstance(job, dict) else None
+        for name in (
+            [needs] if isinstance(needs, str) else (needs if isinstance(needs, list) else [])
+        ):
+            if not isinstance(name, str) or name in seen:
+                continue
+            seen.add(name)
+            ancestor = jobs.get(name)
+            if not isinstance(ancestor, dict) or "if" in ancestor:
+                return name
+            pending.append(name)
+    return None
 
 
 def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version: str) -> None:
@@ -248,8 +362,23 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
       *quoted* echo bypass; ``run: echo Regenerate docs/benchmarks/...json
       when bumping`` yields the path as its own word. Requiring the verifier
       invocation checks a USE of the path rather than a mention (and
-      :func:`_shell_words` additionally drops words belonging to ``echo``-like
-      reporting commands).
+      :func:`_command_name` additionally identifies ``echo``-like reporting
+      commands through wrappers and path spellings).
+
+    None of THAT was enough either, so (round 9 confirm pass 6, Security
+    Important + Minor):
+
+    * the verifier, its flag, and the expected path must co-occur in ONE
+      command's argv (:func:`_commands`). Set-membership over the step-wide
+      union of words let a step verify the PREVIOUS release's manifest in one
+      command and merely name the current path in a second (``ls``,
+      ``test -f``, ``/bin/echo``, a ``cat <<EOF`` body) -- the exact
+      mention-vs-use bypass the paragraph above claims to have closed.
+    * a transitive ``needs:`` ancestor carrying an ``if:`` is rejected. GitHub
+      skips a job when any job it needs is skipped, so an ancestor's
+      ``if: false`` disables this gate while the drift job itself stays
+      unconditional and green. ``needs:`` itself is not rejected -- the real
+      workflow's ``needs: test`` is legitimate.
 
     Not checked, deliberately: the workflow's ``on:`` triggers. Which events
     run CI is a routine, legitimately-varying choice (this repo's gates run on
@@ -267,8 +396,9 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
         workflow = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ReleaseMetadataError(f"{ci_yml_path}: invalid YAML: {exc}") from exc
-    jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
-    job = jobs.get(_MANIFEST_DRIFT_JOB) if isinstance(jobs, dict) else None
+    raw_jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
+    jobs: dict[str, object] = raw_jobs if isinstance(raw_jobs, dict) else {}
+    job = jobs.get(_MANIFEST_DRIFT_JOB)
     if not isinstance(job, dict):
         raise ReleaseMetadataError(
             f"{ci_yml_path}: no `{_MANIFEST_DRIFT_JOB}` job -- the gate that proves the "
@@ -286,6 +416,14 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
             f"`continue-on-error: {job['continue-on-error']!r}` -- the drift check would run, "
             "report drift, and leave the workflow green, which disables the gate as "
             "completely as `if: false`"
+        )
+    switchable_ancestor = _conditional_needs_ancestor(jobs, _MANIFEST_DRIFT_JOB)
+    if switchable_ancestor is not None:
+        raise ReleaseMetadataError(
+            f"{ci_yml_path}: the `{_MANIFEST_DRIFT_JOB}` job transitively `needs:` "
+            f"`{switchable_ancestor}`, which is itself conditional or missing -- GitHub skips a "
+            "job when any job it needs is skipped, so that ancestor can switch the drift check "
+            "off while this gate stays green"
         )
     steps = job.get("steps")
     expected = f"docs/benchmarks/v{version}-promotion-manifest.json"

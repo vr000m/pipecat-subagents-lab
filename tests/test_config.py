@@ -2309,7 +2309,18 @@ class TestReasoningEffortInheritance:
         """A `_*_ENDPOINT_MEMBERS` constant that never reached
         `_ENDPOINT_FAMILIES` would be resolved by nothing and enumerated by
         nothing -- `load_config` iterates that registry, so an unregistered
-        family is simply dead (round 8 confirm pass 5, Architecture Minor)."""
+        family is simply dead (round 8 confirm pass 5, Architecture Minor).
+
+        A naming-convention scan can only see constants that FOLLOW the
+        convention, so this is deliberately the weaker half of a pair:
+        `test_load_config_consumes_every_registered_endpoint_family` below
+        catches a registered family that never reaches `kwargs` regardless of
+        what its member constant is called, or whether it is a module constant
+        at all (round 9 confirm pass 6, Architecture Minor).
+
+        Comparison is by VALUE, not `id()`: a constant registered as an
+        equal-but-distinct tuple literal is registered, and reporting it as
+        missing would be a confusing failure mode for a backstop test."""
         import server.config as _config_module
 
         declared = {
@@ -2318,13 +2329,63 @@ class TestReasoningEffortInheritance:
             if name.startswith("_") and name.endswith("_ENDPOINT_MEMBERS")
         }
         assert declared, "no `_*_ENDPOINT_MEMBERS` constants found -- has the naming changed?"
-        registered = {id(members) for _field, members in _config_module._ENDPOINT_FAMILIES}
-        unregistered = sorted(
-            name for name, value in declared.items() if id(value) not in registered
-        )
+        registered = [members for _field, members, _build in _config_module._ENDPOINT_FAMILIES]
+        unregistered = sorted(name for name, value in declared.items() if value not in registered)
         assert not unregistered, (
             f"{unregistered} declared but absent from _ENDPOINT_FAMILIES -- "
             "load_config resolves only what that registry names"
+        )
+
+    def test_load_config_consumes_every_registered_endpoint_family(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 9 confirm pass 6, Architecture Important: `_ENDPOINT_FAMILIES`
+        consolidated RESOLUTION but not CONSUMPTION. `load_config` looped the
+        registry to compute each family's winner and then read only the two
+        hand-written literals `endpoint_resolution["stt_endpoint"]` /
+        `["tts_endpoint"]` back out, so a third registered family resolved
+        correctly and was then silently dropped -- the operator's configured
+        endpoint replaced by the dataclass default, with the registration scan
+        above still green.
+
+        This pins the invariant that actually matters: every registered row's
+        builder is invoked, and what it returns lands on the Config field the
+        row names."""
+        import server.config as _config_module
+
+        original = _config_module._ENDPOINT_FAMILIES
+        called: list[str] = []
+        sentinel = ("ws", "sentinel.invalid:9")
+
+        def _wrap(
+            field: str,
+            build: object,
+        ) -> object:
+            def _wrapped(member: str | None, values: object) -> object:
+                called.append(field)
+                # The first row's builder is replaced outright so the return
+                # value can be traced to the field it was registered under.
+                if field == original[0][0]:
+                    return sentinel
+                return build(member, values)  # type: ignore[operator]
+
+            return _wrapped
+
+        monkeypatch.setattr(
+            _config_module,
+            "_ENDPOINT_FAMILIES",
+            tuple((field, members, _wrap(field, build)) for field, members, build in original),
+        )
+
+        config = _config_module.load_config(env={})
+
+        assert called == [field for field, _members, _build in original], (
+            "load_config must invoke every registered family's builder, in registry order -- "
+            "a row it never consumes resolves and then vanishes"
+        )
+        assert getattr(config, original[0][0]) == sentinel, (
+            f"the builder registered for {original[0][0]!r} returned a value that never "
+            "reached that Config field"
         )
 
 

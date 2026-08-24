@@ -715,7 +715,13 @@ so `scripts/check_release_metadata.py` additionally asserts the workflow still
 points at `docs/benchmarks/v{version}-promotion-manifest.json` for the current
 `pyproject.toml` version — a version bump that forgot the workflow would
 otherwise keep verifying the previous release's manifest and report green about
-a file nothing consumes. Reproduce the job locally with `just verify-manifest`.
+a file nothing consumes. What it looks for is a genuine *use* of that path: the
+verifier, `--verify-manifest`, and the path must appear in one command's argv,
+so naming the path in a neighbouring `echo`/`ls`/heredoc does not satisfy the
+gate. It also rejects an `if:`/`continue-on-error:` on the drift job or its only
+verifying step, and an `if:` on any job the drift job transitively `needs:`
+(a skipped dependency skips the drift check). Reproduce the job locally with
+`just verify-manifest`.
 
 To regenerate locally, export the same identity from a clean checkout and run
 the writer by hand:

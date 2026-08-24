@@ -633,6 +633,16 @@ _GH = f"https://github.com/pipecat-ai/{_LEAF}"
         # branch` (`;` is a legal git ref character).
         f"{_GH}/tree/v{PINNED_PACKAGE_VERSION};attacker-branch",
         f"{_GH}/releases/tag/{PINNED_PACKAGE_VERSION};attacker-branch",
+        # Round 9 confirm pass 6, Logic/Security Minor: the round-8 fold-back
+        # was guarded by `if parsed.params:`, and a BARE trailing `;` gives an
+        # empty (falsy) `params` -- so the truncated segment was compared and
+        # `v1.10.6;` (a distinct, creatable git ref) validated as `v1.10.6`.
+        # `urlsplit` does no params splitting at all, so the `;` stays put.
+        f"{_GH}/tree/v{PINNED_PACKAGE_VERSION};",
+        f"{_GH}/releases/tag/{PINNED_PACKAGE_VERSION};",
+        f"{_GH}/commit/{PINNED_PACKAGE_VERSION};",
+        # A `;` in a non-final segment was never in `params`, and still is not.
+        f"{_GH}/tree/v{PINNED_PACKAGE_VERSION};/index.js",
     ],
 )
 def test_validator_rejects_a_source_anchor_whose_version_segment_is_not_the_ref(
