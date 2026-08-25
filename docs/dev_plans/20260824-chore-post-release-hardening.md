@@ -1,6 +1,6 @@
 # Task: Post-Release Hardening — Gauntlet Caveats + Eval Minors (P3)
 
-**Status**: Not Started
+**Status**: In Progress — Phase 1 complete
 **Component**: tooling
 **Assigned to**: Claude
 **Priority**: Medium
@@ -163,9 +163,9 @@ sufficient.
 **Test command:** `uv run pytest -q tests/test_config.py`
 **Goal:** The guard cannot silently drift from the registry — the key-string literals become registry-derived, or a parity test fails when guard and registry disagree.
 
-- [ ] Read the guard (`:1676-1708`) and the registry row (`:1151`); pick derivation vs parity-test for the literal residue (smaller correct change wins).
-- [ ] Implement; add the drift test.
-- [ ] Land-order note: P2 Phase 3 also edits `server/config.py` — prefer landing this first (program matrix). This is P3's **only** `server/config.py` edit (Phase 3 makes none), so no later same-file race with P2 re-opens.
+- [x] Read the guard (`:1676-1708`) and the registry row (`:1151`); pick derivation vs parity-test for the literal residue (smaller correct change wins).
+- [x] Implement; add the drift test.
+- [x] Land-order note: P2 Phase 3 also edits `server/config.py` — prefer landing this first (program matrix). This is P3's **only** `server/config.py` edit (Phase 3 makes none), so no later same-file race with P2 re-opens.
 
 ### Phase 2: Release-metadata + drift-gate closure
 
@@ -205,8 +205,10 @@ sufficient.
 
 ## Progress
 
-- [ ] Phase 1: Registry-driven TTS half-pair guard
+- [x] Phase 1: Registry-driven TTS half-pair guard
 - [ ] Phase 2: Release-metadata + drift-gate closure
 - [ ] Phase 3: Eval-suite verification + minors
 
 ## Findings
+
+- 2026-08-26 Phase 1: chose **derivation** over parity-test (smaller correct change): the guard now pulls the pair's key names from the registry row's `host_port` member (already stored in `endpoint_resolution`) — literals at old `:1689-1690/:1706/:1710` gone; unpack fails loudly on arity drift; guard skips when no `host_port` member exists. Drift test `test_half_pair_guard_names_the_registry_pair_keys` reads the pair from `_TTS_ENDPOINT_MEMBERS` and matches the error message against those keys. `tests/test_config.py` 174 passed; ruff + mypy clean. Requirement 1 met.

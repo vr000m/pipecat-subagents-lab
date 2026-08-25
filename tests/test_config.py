@@ -2541,6 +2541,19 @@ class TestEndpointFamilyLayerPrecedence:
         with pytest.raises(ConfigError, match="must be set together"):
             load_config(config_file=config_file, env={"WEBSEARCH_TTS_WS_HOST": "127.0.0.1"})
 
+    def test_half_pair_guard_names_the_registry_pair_keys(self) -> None:
+        """P3 Phase 1 (program row 13): the half-pair guard derives its key
+        names from the registry row (the `host_port` member of
+        `_TTS_ENDPOINT_MEMBERS`) instead of hand-written literals. Reading the
+        pair from the registry here means a renamed or regrown row makes this
+        test fail loudly instead of the guard silently checking stale keys."""
+        from server.config import _TTS_ENDPOINT_MEMBERS
+
+        (pair,) = [keys for name, keys in _TTS_ENDPOINT_MEMBERS if name == "host_port"]
+        host_key, port_key = pair
+        with pytest.raises(ConfigError, match=rf"{host_key} and {port_key} must be set together"):
+            load_config(env={host_key: "127.0.0.1"})
+
     def test_explicit_zero_port_reaches_the_range_validator(self, tmp_path) -> None:
         """Round 6 confirm pass 3, Logic Minor: TOML supplies real integers, so
         a truthiness presence test read an explicit `tts_ws_port = 0` as an

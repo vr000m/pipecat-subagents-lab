@@ -1686,29 +1686,32 @@ def load_config(
             family_layers,
             family_members,
         )
-    tts_host = values.get("WEBSEARCH_TTS_WS_HOST")
-    tts_port = values.get("WEBSEARCH_TTS_WS_PORT")
     tts_member, tts_layers, tts_members = endpoint_resolution["tts_endpoint"]
-    if _family_key_set(tts_host) != _family_key_set(tts_port):
-        # Half a pair is malformed input, and every other malformed endpoint
-        # input here is loud (non-integer port, out-of-range port). Falling
-        # through the chain silently substituted the dataclass default endpoint.
-        #
-        # Raised only when the half-pair would otherwise have WON the family --
-        # i.e. it sits at a strictly higher layer than the winning member (a
-        # same-layer stray loses to the documented key priority, exactly as a
-        # complete pair would). Firing unconditionally turned a config that
-        # booted fine into a startup failure: a leftover `[tts] tts_ws_host` in
-        # config.toml is simply not consulted once `WEBSEARCH_TTS_ENDPOINT` is
-        # exported in the environment, and never was (round 6 confirm pass 3,
-        # Logic Important).
-        half_pair_layer = max(
-            tts_layers["WEBSEARCH_TTS_WS_HOST"], tts_layers["WEBSEARCH_TTS_WS_PORT"]
-        )
-        if half_pair_layer > _winning_family_layer(tts_layers, tts_members, tts_member):
-            raise ConfigError(
-                "WEBSEARCH_TTS_WS_HOST and WEBSEARCH_TTS_WS_PORT must be set together"
-            )
+    # The pair's key names come from the registry row itself (the `host_port`
+    # member of `_TTS_ENDPOINT_MEMBERS`), never from string literals here: the
+    # guard cannot drift from the registry, and a row renamed or regrown to a
+    # different arity fails loudly at the unpack below.
+    tts_pair = next((keys for name, keys in tts_members if name == "host_port"), None)
+    if tts_pair is not None:
+        tts_host_key, tts_port_key = tts_pair
+        tts_host = values.get(tts_host_key)
+        tts_port = values.get(tts_port_key)
+        if _family_key_set(tts_host) != _family_key_set(tts_port):
+            # Half a pair is malformed input, and every other malformed endpoint
+            # input here is loud (non-integer port, out-of-range port). Falling
+            # through the chain silently substituted the dataclass default endpoint.
+            #
+            # Raised only when the half-pair would otherwise have WON the family --
+            # i.e. it sits at a strictly higher layer than the winning member (a
+            # same-layer stray loses to the documented key priority, exactly as a
+            # complete pair would). Firing unconditionally turned a config that
+            # booted fine into a startup failure: a leftover `[tts] tts_ws_host` in
+            # config.toml is simply not consulted once `WEBSEARCH_TTS_ENDPOINT` is
+            # exported in the environment, and never was (round 6 confirm pass 3,
+            # Logic Important).
+            half_pair_layer = max(tts_layers[tts_host_key], tts_layers[tts_port_key])
+            if half_pair_layer > _winning_family_layer(tts_layers, tts_members, tts_member):
+                raise ConfigError(f"{tts_host_key} and {tts_port_key} must be set together")
     for family_name, _family_members, build_endpoint in _ENDPOINT_FAMILIES:
         endpoint = build_endpoint(endpoint_resolution[family_name][0], values)
         if endpoint is not None:
