@@ -59,9 +59,9 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 13 | TTS half-pair guard hand-written, not registry-driven (`server/config.py:1676-1708`) | RG-r9 | P3 Ph1 | open |
 | 14 | `check_release_metadata.py` manifest-verify false-negative on indirect shell invocation (fail-closed, not live in ci.yml) | RG-r9 | P3 Ph2 | open |
 | 15 | ci.yml drift-gate class structurally open-ended (YAML-intent parsing vs observed-behavior assertion) | RG-r9 | P3 Ph2 | open |
-| 16 | Eval manifest-staleness heuristic: exact `source_commit` equality trips after every commit (override flag exists) | ES | P3 Ph3 | open |
-| 17 | Effort-policy labels not cross-validated against registered model labels (typos silently accepted) | ES | P3 Ph3 | open |
-| 18 | Env-var coverage gaps: 2 reasoning-effort env vars untested; README env-var docs stale | ES | P3 Ph3 | open |
+| 16 | Eval manifest-staleness heuristic: exact `source_commit` equality trips after every commit — P3 review found this is a documented fail-closed whole-tree-attestation decision with the override flag as its sanctioned valve; P3 Ph3 records a go/no-go (retire vs explicit reversal), not a presumed relaxation | ES | P3 Ph3 (decision) | open |
+| 17 | Effort-policy labels not cross-validated (typos silently accepted) — premise stale: P3 review verified the validation already exists (`server/config.py:236-259` + tests); P3 Ph3 verifies and retires with citation | ES | P3 Ph3 (verify) | open |
+| 18 | Env-var coverage gaps: 2 reasoning-effort env vars untested; README stale — premise stale: P3 review verified both vars are tested incl. the empty-string pin (`tests/test_config.py:2019-2030`); P3 Ph3 verifies README against the pinned semantics and retires with citation | ES | P3 Ph3 (verify) | open |
 | 19 | Policy-dict wholesale-replacement semantics + effort-display-vs-effective-value + truncated-cell reporting (Phase-2 minors) | ES | P3 Ph3 | open |
 | 20 | Query-context narrowing implemented but `promotion_eligible=false` (`reason=real_stratum_missing`) — no paid evidence ever collected | AD Phase 4 | P1 (all) | open |
 
