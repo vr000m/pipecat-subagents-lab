@@ -174,10 +174,10 @@ sufficient.
 **Test command:** `uv run pytest -q tests/test_release_metadata.py tests/test_justfile_ci_parity.py`
 **Goal:** Both round-9 caveats end as decided boundaries, not open-ended TODOs — each with a test that pins the decision.
 
-- [ ] Manifest-verify (Requirement 2): pin fail-closed on indirect invocation — test + comment naming the accepted false-negative; add the direct-invocation-detection regression test.
-- [ ] Land-order note: P1's retire path later removes the ci.yml manifest-write step, `justfile:41`, and `check_release_metadata.py:429`'s manifest requirement — land this phase first so P1 rebases over pinned, decided behavior rather than racing it.
-- [ ] Drift-gate decision gate (Requirement 3): choose scoped-parser (default, in-footprint) vs behavior-assertion (requires program-matrix update landing **first**, per invariant 2 — record the decision in Findings before writing code).
-- [ ] Implement the chosen branch + test; document the covered/uncovered axes where the check lives.
+- [x] Manifest-verify (Requirement 2): pin fail-closed on indirect invocation — test + comment naming the accepted false-negative; add the direct-invocation-detection regression test.
+- [x] Land-order note: P1's retire path later removes the ci.yml manifest-write step, `justfile:41`, and `check_release_metadata.py:429`'s manifest requirement — land this phase first so P1 rebases over pinned, decided behavior rather than racing it.
+- [x] Drift-gate decision gate (Requirement 3): choose scoped-parser (default, in-footprint) vs behavior-assertion (requires program-matrix update landing **first**, per invariant 2 — record the decision in Findings before writing code).
+- [x] Implement the chosen branch + test; document the covered/uncovered axes where the check lives.
 
 ### Phase 3: Eval-suite verification + minors
 
@@ -206,9 +206,11 @@ sufficient.
 ## Progress
 
 - [x] Phase 1: Registry-driven TTS half-pair guard
-- [ ] Phase 2: Release-metadata + drift-gate closure
+- [x] Phase 2: Release-metadata + drift-gate closure
 - [ ] Phase 3: Eval-suite verification + minors
 
 ## Findings
 
 - 2026-08-26 Phase 1: chose **derivation** over parity-test (smaller correct change): the guard now pulls the pair's key names from the registry row's `host_port` member (already stored in `endpoint_resolution`) — literals at old `:1689-1690/:1706/:1710` gone; unpack fails loudly on arity drift; guard skips when no `host_port` member exists. Drift test `test_half_pair_guard_names_the_registry_pair_keys` reads the pair from `_TTS_ENDPOINT_MEMBERS` and matches the error message against those keys. `tests/test_config.py` 174 passed; ruff + mypy clean. Requirement 1 met.
+- 2026-08-26 Phase 2, R2: **fail-closed on indirect invocation is the pinned decision.** `_verifies_manifest`'s docstring now names the accepted false-negative (a shell-variable invocation like `--verify-manifest "$MANIFEST"` does not literal-match, so the gate reports the drift step as missing — fails closed, never open) and why no partial shell-expansion interpreter is added. Paired regression test `test_direct_literal_invocation_is_detected_and_variable_indirection_fails_closed` in `tests/test_release_metadata.py` pins both directions on synthetic ci.yml fixtures; existing direct-detection assertions retained. `tests/test_release_metadata.py`: 45 passed, 1 skipped. Requirement 2 met.
+- 2026-08-26 Phase 2, R3: **decision recorded before implementation — scoped-parser branch** (the in-footprint default; behavior-assertion would have required a program-matrix update landing first, per invariant 2, for no added coverage). The round-9 "structurally open-ended" caveat closes as a documented boundary: a covered-axes comment in `tests/test_justfile_ci_parity.py` enumerates exactly what the parity check compares (1 command identity via `&&`-split + tracked prefixes, 2 working directory via `working-directory:` + literal `cd`, 3 job scope via the push-to-main marker substring, 4 step exemption by name, 5 justfile recipe closure), and `TestParityCheckScopeBoundaries` pins each uncovered form as a negative test (untracked prefixes invisible; `;` chains unsplit; `cd "$VAR"` literal; `pushd` not a cwd change; compound-`if` over-exclusion; exemption-by-name). Positive coverage per axis already existed (`test_ci_run_lines_are_split_on_ampersands`, `test_working_directory_disambiguates_identical_commands`, `test_a_job_with_no_if_defaults_to_in_scope`, `test_uv_sync_flags_match`, `test_promotion_manifest_drift_job_is_covered_by_the_parity_check`). Main test now shares the extracted `_tracked_only` filter, so the boundary tests exercise the same code path. `tests/test_justfile_ci_parity.py`: 17 passed. Requirement 3 met.
