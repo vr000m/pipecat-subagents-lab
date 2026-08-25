@@ -52,10 +52,10 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 6 | `SessionHost`↔coordinator boundary declared 4× (two production-dead) | AD-r8/r10 | P2 Ph3 | open |
 | 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | P1 Ph2 (deleted on retire) / P2 Ph3 (extracted, only if P1 chooses invest) | open |
 | 8 | `_OWNED_CONFIG_FIELDS` permissive default (`server/work_item_coordinator.py:131`) — deferred 5 consecutive rounds | AD-r5/7/8/9/10 | P2 Ph3 | open |
-| 9 | Fire-and-forget task-reference idiom hand-rolled in 5 classes | AD-r9/r10 | P2 Ph4 | open |
-| 10 | Ack-retry latch cannot distinguish its own latch from a sibling's re-latch (real, narrow race; needs new state-machine exit path) | AD-r10 | P2 Ph5 | open |
+| 9 | Fire-and-forget task-reference idiom hand-rolled in ~11 sites (P2 review corrected the original "5 classes" count) | AD-r9/r10 | P2 Ph5 | open |
+| 10 | Ack-retry latch sibling re-latch race — verify-first: `_ack_admission_generation` (turn_ack_ledger.py:74-139) may already cover it; P2 Ph4 reproduces before fixing | AD-r10 | P2 Ph4 | open |
 | 11 | ~60 duck-typed `Coordinator` test doubles + 56 test call sites reading extracted collaborators — blocked every in-gauntlet structural attempt | AD-r5/r8/r10 | P2 Ph0 | open |
-| 12 | Client re-implements server's work-status eviction policy (open design question) | AD-r10 | P2 Ph3 (decide) | open |
+| 12 | Client re-implements server's work-status eviction policy — P2 review found the "pin" option already implemented (`shared/work-status-retention.json` + dual parity tests); P2 Ph3 verifies and documents | AD-r10 | P2 Ph3 (verify) | open |
 | 13 | TTS half-pair guard hand-written, not registry-driven (`server/config.py:1676-1708`) | RG-r9 | P3 Ph1 | open |
 | 14 | `check_release_metadata.py` manifest-verify false-negative on indirect shell invocation (fail-closed, not live in ci.yml) | RG-r9 | P3 Ph2 | open |
 | 15 | ci.yml drift-gate class structurally open-ended (YAML-intent parsing vs observed-behavior assertion) | RG-r9 | P3 Ph2 | open |
@@ -78,9 +78,11 @@ When an item closes, replace `open` with `fixed <short-sha>` or `retired: <one-l
 | P2 ∥ P3 | **Mostly — one same-file caveat.** | P3 Ph1 (TTS half-pair guard) and P2 Ph3 (promotion-manifest extraction) both edit `server/config.py`, in different regions (~1676-1708 vs ~340-470/667-770). Semantically independent; merge conflict is mechanical. Rule: whichever lands second rebases; prefer landing P3 Ph1 first since it's small. Everything else is disjoint. |
 
 **Recommended schedule**: start P1 and P3 immediately in parallel worktrees.
-P2 may also start immediately (its Phase 0 test-double work conflicts with
-nothing), but its Phase 2+ should not merge before P1's decision lands if that
-decision is retirement.
+P2 may also start immediately — its Phase 0 touches tests/ plus narrow public
+read accessors on server collaborator modules (speech_scheduler, turn_ack_ledger,
+observers, speech_lifecycle, work_item_coordinator), all disjoint from P1's and
+P3's footprints — but its Phase 2 is gated on P1's Phase 1 decision (retire
+commit must land first on the retire path; P2 plan Phase 2 gate).
 
 **Cross-plan invariants**:
 1. No *new* feature plan may touch `SessionHost` until P2 Phases 0-1 have merged — otherwise its review gauntlet re-reports items 1-4 for a third time.
