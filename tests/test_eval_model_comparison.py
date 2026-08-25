@@ -1018,6 +1018,33 @@ class TestReportAggregation:
         assert "shipped_config_cells" in report
         assert report["shipped_config_cells"] is not None
 
+    def test_annotation_records_the_effective_effort_not_the_raw_declared_value(self) -> None:
+        """P3 post-release hardening, Requirement 7 (Phase-2 mid-phase
+        reviewer's effort-display-vs-effective-value minor): cell membership
+        keys on candidate_wire_key() -- effective effort -- so the annotation
+        must record the same resolution. The baseline router declares
+        effort=None but effectively sends `minimal` (gpt-5* rule); recording
+        the raw None here displayed `@None` for cells matched at minimal."""
+        pairs = eval_runner.default_sweep_pairs()
+        outcomes = [
+            eval_runner.CellOutcome(pair_label=pair.label, scenario_name="s", status="ok")
+            for pair in pairs
+        ]
+        annotation = eval_runner._shipped_config_cells_annotation(
+            outcomes,
+            (eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE),
+            pairs,
+        )
+        assert eval_runner.ROUTER_BASELINE.effort is None
+        assert annotation["router"]["effort"] == eval_runner.effective_effort_for_manifest_lookup(
+            eval_runner.ROUTER_BASELINE
+        )
+        assert annotation["router"]["effort"] is not None
+        # The worker has no gpt-5* defaulting rule: raw and effective agree.
+        assert annotation["worker"]["effort"] == eval_runner.effective_effort_for_manifest_lookup(
+            eval_runner.WORKER_BASELINE
+        )
+
     # test_build_report_rejects_shipped_without_pairs deleted (round 7 F3):
     # `shipped`/`pairs` were two correlated-optional keyword arguments with a
     # runtime ValueError guarding "shipped without pairs". They are now one
