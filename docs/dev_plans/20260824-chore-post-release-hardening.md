@@ -20,8 +20,12 @@ deferred Minor findings. Each item is estimated (not measured) at roughly half a
 day; Requirement 3 is the likely overrun — its drift-gate design surface has
 consumed multiple gauntlet rounds before. Phases run **sequentially within this
 plan** (Phases 1 and 3 share `tests/test_config.py`; only Phase 1 edits
-`server/config.py`); the plan as a whole is worktree-parallel-safe with P1 and
-(modulo the guard region of `server/config.py` — see program matrix) with P2.
+`server/config.py`); the plan as a whole is worktree-parallel-safe with P1's
+Phases 0-1 and (modulo the guard region of `server/config.py` — see program
+matrix) with P2. **P1's retire path (its Phase 2) also touches
+`scripts/check_release_metadata.py`, ci.yml, and `justfile`** — this plan's
+Phase 2 footprint — so land P3 Phase 2 before P1's retire commit, or whichever
+lands second rebases (program matrix, corrected 2026-08-25).
 
 ## Context (verified 2026-08-25, P3 plan review)
 
@@ -165,6 +169,7 @@ sufficient.
 **Goal:** Both round-9 caveats end as decided boundaries, not open-ended TODOs — each with a test that pins the decision.
 
 - [ ] Manifest-verify (Requirement 2): pin fail-closed on indirect invocation — test + comment naming the accepted false-negative; add the direct-invocation-detection regression test.
+- [ ] Land-order note: P1's retire path later removes the ci.yml manifest-write step, `justfile:41`, and `check_release_metadata.py:429`'s manifest requirement — land this phase first so P1 rebases over pinned, decided behavior rather than racing it.
 - [ ] Drift-gate decision gate (Requirement 3): choose scoped-parser (default, in-footprint) vs behavior-assertion (requires program-matrix update landing **first**, per invariant 2 — record the decision in Findings before writing code).
 - [ ] Implement the chosen branch + test; document the covered/uncovered axes where the check lives.
 
@@ -189,7 +194,7 @@ sufficient.
 - [ ] Full pytest suite, `ruff format`/`ruff check` green.
 - [ ] Program provenance map rows 13-19 closed (fixed or retired per row).
 
-<!-- reviewed: 2026-08-25 @ a7ef2ee976c150c5ce68f6f6fbd1f2d67c0999b1 -->
+<!-- reviewed: 2026-08-25 @ da75b2174140209641f62a2a7f6af5b362fee407 -->
 
 ## Progress
 
