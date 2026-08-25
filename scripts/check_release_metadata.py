@@ -271,6 +271,17 @@ def _verifies_manifest(command: str, expected: str) -> bool:
     verified the *previous* release's manifest and then merely named the
     current path in a second command passed, while the drift check ran against
     the wrong file (round 9 confirm pass 6, Security Important).
+
+    Fail-closed on indirect invocation, by decision (post-release hardening
+    P3, Requirement 2 -- program row 14): argv words are compared literally,
+    so ``M=docs/...json`` followed by ``--verify-manifest "$M"`` is NOT
+    recognized even though the shell would expand it into a real
+    verification. That false-negative is the accepted cost: recognizing it
+    would require a partial shell-expansion interpreter (assignments,
+    ``${VAR}``, command substitution -- an open-ended axis this checker
+    deliberately avoids by requiring all three words literally in one argv).
+    CI must spell the manifest path out; otherwise this gate fails closed
+    with "no step runs the verifier".
     """
     required = {_MANIFEST_VERIFIER, _VERIFY_MANIFEST_FLAG, expected}
     return any(
