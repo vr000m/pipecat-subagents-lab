@@ -33,7 +33,7 @@ program either **fixed** (commit recorded) or **retired** (reason recorded).
 |------|------|--------|--------------|
 | P1 — Query-context promotion decision | `20260824-feature-query-context-promotion.md` | Not Started | none (hand-run reviews) |
 | P2 — SessionHost decomposition | `20260824-refactor-sessionhost-decomposition.md` | Not Started | full |
-| P3 — Post-release hardening | `20260824-chore-post-release-hardening.md` | Not Started | none (hand-run reviews) |
+| P3 — Post-release hardening | `20260824-chore-post-release-hardening.md` | Complete (rows 13-19 closed) | none (hand-run reviews) |
 
 Child-plan completion updates this table and the provenance map below in the
 same commit that flips the child's own status header.
@@ -62,13 +62,13 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 10 | Ack-retry latch sibling re-latch race — verify-first: `_ack_admission_generation` (turn_ack_ledger.py:74-139) may already cover it; P2 Ph4 reproduces before fixing | AD-r10 | P2 Ph4 | open |
 | 11 | ~60 duck-typed `Coordinator` test doubles + 56 test call sites reading extracted collaborators — blocked every in-gauntlet structural attempt | AD-r5/r8/r10 | P2 Ph0 | open |
 | 12 | Client re-implements server's work-status eviction policy — P2 review found the "pin" option already implemented (`shared/work-status-retention.json` + dual parity tests); P2 Ph3 verifies and documents | AD-r10 | P2 Ph3 (verify) | open |
-| 13 | TTS half-pair guard hand-written, not registry-driven (`server/config.py:1676-1708`) | RG-r9 | P3 Ph1 | open |
-| 14 | `check_release_metadata.py` manifest-verify false-negative on indirect shell invocation (fail-closed, not live in ci.yml) | RG-r9 | P3 Ph2 | open |
-| 15 | ci.yml drift-gate class structurally open-ended (YAML-intent parsing vs observed-behavior assertion) | RG-r9 | P3 Ph2 | open |
-| 16 | Eval manifest-staleness heuristic: exact `source_commit` equality trips after every commit — P3 review found this is a documented fail-closed whole-tree-attestation decision with the override flag as its sanctioned valve; P3 Ph3 records a go/no-go (retire vs explicit reversal), not a presumed relaxation | ES | P3 Ph3 (decision) | open |
-| 17 | Effort-policy labels not cross-validated (typos silently accepted) — premise stale: P3 review verified the validation already exists (`server/config.py:236-259` + tests); P3 Ph3 verifies and retires with citation | ES | P3 Ph3 (verify) | open |
-| 18 | Env-var coverage gaps: 2 reasoning-effort env vars untested; README stale — premise stale: P3 review verified both vars are tested incl. the empty-string pin (`tests/test_config.py:2019-2030`); P3 Ph3 verifies README against the pinned semantics and retires with citation | ES | P3 Ph3 (verify) | open |
-| 19 | Policy-dict wholesale-replacement semantics + effort-display-vs-effective-value + truncated-cell reporting (Phase-2 minors) | ES | P3 Ph3 | open |
+| 13 | TTS half-pair guard hand-written, not registry-driven (`server/config.py:1676-1708`) | RG-r9 | P3 Ph1 | fixed 60e0f36 |
+| 14 | `check_release_metadata.py` manifest-verify false-negative on indirect shell invocation (fail-closed, not live in ci.yml) | RG-r9 | P3 Ph2 | fixed 0f3da39 |
+| 15 | ci.yml drift-gate class structurally open-ended (YAML-intent parsing vs observed-behavior assertion) | RG-r9 | P3 Ph2 | fixed 8e2090c |
+| 16 | Eval manifest-staleness heuristic: exact `source_commit` equality trips after every commit — P3 review found this is a documented fail-closed whole-tree-attestation decision with the override flag as its sanctioned valve; P3 Ph3 records a go/no-go (retire vs explicit reversal), not a presumed relaxation | ES | P3 Ph3 (decision) | retired: no-go on relaxation — fail-closed whole-tree attestation stands, override flag is the sanctioned valve (730db3f) |
+| 17 | Effort-policy labels not cross-validated (typos silently accepted) — premise stale: P3 review verified the validation already exists (`server/config.py:236-259` + tests); P3 Ph3 verifies and retires with citation | ES | P3 Ph3 (verify) | retired: verified — `server/config.py:236-259` + `tests/test_config.py:313`/`:329` (730db3f) |
+| 18 | Env-var coverage gaps: 2 reasoning-effort env vars untested; README stale — premise stale: P3 review verified both vars are tested incl. the empty-string pin (`tests/test_config.py:2019-2030`); P3 Ph3 verifies README against the pinned semantics and retires with citation | ES | P3 Ph3 (verify) | retired: verified — worker var `tests/test_config.py:1955-2132` (empty-string pin `:2019-2030`), router var `:376`; README matches (730db3f) |
+| 19 | Policy-dict wholesale-replacement semantics + effort-display-vs-effective-value + truncated-cell reporting (Phase-2 minors) | ES | P3 Ph3 | fixed 730db3f (effort-display gap fixed with test; policy-dict retired as intended design; truncated-cell retired as not-reproducible) |
 | 20 | Query-context narrowing implemented but `promotion_eligible=false` (`reason=real_stratum_missing`) — no paid evidence ever collected | AD Phase 4 | P1 (all) | open |
 | 21 | `docs/benchmarks/` misnomer: 8 of 9 committed files are v0.1.3 release-gate evidence, not benchmarks — load-bearing (`config.toml:54` loader, ci.yml:174 + `justfile:41` re-hash, `check_release_metadata.py:429` path check) and frozen in place (manifest embeds paths; re-stamping requires `--source-commit` = `740b364`, impossible from later HEAD). Fix forward only: v0.1.4+ evidence lands in `docs/evidence/`, `check_release_metadata.py`'s path pattern updated then. Never delete/move the v0.1.3 artifacts | evidence audit 2026-08-25 | first v0.1.4 release plan (deferred — not P1/P2/P3) | open |
 

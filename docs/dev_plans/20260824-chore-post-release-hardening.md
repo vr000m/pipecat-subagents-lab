@@ -1,6 +1,6 @@
 # Task: Post-Release Hardening — Gauntlet Caveats + Eval Minors (P3)
 
-**Status**: In Progress — Phase 1 complete
+**Status**: Complete — all three phases landed; program provenance rows 13-19 closed
 **Component**: tooling
 **Assigned to**: Claude
 **Priority**: Medium
@@ -190,16 +190,16 @@ sufficient.
 - [x] Verify-and-retire Requirement 5 (effort-label validation) with citations; update the provenance map row.
 - [x] Verify-and-retire Requirement 6 (env-var tests): check README against the pinned test semantics; fix README only if drifted; citations + provenance row.
 - [x] Phase-2 minors triage (Requirement 7) — record each disposition in Findings.
-- [ ] Program closure commit: flip this plan's status header, update the program's Subordinate Plans row and provenance rows 13-19, and create or update `docs/dev_plans/README.md` — all in the same commit, per the program's same-commit rule.
+- [x] Program closure commit: flip this plan's status header, update the program's Subordinate Plans row and provenance rows 13-19, and create or update `docs/dev_plans/README.md` — all in the same commit, per the program's same-commit rule.
 
 ## Acceptance Criteria
 
-- [ ] Requirements 1-3 end **implemented with tests** (retirement is not a valid resolution for them; for R3, "implemented" means the chosen branch's assertion + boundary documentation landed).
-- [ ] Requirement 4 ends with a recorded go/no-go decision — retire-with-reason or reverse-with-tests.
-- [ ] Requirements 5-6 end **verified-and-retired with citations** to the existing implementation and tests (or, if verification finds a gap, the gap is fixed with a test and the citation updated).
-- [ ] Requirement 7's three minors each carry a recorded disposition.
-- [ ] Full pytest suite, `ruff format`/`ruff check` green.
-- [ ] Program provenance map rows 13-19 closed (fixed or retired per row).
+- [x] Requirements 1-3 end **implemented with tests** (retirement is not a valid resolution for them; for R3, "implemented" means the chosen branch's assertion + boundary documentation landed).
+- [x] Requirement 4 ends with a recorded go/no-go decision — retire-with-reason or reverse-with-tests.
+- [x] Requirements 5-6 end **verified-and-retired with citations** to the existing implementation and tests (or, if verification finds a gap, the gap is fixed with a test and the citation updated).
+- [x] Requirement 7's three minors each carry a recorded disposition.
+- [x] Full pytest suite, `ruff format`/`ruff check` green.
+- [x] Program provenance map rows 13-19 closed (fixed or retired per row).
 
 <!-- reviewed: 2026-08-25 @ 034a1fc4ce4512d0bc87f0326e45f4150e09cf7c -->
 
@@ -207,7 +207,7 @@ sufficient.
 
 - [x] Phase 1: Registry-driven TTS half-pair guard
 - [x] Phase 2: Release-metadata + drift-gate closure
-- [ ] Phase 3: Eval-suite verification + minors
+- [x] Phase 3: Eval-suite verification + minors
 
 ## Findings
 
