@@ -52,9 +52,9 @@ Prior-decision pins to respect (do NOT re-litigate silently):
 1. `SessionHost` loses its pass-through forwarders (~19 per AD-r10; enumerated in Phase 6 before removal). The four coordinator-boundary declarations get an explicit, recorded re-litigation — NOT a silent collapse: either (a) the Phase 0 contract-checked doubles are shown to remove the getattr-fallback rationale and the declarations collapse with the roster frozenset + its pinning test updated in the same commit, with call-site evidence for any declaration retired, or (b) the four-declaration pin is re-affirmed with the rationale recorded in Findings and the boundary-consolidation ambition dropped from this plan.
 2. Shared turn-epilogue abstraction replaces the duplicated logic in the three ~250-615-line turn handlers, with each row of the Phase 1 differences table backed by a cited existing test or a new characterization test before extraction.
 3. `connect()` (210 lines, 9 nested closures — recounted; the AD report said 8) decomposed; `ConnectionPipeline` (`server/pipeline.py:356`) moves to its own module with **no re-export** from `pipeline.py` (importers such as `server/turn_ack_ledger.py:55` update in the move commit).
-4. Promotion-manifest logic (~400 lines: `server/config.py` ~340-470 + 667-770) **leaves `config.py` either way**: deleted wholesale by P1's retire commit (default expectation), or extracted to `server/promotion_manifest.py` here on P1-invest. Evidence in both branches: grep-zero manifest logic in `config.py`.
+4. Promotion-manifest logic (~400 lines: `server/config.py` ~340-470 + 667-770) **leaves `config.py` on either decided P1 branch**: deleted wholesale by P1's retire commit (default expectation), or extracted to `server/promotion_manifest.py` here on P1-invest. Evidence in both branches: grep-zero manifest logic in `config.py`. **On P1-blocked/escalated** this requirement stays open — recorded as such in Findings and in the acceptance carve-out below; program row 7 remains open and this plan may still complete around it.
 5. `_OWNED_CONFIG_FIELDS` permissive-vs-strict default (`server/work_item_coordinator.py:131`) gets a *decision* (5th-round deferral ends here): either strict — a sanctioned behavior change under Requirement 9, with the modernized doubles absorbing it and the tests that now enforce strictness cited — or permissive pinned with a rationale comment + pinning test.
-6. One shared fire-and-forget helper (supporting both `Task` and `Future` retention) replaces the hand-rolled add/discard idiom at **every site an inventory sweep finds** (`rg -n 'add_done_callback' server/` — current grep shows ~11 sites across 7 files, not the 5 originally listed: also `SpeechScheduler._stop_tasks` `speech_scheduler.py:145`, `work_item_coordinator.py:555/:1001`, `turns.py:92/:151`, and two `turn_ack_ledger.py` call sites `:553/:606`); any site left unconverted is listed in Findings with a reason (e.g. `SessionHost.shutdown`'s cancel-then-retrieve-exception idiom at `pipeline.py:3421` is a different pattern).
+6. One shared fire-and-forget helper (supporting both `Task` and `Future` retention) replaces the hand-rolled add/discard idiom at **every site an inventory sweep finds** (`rg -n 'add_done_callback' server/` — current grep, 2026-08-25: **22 hits across 10 files**, including `server/app.py`, `server/runner_supervisor.py`, and `server/work_task_ledger.py` beyond the originally listed seven; hits ≠ convertible sites — the Phase 5 inventory classifies every hit at execution time); any site left unconverted is listed in Findings with a reason (e.g. `SessionHost.shutdown`'s cancel-then-retrieve-exception idiom at `pipeline.py:3421` is a different pattern).
 7. Ack-latch race **verified before fixed**: Phase 4 first attempts to reproduce the round-10 quarantined interleaving against current code. If it cannot be made to fail — the existing `_ack_admission_generation` mechanism already covers it — item 10 closes as already-fixed with the reproduction attempt as evidence. Only if it fails does the fix land, by **extending** the existing generation mechanism (`_retry_or_abandon`'s generation check), never by adding a parallel identity/state machine.
 8. Client-side eviction policy (item 12): **verify and document** the existing arrangement — numeric bounds already shared via `shared/work-status-retention.json` (loaded by both `server/session_state.py` and `web/src/state.js:179-187`) and pinned by dual parity tests (`web/test/state.test.js:554,585`, `tests/test_session_state.py`). If verification confirms coverage, close item 12 with the evidence recorded; only a concrete named gap justifies new work. The "share via schema field" option is out of scope here — it changes the client contract, which Requirement 9 forbids.
 9. Zero behavior change outside item 7 (the race fix, if the reproduction fails) and item 5 (only if strict is chosen — explicitly sanctioned above); full suite + `ruff format`/`ruff check` + `mypy` green at **every phase boundary**, not just at the end.
@@ -148,36 +148,38 @@ Dependency direction: new modules import from collaborators, never back into
 
 ### Phase 5: Fire-and-forget helper
 
-**Impl files:** server/task_retention.py, server/speech_scheduler.py, server/turn_ack_ledger.py, server/observers.py, server/pipeline.py, server/speech_lifecycle.py, server/work_item_coordinator.py, server/turns.py
-**Test files:** tests/test_task_retention.py, tests/test_speech_scheduler.py, tests/test_work_task_ledger.py, tests/test_observers.py, tests/test_speech_lifecycle.py, tests/test_work_item_coordinator.py
+**Impl files:** server/task_retention.py, server/speech_scheduler.py, server/turn_ack_ledger.py, server/observers.py, server/pipeline.py, server/speech_lifecycle.py, server/work_item_coordinator.py, server/turns.py, server/app.py, server/runner_supervisor.py, server/work_task_ledger.py
+**Test files:** tests/test_task_retention.py, tests/test_speech_scheduler.py, tests/test_work_task_ledger.py, tests/test_observers.py, tests/test_speech_lifecycle.py, tests/test_work_item_coordinator.py, tests/test_app.py
 **Test command:** `uv run pytest -q && uv run ruff check . && uv run mypy .`
 **Goal:** The add/discard task-retention idiom exists once, used by every inventoried site, so the next fire-and-forget task cannot be written subtly differently.
 
-- [ ] Inventory: `rg -n 'add_done_callback' server/` — record every hit in Findings (current grep: ~11 sites in 7 files); classify each as convert / exclude-with-reason (the `SessionHost.shutdown` cancel-then-retrieve idiom at `pipeline.py:3421` is expected to be excluded).
+- [ ] Inventory: `rg -n 'add_done_callback' server/` — record every hit in Findings (current grep, 2026-08-25: 22 hits across 10 files; re-run at execution time — the counts drift); classify **every hit** as convert / exclude-with-reason (the `SessionHost.shutdown` cancel-then-retrieve idiom at `pipeline.py:3421` is expected to be excluded), no hit left unclassified.
 - [ ] Implement the shared helper (module-level utility; keep it tiny; accepts both `Task` and `Future`) **with its own tests first**: `tests/test_task_retention.py` covering retention-until-done, discard-after-done, and exception handling.
 - [ ] Convert the inventoried sites, one commit each.
 
 ### Phase 6: Facade collapse
 
-**Impl files:** server/pipeline.py
+**Impl files:** server/pipeline.py, docs/architecture.md, AGENTS.md, docs/dev_plans/20260824-design-v013-followup-program.md, docs/dev_plans/20260824-refactor-sessionhost-decomposition.md, docs/dev_plans/README.md
 **Test files:** tests/test_session_host.py, tests/test_pipeline.py
 **Test command:** `uv run pytest -q && uv run ruff check . && uv run mypy .`
 **Validation cmd:** `uv run python scripts/smoke_server.py`
-**Goal:** The pass-through forwarders are gone; callers reach collaborators through the boundary Requirement 1 decided on; SessionHost's line count reflects a real decomposition.
+**Goal:** The pass-through forwarders are gone; callers reach collaborators through the boundary Requirement 1 decided on; SessionHost's line count reflects a real decomposition; the program map records the closures.
 
 - [ ] Enumerate the forwarders first (list them in Findings — "~19" is the AD-r10 figure, treat as approximate) before removing any.
 - [ ] Remove forwarders; update call sites (Phase 0's accessors make this mechanical).
 - [ ] Record before/after line counts for `server/pipeline.py` and `SessionHost` in Findings.
 - [ ] Update `docs/architecture.md` and AGENTS.md layout to the new module set.
+- [ ] Program closure commit: flip this plan's status header, update the program's Subordinate Plans row and provenance rows 1-12 (per the acceptance carve-outs), and create or update `docs/dev_plans/README.md` — all in the same commit, per the program's same-commit rule.
 
 ## Acceptance Criteria
 
-- [ ] All nine Requirements resolved — met, or closed by their built-in decision branch (R1 collapse-or-re-affirm, R4 either P1 branch, R7 fixed-or-already-fixed, R8 verified-or-gap-named) — each with concrete evidence (line counts, grep-zero for forwarders and for manifest logic in config.py, the reproduction attempt or failing-then-passing race test).
+- [ ] All nine Requirements resolved — met, or closed by their built-in decision branch (R1 collapse-or-re-affirm, R4 either decided P1 branch, R7 fixed-or-already-fixed, R8 verified-or-gap-named) — each with concrete evidence (line counts, grep-zero for forwarders and for manifest logic in config.py, the reproduction attempt or failing-then-passing race test). **Sole carve-out**: on P1-blocked, R4 stays open with the blocked state recorded in Findings; every other requirement still resolves.
+- [ ] Phase 0/5 migration evidence recorded, not assumed: the Phase 0 inventory's before/after counts; grep-zero duck-typed `class *Coordinator` doubles outside `tests/_doubles.py`; grep-zero private collaborator reads outside the new accessors (allowlist any exception with reason); and an allowlisted zero-result check that no hand-rolled `add_done_callback` retention idiom remains outside `server/task_retention.py` plus the Phase 5 excluded sites.
 - [ ] Full suite + `ruff format`/`ruff check` + mypy green at every phase boundary; smoke script passes at Phases 2, 3, and 6.
 - [ ] No behavior change outside Phase 4 (race fix, if taken) and the R5-strict branch (if chosen) — pinned by the assertion-parity-checked public-contract tests.
-- [ ] Program provenance map rows 1-12 closed here, except row 7 which closes via P1 (either branch) — noted in the program doc in the same commit.
+- [ ] Program provenance map rows 1-12 closed here, with two exceptions: row 7 closes via P1's retire commit on retire, via this plan's Phase 3 extraction on invest, and **stays open on P1-blocked**; any row a carve-out leaves open is noted in the program doc in the same commit.
 
-<!-- reviewed: 2026-08-25 @ 02c80710a7ca94c2c5e5062474867dcf805c80c3 -->
+<!-- reviewed: 2026-08-25 @ 55db787acac5f0de3b2a809a685d5963f543c0ea -->
 
 ## Progress
 

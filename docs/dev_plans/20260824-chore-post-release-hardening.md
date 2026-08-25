@@ -110,7 +110,13 @@ sufficient.
    - **Scoped-parser branch (default)**: explicitly enumerate the YAML-intent
      parser's covered axes in a comment + test at the check
      (`tests/test_justfile_ci_parity.py:37`), documenting uncovered axes as an
-     accepted boundary. Stays inside P3's declared footprint.
+     accepted boundary. Stays inside P3's declared footprint. The enumeration
+     must **name the axes concretely** (at minimum: command text, flags,
+     working directory, env, step presence/order — finalize the list from the
+     check's code at implementation), and each covered axis gets a positive
+     test plus at least one representative rejected/uncovered form pinned as a
+     negative test — a comment plus an always-passing test does not satisfy
+     this requirement.
    - **Behavior-assertion branch**: a fixture-commit or observed-CI check. This
      branch touches `.github/workflows/ci.yml` and/or fixtures — outside
      Phase 2's impl files and P3's program-matrix footprint — so choosing it
@@ -175,8 +181,8 @@ sufficient.
 
 ### Phase 3: Eval-suite verification + minors
 
-**Impl files:** scripts/verify_eval_candidates.py, scripts/eval_common.py, scripts/eval_model_comparison.py, README.md
-**Test files:** tests/test_verify_eval_candidates.py, tests/test_eval_common.py, tests/test_eval_model_comparison.py
+**Impl files:** scripts/verify_eval_candidates.py, scripts/eval_common.py, scripts/eval_model_comparison.py, README.md, docs/dev_plans/20260824-design-v013-followup-program.md, docs/dev_plans/20260824-chore-post-release-hardening.md, docs/dev_plans/README.md
+**Test files:** tests/test_verify_eval_candidates.py, tests/test_eval_common.py, tests/test_eval_model_comparison.py, tests/test_config.py (verification target of R5/R6 citations — no edits expected)
 **Test command:** `uv run pytest -q tests/test_verify_eval_candidates.py tests/test_eval_common.py tests/test_eval_model_comparison.py tests/test_config.py`
 **Goal:** Requirements 4-7 each end fixed-with-test, verified-and-retired-with-citation, or retired-with-reason; none stays silently deferred. No `server/config.py` edits in this phase (R5/R6 are verification-only; see Requirements).
 
@@ -184,6 +190,7 @@ sufficient.
 - [ ] Verify-and-retire Requirement 5 (effort-label validation) with citations; update the provenance map row.
 - [ ] Verify-and-retire Requirement 6 (env-var tests): check README against the pinned test semantics; fix README only if drifted; citations + provenance row.
 - [ ] Phase-2 minors triage (Requirement 7) — record each disposition in Findings.
+- [ ] Program closure commit: flip this plan's status header, update the program's Subordinate Plans row and provenance rows 13-19, and create or update `docs/dev_plans/README.md` — all in the same commit, per the program's same-commit rule.
 
 ## Acceptance Criteria
 
@@ -194,7 +201,7 @@ sufficient.
 - [ ] Full pytest suite, `ruff format`/`ruff check` green.
 - [ ] Program provenance map rows 13-19 closed (fixed or retired per row).
 
-<!-- reviewed: 2026-08-25 @ da75b2174140209641f62a2a7f6af5b362fee407 -->
+<!-- reviewed: 2026-08-25 @ 034a1fc4ce4512d0bc87f0326e45f4150e09cf7c -->
 
 ## Progress
 

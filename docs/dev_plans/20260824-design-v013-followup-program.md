@@ -38,6 +38,12 @@ program either **fixed** (commit recorded) or **retired** (reason recorded).
 Child-plan completion updates this table and the provenance map below in the
 same commit that flips the child's own status header.
 
+**Conditional fourth plan (P1-invest only):** if P1's Phase 1 decision is
+*invest*, P1 creates a dedicated promote plan (its Appendix A) and, in the same
+commit, adds it to this table and the parallelization matrix, repoints row 20
+at it, and closes itself as handed-off. Until that happens, no such plan
+exists and the matrix governs only P1-P3.
+
 ## Provenance Map (canonical — the single source for "why is this still open")
 
 Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-background-delivery-v0.1.3.md`) gauntlet round N; **RG-r9** = its Restart Gauntlet round 9 caveats; **ES** = eval-suite plan (`20260817-feature-router-worker-model-eval-suite.md`) phase reviews.
@@ -47,10 +53,10 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 1 | `SessionHost` god-class (~2856 lines, `server/pipeline.py:594`), decomposition so far facade-only | AD-r8/r10 | P2 Ph1-2,6 | open |
 | 2 | ~19 one-line pass-through forwarders left by prior extractions | AD-r10 | P2 Ph6 | open |
 | 3 | Three ~250-600-line turn handlers duplicating epilogue logic | AD-r8/r10 | P2 Ph1 | open |
-| 4 | `SessionHost.connect` — 210 lines, 8 nested closures | AD-r8/r10 | P2 Ph2 | open |
+| 4 | `SessionHost.connect` — 210 lines, 8 nested closures (AD-r10 figure; 9 by P2's current recount) | AD-r8/r10 | P2 Ph2 | open |
 | 5 | `ConnectionPipeline` should live in its own module (`server/pipeline.py:356`) | AD-r10 | P2 Ph2 | open |
-| 6 | `SessionHost`↔coordinator boundary declared 4× (two production-dead) | AD-r8/r10 | P2 Ph3 | open |
-| 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | P1 Ph2 (deleted on retire) / P2 Ph3 (extracted, only if P1 chooses invest) | open |
+| 6 | `SessionHost`↔coordinator boundary declared 4× — all four live in production paths (the AD-r10 "two production-dead" claim was disproven in P2's plan review); re-litigation of the pin stays open, in P2 Ph3 | AD-r8/r10 | P2 Ph3 | open |
+| 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | retire → P1 Ph2 (deleted); invest → P2 Ph3 (extracted); P1-blocked → stays open | open |
 | 8 | `_OWNED_CONFIG_FIELDS` permissive default (`server/work_item_coordinator.py:131`) — deferred 5 consecutive rounds | AD-r5/7/8/9/10 | P2 Ph3 | open |
 | 9 | Fire-and-forget task-reference idiom hand-rolled in ~11 sites (P2 review corrected the original "5 classes" count) | AD-r9/r10 | P2 Ph5 | open |
 | 10 | Ack-retry latch sibling re-latch race — verify-first: `_ack_admission_generation` (turn_ack_ledger.py:74-139) may already cover it; P2 Ph4 reproduces before fixing | AD-r10 | P2 Ph4 | open |
@@ -74,7 +80,7 @@ When an item closes, replace `open` with `fixed <short-sha>` or `retired: <one-l
 
 | Pair | Parallel-safe? | Why |
 |------|----------------|-----|
-| P1 ∥ P3 | **Phases 0-1 yes; retire path no** (corrected 2026-08-25 after the evidence audit). | P1's Phases 0-1 touch only its own plan file + one probe. Its *retire* Phase 2 removes the manifest's out-of-server consumers — the ci.yml release-metadata manifest-write step, `justfile:41`, `check_release_metadata.py:429`, `config.toml:54` — overlapping P3 Phase 2 (`scripts/check_release_metadata.py`, `tests/test_justfile_ci_parity.py`). Rule: land P3 Phase 2 before P1's retire commit; whichever lands second rebases. P3's other files (`server/config.py` guard region, `scripts/eval_*.py`) stay disjoint. |
+| P1 ∥ P3 | **Phases 0-1 yes; retire path no** (corrected 2026-08-25 after the evidence audit). | P1's Phases 0-1 touch its own plan file, this program doc (Phase 1 records the decision and updates row 20 — P3 Phase 3 also edits this doc; mechanical merge, last lander rebases), and one probe. Its *retire* Phase 2 removes the manifest's out-of-server consumers — the ci.yml release-metadata manifest-write step, `justfile:41`, `check_release_metadata.py:429`, `config.toml:54` — overlapping P3 Phase 2 (`scripts/check_release_metadata.py`, `tests/test_justfile_ci_parity.py`). Rule: land P3 Phase 2 before P1's retire commit; whichever lands second rebases. P3's other files (`server/config.py` guard region, `scripts/eval_*.py`) stay disjoint. |
 | P1 ∥ P2 | **No on either path** (corrected 2026-08-24 after P1's plan review — the original "promote is data-only" claim was false). | *Retire* is a full-chain removal of the machinery (pipeline gate → unconditional `commit_display_only`, `load_promotion_manifest`/`PromotionManifest` out of `server/config.py`, `app.py` call, plus the manifest's CI/release-check consumers; the committed manifest and evidence files stay as frozen records — row 21) overlapping P2 Phases 2-3 — land P1's retire commit before P2 Phase 2 starts; P2 Phase 3's manifest-extraction bullet then drops. *Promote* (invest path, separate plan) requires serialization: the manifest's identity binding (`source_commit`/`tree_hash`) means it must be stamped after all concurrent work merges, or re-stamped post-merge. |
 | P2 ∥ P3 | **Mostly — one same-file caveat.** | P3 Ph1 (TTS half-pair guard) and P2 Ph3 (promotion-manifest extraction) both edit `server/config.py`, in different regions (~1676-1708 vs ~340-470/667-770). Semantically independent; merge conflict is mechanical. Rule: whichever lands second rebases; prefer landing P3 Ph1 first since it's small. Everything else is disjoint. |
 
@@ -85,6 +91,13 @@ observers, speech_lifecycle, work_item_coordinator), all disjoint from P1's and
 P3's footprints — but its Phase 2 is gated on P1's Phase 1 decision (retire
 commit must land first on the retire path; P2 plan Phase 2 gate).
 
+**Retire-path landing order** (explicit, since three plans touch shared files):
+P2 Phase 0 anytime → P3 Phase 2 → P1 retire commit → P2 Phase 2 onward.
+Invariant 1 below governs plans **outside** this program; inside it, this order
+and the matrix govern — P1's `server/pipeline.py` gate-region edits and P2
+Phase 1's epilogue work touch different regions of that file, whichever lands
+second rebases.
+
 **Cross-plan invariants**:
 1. No *new* feature plan may touch `SessionHost` until P2 Phases 0-1 have merged — otherwise its review gauntlet re-reports items 1-4 for a third time.
 2. Each child plan's Files-to-Modify must stay inside its footprint above; expanding it requires updating the matrix here first.
@@ -92,12 +105,18 @@ commit must land first on the retire path; P2 plan Phase 2 gate).
 
 ## Exit Criterion
 
-The program closes when every provenance-map row reads `fixed` or `retired`,
-all three child plans' status headers read Complete/Shipped, and
-`docs/dev_plans/README.md` (index — created alongside the first child-plan PR)
-reflects the final states.
+The program closes when every provenance-map row **1-20** reads `fixed` or
+`retired` (row 21 is deferred by construction to the first v0.1.4 release plan
+— it closes as `deferred: v0.1.4` here and does not block program exit; rows a
+recorded P1-blocked carve-out leaves open — 7, and 20 if blocked persists —
+block exit until the blocked state is resolved by an operator decision), all
+child plans' status headers read Complete/Shipped, and `docs/dev_plans/README.md`
+reflects the final states. The index is **created by the first child plan to
+complete** (each child's final phase carries the create-or-update task) — it
+does not exist today.
 
 ## Findings
 
 - 2026-08-24: Program created. Backlog snapshot taken from AD rounds 5-10, Restart Gauntlet rounds 4-9 (156 fixes, 0 new quarantines — backlog stable across ~20 total rounds), and eval-suite phase reviews.
 - 2026-08-25: Evidence audit of `docs/benchmarks/` added row 21 and corrected the P1 ∥ P3 matrix row: P1's retire path must remove the manifest's CI/release-check consumers (overlapping P3 Phase 2) while keeping every committed v0.1.3 artifact as a frozen release record. P1 and P3 plans updated in the same pass.
+- 2026-08-25: Codex adversarial review of all four plan docs (20 findings, 2 Critical) fixed across the set. Headlines: P1's retire footprint gained the remaining `PromotionManifest` consumers (`server/composition.py`, `scripts/eval_common.py`, `scripts/smoke_conversation.py`) and the regression test must cover the fail-open `enable_autoplay_policy=False → "autoplay"` branch at `server/pipeline.py:2835`; P2's fire-and-forget inventory recounted (22 hits / 10 files); rows 4/6/7 corrected here; blocked-branch carve-outs, invest handoff, retire-path landing order, and index-creation ownership made explicit.
