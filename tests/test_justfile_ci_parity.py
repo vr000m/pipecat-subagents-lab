@@ -42,6 +42,55 @@ _CI_YML = _REPO / ".github" / "workflows" / "ci.yml"
 _CI_STEPS_WITHOUT_A_JUST_EQUIVALENT = frozenset({"Scan repository history for secrets"})
 _TRACKED_PREFIXES = ("uv run", "bun ")
 
+# ── Covered axes (P3 post-release hardening R3, program row 15) ──────────────
+# Decision: the round-9 "structurally open-ended" caveat closes as a DOCUMENTED
+# BOUNDARY (scoped parser), not a parser that chases every conceivable bypass.
+# The parity check compares exactly these axes and nothing else:
+#   1. Command identity — exact text of each `&&`-split piece, and only pieces
+#      starting with _TRACKED_PREFIXES ("uv run", "bun ").
+#   2. Working directory — the step's `working-directory:` key plus literal
+#      inline `cd <dir>` pieces. No shell semantics beyond that: `cd "$VAR"`
+#      stays the literal string, `pushd` is not a directory change, and `;`/
+#      `|`/`||` chains are not split -- but a tracked prefix hidden inside an
+#      unmodeled chain fails the check loudly rather than vanishing (Codex
+#      adversarial review 2026-08-26).
+#   3. Job scope — every job whose `if:` lacks the push-to-main marker
+#      substring is in scope (fail-safe default); a compound `if:` that
+#      mentions the marker is excluded even if it could also run on
+#      pull_request (accepted over-exclusion).
+#   4. Step exemption — by human-readable step name (denylist above).
+#   5. Justfile side — `check`'s transitive recipe closure, parsed from
+#      column-0 recipe headers; just variables/interpolation are not modeled.
+# Every uncovered form named above is pinned by a negative test in
+# TestParityCheckScopeBoundaries. Anything outside these axes is out of the
+# check's contract by decision — extend the axis list and its tests together.
+
+
+def _tracked_only(commands: set[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Axis 1's filter: only tracked-prefix commands participate in parity."""
+    return [(cwd, cmd) for cwd, cmd in commands if cmd.startswith(_TRACKED_PREFIXES)]
+
+
+def _hidden_tracked_commands(commands: set[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Pieces whose text contains a tracked prefix somewhere OTHER than the
+    start -- i.e. a tracked command hidden behind unmodeled shell syntax
+    (``;``, ``|``, ...) instead of being its own ``&&``-split piece.
+
+    A piece that STARTS with a tracked prefix is not hidden: if it also
+    embeds a `;`-chain, the untracked head already makes the whole piece
+    invisible to `_tracked_only` (which matches on `.startswith()`), and that
+    is the documented, tested boundary -- not this function's concern. This
+    function exists for the opposite case: a tracked command sitting AFTER
+    unmodeled shell syntax, which would otherwise vanish from the parity
+    check silently instead of failing loudly (Codex adversarial review
+    2026-08-26)."""
+    hidden: list[tuple[str, str]] = []
+    for cwd, cmd in commands:
+        if any(cmd.find(prefix) > 0 for prefix in _TRACKED_PREFIXES):
+            hidden.append((cwd, cmd))
+    return hidden
+
+
 _RECIPE_HEADER_RE = re.compile(r"^([a-z][a-z-]*):(.*)$")
 
 
@@ -198,11 +247,14 @@ def test_ci_pull_request_job_commands_are_reachable_from_just_check() -> None:
     closure = _just_check_command_closure()
     assert closure, "`check`'s recipe closure resolved to zero commands -- parser likely broken"
 
-    tracked = [
-        (cwd, cmd)
-        for cwd, cmd in _ci_pull_request_job_commands()
-        if cmd.startswith(_TRACKED_PREFIXES)
-    ]
+    ci_commands = _ci_pull_request_job_commands()
+    hidden = _hidden_tracked_commands(ci_commands)
+    assert hidden == [], (
+        "a tracked command is hidden behind unmodeled shell syntax (`;`, `|`, ...): "
+        f"{hidden}. Split the line with `&&` or move it into a just recipe."
+    )
+
+    tracked = _tracked_only(ci_commands)
     assert tracked, (
         "no `uv run`/`bun` commands found in any pull_request-triggered CI job -- "
         "parser likely broken"
@@ -262,6 +314,85 @@ def test_working_directory_disambiguates_identical_commands() -> None:
     commands = _qualified_commands_from_steps(steps)
     assert commands == {("web", "uv run pytest")}
     assert (".", "uv run pytest") not in commands
+
+
+class TestParityCheckScopeBoundaries:
+    """Pins each uncovered form named in the covered-axes comment above.
+
+    These are the parser's decided boundaries, not bugs: a form asserted
+    here as invisible/unmodeled is OUT of the parity contract. If one of
+    these assertions ever fails, the parser grew a new axis -- update the
+    covered-axes comment in the same change.
+    """
+
+    def test_untracked_prefix_commands_are_invisible(self) -> None:
+        """Axis 1 boundary: only `uv run`/`bun ` commands participate.
+        A `python`- or `npx`-prefixed CI step is not checked for a just
+        equivalent."""
+        steps = [{"run": "python scripts/foo.py"}, {"run": "npx eslint ."}]
+        assert _tracked_only(_qualified_commands_from_steps(steps)) == []
+
+    def test_semicolon_chains_are_not_split(self) -> None:
+        """Axis 1/2 boundary: only `&&` splits. A `;`-chained line stays one
+        piece -- here with an untracked head, so `_tracked_only` (which
+        matches on `.startswith()`) still can't see the embedded `uv run`.
+        But the piece is no longer silently invisible end-to-end:
+        `_hidden_tracked_commands` catches the hidden tracked prefix and
+        fails the check loudly instead of vanishing (Codex adversarial
+        review 2026-08-26)."""
+        commands = _qualified_commands("echo setup; uv run pytest")
+        assert commands == {(".", "echo setup; uv run pytest")}
+        assert _tracked_only(commands) == []
+        assert _hidden_tracked_commands(commands) == [(".", "echo setup; uv run pytest")]
+
+    def test_untracked_semicolon_chain_is_still_invisible(self) -> None:
+        """Boundary companion to the above: a `;`-chain with no tracked
+        prefix ANYWHERE stays genuinely invisible -- `_hidden_tracked_commands`
+        only fires when a tracked prefix is actually hiding, not for every
+        unmodeled `;`/`|` chain."""
+        commands = _qualified_commands("echo a; echo b")
+        assert commands == {(".", "echo a; echo b")}
+        assert _tracked_only(commands) == []
+        assert _hidden_tracked_commands(commands) == []
+
+    def test_cd_with_a_shell_variable_is_not_expanded(self) -> None:
+        """Axis 2 boundary: `cd` directories are literal text, never
+        shell-expanded -- `"$WEB_DIR"` is a cwd string, not a lookup."""
+        assert _qualified_commands('cd "$WEB_DIR" && bun test') == {('"$WEB_DIR"', "bun test")}
+
+    def test_pushd_is_not_a_directory_change(self) -> None:
+        """Axis 2 boundary: only `cd` updates the cwd. A `pushd web` piece is
+        emitted as an (untracked, hence invisible) command and the following
+        command keeps the repo-root cwd."""
+        assert _qualified_commands("pushd web && bun test") == {
+            (".", "pushd web"),
+            (".", "bun test"),
+        }
+
+    def test_compound_if_mentioning_the_push_marker_is_over_excluded(self) -> None:
+        """Axis 3 boundary: exclusion is a substring match on the push-to-main
+        marker. A compound `if:` that could also run on pull_request is still
+        excluded -- accepted, since the marker exists for exactly one real job
+        and the default for everything else is fail-safe (in scope)."""
+        data = {
+            "jobs": {
+                "j": {"if": "github.event_name == 'push' || github.event_name == 'pull_request'"}
+            }
+        }
+        assert _pull_request_job_names(data) == []
+
+    def test_step_exemption_is_by_human_readable_name(self) -> None:
+        """Axis 4 boundary: exemption keys on the step's `name:` string, so a
+        step renamed to an exempt name is exempt regardless of what it runs
+        (the deferred in-workflow-marker alternative is noted above).
+
+        Iterates the whole exemption set rather than unpacking a single
+        element: a single-element unpack breaks with an unrelated
+        `ValueError` the day a second exempt name is added, instead of
+        exercising axis 4 for it."""
+        for exempt_name in _CI_STEPS_WITHOUT_A_JUST_EQUIVALENT:
+            steps = [{"name": exempt_name, "run": "uv run pytest"}]
+            assert _qualified_commands_from_steps(steps) == set()
 
 
 class TestRunRecipeGuardsItsEnvFile:

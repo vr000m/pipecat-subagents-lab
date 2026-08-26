@@ -1,6 +1,6 @@
 # Task: Post-Release Hardening — Gauntlet Caveats + Eval Minors (P3)
 
-**Status**: Not Started
+**Status**: Complete — all three phases landed; program provenance rows 13-19 closed
 **Component**: tooling
 **Assigned to**: Claude
 **Priority**: Medium
@@ -51,7 +51,7 @@ already exists and one proposal would reverse a documented decision:
   equality plus a dirty-tree check over whole-tree attestation
   (`_MANIFEST_ATTESTED_PATHS = ("server/", "scripts/", "evals/")`, `:486-504`),
   chosen after four failed enumerated-input-list rounds each missed a file;
-  `--i-know-the-manifest-is-stale` (`:3078`) is the sanctioned override valve.
+  `--i-know-the-manifest-is-stale` (`:3085`) is the sanctioned override valve.
   Any "staleness = candidate-defining inputs changed" relaxation would
   re-introduce the retired enumerated-list anti-pattern.
 - **TTS guard is already mostly registry-driven** (R1's target): the guard
@@ -163,9 +163,9 @@ sufficient.
 **Test command:** `uv run pytest -q tests/test_config.py`
 **Goal:** The guard cannot silently drift from the registry — the key-string literals become registry-derived, or a parity test fails when guard and registry disagree.
 
-- [ ] Read the guard (`:1676-1708`) and the registry row (`:1151`); pick derivation vs parity-test for the literal residue (smaller correct change wins).
-- [ ] Implement; add the drift test.
-- [ ] Land-order note: P2 Phase 3 also edits `server/config.py` — prefer landing this first (program matrix). This is P3's **only** `server/config.py` edit (Phase 3 makes none), so no later same-file race with P2 re-opens.
+- [x] Read the guard (`:1676-1708`) and the registry row (`:1151`); pick derivation vs parity-test for the literal residue (smaller correct change wins).
+- [x] Implement; add the drift test.
+- [x] Land-order note: P2 Phase 3 also edits `server/config.py` — prefer landing this first (program matrix). This is P3's **only** `server/config.py` edit (Phase 3 makes none), so no later same-file race with P2 re-opens.
 
 ### Phase 2: Release-metadata + drift-gate closure
 
@@ -174,10 +174,10 @@ sufficient.
 **Test command:** `uv run pytest -q tests/test_release_metadata.py tests/test_justfile_ci_parity.py`
 **Goal:** Both round-9 caveats end as decided boundaries, not open-ended TODOs — each with a test that pins the decision.
 
-- [ ] Manifest-verify (Requirement 2): pin fail-closed on indirect invocation — test + comment naming the accepted false-negative; add the direct-invocation-detection regression test.
-- [ ] Land-order note: P1's retire path later removes the ci.yml manifest-write step, `justfile:41`, and `check_release_metadata.py:429`'s manifest requirement — land this phase first so P1 rebases over pinned, decided behavior rather than racing it.
-- [ ] Drift-gate decision gate (Requirement 3): choose scoped-parser (default, in-footprint) vs behavior-assertion (requires program-matrix update landing **first**, per invariant 2 — record the decision in Findings before writing code).
-- [ ] Implement the chosen branch + test; document the covered/uncovered axes where the check lives.
+- [x] Manifest-verify (Requirement 2): pin fail-closed on indirect invocation — test + comment naming the accepted false-negative; add the direct-invocation-detection regression test.
+- [x] Land-order note: P1's retire path later removes the ci.yml manifest-write step, `justfile:41`, and `check_release_metadata.py:429`'s manifest requirement — land this phase first so P1 rebases over pinned, decided behavior rather than racing it.
+- [x] Drift-gate decision gate (Requirement 3): choose scoped-parser (default, in-footprint) vs behavior-assertion (requires program-matrix update landing **first**, per invariant 2 — record the decision in Findings before writing code).
+- [x] Implement the chosen branch + test; document the covered/uncovered axes where the check lives.
 
 ### Phase 3: Eval-suite verification + minors
 
@@ -186,27 +186,36 @@ sufficient.
 **Test command:** `uv run pytest -q tests/test_verify_eval_candidates.py tests/test_eval_common.py tests/test_eval_model_comparison.py tests/test_config.py`
 **Goal:** Requirements 4-7 each end fixed-with-test, verified-and-retired-with-citation, or retired-with-reason; none stays silently deferred. No `server/config.py` edits in this phase (R5/R6 are verification-only; see Requirements).
 
-- [ ] Staleness go/no-go (Requirement 4): record retire-or-reverse in Findings first; code + tests only on the reverse branch, per the requirement's constraints.
-- [ ] Verify-and-retire Requirement 5 (effort-label validation) with citations; update the provenance map row.
-- [ ] Verify-and-retire Requirement 6 (env-var tests): check README against the pinned test semantics; fix README only if drifted; citations + provenance row.
-- [ ] Phase-2 minors triage (Requirement 7) — record each disposition in Findings.
-- [ ] Program closure commit: flip this plan's status header, update the program's Subordinate Plans row and provenance rows 13-19, and create or update `docs/dev_plans/README.md` — all in the same commit, per the program's same-commit rule.
+- [x] Staleness go/no-go (Requirement 4): record retire-or-reverse in Findings first; code + tests only on the reverse branch, per the requirement's constraints.
+- [x] Verify-and-retire Requirement 5 (effort-label validation) with citations; update the provenance map row.
+- [x] Verify-and-retire Requirement 6 (env-var tests): check README against the pinned test semantics; fix README only if drifted; citations + provenance row.
+- [x] Phase-2 minors triage (Requirement 7) — record each disposition in Findings.
+- [x] Program closure commit: flip this plan's status header, update the program's Subordinate Plans row and provenance rows 13-19, and create or update `docs/dev_plans/README.md` — all in the same commit, per the program's same-commit rule.
 
 ## Acceptance Criteria
 
-- [ ] Requirements 1-3 end **implemented with tests** (retirement is not a valid resolution for them; for R3, "implemented" means the chosen branch's assertion + boundary documentation landed).
-- [ ] Requirement 4 ends with a recorded go/no-go decision — retire-with-reason or reverse-with-tests.
-- [ ] Requirements 5-6 end **verified-and-retired with citations** to the existing implementation and tests (or, if verification finds a gap, the gap is fixed with a test and the citation updated).
-- [ ] Requirement 7's three minors each carry a recorded disposition.
-- [ ] Full pytest suite, `ruff format`/`ruff check` green.
-- [ ] Program provenance map rows 13-19 closed (fixed or retired per row).
+- [x] Requirements 1-3 end **implemented with tests** (retirement is not a valid resolution for them; for R3, "implemented" means the chosen branch's assertion + boundary documentation landed).
+- [x] Requirement 4 ends with a recorded go/no-go decision — retire-with-reason or reverse-with-tests.
+- [x] Requirements 5-6 end **verified-and-retired with citations** to the existing implementation and tests (or, if verification finds a gap, the gap is fixed with a test and the citation updated).
+- [x] Requirement 7's three minors each carry a recorded disposition.
+- [x] Full pytest suite, `ruff format`/`ruff check` green.
+- [x] Program provenance map rows 13-19 closed (fixed or retired per row).
 
 <!-- reviewed: 2026-08-25 @ 034a1fc4ce4512d0bc87f0326e45f4150e09cf7c -->
 
 ## Progress
 
-- [ ] Phase 1: Registry-driven TTS half-pair guard
-- [ ] Phase 2: Release-metadata + drift-gate closure
-- [ ] Phase 3: Eval-suite verification + minors
+- [x] Phase 1: Registry-driven TTS half-pair guard
+- [x] Phase 2: Release-metadata + drift-gate closure
+- [x] Phase 3: Eval-suite verification + minors
 
 ## Findings
+
+- 2026-08-26 Phase 1: chose **derivation** over parity-test (smaller correct change): the guard now pulls the pair's key names from the registry row's `host_port` member (already stored in `endpoint_resolution`) — literals at old `:1689-1690/:1706/:1710` gone; unpack fails loudly on arity drift; guard skips when no `host_port` member exists. Drift test `test_half_pair_guard_names_the_registry_pair_keys` reads the pair from `_TTS_ENDPOINT_MEMBERS` and matches the error message against those keys. `tests/test_config.py` 174 passed; ruff + mypy clean. Requirement 1 met.
+- 2026-08-26 Phase 2, R2: **fail-closed on indirect invocation is the pinned decision.** `_verifies_manifest`'s docstring now names the accepted false-negative (a shell-variable invocation like `--verify-manifest "$MANIFEST"` does not literal-match, so the gate reports the drift step as missing — fails closed, never open) and why no partial shell-expansion interpreter is added. Paired regression test `test_direct_literal_invocation_is_detected_and_variable_indirection_fails_closed` in `tests/test_release_metadata.py` pins both directions on synthetic ci.yml fixtures; existing direct-detection assertions retained. `tests/test_release_metadata.py`: 45 passed, 1 skipped. Requirement 2 met.
+- 2026-08-26 Phase 2, R3: **decision recorded before implementation — scoped-parser branch** (the in-footprint default; behavior-assertion would have required a program-matrix update landing first, per invariant 2, for no added coverage). The round-9 "structurally open-ended" caveat closes as a documented boundary: a covered-axes comment in `tests/test_justfile_ci_parity.py` enumerates exactly what the parity check compares (1 command identity via `&&`-split + tracked prefixes, 2 working directory via `working-directory:` + literal `cd`, 3 job scope via the push-to-main marker substring, 4 step exemption by name, 5 justfile recipe closure), and `TestParityCheckScopeBoundaries` pins each uncovered form as a negative test (untracked prefixes invisible; `;` chains unsplit; `cd "$VAR"` literal; `pushd` not a cwd change; compound-`if` over-exclusion; exemption-by-name). Positive coverage per axis already existed (`test_ci_run_lines_are_split_on_ampersands`, `test_working_directory_disambiguates_identical_commands`, `test_a_job_with_no_if_defaults_to_in_scope`, `test_uv_sync_flags_match`, `test_promotion_manifest_drift_job_is_covered_by_the_parity_check`). Main test now shares the extracted `_tracked_only` filter, so the boundary tests exercise the same code path. `tests/test_justfile_ci_parity.py`: 17 passed. Requirement 3 met.
+- 2026-08-26 Phase 3, R4: **retired (go/no-go: no-go on relaxation).** The exact-`source_commit`-equality + dirty-tree staleness check (`scripts/eval_model_comparison.py:762`, attested-path set `_MANIFEST_ATTESTED_PATHS` `:486-504`) stays fail-closed by decision: `--i-know-the-manifest-is-stale` (`:3085`) is the sanctioned noise valve, and false-positive staleness after unrelated commits is the documented cost of whole-tree attestation — any narrower heuristic would re-introduce an enumerated input list, the exact shape this program retires elsewhere. No code change.
+- 2026-08-26 Phase 3, R5: **verified-and-retired.** `Config.__post_init__` (`server/config.py:236-259`) diffs each effort-policy's label set against its model-policy's and raises `ConfigError` on any leftover — a typo hard-errors at load. Tests: `tests/test_config.py:313` (`test_reasoning_effort_policy_rejects_a_label_not_in_model_policy`) and `:329` (`test_reasoning_effort_policy_allows_a_subset_of_model_policy_labels`, the no-false-positive direction). No new validation path added.
+- 2026-08-26 Phase 3, R6: **verified-and-retired, with one citation correction.** Both env vars are tested, but not both inside the `:1955-2132` range this plan cited: `WEBSEARCH_WORKER_REASONING_EFFORT` is covered there (`:1961` effort-only override, `:2019-2030` empty-string pin — an explicit empty override does NOT clear the inherited TOML effort), while `WEBSEARCH_ROUTER_REASONING_EFFORT`'s coverage lives at `:376` (`test_websearch_router_reasoning_effort_env_applies_to_the_registered_label`). `README.md:191-198` matches the pinned semantics (override behavior, unset-preserves, model-only-override clears inherited effort) — no README edit needed.
+- 2026-08-26 Phase 3, R7 triage: (a) **policy-dict wholesale replacement — retired as intended design**: `_per_run_config()` (`scripts/eval_model_comparison.py:1619-1653`) deliberately builds a single-entry policy per run so each per-run `Config` carries exactly the candidate under test; no caller relies on merged base-config policy labels. (b) **effort-display-vs-effective-value — residual gap fixed with test**: preview and missing-candidate paths already printed `effective_effort_for_manifest_lookup()`, but `_shipped_config_cells_annotation` still recorded the raw declared effort while matching cells on `candidate_wire_key()` (effective) — the baseline router annotated `@None` for cells matched at `minimal`. Fixed to record the effective value; regression test `test_annotation_records_the_effective_effort_not_the_raw_declared_value`. (c) **truncated-cell status reporting — retired as not-reproducible**: the finding text was never persisted beyond its five-word deferral label; searched both current code and the Phase-2-era runner (`d2a3f91`) for any cell/status truncation (slicing, width formatting) — none exists; `print_report_summary`/`build_report` emit full status/error/reason strings. Re-raise with a concrete location if the original concern resurfaces.
+- 2026-08-26 Codex adversarial review (post-PR): two findings, both fail-**open** gaps the pinned fail-closed decisions never sanctioned; both fixed. (a) **R2 predicate accepted mention as execution** (high): `uv run echo <verifier> --verify-manifest <path>` passed `_verifies_manifest` — the reporting-command denylist + anywhere-in-argv co-occurrence never required the verifier to be the program actually invoked. Replaced with a positional allowlist: assignment/wrapper stepping shared with `_command_name` via extracted `_program_index`, an optional `uv run [python[3]]`/bare-`python` runner prefix, the verifier required in program position, and `expected` required immediately after the flag. The fail-closed-on-indirection decision is unchanged. Unit-test matrix: 5 rejected mention-forms, 3 accepted execution-forms. (b) **R3 boundary was silent, not loud** (medium): a tracked command hidden behind unmodeled `;`/`|` syntax (`echo setup; uv run pytest`) vanished from the parity comparison. The scoped-parser decision stands; the boundary now fails closed — `_hidden_tracked_commands` flags any piece containing a tracked prefix at a non-start position, asserted empty in the main parity test; the `;`-chain boundary test now pins loud detection, and a genuinely untracked chain (`echo a; echo b`) stays invisible by design.

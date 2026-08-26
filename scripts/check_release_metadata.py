@@ -219,6 +219,24 @@ def _commands(command: str) -> list[list[str]]:
     return commands
 
 
+def _program_index(argv: list[str]) -> int | None:
+    """The index in ``argv`` of the token that names the program invoked, or
+    ``None`` if ``argv`` never reaches a program position.
+
+    ``VAR=value`` assignment prefixes and wrapper programs
+    (:data:`_COMMAND_WRAPPERS`) plus their flags are stepped over.
+    """
+    for index, token in enumerate(argv):
+        if "=" in token and token.split("=", 1)[0].isidentifier():
+            continue
+        if token.startswith("-"):
+            continue
+        if PurePosixPath(token).name in _COMMAND_WRAPPERS:
+            continue
+        return index
+    return None
+
+
 def _command_name(argv: list[str]) -> str:
     """The basename of the program ``argv`` actually invokes, or ``""``.
 
@@ -226,16 +244,8 @@ def _command_name(argv: list[str]) -> str:
     and their flags are stepped over, and the result is basenamed, so
     ``/bin/echo``, ``env -i echo`` and ``LC_ALL=C echo`` all answer ``echo``.
     """
-    for token in argv:
-        if "=" in token and token.split("=", 1)[0].isidentifier():
-            continue
-        if token.startswith("-"):
-            continue
-        name = PurePosixPath(token).name
-        if name in _COMMAND_WRAPPERS:
-            continue
-        return name
-    return ""
+    index = _program_index(argv)
+    return PurePosixPath(argv[index]).name if index is not None else ""
 
 
 #: The script (and its flag) whose invocation is what actually proves the
@@ -262,22 +272,96 @@ def _is_truthy(raw: object) -> bool:
     return str(raw).strip().lower() not in ("", "false", "0")
 
 
+#: Runner prefixes that may precede the verifier in program position, each as
+#: the literal token sequence that must appear with no flags between: bare
+#: ``uv run`` (optionally followed by ``python``/``python3``), or a bare
+#: ``python``/``python3``. Anything else in program position -- including a
+#: flag between these tokens -- fails closed, consistent with this file's
+#: pinned fail-closed decision on indirection.
+_RUNNER_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("uv", "run", "python3"),
+    ("uv", "run", "python"),
+    ("uv", "run"),
+    ("python3",),
+    ("python",),
+)
+
+
+def _program_position_index(argv: list[str]) -> int | None:
+    """The index in ``argv`` of the token in EXECUTION position -- the
+    verifier's own program slot, past any recognised runner prefix.
+
+    Reuses :func:`_program_index` for the assignment-prefix/wrapper stepping,
+    then optionally steps past one recognised runner prefix
+    (:data:`_RUNNER_PREFIXES`). Returns ``None`` if ``argv`` never reaches a
+    program position.
+    """
+    index = _program_index(argv)
+    if index is None:
+        return None
+    for prefix in _RUNNER_PREFIXES:
+        end = index + len(prefix)
+        if tuple(argv[index:end]) == prefix and end < len(argv):
+            return end
+    return index
+
+
 def _verifies_manifest(command: str, expected: str) -> bool:
     """Whether ``command`` actually runs the drift verifier against ``expected``.
 
-    The verifier, its flag, and the expected path must co-occur in ONE
-    command's argv. Testing set-membership against the step-wide union of
-    words let the three be supplied by three different commands: a step that
-    verified the *previous* release's manifest and then merely named the
-    current path in a second command passed, while the drift check ran against
-    the wrong file (round 9 confirm pass 6, Security Important).
+    A positional allowlist predicate, not a token co-occurrence test:
+    ``_MANIFEST_VERIFIER`` must be the PROGRAM this command invokes (after
+    stepping over any assignment prefix, wrapper program, and an optional
+    recognised runner prefix -- see :func:`_program_position_index`), and
+    ``_VERIFY_MANIFEST_FLAG`` must be immediately followed by ``expected``
+    among the tokens that remain after the verifier. Testing set-membership
+    against the step-wide union of words let the three be supplied by three
+    different commands: a step that verified the *previous* release's
+    manifest and then merely named the current path in a second command
+    passed, while the drift check ran against the wrong file (round 9 confirm
+    pass 6, Security Important).
+
+    Fail-closed on indirect invocation, by decision (post-release hardening
+    P3, Requirement 2 -- program row 14): argv words are compared literally,
+    so ``M=docs/...json`` followed by ``--verify-manifest "$M"`` is NOT
+    recognized even though the shell would expand it into a real
+    verification. That false-negative is the accepted cost: recognizing it
+    would require a partial shell-expansion interpreter (assignments,
+    ``${VAR}``, command substitution -- an open-ended axis this checker
+    deliberately avoids by requiring all three words literally in one argv).
+    CI must spell the manifest path out; otherwise this gate fails closed
+    with "no step runs the verifier".
+
+    Execution position is now required, not merely co-occurrence: a command
+    that only MENTIONS the verifier -- as an ``echo``'d string, a ``python -c``
+    argument, or an argument to some other program -- no longer satisfies this
+    predicate, because ``_MANIFEST_VERIFIER`` must sit in program position.
+    ``uv run echo scripts/validate_v013_evidence.py --verify-manifest
+    <expected>`` previously passed: ``echo`` was absent from
+    ``_REPORTING_COMMANDS`` because the denylist matched on ``_command_name``
+    (``echo``, correctly identified) but that predicate only gated a
+    *different* command's name, not this one's, and the required tokens were
+    present anywhere in argv regardless of position (Codex adversarial review
+    2026-08-26). The ``--verify-manifest=path`` form is deliberately not
+    recognized either: CI and the justfile both spell the flag and its value
+    as separate tokens (see ``.github/workflows/ci.yml`` and ``justfile``),
+    so requiring the immediately-next-token form is a documented boundary,
+    not a gap.
     """
-    required = {_MANIFEST_VERIFIER, _VERIFY_MANIFEST_FLAG, expected}
-    return any(
-        _command_name(argv) not in _REPORTING_COMMANDS
-        and required <= {word.removeprefix("./") for word in argv}
-        for argv in _commands(command)
-    )
+    for argv in _commands(command):
+        index = _program_position_index(argv)
+        if index is None or index >= len(argv):
+            continue
+        program = argv[index].removeprefix("./")
+        if program != _MANIFEST_VERIFIER:
+            continue
+        rest = argv[index + 1 :]
+        if any(
+            token == _VERIFY_MANIFEST_FLAG and idx + 1 < len(rest) and rest[idx + 1] == expected
+            for idx, token in enumerate(rest)
+        ):
+            return True
+    return False
 
 
 def _conditional_needs_ancestor(jobs: Mapping[str, object], job_name: str) -> str | None:

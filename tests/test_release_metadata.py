@@ -614,6 +614,50 @@ def test_rejects_a_step_verifying_the_previous_manifest_while_another_command_na
         module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
 
 
+def test_direct_literal_invocation_is_detected_and_variable_indirection_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """P3 hardening Requirement 2 (program row 14, round-9 caveat): the two
+    arms share one fixture shape so the parsing seam is pinned from both
+    sides. The literal-path arm is the direct-detection regression guard --
+    invocation-parsing changes are exactly where it could silently break.
+    The variable arm pins the DECIDED false-negative: ``M=path`` then
+    ``--verify-manifest "$M"`` would genuinely verify at runtime, but
+    recognizing it requires a partial shell-expansion interpreter
+    (assignments, ``${VAR}``, command substitution) -- the same open-ended
+    axis the drift-gate caveat exists to close -- so the gate fails closed
+    and CI must name the literal path."""
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
+
+    def ci_yml(run_body: str) -> Path:
+        ci_yml_path = tmp_path / "ci.yml"
+        ci_yml_path.write_text(
+            "jobs:\n"
+            "  promotion-manifest-drift:\n"
+            "    steps:\n"
+            "      - name: Verify the committed promotion manifest has not drifted\n"
+            "        run: |\n" + run_body,
+            encoding="utf-8",
+        )
+        return ci_yml_path
+
+    direct = ci_yml(
+        "          uv run python scripts/validate_v013_evidence.py --verify-manifest "
+        "docs/benchmarks/v0.1.3-promotion-manifest.json\n"
+    )
+    assert module.check(pyproject_path, changelog_path, ci_yml_path=direct) == "0.1.3"
+
+    indirect = ci_yml(
+        "          MANIFEST=docs/benchmarks/v0.1.3-promotion-manifest.json\n"
+        '          uv run python scripts/validate_v013_evidence.py --verify-manifest "$MANIFEST"\n'
+    )
+    with pytest.raises(
+        module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
+    ):
+        module.check(pyproject_path, changelog_path, ci_yml_path=indirect)
+
+
 def test_rejects_a_heredoc_body_that_merely_spells_out_a_verifier_invocation(
     tmp_path: Path,
 ) -> None:
@@ -761,3 +805,71 @@ def test_rejects_a_symlinked_ci_yml(tmp_path: Path) -> None:
 
     with pytest.raises(module.ReleaseMetadataError, match="cannot read CI workflow"):
         module.check(pyproject_path, changelog_path, ci_yml_path=linked)
+
+
+_EXPECTED_MANIFEST = "docs/benchmarks/v0.1.3-promotion-manifest.json"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            f"uv run echo scripts/validate_v013_evidence.py --verify-manifest {_EXPECTED_MANIFEST}",
+            id="uv-run-echo-mentions-verifier-as-argument",
+        ),
+        pytest.param(
+            f"echo scripts/validate_v013_evidence.py --verify-manifest {_EXPECTED_MANIFEST}",
+            id="bare-echo-mentions-verifier-as-argument",
+        ),
+        pytest.param(
+            "uv run python scripts/other_script.py scripts/validate_v013_evidence.py "
+            f"--verify-manifest {_EXPECTED_MANIFEST}",
+            id="verifier-as-argument-not-program",
+        ),
+        pytest.param(
+            "uv run python scripts/validate_v013_evidence.py --verify-manifest "
+            f"docs/benchmarks/other.json {_EXPECTED_MANIFEST}",
+            id="expected-path-present-but-not-immediately-after-flag",
+        ),
+        pytest.param(
+            "uv run python -c 'anything' scripts/validate_v013_evidence.py "
+            f"--verify-manifest {_EXPECTED_MANIFEST}",
+            id="python-dash-c-before-verifier",
+        ),
+    ],
+)
+def test_verifies_manifest_rejects_verifier_outside_program_position(command: str) -> None:
+    """Codex adversarial review 2026-08-26: the old predicate was a
+    reporting-command denylist plus anywhere-in-argv token co-occurrence, so
+    ``uv run echo scripts/validate_v013_evidence.py --verify-manifest
+    <expected>`` passed -- the verifier was merely MENTIONED, never actually
+    executed. ``_verifies_manifest`` is now a positional allowlist: the
+    verifier must be the PROGRAM a command invokes, not an argument to some
+    other program."""
+    module = _load_script()
+
+    assert module._verifies_manifest(command, _EXPECTED_MANIFEST) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            "uv run python scripts/validate_v013_evidence.py --verify-manifest "
+            f"{_EXPECTED_MANIFEST}",
+            id="real-ci-form",
+        ),
+        pytest.param(
+            f"./scripts/validate_v013_evidence.py --verify-manifest {_EXPECTED_MANIFEST}",
+            id="relative-dot-slash-invocation",
+        ),
+        pytest.param(
+            f"python scripts/validate_v013_evidence.py --verify-manifest {_EXPECTED_MANIFEST}",
+            id="bare-python-runner",
+        ),
+    ],
+)
+def test_verifies_manifest_accepts_verifier_in_program_position(command: str) -> None:
+    module = _load_script()
+
+    assert module._verifies_manifest(command, _EXPECTED_MANIFEST) is True

@@ -5,6 +5,7 @@ environment-specific defaults.  They are test-first: the Phase 1
 implementation is expected to provide ``Config`` and ``load_config``.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -2540,6 +2541,38 @@ class TestEndpointFamilyLayerPrecedence:
 
         with pytest.raises(ConfigError, match="must be set together"):
             load_config(config_file=config_file, env={"WEBSEARCH_TTS_WS_HOST": "127.0.0.1"})
+
+    def test_half_pair_guard_names_the_registry_pair_keys(self) -> None:
+        """P3 Phase 1 (program row 13): the half-pair guard derives its key
+        names from the registry row (the `host_port` member of
+        `_TTS_ENDPOINT_MEMBERS`) instead of hand-written literals. Reading the
+        pair from the registry here means a renamed or regrown row makes this
+        test fail loudly instead of the guard silently checking stale keys."""
+        from server.config import _TTS_ENDPOINT_MEMBERS
+
+        (pair,) = [keys for name, keys in _TTS_ENDPOINT_MEMBERS if name == "host_port"]
+        host_key, port_key = pair
+        expected = rf"{re.escape(host_key)} and {re.escape(port_key)} must be set together"
+        with pytest.raises(ConfigError, match=expected):
+            load_config(env={host_key: "127.0.0.1"})
+
+    def test_tts_host_port_builder_reads_the_registry_pairs_key_names(self) -> None:
+        """P3 Phase 1 (program row 13) closed the half-pair GUARD's drift
+        surface but not the endpoint BUILDER's: `_build_tts_endpoint`'s
+        `host_port` branch still reads `values["WEBSEARCH_TTS_WS_HOST"]`/
+        `WS_PORT"]` as two hardcoded literals, independent of
+        `_TTS_ENDPOINT_MEMBERS`. Building the endpoint using ONLY the
+        registry-derived key names pins today's agreement, so a future
+        registry rename that the guard tracks but the builder doesn't
+        surfaces here as a wrong endpoint instead of staying silently in
+        sync by coincidence."""
+        from server.config import _TTS_ENDPOINT_MEMBERS, _build_tts_endpoint
+
+        (pair,) = [keys for name, keys in _TTS_ENDPOINT_MEMBERS if name == "host_port"]
+        host_key, port_key = pair
+        values = {host_key: "127.0.0.1", port_key: "9001"}
+
+        assert _build_tts_endpoint("host_port", values) == ("ws", "127.0.0.1:9001")
 
     def test_explicit_zero_port_reaches_the_range_validator(self, tmp_path) -> None:
         """Round 6 confirm pass 3, Logic Minor: TOML supplies real integers, so

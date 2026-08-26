@@ -2585,20 +2585,27 @@ def _shipped_config_cells_annotation(
             router_cells.append(pair_label)
         if candidate_wire_key(pair.worker) == worker_key:
             worker_cells.append(pair_label)
+    # Effective effort, not the raw declared value: cell membership above is
+    # keyed on candidate_wire_key() (effective effort), so recording the raw
+    # effort here would let the baseline router annotate as `@None` while its
+    # cells were matched at `minimal` -- the same display-vs-effective split
+    # the Phase-2 mid-phase reviewer flagged (closed by post-release
+    # hardening P3, Requirement 7).
     result: dict[str, Any] = {
         "router": {
             "model": shipped_router.model,
-            "effort": shipped_router.effort,
+            "effort": effective_effort_for_manifest_lookup(shipped_router),
             "cells": router_cells,
         },
         "worker": {
             "model": shipped_worker.model,
-            "effort": shipped_worker.effort,
+            "effort": effective_effort_for_manifest_lookup(shipped_worker),
             "cells": worker_cells,
         },
         "note": (
-            "these sweep cells carry the (model, effort) config.toml ships; "
-            "their latency budget is report-only, not blocking"
+            "these sweep cells carry the (model, effective effort) config.toml ships "
+            "(see the `effort` fields above, resolved the same way); their latency "
+            "budget is report-only, not blocking"
         ),
     }
     # `_registered_label` (eval_common.py) returns the sentinel "shipped" when
