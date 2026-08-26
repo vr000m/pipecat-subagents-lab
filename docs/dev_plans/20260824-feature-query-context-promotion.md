@@ -186,11 +186,11 @@ If the operator chooses invest at Phase 1, the follow-up plan must cover, at min
 6. Live smoke with a named observable: force a late-result delivery (extend the `--ack-ordering` smoke, commit `840a360`) and assert the autoplay branch at `server/pipeline.py:2837` is taken (log line / session-record disposition), run at the manifest-bound commit with matching `PIPECAT_SOURCE_COMMIT`/`PIPECAT_SOURCE_TREE_HASH`.
 7. Decision gate evaluated against the thresholds verbatim (≥10% median, bootstrap LB ≥5%, quality ≥0.90, drop ≤0.02, ≥30 paired samples/cell, ≥10 baseline repeats, baseline SD ≤0.01), with non-decisive outcomes escalating per Requirement 2.
 
-<!-- reviewed: 2026-08-25 @ dd50a54c29552ef9c13957d9ac801cba3d058811 -->
+<!-- reviewed: 2026-08-26 @ 52660dbe19d035799dc6759de7da2189795af923 -->
 
 ## Progress
 
-- [ ] Phase 0: Feasibility pre-flight (no material paid spend)
+- [x] Phase 0: Feasibility pre-flight (no material paid spend)
 - [ ] Phase 1: Decision checkpoint (escalation)
 - [ ] Phase 2: Retire — fail-closed gate replacement, then full-chain removal
 - [ ] Phase 3: Docs + program closure
@@ -199,4 +199,56 @@ If the operator chooses invest at Phase 1, the follow-up plan must cover, at min
 
 ### Review Waivers
 
-(none)
+- **Marker refresh without re-review (2026-08-26).** The recorded marker (`2026-08-25 @ dd50a54c`) was staled solely by merged commit `0c3320e` (PR #9), which corrected the line citation `check_release_metadata.py:429` → `:440` in three places — a mechanical docs fix with no semantic change to the contract. Refreshed in place to `52660dbe` rather than re-running `/review-plan`, matching the identical waiver precedent recorded in the P2 plan for the same commit.
+- **Phase 0 executed by the conductor inline, not an implementer subagent.** Phase 0's sole impl file is this plan document, and the implementer prompt template categorically forbids modifying the plan file — a spawned worker structurally cannot complete the phase. The paid probe (exactly one permitted call) also warrants single-call control in the conductor rather than an autonomous worker.
+
+### Phase 0 feasibility verdict (2026-08-26)
+
+**Blocker (a) — gate wiring: CONFIRMED, both inputs false-producing.**
+`promotion_eligible = real_stratum_present and transport_eligible`
+(`scripts/validate_v013_evidence.py:565`). `real_stratum_present` derives from
+the phase0/phase1 records via `has_real_provider_stratum`
+(`validate_v013_evidence.py:305-315`), which requires membership in
+`REAL_PROVIDER_ALLOWLIST = {("openai", "gpt-4o-search-preview")}` (`:150-154`).
+Current values:
+- phase0 (`docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl`) and phase1
+  (`v0.1.3-phase1-ack-evidence.jsonl`) records carry only the
+  `("unavailable", "unavailable")` stratum → `real_stratum_present = False`.
+- phase2 artifact (`v0.1.3-phase2-transport-browser-contract.json`) has
+  `promotion_eligible: false` → `transport_eligible = False`.
+- Committed manifest (`v0.1.3-promotion-manifest.json`):
+  `promotion_eligible: false, reason: "real_stratum_missing"`.
+
+**Blocker (b) — `run_live()` stub: CONFIRMED still a stub.**
+`scripts/run_query_context_experiment.py:358-401` resolves credentials via the
+shared `resolve_openai_api_key()` gate, then unconditionally prints
+`BLOCKED: live query-context collection is not wired to a responses client in
+this runner` and returns 1. No live collection path exists.
+
+**Blocker (c) — credential resolution + probe: CREDENTIALS RESOLVE; MODEL AVAILABLE.**
+- Credential env var resolved: `OPENAI_API_KEY` (sourced from
+  `~/.secrets/ai.env`; the repo resolver order is config.toml → env-file →
+  process environment per `scripts/eval_common.py:848-860`).
+- Probe (exactly one live authenticated call; the models endpoint is unbilled,
+  so this also satisfies the phase's no-material-spend goal — this is not
+  `run_live()`, which remains a stub):
+  `curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models/gpt-4o-search-preview`
+- Redacted result: model id `gpt-4o-search-preview`, HTTP 200. No response
+  body committed; `git status --short` after the probe showed only this plan
+  file modified — no evidence artifacts were collected.
+
+**Promotion thresholds recorded verbatim from the v0.1.3 plan (for Appendix A):**
+≥10% median latency improvement, bootstrap lower bound ≥5%, quality ≥0.90,
+quality drop ≤0.02, ≥30 paired samples per cell, ≥10 baseline repeats,
+baseline SD ≤0.01.
+
+**Per-blocker verdict:** the model is available and credentials resolve, but
+promote remains unreachable on two independent axes: (1) no live collection
+path exists (`run_live()` stub), and (2) both gate inputs are false-producing
+— reaching `promotion_eligible=true` requires implementing `run_live()`,
+collecting ≥30 paired real-stratum samples per cell into the phase0/phase1
+artifacts, regenerating the phase2 transport artifact at the target commit,
+and re-stamping the manifest (Appendix A scope). Feasibility of *invest* is
+therefore "possible but requires the full Appendix A follow-up plan"; nothing
+in Phase 0 changes the retire-default expectation. Decision escalates to the
+operator at Phase 1.
