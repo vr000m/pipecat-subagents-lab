@@ -617,7 +617,7 @@ def test_background_provider_tasks_are_capped_per_coordinator() -> None:
         await asyncio.sleep(0)
 
         assert cancelled == ["third"]
-        assert len(coordinator._late_tasks) == 2
+        assert coordinator.late_task_count == 2
         await coordinator.shutdown()
 
     asyncio.run(run())
@@ -683,11 +683,11 @@ def test_rejected_cancellation_resistant_task_remains_owned_until_completion() -
         )
         await ignored_cancellation.wait()
 
-        assert rejected in coordinator._cancelling_tasks
+        assert coordinator.is_cancelling_task(rejected)
         release.set()
         await rejected
         await asyncio.sleep(0)
-        assert rejected not in coordinator._cancelling_tasks
+        assert not coordinator.is_cancelling_task(rejected)
         await coordinator.shutdown()
 
     asyncio.run(run())
@@ -737,8 +737,8 @@ def test_submit_releases_caller_ownership_when_call_returns() -> None:
 
         await coordinator.submit("turn-1", [("worker-1", "answer")], provider)
 
-        assert asyncio.current_task() not in coordinator._submission_tasks
-        assert coordinator._submission_tasks == set()
+        assert not coordinator.is_submission_task(asyncio.current_task())
+        assert not coordinator.has_pending_submission_tasks()
         await coordinator.shutdown()
 
     asyncio.run(run())
@@ -868,9 +868,9 @@ def test_shutdown_cancels_active_submit_and_provider_tasks() -> None:
         assert submission.done()
         with pytest.raises(asyncio.CancelledError):
             await submission
-        assert coordinator._submission_tasks == set()
-        assert coordinator._submit_tasks == set()
-        assert coordinator._provider_tasks == set()
+        assert not coordinator.has_pending_submission_tasks()
+        assert not coordinator.has_pending_submit_tasks()
+        assert not coordinator.has_pending_provider_tasks()
 
     asyncio.run(run())
 
@@ -1035,8 +1035,8 @@ def test_raising_on_late_terminal_hook_does_not_block_cleanup_or_on_complete() -
         await task
         await asyncio.sleep(0)
 
-        assert task not in coordinator._late_tasks
-        assert task not in coordinator._background_task_order
+        assert not coordinator.is_late_task(task)
+        assert not coordinator.is_background_task_ordered(task)
         assert len(completed_calls) == 1
         assert completed_calls[0].work_item_id == "work-terminal-hook-raises"
         assert completed_calls[0].worker_id == "worker-1"
@@ -1330,7 +1330,7 @@ def test_retain_late_task_force_schedules_callback_when_background_capacity_is_e
         # on_complete coroutine with `_has_background_capacity()` false.
         sentinel = asyncio.create_task(asyncio.sleep(60))
         coordinator._owned_tasks.add(sentinel)
-        assert not coordinator._has_background_capacity()
+        assert not coordinator.has_background_capacity()
 
         await task
         await asyncio.wait_for(callback_ran.wait(), timeout=1.0)
@@ -1421,8 +1421,8 @@ def test_late_callback_task_does_not_consume_the_capacity_budget() -> None:
 
         # The callback is owned (so it cannot be garbage-collected mid-flight)
         # but is not charged against the one-task budget.
-        assert coordinator._mandatory_tasks, "the callback task must be tracked as mandatory"
-        assert coordinator._has_background_capacity(), (
+        assert coordinator.has_mandatory_tasks(), "the callback task must be tracked as mandatory"
+        assert coordinator.has_background_capacity(), (
             "an in-flight mandatory callback must not exhaust the capacity budget"
         )
 
