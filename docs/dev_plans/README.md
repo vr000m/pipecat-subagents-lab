@@ -8,7 +8,7 @@ status (the v0.1.3 follow-up program's same-commit rule).
 
 | Plan | Status |
 |------|--------|
-| [v0.1.3 follow-up program (super plan)](20260824-design-v013-followup-program.md) | Active — program tracking; provenance rows 1-19 closed, row 20 open (P1), row 21 deferred to v0.1.4 |
+| [v0.1.3 follow-up program (super plan)](20260824-design-v013-followup-program.md) | Active — program tracking; provenance rows 13-19 closed, rows 1-12 open (P2, Not Started), row 20 open (P1), row 21 deferred to v0.1.4 |
 | [P1 — Query-context promotion decision](20260824-feature-query-context-promotion.md) | Not Started |
 | [P2 — SessionHost decomposition](20260824-refactor-sessionhost-decomposition.md) | Not Started |
 
