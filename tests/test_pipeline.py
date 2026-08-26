@@ -398,7 +398,7 @@ def test_synthesis_started_on_a_superseded_connection_does_not_mutate_scheduler_
 
         await tts.on_event("synthesis_started", utterance_id)
 
-        assert connection.scheduler._provider_contexts == {}
+        assert not connection.scheduler.has_provider_contexts()
         await host.shutdown()
 
     asyncio.run(run())
@@ -782,8 +782,8 @@ def test_reconnect_while_search_is_blocked_keeps_late_result_history_only() -> N
         assert host.state.workers.get("worker-search") is None
         assert first_worker.frames == []
         assert second_worker.frames == []
-        assert first.scheduler._queues == {}
-        assert second.scheduler._queues == {}
+        assert not first.scheduler.pending_work_item_ids()
+        assert not second.scheduler.pending_work_item_ids()
         assert host.state.speech == {}
         await host.shutdown()
 
@@ -1031,7 +1031,7 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
             origin_epoch=1,
         )
         await host._commit_and_speak(timeout, connection, role=ROLE_TIMEOUT_NOTICE)
-        stale = connection.scheduler._queues["work-turn-sf"][0]
+        stale = connection.scheduler.queued_items("work-turn-sf")[0]
         assert stale.role == ROLE_TIMEOUT_NOTICE
 
         final = GroundedResult(
@@ -1060,7 +1060,7 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item == active
         assert host.state.speech[stale.utterance_id].state.value == "interrupted"
-        queued = connection.scheduler._queues["work-turn-sf"]
+        queued = connection.scheduler.queued_items("work-turn-sf")
         assert len(queued) == 1
         assert queued[0].result_id == final.result_id
 
@@ -2284,7 +2284,7 @@ def test_successful_result_without_tts_is_history_only() -> None:
 
         assert host.state.result_history("worker-search") == (result,)
         assert connection.worker.frames == []
-        assert connection.scheduler._queues == {}
+        assert not connection.scheduler.pending_work_item_ids()
         assert host.state.speech == {}
         await host.shutdown()
 
@@ -6262,8 +6262,8 @@ def test_cancel_turn_or_child_sole_child_check_treats_a_known_only_sibling_as_li
         # The sole remaining child is still known/live, so the ack must
         # survive -- it must not be retracted just because the sibling has
         # no local or coordinator-tracked task yet.
-        assert ack_work_item_id in connection.scheduler._queues
-        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
+        assert connection.scheduler.has_queue(ack_work_item_id)
+        assert host._turn_ack_ledger.has_emitted_ack(turn_id)
         await host.shutdown()
 
     asyncio.run(run())
@@ -6371,7 +6371,7 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
             "first answer",
             "That item is taking longer than expected; I will continue in the background.",
         ]
-        queued_notice = origin.scheduler._queues["work-turn-role-1"][0]
+        queued_notice = origin.scheduler.queued_items("work-turn-role-1")[0]
         assert queued_notice.role == ROLE_TIMEOUT_NOTICE
 
         await host.commit_late_result_once(
@@ -6388,7 +6388,7 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
             ),
         )
 
-        queued = origin.scheduler._queues["work-turn-role-1"]
+        queued = origin.scheduler.queued_items("work-turn-role-1")
         assert [item.text for item in queued] == ["late answer"]
         assert queued[0].role == ROLE_RESULT
         await host.shutdown()
@@ -6717,7 +6717,7 @@ def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slo
             connection, turn_id=turn_id, origin_epoch=connection.epoch, dispatched=False
         )
         connection.tts = tts
-        assert f"ack-{turn_id}" not in connection.scheduler._queues
+        assert not connection.scheduler.has_queue(f"ack-{turn_id}")
 
         # Second child: a search that resolves within one tick, so it also
         # bails before enqueueing.
@@ -6730,7 +6730,7 @@ def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slo
             search_task=fast,
         )
         await fast
-        assert f"ack-{turn_id}" not in connection.scheduler._queues
+        assert not connection.scheduler.has_queue(f"ack-{turn_id}")
 
         # Third child of the same turn is genuinely slow: it must still get
         # the turn's one ack.
@@ -6742,11 +6742,11 @@ def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slo
             dispatched=True,
             search_task=slow,
         )
-        assert f"ack-{turn_id}" in connection.scheduler._queues or any(
+        assert connection.scheduler.has_queue(f"ack-{turn_id}") or any(
             lease is not None and lease.item.work_item_id == f"ack-{turn_id}"
             for lease in (connection.scheduler.active,)
         )
-        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
+        assert host._turn_ack_ledger.has_emitted_ack(turn_id)
 
         slow.cancel()
         await host.shutdown()
@@ -6814,8 +6814,8 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
 
         coordinator.target = f"work-{turn_id}-0"
         await host._handle_transcript(f"cancel work-{turn_id}-0")
-        assert ack_work_item_id in connection.scheduler._queues
-        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
+        assert connection.scheduler.has_queue(ack_work_item_id)
+        assert host._turn_ack_ledger.has_emitted_ack(turn_id)
 
         # Let the first control confirmation finish speaking, so the second
         # cancel really does target the turn's sole remaining delegated child.
@@ -6826,8 +6826,8 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
 
         coordinator.target = f"work-{turn_id}-1"
         await host._handle_transcript(f"cancel work-{turn_id}-1")
-        assert ack_work_item_id not in connection.scheduler._queues
-        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
+        assert not connection.scheduler.has_queue(ack_work_item_id)
+        assert not host._turn_ack_ledger.has_emitted_ack(turn_id)
 
         # A whole-turn cancel removes an earlier turn's live ack and its latch
         # too: nothing may speak an ack for work the user just cancelled.
@@ -6847,8 +6847,8 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
         coordinator.target = None
         frames_before_sweep = len(connection.worker.frames)
         await host._handle_transcript("cancel")
-        assert other_ack not in connection.scheduler._queues
-        assert other_turn not in host._turn_ack_ledger._ack_emitted_turns
+        assert not connection.scheduler.has_queue(other_ack)
+        assert not host._turn_ack_ledger.has_emitted_ack(other_turn)
         assert all(
             not isinstance(frame, TTSSpeakFrame) or frame.text != "One moment."
             for frame in connection.worker.frames[frames_before_sweep:]
@@ -6905,10 +6905,10 @@ def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_liv
 
         await host.cancel_turn_or_child(turn_id, "work-turn-h-0", origin=connection)
 
-        assert ack_work_item_id in connection.scheduler._queues, (
+        assert connection.scheduler.has_queue(ack_work_item_id), (
             "the ack must survive: a coordinator-retained sibling is still live"
         )
-        assert turn_id in host._turn_ack_ledger._ack_emitted_turns
+        assert host._turn_ack_ledger.has_emitted_ack(turn_id)
 
         await host.shutdown()
 
@@ -7276,7 +7276,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
             await asyncio.wait_for(search.started.wait(), timeout=1)
 
             assert _ack_items(origin.scheduler) == []
-            assert host._turn_ack_ledger._ack_emitted_turns == set()
+            assert not host._turn_ack_ledger.emitted_ack_turns()
 
             search.release.set()
             result = await asyncio.wait_for(pending, timeout=1)
@@ -7317,7 +7317,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
             )
 
             assert _ack_items(origin.scheduler) == []
-            assert host._turn_ack_ledger._ack_emitted_turns == set()
+            assert not host._turn_ack_ledger.emitted_ack_turns()
 
         else:
             assert path == "mixed_multi_intent"
@@ -7390,7 +7390,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
             await asyncio.wait_for(search.started.wait(), timeout=1)
 
             assert _ack_items(origin.scheduler) == []
-            assert host._turn_ack_ledger._ack_emitted_turns == set()
+            assert not host._turn_ack_ledger.emitted_ack_turns()
 
             search.release.set()
             await asyncio.wait_for(pending, timeout=1)
@@ -7399,7 +7399,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
         # (or, for the direct-delegated path, its release) must not have
         # left any deferred ack admission task or index entry behind either.
         assert _ack_items(origin.scheduler) == []
-        assert host._turn_ack_ledger._ack_emitted_turns == set()
+        assert not host._turn_ack_ledger.emitted_ack_turns()
         await host.shutdown()
 
     asyncio.run(run())
@@ -7984,7 +7984,7 @@ def test_capacity_rejected_dispatch_emits_no_ack_and_never_dispatches_twice() ->
 
         assert "search service is busy" in result.text
         assert _ack_items(origin.scheduler) == []
-        assert host._turn_ack_ledger._ack_emitted_turns == set()
+        assert not host._turn_ack_ledger.emitted_ack_turns()
         # Exactly one dispatch attempt: the refused one.
         assert worker.creations == 1
         await host.shutdown()
@@ -8437,10 +8437,10 @@ def test_sole_child_cancel_ignores_another_turns_speech_when_settling_the_ack() 
 
         await host.cancel_turn_or_child(turn_id, "work-turn-a", origin=origin)
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not host._turn_ack_ledger.has_emitted_ack(turn_id)
         # The unrelated turn's own speech is untouched.
-        assert "work-turn-b" in origin.scheduler._queues
+        assert origin.scheduler.has_queue("work-turn-b")
         await host.shutdown()
 
     asyncio.run(run())
@@ -8527,7 +8527,7 @@ def test_ack_admission_retry_clears_the_latch_when_the_epoch_is_no_longer_live()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-        assert "turn-stale-epoch" not in ledger._ack_emitted_turns
+        assert not ledger.has_emitted_ack("turn-stale-epoch")
         # ...so a later eligible sibling of the same turn can still claim the
         # turn's one ack instead of being short-circuited by a dead latch.
         await ledger.emit_early_ack(
@@ -8536,7 +8536,7 @@ def test_ack_admission_retry_clears_the_latch_when_the_epoch_is_no_longer_live()
             origin_epoch=origin.epoch,
             dispatched=False,
         )
-        assert "turn-stale-epoch" in ledger._ack_emitted_turns
+        assert ledger.has_emitted_ack("turn-stale-epoch")
         await host.shutdown()
 
     asyncio.run(run())
@@ -8575,7 +8575,7 @@ def test_ack_admission_not_live_arm_discards_the_still_queued_ack_on_the_busy_sl
         await ledger.emit_early_ack(
             origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
         )
-        assert len(origin.scheduler._queues[ack_id]) == 1
+        assert len(origin.scheduler.queued_items(ack_id)) == 1
 
         # Drive the busy-slot admission against a stale epoch so it lands in
         # the not-live arm with needs_requeue=False.
@@ -8589,16 +8589,16 @@ def test_ack_admission_not_live_arm_discards_the_still_queued_ack_on_the_busy_sl
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-        assert turn_id not in ledger._ack_emitted_turns
-        assert not origin.scheduler._queues.get(ack_id)
+        assert not ledger.has_emitted_ack(turn_id)
+        assert not origin.scheduler.has_queue(ack_id)
 
         # A later eligible sibling may still claim the turn's one ack -- and
         # ends up with exactly one queued item, not two.
         await ledger.emit_early_ack(
             origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
         )
-        assert turn_id in ledger._ack_emitted_turns
-        assert len(origin.scheduler._queues[ack_id]) == 1
+        assert ledger.has_emitted_ack(turn_id)
+        assert len(origin.scheduler.queued_items(ack_id)) == 1
         await host.shutdown()
 
     asyncio.run(run())
@@ -8621,7 +8621,7 @@ def test_turn_ack_ledger_reads_feature_policy_and_ack_text_live() -> None:
         await ledger.emit_early_ack(
             origin, turn_id="turn-live-text", origin_epoch=origin.epoch, dispatched=False
         )
-        queued = origin.scheduler._queues[ledger.ack_work_item_id("turn-live-text")]
+        queued = origin.scheduler.queued_items(ledger.ack_work_item_id("turn-live-text"))
         assert [item.text for item in queued] == ["Reassigned wording."]
 
         # The feature-policy gate is read live too: flipping the kill switch
@@ -8630,7 +8630,7 @@ def test_turn_ack_ledger_reads_feature_policy_and_ack_text_live() -> None:
         await ledger.emit_early_ack(
             origin, turn_id="turn-flag-off", origin_epoch=origin.epoch, dispatched=False
         )
-        assert "turn-flag-off" not in ledger._ack_emitted_turns
+        assert not ledger.has_emitted_ack("turn-flag-off")
         await host.shutdown()
 
     asyncio.run(run())
@@ -8696,7 +8696,7 @@ def test_ack_admission_retries_after_a_transient_start_next_failure(
             await asyncio.sleep(0.01)
 
         assert len(attempts) >= 2, "the ack admission must be retried after the transient failure"
-        active = origin.scheduler._active
+        active = origin.scheduler.active
         assert active is not None and active.item.work_item_id == ack_work_item_id
         await host.shutdown()
 
@@ -8756,15 +8756,15 @@ def test_ack_admission_retry_gives_up_after_max_attempts_instead_of_forever(
         )
 
         for _ in range(200):
-            if turn_id not in host._turn_ack_ledger._ack_emitted_turns:
+            if not host._turn_ack_ledger.has_emitted_ack(turn_id):
                 break
             await asyncio.sleep(0.01)
 
-        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns, (
+        assert not host._turn_ack_ledger.has_emitted_ack(turn_id), (
             "the ack latch must be cleared after giving up"
         )
         assert len(attempts) == 3, "retries must stop at the attempt cap, not continue forever"
-        assert ack_work_item_id not in origin.scheduler._queues, (
+        assert not origin.scheduler.has_queue(ack_work_item_id), (
             "the abandoned ack's queued item must be discarded"
         )
 
@@ -8846,15 +8846,15 @@ def test_stale_ack_admission_retry_does_not_clobber_a_newer_chain_sharing_its_ke
                 break
             await asyncio.sleep(0.005)
         assert len(start_next_calls) == 1, "chain A's first admission attempt must have run"
-        assert turn_id in ledger._ack_emitted_turns, "attempt 1 of 4 must not abandon yet"
+        assert ledger.has_emitted_ack(turn_id), "attempt 1 of 4 must not abandon yet"
 
         # While chain A's delayed retry is still pending, the turn settles
         # for real (its owning handler's cleanup) and a later eligible
         # sibling of the *same* turn re-latches and starts chain B under the
         # identical key.
         ledger.settle_turn_ack(origin.scheduler, turn_id)
-        assert turn_id not in ledger._ack_emitted_turns
-        assert ack_work_item_id not in origin.scheduler._queues
+        assert not ledger.has_emitted_ack(turn_id)
+        assert not origin.scheduler.has_queue(ack_work_item_id)
 
         ledger._ack_emitted_turns.add(turn_id)
         enqueue_ack()
@@ -8866,7 +8866,7 @@ def test_stale_ack_admission_retry_does_not_clobber_a_newer_chain_sharing_its_ke
                 break
             await asyncio.sleep(0.005)
         assert len(start_next_calls) == 2, "chain B's own first admission attempt must have run"
-        active = origin.scheduler._active
+        active = origin.scheduler.active
         assert active is not None and active.item.work_item_id == ack_work_item_id
         chain_b_utterance_id = active.item.utterance_id
 
@@ -8880,7 +8880,7 @@ def test_stale_ack_admission_retry_does_not_clobber_a_newer_chain_sharing_its_ke
         assert len(start_next_calls) == 2, (
             "chain A must not re-enter start_next once its generation has been superseded"
         )
-        active = origin.scheduler._active
+        active = origin.scheduler.active
         assert active is not None and active.item.utterance_id == chain_b_utterance_id, (
             "chain B's admitted ack must survive undisturbed by chain A's stale retry"
         )
@@ -9039,14 +9039,14 @@ def test_ack_work_item_id_accessor_matches_every_call_site() -> None:
         with patch.object(TurnAckLedger, "ack_work_item_id", staticmethod(spy)):
             # Emission: the enqueued key is the accessor's, not a literal.
             await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
-            assert f"spy-ack-{turn_id}" in origin.scheduler._queues
-            assert origin.scheduler._queues[f"spy-ack-{turn_id}"][0].role == ROLE_ACK
+            assert origin.scheduler.has_queue(f"spy-ack-{turn_id}")
+            assert origin.scheduler.queued_items(f"spy-ack-{turn_id}")[0].role == ROLE_ACK
 
             # Cancellation: settling the sole delegated child finds that key.
             host._register_turn_work_item(turn_id, "work-turn-accessor")
             await host.cancel_turn_or_child(turn_id, "work-turn-accessor", origin=origin)
-            assert f"spy-ack-{turn_id}" not in origin.scheduler._queues
-            assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
+            assert not origin.scheduler.has_queue(f"spy-ack-{turn_id}")
+            assert not host._turn_ack_ledger.has_emitted_ack(turn_id)
 
             # A turn handler's post-commit discard reaches the same key.
             await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
@@ -9107,8 +9107,8 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
             origin=origin,
         )
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not host._turn_ack_ledger.has_emitted_ack(turn_id)
         await host.shutdown()
 
     asyncio.run(run())
@@ -9157,7 +9157,7 @@ def test_multi_intent_rejection_retracts_an_already_admitted_ack() -> None:
 
         assert committed == ()
         assert origin.scheduler.active is None
-        assert ack_work_item_id not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue(ack_work_item_id)
         await host.shutdown()
 
     asyncio.run(run())
@@ -9223,10 +9223,10 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
         await host._handle_transcript("cancel work-orphan")
 
         # The target's own cancellation still ran...
-        assert "work-orphan" not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue("work-orphan")
         # ...and the unrelated turn's ack and latch are untouched.
-        assert other_ack in origin.scheduler._queues
-        assert other_turn in host._turn_ack_ledger._ack_emitted_turns
+        assert origin.scheduler.has_queue(other_ack)
+        assert host._turn_ack_ledger.has_emitted_ack(other_turn)
         assert host._turn_ack_ledger._turn_work_items.get(other_turn) == {"work-turn-other"}
         await host.shutdown()
 
@@ -9455,7 +9455,7 @@ def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
 
             async def submit(self, *_args: object, **_kwargs: object) -> object:
                 nonlocal ack_seen_queued
-                ack_seen_queued = ack_work_item_id in origin.scheduler._queues
+                ack_seen_queued = origin.scheduler.has_queue(ack_work_item_id)
                 raise RuntimeError("submit exploded")
 
         tts = FakeTTS()
@@ -9477,7 +9477,7 @@ def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
         # The ack must have actually been queued before the exception, or
         # this test would not exercise the gap at all.
         assert ack_seen_queued is True
-        assert ack_work_item_id not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue(ack_work_item_id)
         await host.shutdown()
 
     asyncio.run(run())
@@ -9549,7 +9549,7 @@ def test_pending_turn_retracts_its_ack_when_submit_accepts_nothing() -> None:
         )
 
         assert _ack_items(origin.scheduler) == []
-        assert host._turn_ack_ledger._ack_emitted_turns == set()
+        assert not host._turn_ack_ledger.emitted_ack_turns()
         await host.shutdown()
 
     asyncio.run(run())
@@ -9907,12 +9907,12 @@ def test_ack_admission_generation_dict_is_bounded() -> None:
     for index in range(_MAX_ACK_GENERATION_TURNS + 250):
         ledger._claim_ack_admission_generation(f"turn-{index}")
 
-    assert len(ledger._ack_admission_generation) == _MAX_ACK_GENERATION_TURNS
+    assert ledger.admission_generation_count() == _MAX_ACK_GENERATION_TURNS
     # Oldest-first eviction: the most recent turns are the ones retained, so a
     # chain that could still be in flight never loses its generation.
     newest = f"turn-{_MAX_ACK_GENERATION_TURNS + 249}"
-    assert newest in ledger._ack_admission_generation
-    assert "turn-0" not in ledger._ack_admission_generation
+    assert ledger.admission_generation(newest) is not None
+    assert ledger.admission_generation("turn-0") is None
 
 
 def test_reclaiming_a_turns_generation_still_increments_monotonically() -> None:
@@ -9953,7 +9953,7 @@ def test_relatching_an_evicted_turn_cannot_reuse_a_live_chains_generation() -> N
     live_chain_generation = ledger._claim_ack_admission_generation("turn-evicted")
     for index in range(_MAX_ACK_GENERATION_TURNS + 1):
         ledger._claim_ack_admission_generation(f"turn-later-{index}")
-    assert "turn-evicted" not in ledger._ack_admission_generation
+    assert ledger.admission_generation("turn-evicted") is None
 
     relatched_generation = ledger._claim_ack_admission_generation("turn-evicted")
 
@@ -10014,7 +10014,7 @@ def test_evicted_generation_entry_does_not_orphan_a_live_ack_chains_latch(
         # _MAX_ACK_GENERATION_TURNS eviction would once enough later turns
         # latch inside the chain's ~1s lifetime.
         for _ in range(200):
-            if turn_id in ledger._ack_admission_generation:
+            if ledger.admission_generation(turn_id) is not None:
                 break
             await asyncio.sleep(0.005)
         del ledger._ack_admission_generation[turn_id]
@@ -10022,11 +10022,11 @@ def test_evicted_generation_entry_does_not_orphan_a_live_ack_chains_latch(
         # Let the whole bounded retry chain run to its abandon branch.
         await asyncio.sleep(0.6)
 
-        assert turn_id not in ledger._ack_emitted_turns, (
+        assert not ledger.has_emitted_ack(turn_id), (
             "an evicted-but-live chain must still settle its turn's ack latch, "
             "not read itself as superseded and return without settling"
         )
-        assert ack_work_item_id not in origin.scheduler._queues, (
+        assert not origin.scheduler.has_queue(ack_work_item_id), (
             "the orphaned ack must be discarded from the scheduler queue too"
         )
         await host.shutdown()
@@ -10183,7 +10183,7 @@ def test_late_commit_after_a_reconnect_does_not_settle_against_the_new_epochs_sc
             ),
         )
 
-        assert new.scheduler._queues.get(new_ack_work_item_id), (
+        assert new.scheduler.has_queue(new_ack_work_item_id), (
             "the live epoch's queued ack must survive a late commit belonging to a retired epoch"
         )
         await host.shutdown()

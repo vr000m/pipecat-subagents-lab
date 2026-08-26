@@ -1219,7 +1219,7 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
 
         assert not origin.scheduler.has_queue(ack_work_item_id)
         assert not origin.scheduler.has_queue("work-5-0")
-        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
+        assert not host._turn_ack_ledger.has_emitted_ack(turn_id)
         await host.shutdown()
 
     asyncio.run(run())
