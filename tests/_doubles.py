@@ -138,11 +138,20 @@ AddWorkerClarificationHook = Callable[..., None]
 class FakeCoordinator(CoordinatorDefaults):
     """Canonical, contract-checked ``Coordinator`` double for tests/.
 
-    Provides every required ``Coordinator`` member. The 7 optional members
+    Provides every required ``Coordinator`` member. All 7 optional members
     (``registry``, ``config``, ``OWNED_CONFIG_FIELDS``, ``live_work_item_ids``,
-    ``start_task``, ``cancel``, ``shutdown``) come from ``CoordinatorDefaults``
-    except ``config``, which defaults to a real ``Config()`` here (matching
-    how the existing doubles already construct one) rather than ``None``.
+    ``start_task``, ``cancel``, ``shutdown``) come from ``CoordinatorDefaults``,
+    including ``config``, which defaults to ``None`` there -- matching the
+    production fallback surface (``CoordinatorDefaults.config``) rather than
+    silently supplying a real ``Config()`` a test never asked for. Pass
+    ``config=...`` explicitly at the call site when a test needs the
+    coordinator to declare one.
+
+    ``config`` is deliberately left unset here (not assigned ``None``) when
+    no explicit value is given, so a subclass that declares its own
+    class-level ``config`` attribute (e.g. to exercise the "coordinator owns
+    a diverging Config" path) is not shadowed by an instance attribute --
+    the class attribute lookup falls through naturally.
 
     Override a behaviour by passing a constructor hook, or by subclassing and
     overriding the method directly -- both are first-class; see the module
@@ -163,7 +172,8 @@ class FakeCoordinator(CoordinatorDefaults):
     ) -> None:
         self.registry = registry
         self.router = router
-        self.config = config if config is not None else Config()
+        if config is not None:
+            self.config = config
         self._arbitrate_hook = arbitrate
         self._dispatch_hook = dispatch
         self._submit_hook = submit

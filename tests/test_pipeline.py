@@ -54,14 +54,16 @@ from server.workers.web_search import WorkerClarify, WorkerDeclined
 
 class RoutedCoordinator(FakeCoordinator):
     def __init__(self, worker: object) -> None:
+        # FakeCoordinator leaves ``config`` unset (falling through to
+        # CoordinatorDefaults' ``None``) unless passed explicitly here, so
+        # RoutedCoordinator doubles as a "coordinator with no Config of its
+        # own" fixture (see
+        # test_foreground_search_timeout_comes_from_the_host_config_not_the_coordinator)
+        # by default, while a subclass that declares its own class-level
+        # ``config`` (e.g. RejectingCoordinator's custom foreground timeout)
+        # is still picked up via ordinary attribute lookup.
         super().__init__()
         self.worker = worker
-        # Unlike FakeCoordinator's own default, RoutedCoordinator doubles as
-        # a "coordinator with no Config of its own" fixture (see
-        # test_foreground_search_timeout_comes_from_the_host_config_not_the_coordinator):
-        # only adopt a Config when a subclass declares one as a class
-        # attribute (e.g. RejectingCoordinator's custom foreground timeout).
-        self.config = getattr(type(self), "config", None)
 
     def arbitrate(self, _session_id: str, transcript: str) -> object:
         return type(
