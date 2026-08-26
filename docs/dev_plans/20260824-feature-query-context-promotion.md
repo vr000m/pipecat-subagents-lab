@@ -191,7 +191,7 @@ If the operator chooses invest at Phase 1, the follow-up plan must cover, at min
 ## Progress
 
 - [x] Phase 0: Feasibility pre-flight (no material paid spend)
-- [ ] Phase 1: Decision checkpoint (escalation)
+- [x] Phase 1: Decision checkpoint (escalation)
 - [ ] Phase 2: Retire — fail-closed gate replacement, then full-chain removal
 - [ ] Phase 3: Docs + program closure
 
@@ -252,3 +252,20 @@ and re-stamping the manifest (Appendix A scope). Feasibility of *invest* is
 therefore "possible but requires the full Appendix A follow-up plan"; nothing
 in Phase 0 changes the retire-default expectation. Decision escalates to the
 operator at Phase 1.
+
+### Phase 1 decision (2026-08-26)
+
+**Operator decision: RETIRE.** Explicitly chosen by the operator (not
+defaulted) after reviewing the Phase 0 feasibility verdict and the Appendix A
+invest-scope estimate. Rationale: although the model is available and
+credentials resolve, promote still requires the full Appendix A effort —
+implementing `run_live()`, ≥30 paired real-stratum samples per cell of paid
+collection into the phase0/phase1 artifacts, the named browser/device
+transport check regenerating phase2, the phase4c artifact, and a
+manifest re-stamp serialized after P2/P3 — against an experiment whose value
+was never demonstrated (`promotion_eligible=false` shipped in v0.1.3).
+Retire proceeds to Phase 2: fail-closed gate replacement, then full-chain
+removal. This decision also satisfies the P2 plan's Phase 2 gate
+("P1's Phase 1 decision is recorded"): P2 Phase 2 must now wait for this
+plan's retire commit to land (it deletes the `server/pipeline.py:2837` gate
+region P2 rewrites).
