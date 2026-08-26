@@ -72,7 +72,9 @@ from .turn_ack_ledger import TurnAckLedger
 from .turn_epilogue import (
     SingleChildEpilogueOutcome,
     TurnEpilogueContext,
+    finalize_fan_out_turn,
     finalize_single_child_turn,
+    release_fan_out_turn_work_items,
 )
 from .work_item_coordinator import (
     FAILURE_KINDS,
@@ -2052,6 +2054,19 @@ class SessionHost:
         # accepted concurrently: this is the turn-sequence snapshot
         # LateDeliveryContext needs to detect a newer-turn arrival.
         dispatch_turn_sequence = self._turn_sequence
+        # Constructed here (before `try`) rather than at its first use point
+        # like the single-child shape's context: the `finally` below needs it
+        # for `release_fan_out_turn_work_items` even if the body raises
+        # before ever reaching the epilogue call, and this is a pure
+        # attribute read that cannot itself fail.
+        epilogue_ctx = TurnEpilogueContext(
+            settle_turn_ack=self._settle_turn_ack,
+            cancelled_ids=self._work_ledger.cancelled_ids,
+            emit_work_status=self._emit_work_status,
+            release_turn_work_item=self._release_turn_work_item,
+            release_all_turn_work_items=self._release_all_turn_work_items,
+            finalize_turn_exception=self._finalize_turn_exception,
+        )
         try:
             results: dict[int, Any] = {}
             runnable: list[tuple[str, str]] = []
@@ -2503,108 +2518,25 @@ class SessionHost:
                 # `shared/protocol.md` already documents for reconnect
                 # snapshot terminal records, which is a larger, separately
                 # scoped change.
-            if not attributed_indexes and not retained_work_items:
-                # No *delegated* child was accepted or retained: every one was
-                # rejected before dispatch or never accounted for by the
-                # coordinator. The ack was enqueued at the delegation decision
-                # and promises a search result that is never coming, so retract
-                # it in whatever state it is in -- a plain queued-ack discard
-                # cannot reach one already admitted to the transport.
-                #
-                # The test is deliberately ``attributed_indexes``, not
-                # ``results``: a mixed multi-intent turn whose direct half
-                # produced a result and whose delegated half was
-                # capacity-rejected has a non-empty ``results`` while nothing
-                # was delegated at all, which left the false-progress ack
-                # speakable. ``attributed_indexes`` holds exactly the runnable
-                # (delegated) indexes the coordinator accounted for in some
-                # fan-in bucket -- result, pending, or failure -- so it is the
-                # accepted/retained-delegated-work signal this decision needs.
-                # ``retained_work_items`` is a subset of it and is kept only to
-                # state the "still running" half of the condition explicitly.
-                self._settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=True)
-            else:
-                self._settle_turn_ack(origin.scheduler, turn_id)
-            committed = []
-            commit_exceptions: list[Exception] = []
-            for index in sorted(results):
-                # _commit_and_speak durably commits state before it ever
-                # attempts to speak, so a speak-time failure on one item must
-                # not abort the loop and drop already-computed sibling
-                # results; each item is isolated and the first failure is
-                # re-raised only after every item has been committed.
-                #
-                # Each item's terminal work-status is emitted only after its
-                # own commit returns, so `result_ready` is never published for
-                # a result whose commit raised.
-                #
-                # `deferred_status` was derived above from the cancel set as it
-                # stood *before* this loop. A cancel landing between then and
-                # this await makes _commit_and_speak silently skip the commit
-                # and return normally, so the pre-derived status has to be
-                # downgraded to the outcome that actually happened rather than
-                # published as-is.
-                suppressed: set[str] = set()
-                try:
-                    committed.append(
-                        await self._commit_and_speak(
-                            results[index],
-                            origin,
-                            role=speech_roles.get(index, ROLE_RESULT),
-                            suppressed_out=suppressed,
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001  # isolate one item's speak failure from its siblings; re-raised below once all items are committed
-                    logger.exception(
-                        f"multi-intent commit for {turn_id}: item {index} failed after its "
-                        f"state was already committed; continuing with remaining items"
-                    )
-                    committed.append(results[index])
-                    commit_exceptions.append(exc)
-                    pending_status = deferred_status.pop(index, None)
-                    if pending_status is not None:
-                        failed_item_id, failed_worker_id, _state, _reason = pending_status
-                        self._emit_work_status(
-                            turn_id=turn_id,
-                            work_item_id=failed_item_id,
-                            parent_work_item_id=parent_work_item_id,
-                            worker_id=failed_worker_id,
-                            state="failed",
-                            origin_epoch=origin_epoch,
-                        )
-                else:
-                    pending_status = deferred_status.pop(index, None)
-                    if pending_status is not None:
-                        item_id, item_worker_id, status_state, status_reason = pending_status
-                        if item_id in suppressed:
-                            status_state, status_reason = "cancelled", None
-                        self._emit_work_status(
-                            turn_id=turn_id,
-                            work_item_id=item_id,
-                            parent_work_item_id=parent_work_item_id,
-                            worker_id=item_worker_id,
-                            state=status_state,
-                            origin_epoch=origin_epoch,
-                            terminal_reason=status_reason,
-                        )
-            # A deferred status whose index never reached the commit loop (its
-            # result was dropped from `results` between derivation and commit)
-            # still has to terminalize rather than strand the parent.
-            for item_id, item_worker_id, status_state, status_reason in deferred_status.values():
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=item_id,
-                    parent_work_item_id=parent_work_item_id,
-                    worker_id=item_worker_id,
-                    state=status_state,
-                    origin_epoch=origin_epoch,
-                    terminal_reason=status_reason,
-                )
-            deferred_status.clear()
-            if commit_exceptions:
-                raise commit_exceptions[0]
-            turn_recorder.finalize()
-            return tuple(committed)
+            # Rows 2, 4, 5, 7 of the Phase 1 differences table: ack settle,
+            # per-item commit loop with per-item failure isolation, per-item
+            # (plus final-sweep) status emission, and end-of-happy-path
+            # `turn_recorder.finalize()`. No worker-idle projection (row 9,
+            # absent for this handler) and no early-exit variant (row 8 stays
+            # in the fan-in loops above, which built every input below).
+            return await finalize_fan_out_turn(
+                epilogue_ctx,
+                origin=origin,
+                turn_id=turn_id,
+                parent_work_item_id=parent_work_item_id,
+                turn_recorder=turn_recorder,
+                results=results,
+                attributed_indexes=attributed_indexes,
+                retained_work_items=retained_work_items,
+                deferred_status=deferred_status,
+                speech_roles=speech_roles,
+                commit_and_speak=self._commit_and_speak,
+            )
         except asyncio.CancelledError:
             self._finalize_turn_exception(
                 cancelled=True,
@@ -2632,12 +2564,12 @@ class SessionHost:
             )
             raise
         finally:
-            if retained_work_items:
-                for item_work_item_id in delegated_children:
-                    if item_work_item_id not in retained_work_items:
-                        self._release_turn_work_item(turn_id, item_work_item_id)
-            else:
-                self._release_all_turn_work_items(turn_id)
+            release_fan_out_turn_work_items(
+                epilogue_ctx,
+                turn_id=turn_id,
+                delegated_children=delegated_children,
+                retained_work_items=retained_work_items,
+            )
 
     def _dispatch_search_task(
         self,

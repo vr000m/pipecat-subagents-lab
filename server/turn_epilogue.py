@@ -17,20 +17,28 @@ section). Collaborator types are pulled from their owning modules
 (``contracts``, ``perf_metrics``, ``speech_scheduler``, ``work_status_publisher``)
 instead.
 
-This sub-step (C1) covers only the single-child epilogue shape
-(``finalize_single_child_turn``), used today by ``_handle_transcript_impl``.
-The fan-out entry point for ``_handle_multi_intent`` is a later sub-step and
-is deliberately not built here.
+Sub-step C1 covers the single-child epilogue shape
+(``finalize_single_child_turn``), used by ``_handle_transcript_impl`` and (as
+of C2) ``_handle_pending``. Sub-step C3 adds the fan-out shape
+(``finalize_fan_out_turn`` and ``release_fan_out_turn_work_items``), used by
+``_handle_multi_intent``: unlike the single-child shape, the fan-out
+handler's per-index result/pending/failure/reconcile fan-in loops that BUILD
+the per-item state remain the handler's own distinct middle -- only the
+tail that CONSUMES that already-built state (ack settle, the per-item commit
+loop, the deferred-status sweep, and the partial-release decision) lives
+here.
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import AbstractSet, Any
 
-from .contracts import GroundedResult
+from loguru import logger
+
+from .contracts import GroundedResult, TerminalReason, WorkStatusState
 from .perf_metrics import AppTurnRecorder, WorkItemOutcome, WorkItemRecorder
 from .speech_scheduler import ROLE_RESULT, SpeechRole
 from .work_status_publisher import work_status_after_commit_failure, work_status_for_outcome
@@ -168,3 +176,143 @@ async def finalize_single_child_turn(
             latest_result_id=None if was_cancelled else result.result_id,
         )
     return SingleChildEpilogueOutcome(result=committed, retained_still_open=retained_still_open)
+
+
+async def finalize_fan_out_turn(
+    ctx: TurnEpilogueContext,
+    *,
+    origin: Any,
+    turn_id: str,
+    parent_work_item_id: str,
+    turn_recorder: AppTurnRecorder,
+    results: dict[int, GroundedResult],
+    attributed_indexes: AbstractSet[int],
+    retained_work_items: AbstractSet[str],
+    deferred_status: dict[int, tuple[str, str | None, WorkStatusState, TerminalReason | None]],
+    speech_roles: dict[int, SpeechRole],
+    commit_and_speak: Callable[..., Awaitable[GroundedResult]],
+) -> tuple[GroundedResult, ...]:
+    """Rows 2, 4, 5, 7 of the Phase 1 differences table, fan-out shape.
+
+    Covers the tail of ``_handle_multi_intent`` that *consumes* per-index
+    state already built by the handler's own fan-in loops (results/pending/
+    failures/reconcile) -- ``results``, ``attributed_indexes``,
+    ``retained_work_items``, ``deferred_status``, and ``speech_roles`` are
+    all inputs here, never derived inside this function. Row 1 (per-child
+    ``was_cancelled``), row 3 (per-index status derivation), row 6 (per-item
+    child-recorder finalize at up to 4 fan-in sites), and row 8 (the
+    per-item retained/capability-gated legacy result) all stay in that
+    middle -- they run before any of the state this function consumes
+    exists in final form.
+
+    Row 9 (post-commit worker-``idle`` projection) is deliberately absent
+    here, unlike the single-child shape: no fan-out call site ever passed
+    one, matching the Phase 1 characterization's "absent" cell for this row.
+
+    Row 11's *decision* (release-all vs partial-release) is a separate
+    function, ``release_fan_out_turn_work_items`` below -- it must run from
+    the caller's own ``finally`` so it still fires when this function's
+    commit loop re-raises, or when an earlier exception in the handler's
+    middle skips this function entirely.
+    """
+    if not attributed_indexes and not retained_work_items:
+        # No *delegated* child was accepted or retained: the ack promised a
+        # search result that is never coming, so retract it outright (see
+        # the caller's own comment on this branch for the full rationale).
+        ctx.settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=True)
+    else:
+        ctx.settle_turn_ack(origin.scheduler, turn_id)
+    committed: list[GroundedResult] = []
+    commit_exceptions: list[Exception] = []
+    for index in sorted(results):
+        # Each item is isolated so one item's speak-time failure cannot drop
+        # already-computed sibling results; only the first exception is
+        # re-raised, and only after every item has been committed.
+        suppressed: set[str] = set()
+        try:
+            committed.append(
+                await commit_and_speak(
+                    results[index],
+                    origin,
+                    role=speech_roles.get(index, ROLE_RESULT),
+                    suppressed_out=suppressed,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001  # isolate one item's speak failure from its siblings; re-raised below once all items are committed
+            logger.exception(
+                f"multi-intent commit for {turn_id}: item {index} failed after its "
+                f"state was already committed; continuing with remaining items"
+            )
+            committed.append(results[index])
+            commit_exceptions.append(exc)
+            pending_status = deferred_status.pop(index, None)
+            if pending_status is not None:
+                failed_item_id, failed_worker_id, _state, _reason = pending_status
+                ctx.emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=failed_item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=failed_worker_id,
+                    state="failed",
+                    origin_epoch=origin.epoch,
+                )
+        else:
+            pending_status = deferred_status.pop(index, None)
+            if pending_status is not None:
+                item_id, item_worker_id, status_state, status_reason = pending_status
+                if item_id in suppressed:
+                    status_state, status_reason = "cancelled", None
+                ctx.emit_work_status(
+                    turn_id=turn_id,
+                    work_item_id=item_id,
+                    parent_work_item_id=parent_work_item_id,
+                    worker_id=item_worker_id,
+                    state=status_state,
+                    origin_epoch=origin.epoch,
+                    terminal_reason=status_reason,
+                )
+    # A deferred status whose index never reached the commit loop (its result
+    # was dropped from `results` between derivation and commit) still has to
+    # terminalize rather than strand the parent.
+    for item_id, item_worker_id, status_state, status_reason in deferred_status.values():
+        ctx.emit_work_status(
+            turn_id=turn_id,
+            work_item_id=item_id,
+            parent_work_item_id=parent_work_item_id,
+            worker_id=item_worker_id,
+            state=status_state,
+            origin_epoch=origin.epoch,
+            terminal_reason=status_reason,
+        )
+    deferred_status.clear()
+    if commit_exceptions:
+        raise commit_exceptions[0]
+    turn_recorder.finalize()
+    return tuple(committed)
+
+
+def release_fan_out_turn_work_items(
+    ctx: TurnEpilogueContext,
+    *,
+    turn_id: str,
+    delegated_children: Mapping[str, str | None],
+    retained_work_items: AbstractSet[str],
+) -> None:
+    """Row 11 of the Phase 1 differences table, fan-out shape.
+
+    Unlike the single-child shape's release decision (a bool the handler
+    keeps as a thin call-through in its own ``finally``), the fan-out
+    handler's retained state is per-child, not per-turn: some children may
+    be retained while their siblings are not, so releasing "all turn work
+    items" outright would release a still-live retained sibling's work item
+    out from under it. This runs from the caller's own ``finally`` (not from
+    inside ``finalize_fan_out_turn``) so it still fires when the commit loop
+    re-raises, or when an earlier exception skips ``finalize_fan_out_turn``
+    entirely.
+    """
+    if retained_work_items:
+        for item_work_item_id in delegated_children:
+            if item_work_item_id not in retained_work_items:
+                ctx.release_turn_work_item(turn_id, item_work_item_id)
+    else:
+        ctx.release_all_turn_work_items(turn_id)
