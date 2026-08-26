@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from _doubles import FakeCoordinator
 
 from server.contracts import DeliveryState, GroundedResult, WorkerState
 from server.perf_metrics import CollectingMeasurementSink
@@ -227,7 +228,7 @@ def test_shutdown_finalizes_retained_recorders_only_after_coordinator_shutdown_r
     async def run() -> None:
         order: list[str] = []
 
-        class SlowShutdownCoordinator:
+        class SlowShutdownCoordinator(FakeCoordinator):
             async def shutdown(self) -> None:
                 order.append("coordinator-shutdown-start")
                 await asyncio.sleep(0.02)
