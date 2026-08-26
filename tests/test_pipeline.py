@@ -6,6 +6,7 @@ import threading
 import time
 
 import pytest
+from _doubles import FakeCoordinator
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.bus.bridge_processor import BusBridgeProcessor as FrameworkBusBridgeProcessor
 from pipecat.frames.frames import (
@@ -51,10 +52,16 @@ from server.workers.base import ClarificationContext
 from server.workers.web_search import WorkerClarify, WorkerDeclined
 
 
-class RoutedCoordinator:
+class RoutedCoordinator(FakeCoordinator):
     def __init__(self, worker: object) -> None:
+        super().__init__()
         self.worker = worker
-        self.clarifications: list[dict[str, str]] = []
+        # Unlike FakeCoordinator's own default, RoutedCoordinator doubles as
+        # a "coordinator with no Config of its own" fixture (see
+        # test_foreground_search_timeout_comes_from_the_host_config_not_the_coordinator):
+        # only adopt a Config when a subclass declares one as a class
+        # attribute (e.g. RejectingCoordinator's custom foreground timeout).
+        self.config = getattr(type(self), "config", None)
 
     def arbitrate(self, _session_id: str, transcript: str) -> object:
         return type(
@@ -63,29 +70,10 @@ class RoutedCoordinator:
             {"kind": "routed", "decision": object(), "transcript": transcript},
         )()
 
-    def dispatch(self, _decision: object) -> object:
+    def dispatch(
+        self, decision: object, operation: object = None, catalogue: object = None
+    ) -> object:
         return self.worker
-
-    def add_worker_clarification(
-        self,
-        *,
-        session_id: str,
-        worker_id: str,
-        turn_id: str,
-        result_id: str,
-        original_query: str,
-        question: str,
-    ) -> None:
-        self.clarifications.append(
-            {
-                "session_id": session_id,
-                "worker_id": worker_id,
-                "turn_id": turn_id,
-                "result_id": result_id,
-                "original_query": original_query,
-                "question": question,
-            }
-        )
 
 
 class ResultWorker:
@@ -1343,7 +1331,7 @@ def test_duplicate_late_result_callback_commits_and_enqueues_speech_once() -> No
 
 def test_unimplemented_worker_type_becomes_a_safe_canonical_result() -> None:
     async def run() -> None:
-        class UnsupportedCoordinator:
+        class UnsupportedCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -1368,7 +1356,7 @@ def test_unimplemented_worker_type_becomes_a_safe_canonical_result() -> None:
 
 def test_router_provider_failure_becomes_a_safe_canonical_result() -> None:
     async def run() -> None:
-        class FailingCoordinator:
+        class FailingCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 raise RuntimeError("provider detail must stay in server logs")
 
@@ -1388,7 +1376,7 @@ def test_router_provider_failure_becomes_a_safe_canonical_result() -> None:
 def test_cancel_control_interrupts_active_speech() -> None:
 
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -1441,7 +1429,7 @@ def test_cancel_control_interrupts_active_speech() -> None:
 def test_pause_control_stops_active_speech_before_confirmation() -> None:
 
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -1501,7 +1489,7 @@ def test_control_action_calls_record_interruption_exactly_once(action: str) -> N
     cleanup twice."""
 
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -1553,7 +1541,7 @@ def test_control_action_calls_record_interruption_exactly_once(action: str) -> N
 
 def test_pause_targeting_a_queued_item_does_not_tombstone_the_active_speech() -> None:
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -1692,7 +1680,7 @@ def test_late_tts_start_before_pause_does_not_bind_replacement_utterance() -> No
 
 def test_resume_control_requeues_and_starts_targeted_paused_item() -> None:
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -1913,8 +1901,9 @@ def test_concurrent_registration_of_one_worker_uses_one_runner_operation() -> No
 
 def test_search_cancellation_cancels_child_without_retaining_it() -> None:
     async def run() -> None:
-        class RetainingCoordinator:
+        class RetainingCoordinator(FakeCoordinator):
             def __init__(self) -> None:
+                super().__init__()
                 self.retained: list[asyncio.Task[object]] = []
 
             def retain_late_task(self, task: asyncio.Task[object], **_: object) -> None:
@@ -2237,8 +2226,9 @@ def test_late_worker_error_log_omits_untrusted_exception_text(
 
 def test_session_shutdown_closes_coordinator() -> None:
     async def run() -> None:
-        class Coordinator:
+        class Coordinator(FakeCoordinator):
             def __init__(self) -> None:
+                super().__init__()
                 self.closed = False
 
             async def shutdown(self) -> None:
@@ -2267,7 +2257,7 @@ def test_session_shutdown_fences_connection_before_coordinator() -> None:
                 assert reconnect is False
                 events.append("connection")
 
-        class Coordinator:
+        class Coordinator(FakeCoordinator):
             async def shutdown(self) -> None:
                 events.append("coordinator")
 
@@ -3192,7 +3182,7 @@ def _events(sink: CollectingMeasurementSink, name: str) -> tuple[object, ...]:
 
 def test_direct_response_emits_zero_child_app_turn_foreground() -> None:
     async def run() -> None:
-        class DirectCoordinator:
+        class DirectCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -3242,7 +3232,7 @@ def test_direct_response_emits_zero_child_app_turn_foreground() -> None:
 
 def test_unsupported_capability_emits_zero_child_app_turn_foreground() -> None:
     async def run() -> None:
-        class UnsupportedActionCoordinator:
+        class UnsupportedActionCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -3278,7 +3268,7 @@ def test_unsupported_capability_emits_zero_child_app_turn_foreground() -> None:
 
 def test_router_clarification_emits_clarify_outcome_with_zero_child() -> None:
     async def run() -> None:
-        class ClarifyActionCoordinator:
+        class ClarifyActionCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -3313,7 +3303,7 @@ def test_router_clarification_emits_clarify_outcome_with_zero_child() -> None:
 
 def test_cancel_control_emits_control_action_and_applied_outcome() -> None:
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -3644,7 +3634,7 @@ def test_delegated_foreground_timeout_emits_retained_parent_and_child_then_backg
 
 def test_router_exception_emits_failed_parent_and_no_child() -> None:
     async def run() -> None:
-        class FailingCoordinator:
+        class FailingCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 raise RuntimeError("provider detail must stay in server logs")
 
@@ -3674,7 +3664,7 @@ def test_dispatch_exception_emits_failed_parent_with_no_completed_child() -> Non
     """
 
     async def run() -> None:
-        class UnsupportedCoordinator:
+        class UnsupportedCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -4874,8 +4864,9 @@ def test_search_with_timeout_registers_recorder_before_retention_captures_eager_
         sink = CollectingMeasurementSink()
         host = SessionHost(measurement_sink=sink)
 
-        class EagerCoordinator:
+        class EagerCoordinator(FakeCoordinator):
             def __init__(self) -> None:
+                super().__init__()
                 self.search_task: asyncio.Task[object] | None = None
 
             def start_task(self, operation: object) -> asyncio.Task[object] | None:
@@ -5159,7 +5150,7 @@ def test_uncaught_exception_in_handle_transcript_emits_one_failed_parent() -> No
     """
 
     async def run() -> None:
-        class DirectCoordinator:
+        class DirectCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -5203,7 +5194,7 @@ def test_router_resolved_direct_turn_reports_all_counters_zero() -> None:
     """
 
     async def run() -> None:
-        class DirectCoordinator:
+        class DirectCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 return type(
                     "Outcome",
@@ -5315,7 +5306,7 @@ def test_routing_failure_logs_exception_type_without_traceback_or_message() -> N
     async def run() -> None:
         secret = "sk-live-do-not-log-this"
 
-        class ExplodingCoordinator:
+        class ExplodingCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
                 raise RuntimeError(f"provider rejected token {secret}")
 
@@ -5352,7 +5343,7 @@ def test_multi_intent_with_no_work_items_still_emits_exactly_one_parent() -> Non
     latching finalized and emitting nothing at all."""
 
     async def run() -> None:
-        class EmptyMultiIntentCoordinator:
+        class EmptyMultiIntentCoordinator(FakeCoordinator):
             @staticmethod
             def arbitrate(_session_id: str, _transcript: str) -> object:
                 return type(
@@ -5405,7 +5396,7 @@ def test_control_turn_without_control_action_emits_failed_parent_and_same_speech
     with the spoken fallback text unchanged."""
 
     async def run() -> None:
-        class ActionlessControlCoordinator:
+        class ActionlessControlCoordinator(FakeCoordinator):
             @staticmethod
             def arbitrate(_session_id: str, _transcript: str) -> object:
                 return type(
@@ -6473,7 +6464,7 @@ def test_no_early_ack_for_the_non_delegated_direct_route() -> None:
     *web-search delegation* (existing_worker/new_worker) is eligible."""
 
     async def run() -> None:
-        class DirectCoordinator:
+        class DirectCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 decision = type("Decision", (), {"action": "direct"})()
                 return type(
@@ -6498,7 +6489,7 @@ def test_no_early_ack_for_the_non_delegated_direct_route() -> None:
 @pytest.mark.parametrize("action", ["unsupported", "clarify"])
 def test_no_early_ack_for_unsupported_and_clarify_routes(action: str) -> None:
     async def run() -> None:
-        class UnsupportedOrClarifyCoordinator:
+        class UnsupportedOrClarifyCoordinator(FakeCoordinator):
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 decision = type("Decision", (), {"action": action})()
                 return type("Outcome", (), {"kind": "routed", "decision": decision})()
@@ -6772,8 +6763,9 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
     from server.speech_scheduler import ROLE_ACK
 
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def __init__(self) -> None:
+                super().__init__()
                 self.target: str | None = None
 
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
@@ -6881,7 +6873,7 @@ def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_liv
     from server.speech_scheduler import ROLE_ACK
 
     async def run() -> None:
-        class RetainedChildCoordinator:
+        class RetainedChildCoordinator(FakeCoordinator):
             def live_work_item_ids(self) -> frozenset[str]:
                 # The sibling child is live only here -- not in the scheduler,
                 # not in the host's own _inflight_* maps -- exactly the state
@@ -9179,8 +9171,9 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
     from server.speech_scheduler import ROLE_ACK
 
     async def run() -> None:
-        class ControlCoordinator:
+        class ControlCoordinator(FakeCoordinator):
             def __init__(self) -> None:
+                super().__init__()
                 self.target: str | None = None
 
             def arbitrate(self, _session_id: str, _transcript: str) -> object:
