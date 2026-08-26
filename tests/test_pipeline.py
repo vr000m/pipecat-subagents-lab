@@ -1150,7 +1150,7 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
             text="Unrelated speech.",
             origin_epoch=1,
         )
-        other_queue_before = list(scheduler._queues["work-other"])
+        other_queue_before = scheduler.queued_items("work-other")
 
         call_order: list[str] = []
         real_discard_queued_notice = scheduler.discard_queued_notice
@@ -1207,7 +1207,7 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
 
         # B's remaining same-work items retain order, with the final result
         # appended after them.
-        remaining = scheduler._queues["work-b"]
+        remaining = scheduler.queued_items("work-b")
         assert [item.result_id for item in remaining] == [
             before_notice.result_id,
             after_notice.result_id,
@@ -1215,7 +1215,7 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
         ]
 
         # Another work item's queue is untouched.
-        assert scheduler._queues["work-other"] == other_queue_before
+        assert scheduler.queued_items("work-other") == other_queue_before
         assert other_item.result_id == "result-other"
 
         # A is not interrupted and still owns the transport slot.
@@ -6408,7 +6408,7 @@ def _ack_items(scheduler: object) -> list[object]:
     from server.speech_scheduler import ROLE_ACK
 
     items = [
-        item for queue in scheduler._queues.values() for item in queue if item.role == ROLE_ACK
+        item for item in scheduler.all_queued_items() if item.role == ROLE_ACK
     ]
     active = scheduler.active
     if active is not None and active.item.role == ROLE_ACK:
@@ -9367,7 +9367,7 @@ def test_late_result_display_only_still_discards_the_stale_queued_notice() -> No
             LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
         )
 
-        remaining_roles = [item.role for item in scheduler._queues.get("work-b", ())]
+        remaining_roles = [item.role for item in scheduler.queued_items("work-b")]
         assert ROLE_TIMEOUT_NOTICE not in remaining_roles
         await host.shutdown()
 
@@ -9424,7 +9424,7 @@ def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_p
             LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
         )
 
-        assert ack_work_item_id not in scheduler._queues
+        assert not scheduler.has_queue(ack_work_item_id)
         await host.shutdown()
 
     asyncio.run(run())
