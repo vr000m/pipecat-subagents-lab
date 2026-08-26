@@ -11,12 +11,13 @@ so they stay deterministic and credential-free.
 
 import asyncio
 
+from _doubles import FakeCoordinator
+
 from scripts.eval_common import latest_turn_stage_metrics
 from scripts.smoke_conversation import (
     ROUTING_REGRESSION_QUERIES,
     _run_routing_regression,
 )
-from server.config import Config
 from server.contracts import Citation, GroundedResult, RoutingDecision
 from server.perf_metrics import CollectingMeasurementSink
 from server.pipeline import SessionHost
@@ -57,14 +58,13 @@ class _TimedWorker:
         )
 
 
-class _AlternatingCoordinator:
+class _AlternatingCoordinator(FakeCoordinator):
     """Direct greeting, then delegated turns with distinct, known delays."""
 
     def __init__(self, delays: list[float]) -> None:
+        super().__init__(registry=type("Registry", (), {"workers": ()})())
         self._delays = iter(delays)
         self._pending_delay = 0.0
-        self.config = Config()
-        self.registry = type("Registry", (), {"workers": ()})()
 
     def arbitrate(self, _session_id: str, transcript: str) -> object:
         if transcript == ROUTING_REGRESSION_QUERIES[0]:
@@ -97,7 +97,9 @@ class _AlternatingCoordinator:
             },
         )()
 
-    def dispatch(self, _decision: object) -> object:
+    def dispatch(
+        self, decision: object, operation: object = None, catalogue: object = None
+    ) -> object:
         return _TimedWorker(self._pending_delay, "worker-weather")
 
 
@@ -159,10 +161,9 @@ def test_direct_turn_between_delegated_turns_does_not_inherit_delegated_worker_i
     its own ``main`` worker identity and text, not the preceding turn's."""
 
     async def run() -> None:
-        class DirectThenSlowCoordinator:
+        class DirectThenSlowCoordinator(FakeCoordinator):
             def __init__(self) -> None:
-                self.config = Config()
-                self.registry = type("Registry", (), {"workers": ()})()
+                super().__init__(registry=type("Registry", (), {"workers": ()})())
 
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 if transcript == "search slowly":
@@ -196,7 +197,9 @@ def test_direct_turn_between_delegated_turns_does_not_inherit_delegated_worker_i
                     },
                 )()
 
-            def dispatch(self, _decision: object) -> object:
+            def dispatch(
+                self, decision: object, operation: object = None, catalogue: object = None
+            ) -> object:
                 return _TimedWorker(0.2, "worker-weather")
 
         host, connection = await _connected_host(DirectThenSlowCoordinator())
@@ -219,10 +222,9 @@ def test_direct_turn_stage_metrics_do_not_inherit_a_preceding_delegated_turns_se
     delegated turn's ``search_ms``/``total_ms``."""
 
     async def run() -> None:
-        class DirectThenSlowCoordinator:
+        class DirectThenSlowCoordinator(FakeCoordinator):
             def __init__(self) -> None:
-                self.config = Config()
-                self.registry = type("Registry", (), {"workers": ()})()
+                super().__init__(registry=type("Registry", (), {"workers": ()})())
 
             def arbitrate(self, _session_id: str, transcript: str) -> object:
                 if transcript == "search slowly":
@@ -256,7 +258,9 @@ def test_direct_turn_stage_metrics_do_not_inherit_a_preceding_delegated_turns_se
                     },
                 )()
 
-            def dispatch(self, _decision: object) -> object:
+            def dispatch(
+                self, decision: object, operation: object = None, catalogue: object = None
+            ) -> object:
                 return _TimedWorker(0.2, "worker-weather")
 
         sink = CollectingMeasurementSink()
