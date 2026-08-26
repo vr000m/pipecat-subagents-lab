@@ -88,7 +88,6 @@ from .work_status_publisher import (
     WorkStatusPublisher,
     child_work_status_after_dispatch,
     late_commit_work_status,
-    work_status_after_commit_failure,  # noqa: F401  # re-exported: tests/test_pipeline.py imports it from here
     work_status_for_outcome,
 )
 from .work_task_ledger import WorkTaskLedger
@@ -1737,13 +1736,19 @@ class SessionHost:
                 )
                 child_outcome_label = "failed"
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
+            # Computed -- and assigned to this handler's own `retained_still_open`
+            # local -- *before* the epilogue's commit/speak await below, not
+            # derived from its return: the `except`/`finally` epilogue further
+            # down reads this same local across that await, and must see the
+            # correct value even if the commit raises or the turn is cancelled
+            # mid-await (pre-extraction: 8875fdc:server/pipeline.py:1740).
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
+            retained_still_open = child_outcome_label == "retained" and not was_cancelled
             epilogue_ctx = TurnEpilogueContext(
                 settle_turn_ack=self._settle_turn_ack,
-                cancelled_ids=self._work_ledger.cancelled_ids,
                 emit_work_status=self._emit_work_status,
                 release_turn_work_item=self._release_turn_work_item,
                 release_all_turn_work_items=self._release_all_turn_work_items,
-                finalize_turn_exception=self._finalize_turn_exception,
                 worker_projection=self._worker_projection,
             )
             epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
@@ -1758,6 +1763,8 @@ class SessionHost:
                 turn_recorder=turn_recorder,
                 result=result,
                 child_outcome_label=child_outcome_label,
+                retained_still_open=retained_still_open,
+                was_cancelled=was_cancelled,
                 speech_role=speech_role,
                 search_ms=search_ms,
                 commit_and_speak=self._commit_and_speak,
@@ -1966,13 +1973,21 @@ class SessionHost:
                 child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
+            # A cancelled child is settled here and now, so its ack ownership
+            # does not have to survive for a late result that will not speak.
+            # Assigned to this handler's own `retained_still_open` local --
+            # not derived from the epilogue's return -- *before* the epilogue's
+            # commit/speak await below: the `except`/`finally` epilogue further
+            # down reads this same local across that await, and must see the
+            # correct value even if the commit raises or the turn is cancelled
+            # mid-await (pre-extraction: 8875fdc:server/pipeline.py:2011).
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
+            retained_still_open = retained_still_open and not was_cancelled
             epilogue_ctx = TurnEpilogueContext(
                 settle_turn_ack=self._settle_turn_ack,
-                cancelled_ids=self._work_ledger.cancelled_ids,
                 emit_work_status=self._emit_work_status,
                 release_turn_work_item=self._release_turn_work_item,
                 release_all_turn_work_items=self._release_all_turn_work_items,
-                finalize_turn_exception=self._finalize_turn_exception,
                 worker_projection=self._worker_projection,
             )
             epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
@@ -1987,6 +2002,8 @@ class SessionHost:
                 turn_recorder=turn_recorder,
                 result=result,
                 child_outcome_label=child_outcome_label,
+                retained_still_open=retained_still_open,
+                was_cancelled=was_cancelled,
                 speech_role=speech_role,
                 commit_and_speak=self._commit_and_speak,
                 # This turn's ack was enqueued at the delegation *decision*,
@@ -2001,6 +2018,10 @@ class SessionHost:
                 # projects the worker back to `idle` (row 9 of the Phase 1
                 # differences table).
                 project_idle=False,
+                # Pre-extraction, `_handle_pending` never recorded a commit
+                # duration against `app_turn_foreground` (Finding 3) -- only
+                # the single-intent handler did.
+                record_commit_ms=False,
             )
             retained_still_open = epilogue_outcome.retained_still_open
             return epilogue_outcome.result
@@ -2061,11 +2082,9 @@ class SessionHost:
         # attribute read that cannot itself fail.
         epilogue_ctx = TurnEpilogueContext(
             settle_turn_ack=self._settle_turn_ack,
-            cancelled_ids=self._work_ledger.cancelled_ids,
             emit_work_status=self._emit_work_status,
             release_turn_work_item=self._release_turn_work_item,
             release_all_turn_work_items=self._release_all_turn_work_items,
-            finalize_turn_exception=self._finalize_turn_exception,
         )
         try:
             results: dict[int, Any] = {}

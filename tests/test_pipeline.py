@@ -37,7 +37,6 @@ from server.pipeline import (
     SessionHost,
     build_pipeline,
     framework_bridge,
-    work_status_after_commit_failure,
 )
 from server.registry import UnsupportedWorkerType, WorkerRegistry
 from server.services.tts import CorrelatedTTSSpeakFrame
@@ -9828,10 +9827,16 @@ def test_cancelled_child_whose_commit_raises_is_reported_cancelled_not_failed() 
     (``work_status_for_outcome``). The commit-failure epilogue published
     ``failed`` unconditionally instead, and a terminal parent never
     regresses, so nothing could correct it afterwards."""
-    assert work_status_after_commit_failure(("cancelled", None)) == ("cancelled", None)
-    assert work_status_after_commit_failure(("result_ready", None)) == ("failed", None)
-    assert work_status_after_commit_failure(("background", None)) is None
-    assert work_status_after_commit_failure(None) is None
+    assert work_status_publisher.work_status_after_commit_failure(("cancelled", None)) == (
+        "cancelled",
+        None,
+    )
+    assert work_status_publisher.work_status_after_commit_failure(("result_ready", None)) == (
+        "failed",
+        None,
+    )
+    assert work_status_publisher.work_status_after_commit_failure(("background", None)) is None
+    assert work_status_publisher.work_status_after_commit_failure(None) is None
 
 
 def test_multi_intent_fan_in_guard_never_logs_the_spoken_query() -> None:
@@ -10386,6 +10391,207 @@ def test_late_commit_after_a_reconnect_does_not_settle_against_the_new_epochs_sc
         assert new.scheduler.queued_items(new_ack_work_item_id), (
             "the live epoch's queued ack must survive a late commit belonging to a retired epoch"
         )
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_retained_foreground_commit_exception_does_not_sweep_or_release_the_retained_child() -> (
+    None
+):
+    """Phase 1 regression pin (Finding 1): pre-extraction, `_handle_transcript_impl`
+    computed `retained_still_open` BEFORE the commit/speak await
+    (`8875fdc:server/pipeline.py:1740`), so its `except`/`finally` epilogue
+    always saw the correct value even when the commit raised. The Phase 1
+    extraction derived that local only from the epilogue's return, so on the
+    non-capable retained path (this test) a commit exception during the
+    await left the handler's local at its stale pre-call value (``False``)
+    -- sweeping the still-open retained child to ``failed`` via
+    `_finalize_turn_exception` and releasing its still-live turn-ack-ledger
+    entry via `_release_all_turn_work_items`, both of which pre-extraction
+    skipped for a retained-and-not-cancelled child."""
+
+    async def run() -> None:
+        worker = BlockingResultWorker()
+        worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "slow search", "model_policy": "deep"},
+        )()
+
+        class RetainingRoutedCoordinator(RoutedCoordinator):
+            def __init__(self) -> None:
+                super().__init__(worker)
+                self.owner = WorkItemCoordinator(
+                    config=Config(foreground_search_timeout_seconds=0.001)
+                )
+                self.config = self.owner.config
+
+            def start_task(self, operation: object) -> asyncio.Task[object] | None:
+                return self.owner.start_task(operation)
+
+            def retain_late_task(self, task: asyncio.Task[object], **kwargs: object) -> bool:
+                return self.owner.retain_late_task(task, **kwargs)
+
+            async def shutdown(self) -> None:
+                await self.owner.shutdown()
+
+        coordinator = RetainingRoutedCoordinator()
+        host = SessionHost(
+            registry=WorkerRegistry(config=coordinator.config),
+            config=coordinator.config,
+            runner_factory=LifecycleRunner,
+            coordinator=coordinator,
+        )
+        origin = await host.connect(connection_handshake(host, 1))
+        assert not origin.supports_work_status
+
+        async def raising_commit_and_speak(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("commit exploded")
+
+        host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit exploded"):
+            await host._handle_transcript("slow query")
+
+        # Pre-extraction behavior: the still-open retained child is NOT swept
+        # to a terminal state by the exception epilogue...
+        states = _work_status_states(host)
+        assert states == ["routing", "searching", "background"]
+        assert "failed" not in states
+        assert host.state.work_status_snapshot()[0].state == "background"
+        # ...and its turn-ack-ledger entry is NOT released by the `finally`.
+        turn_id = host.state.work_status_snapshot()[0].turn_id
+        assert host._turn_ack_ledger.turn_work_items(turn_id) == {
+            host.state.work_status_snapshot()[0].work_item_id
+        }
+
+        worker.release.set()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_commit_exception_with_already_cancelled_retained_child_sweeps_and_releases() -> (
+    None
+):
+    """Phase 1 regression pin (Finding 2): pre-extraction, `_handle_pending`
+    folded the cancellation check into `retained_still_open` BEFORE the
+    commit/speak await (`retained_still_open = retained_still_open and not
+    was_cancelled`, `8875fdc:server/pipeline.py:2011`). The Phase 1
+    extraction only updated the handler's local from the epilogue's return,
+    so a commit exception racing in while the retained child was already in
+    `cancelled_ids` left the handler observing the stale, un-adjusted
+    ``True`` -- skipping the sweep/release that pre-extraction always ran
+    once cancellation was known."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        worker = ResultWorker()
+        host_ref: list[SessionHost] = []
+        work_item_id = "work-turn-pending"
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        class Coordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                # Simulates the child already being cancelled (e.g. a "stop
+                # that" control message) by the time submit resolves, before
+                # this handler ever reaches its commit/speak await.
+                host_ref[0]._work_ledger.cancelled_ids.add(work_item_id)
+                return _submitted(pending_work_item_ids=(work_item_id,))
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner, coordinator=Coordinator(), measurement_sink=sink
+        )
+        host_ref.append(host)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        async def raising_commit_and_speak(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("commit exploded")
+
+        host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit exploded"):
+            await host._handle_pending(
+                _pending_outcome(),
+                "continue please",
+                origin,
+                "turn-pending",
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending"
+                ),
+            )
+
+        # Pre-extraction behavior: an already-cancelled retained child whose
+        # commit raises IS swept to a terminal state (cancellation classifies
+        # it regardless of the commit outcome)...
+        assert _work_status_states(host)[-1] == "cancelled"
+        # ...and its turn-ack-ledger entry IS released, not left open forever.
+        assert host._turn_ack_ledger.turn_work_items("turn-pending") == set()
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_successful_commit_records_no_commit_ms_but_single_intent_does() -> None:
+    """Phase 1 regression pin (Finding 3): `finalize_single_child_turn`
+    unconditionally called `turn_recorder.record_commit(commit_ms)`, but
+    pre-extraction `_handle_pending` never did -- only the single-intent
+    handler recorded a commit duration against `app_turn_foreground`. This
+    pins both directions: a pending turn's successful commit carries no
+    `commit_ms`, while a single-intent turn's does."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = _pending_host(_submitted(results=(_fan_in_result("turn-pending", "answer"),)), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        await host._handle_pending(
+            _pending_outcome(),
+            "continue please",
+            origin,
+            "turn-pending",
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending"
+            ),
+        )
+
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert "commit_ms" not in parents[0].fields
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_single_intent_successful_commit_records_commit_ms() -> None:
+    """Phase 1 regression pin (Finding 3), single-intent half: unlike
+    `_handle_pending`, `_handle_transcript_impl` always recorded a commit
+    duration against `app_turn_foreground` pre-extraction, and still must."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=RoutedCoordinator(ResultWorker()),
+            measurement_sink=sink,
+        )
+        await host.connect(connection_handshake(host, 1))
+
+        await host._handle_transcript("Riga weather")
+
+        parents = _events(sink, "app_turn_foreground")
+        assert len(parents) == 1
+        assert "commit_ms" in parents[0].fields
         await host.shutdown()
 
     asyncio.run(run())

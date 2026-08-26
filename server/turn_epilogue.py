@@ -55,11 +55,9 @@ class TurnEpilogueContext:
     """
 
     settle_turn_ack: Callable[..., None]
-    cancelled_ids: AbstractSet[str]
     emit_work_status: Callable[..., None]
     release_turn_work_item: Callable[[str, str], None]
     release_all_turn_work_items: Callable[[str], None]
-    finalize_turn_exception: Callable[..., None]
     worker_projection: Any | None = None
 
 
@@ -91,11 +89,14 @@ async def finalize_single_child_turn(
     turn_recorder: AppTurnRecorder,
     result: GroundedResult,
     child_outcome_label: WorkItemOutcome,
+    retained_still_open: bool,
+    was_cancelled: bool,
     speech_role: SpeechRole = ROLE_RESULT,
     search_ms: float = 0.0,
     commit_and_speak: Callable[..., Awaitable[GroundedResult]],
     project_idle: bool = False,
     cancel_admitted: bool = False,
+    record_commit_ms: bool = True,
 ) -> SingleChildEpilogueOutcome:
     """Rows 1-7, 9, 11 of the Phase 1 differences table, single-child shape.
 
@@ -107,19 +108,32 @@ async def finalize_single_child_turn(
     middle -- this function is only reached once a ``result`` to commit has
     been produced.
 
+    ``retained_still_open`` and ``was_cancelled`` are computed by the caller
+    -- not derived here -- and must be assigned to the handler's own local
+    *before* it calls this function: the handler's ``except``/``finally``
+    epilogue reads its own ``retained_still_open`` local across this
+    function's ``commit_and_speak`` await, and pre-extraction that local was
+    always set before the equivalent await (see
+    ``8875fdc:server/pipeline.py:1740`` and ``:2011``). Deriving it only from
+    this function's return value would leave the caller's local stale (still
+    the value from before this call) for the whole duration of the await, so
+    a commit exception or cancellation racing in during that await would
+    make the caller's ``except``/``finally`` observe the wrong value.
+
     ``cancel_admitted`` is row 2's variance: the single-intent caller settles
     its ack unconditionally (the default, ``False``), while pending-dialogue
     queues its ack at the delegation *decision*, before it knows whether
     ``coordinator.submit`` accepted or retained anything, and so must pass
     whether nothing was accepted/retained here instead.
+
+    ``record_commit_ms`` gates ``turn_recorder.record_commit(commit_ms)``:
+    pre-extraction, only the single-intent handler recorded a commit
+    duration against ``app_turn_foreground`` -- ``_handle_pending`` never
+    did (see ``8875fdc:server/pipeline.py`` around its commit call), so its
+    caller passes ``False``.
     """
-    was_cancelled = work_item_id in ctx.cancelled_ids
     commit_started = time.perf_counter()
     ctx.settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=cancel_admitted)
-    # A retained child is not terminal: its truthful `background` status was
-    # already emitted by the caller and the coordinator terminalizes it when
-    # the late result lands. Only an actual cancellation settles it here.
-    retained_still_open = child_outcome_label == "retained" and not was_cancelled
     derived = (
         None
         if retained_still_open
@@ -166,7 +180,8 @@ async def finalize_single_child_turn(
         search_ms=search_ms,
         commit_ms=commit_ms,
     )
-    turn_recorder.record_commit(commit_ms)
+    if record_commit_ms:
+        turn_recorder.record_commit(commit_ms)
     turn_recorder.finalize()
     if project_idle and ctx.worker_projection is not None:
         ctx.worker_projection.project(
