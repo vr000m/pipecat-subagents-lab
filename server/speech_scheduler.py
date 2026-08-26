@@ -189,6 +189,30 @@ class SpeechScheduler:
         """
         return tuple(self._queues.get(work_item_id, ()))
 
+    def all_queued_items(self) -> tuple[SpeechItem, ...]:
+        """Every currently queued (not yet active) speech item, across all queues.
+
+        Public read for tests that previously iterated
+        ``scheduler._queues.values()`` directly.
+        """
+        return tuple(item for queue in self._queues.values() for item in queue)
+
+    def has_any_queue(self) -> bool:
+        """Whether any queue key exists at all, regardless of emptiness.
+
+        Public read for tests that previously asserted
+        ``scheduler._queues == {}`` directly.
+        """
+        return bool(self._queues)
+
+    def has_any_paused(self) -> bool:
+        """Whether any work item currently has a paused speech item.
+
+        Public read for tests that previously asserted
+        ``scheduler._paused == {}`` directly.
+        """
+        return bool(self._paused)
+
     def has_provider_contexts(self) -> bool:
         """Whether any provider-context handoff is currently tracked.
 
