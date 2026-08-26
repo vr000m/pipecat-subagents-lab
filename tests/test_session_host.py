@@ -476,9 +476,9 @@ def test_cancel_turn_or_child_removes_only_the_named_childs_speech_and_leaves_th
 
         await host.cancel_turn_or_child("turn-1", "work-1-0")
 
-        assert ack_work_item_id in origin.scheduler._queues
-        assert "work-1-0" not in origin.scheduler._queues
-        assert "work-1-1" in origin.scheduler._queues
+        assert origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-1-0")
+        assert origin.scheduler.has_queue("work-1-1")
         await host.shutdown()
 
     asyncio.run(run())
@@ -512,8 +512,8 @@ def test_cancel_turn_or_child_whole_turn_removes_the_parent_ack_and_every_child_
 
         await host.cancel_turn_or_child("turn-2", None)
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert "work-2-0" not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-2-0")
         await host.shutdown()
 
     asyncio.run(run())
@@ -551,8 +551,8 @@ def test_cancel_turn_or_child_sole_delegated_child_removes_both_ack_and_child_at
 
         await host.cancel_turn_or_child("turn-3", "work-3-0")
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert "work-3-0" not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-3-0")
         await host.shutdown()
 
     asyncio.run(run())
@@ -1217,8 +1217,8 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
 
         await host.cancel_turn_or_child(turn_id, "work-5-0")
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert "work-5-0" not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-5-0")
         assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
         await host.shutdown()
 
