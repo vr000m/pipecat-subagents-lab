@@ -340,10 +340,15 @@ class TestParityCheckScopeBoundaries:
     def test_step_exemption_is_by_human_readable_name(self) -> None:
         """Axis 4 boundary: exemption keys on the step's `name:` string, so a
         step renamed to an exempt name is exempt regardless of what it runs
-        (the deferred in-workflow-marker alternative is noted above)."""
-        (exempt_name,) = _CI_STEPS_WITHOUT_A_JUST_EQUIVALENT
-        steps = [{"name": exempt_name, "run": "uv run pytest"}]
-        assert _qualified_commands_from_steps(steps) == set()
+        (the deferred in-workflow-marker alternative is noted above).
+
+        Iterates the whole exemption set rather than unpacking a single
+        element: a single-element unpack breaks with an unrelated
+        `ValueError` the day a second exempt name is added, instead of
+        exercising axis 4 for it."""
+        for exempt_name in _CI_STEPS_WITHOUT_A_JUST_EQUIVALENT:
+            steps = [{"name": exempt_name, "run": "uv run pytest"}]
+            assert _qualified_commands_from_steps(steps) == set()
 
 
 class TestRunRecipeGuardsItsEnvFile:
