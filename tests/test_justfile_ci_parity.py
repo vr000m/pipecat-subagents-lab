@@ -51,7 +51,9 @@ _TRACKED_PREFIXES = ("uv run", "bun ")
 #   2. Working directory — the step's `working-directory:` key plus literal
 #      inline `cd <dir>` pieces. No shell semantics beyond that: `cd "$VAR"`
 #      stays the literal string, `pushd` is not a directory change, and `;`/
-#      `|`/`||` chains are not split.
+#      `|`/`||` chains are not split -- but a tracked prefix hidden inside an
+#      unmodeled chain fails the check loudly rather than vanishing (Codex
+#      adversarial review 2026-08-26).
 #   3. Job scope — every job whose `if:` lacks the push-to-main marker
 #      substring is in scope (fail-safe default); a compound `if:` that
 #      mentions the marker is excluded even if it could also run on
@@ -67,6 +69,26 @@ _TRACKED_PREFIXES = ("uv run", "bun ")
 def _tracked_only(commands: set[tuple[str, str]]) -> list[tuple[str, str]]:
     """Axis 1's filter: only tracked-prefix commands participate in parity."""
     return [(cwd, cmd) for cwd, cmd in commands if cmd.startswith(_TRACKED_PREFIXES)]
+
+
+def _hidden_tracked_commands(commands: set[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Pieces whose text contains a tracked prefix somewhere OTHER than the
+    start -- i.e. a tracked command hidden behind unmodeled shell syntax
+    (``;``, ``|``, ...) instead of being its own ``&&``-split piece.
+
+    A piece that STARTS with a tracked prefix is not hidden: if it also
+    embeds a `;`-chain, the untracked head already makes the whole piece
+    invisible to `_tracked_only` (which matches on `.startswith()`), and that
+    is the documented, tested boundary -- not this function's concern. This
+    function exists for the opposite case: a tracked command sitting AFTER
+    unmodeled shell syntax, which would otherwise vanish from the parity
+    check silently instead of failing loudly (Codex adversarial review
+    2026-08-26)."""
+    hidden: list[tuple[str, str]] = []
+    for cwd, cmd in commands:
+        if any(cmd.find(prefix) > 0 for prefix in _TRACKED_PREFIXES):
+            hidden.append((cwd, cmd))
+    return hidden
 
 
 _RECIPE_HEADER_RE = re.compile(r"^([a-z][a-z-]*):(.*)$")
@@ -225,7 +247,14 @@ def test_ci_pull_request_job_commands_are_reachable_from_just_check() -> None:
     closure = _just_check_command_closure()
     assert closure, "`check`'s recipe closure resolved to zero commands -- parser likely broken"
 
-    tracked = _tracked_only(_ci_pull_request_job_commands())
+    ci_commands = _ci_pull_request_job_commands()
+    hidden = _hidden_tracked_commands(ci_commands)
+    assert hidden == [], (
+        "a tracked command is hidden behind unmodeled shell syntax (`;`, `|`, ...): "
+        f"{hidden}. Split the line with `&&` or move it into a just recipe."
+    )
+
+    tracked = _tracked_only(ci_commands)
     assert tracked, (
         "no `uv run`/`bun` commands found in any pull_request-triggered CI job -- "
         "parser likely broken"
@@ -305,11 +334,26 @@ class TestParityCheckScopeBoundaries:
 
     def test_semicolon_chains_are_not_split(self) -> None:
         """Axis 1/2 boundary: only `&&` splits. A `;`-chained line stays one
-        piece -- here with an untracked head, so the whole line is invisible
-        even though it embeds a `uv run` command."""
+        piece -- here with an untracked head, so `_tracked_only` (which
+        matches on `.startswith()`) still can't see the embedded `uv run`.
+        But the piece is no longer silently invisible end-to-end:
+        `_hidden_tracked_commands` catches the hidden tracked prefix and
+        fails the check loudly instead of vanishing (Codex adversarial
+        review 2026-08-26)."""
         commands = _qualified_commands("echo setup; uv run pytest")
         assert commands == {(".", "echo setup; uv run pytest")}
         assert _tracked_only(commands) == []
+        assert _hidden_tracked_commands(commands) == [(".", "echo setup; uv run pytest")]
+
+    def test_untracked_semicolon_chain_is_still_invisible(self) -> None:
+        """Boundary companion to the above: a `;`-chain with no tracked
+        prefix ANYWHERE stays genuinely invisible -- `_hidden_tracked_commands`
+        only fires when a tracked prefix is actually hiding, not for every
+        unmodeled `;`/`|` chain."""
+        commands = _qualified_commands("echo a; echo b")
+        assert commands == {(".", "echo a; echo b")}
+        assert _tracked_only(commands) == []
+        assert _hidden_tracked_commands(commands) == []
 
     def test_cd_with_a_shell_variable_is_not_expanded(self) -> None:
         """Axis 2 boundary: `cd` directories are literal text, never
