@@ -1584,7 +1584,7 @@ def test_a_coalesced_snapshot_request_is_retried_once_if_the_in_flight_attempt_f
         assert FailFirstBarrierThenAcknowledgePipelineWorker.barrier_frames_seen == 2, (
             "the coalesced request's recheck must trigger a second attempt"
         )
-        assert runtime.observer._paused is False
+        assert runtime.observer.is_paused is False
         snapshot_frames = [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"]
         assert len(snapshot_frames) == 1, "the retried attempt must deliver exactly one snapshot"
 
@@ -1635,8 +1635,8 @@ def test_an_unacknowledged_barrier_does_not_leave_the_observer_paused_forever(
             worker.rtvi, SimpleNamespace(type="snapshot-request", data=None)
         )
 
-        assert runtime.observer._paused is False
-        assert runtime.observer._buffer == []
+        assert runtime.observer.is_paused is False
+        assert runtime.observer.buffered_event_count == 0
         # A failed install must not put a snapshot on the wire.
         assert [frame for frame in worker.frames if frame["kind"] == "runtime_snapshot"] == []
 
