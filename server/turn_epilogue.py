@@ -87,20 +87,27 @@ async def finalize_single_child_turn(
     search_ms: float = 0.0,
     commit_and_speak: Callable[..., Awaitable[GroundedResult]],
     project_idle: bool = False,
+    cancel_admitted: bool = False,
 ) -> SingleChildEpilogueOutcome:
     """Rows 1-7, 9, 11 of the Phase 1 differences table, single-child shape.
 
     Covers the tail shared (with divergent details already folded in via
     parameters) by a turn that delegates exactly one child -- single-intent
-    today, pending-dialogue in a later sub-step. Row 8 (the retained
+    today, pending-dialogue as of sub-step C2. Row 8 (the retained
     work-item capability-gated short-circuit) is decided by the caller
     before a ``result`` even exists and stays in the handler's distinct
     middle -- this function is only reached once a ``result`` to commit has
     been produced.
+
+    ``cancel_admitted`` is row 2's variance: the single-intent caller settles
+    its ack unconditionally (the default, ``False``), while pending-dialogue
+    queues its ack at the delegation *decision*, before it knows whether
+    ``coordinator.submit`` accepted or retained anything, and so must pass
+    whether nothing was accepted/retained here instead.
     """
     was_cancelled = work_item_id in ctx.cancelled_ids
     commit_started = time.perf_counter()
-    ctx.settle_turn_ack(origin.scheduler, turn_id)
+    ctx.settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=cancel_admitted)
     # A retained child is not terminal: its truthful `background` status was
     # already emitted by the caller and the coordinator terminalizes it when
     # the late result lands. Only an actual cancellation settles it here.

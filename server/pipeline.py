@@ -86,7 +86,7 @@ from .work_status_publisher import (
     WorkStatusPublisher,
     child_work_status_after_dispatch,
     late_commit_work_status,
-    work_status_after_commit_failure,
+    work_status_after_commit_failure,  # noqa: F401  # re-exported: tests/test_pipeline.py imports it from here
     work_status_for_outcome,
 )
 from .work_task_ledger import WorkTaskLedger
@@ -1964,54 +1964,44 @@ class SessionHost:
                 child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            # This turn's ack was enqueued at the delegation *decision*, before
-            # coordinator.submit could report whether the work was accepted at
-            # all. Nothing committed and nothing is still running here, so the
-            # ack promises a result that is never coming; retract it even if it
-            # already reached the transport (the multi-intent path's own
-            # "nothing accepted" branch does the same).
-            self._settle_turn_ack(
-                origin.scheduler,
-                turn_id,
+            epilogue_ctx = TurnEpilogueContext(
+                settle_turn_ack=self._settle_turn_ack,
+                cancelled_ids=self._work_ledger.cancelled_ids,
+                emit_work_status=self._emit_work_status,
+                release_turn_work_item=self._release_turn_work_item,
+                release_all_turn_work_items=self._release_all_turn_work_items,
+                finalize_turn_exception=self._finalize_turn_exception,
+                worker_projection=self._worker_projection,
+            )
+            epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
+                epilogue_ctx,
+                origin=origin,
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                origin_epoch=origin_epoch,
+                worker=worker,
+                worker_id=worker_id,
+                child=child,
+                turn_recorder=turn_recorder,
+                result=result,
+                child_outcome_label=child_outcome_label,
+                speech_role=speech_role,
+                commit_and_speak=self._commit_and_speak,
+                # This turn's ack was enqueued at the delegation *decision*,
+                # before coordinator.submit could report whether the work was
+                # accepted at all. Nothing committed and nothing is still
+                # running here, so the ack promises a result that is never
+                # coming; retract it even if it already reached the transport
+                # (the multi-intent path's own "nothing accepted" branch does
+                # the same).
                 cancel_admitted=not submitted.results and not submitted.pending_work_item_ids,
+                # Unlike the single-intent path, pending-dialogue never
+                # projects the worker back to `idle` (row 9 of the Phase 1
+                # differences table).
+                project_idle=False,
             )
-            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
-            # A cancelled child is settled here and now, so its ack ownership
-            # does not have to survive for a late result that will not speak.
-            retained_still_open = retained_still_open and not was_cancelled
-            derived = child_work_status_after_dispatch(
-                child_outcome_label,
-                cancelled=was_cancelled,
-                terminal_kind=child_outcome_label,
-            )
-            # Terminal status only after the canonical commit succeeds; see the
-            # matching comment in the single-intent path.
-            try:
-                committed = await self._commit_and_speak(result, origin, role=speech_role)
-            except Exception:
-                failure_status = work_status_after_commit_failure(derived)
-                if failure_status is not None:
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state=failure_status[0],
-                        origin_epoch=origin_epoch,
-                        terminal_reason=failure_status[1],
-                    )
-                raise
-            if derived is not None:
-                status_state, status_reason = derived
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=work_item_id,
-                    worker_id=worker_id,
-                    state=status_state,
-                    origin_epoch=origin_epoch,
-                    terminal_reason=status_reason,
-                )
-            turn_recorder.finalize()
-            return committed
+            retained_still_open = epilogue_outcome.retained_still_open
+            return epilogue_outcome.result
         except asyncio.CancelledError:
             self._finalize_turn_exception(
                 cancelled=True,
