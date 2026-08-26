@@ -383,6 +383,17 @@ class SpeechLifecycleCoordinator:
         """
         return len(self._timer_handles)
 
+    def uses_event_loop_timers_with_clock(self, clock: Clock) -> bool:
+        """Whether this coordinator's timer scheduler is an
+        ``EventLoopTimerScheduler`` sharing ``clock``.
+
+        Public read for tests that previously asserted
+        ``isinstance(coordinator._timers, EventLoopTimerScheduler)`` and
+        ``coordinator._timers._clock is clock`` directly.
+        """
+        timers = self._timers
+        return isinstance(timers, EventLoopTimerScheduler) and timers._clock is clock
+
     # -- admission and TTS handoff --
 
     def try_admit(self, identity: GenerationIdentity) -> SpeechGeneration | None:
