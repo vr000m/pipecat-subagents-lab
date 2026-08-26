@@ -184,7 +184,7 @@ Dependency direction: new modules import from collaborators, never back into
 ## Progress
 
 - [x] Phase 0: Test-double modernization
-- [ ] Phase 1: Shared turn-epilogue abstraction
+- [x] Phase 1: Shared turn-epilogue abstraction
 - [ ] Phase 2: connect() + ConnectionPipeline extraction
 - [ ] Phase 3: Config/boundary consolidation
 - [ ] Phase 4: Ack-latch race — verify, then fix
@@ -261,6 +261,14 @@ Justification (from the table):
 3. Collaborators touched by the epilogue are already numerous and cross-cutting (`_turn_ack_ledger`/`_settle_turn_ack`, `origin.scheduler`, `_work_ledger` cancellation set, `_emit_work_status`, `_recorder_factory`/child+turn recorders, `_worker_projection`, `_release_*_turn_work_item`) — a free module with an explicit context dataclass makes every one of these an auditable parameter rather than an implicit `self` reach, which is exactly what Requirement 2/Architecture demand.
 4. The divergence is real but boundable: rows 1, 3, 4, 5, 6, 8, 9, 11 all diverge *only* in cardinality (one child vs N children) or in one extra gating condition (`cancel_admitted`, capability gate, worker-idle projection). This is naturally expressed as a small entry-point per cardinality (`finalize_single_child_turn(...)` for single/pending, `finalize_fan_out_turn(...)` for multi-intent) sharing internal helpers, not as one all-purpose god-function or three near-duplicate methods bolted onto `SessionHost`.
 5. Row 9 (worker-idle projection) is the sharpest argument for an explicit, opt-in parameter (e.g. `project_idle: bool = False`) rather than folding it in unconditionally — the module boundary makes that toggle a visible, tested contract instead of a silent `self._worker_projection` reach that only single-intent happens to exercise today.
+
+### Phase 1 outcome (2026-08-26, commits 8875fdc…d1226e2)
+
+- **Scope decision: new module `server/turn_epilogue.py`** (rationale in the characterization section above). Two entry points: `finalize_single_child_turn` (single-intent + pending; per-caller variance via `cancel_admitted`, `project_idle`, `record_commit_ms` params) and `finalize_fan_out_turn` + sync `release_fan_out_turn_work_items` (multi-intent). `TurnEpilogueContext` carries explicit collaborators; no `self`-reads, no imports from `pipeline.py` (verified by review).
+- Line drawn: the three fan-in loops that BUILD per-index state stay in `_handle_multi_intent`'s distinct middle; the epilogue starts at ack-settle. Row 8 (capability-gated retained short-circuit) stays in the single/pending middles — it returns before a result exists. Row 10 (`_finalize_turn_exception`) remains the pre-existing shared method, called from thin except blocks.
+- Handler deltas: `_handle_transcript_impl` 470→~435, `_handle_pending` 249→239, `_handle_multi_intent` 613→~543 lines.
+- Requirement 2 evidence: 11-row table above; 4 NEEDS-CHARACTERIZATION-TEST cells got tests in 8875fdc (397→401) before any extraction.
+- **Advisory review (opus) findings, all fixed in d1226e2 with fail-first regression pins (401→405):** Critical — `retained_still_open` was derived inside the awaited epilogue, so except/finally saw a stale value when commit/speak raised on the retained path (single-intent; sweep + release-all fired where pre-extraction skipped); Important — pending mirror (`and not was_cancelled` adjustment lost pre-await); Important — pending turns gained an unsanctioned `commit_ms` measurement (now gated off via `record_commit_ms=False`); Minor — dead `finalize_turn_exception`/`cancelled_ids` ctx fields dropped; Minor — `work_status_after_commit_failure` test re-export removed (test imports the real home).
 
 ### Review Waivers
 
