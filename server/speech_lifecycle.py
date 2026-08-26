@@ -323,6 +323,66 @@ class SpeechLifecycleCoordinator:
     def token_for_context(self, context_id: str) -> str | None:
         return self._context_tokens.get(context_id)
 
+    @property
+    def teardown_count(self) -> int:
+        """How many teardowns have completed so far.
+
+        Public read for tests that previously asserted
+        ``coordinator._teardown_generation == ...`` directly.
+        """
+        return self._teardown_generation
+
+    def is_tombstoned(self, context_id: str) -> bool:
+        """Whether ``context_id`` has been permanently retired.
+
+        Public read for tests that previously asserted
+        ``context_id in coordinator._context_tombstones`` directly.
+        """
+        return context_id in self._context_tombstones
+
+    def tombstoned_context_ids(self) -> tuple[str, ...]:
+        """Every tombstoned context id, oldest first.
+
+        Public read for tests that previously enumerated
+        ``coordinator._context_tombstones`` directly.
+        """
+        return tuple(self._context_tombstones)
+
+    @property
+    def context_token_count(self) -> int:
+        """How many contexts currently have a live generation token.
+
+        Public read for tests that previously asserted
+        ``len(coordinator._context_tokens) == ...`` directly.
+        """
+        return len(self._context_tokens)
+
+    @property
+    def pending_transition_count(self) -> int:
+        """How many internal transitions are currently in flight.
+
+        Public read for tests that previously asserted
+        ``coordinator._transition_tasks == set()`` (or its length) directly.
+        """
+        return len(self._transition_tasks)
+
+    def has_pending_transition(self, future: asyncio.Future[Any]) -> bool:
+        """Whether ``future`` is one of the in-flight internal transitions.
+
+        Public read for tests that previously asserted
+        ``future in coordinator._transition_tasks`` directly.
+        """
+        return future in self._transition_tasks
+
+    @property
+    def timer_handle_count(self) -> int:
+        """How many timer handles are currently armed.
+
+        Public read for tests that previously asserted
+        ``coordinator._timer_handles == {}`` directly.
+        """
+        return len(self._timer_handles)
+
     # -- admission and TTS handoff --
 
     def try_admit(self, identity: GenerationIdentity) -> SpeechGeneration | None:

@@ -611,6 +611,96 @@ class WorkItemCoordinator:
         self._late_results.clear()
         return results
 
+    @property
+    def is_shutdown(self) -> bool:
+        """Whether :meth:`shutdown` has already run.
+
+        Public read for tests that previously asserted
+        ``coordinator._shutdown`` directly.
+        """
+        return self._shutdown
+
+    def has_background_capacity(self) -> bool:
+        """Whether another non-mandatory background task can be admitted right now.
+
+        Public read for tests that previously called
+        ``coordinator._has_background_capacity()`` directly.
+        """
+        return self._has_background_capacity()
+
+    @property
+    def late_task_count(self) -> int:
+        """How many timed-out tasks are currently retained.
+
+        Public read for tests that previously asserted
+        ``len(coordinator._late_tasks) == ...`` directly.
+        """
+        return len(self._late_tasks)
+
+    def is_late_task(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently tracked as a retained late task.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._late_tasks`` directly.
+        """
+        return task in self._late_tasks
+
+    def is_cancelling_task(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently tracked as a cancellation-in-flight task.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._cancelling_tasks`` directly.
+        """
+        return task in self._cancelling_tasks
+
+    def is_background_task_ordered(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently in the background-completion order.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._background_task_order`` directly.
+        """
+        return task in self._background_task_order
+
+    def has_mandatory_tasks(self) -> bool:
+        """Whether any mandatory (budget-exempt) task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._mandatory_tasks`` (truthiness) directly.
+        """
+        return bool(self._mandatory_tasks)
+
+    def has_pending_submission_tasks(self) -> bool:
+        """Whether any multi-intent submission task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._submission_tasks == set()`` directly.
+        """
+        return bool(self._submission_tasks)
+
+    def is_submission_task(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently tracked as a submission task.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._submission_tasks`` (or its negation) directly.
+        """
+        return task in self._submission_tasks
+
+    def has_pending_submit_tasks(self) -> bool:
+        """Whether any per-item submit task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._submit_tasks == set()`` directly.
+        """
+        return bool(self._submit_tasks)
+
+    def has_pending_provider_tasks(self) -> bool:
+        """Whether any provider task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._provider_tasks == set()`` directly.
+        """
+        return bool(self._provider_tasks)
+
     def retain_late_task(
         self,
         task: asyncio.Task[Any],

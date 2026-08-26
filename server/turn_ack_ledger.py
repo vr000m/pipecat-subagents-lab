@@ -174,6 +174,38 @@ class TurnAckLedger:
     def clear_ack_latch(self, turn_id: str) -> None:
         self._ack_emitted_turns.discard(turn_id)
 
+    def has_emitted_ack(self, turn_id: str) -> bool:
+        """Whether ``turn_id`` currently holds the one-ack-per-turn latch.
+
+        Public read for tests that previously asserted
+        ``turn_id in ledger._ack_emitted_turns`` directly.
+        """
+        return turn_id in self._ack_emitted_turns
+
+    def emitted_ack_turns(self) -> frozenset[str]:
+        """Every turn id currently holding the ack latch.
+
+        Public read for tests that previously asserted
+        ``ledger._ack_emitted_turns == set()`` (or enumerated it) directly.
+        """
+        return frozenset(self._ack_emitted_turns)
+
+    def admission_generation(self, turn_id: str) -> int | None:
+        """The current admission-retry generation for ``turn_id``, if any.
+
+        Public read for tests that previously read
+        ``ledger._ack_admission_generation.get(turn_id)`` directly.
+        """
+        return self._ack_admission_generation.get(turn_id)
+
+    def admission_generation_count(self) -> int:
+        """How many turns currently hold an admission-retry generation.
+
+        Public read for tests that previously asserted
+        ``len(ledger._ack_admission_generation) == ...`` directly.
+        """
+        return len(self._ack_admission_generation)
+
     def settle_turn_ack(
         self, scheduler: Any, turn_id: str, *, cancel_admitted: bool = False
     ) -> None:

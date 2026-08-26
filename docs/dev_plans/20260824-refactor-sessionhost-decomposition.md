@@ -179,7 +179,7 @@ Dependency direction: new modules import from collaborators, never back into
 - [ ] No behavior change outside Phase 4 (race fix, if taken) and the R5-strict branch (if chosen) — pinned by the assertion-parity-checked public-contract tests.
 - [ ] Program provenance map rows 1-12 closed here, with two exceptions: row 7 closes via P1's retire commit on retire, via this plan's Phase 3 extraction on invest, and **stays open on P1-blocked**; any row a carve-out leaves open is noted in the program doc in the same commit.
 
-<!-- reviewed: 2026-08-25 @ 55db787acac5f0de3b2a809a685d5963f543c0ea -->
+<!-- reviewed: 2026-08-26 @ e3e5ad2cd85425bedcc9a3b43a386169616611c2 -->
 
 ## Progress
 
@@ -195,4 +195,20 @@ Dependency direction: new modules import from collaborators, never back into
 
 ### Review Waivers
 
-(none)
+- 2026-08-26 marker refresh at conduct start: recorded marker (2026-08-25 @ 55db787a…) was stale because commit `0c3320e` (merged PR #9) corrected one Phase 3 line citation (`server/config.py` edit region + landed sha). Sole contract drift; landed via reviewed PR, so the marker was refreshed in place (`e3e5ad2c…`) instead of re-running `/review-plan`.
+- Test-command override (all phases): the plan's literal `uv run mypy .` fails with 723 pre-existing errors because `.` overrides the pyproject mypy scope (`files = ["server", "evals", "scripts"]`; tests/ carries legacy debt by design). Effective gate used by conduct: `uv run pytest -q && uv run ruff check . && uv run mypy` (bare mypy = repo-intended scope, green at baseline).
+
+### Phase 0 inventory (2026-08-26)
+
+Baseline test counts (assertion-parity reference): full suite 2101 collected; tests/test_pipeline.py 397, tests/test_smoke_conversation.py 6, tests/test_work_item_coordinator.py 58, tests/test_session_host.py 45.
+
+Duck-typed Coordinator doubles (`rg -n 'class \w*Coordinator' tests/`): 77 total — test_pipeline.py 71, test_smoke_conversation.py 3, test_work_item_coordinator.py 2, test_session_host.py 1.
+
+Private collaborator-read call sites (patterns per collaborator):
+- speech_scheduler: `\.scheduler\._\w+` → 47 hits (43 `_queues`, 3 `_active`, 1 `_provider_contexts`) in test_pipeline.py + test_session_host.py.
+- turn_ack_ledger: `(ack_)?ledger\._\w+` → 29 hits in test_pipeline.py (12 `_ack_emitted_turns`; 12 `_claim_ack_admission_generation`/`_ack_admission_generation`; 5 `_schedule_ack_admission` — private-method setup calls, excluded from read-accessor scope).
+- observers: 3 hits in tests/test_app.py (`_paused`, `_buffer`).
+- speech_lifecycle: 21 hits in tests/test_speech_lifecycle.py (`_transition_tasks`, `_context_tombstones`, `_context_tokens`, `_timers`, `_timer_handles`, `_teardown_generation`, `_generations`, plus private-method setup calls excluded).
+- work_item_coordinator: ~21 hits in tests/test_work_item_coordinator.py (`_submission_tasks`, `_shutdown`, `_owned_tasks`, `_late_tasks`, `_cancelling_tasks`, `_submit_tasks`, `_provider_tasks`, `_mandatory_tasks`, `_background_task_order`; setup *writes* like `coordinator._shutdown = True` excluded from read-accessor scope).
+
+Doubles mechanism decision: **Protocol** (reuse of existing `server.work_item_coordinator.Coordinator` Protocol as sole interface source; ABC rejected — would force a shared base class the suite deliberately avoids). `tests/_doubles.py` provides `FakeCoordinator` (subclasses `CoordinatorDefaults`, overridable per-member) plus structural conformance checks (`conformance_problems` / `assert_conforms_to_coordinator` comparing Protocol annotations + method signatures); pinned by tests/test_doubles.py against both the fake and the real `WorkItemCoordinator` (4 new tests). Note: tests/test_doubles.py imports `from _doubles import ...` (bare) — `tests.`-prefixed import collides in `mypy .` runs because tests/ has no `__init__.py`.

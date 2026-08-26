@@ -100,6 +100,24 @@ class RuntimeObserver:
         return resolve_work_status_wire_presence(self.capabilities)
 
     @property
+    def is_paused(self) -> bool:
+        """Whether the barrier's pause/replay buffer is currently open.
+
+        Read-only view of the pause flag so callers and tests can assert the
+        pause/resume lifecycle without reaching into private state.
+        """
+        return self._paused
+
+    @property
+    def buffered_event_count(self) -> int:
+        """How many raw events are currently buffered behind an open barrier.
+
+        Read-only view of the buffer's length so callers and tests can
+        assert it drained without reaching into private state.
+        """
+        return len(self._buffer)
+
+    @property
     def projected_sequence(self) -> int:
         """The last connection-projected envelope sequence handed to the client.
 

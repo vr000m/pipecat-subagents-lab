@@ -173,6 +173,30 @@ class SpeechScheduler:
         """
         return tuple(item.role for queue in self._queues.values() for item in queue)
 
+    def has_queue(self, work_item_id: str) -> bool:
+        """Whether ``work_item_id`` currently has a queue entry at all.
+
+        Public read for tests that previously asserted
+        ``work_item_id in scheduler._queues`` directly.
+        """
+        return work_item_id in self._queues
+
+    def queued_items(self, work_item_id: str) -> tuple[SpeechItem, ...]:
+        """The queued (not yet active) items for ``work_item_id``, in order.
+
+        Public read for tests that previously indexed
+        ``scheduler._queues[work_item_id]`` directly.
+        """
+        return tuple(self._queues.get(work_item_id, ()))
+
+    def has_provider_contexts(self) -> bool:
+        """Whether any provider-context handoff is currently tracked.
+
+        Public read for tests that previously asserted
+        ``scheduler._provider_contexts == {}`` directly.
+        """
+        return bool(self._provider_contexts)
+
     def paused(self, work_item_id: str | None = None) -> SpeechItem | None:
         if work_item_id is not None:
             return self._paused.get(work_item_id)
