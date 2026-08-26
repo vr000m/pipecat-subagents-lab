@@ -8199,6 +8199,206 @@ def test_result_ready_is_not_emitted_when_the_canonical_commit_raises() -> None:
     asyncio.run(run())
 
 
+def test_pending_commit_exception_after_a_completed_search_sweeps_the_child_as_failed() -> None:
+    """Phase 1 row-4 characterization: `_handle_pending`'s commit-failure
+    branch (:2019-2032) emits the `work_status_after_commit_failure` fallback
+    status and re-raises -- the pending-dialogue flavor of
+    `test_commit_exception_after_a_completed_search_sweeps_the_child_as_failed`,
+    which only drives the single-intent handler."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = _pending_host(_submitted(results=(_fan_in_result("turn-pending", "answer"),)), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        async def raising_commit_and_speak(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("commit exploded")
+
+        host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit exploded"):
+            await host._handle_pending(
+                _pending_outcome(),
+                "continue please",
+                origin,
+                "turn-pending",
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending"
+                ),
+            )
+
+        # Unlike the single-intent path, `_handle_pending` finalizes its child
+        # recorder as "completed" *before* attempting the commit (row 6's
+        # different-call-site shape), so the child record itself does not
+        # flip to "failed" here -- the work-status fallback is the row-4
+        # signal this test pins.
+        children = _events(sink, "work_item_foreground")
+        assert len(children) == 1
+        assert children[0].fields["outcome"] == "completed"
+        assert _work_status_states(host) == ["routing", "searching", "failed"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_result_ready_is_not_emitted_when_the_canonical_commit_raises() -> None:
+    """Phase 1 row-5 characterization: `_handle_pending` derives its terminal
+    work-status before `_commit_and_speak` but only emits it after the commit
+    succeeds -- a raising commit must not have already told a capable client
+    `result_ready`. Pending-dialogue flavor of
+    `test_result_ready_is_not_emitted_when_the_canonical_commit_raises`, which
+    only drives the single-intent handler; the successful-commit half of this
+    ordering (terminal status emitted after commit) is already pinned by
+    `test_pending_continuation_turn_emits_routing_through_terminal_work_status`."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = _pending_host(_submitted(results=(_fan_in_result("turn-pending", "answer"),)), sink)
+        origin = await host.connect(connection_handshake(host, 1))
+
+        async def raising_commit_and_speak(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("commit failed")
+
+        host._commit_and_speak = raising_commit_and_speak  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await host._handle_pending(
+                _pending_outcome(),
+                "continue please",
+                origin,
+                "turn-pending",
+                host._recorder_factory.new_app_turn_recorder(
+                    origin_epoch=origin.epoch, turn_id="turn-pending"
+                ),
+            )
+
+        states = _work_status_states(host)
+        assert "result_ready" not in states
+        assert states[-1] == "failed"
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_retained_child_on_capable_connection_finalizes_turn_recorder_early() -> None:
+    """Phase 1 row-8 characterization: `_handle_pending`'s capability-gated
+    retained short-circuit (:1967-1975) returns `None` early, having already
+    called `turn_recorder.finalize()`, and emits no legacy canonical result --
+    status-only, like `test_multi_intent_retained_child_on_capable_connection_stays_status_only`'s
+    multi-intent half. The status-only-with-no-legacy-result shape is already
+    pinned by `test_pending_retained_child_on_capable_connection_stays_status_only`;
+    this test adds the early `turn_recorder.finalize()` call the return-None
+    contract depends on, which that test does not directly observe."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        host = _pending_host(_submitted(pending_work_item_ids=("work-turn-pending",)), sink)
+        origin = await host.connect(_capable_handshake(host, 1))
+        assert origin.supports_work_status
+
+        turn_recorder = host._recorder_factory.new_app_turn_recorder(
+            origin_epoch=origin.epoch, turn_id="turn-pending"
+        )
+        assert not turn_recorder.finalized
+
+        returned = await host._handle_pending(
+            _pending_outcome(),
+            "continue please",
+            origin,
+            "turn-pending",
+            turn_recorder,
+        )
+
+        assert returned is None
+        assert turn_recorder.finalized
+        assert host.state.results.results == ()
+        assert _work_status_states(host) == ["routing", "searching", "background"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_pending_and_multi_intent_successful_commit_leaves_worker_projection_untouched() -> None:
+    """Phase 1 row-9 characterization: unlike `_handle_transcript_impl` (which
+    projects the worker to `idle` with the fresh `latest_result_id` at
+    :1789-1794 after its own commit), neither `_handle_pending` nor
+    `_handle_multi_intent` calls `_worker_projection.project(..., status="idle")`
+    anywhere in their epilogues. A naive shared epilogue that started doing so
+    unconditionally would change this silently -- both must still see the
+    dispatch-time `running` status left behind, not `idle`.
+
+    ``latest_result_id`` is a partial exception worth noting: `SessionState
+    .append_result` (called from `_commit_result_state`, independently of
+    `WorkerProjection.project`) always refreshes a *known* worker's
+    `latest_result_id` as a side effect of the commit itself, regardless of
+    handler. So `status` is the row-9 signal a naive shared epilogue would
+    change; `latest_result_id` is already current before `_handle_pending`/
+    `_handle_multi_intent` return."""
+
+    async def run() -> None:
+        # Pending-dialogue half.
+        pending_sink = CollectingMeasurementSink()
+        pending_worker = ProjectedResultWorker()
+        pending_host = _pending_host(
+            _submitted(results=(_fan_in_result("turn-pending", "answer"),)),
+            pending_sink,
+            worker=pending_worker,
+        )
+        pending_origin = await pending_host.connect(connection_handshake(pending_host, 1))
+
+        committed = await pending_host._handle_pending(
+            _pending_outcome(),
+            "continue please",
+            pending_origin,
+            "turn-pending",
+            pending_host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=pending_origin.epoch, turn_id="turn-pending"
+            ),
+        )
+        assert committed is not None
+
+        pending_worker_state = pending_host.state.workers["worker-search"]
+        assert pending_worker_state.status == "running"
+        assert pending_worker_state.latest_result_id == committed.result_id
+        await pending_host.shutdown()
+
+        # Multi-intent half.
+        multi_sink = CollectingMeasurementSink()
+        multi_host, multi_worker = _fan_in_host(
+            _submitted(
+                results=(
+                    _fan_in_result("turn-fan-0", "first answer"),
+                    _fan_in_result("turn-fan-1", "second answer"),
+                )
+            ),
+            multi_sink,
+        )
+        multi_worker.metadata = type(
+            "Metadata",
+            (),
+            {"worker_id": "worker-search", "topic": "fan-in", "model_policy": "deep"},
+        )()
+        multi_origin = await multi_host.connect(connection_handshake(multi_host, 1))
+
+        multi_committed = await multi_host._handle_multi_intent(
+            _multi_intent_outcome("first item", "second item"),
+            "first and second",
+            multi_origin,
+            "turn-fan",
+            multi_host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=multi_origin.epoch, turn_id="turn-fan"
+            ),
+        )
+        assert [result.text for result in multi_committed] == ["first answer", "second answer"]
+
+        multi_worker_state = multi_host.state.workers["worker-search"]
+        assert multi_worker_state.status == "running"
+        assert multi_worker_state.latest_result_id == multi_committed[-1].result_id
+        await multi_host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_submit_failure_terminalizes_every_registered_child_as_failed() -> None:
     """I8: an exception raised after ``routing``/``searching`` was published
     left every delegated child -- and therefore the parent aggregate --
