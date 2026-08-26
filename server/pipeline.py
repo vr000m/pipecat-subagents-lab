@@ -69,6 +69,11 @@ from .speech_scheduler import (
     SpeechScheduler,
 )
 from .turn_ack_ledger import TurnAckLedger
+from .turn_epilogue import (
+    SingleChildEpilogueOutcome,
+    TurnEpilogueContext,
+    finalize_single_child_turn,
+)
 from .work_item_coordinator import (
     FAILURE_KINDS,
     Coordinator,
@@ -1729,70 +1734,35 @@ class SessionHost:
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "failed"
-            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
-            commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            self._settle_turn_ack(origin.scheduler, turn_id)
-            # A retained child is not terminal: its truthful `background`
-            # status was already emitted above and the coordinator terminalizes
-            # it when the late result lands. Only an actual cancellation
-            # settles it here.
-            retained_still_open = child_outcome_label == "retained" and not was_cancelled
-            derived = (
-                None
-                if retained_still_open
-                else work_status_for_outcome(
-                    child_outcome_label,
-                    cancelled=was_cancelled,
-                    terminal_kind=child_outcome_label,
-                )
+            epilogue_ctx = TurnEpilogueContext(
+                settle_turn_ack=self._settle_turn_ack,
+                cancelled_ids=self._work_ledger.cancelled_ids,
+                emit_work_status=self._emit_work_status,
+                release_turn_work_item=self._release_turn_work_item,
+                release_all_turn_work_items=self._release_all_turn_work_items,
+                finalize_turn_exception=self._finalize_turn_exception,
+                worker_projection=self._worker_projection,
             )
-            # Terminal status is emitted only *after* the canonical commit
-            # succeeds. Emitting `result_ready` first would tell a capable
-            # client the result was committed and display-ready even when the
-            # commit then raised or the turn was cancelled before it ran; a
-            # commit failure settles the child to `failed` instead.
-            try:
-                committed = await self._commit_and_speak(result, origin, role=speech_role)
-            except Exception:
-                failure_status = work_status_after_commit_failure(derived)
-                if failure_status is not None:
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state=failure_status[0],
-                        origin_epoch=origin_epoch,
-                        terminal_reason=failure_status[1],
-                    )
-                raise
-            if derived is not None:
-                status_state, status_reason = derived
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=work_item_id,
-                    worker_id=worker_id,
-                    state=status_state,
-                    origin_epoch=origin_epoch,
-                    terminal_reason=status_reason,
-                )
-            commit_ms = (time.perf_counter() - commit_started) * 1000
-            child.finalize(
-                outcome=child_outcome_label,
-                app_worker_id=worker_id,
-                result_id=result.result_id,
-                search_ms=search_ms,
-                commit_ms=commit_ms,
-            )
-            turn_recorder.record_commit(commit_ms)
-            turn_recorder.finalize()
-            self._worker_projection.project(
-                worker,
+            epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
+                epilogue_ctx,
+                origin=origin,
+                turn_id=turn_id,
+                work_item_id=work_item_id,
                 origin_epoch=origin_epoch,
-                status="idle",
-                latest_result_id=None if was_cancelled else result.result_id,
+                worker=worker,
+                worker_id=worker_id,
+                child=child,
+                turn_recorder=turn_recorder,
+                result=result,
+                child_outcome_label=child_outcome_label,
+                speech_role=speech_role,
+                search_ms=search_ms,
+                commit_and_speak=self._commit_and_speak,
+                project_idle=True,
             )
-            return committed
+            retained_still_open = epilogue_outcome.retained_still_open
+            return epilogue_outcome.result
         except asyncio.CancelledError:
             self._finalize_turn_exception(
                 cancelled=True,
