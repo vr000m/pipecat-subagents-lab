@@ -782,8 +782,8 @@ def test_reconnect_while_search_is_blocked_keeps_late_result_history_only() -> N
         assert host.state.workers.get("worker-search") is None
         assert first_worker.frames == []
         assert second_worker.frames == []
-        assert not first.scheduler.pending_work_item_ids()
-        assert not second.scheduler.pending_work_item_ids()
+        assert not first.scheduler.has_any_queue()
+        assert not second.scheduler.has_any_queue()
         assert host.state.speech == {}
         await host.shutdown()
 
@@ -2284,7 +2284,7 @@ def test_successful_result_without_tts_is_history_only() -> None:
 
         assert host.state.result_history("worker-search") == (result,)
         assert connection.worker.frames == []
-        assert not connection.scheduler.pending_work_item_ids()
+        assert not connection.scheduler.has_any_queue()
         assert host.state.speech == {}
         await host.shutdown()
 
@@ -9096,7 +9096,7 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
         )
 
         # The child is still running, so its ack ownership outlives the handler.
-        assert host._turn_ack_ledger._turn_work_items.get(turn_id) == {"work-turn-pending"}
+        assert host._turn_ack_ledger.turn_work_items(turn_id) == {"work-turn-pending"}
         assert host._ack_turn_for_work_item("work-turn-pending") == turn_id
 
         await host.cancel_turn_or_child(
@@ -9225,7 +9225,7 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
         # ...and the unrelated turn's ack and latch are untouched.
         assert origin.scheduler.has_queue(other_ack)
         assert host._turn_ack_ledger.has_emitted_ack(other_turn)
-        assert host._turn_ack_ledger._turn_work_items.get(other_turn) == {"work-turn-other"}
+        assert host._turn_ack_ledger.turn_work_items(other_turn) == {"work-turn-other"}
         await host.shutdown()
 
     asyncio.run(run())
@@ -10181,7 +10181,7 @@ def test_late_commit_after_a_reconnect_does_not_settle_against_the_new_epochs_sc
             ),
         )
 
-        assert new.scheduler.has_queue(new_ack_work_item_id), (
+        assert new.scheduler.queued_items(new_ack_work_item_id), (
             "the live epoch's queued ack must survive a late commit belonging to a retired epoch"
         )
         await host.shutdown()

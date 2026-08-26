@@ -795,7 +795,7 @@ def test_no_tts_result_never_occupies_the_slot_waiting_for_the_start_timeout() -
     assert asyncio.run(scheduler.start_next("work-1")) is None
     assert lifecycle.occupied is False
     assert scheduler.active is None
-    assert lifecycle._timer_handles == {}
+    assert lifecycle.timer_handle_count == 0
     assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
     assert scheduler.pending_work_item_ids() == frozenset({"work-2"})
 
@@ -920,8 +920,8 @@ def test_full_stop_cancels_a_pending_queue_advance_task() -> None:
             pass
 
         # The deferred re-probe task is scheduled but has not run yet.
-        assert len(scheduler._advance_tasks) == 1
-        pending_task = next(iter(scheduler._advance_tasks))
+        assert scheduler.advance_task_count() == 1
+        pending_task = scheduler.advance_tasks()[0]
         assert not pending_task.done()
 
         scheduler.interrupt(full_stop=True)
@@ -930,7 +930,7 @@ def test_full_stop_cancels_a_pending_queue_advance_task() -> None:
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert pending_task.cancelled()
-        assert scheduler._advance_tasks == set()
+        assert scheduler.advance_task_count() == 0
 
     asyncio.run(run())
 
@@ -971,8 +971,8 @@ def test_full_stop_does_not_resurrect_an_advance_task_that_is_already_running() 
 
         # Let the deferred re-probe task actually run: it should admit
         # work-2 and suspend inside speak(), not merely sit pending.
-        assert len(scheduler._advance_tasks) == 1
-        running_task = next(iter(scheduler._advance_tasks))
+        assert scheduler.advance_task_count() == 1
+        running_task = scheduler.advance_tasks()[0]
         await asyncio.wait_for(entered_speak.wait(), timeout=1)
         assert not running_task.done()
         assert scheduler.active is not None
@@ -984,7 +984,7 @@ def test_full_stop_does_not_resurrect_an_advance_task_that_is_already_running() 
         # advance()'s exception handlers to completion.
         await asyncio.wait_for(running_task, timeout=1)
 
-        assert scheduler._advance_tasks == set(), (
+        assert scheduler.advance_task_count() == 0, (
             "start_next's own failure-cleanup path re-scheduled a fresh "
             "advance task after full_stop's sweep already ran"
         )

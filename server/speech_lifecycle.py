@@ -202,6 +202,15 @@ class EventLoopTimerScheduler:
     def __init__(self, clock: Clock | None = None) -> None:
         self._clock: Clock = clock or MonotonicClock()
 
+    @property
+    def clock(self) -> Clock:
+        """The clock this scheduler computes delays against.
+
+        Public read for callers that previously read ``self._clock``
+        directly (e.g. ``uses_event_loop_timers_with_clock``).
+        """
+        return self._clock
+
     def call_at(self, when: float, callback: Callable[[], Any]) -> TimerHandle:
         loop = asyncio.get_event_loop()
         delay = max(0.0, when - self._clock.now())
@@ -392,7 +401,7 @@ class SpeechLifecycleCoordinator:
         ``coordinator._timers._clock is clock`` directly.
         """
         timers = self._timers
-        return isinstance(timers, EventLoopTimerScheduler) and timers._clock is clock
+        return isinstance(timers, EventLoopTimerScheduler) and timers.clock is clock
 
     # -- admission and TTS handoff --
 

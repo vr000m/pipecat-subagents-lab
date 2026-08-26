@@ -216,7 +216,10 @@ class FakeCoordinator(CoordinatorDefaults):
             if inspect.isawaitable(result):
                 return await result
             return result
-        return SubmittedOutcome(work_items=(), results=())
+        raise NotImplementedError(
+            "FakeCoordinator.submit: no submit=... hook was supplied. Pass "
+            "submit=... or override submit() in a subclass."
+        )
 
     def retain_late_task(
         self,
@@ -235,7 +238,11 @@ class FakeCoordinator(CoordinatorDefaults):
                 on_complete=on_complete,
                 on_late_terminal=on_late_terminal,
             )
-        return False
+        raise NotImplementedError(
+            "FakeCoordinator.retain_late_task: no retain_late_task=... hook "
+            "was supplied. Pass retain_late_task=... or override "
+            "retain_late_task() in a subclass."
+        )
 
     def add_worker_clarification(
         self,

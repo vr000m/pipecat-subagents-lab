@@ -205,6 +205,23 @@ class SpeechScheduler:
         """
         return bool(self._queues)
 
+    def advance_task_count(self) -> int:
+        """Number of in-flight deferred queue-advance tasks.
+
+        Public read for tests that previously asserted
+        ``len(scheduler._advance_tasks) == N`` or
+        ``scheduler._advance_tasks == set()`` directly.
+        """
+        return len(self._advance_tasks)
+
+    def advance_tasks(self) -> tuple[asyncio.Future[Any], ...]:
+        """Every in-flight deferred queue-advance task, as an immutable snapshot.
+
+        Public read for tests that previously did
+        ``next(iter(scheduler._advance_tasks))`` directly.
+        """
+        return tuple(self._advance_tasks)
+
     def has_any_paused(self) -> bool:
         """Whether any work item currently has a paused speech item.
 

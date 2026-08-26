@@ -611,15 +611,6 @@ class WorkItemCoordinator:
         self._late_results.clear()
         return results
 
-    @property
-    def is_shutdown(self) -> bool:
-        """Whether :meth:`shutdown` has already run.
-
-        Public read for tests that previously asserted
-        ``coordinator._shutdown`` directly.
-        """
-        return self._shutdown
-
     def has_background_capacity(self) -> bool:
         """Whether another non-mandatory background task can be admitted right now.
 
