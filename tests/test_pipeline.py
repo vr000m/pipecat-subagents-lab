@@ -6407,9 +6407,7 @@ def _ack_items(scheduler: object) -> list[object]:
     """
     from server.speech_scheduler import ROLE_ACK
 
-    items = [
-        item for item in scheduler.all_queued_items() if item.role == ROLE_ACK
-    ]
+    items = [item for item in scheduler.all_queued_items() if item.role == ROLE_ACK]
     active = scheduler.active
     if active is not None and active.item.role == ROLE_ACK:
         items.append(active.item)

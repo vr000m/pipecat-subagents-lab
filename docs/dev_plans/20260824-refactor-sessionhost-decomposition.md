@@ -183,7 +183,7 @@ Dependency direction: new modules import from collaborators, never back into
 
 ## Progress
 
-- [ ] Phase 0: Test-double modernization
+- [x] Phase 0: Test-double modernization
 - [ ] Phase 1: Shared turn-epilogue abstraction
 - [ ] Phase 2: connect() + ConnectionPipeline extraction
 - [ ] Phase 3: Config/boundary consolidation
@@ -210,5 +210,12 @@ Private collaborator-read call sites (patterns per collaborator):
 - observers: 3 hits in tests/test_app.py (`_paused`, `_buffer`).
 - speech_lifecycle: 21 hits in tests/test_speech_lifecycle.py (`_transition_tasks`, `_context_tombstones`, `_context_tokens`, `_timers`, `_timer_handles`, `_teardown_generation`, `_generations`, plus private-method setup calls excluded).
 - work_item_coordinator: ~21 hits in tests/test_work_item_coordinator.py (`_submission_tasks`, `_shutdown`, `_owned_tasks`, `_late_tasks`, `_cancelling_tasks`, `_submit_tasks`, `_provider_tasks`, `_mandatory_tasks`, `_background_task_order`; setup *writes* like `coordinator._shutdown = True` excluded from read-accessor scope).
+
+#### Phase 0 migration evidence (2026-08-26, commits b0860a7…e67b422)
+
+- Doubles: 77 `class *Coordinator` matches → 43 genuine duck-typed doubles migrated to `FakeCoordinator` (test_pipeline.py 17-via-`RoutedCoordinator`-base + 27 standalone — one standalone also counted in the base group; test_smoke_conversation.py 3; test_session_host.py 1). **Allowlisted non-doubles (with reason):** test_pipeline.py 28-29 `class *Coordinator(WorkItemCoordinator)` subclasses of the *real* class (production-seam tests, not duck-typed impersonators); test_work_item_coordinator.py `BareCoordinator` (deliberately member-less — tests `coordinator_view`'s getattr-fallback path; migrating would defeat the test) and `RecordingCoordinator` (real-class subclass). Post-migration base-class census: 33 FakeCoordinator + 15 RoutedCoordinator(→FakeCoordinator) + 1 CoordinatorDefaults (in `_doubles.py` itself) + 29 WorkItemCoordinator (allowlisted).
+- Assertion parity: every doubles-migration commit verified `git diff | grep -cE '^[-+].*assert'` == 0 and collect-only counts unchanged (397/45/6/58/80/77/50/18 per module). Call-site migration commits rewrote assert lines only under semantic equivalence (same predicate strength; never count-for-contents), recorded per commit message.
+- Call sites: 38 (sub-step c) + 70 (test_pipeline + leftover) + 30 (residual sweep: bare-local-variable reads the dot-prefixed inventory grep missed in test_speech_scheduler/test_observers/test_pipeline) migrated. Accessors added beyond b0860a7: `speech_lifecycle.uses_event_loop_timers_with_clock`, `speech_scheduler.has_any_queue/has_any_paused/all_queued_items`.
+- Residual private-read allowlist (final sweep clean otherwise): test_pipeline.py:4923 `coordinator._callback` (test-owned attribute on an inline double); test_perf_metrics.py:170-219 `observer._event_handlers` (upstream `pipecat.observers.*` classes, outside the 5 collaborator modules); test_observers.py:502 `observer._emit is None` (white-box emitter-wiring check, no accessor); test_pipeline.py:7255 (docstring mention). Sanctioned non-reads retained: private setup writes (`_ack_emitted_turns.add/update`, `_shutdown =`, `_owned_tasks`, `_queues[...] =`) and private-method setup calls (`_claim_ack_admission_generation`, `_schedule_ack_admission`, `_schedule`, `_dispatch_cleanup`).
 
 Doubles mechanism decision: **Protocol** (reuse of existing `server.work_item_coordinator.Coordinator` Protocol as sole interface source; ABC rejected — would force a shared base class the suite deliberately avoids). `tests/_doubles.py` provides `FakeCoordinator` (subclasses `CoordinatorDefaults`, overridable per-member) plus structural conformance checks (`conformance_problems` / `assert_conforms_to_coordinator` comparing Protocol annotations + method signatures); pinned by tests/test_doubles.py against both the fake and the real `WorkItemCoordinator` (4 new tests). Note: tests/test_doubles.py imports `from _doubles import ...` (bare) — `tests.`-prefixed import collides in `mypy .` runs because tests/ has no `__init__.py`.
