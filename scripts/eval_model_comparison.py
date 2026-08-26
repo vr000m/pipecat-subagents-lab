@@ -2603,8 +2603,9 @@ def _shipped_config_cells_annotation(
             "cells": worker_cells,
         },
         "note": (
-            "these sweep cells carry the (model, effort) config.toml ships; "
-            "their latency budget is report-only, not blocking"
+            "these sweep cells carry the (model, effective effort) config.toml ships "
+            "(see the `effort` fields above, resolved the same way); their latency "
+            "budget is report-only, not blocking"
         ),
     }
     # `_registered_label` (eval_common.py) returns the sentinel "shipped" when
