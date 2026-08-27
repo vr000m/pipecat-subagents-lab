@@ -270,6 +270,26 @@ Justification (from the table):
 - Requirement 2 evidence: 11-row table above; 4 NEEDS-CHARACTERIZATION-TEST cells got tests in 8875fdc (397→401) before any extraction.
 - **Advisory review (opus) findings, all fixed in d1226e2 with fail-first regression pins (401→405):** Critical — `retained_still_open` was derived inside the awaited epilogue, so except/finally saw a stale value when commit/speak raised on the retained path (single-intent; sweep + release-all fired where pre-extraction skipped); Important — pending mirror (`and not was_cancelled` adjustment lost pre-await); Important — pending turns gained an unsanctioned `commit_ms` measurement (now gated off via `record_commit_ms=False`); Minor — dead `finalize_turn_exception`/`cancelled_ids` ctx fields dropped; Minor — `work_status_after_commit_failure` test re-export removed (test imports the real home).
 
+### Phase 1 row-3 correction (2026-08-27, review round 1)
+
+The differences table above records row 3 (terminal-status derivation) as
+"Same shape, single child" for both `_handle_transcript_impl` and
+`_handle_pending`. That was wrong in one detail: single-intent gated the
+retained-and-not-cancelled case to "emit nothing", while `_handle_pending`
+re-derived it through `child_work_status_after_dispatch`, which republishes
+`background` after the commit. The first extraction collapsed both onto the
+single-intent policy. The two are observably different only when
+`enable_background_status` is off when the dispatch-time `background` emit
+runs (suppressing it) and back on by the time `_commit_and_speak` returns --
+in that window pending's second derivation is the only thing that moves the
+child off its stale `searching` record before the late result lands, so the
+collapse was an unsanctioned behavior change under Requirement 9. Fixed by
+making the policy an explicit `derive_status` parameter on
+`finalize_single_child_turn` (default `status_omitted_while_retained` for
+single-intent; `_handle_pending` passes `child_work_status_after_dispatch`),
+pinned fail-first by
+`tests/test_pipeline.py::test_pending_retained_child_recovers_background_when_the_status_gate_reopens`.
+
 ### Review Waivers
 
 - 2026-08-26 marker refresh at conduct start: recorded marker (2026-08-25 @ 55db787a…) was stale because commit `0c3320e` (merged PR #9) corrected one Phase 3 line citation (`server/config.py` edit region + landed sha). Sole contract drift; landed via reviewed PR, so the marker was refreshed in place (`e3e5ad2c…`) instead of re-running `/review-plan`.

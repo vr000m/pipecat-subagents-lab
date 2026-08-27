@@ -1954,6 +1954,15 @@ class SessionHost:
                 # duration against `app_turn_foreground` (Finding 3) -- only
                 # the single-intent handler did.
                 record_commit_ms=False,
+                # Row 3's variance: pending-dialogue re-derives the retained
+                # child's status through `child_work_status_after_dispatch`
+                # (republishing `background` after the commit), where
+                # single-intent emits nothing. The two differ only when
+                # `enable_background_status` was off for the dispatch-time
+                # `background` emit above and back on by the time the commit
+                # returns -- pre-extraction, this path recovered the child
+                # from its stale `searching` record there.
+                derive_status=child_work_status_after_dispatch,
             )
             retained_still_open = epilogue_outcome.retained_still_open
             return epilogue_outcome.result

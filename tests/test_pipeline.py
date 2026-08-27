@@ -7168,6 +7168,78 @@ def test_pending_continuation_retained_child_reports_background_not_failed() -> 
     asyncio.run(run())
 
 
+def test_pending_retained_child_recovers_background_when_the_status_gate_reopens() -> None:
+    """Regression (P2 round-1 review, findings 2+4): pre-extraction,
+    ``_handle_pending`` derived its post-commit status through
+    ``child_work_status_after_dispatch``, which re-derives ``background`` for a
+    retained, non-cancelled child -- unlike the single-intent handler, which
+    emits nothing there. The two are observably different only when
+    ``enable_background_status`` is off when the dispatch-time ``background``
+    emit runs (suppressing it outright) and back on by the time
+    ``_commit_and_speak`` returns: pending's second derivation is then the only
+    thing that moves the child off its stale ``searching`` record before the
+    late result lands. The shared epilogue must keep that per-caller policy."""
+
+    async def run() -> None:
+        sink = CollectingMeasurementSink()
+        worker = ResultWorker()
+        holder: dict[str, SessionHost] = {}
+
+        class Registry:
+            config = Config(max_work_items_per_turn=2)
+
+            @staticmethod
+            def get(_worker_id: str) -> object:
+                return type("Registered", (), {"worker": worker})()
+
+        class GateFlippingCoordinator(WorkItemCoordinator):
+            def __init__(self) -> None:
+                super().__init__(registry=Registry(), router=object())
+
+            async def submit(self, *_args: object, **_kwargs: object) -> object:
+                # Operator kill switch goes off mid-turn, after `routing` and
+                # `searching` were already recorded: the handler's
+                # dispatch-time `background` emit is suppressed outright.
+                gated = holder["host"]
+                gated.feature_policy = dataclasses.replace(
+                    gated.feature_policy, enable_background_status=False
+                )
+                return _submitted(pending_work_item_ids=("work-turn-pending",))
+
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            coordinator=GateFlippingCoordinator(),
+            measurement_sink=sink,
+        )
+        holder["host"] = host
+        origin = await host.connect(connection_handshake(host, 1))
+        original_commit_and_speak = host._commit_and_speak
+
+        async def commit_and_speak_reopening_the_gate(*args: object, **kwargs: object) -> object:
+            # ... and back on while the canonical commit is in flight.
+            host.feature_policy = dataclasses.replace(
+                host.feature_policy, enable_background_status=True
+            )
+            return await original_commit_and_speak(*args, **kwargs)
+
+        host._commit_and_speak = commit_and_speak_reopening_the_gate  # type: ignore[method-assign]
+
+        await host._handle_pending(
+            _pending_outcome(),
+            "continue please",
+            origin,
+            "turn-pending",
+            host._recorder_factory.new_app_turn_recorder(
+                origin_epoch=origin.epoch, turn_id="turn-pending"
+            ),
+        )
+
+        assert _work_status_states(host) == ["routing", "searching", "background"]
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
 def test_pending_missing_worker_emits_failed_work_status() -> None:
     """D-a: converting ``_handle_pending`` to ``_begin_delegation`` must close
     the gap where a missing worker finalized the child silently, with no

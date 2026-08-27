@@ -44,6 +44,32 @@ from .speech_scheduler import ROLE_RESULT, SpeechRole
 from .work_status_publisher import work_status_after_commit_failure, work_status_for_outcome
 
 
+def status_omitted_while_retained(
+    outcome_label: str | None,
+    *,
+    cancelled: bool,
+    terminal_kind: str | None = None,
+) -> tuple[WorkStatusState, TerminalReason | None] | None:
+    """Row-3 derivation policy used by the single-intent turn handler.
+
+    A retained-and-not-cancelled child gets *no* post-commit status at all:
+    its truthful ``background`` was already emitted at dispatch time and the
+    coordinator terminalizes it when the late result lands. Every other case
+    defers to ``work_status_for_outcome``.
+
+    This is deliberately **not** ``child_work_status_after_dispatch`` (which
+    re-derives ``("background", None)`` for the same case). The two policies
+    are observably different only when ``enable_background_status`` was off
+    at dispatch time and back on by the time the commit returns -- the
+    pending-dialogue handler keeps the re-deriving policy it had before the
+    epilogue was extracted, which is why this is a parameter rather than a
+    hardcoded branch (see ``finalize_single_child_turn``'s ``derive_status``).
+    """
+    if outcome_label == "retained" and not cancelled:
+        return None
+    return work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
+
+
 @dataclass(frozen=True)
 class TurnEpilogueContext:
     """Explicit collaborators the epilogue needs -- no ``SessionHost`` self-reads.
@@ -97,6 +123,9 @@ async def finalize_single_child_turn(
     project_idle: bool = False,
     cancel_admitted: bool = False,
     record_commit_ms: bool = True,
+    derive_status: Callable[
+        ..., tuple[WorkStatusState, TerminalReason | None] | None
+    ] = status_omitted_while_retained,
 ) -> SingleChildEpilogueOutcome:
     """Rows 1-7, 9, 11 of the Phase 1 differences table, single-child shape.
 
@@ -126,6 +155,17 @@ async def finalize_single_child_turn(
     ``coordinator.submit`` accepted or retained anything, and so must pass
     whether nothing was accepted/retained here instead.
 
+    ``derive_status`` is row 3's variance, and the reason row 3 is not simply
+    "same shape" across the two callers: single-intent gated the retained
+    case to "emit nothing" (``status_omitted_while_retained``, the default),
+    while pending-dialogue re-derived it through
+    ``child_work_status_after_dispatch``, which republishes ``background``
+    after the commit. The two agree except when ``enable_background_status``
+    was off when the dispatch-time ``background`` was emitted (suppressing
+    it) and on again by the time the commit returns; collapsing them would
+    silently drop pending-dialogue's recovery emit in that window
+    (Requirement 9: zero behavior change).
+
     ``record_commit_ms`` gates ``turn_recorder.record_commit(commit_ms)``:
     pre-extraction, only the single-intent handler recorded a commit
     duration against ``app_turn_foreground`` -- ``_handle_pending`` never
@@ -134,14 +174,14 @@ async def finalize_single_child_turn(
     """
     commit_started = time.perf_counter()
     ctx.settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=cancel_admitted)
-    derived = (
-        None
-        if retained_still_open
-        else work_status_for_outcome(
-            child_outcome_label,
-            cancelled=was_cancelled,
-            terminal_kind=child_outcome_label,
-        )
+    # `retained_still_open` is exactly `child_outcome_label == "retained" and
+    # not was_cancelled` at both call sites, so the retained case is decided
+    # inside the policy rather than gated here -- which is what lets the two
+    # call sites keep their (genuinely different) pre-extraction policies.
+    derived = derive_status(
+        child_outcome_label,
+        cancelled=was_cancelled,
+        terminal_kind=child_outcome_label,
     )
     # Terminal status is emitted only *after* the canonical commit succeeds.
     # Emitting `result_ready` first would tell a capable client the result
