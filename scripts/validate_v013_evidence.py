@@ -588,6 +588,23 @@ def verify_manifest(manifest_path: Path) -> list[str]:
             "retired along with the rest of the query-context promotion chain"
         )
 
+    # Fail closed on an input phase nothing below knows how to gate-check:
+    # the per-entry loop only hash-verifies a declared input against the
+    # bytes at its path, and the verdict re-derivation further down only
+    # runs the known phase0-3 gates, so an unrecognized extra `inputs`
+    # entry would otherwise verify clean without any gate ever evaluating
+    # its artifact -- the same asymmetry the trailing uncovered-field guard
+    # closes for top-level manifest fields. `MANIFEST_REQUIRED_FINAL_INPUTS`
+    # is the complete roster of known phases (provisional is a subset);
+    # `phase4c` is excluded here only because it draws its dedicated
+    # retirement message above.
+    unrecognized_phases = sorted(set(inputs) - MANIFEST_REQUIRED_FINAL_INPUTS - {"phase4c"})
+    if unrecognized_phases:
+        drift.append(
+            f"inputs declares unrecognized phase(s) {unrecognized_phases} that no gate "
+            "here knows how to verify"
+        )
+
     resolved: dict[str, Path] = {}
     for phase, entry in sorted(inputs.items()):
         if phase == "phase4c":

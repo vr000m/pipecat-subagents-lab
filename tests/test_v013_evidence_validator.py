@@ -458,6 +458,50 @@ class TestVerifyManifestDriftCheck:
             "phase4c_artifact_sha256 is no longer a supported field" in line for line in drift
         )
 
+    def test_verify_manifest_rejects_a_declared_phase4c_input(self, tmp_path: Path) -> None:
+        """``inputs.phase4c`` draws its dedicated retirement rejection -- not
+        the generic unrecognized-phase drift, and never silent acceptance --
+        even when the entry is well-formed and hashes to a real repo file."""
+        manifest = self._load_committed_manifest()
+        manifest["inputs"]["phase4c"] = dict(manifest["inputs"]["phase0"])
+        module = _validator()
+        manifest_path = tmp_path / "mutated-manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        original_root = module.REPO_ROOT
+        module.REPO_ROOT = REPO_ROOT
+        try:
+            drift = module.verify_manifest(manifest_path)
+        finally:
+            module.REPO_ROOT = original_root
+
+        assert any("inputs.phase4c is no longer a supported input" in line for line in drift)
+
+    def test_verify_manifest_fails_closed_on_an_unrecognized_input_phase(
+        self, tmp_path: Path
+    ) -> None:
+        """An ``inputs`` entry no gate knows how to verify must be reported
+        as drift, not silently hash-checked-only: the per-entry loop proves
+        the declared bytes exist, but the verdict re-derivation only runs
+        the known phase0-3 gates, so without this guard an extra entry
+        would verify clean without any gate ever evaluating its artifact --
+        the same fail-closed rule the uncovered-field guard applies to
+        top-level manifest fields."""
+        manifest = self._load_committed_manifest()
+        # A well-formed entry pointing at a real, correctly-hashed repo
+        # file: only its phase name is unknown.
+        manifest["inputs"]["phase9"] = dict(manifest["inputs"]["phase0"])
+        module = _validator()
+        manifest_path = tmp_path / "mutated-manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        original_root = module.REPO_ROOT
+        module.REPO_ROOT = REPO_ROOT
+        try:
+            drift = module.verify_manifest(manifest_path)
+        finally:
+            module.REPO_ROOT = original_root
+
+        assert any("unrecognized phase(s) ['phase9']" in line for line in drift)
+
     def test_verify_manifest_writes_nothing(self, tmp_path: Path) -> None:
         """``--verify-manifest`` is documented as read-only; prove it against
         the real committed manifest rather than just trusting the docstring."""
