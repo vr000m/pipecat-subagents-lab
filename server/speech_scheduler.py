@@ -21,6 +21,7 @@ from .speech_lifecycle import (
     PreAdmissionTerminalReason,
     SpeechLifecycleCoordinator,
 )
+from .task_retention import retain_until_done
 
 SpeechRole = Literal["result", "timeout_notice", "ack"]
 ROLE_RESULT: SpeechRole = "result"
@@ -141,8 +142,7 @@ class SpeechScheduler:
                 task = asyncio.ensure_future(outcome)
             except RuntimeError:
                 return
-            self._stop_tasks.add(task)
-            task.add_done_callback(self._stop_tasks.discard)
+            retain_until_done(task, self._stop_tasks)
 
     async def wait_for_stops(self) -> None:
         """Wait until every stop signal scheduled so far has reached the pipeline."""
@@ -513,8 +513,7 @@ class SpeechScheduler:
             task = asyncio.ensure_future(advance())
         except RuntimeError:  # no running loop: nothing to advance onto
             return
-        self._advance_tasks.add(task)
-        task.add_done_callback(self._advance_tasks.discard)
+        retain_until_done(task, self._advance_tasks)
 
     def _discard_from_queue(self, item: SpeechItem) -> None:
         queue = self._queues.get(item.work_item_id)
