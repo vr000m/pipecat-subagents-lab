@@ -66,8 +66,6 @@ ignore_errors = true
 # review gauntlet -- it had no real external consumers.)
 [[tool.mypy.overrides]]
 module = [
-    "scripts.collect_query_context_latency",
-    "scripts.analyze_query_context_latency",
     "scripts.benchmark_speech",
     "scripts.smoke_conversation",
 ]

@@ -1375,9 +1375,11 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
     if "release_version" in features:
         # Documented in README alongside WEBSEARCH_RELEASE_VERSION. Without
         # this copy an operator's [features].release_version was silently
-        # dropped and load_config fell back to the packaged default, so the
-        # promotion manifest's release_version bind check compared against the
-        # wrong identity.
+        # dropped and load_config fell back to the packaged default, so
+        # release-identity consumers compared against the wrong identity --
+        # historically the (now-retired) runtime promotion-manifest bind
+        # check, today `scripts/validate_v013_evidence.py --verify-manifest`'s
+        # release_version drift re-derivation against this effective config.
         values["WEBSEARCH_RELEASE_VERSION"] = features["release_version"]
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]

@@ -847,10 +847,12 @@ def resolve_openai_api_key() -> str | None:
     -- not a raw ``os.environ["OPENAI_API_KEY"]`` read, which false-negatives
     for an operator whose key only lives in config.toml or an env-file.
 
-    THE shared credential gate: ``scripts/verify_eval_candidates.py`` and its
-    sibling scripts call this rather than keeping private copies, and a
-    third live path has something to import (round 9 confirm pass 6,
-    Architecture Minor).
+    THE shared credential gate: ``scripts/verify_eval_candidates.py`` calls
+    this rather than keeping a private copy (round 9 confirm pass 6,
+    Architecture Minor). The retired query-context experiment runner was the
+    other caller before its removal (see
+    docs/dev_plans/20260824-feature-query-context-promotion.md); any future
+    live path should import this rather than re-resolving.
     """
     try:
         return load_config().openai_api_key

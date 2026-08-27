@@ -534,8 +534,10 @@ def confine_output_arg(raw_output: str | Path, *, allowed_root: Path) -> Path:
 def confined_evidence_input_path(raw_path: str, *, allowed_root: Path | None = None) -> Path | None:
     """Resolve a *manifest-declared* evidence input path, confined to the repo tree.
 
-    The read-side counterpart to :func:`confined_output_path`, and the CLI-side
-    mirror of ``server.config._resolve_confined_evidence_path``. ``raw_path``
+    The read-side counterpart to :func:`confined_output_path`. (It used to be
+    the CLI-side mirror of ``server.config._resolve_confined_evidence_path``,
+    which was deleted along with the runtime loader it served -- see the
+    retirement note below.) ``raw_path``
     comes from ``manifest["inputs"][phase]["path"]`` -- a value the artifact
     under scrutiny declares about *itself*, not an operator setting -- so it is
     attacker-steerable and must never be used as a read target unconfined.
