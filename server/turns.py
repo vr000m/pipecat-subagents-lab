@@ -22,6 +22,8 @@ from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
+from .task_retention import retain_until_done
+
 
 def smart_turn_processor(*, timeout_seconds: float = 5.0) -> UserTurnProcessor:
     """Build the Pipecat 1.6 semantic end-of-turn processor explicitly."""
@@ -87,9 +89,7 @@ class FinalTurnTranscriptProcessor(FrameProcessor):
         if self._closing:
             self._dispatch_slots.release()
             return
-        task = asyncio.create_task(self._dispatch_with_slot(text))
-        self._dispatch_tasks.add(task)
-        task.add_done_callback(self._dispatch_tasks.discard)
+        retain_until_done(asyncio.create_task(self._dispatch_with_slot(text)), self._dispatch_tasks)
 
     def _cancel_completion(self) -> None:
         if self._completion_task is not None and not self._completion_task.done():
@@ -146,9 +146,9 @@ class FinalTurnTranscriptProcessor(FrameProcessor):
         logger.debug(
             f"{self}: Smart Turn completion armed for {self._complete_grace_seconds:g}s grace"
         )
-        self._completion_task = asyncio.create_task(self._complete_after_grace())
-        self._completion_tasks.add(self._completion_task)
-        self._completion_task.add_done_callback(self._completion_tasks.discard)
+        self._completion_task = retain_until_done(
+            asyncio.create_task(self._complete_after_grace()), self._completion_tasks
+        )
 
     async def cleanup(self) -> None:
         """Cancel and drain every application-turn task before processor teardown."""
