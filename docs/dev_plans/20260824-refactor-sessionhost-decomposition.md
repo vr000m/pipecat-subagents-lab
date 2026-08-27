@@ -179,13 +179,13 @@ Dependency direction: new modules import from collaborators, never back into
 - [ ] No behavior change outside Phase 4 (race fix, if taken) and the R5-strict branch (if chosen) — pinned by the assertion-parity-checked public-contract tests.
 - [ ] Program provenance map rows 1-12 closed here, with two exceptions: row 7 closes via P1's retire commit on retire, via this plan's Phase 3 extraction on invest, and **stays open on P1-blocked**; any row a carve-out leaves open is noted in the program doc in the same commit.
 
-<!-- reviewed: 2026-08-26 @ e3e5ad2cd85425bedcc9a3b43a386169616611c2 -->
+<!-- reviewed: 2026-08-27 @ e7fd020899e2b46678381cb987f3b54d65fad46c -->
 
 ## Progress
 
 - [x] Phase 0: Test-double modernization
 - [x] Phase 1: Shared turn-epilogue abstraction
-- [ ] Phase 2: connect() + ConnectionPipeline extraction
+- [x] Phase 2: connect() + ConnectionPipeline extraction
 - [ ] Phase 3: Config/boundary consolidation
 - [ ] Phase 4: Ack-latch race — verify, then fix
 - [ ] Phase 5: Fire-and-forget helper
@@ -317,3 +317,11 @@ Private collaborator-read call sites (patterns per collaborator):
 - **Finding 4 fixed (follow-up commit):** `FakeCoordinator.config` now defaults to unset (falling through to `CoordinatorDefaults.config = None`), matching the production fallback surface, so `coordinator_view`'s `getattr(coordinator, "config", None)` branch is exercised again post-migration (pinned by `test_foreground_search_timeout_comes_from_the_host_config_not_the_coordinator` and the `direct_delegated` early-ack residue test). `RoutedCoordinator`'s hand-written config workaround was removed as redundant; no test site needed an explicit `Config()` added (parity 452 collected unchanged; suite matches baseline). Phase 3's Requirement 1 re-litigation should still weigh `BareCoordinator` as the deliberate member-absence fallback test — doubles conformance alone doesn't prove the getattr-fallbacks dead.
 
 Doubles mechanism decision: **Protocol** (reuse of existing `server.work_item_coordinator.Coordinator` Protocol as sole interface source; ABC rejected — would force a shared base class the suite deliberately avoids). `tests/_doubles.py` provides `FakeCoordinator` (subclasses `CoordinatorDefaults`, overridable per-member) plus structural conformance checks (`conformance_problems` / `assert_conforms_to_coordinator` comparing Protocol annotations + method signatures); pinned by tests/test_doubles.py against both the fake and the real `WorkItemCoordinator` (4 new tests). Note: tests/test_doubles.py imports `from _doubles import ...` (bare) — `tests.`-prefixed import collides in `mypy .` runs because tests/ has no `__init__.py`.
+
+### Phase 2 outcome (2026-08-27): connect() + ConnectionPipeline extraction
+
+- Sub-step A (commit 56b5d70): `ConnectionPipeline` moved verbatim to new `server/connection_pipeline.py`; no re-export shim from pipeline.py. Real importers updated: `turn_ack_ledger.py` TYPE_CHECKING import, `handshake_gate.py` docstring ref.
+- Sub-step B: `connect()` (210 lines, 9 nested closures) decomposed into ~63-line orchestration + 9 `_connect_*` methods bound via `functools.partial`, plus helpers `_build_connection_lifecycle` / `_wire_connection_transcript_and_tts` / `_retire_old_connection`. Late-binding closure semantics preserved via module-level `_PendingConnectionPipeline` holder dataclass read at call time; per-connect holder keeps reconnect callbacks isolated. Zero behavior change (Requirement 9).
+- Test-writer added 2 pin tests: call-time (not registration-time) holder reads; reconnect gives each connection's transport callback its own fresh holder.
+- Advisory review (opus): all 9 closures verified binding-equivalent, side-effect ordering line-for-line identical, coordinator-boundary declarations untouched. 3 Minor findings, all fixed: unfilled-holder paths in `_connect_stop_speech` / `_connect_on_lifecycle_terminal` / `_connect_transport_acceptable` now `assert pipeline is not None` (loud failure matching original NameError behavior); reconnect test pins `PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT` instead of bare isinstance; call-time test asserts the empty-holder invocations raise and notes its scope (method-body semantics, not connect() wiring).
+- Gate: 1868 passed + 1 skipped, ruff format/check clean, bare mypy clean, smoke passed.

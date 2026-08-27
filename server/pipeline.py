@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import time
 from collections.abc import Callable, Mapping
@@ -501,6 +502,25 @@ class DelegatedChild:
     retained_recorder: RetainedRecorder | None = None
 
 
+@dataclass
+class _PendingConnectionPipeline:
+    """Mutable forward-reference to the ``ConnectionPipeline`` a ``connect()``
+    call is still constructing.
+
+    ``SessionHost.connect()`` builds several callbacks (speech queue/stop,
+    lifecycle terminal/cleanup/teardown, transport-acceptance) that must be
+    handed to the ``SpeechLifecycleCoordinator``/``SpeechScheduler``
+    constructors *before* the ``ConnectionPipeline`` they close over exists.
+    A plain parameter cannot carry a value that does not exist yet; this
+    holder is passed explicitly instead of letting the callbacks implicitly
+    capture a `connect()`-local variable, while still resolving to the same
+    object once ``connect()`` finishes constructing it -- preserving the
+    original closures' late-binding read of that not-yet-assigned local.
+    """
+
+    pipeline: ConnectionPipeline | None = None
+
+
 class SessionHost:
     """Process-lifetime host; persistent workers outlive connection pipelines."""
 
@@ -673,135 +693,40 @@ class SessionHost:
         old_connection = self.connection
         # Publish the new authority before awaiting any old transport cleanup.
         self.state.active_epoch = connection.epoch
-        pipeline: ConnectionPipeline
         connection_stt = self._connection_service(self.stt)
         connection_tts = self._connection_service(self.tts)
 
-        async def queue_speech(item: Any) -> None:
-            if (
-                connection_tts is None
-                or self.connection is not pipeline
-                or not pipeline.active
-                or item.origin_epoch != pipeline.epoch
-                or not self.accepts(pipeline.epoch)
-            ):
-                raise RuntimeError("speech target is not the active TTS connection")
-            if pipeline.worker is None:
-                raise RuntimeError("active connection has no Pipecat worker for TTS")
-            lease = pipeline.scheduler.active
-            if pipeline.lifecycle is not None and lease is not None:
-                await pipeline.worker.queue_frame(
-                    SpeechGenerationMarkerFrame(
-                        token=lease.token,
-                        utterance_id=item.utterance_id,
-                        work_item_id=item.work_item_id,
-                        origin_epoch=item.origin_epoch,
-                    )
-                )
-            frame_factory = getattr(connection_tts, "correlated_speak_frame", None)
-            frame = (
-                frame_factory(
-                    item.text,
-                    correlation_id=item.utterance_id,
-                    append_to_context=False,
-                )
-                if frame_factory is not None
-                else TTSSpeakFrame(text=item.text, append_to_context=False)
-            )
-            await pipeline.worker.queue_frame(frame)
+        # `pending` stands in for the `pipeline` local that the pre-extraction
+        # closures forward-referenced: the speech/lifecycle callbacks below
+        # are constructed (and registered on `lifecycle`/the scheduler)
+        # *before* the ConnectionPipeline they operate on exists. Passing
+        # `pipeline` itself is impossible at that point, so the callbacks
+        # take this mutable holder as an explicit parameter and read
+        # `pending.pipeline` at call time -- preserving the original
+        # closures' late-binding read of the not-yet-assigned `pipeline`
+        # variable, now made explicit instead of implicit.
+        pending = _PendingConnectionPipeline()
 
-        async def stop_speech(item: Any) -> None:
-            if connection_tts is None or self.connection is not pipeline or pipeline.worker is None:
-                return
-            token = pipeline.lifecycle.slot_token if pipeline.lifecycle is not None else None
-            generation = (
-                pipeline.lifecycle.generation_for_token(token)
-                if pipeline.lifecycle is not None and token is not None
-                else None
-            )
-            if item is not None and (
-                generation is None or generation.identity.utterance_id != item.utterance_id
-            ):
-                token = None
-            await pipeline.worker.queue_frame(InterruptionFrame())
-            if token is not None:
-                await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
-
-        def schedule_pipeline_shutdown(reason: str) -> None:
-            self.track_background_shutdown(
-                asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
-            )
-
-        async def on_lifecycle_terminal(
-            token: str, identity: GenerationIdentity, disposition: DeliveryDisposition
-        ) -> None:
-            del token
-            if self.connection is not pipeline:
-                return
-            if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
-                pipeline.scheduler.delivery_unknown(identity.utterance_id)
-            if pipeline.active and pipeline.scheduler.active is None:
-                await pipeline.scheduler.start_next()
-
-        async def dispatch_lifecycle_cleanup(token: str, identity: GenerationIdentity) -> None:
-            del token, identity
-            await stop_speech(None)
-
-        async def dispatch_lifecycle_teardown(token: str, identity: GenerationIdentity) -> None:
-            del identity
-            # Fence this connection before any await or fallback. If the
-            # physical output barrier is unavailable/fails, shutdown still
-            # prevents another generation from entering this lane.
-            pipeline.active = False
-            teardown = pipeline.output_teardown
-            if teardown is None:
-                logger.error("speech output teardown unavailable; shutting down the speech lane")
-                schedule_pipeline_shutdown("speech output teardown failed")
-                return
-
-            # SmallWebRTCConnection.disconnect() does not return until its
-            # tracks and peer connection have been closed, so no fieldless
-            # stop from this lane can arrive after teardown_complete().
-            try:
-                result = teardown()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:  # noqa: BLE001  # fail closed: never acknowledge an unconfirmed output teardown
-                logger.exception("speech output teardown failed; retaining the lifecycle barrier")
-                schedule_pipeline_shutdown("speech output teardown failed")
-                return
-
-            if pipeline.lifecycle is not None:
-                await pipeline.lifecycle.teardown_complete(token)
-            schedule_pipeline_shutdown("speech output teardown")
-
-        def transport_acceptable() -> bool:
-            return self.connection is pipeline and pipeline.active
-
-        connection_config = self.config
-        # Every connection constructs one SpeechLifecycleCoordinator,
-        # including when connection_tts is None: the no-TTS/unavailable-
-        # transport cases are decided by pre_admission_disposition() rather
-        # than by never constructing a coordinator at all.
-        lifecycle = SpeechLifecycleCoordinator(
-            clock=MonotonicClock(),
-            timers=EventLoopTimerScheduler(),
-            speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
-            speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
-            on_terminal=on_lifecycle_terminal,
-            dispatch_cleanup=dispatch_lifecycle_cleanup,
-            dispatch_teardown=dispatch_lifecycle_teardown,
-            tts_available=connection_tts is not None,
-            transport_acceptance=transport_acceptable,
-        )
-
+        lifecycle = self._build_connection_lifecycle(connection_tts=connection_tts, pending=pending)
         pipeline = ConnectionPipeline(
             connection.epoch,
             RuntimeObserver(self.state, connection.epoch, frozenset(connection.capabilities)),
             SpeechScheduler(
                 self.state,
-                speak=queue_speech if connection_tts is not None else None,
-                stop=stop_speech if connection_tts is not None else None,
+                speak=(
+                    functools.partial(
+                        self._connect_queue_speech, connection_tts=connection_tts, pending=pending
+                    )
+                    if connection_tts is not None
+                    else None
+                ),
+                stop=(
+                    functools.partial(
+                        self._connect_stop_speech, connection_tts=connection_tts, pending=pending
+                    )
+                    if connection_tts is not None
+                    else None
+                ),
                 lifecycle=lifecycle,
                 on_ack_terminal=self.on_ack_terminal,
             ),
@@ -809,62 +734,250 @@ class SessionHost:
             stt=connection_stt,
             tts=connection_tts,
         )
-        if connection_stt is not None and self.coordinator is not None:
-
-            async def on_final(text: str) -> Any:
-                if self.connection is not pipeline or not pipeline.active:
-                    return None
-                return await self._handle_transcript(text, origin=pipeline)
-
-            pipeline.on_transcript = on_final
-        if connection_tts is not None and hasattr(connection_tts, "on_event"):
-
-            async def on_tts_event(event: str, context_id: str) -> Any:
-                callback_result = None
-                if self._tts_on_event is not None:
-                    callback_result = self._tts_on_event(event, context_id)
-                    if inspect.isawaitable(callback_result):
-                        callback_result = await callback_result
-                current = self.connection is pipeline and pipeline.active
-                has_lifecycle = pipeline.lifecycle is not None
-                if event == "synthesis_started" and current:
-                    pipeline.scheduler.provider_started(context_id)
-                elif event == "synthesis_ended" and current:
-                    pipeline.scheduler.provider_synthesis_ended(context_id)
-                    # Non-terminal: the real TTSStoppedFrame observed by
-                    # TransportSpeechLifecycleProcessor arms the coordinator's
-                    # drain deadline. Without a coordinator, fall back to the
-                    # old conservative immediate release so later utterances
-                    # cannot be starved.
-                    if not has_lifecycle:
-                        pipeline.scheduler.provider_delivery_unknown(context_id)
-                elif event == "delivery_completed" and current:
-                    # Same has_lifecycle gate as synthesis_ended above: with a
-                    # coordinator installed, only its own token-bearing
-                    # transport/tombstone barriers may release the slot.
-                    if not has_lifecycle:
-                        pipeline.scheduler.provider_delivery_completed(context_id)
-                elif event == "delivery_unknown" and current:
-                    lifecycle = pipeline.lifecycle
-                    token = (
-                        lifecycle.token_for_context(context_id) if lifecycle is not None else None
-                    )
-                    if lifecycle is not None and token is not None:
-                        await lifecycle.provider_error(token)
-                    else:
-                        pipeline.scheduler.provider_delivery_unknown(context_id)
-                if (
-                    not has_lifecycle
-                    and event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
-                    and self.connection is pipeline
-                    and pipeline.active
-                    and pipeline.scheduler.active is None
-                ):
-                    await pipeline.scheduler.start_next()
-                return callback_result
-
-            connection_tts.on_event = on_tts_event
+        # From here on, `pipeline` exists: the forward-referencing callbacks
+        # above resolve `pending.pipeline` to it the first time any of them
+        # actually runs (always after this assignment, since none of the
+        # constructors above invoke their callbacks synchronously).
+        pending.pipeline = pipeline
+        self._wire_connection_transcript_and_tts(
+            pipeline, connection_stt=connection_stt, connection_tts=connection_tts
+        )
         self.connection = pipeline
+        self._retire_old_connection(old_connection)
+        await self._runner_supervisor.register_persistent_workers(lambda: self.registry.workers)
+        return pipeline
+
+    def _build_connection_lifecycle(
+        self, *, connection_tts: Any | None, pending: _PendingConnectionPipeline
+    ) -> SpeechLifecycleCoordinator:
+        connection_config = self.config
+        # Every connection constructs one SpeechLifecycleCoordinator,
+        # including when connection_tts is None: the no-TTS/unavailable-
+        # transport cases are decided by pre_admission_disposition() rather
+        # than by never constructing a coordinator at all.
+        return SpeechLifecycleCoordinator(
+            clock=MonotonicClock(),
+            timers=EventLoopTimerScheduler(),
+            speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
+            speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
+            on_terminal=functools.partial(self._connect_on_lifecycle_terminal, pending=pending),
+            dispatch_cleanup=functools.partial(
+                self._connect_dispatch_lifecycle_cleanup,
+                connection_tts=connection_tts,
+                pending=pending,
+            ),
+            dispatch_teardown=functools.partial(
+                self._connect_dispatch_lifecycle_teardown, pending=pending
+            ),
+            tts_available=connection_tts is not None,
+            transport_acceptance=functools.partial(
+                self._connect_transport_acceptable, pending=pending
+            ),
+        )
+
+    async def _connect_queue_speech(
+        self, item: Any, *, connection_tts: Any | None, pending: _PendingConnectionPipeline
+    ) -> None:
+        pipeline = pending.pipeline
+        if (
+            connection_tts is None
+            or pipeline is None
+            or self.connection is not pipeline
+            or not pipeline.active
+            or item.origin_epoch != pipeline.epoch
+            or not self.accepts(pipeline.epoch)
+        ):
+            raise RuntimeError("speech target is not the active TTS connection")
+        if pipeline.worker is None:
+            raise RuntimeError("active connection has no Pipecat worker for TTS")
+        lease = pipeline.scheduler.active
+        if pipeline.lifecycle is not None and lease is not None:
+            await pipeline.worker.queue_frame(
+                SpeechGenerationMarkerFrame(
+                    token=lease.token,
+                    utterance_id=item.utterance_id,
+                    work_item_id=item.work_item_id,
+                    origin_epoch=item.origin_epoch,
+                )
+            )
+        frame_factory = getattr(connection_tts, "correlated_speak_frame", None)
+        frame = (
+            frame_factory(
+                item.text,
+                correlation_id=item.utterance_id,
+                append_to_context=False,
+            )
+            if frame_factory is not None
+            else TTSSpeakFrame(text=item.text, append_to_context=False)
+        )
+        await pipeline.worker.queue_frame(frame)
+
+    async def _connect_stop_speech(
+        self, item: Any, *, connection_tts: Any | None, pending: _PendingConnectionPipeline
+    ) -> None:
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before stopping speech"
+        if connection_tts is None or self.connection is not pipeline or pipeline.worker is None:
+            return
+        token = pipeline.lifecycle.slot_token if pipeline.lifecycle is not None else None
+        generation = (
+            pipeline.lifecycle.generation_for_token(token)
+            if pipeline.lifecycle is not None and token is not None
+            else None
+        )
+        if item is not None and (
+            generation is None or generation.identity.utterance_id != item.utterance_id
+        ):
+            token = None
+        await pipeline.worker.queue_frame(InterruptionFrame())
+        if token is not None:
+            await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
+
+    def _connect_schedule_pipeline_shutdown(
+        self, reason: str, *, pending: _PendingConnectionPipeline
+    ) -> None:
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before scheduling shutdown"
+        self.track_background_shutdown(
+            asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
+        )
+
+    async def _connect_on_lifecycle_terminal(
+        self,
+        token: str,
+        identity: GenerationIdentity,
+        disposition: DeliveryDisposition,
+        *,
+        pending: _PendingConnectionPipeline,
+    ) -> None:
+        del token
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before lifecycle terminal"
+        if self.connection is not pipeline:
+            return
+        if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
+            pipeline.scheduler.delivery_unknown(identity.utterance_id)
+        if pipeline.active and pipeline.scheduler.active is None:
+            await pipeline.scheduler.start_next()
+
+    async def _connect_dispatch_lifecycle_cleanup(
+        self,
+        token: str,
+        identity: GenerationIdentity,
+        *,
+        connection_tts: Any | None,
+        pending: _PendingConnectionPipeline,
+    ) -> None:
+        del token, identity
+        await self._connect_stop_speech(None, connection_tts=connection_tts, pending=pending)
+
+    async def _connect_dispatch_lifecycle_teardown(
+        self, token: str, identity: GenerationIdentity, *, pending: _PendingConnectionPipeline
+    ) -> None:
+        del identity
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before lifecycle teardown"
+        # Fence this connection before any await or fallback. If the
+        # physical output barrier is unavailable/fails, shutdown still
+        # prevents another generation from entering this lane.
+        pipeline.active = False
+        teardown = pipeline.output_teardown
+        if teardown is None:
+            logger.error("speech output teardown unavailable; shutting down the speech lane")
+            self._connect_schedule_pipeline_shutdown(
+                "speech output teardown failed", pending=pending
+            )
+            return
+
+        # SmallWebRTCConnection.disconnect() does not return until its
+        # tracks and peer connection have been closed, so no fieldless
+        # stop from this lane can arrive after teardown_complete().
+        try:
+            result = teardown()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001  # fail closed: never acknowledge an unconfirmed output teardown
+            logger.exception("speech output teardown failed; retaining the lifecycle barrier")
+            self._connect_schedule_pipeline_shutdown(
+                "speech output teardown failed", pending=pending
+            )
+            return
+
+        if pipeline.lifecycle is not None:
+            await pipeline.lifecycle.teardown_complete(token)
+        self._connect_schedule_pipeline_shutdown("speech output teardown", pending=pending)
+
+    def _connect_transport_acceptable(self, *, pending: _PendingConnectionPipeline) -> bool:
+        pipeline = pending.pipeline
+        assert pipeline is not None, (
+            "pending.pipeline must be set before transport acceptance check"
+        )
+        return self.connection is pipeline and pipeline.active
+
+    async def _connect_on_final(self, text: str, *, pipeline: ConnectionPipeline) -> Any:
+        if self.connection is not pipeline or not pipeline.active:
+            return None
+        return await self._handle_transcript(text, origin=pipeline)
+
+    async def _connect_on_tts_event(
+        self, event: str, context_id: str, *, pipeline: ConnectionPipeline
+    ) -> Any:
+        callback_result = None
+        if self._tts_on_event is not None:
+            callback_result = self._tts_on_event(event, context_id)
+            if inspect.isawaitable(callback_result):
+                callback_result = await callback_result
+        current = self.connection is pipeline and pipeline.active
+        has_lifecycle = pipeline.lifecycle is not None
+        if event == "synthesis_started" and current:
+            pipeline.scheduler.provider_started(context_id)
+        elif event == "synthesis_ended" and current:
+            pipeline.scheduler.provider_synthesis_ended(context_id)
+            # Non-terminal: the real TTSStoppedFrame observed by
+            # TransportSpeechLifecycleProcessor arms the coordinator's
+            # drain deadline. Without a coordinator, fall back to the
+            # old conservative immediate release so later utterances
+            # cannot be starved.
+            if not has_lifecycle:
+                pipeline.scheduler.provider_delivery_unknown(context_id)
+        elif event == "delivery_completed" and current:
+            # Same has_lifecycle gate as synthesis_ended above: with a
+            # coordinator installed, only its own token-bearing
+            # transport/tombstone barriers may release the slot.
+            if not has_lifecycle:
+                pipeline.scheduler.provider_delivery_completed(context_id)
+        elif event == "delivery_unknown" and current:
+            lifecycle = pipeline.lifecycle
+            token = lifecycle.token_for_context(context_id) if lifecycle is not None else None
+            if lifecycle is not None and token is not None:
+                await lifecycle.provider_error(token)
+            else:
+                pipeline.scheduler.provider_delivery_unknown(context_id)
+        if (
+            not has_lifecycle
+            and event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
+            and self.connection is pipeline
+            and pipeline.active
+            and pipeline.scheduler.active is None
+        ):
+            await pipeline.scheduler.start_next()
+        return callback_result
+
+    def _wire_connection_transcript_and_tts(
+        self,
+        pipeline: ConnectionPipeline,
+        *,
+        connection_stt: Any | None,
+        connection_tts: Any | None,
+    ) -> None:
+        if connection_stt is not None and self.coordinator is not None:
+            pipeline.on_transcript = functools.partial(self._connect_on_final, pipeline=pipeline)
+        if connection_tts is not None and hasattr(connection_tts, "on_event"):
+            connection_tts.on_event = functools.partial(
+                self._connect_on_tts_event, pipeline=pipeline
+            )
+
+    def _retire_old_connection(self, old_connection: ConnectionPipeline | None) -> None:
         if old_connection is not None:
             old_connection.deactivate()
             self.track_background_shutdown(
@@ -872,8 +985,6 @@ class SessionHost:
                     old_connection.shutdown(reason="connection replaced", reconnect=True)
                 )
             )
-        await self._runner_supervisor.register_persistent_workers(lambda: self.registry.workers)
-        return pipeline
 
     @staticmethod
     def _connection_service(service: Any | None) -> Any | None:

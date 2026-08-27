@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import functools
 import threading
 import time
 
@@ -1227,6 +1228,120 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
         assert scheduler.active.item == a_item
         assert host.state.speech[a_item.utterance_id].state.value != "interrupted"
 
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_connect_callbacks_read_pending_pipeline_at_call_time_not_registration_time() -> None:
+    """Phase 2 decomposition: ``_connect_transport_acceptable``/``_connect_stop_speech``
+    (callbacks 1-7) take a mutable ``_PendingConnectionPipeline`` holder and must
+    resolve ``pending.pipeline`` at *call* time, not at partial-construction time --
+    mirroring the pre-decomposition closures, which forward-referenced a
+    ``connect()``-local ``pipeline`` variable that did not exist yet when the
+    closures were registered. Binding the same partials against an initially-empty
+    holder, then filling it, pins that late-binding contract directly against the
+    unit under test rather than only through connect()'s own internal wiring.
+
+    Reconnect-freshness coverage of connect()'s own wiring (i.e. that each
+    connect() call wires its callbacks against its own, separately-filled
+    holder) lives in
+    ``test_reconnect_gives_each_connections_transport_callback_its_own_fresh_holder``
+    below -- this test rebuilds partials locally, so it pins method-body
+    semantics, not connect()'s wiring."""
+
+    async def run() -> None:
+        tts = FakeTTS()
+        host = SessionHost(
+            runner_factory=LifecycleRunner,
+            tts=tts,
+            coordinator=RoutedCoordinator(ResultWorker()),
+        )
+        connection = await host.connect(connection_handshake(host, 1))
+        worker = QueueingPipelineWorker()
+        connection.worker = worker
+
+        pending = pipeline_module._PendingConnectionPipeline()
+        transport_acceptable = functools.partial(
+            host._connect_transport_acceptable, pending=pending
+        )
+        stop_speech = functools.partial(
+            host._connect_stop_speech, connection_tts=connection.tts, pending=pending
+        )
+
+        # Built while the holder is still empty (as connect() builds these
+        # callbacks before the ConnectionPipeline they close over exists):
+        # must raise loudly, mirroring the pre-decomposition closures which
+        # would raise NameError on the not-yet-assigned connect()-local
+        # ``pipeline`` if invoked before assignment.
+        with pytest.raises(AssertionError):
+            transport_acceptable()
+        with pytest.raises(AssertionError):
+            await stop_speech(None)
+        assert worker.frames == []
+
+        # Fill the holder the way connect() does immediately after
+        # constructing the pipeline, then invoke the SAME bound callables.
+        pending.pipeline = connection
+
+        assert transport_acceptable() is True
+        await stop_speech(None)
+        assert any(isinstance(frame, InterruptionFrame) for frame in worker.frames)
+
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_reconnect_gives_each_connections_transport_callback_its_own_fresh_holder() -> None:
+    """Reconnect freshness: a second ``connect()`` must wire the new
+    connection's lifecycle/scheduler callbacks against a holder that resolves
+    to the *new* ``ConnectionPipeline``, while the first connection's own
+    callbacks (bound against its own, separately-filled holder) correctly
+    stop accepting once it is no longer ``host.connection`` -- observed
+    through the public ``pre_admission_disposition`` surface rather than any
+    private callback attribute, so this pins connect()-level behavior instead
+    of internal wiring."""
+
+    async def run() -> None:
+        from server.speech_lifecycle import (
+            GenerationIdentity,
+            PreAdmissionAdmit,
+            PreAdmissionTerminal,
+            PreAdmissionTerminalReason,
+        )
+
+        host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
+        first = await host.connect(connection_handshake(host, 1))
+        first.worker = QueueingPipelineWorker()
+        second = await host.connect(connection_handshake(host, 2))
+        second.worker = QueueingPipelineWorker()
+
+        assert first.lifecycle is not None
+        assert second.lifecycle is not None
+
+        stale_ack = GenerationIdentity(
+            "utt-stale-ack", "work-stale-ack", role="ack", turn_id="turn-1", ack_id="ack-1"
+        )
+        fresh_ack = GenerationIdentity(
+            "utt-fresh-ack", "work-fresh-ack", role="ack", turn_id="turn-2", ack_id="ack-2"
+        )
+
+        stale_disposition = first.lifecycle.pre_admission_disposition(stale_ack)
+        fresh_disposition = second.lifecycle.pre_admission_disposition(fresh_ack)
+
+        assert isinstance(stale_disposition, PreAdmissionTerminal), (
+            "the superseded connection's transport-acceptance callback must resolve "
+            "against its own (now-stale) pipeline and refuse, not silently accept"
+        )
+        assert stale_disposition.reason is PreAdmissionTerminalReason.UNAVAILABLE_TRANSPORT, (
+            "the refusal must come from the transport-acceptance callback itself, not "
+            "from unrelated shutdown-task scheduling timing"
+        )
+        assert isinstance(fresh_disposition, PreAdmissionAdmit), (
+            "the new connection's transport-acceptance callback must resolve its own "
+            "freshly-filled holder, not a stale one left over from the first connect()"
+        )
         await host.shutdown()
 
     asyncio.run(run())
