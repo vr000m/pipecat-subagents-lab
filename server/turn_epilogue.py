@@ -118,6 +118,17 @@ class TurnEpilogueContext:
     passes one (via ``project_idle=True`` on `finalize_single_child_turn`),
     matching row 9 of the Phase 1 differences table, which is present only
     for ``_handle_transcript_impl``.
+
+    One context type serves both entry points on purpose (the plan's
+    Architecture & Call Flow mandates "an explicit context object"), so not
+    every field is read on every path: the ``release_*`` callables are read
+    only by `release_fan_out_turn_work_items` (the single-child shape keeps
+    its release call in the caller's own ``finally``), and
+    ``worker_projection`` only by `finalize_single_child_turn`. The unread
+    fields are cheap bound-method reads, and one construction site per
+    handler is what keeps the collaborator set auditable in one place; a
+    caller that sets ``project_idle`` without a projection fails loudly
+    rather than no-opping (see `finalize_single_child_turn`).
     """
 
     settle_turn_ack: SettleTurnAck
@@ -264,7 +275,15 @@ async def finalize_single_child_turn(
     if record_commit_ms:
         turn_recorder.record_commit(commit_ms)
     turn_recorder.finalize()
-    if project_idle and ctx.worker_projection is not None:
+    if project_idle:
+        # Loud, not silently skipped: opting into row 9 without wiring a
+        # projection is a caller bug, and letting it no-op would lose the
+        # worker's post-commit `idle` state with nothing to show for it. Both
+        # single-child call sites pass one; the fan-out context deliberately
+        # omits it and never sets `project_idle`.
+        assert ctx.worker_projection is not None, (
+            "project_idle=True requires TurnEpilogueContext.worker_projection"
+        )
         ctx.worker_projection.project(
             worker,
             origin_epoch=origin_epoch,
@@ -304,6 +323,15 @@ async def finalize_fan_out_turn(
     Row 9 (post-commit worker-``idle`` projection) is deliberately absent
     here, unlike the single-child shape: no fan-out call site ever passed
     one, matching the Phase 1 characterization's "absent" cell for this row.
+
+    ``deferred_status`` is **consumed**, not just read: entries are popped as
+    each index is emitted and the dict is cleared once the trailing sweep has
+    drained it, so the caller must not read it after this call. That is why
+    it is typed ``dict`` while its sibling inputs are ``AbstractSet``/
+    ``Mapping`` — the mutable type is the contract, carried over from the
+    pre-extraction handler, which drained the same dict inline. Draining is
+    load-bearing: the sweep must emit exactly the entries the commit loop did
+    not, and the clear keeps a re-entry from double-emitting them.
 
     Row 11's *decision* (release-all vs partial-release) is a separate
     function, ``release_fan_out_turn_work_items`` below -- it must run from
