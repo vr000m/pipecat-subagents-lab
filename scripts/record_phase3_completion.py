@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Record the exact Phase 3 command digest, source commit, and tree hash.
+"""Record the historical Phase 3 completion metadata.
 
-Run only after Phase 3's own Test command (see the dev plan's closing Phase
-3 bullet) has passed against a clean checkout. The resulting artifact is a
-required input to ``scripts/validate_v013_evidence.py --write-manifest
---manifest-phase final``: a final promotion manifest cannot be produced
-without a matching Phase 3 completion record.
+Run after the Phase 3 test command has passed against a clean checkout when a
+standalone completion record is needed. The committed v0.1.3 record remains
+part of the frozen evidence set consumed by the read-only manifest verifier;
+this helper is not an active release gate and does not create or update a
+promotion manifest.
 """
 
 from __future__ import annotations
@@ -64,12 +64,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         # write_bytes_no_follow (scripts/evidence_common.py): this predictable,
-        # repo-relative output path gets the same symlink/FIFO hardening as the
-        # promotion-manifest writer, instead of a plain write_text that would
-        # follow a planted symlink. Kept inside this try block, not after it,
-        # so a symlinked --output fails closed with the same FAIL/exit-1
-        # contract as every other gate error here, instead of an uncaught
-        # traceback.
+        # repo-relative output path gets symlink/FIFO hardening instead of a
+        # plain write_text that would follow a planted symlink. Kept inside
+        # this try block, not after it, so a symlinked --output fails closed
+        # with the same FAIL/exit-1 contract as every other error here, instead
+        # of an uncaught traceback.
         write_bytes_no_follow(
             args.output, (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
         )

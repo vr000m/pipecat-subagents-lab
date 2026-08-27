@@ -83,14 +83,15 @@ def now_utc() -> str:
     exact format -- ``server/config.py``'s boot-path loader parses it with
     ``_parse_utc_timestamp``, so the format is a contract between the writer
     and that parser, not a formatting preference each script was free to pick
-    independently. This was previously hand-written at seven call sites
-    (``analyze_query_context_latency.py`` and ``collect_query_context_latency.py``
-    each wrapped an identical private ``_now_utc``; ``validate_v013_evidence.py``,
-    ``emit_v013_deployment_metadata.py``, ``record_phase3_completion.py``,
-    ``run_query_context_experiment.py``, and ``eval_model_comparison.py`` spelled
-    it inline), all producing the same string -- consolidated here so a future
-    format change happens in one place, not seven (round-5 restart,
-    Architecture finding).
+    independently. This was previously hand-written at several call sites
+    (``validate_v013_evidence.py``, ``emit_v013_deployment_metadata.py``,
+    ``record_phase3_completion.py``, and ``eval_model_comparison.py`` spelled
+    it inline, plus two more in the retired query-context experiment
+    collectors -- see
+    docs/dev_plans/20260824-feature-query-context-promotion.md), all
+    producing the same string -- consolidated here so a future format
+    change happens in one place, not several (round-5 restart, Architecture
+    finding).
     """
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -512,10 +513,11 @@ def confine_output_arg(raw_output: str | Path, *, allowed_root: Path) -> Path:
     ``evidence_common.REPO_ROOT`` would silently stop honouring that
     per-module patch and point every caller back at the real repo root.
 
-    Five evidence-gate scripts (``record_phase3_completion.py``,
-    ``collect_query_context_latency.py``, ``run_query_context_experiment.py``,
-    ``analyze_query_context_latency.py``, ``validate_v013_evidence.py``) used
-    to copy-paste the same prose comment plus ``try/except ValueError: print
+    Several evidence-gate scripts (``record_phase3_completion.py`` and
+    ``validate_v013_evidence.py`` among them; the retired query-context
+    experiment collectors were two more before their removal -- see
+    docs/dev_plans/20260824-feature-query-context-promotion.md) used to
+    copy-paste the same prose comment plus ``try/except ValueError: print
     FAIL; return 1`` block, and the invariant that comment restated in each
     place -- **the confined return value MUST be bound back onto
     ``args.output``, or a caller validates one path and writes a different
@@ -532,8 +534,10 @@ def confine_output_arg(raw_output: str | Path, *, allowed_root: Path) -> Path:
 def confined_evidence_input_path(raw_path: str, *, allowed_root: Path | None = None) -> Path | None:
     """Resolve a *manifest-declared* evidence input path, confined to the repo tree.
 
-    The read-side counterpart to :func:`confined_output_path`, and the CLI-side
-    mirror of ``server.config._resolve_confined_evidence_path``. ``raw_path``
+    The read-side counterpart to :func:`confined_output_path`. (It used to be
+    the CLI-side mirror of ``server.config._resolve_confined_evidence_path``,
+    which was deleted along with the runtime loader it served -- see the
+    retirement note below.) ``raw_path``
     comes from ``manifest["inputs"][phase]["path"]`` -- a value the artifact
     under scrutiny declares about *itself*, not an operator setting -- so it is
     attacker-steerable and must never be used as a read target unconfined.
@@ -543,14 +547,19 @@ def confined_evidence_input_path(raw_path: str, *, allowed_root: Path | None = N
     **The absolute-path rejection is load-bearing, not belt-and-braces.**
     ``Path(root) / "/etc/passwd"`` discards ``root`` entirely in pathlib, so a
     confinement written as "join, then ``is_relative_to``" accepts every
-    absolute path that happens to sit inside the tree -- and the runtime loader
-    rejects those outright. A CI gate that accepts a manifest the consumer it
-    speaks for will refuse is worse than no gate: it reports clean while the
-    server degrades to ``evidence_unresolvable``/display-only with nothing
-    surfaced anywhere (round-4 confirm pass, Architecture + Security findings).
-    ``tests/test_evidence_common.py`` pins this against
-    ``server.config._resolve_confined_evidence_path`` so the two cannot
-    disagree about which declared paths are legal.
+    absolute path that happens to sit inside the tree. This used to matter
+    because the runtime loader (``server.config.load_promotion_manifest``,
+    retired along with the rest of the query-context promotion chain -- see
+    docs/dev_plans/20260824-feature-query-context-promotion.md) rejected
+    those outright: a CI gate that accepted a manifest the consumer it spoke
+    for would refuse was worse than no gate, reporting clean while the server
+    degraded to ``evidence_unresolvable``/display-only with nothing surfaced
+    anywhere (round-4 confirm pass, Architecture + Security findings). The
+    rejection is retained directly now that the runtime consumer is gone --
+    :func:`verify_manifest` is the sole remaining caller, and it must not
+    read outside the repo tree on an attacker-steerable manifest-declared
+    path. ``tests/test_evidence_common.py`` pins the rejection cases
+    directly.
 
     Deliberately does *not* also check "is a regular file within the size cap":
     doing that with a ``stat()`` here and reading the path separately at the
@@ -558,6 +567,13 @@ def confined_evidence_input_path(raw_path: str, *, allowed_root: Path | None = N
     :func:`sha256_file` exist to close, so callers must route the read through
     one of those, which re-derive both facts from the fd they open.
     """
+    if not raw_path:
+        # `Path("") / candidate` resolves to `root` itself -- a directory,
+        # not a file -- which `is_relative_to(root)` below would accept as
+        # "confined" even though it can never name a real evidence artifact.
+        # Reject explicitly rather than handing callers a directory that
+        # only fails later, and less directly, inside `sha256_file`.
+        return None
     root = (allowed_root or REPO_ROOT).resolve()
     candidate = Path(raw_path)
     if candidate.is_absolute():

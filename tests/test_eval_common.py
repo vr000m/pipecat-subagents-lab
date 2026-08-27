@@ -1,8 +1,6 @@
 """Regression tests for scripts/eval_common.py's build_session_for_run().
 
-Covers gauntlet round-2 finding 1 (promotion_manifest was never threaded
-through, silently disabling promotion eligibility for every host this helper
-builds) and finding 7 (stt/tts were bound post-hoc instead of at
+Covers gauntlet round-2 finding 7 (stt/tts were bound post-hoc instead of at
 construction, leaving SessionHost._tts_on_event stale for a caller that
 reassigns host.tts after the fact).
 """
@@ -30,7 +28,7 @@ from scripts.eval_common import (
     confined_output_path,
     turn_correlated_routing_action,
 )
-from server.config import Config, PromotionManifest, load_config
+from server.config import Config, load_config
 from server.pipeline import SAFE_FALLBACK_TEXTS
 
 
@@ -70,22 +68,6 @@ def test_safe_fallbacks_is_the_same_object_as_pipelines_shared_constant() -> Non
     # a no-op false PASS. Now re-exported (not re-typed), so this identity
     # check would fail loudly instead if that ever regresses.
     assert SAFE_FALLBACKS is SAFE_FALLBACK_TEXTS
-
-
-def test_promotion_manifest_flows_into_promotion_eligible() -> None:
-    host = build_session_for_run(
-        Config(), promotion_manifest=PromotionManifest(promotion_eligible=True)
-    )
-    assert host._promotion_eligible is True
-
-
-def test_omitted_promotion_manifest_still_defaults_to_ineligible() -> None:
-    # Documents the default, deliberately-fail-closed behavior for a caller
-    # (like the eval-suite matrix runner) that has no manifest to give --
-    # distinct from finding 1's bug, which was that a caller that *does* have
-    # one (the ack-ordering smoke) could never get it applied.
-    host = build_session_for_run(Config())
-    assert host._promotion_eligible is False
 
 
 def test_tts_bound_at_construction_is_not_stale() -> None:

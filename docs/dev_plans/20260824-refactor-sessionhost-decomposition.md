@@ -128,9 +128,9 @@ Dependency direction: new modules import from collaborators, never back into
 **Test files:** tests/test_config.py, tests/test_work_item_coordinator.py, tests/test_work_status.py
 **Test command:** `uv run pytest -q && uv run ruff check . && uv run mypy .`
 **Validation cmd:** `uv run python scripts/smoke_server.py`
-**Goal:** The coordinator-boundary question decided in the open, promotion-manifest logic out of config.py (via whichever P1 branch), and the OWNED_CONFIG_FIELDS + client-eviction items decided rather than deferred a sixth time.
+**Goal:** The coordinator-boundary question decided in the open, and the OWNED_CONFIG_FIELDS + client-eviction items decided rather than deferred a sixth time.
 
-- [ ] Promotion-manifest logic in `config.py`, by P1 outcome (decision recorded before this phase per the Phase 2 gate): **retire** → deleted by P1's landed commit, this bullet drops; **invest** → extract to `server/promotion_manifest.py` (callers update imports, `config.py` re-exports nothing); **blocked/escalated** → hold this bullet, proceed with the rest of the phase. Rebase note: P3 Phase 1 edited `server/config.py:1689-1716` (landed 60e0f36) — land order per program matrix.
+> **Dropped (superseded):** Promotion-manifest logic in `config.py`, by P1 outcome — P1 retired the machinery outright (commit `c67da7f`); `load_promotion_manifest`/`PromotionManifest` and all consumers are deleted, so there is nothing left in `config.py` to extract. This bullet drops. Rebase note: P3 Phase 1 edited `server/config.py:1689-1716` (landed 60e0f36) — land order per program matrix.
 - [ ] Re-litigate the four-declaration boundary pin in the open (Requirement 1): enumerate current call sites for all four declarations; argue collapse from the Phase 0 doubles (roster frozenset + pinning test updated in the same commit) or re-affirm the pin with rationale in Findings. No silent deletion — the "two production-dead" premise was checked and is false.
 - [ ] Decide `_OWNED_CONFIG_FIELDS` strictness (Requirement 5): **if permissive** — pin with rationale comment + pinning test; **if strict** — cite the tests that now enforce strictness via the modernized doubles, and record it as the Requirement 9-sanctioned behavior change.
 - [ ] Verify the client-eviction arrangement (Requirement 8): confirm `shared/work-status-retention.json` + the dual parity tests cover program item 12; record the evidence and close, or name the concrete gap found.
@@ -274,6 +274,22 @@ Justification (from the table):
 
 - 2026-08-26 marker refresh at conduct start: recorded marker (2026-08-25 @ 55db787a…) was stale because commit `0c3320e` (merged PR #9) corrected one Phase 3 line citation (`server/config.py` edit region + landed sha). Sole contract drift; landed via reviewed PR, so the marker was refreshed in place (`e3e5ad2c…`) instead of re-running `/review-plan`.
 - Test-command override (all phases): the plan's literal `uv run mypy .` fails with 723 pre-existing errors because `.` overrides the pyproject mypy scope (`files = ["server", "evals", "scripts"]`; tests/ carries legacy debt by design). Effective gate used by conduct: `uv run pytest -q && uv run ruff check . && uv run mypy` (bare mypy = repo-intended scope, green at baseline).
+
+### Phase 3 contract update (2026-08-27, merged from main / P1 PR #10)
+
+P1's retire commit (`c67da7f`) deleted `load_promotion_manifest`/
+`PromotionManifest` and all consumers from `server/config.py` outright, so
+Phase 3's "extract promotion-manifest logic to `server/promotion_manifest.py`"
+bullet is dropped as superseded — there is no manifest logic left in
+`config.py` to extract; program row 7 closed as `fixed c67da7f` (machinery
+deleted rather than extracted) rather than via this plan's Phase 3.
+
+This contract edit intentionally stales this plan's review marker (branch
+marker at merge time: `2026-08-26 @ e3e5ad2c…`). This plan is mid-run —
+Phases 0-1 are completed in its conduct state file — so its next conduct
+invocation is a `--resume`, which per conduct's documented resume rule
+auto-refreshes a stale marker itself; no `/review-plan` re-run is needed for
+this superseded-bullet drop.
 
 ### Phase 0 inventory (2026-08-26)
 

@@ -1399,7 +1399,12 @@ def test_app_turn_foreground_accepts_scenario_and_acknowledgement() -> None:
     assert "acknowledgement=true" in line
 
 
-def test_work_item_foreground_accepts_query_context_provider_model() -> None:
+def test_work_item_foreground_accepts_provider_model() -> None:
+    """``provider``/``model`` are live per-turn worker telemetry fields, not
+    an artifact of the retired query-context experiment (see
+    docs/dev_plans/20260824-feature-query-context-promotion.md) -- they
+    record which model actually answered a work item and must keep
+    round-tripping through ``build_record`` regardless."""
     line = build_record(
         "work_item_foreground",
         session_id="session-1",
@@ -1451,7 +1456,11 @@ def test_app_turn_recorder_finalize_forwards_scenario_and_acknowledgement() -> N
     assert record.fields["acknowledgement"] is False
 
 
-def test_work_item_recorder_finalize_forwards_query_context_provider_model() -> None:
+def test_work_item_recorder_finalize_forwards_provider_model() -> None:
+    """Same live-telemetry rationale as
+    ``test_work_item_foreground_accepts_provider_model`` above, exercised
+    through ``WorkItemRecorder.finalize`` instead of ``build_record``
+    directly."""
     sink = CollectingMeasurementSink()
     recorder = WorkItemRecorder(
         sink, session_id="session-1", origin_epoch=1, turn_id="turn-1", work_item_id="work-1"

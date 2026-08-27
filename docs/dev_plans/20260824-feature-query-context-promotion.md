@@ -1,6 +1,6 @@
 # Task: Query-Context Narrowing — Promote or Retire (P1)
 
-**Status**: Not Started
+**Status**: Complete (retired)
 **Component**: evals
 **Assigned to**: Claude
 **Priority**: High
@@ -186,17 +186,160 @@ If the operator chooses invest at Phase 1, the follow-up plan must cover, at min
 6. Live smoke with a named observable: force a late-result delivery (extend the `--ack-ordering` smoke, commit `840a360`) and assert the autoplay branch at `server/pipeline.py:2837` is taken (log line / session-record disposition), run at the manifest-bound commit with matching `PIPECAT_SOURCE_COMMIT`/`PIPECAT_SOURCE_TREE_HASH`.
 7. Decision gate evaluated against the thresholds verbatim (≥10% median, bootstrap LB ≥5%, quality ≥0.90, drop ≤0.02, ≥30 paired samples/cell, ≥10 baseline repeats, baseline SD ≤0.01), with non-decisive outcomes escalating per Requirement 2.
 
-<!-- reviewed: 2026-08-25 @ dd50a54c29552ef9c13957d9ac801cba3d058811 -->
+<!-- reviewed: 2026-08-26 @ 52660dbe19d035799dc6759de7da2189795af923 -->
 
 ## Progress
 
-- [ ] Phase 0: Feasibility pre-flight (no material paid spend)
-- [ ] Phase 1: Decision checkpoint (escalation)
-- [ ] Phase 2: Retire — fail-closed gate replacement, then full-chain removal
-- [ ] Phase 3: Docs + program closure
+- [x] Phase 0: Feasibility pre-flight (no material paid spend)
+- [x] Phase 1: Decision checkpoint (escalation)
+- [x] Phase 2: Retire — fail-closed gate replacement, then full-chain removal
+- [x] Phase 3: Docs + program closure
 
 ## Findings
 
 ### Review Waivers
 
-(none)
+- **Marker refresh without re-review (2026-08-26).** The recorded marker (`2026-08-25 @ dd50a54c`) was staled solely by merged commit `0c3320e` (PR #9), which corrected the line citation `check_release_metadata.py:429` → `:440` in three places — a mechanical docs fix with no semantic change to the contract. Refreshed in place to `52660dbe` rather than re-running `/review-plan`, matching the identical waiver precedent recorded in the P2 plan for the same commit.
+- **Phase 0 executed by the conductor inline, not an implementer subagent.** Phase 0's sole impl file is this plan document, and the implementer prompt template categorically forbids modifying the plan file — a spawned worker structurally cannot complete the phase. The paid probe (exactly one permitted call) also warrants single-call control in the conductor rather than an autonomous worker.
+
+### Phase 0 feasibility verdict (2026-08-26)
+
+**Blocker (a) — gate wiring: CONFIRMED, both inputs false-producing.**
+`promotion_eligible = real_stratum_present and transport_eligible`
+(`scripts/validate_v013_evidence.py:565`). `real_stratum_present` derives from
+the phase0/phase1 records via `has_real_provider_stratum`
+(`validate_v013_evidence.py:305-315`), which requires membership in
+`REAL_PROVIDER_ALLOWLIST = {("openai", "gpt-4o-search-preview")}` (`:150-154`).
+Current values:
+- phase0 (`docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl`) and phase1
+  (`v0.1.3-phase1-ack-evidence.jsonl`) records carry only the
+  `("unavailable", "unavailable")` stratum → `real_stratum_present = False`.
+- phase2 artifact (`v0.1.3-phase2-transport-browser-contract.json`) has
+  `promotion_eligible: false` → `transport_eligible = False`.
+- Committed manifest (`v0.1.3-promotion-manifest.json`):
+  `promotion_eligible: false, reason: "real_stratum_missing"`.
+
+**Blocker (b) — `run_live()` stub: CONFIRMED still a stub.**
+`scripts/run_query_context_experiment.py:358-401` resolves credentials via the
+shared `resolve_openai_api_key()` gate, then unconditionally prints
+`BLOCKED: live query-context collection is not wired to a responses client in
+this runner` and returns 1. No live collection path exists.
+
+**Blocker (c) — credential resolution + probe: CREDENTIALS RESOLVE; MODEL AVAILABLE.**
+- Credential env var resolved: `OPENAI_API_KEY` (sourced from
+  `~/.secrets/ai.env`; the repo resolver order is config.toml → env-file →
+  process environment per `scripts/eval_common.py:848-860`).
+- Probe (exactly one live authenticated call; the models endpoint is unbilled,
+  so this also satisfies the phase's no-material-spend goal — this is not
+  `run_live()`, which remains a stub):
+  `curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models/gpt-4o-search-preview`
+- Redacted result: model id `gpt-4o-search-preview`, HTTP 200. No response
+  body committed; `git status --short` after the probe showed only this plan
+  file modified — no evidence artifacts were collected.
+
+**Promotion thresholds recorded verbatim from the v0.1.3 plan (for Appendix A):**
+≥10% median latency improvement, bootstrap lower bound ≥5%, quality ≥0.90,
+quality drop ≤0.02, ≥30 paired samples per cell, ≥10 baseline repeats,
+baseline SD ≤0.01.
+
+**Per-blocker verdict:** the model is available and credentials resolve, but
+promote remains unreachable on two independent axes: (1) no live collection
+path exists (`run_live()` stub), and (2) both gate inputs are false-producing
+— reaching `promotion_eligible=true` requires implementing `run_live()`,
+collecting ≥30 paired real-stratum samples per cell into the phase0/phase1
+artifacts, regenerating the phase2 transport artifact at the target commit,
+and re-stamping the manifest (Appendix A scope). Feasibility of *invest* is
+therefore "possible but requires the full Appendix A follow-up plan"; nothing
+in Phase 0 changes the retire-default expectation. Decision escalates to the
+operator at Phase 1.
+
+### Phase 1 decision (2026-08-26)
+
+**Operator decision: RETIRE.** Explicitly chosen by the operator (not
+defaulted) after reviewing the Phase 0 feasibility verdict and the Appendix A
+invest-scope estimate. Rationale: although the model is available and
+credentials resolve, promote still requires the full Appendix A effort —
+implementing `run_live()`, ≥30 paired real-stratum samples per cell of paid
+collection into the phase0/phase1 artifacts, the named browser/device
+transport check regenerating phase2, the phase4c artifact, and a
+manifest re-stamp serialized after P2/P3 — against an experiment whose value
+was never demonstrated (`promotion_eligible=false` shipped in v0.1.3).
+Retire proceeds to Phase 2: fail-closed gate replacement, then full-chain
+removal. This decision also satisfies the P2 plan's Phase 2 gate
+("P1's Phase 1 decision is recorded"): P2 Phase 2 must now wait for this
+plan's retire commit to land (it deletes the `server/pipeline.py:2837` gate
+region P2 rewrites).
+
+### Phase 2 outcome (2026-08-27)
+
+**Retire executed as full-chain removal.** Regression test
+`tests/test_session_host.py::test_late_result_disposition_is_unconditionally_display_only`
+pins the disposition to `"display_only"` under both `enable_autoplay_policy`
+values and regardless of manifest state (note: the code literal is
+`"display_only"`; the plan's `commit_display_only` names the
+committed-as-display-only concept). `_late_result_disposition` is now
+unconditional; the legacy fail-open branch and every promotion predicate are
+gone; the dead autoplay consumer arm in `commit_late_result_once` was
+collapsed too (advisory-review finding). Deleted: the four experiment
+scripts, both query-context schemas, `load_promotion_manifest`/
+`PromotionManifest` and all consumers, the config.toml manifest keys, and
+`tests/test_query_context_latency.py`/`tests/test_v013_phase4c_manifest.py`.
+`docs/benchmarks/` untouched (frozen v0.1.3 records).
+
+**Residual-validator decision (checklist bullet 4): KEEP `--verify-manifest`**
+as a read-only historical drift validator of the frozen committed manifest —
+it remains live in the ci.yml `promotion-manifest-drift` job and the justfile
+recipe (both already converted to read-only by merged P3 Phase 2). The
+`--write-manifest` path and all phase4c validation are deleted;
+`phase4c_artifact_sha256` / `inputs.phase4c` now draw an explicit
+"no longer a supported input" drift rejection rather than silent fall-through.
+
+**Advisory review (opus): 3 Important, 5 Minor — all fixed pre-commit.**
+Important: (1) dead autoplay arm in `commit_late_result_once` collapsed;
+(2) drift-gate negative-path coverage rebuilt writer-free (7 new tests from
+mutated in-memory copies of the committed manifest, plus a
+verify-writes-nothing byte-comparison) and `confined_evidence_input_path`
+rejection tests restored — which surfaced a real gap: empty-string paths were
+not rejected (resolved to the confinement root, a directory); root-caused
+with an explicit empty-path guard in `scripts/evidence_common.py`;
+(3) still-live `test_config.py` coverage restored (release_version plumbing,
+env reach-validation, FeaturePolicy equality; 6 tests). Minor fixes: renamed
+the stale flag-off regression test in `test_app.py`; documented
+`enable_autoplay_policy` in config.toml as retained-for-fingerprint-stability
+only (removing it from `feature_policy_fingerprint` would break the frozen
+drift gate — do not delete the flag); reworded all stale references to the
+deleted writer/loader in the validator, `evidence_common.py`, and ci.yml
+(drift remedy is now "revert the evidence edit; the writer is retired").
+
+Gate at boundary: 1842 passed + 1 skipped (pre-existing release-finalization
+guard, not an importorskip remnant), ruff format/check clean, mypy clean
+(54 files), `smoke_server.py` passed, `--verify-manifest` OK against the
+committed manifest.
+
+### Phase 3 outcome (2026-08-27)
+
+Docs + program closure landed: CHANGELOG "Removed" entry under [Unreleased];
+README's promotion-manifest/feature-flag sections rewritten to the current
+read-only-drift-check state (`docs/architecture.md` had no stale references —
+verified, no edit needed); program doc rows 20 (`retired`) and 7
+(`fixed c67da7f`) closed, parallelization matrix and Subordinate Plans table
+updated; plans index updated; P2 plan's Phase 3 manifest-extraction bullet
+dropped (with a Findings note there explaining the intentional marker staling
+— P2 is mid-run, so its next `--resume` auto-refreshes the marker).
+
+**Advisory review (opus): 5 Important, 3 Minor — all fixed pre-commit.** The
+substantive cluster: the first draft of the CHANGELOG entry and the program
+matrix row claimed c67da7f removed the justfile recipe /
+`check_release_metadata` path requirement / ci.yml manifest-write step, when
+those had already been converted to read-only drift checks by merged P3
+Phase 2 — root cause was asserting the plan's *predicted* removal scope
+instead of the executed diff; all three docs now state only what c67da7f
+actually removed (runtime loader chain, config.toml key, scripts, schemas,
+write/phase4c validator paths) and name the surviving read-only validators.
+Also fixed: program row 21's stale `config.toml:54` loader citation, the
+superseded P2 bullet's checkbox syntax (now a plain "Dropped (superseded)"
+note), P2's Phase 3 Goal clause, and this plan's Status header (→ Complete).
+
+Note: the Status-header flip and the marker-refresh earlier both edited above
+this plan's review marker; no further conduct runs consume this plan, so the
+final marker staleness is accepted and recorded here rather than re-refreshed.

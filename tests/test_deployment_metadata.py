@@ -1,4 +1,4 @@
-"""Producer-to-writer-to-loader tests for release deployment metadata.
+"""Tests for standalone release deployment metadata tooling.
 
 Plan: docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md,
 Phase 2 bullet 193. ``scripts/emit_v013_deployment_metadata.py`` always
@@ -11,8 +11,8 @@ shelling out against the real (often mid-edit) working tree.
 bare ``KEY=VALUE`` lines (``PIPECAT_SOURCE_COMMIT``,
 ``PIPECAT_SOURCE_TREE_HASH``, ``PIPECAT_DEPLOYED_AT_UTC``,
 ``PIPECAT_FEATURE_POLICY_FINGERPRINT``) with no ``export `` prefix, because
-``.github/workflows/ci.yml`` appends that stdout to ``$GITHUB_ENV``, which
-GitHub Actions parses literally rather than evaluating as shell.
+The format remains compatible with a ``$GITHUB_ENV``-style environment file,
+but no current CI job consumes these exports.
 ``--check-release-inputs`` does *not* require a clean tree (per the script's
 own docstring: "local dev/test may leave them unset and remains
 display-only") -- it only proves the four values are derivable from the
@@ -129,9 +129,8 @@ def test_shell_export_fails_structurally_outside_a_git_checkout(
     It uses ``_run_git`` with ``check=True``, so running outside a git
     checkout (or against a corrupt index) raised an uncaught
     ``subprocess.CalledProcessError`` -- a raw traceback and a Python exit
-    code, not the ``FAIL:`` message and return-1 the script promises. CI pipes
-    this into ``$GITHUB_ENV``, where a traceback is a far worse signal than
-    the documented refusal.
+    code, not the ``FAIL:`` message and return-1 the script promises. An
+    environment-file consumer needs the same controlled refusal.
     """
     not_a_repo = tmp_path / "no-git-here"
     not_a_repo.mkdir()
@@ -143,7 +142,7 @@ def test_shell_export_fails_structurally_outside_a_git_checkout(
     assert exit_code == 1
     captured = capsys.readouterr()
     assert captured.err.startswith("FAIL: could not derive deployment metadata")
-    # And nothing partial was emitted for CI to source.
+    # And nothing partial was emitted for a caller to source.
     assert not EXPORT_RE.findall(captured.out)
 
 
@@ -185,8 +184,8 @@ def test_shell_export_values_are_shell_safe_for_eval_capture(
 ) -> None:
     """End-to-end handoff shape: the four exported values must be
     single-line and whitespace-free so ``eval "$(... --shell-export)"``
-    binds exactly four variables, matching the CI capture the writer
-    consumes (--source-commit/--source-tree-hash/--deployed-at-utc/
+    binds exactly four variables for an explicit consuming caller
+    (--source-commit/--source-tree-hash/--deployed-at-utc/
     --feature-policy-fingerprint)."""
     module = _load_module()
     monkeypatch.setattr(module, "REPO_ROOT", _init_clean_release_tree(tmp_path))
@@ -199,12 +198,11 @@ def test_shell_export_values_are_shell_safe_for_eval_capture(
 
 
 def test_shell_export_lines_carry_no_export_prefix(tmp_path: Path, monkeypatch, capsys) -> None:
-    """Regression (M6): ``.github/workflows/ci.yml`` appends this stdout to
-    ``$GITHUB_ENV``, which GitHub Actions parses as literal ``KEY=VALUE``
-    pairs without shell evaluation. An ``export `` prefix would be absorbed
-    into the *name*, producing a variable called ``export
-    PIPECAT_SOURCE_COMMIT`` and leaving ``$PIPECAT_SOURCE_COMMIT`` empty in
-    every downstream step."""
+    """Regression (M6): a ``$GITHUB_ENV``-style consumer parses this stdout as
+    literal ``KEY=VALUE`` pairs without shell evaluation. An ``export ``
+    prefix would be absorbed into the *name*, producing a variable called
+    ``export PIPECAT_SOURCE_COMMIT`` and leaving ``$PIPECAT_SOURCE_COMMIT``
+    empty in a downstream step."""
     module = _load_module()
     monkeypatch.setattr(module, "REPO_ROOT", _init_clean_release_tree(tmp_path))
 
@@ -220,8 +218,8 @@ def test_shell_export_lines_carry_no_export_prefix(tmp_path: Path, monkeypatch, 
 def test_shell_export_output_round_trips_through_github_env_parsing(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """Regression (M6): parse the appended file exactly the way GitHub
-    Actions does -- split each line on the first ``=``, no shell -- and
+    """Regression (M6): parse the generated environment file exactly the way
+    GitHub Actions does -- split each line on the first ``=``, no shell -- and
     require the four expected names with non-empty values."""
     module = _load_module()
     monkeypatch.setattr(module, "REPO_ROOT", _init_clean_release_tree(tmp_path))
