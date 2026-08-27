@@ -26,13 +26,26 @@ are dispatched directly by `WorkItemCoordinator`; the connection
 
 Post-decomposition (SessionHost Decomposition, P2), `server/pipeline.py` holds
 `SessionHost` and connection/turn orchestration only; extracted collaborators
-live in their own modules, imported by `SessionHost` and never re-exported:
+live in their own modules, imported by `SessionHost` with no re-export shim:
+`pipeline.py` adds no compatibility alias for a moved name, and every importer
+reaches the owning module directly (`from server.connection_pipeline import
+ConnectionPipeline`, not `from server.pipeline import ...`). A name
+`pipeline.py` imports for its own use stays incidentally reachable through that
+module — Python has no way to hide it — but is not a supported import path.
 
 - `server/connection_pipeline.py` — `ConnectionPipeline` (per-connection state:
   epoch, observer/publisher, speech scheduler, transport references).
 - `server/turn_ack_ledger.py` — `TurnAckLedger` (turn-id sequencing, the ack
   latch, and the ack-admission retry chain).
-- `server/turn_epilogue.py` — the turn handlers' shared epilogue steps.
+- `server/turn_epilogue.py` — the turn handlers' shared epilogue steps, in two
+  entry points: `finalize_single_child_turn` (single-intent and
+  pending-dialogue) and `finalize_fan_out_turn` plus its sibling
+  `release_fan_out_turn_work_items` (multi-intent). Per-handler variance is
+  passed in, not branched on internally — including `derive_status`, the
+  terminal-status derivation policy the single-child callers differ on
+  (single-intent emits nothing for a retained, uncancelled child;
+  pending-dialogue re-derives it through
+  `work_status_publisher.child_work_status_after_dispatch`).
 - `server/task_retention.py` — `retain_until_done`, the one fire-and-forget
   task/future retention helper; a leaf module with no server imports, used by
   `pipeline.py`, `turn_ack_ledger.py`, `observers.py`, `turns.py`,
