@@ -191,13 +191,9 @@ jobs:
 """
 
 
-def test_rejects_ci_yml_manifest_path_stale_after_a_version_bump(tmp_path: Path) -> None:
-    """Round-5 restart regression (Architecture finding #11): ci.yml's
-    promotion-manifest-drift job hardcodes a version-stamped manifest path
-    that the scripts/*.py-scoped hardcoded-literal guard never scanned. Bump
-    pyproject.toml/CHANGELOG.md's version without updating ci.yml's path and
-    this must fail loudly instead of silently green-checking a manifest
-    nothing consumes."""
+def test_accepts_frozen_ci_yml_manifest_path_after_a_version_bump(tmp_path: Path) -> None:
+    """The drift job always checks the frozen v0.1.3 record, even after
+    pyproject.toml/CHANGELOG.md move to a later release."""
     module = _load_script()
     pyproject_path, changelog_path = _write_pair(
         tmp_path,
@@ -205,7 +201,20 @@ def test_rejects_ci_yml_manifest_path_stale_after_a_version_bump(tmp_path: Path)
         changelog_text=VALID_CHANGELOG.replace("0.1.3", "0.1.4"),
     )
     ci_yml_path = tmp_path / "ci.yml"
-    ci_yml_path.write_text(VALID_CI_YML, encoding="utf-8")  # still says v0.1.3
+    ci_yml_path.write_text(VALID_CI_YML, encoding="utf-8")  # frozen v0.1.3 record
+
+    assert module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path) == "0.1.4"
+
+
+def test_rejects_ci_yml_manifest_path_that_tracks_the_new_release(tmp_path: Path) -> None:
+    module = _load_script()
+    pyproject_path, changelog_path = _write_pair(
+        tmp_path,
+        pyproject_text=VALID_PYPROJECT.replace("0.1.3", "0.1.4"),
+        changelog_text=VALID_CHANGELOG.replace("0.1.3", "0.1.4"),
+    )
+    ci_yml_path = tmp_path / "ci.yml"
+    ci_yml_path.write_text(VALID_CI_YML.replace("v0.1.3", "v0.1.4"), encoding="utf-8")
 
     with pytest.raises(
         module.ReleaseMetadataError, match="no .promotion-manifest-drift. step runs"
@@ -213,11 +222,11 @@ def test_rejects_ci_yml_manifest_path_stale_after_a_version_bump(tmp_path: Path)
         module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
 
 
-def test_accepts_ci_yml_manifest_path_matching_the_current_version(tmp_path: Path) -> None:
+def test_accepts_the_frozen_ci_yml_manifest_for_the_original_release(tmp_path: Path) -> None:
     module = _load_script()
     pyproject_path, changelog_path = _write_pair(tmp_path)  # version 0.1.3
     ci_yml_path = tmp_path / "ci.yml"
-    ci_yml_path.write_text(VALID_CI_YML, encoding="utf-8")  # says v0.1.3, matches
+    ci_yml_path.write_text(VALID_CI_YML, encoding="utf-8")
 
     version = module.check(pyproject_path, changelog_path, ci_yml_path=ci_yml_path)
     assert version == "0.1.3"
@@ -749,13 +758,10 @@ def test_accepts_an_unconditional_needs_ancestor(tmp_path: Path) -> None:
 
 def test_the_real_repo_ci_yml_still_satisfies_the_tightened_gate() -> None:
     """The tightening must not have made the live workflow fail: the real
-    `promotion-manifest-drift` job carries no `if:` and names the manifest as
-    a bare shell word."""
+    `promotion-manifest-drift` job carries no `if:` and runs the fixed
+    historical manifest verifier."""
     module = _load_script()
-    module.check_ci_promotion_manifest_path_matches_version(
-        REPO_ROOT / ".github" / "workflows" / "ci.yml",
-        module.read_pyproject_version(REPO_ROOT / "pyproject.toml"),
-    )
+    module.check_ci_uses_frozen_promotion_manifest(REPO_ROOT / ".github" / "workflows" / "ci.yml")
 
 
 def test_rejects_a_symlinked_pyproject(tmp_path: Path) -> None:

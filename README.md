@@ -648,18 +648,12 @@ Router/worker model evaluation (run in this order):
 
 Release and evidence gates:
 
-- `emit_v013_deployment_metadata.py` — derives the deployment identity
-  (`PIPECAT_SOURCE_COMMIT`, `PIPECAT_SOURCE_TREE_HASH`,
-  `PIPECAT_DEPLOYED_AT_UTC`, `PIPECAT_FEATURE_POLICY_FINGERPRINT`) from a
-  clean release checkout. Refuses a dirty or untracked tree.
 - `validate_v013_evidence.py` — validates evidence artifacts against their
   schemas and phase minimums; `--verify-manifest` runs a read-only drift
   check of the frozen v0.1.3 promotion manifest against the committed
   evidence (see Removed, CHANGELOG — the write path was retired).
 - `validate_phase2_transport_browser_contract.py` — validates the Phase 2
   transport/browser contract artifact.
-- `record_phase3_completion.py` — records the exact Phase 3 command digest,
-  source commit, and tree hash after that phase's test command passes.
 - `check_release_metadata.py` — checks that `pyproject.toml` and
   `CHANGELOG.md` agree on the release version and date. Run at release
   finalization.
@@ -679,15 +673,16 @@ CI still runs a read-only `promotion-manifest-drift` job
 `validate_v013_evidence.py --verify-manifest
 docs/benchmarks/v0.1.3-promotion-manifest.json` to re-derive every binding in
 the frozen manifest — each `inputs[*].sha256` against the bytes at its
-declared path, the schema hash, `release_version`, `feature_policy_fingerprint`,
-the `phase3_command_digest` provenance binding, and `promotion_eligible`/
+declared path, the schema hash, the stamped identity bindings, the
+`phase3_command_digest` provenance binding, and `promotion_eligible`/
 `reason` — and fails if the committed manifest has drifted from the committed
-evidence it describes. There is no writer to regenerate it: if the drift
-check fails, the fix is to revert whatever edited the frozen evidence, not to
-re-run a writer. `scripts/check_release_metadata.py` additionally asserts the
-workflow still points at the versioned manifest path for the current
-`pyproject.toml` version. Reproduce the job locally with `just
-verify-manifest`.
+evidence it describes. It does not compare the historical release or
+feature-policy identity with the current checkout. There is no writer to
+regenerate it: if the drift check fails, the fix is to revert whatever edited
+the frozen evidence, not to re-run a writer. `scripts/check_release_metadata.py`
+additionally asserts that CI still points at this fixed historical v0.1.3
+manifest when later releases bump `pyproject.toml`. Reproduce the job locally
+with `just verify-manifest`.
 
 ## Repository layout
 

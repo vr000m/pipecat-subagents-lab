@@ -18,13 +18,12 @@ credential-free provider/model stratum).
 ``--verify-manifest`` performs a read-only drift check on the frozen,
 committed v0.1.3 promotion manifest: it re-derives the manifest's evidence
 bindings from the phase0-3 artifacts it references and reports any mismatch.
-The manifest-*writing* path (``--write-manifest``, and its supporting Phase 4C
-artifact validation) was retired along with the query-context promotion
-chain -- see docs/dev_plans/20260824-feature-query-context-promotion.md --
-because the v0.1.3 manifest this validator checks will never be re-stamped;
-only the read-only drift check on the one frozen artifact survives, so this
-module can no longer construct its own manifest fixtures via the writer --
-the only manifest tests can drift-check against is the real committed one.
+The manifest writer and its supporting Phase 4C artifact validation were
+retired along with the query-context promotion chain.
+The v0.1.3 manifest this validator checks will never be re-stamped; only the
+read-only drift check on the one frozen artifact survives, so this module can
+no longer construct its own manifest fixtures via a writer -- the only
+manifest tests can drift-check against is the real committed one.
 """
 
 from __future__ import annotations
@@ -155,12 +154,10 @@ def test_evidence_common_status_enum_contains_the_documented_values() -> None:
 #
 # Plan bullet 245 (Phase 3 closing step): `scripts/record_phase3_completion.py`
 # writes a dated completion record binding source-commit/source-tree-hash and
-# a sha256 digest of this phase's own Test command; the (now-retired) manifest
-# writer's `final` mode used to require a matching `--phase3-input` and reject
-# any mismatch against the earlier phase0/1/2 artifacts, schema, source
-# identity, or deployment/policy fingerprint -- `verify_manifest` re-derives
-# the same phase3-binding check as a read-only drift comparison instead (see
-# `TestVerifyManifestDriftCheck` below).
+# a sha256 digest of this phase's own Test command. The read-only frozen
+# manifest verifier checks the record's digest and its source identity against
+# the values stamped in the manifest (see `TestVerifyManifestDriftCheck`
+# below).
 
 
 def _record_phase3_completion_script() -> Any:
@@ -337,6 +334,25 @@ class TestVerifyManifestDriftCheck:
         finally:
             module.REPO_ROOT = original_root
 
+    def test_frozen_manifest_does_not_consult_live_release_or_policy_identity(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A later release's config must not invalidate the historical record.
+
+        Patching both live identity helpers to fail makes this test prove the
+        verifier does not merely happen to resolve the same values in the
+        current checkout.
+        """
+        import server.config
+
+        def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("historical verification must not load live identity")
+
+        monkeypatch.setattr(server.config, "load_config", fail_if_called)
+        monkeypatch.setattr(server.config, "effective_feature_policy_fingerprint", fail_if_called)
+
+        assert self._verify_mutated(tmp_path) == []
+
     # -- Negative-path coverage on writer-free fixtures ---------------------
     #
     # With the manifest writer retired, these tests cannot build their own
@@ -376,6 +392,39 @@ class TestVerifyManifestDriftCheck:
         drift = self._verify_mutated(tmp_path, promotion_eligible=True)
 
         assert any("promotion_eligible drift" in line for line in drift)
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            pytest.param(0, id="zero"),
+            pytest.param(None, id="null"),
+            pytest.param([], id="empty-list"),
+            pytest.param({}, id="empty-object"),
+            pytest.param("", id="empty-string"),
+            pytest.param("false", id="string"),
+        ],
+    )
+    def test_verify_manifest_rejects_non_boolean_promotion_eligible_values(
+        self, tmp_path: Path, invalid: Any
+    ) -> None:
+        """Eligibility is a JSON boolean, not a Python truthiness value."""
+        drift = self._verify_mutated(tmp_path, promotion_eligible=invalid)
+
+        assert any("promotion_eligible' must be an exact JSON boolean" in line for line in drift)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param("source_commit", "c" * 40, id="source-commit"),
+            pytest.param("source_tree_hash", "d" * 64, id="source-tree-hash"),
+        ],
+    )
+    def test_verify_manifest_detects_phase3_identity_binding_drift(
+        self, tmp_path: Path, field: str, value: str
+    ) -> None:
+        drift = self._verify_mutated(tmp_path, **{field: value})
+
+        assert any(f"phase3 completion {field} does not match" in line for line in drift)
 
     def test_verify_manifest_detects_a_hand_edited_reason(self, tmp_path: Path) -> None:
         drift = self._verify_mutated(tmp_path, reason="audibility_unverified")

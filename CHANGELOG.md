@@ -25,13 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression test covering both `enable_autoplay_policy` values.
   `scripts/validate_v013_evidence.py --verify-manifest`, the `justfile`
   `verify-manifest` recipe, CI's `promotion-manifest-drift` job, and
-  `scripts/check_release_metadata.py`'s manifest-path requirement all
-  survive unchanged: they were already converted to read-only validators of
-  the frozen v0.1.3 `docs/benchmarks/` records by the earlier CI-hardening
-  work, have no writer or runtime consumer left to bind against, and the
-  frozen records themselves are untouched. `enable_autoplay_policy` is
-  retained for `feature_policy_fingerprint` stability only — its behavioural
-  consumer is retired.
+  `scripts/check_release_metadata.py`'s fixed historical-record path check
+  survive as read-only validators of the frozen v0.1.3 `docs/benchmarks/`
+  records. The unused CI release-metadata job and its environment export were
+  removed because no current consumer reads them; `record_phase3_completion.py`
+  remains only as a standalone historical artifact helper, not an active
+  release/evidence gate. The frozen records themselves are untouched.
+  `enable_autoplay_policy` is retained for `feature_policy_fingerprint`
+  stability only — its behavioural consumer is retired.
 
 ## [0.1.3] - 2026-08-24
 

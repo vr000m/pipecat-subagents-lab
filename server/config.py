@@ -330,12 +330,10 @@ def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
     """Deterministic identity for one frozen `FeaturePolicy` snapshot.
 
     Used to bind a promotion manifest to the exact kill-switch state it was
-    generated against; a manifest fingerprinted against a different policy
-    combination is stale. The server-side consumer of this binding
-    (`load_promotion_manifest`) was retired along with the query-context
-    promotion chain, but `scripts/validate_v013_evidence.py --verify-manifest`
-    still re-derives this fingerprint to check the frozen committed v0.1.3
-    manifest for drift.
+    generated against. The server-side consumer of this binding
+    (`load_promotion_manifest`) and the verifier's live re-derivation were
+    retired along with the query-context promotion chain; the frozen v0.1.3
+    manifest retains the stamped value as historical release metadata.
     """
     canonical = json.dumps(
         {
@@ -352,18 +350,10 @@ def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
 def effective_feature_policy_fingerprint(config: Config) -> str:
     """`feature_policy_fingerprint(FeaturePolicy.from_config(config))`, named.
 
-    Two independent callers -- ``scripts/emit_v013_deployment_metadata.py``
-    (the writer, which stamps this into the release-metadata shell exports)
-    and ``scripts/validate_v013_evidence.py`` (the verifier, which
-    re-derives it to check manifest drift against the frozen committed
-    v0.1.3 manifest) -- must resolve this composition identically by
-    construction, not by each happening to spell the same three-call chain
-    the same way. Previously the writer wrapped it in a script-local
-    ``feature_policy_fingerprint_value()`` (with a function-local
-    ``server.config`` import) while the verifier spelled the same composition
-    inline; this is the one home for it, since both the writer and the
-    verifier already import from ``server.config`` (round-5 restart,
-    Architecture finding).
+    Standalone metadata tooling that needs a current policy identity should
+    resolve this composition through one helper. The frozen v0.1.3 manifest
+    verifier intentionally does not call it: a historical record must not be
+    compared with a later release's live feature policy.
     """
     return feature_policy_fingerprint(FeaturePolicy.from_config(config))
 
@@ -1377,9 +1367,8 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         # this copy an operator's [features].release_version was silently
         # dropped and load_config fell back to the packaged default, so
         # release-identity consumers compared against the wrong identity --
-        # historically the (now-retired) runtime promotion-manifest bind
-        # check, today `scripts/validate_v013_evidence.py --verify-manifest`'s
-        # release_version drift re-derivation against this effective config.
+        # historically the runtime promotion-manifest bind check; the frozen
+        # v0.1.3 verifier now treats its release identity as historical data.
         values["WEBSEARCH_RELEASE_VERSION"] = features["release_version"]
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]

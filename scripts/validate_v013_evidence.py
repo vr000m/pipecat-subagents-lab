@@ -12,11 +12,10 @@ stratum is ``unavailable``/``unavailable``).
 ``--verify-manifest`` performs a read-only drift check on a previously
 committed promotion manifest: it re-derives the manifest's evidence bindings
 from the phase0-3 artifacts it references and reports any mismatch. The
-manifest-writing path (``--write-manifest``, and its supporting Phase 4C
-artifact validation) was retired along with the query-context promotion
-chain -- see docs/dev_plans/20260824-feature-query-context-promotion.md --
-because the v0.1.3 manifest this validator checks is a one-time frozen
-artifact that will never be re-stamped.
+manifest-writing path and its supporting Phase 4C artifact validation were
+retired along with the query-context promotion chain. The v0.1.3 manifest
+this validator checks is a one-time frozen artifact that will never be
+re-stamped; this module only validates it and the evidence it binds.
 """
 
 from __future__ import annotations
@@ -44,8 +43,6 @@ from server.config import (
     MANIFEST_REQUIRED_FINAL_INPUTS,
     MANIFEST_REQUIRED_PROVISIONAL_INPUTS,
     MANIFEST_STRING_FIELDS,
-    effective_feature_policy_fingerprint,
-    load_config,
 )
 
 SCHEMA_PATH = REPO_ROOT / "shared" / "schemas" / "v013-evidence.json"
@@ -332,22 +329,22 @@ PHASE3_COMPLETION_REQUIRED_FIELDS = (
 
 
 def _read_phase3_completion(input_path: Path) -> dict[str, Any]:
-    """Shape-validate the Phase 3 completion artifact, without binding it to a
-    source identity.
+    """Shape-validate the Phase 3 completion artifact.
 
-    Shape-only on purpose: this is used solely by :func:`verify_manifest`,
-    which needs `command_digest` off this record but has no trustworthy
-    ``--source-commit``/``--source-tree-hash`` to bind it against -- those
-    live in the manifest under scrutiny and are deliberately *not* re-derived
-    (see ``_MANIFEST_VOLATILE_FIELDS``), so comparing the artifact to them
-    would only prove the forged manifest is self-consistent. (The identity-
-    binding variant of this check used to live in the now-retired manifest
-    writer; see docs/dev_plans/20260824-feature-query-context-promotion.md.)
+    :func:`verify_manifest` separately binds the source identity in this
+    record to the values stamped in the frozen manifest. It deliberately does
+    not compare either value with the current checkout: the manifest records
+    the historical release identity, while this validator is a historical
+    drift check.
     """
     record = load_json(input_path)
     if not isinstance(record, dict):
         raise EvidenceGateError("phase3 completion artifact must be a JSON object")
-    missing = [field for field in PHASE3_COMPLETION_REQUIRED_FIELDS if not record.get(field)]
+    missing = [
+        field
+        for field in PHASE3_COMPLETION_REQUIRED_FIELDS
+        if not isinstance(record.get(field), str) or not record[field]
+    ]
     if missing:
         raise EvidenceGateError(f"phase3 completion artifact missing field(s) {missing}")
     return record
@@ -388,17 +385,15 @@ def _promotion_verdict(
 #: ``source_tree_hash`` name the checkout the manifest was written *from*,
 #: which every subsequent commit on the branch changes.
 #:
-#: ``release_version`` and ``feature_policy_fingerprint`` used to be listed
-#: here too, on the same "derived from whichever checkout the verifier happens
-#: to be running in" rationale -- which does not apply to them (round-4 confirm
-#: pass, Architecture finding). Both are deterministic from the effective
-#: config and both are re-derived by ``verify_manifest`` now; both used to
-#: additionally be compared by the runtime loader (``load_promotion_manifest``,
-#: retired along with the rest of the query-context promotion chain -- see
-#: docs/dev_plans/20260824-feature-query-context-promotion.md) with a
-#: fail-closed display-only verdict, so excluding them here would have meant
-#: CI could not pre-catch a mismatch that loader was guaranteed to reject
-#: while it still existed.
+#: ``release_version`` and ``feature_policy_fingerprint`` are historical
+#: identity values stamped in the manifest. They are structurally validated
+#: below, but intentionally are not derived from the current checkout: a
+#: later release is expected to have different live identity values.
+#:
+#: The source identity is also kept volatile relative to the current checkout,
+#: but its internal binding to the final Phase 3 completion record is checked
+#: below. That catches a manifest whose stamped source identity no longer
+#: agrees with the historical record it claims to bind.
 #:
 #: Everything *not* listed here is evidence binding, and must match.
 _MANIFEST_VOLATILE_FIELDS = frozenset(
@@ -415,16 +410,12 @@ _MANIFEST_VOLATILE_FIELDS = frozenset(
 #: manifest key -- ``verify_manifest`` reports anything left over as drift, so
 #: a field the retired writer once emitted cannot slip through unverified.
 #:
-#: **Membership here is a claim that the field is actually compared**, and
-#: ``tests/test_v013_evidence_validator.py`` pins that claim per field by
-#: mutating each one and asserting drift is reported. Three names were listed
-#: here while nothing in ``verify_manifest`` compared them (round-4 confirm
-#: pass, Architecture + Security + Logic findings): ``reason`` (never
-#: re-derived), ``manifest_phase`` (read as an input, never checked), and
-#: ``phase3_command_digest`` (unreachable by construction -- the cross-check
-#: loop paired it with ``phase = None`` and skipped it on the first
-#: statement). The trailing uncovered-field guard counted all three as
-#: covered, so it asserted a completeness property the function did not have.
+#: Membership here is a claim that the field is explicitly covered by the
+#: structural or binding checks in ``verify_manifest``. The release and
+#: feature-policy identity fields are covered structurally only: their values
+#: are historical facts and have no live authority to compare against.
+#: ``tests/test_v013_evidence_validator.py`` pins the roster so a newly added
+#: manifest field cannot silently escape review.
 #:
 #: ``phase4c_artifact_sha256`` is deliberately absent: the committed v0.1.3
 #: manifest never declared it (phase4c was a promote-only artifact and this
@@ -474,9 +465,9 @@ def verify_manifest(manifest_path: Path) -> list[str]:
       ``inputs[*].path`` -- i.e. nobody edited an evidence artifact without
       regenerating the manifest that vouches for it;
     * ``schema_hash`` still matches ``shared/schemas/v013-evidence.json``;
-    * ``release_version`` and ``feature_policy_fingerprint`` still match the
-      effective config -- the two identity bindings the retired runtime
-      loader used to compare and fail closed on;
+    * ``release_version`` and ``feature_policy_fingerprint`` remain valid
+      stamped identity strings. They are not compared with the current
+      release/config because this is a historical v0.1.3 check;
     * ``manifest_phase`` is one of the two known values and the ``inputs``
       *it* implies are all declared -- a ``final`` manifest must carry
       phase0-3 and a ``phase3_completion_hash``. It is a writer input, not
@@ -488,10 +479,10 @@ def verify_manifest(manifest_path: Path) -> list[str]:
       now conclude, re-derived through :func:`_promotion_verdict` -- the
       check that stops a stale manifest from vouching for evidence the
       current tree no longer supports;
-    * ``phase3_command_digest`` still matches the ``command_digest`` inside
-      the resolved Phase 3 completion artifact, the provenance binding the
-      retired writer copied up so release verification could re-check which
-      command produced Phase 3.
+    * the Phase 3 completion artifact's ``source_commit`` and
+      ``source_tree_hash`` still match the identity stamped in the manifest,
+      and its ``command_digest`` still matches the manifest's copied
+      ``phase3_command_digest`` provenance binding;
 
     **The empty return is the security property.** An empty list must mean
     every one of the above was actually evaluated, never that some of them
@@ -542,6 +533,12 @@ def verify_manifest(manifest_path: Path) -> list[str]:
         drift.append(
             f"manifest field(s) {wrongly_typed_fields} must be JSON strings -- "
             "violates the frozen manifest format"
+        )
+    promotion_eligible = manifest.get("promotion_eligible")
+    if type(promotion_eligible) is not bool:
+        drift.append(
+            "manifest field 'promotion_eligible' must be an exact JSON boolean -- "
+            f"got {promotion_eligible!r}"
         )
 
     manifest_phase = manifest.get("manifest_phase")
@@ -665,20 +662,6 @@ def verify_manifest(manifest_path: Path) -> list[str]:
     else:
         drift.append(f"evidence schema missing, cannot verify schema_hash: {SCHEMA_PATH}")
 
-    config = load_config()
-    if manifest.get("release_version") != config.release_version:
-        drift.append(
-            f"release_version drift: manifest says {manifest.get('release_version')!r}, "
-            f"the effective config resolves {config.release_version!r}"
-        )
-    expected_fingerprint = effective_feature_policy_fingerprint(config)
-    if manifest.get("feature_policy_fingerprint") != expected_fingerprint:
-        drift.append(
-            "feature_policy_fingerprint drift: manifest says "
-            f"{manifest.get('feature_policy_fingerprint')!r}, the effective feature policy "
-            f"fingerprints to {expected_fingerprint!r}"
-        )
-
     if manifest_phase == "final" and "phase3_completion_hash" not in manifest:
         drift.append("a 'final' manifest must carry phase3_completion_hash")
 
@@ -715,12 +698,12 @@ def verify_manifest(manifest_path: Path) -> list[str]:
             expected_eligible, expected_reason = _promotion_verdict(
                 manifest_phase=manifest_phase,
                 real_stratum_present=real_stratum_present,
-                transport_eligible=bool(transport_record.get("promotion_eligible")),
+                transport_eligible=transport_record["promotion_eligible"],
             )
-            if bool(manifest.get("promotion_eligible")) != expected_eligible:
+            if type(promotion_eligible) is bool and promotion_eligible != expected_eligible:
                 drift.append(
                     f"promotion_eligible drift: manifest says "
-                    f"{manifest.get('promotion_eligible')!r}, the current evidence supports "
+                    f"{promotion_eligible!r}, the current evidence supports "
                     f"{expected_eligible!r}"
                 )
             if manifest.get("reason") != expected_reason:
@@ -730,6 +713,12 @@ def verify_manifest(manifest_path: Path) -> list[str]:
                 )
             if phase3_record is not None:
                 phase3_command_digest_checked = True
+                for field in ("source_commit", "source_tree_hash"):
+                    if phase3_record[field] != manifest.get(field):
+                        drift.append(
+                            f"phase3 completion {field} does not match the manifest's stamped "
+                            f"{field} ({phase3_record[field]!r} vs {manifest.get(field)!r})"
+                        )
                 if (
                     "phase3_command_digest" in manifest
                     and manifest["phase3_command_digest"] != phase3_record["command_digest"]

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Derive and emit the v0.1.3 deployment identity metadata.
+"""Derive deployment identity metadata for standalone release tooling.
 
-Concrete metadata ownership (see the dev plan's Phase 2 section): CI's
-release/manifest job invokes this script with ``--shell-export`` against a
-clean, checked-out release tree and appends its four ``KEY=VALUE`` lines to
-``$GITHUB_ENV`` before invoking
-``scripts/validate_v013_evidence.py --write-manifest``.
+``--shell-export`` emits four ``KEY=VALUE`` lines for an explicit caller that
+needs deployment identity from a clean checkout. The v0.1.3 manifest verifier
+does not consume these values, and the repository's CI no longer exports them
+to ``$GITHUB_ENV`` because the former manifest writer was retired.
 
 ``--shell-export`` prints bare ``NAME=value`` lines with **no** ``export``
 prefix, because GitHub Actions parses ``$GITHUB_ENV`` as literal
@@ -165,9 +164,9 @@ def shell_export() -> int:
     # checkout -- or against a corrupt index -- it raised an uncaught
     # ``CalledProcessError``: a raw traceback and a Python exit code, not the
     # structured ``FAIL:`` message and return-1 this function promises every
-    # caller. CI pipes this straight into ``$GITHUB_ENV``, so the failure mode
-    # mattered: an unhandled traceback there is a much worse signal than the
-    # documented refusal.
+    # caller. A caller may pipe this into a ``KEY=VALUE`` environment file, so
+    # the failure mode must remain a structured refusal rather than an
+    # unhandled traceback.
     try:
         dirty = _is_dirty()
         commit = source_commit()
