@@ -214,22 +214,13 @@ emission of the capability-gated `work_status` updates described below;
 when disabled, no `work_status` frame is produced and the legacy
 foreground-timeout notice applies instead.
 `WEBSEARCH_ENABLE_AUTOPLAY_POLICY` (`[features].enable_autoplay_policy`,
-default `true`) enables the browser autoplay-recovery policy that surfaces the
-page's audio action when playback is blocked.
-`WEBSEARCH_PROMOTION_MANIFEST_PATH`
-(`[features].promotion_manifest_path`, default
-`docs/benchmarks/v0.1.3-promotion-manifest.json`) points at the release
-promotion manifest that the server bind-checks at startup; it must not be
-empty. `WEBSEARCH_PHASE4C_ARTIFACT_PATH`
-(`[features].phase4c_artifact_path`, default unset) points at the Phase 4C
-completion artifact whose SHA-256 the manifest's `phase4c_artifact_sha256`
-field is checked against, when present; leaving it unset makes any manifest
-declaring that field resolve to a `phase4c_unresolvable` (display-only)
-verdict. `WEBSEARCH_RELEASE_VERSION` (`[features].release_version`, default
-the installed package version) overrides the release version the promotion
-manifest's own `release_version` field is bind-checked against; it must not be
-empty, and overriding it to a version the manifest was not cut for resolves to
-a display-only verdict. The three boolean flags are parsed strictly: only `true` or `false`
+default `true`) is retained only for `feature_policy_fingerprint` stability;
+its behavioural consumer (the promotion-gated autoplay path) was retired
+along with the promotion-manifest chain (see Removed, CHANGELOG), so late
+results now always commit display-only regardless of this flag's value.
+`WEBSEARCH_RELEASE_VERSION` (`[features].release_version`, default the
+installed package version) identifies the running release; it must not be
+empty. The three boolean flags are parsed strictly: only `true` or `false`
 (case-insensitive) is accepted, and any other value fails startup.
 
 Server deployment binding is controlled by three more env vars, with no TOML
@@ -655,15 +646,6 @@ Router/worker model evaluation (run in this order):
     which cells those are; run `--router <shipped-label> --worker
     <shipped-label>` explicitly to measure the joint pairing.
 
-Phase 4 query-context narrowing experiment (run in this order):
-
-- `run_query_context_experiment.py` — bounded experiment runner producing raw
-  samples (Phase 4A).
-- `collect_query_context_latency.py` — normalizes raw samples into the
-  artifact the analyzer consumes (Phase 4A).
-- `analyze_query_context_latency.py` — deterministic, credential-free
-  promotion decision over the collected artifact (Phase 4B).
-
 Release and evidence gates:
 
 - `emit_v013_deployment_metadata.py` — derives the deployment identity
@@ -671,8 +653,9 @@ Release and evidence gates:
   `PIPECAT_DEPLOYED_AT_UTC`, `PIPECAT_FEATURE_POLICY_FINGERPRINT`) from a
   clean release checkout. Refuses a dirty or untracked tree.
 - `validate_v013_evidence.py` — validates evidence artifacts against their
-  schemas and phase minimums, and with `--write-manifest` writes the
-  promotion manifest.
+  schemas and phase minimums; `--verify-manifest` runs a read-only drift
+  check of the frozen v0.1.3 promotion manifest against the committed
+  evidence (see Removed, CHANGELOG — the write path was retired).
 - `validate_phase2_transport_browser_contract.py` — validates the Phase 2
   transport/browser contract artifact.
 - `record_phase3_completion.py` — records the exact Phase 3 command digest,
@@ -681,69 +664,30 @@ Release and evidence gates:
   `CHANGELOG.md` agree on the release version and date. Run at release
   finalization.
 
-## Promotion manifest
+## Frozen v0.1.3 promotion manifest (historical release record)
 
-`docs/benchmarks/v0.1.3-promotion-manifest.json` is the single artifact that
-decides whether the runtime may enable autoplay. It binds the accumulated
-evidence artifacts (their SHA-256 hashes plus the schema hash) to one
-deployment identity: release version, source commit, filtered source tree
-hash, `FeaturePolicy` fingerprint, and deployment timestamp. At startup
-`server.config.load_promotion_manifest()` re-verifies every binding against
-the running `Config` and **fails closed** — a missing, malformed, foreign, or
-stale manifest silently degrades to display-only rather than blocking boot.
+The query-context narrowing experiment and the deployment promotion-manifest
+system that gated autoplay on its evidence were retired (see Removed,
+CHANGELOG): the runtime no longer loads, checks, or acts on any manifest, and
+late results always commit display-only. `docs/benchmarks/v0.1.3-promotion-manifest.json`
+and its supporting evidence artifacts remain committed as frozen v0.1.3
+release records — they are load-bearing for that release's provenance but
+have no runtime consumer.
 
-A `manifest_phase=provisional` manifest is permanently
-`promotion_eligible=false` and exists only for diagnostics; only a
-`manifest_phase=final` manifest bound to a Phase 3 completion record can make
-the runtime promotion-eligible.
-
-CI never writes the manifest — it *verifies* the committed one. The
-`promotion-manifest-drift` job (`.github/workflows/ci.yml`, on both pull
-requests and pushes) runs `validate_v013_evidence.py --verify-manifest
-docs/benchmarks/v0.1.3-promotion-manifest.json`, which re-derives every
-binding: each `inputs[*].sha256` against the bytes at its declared path, the
-schema hash, `release_version`, `feature_policy_fingerprint`, the
-`phase3_command_digest` provenance binding, and `promotion_eligible`/`reason`
-against what the evidence gates now conclude. Only the wall-clock stamps and
-the writing checkout's `source_commit`/`source_tree_hash` are exempt (a
-manifest committed at one commit can never match a regeneration at a later
-one). A failure means the committed manifest has drifted from its evidence;
-the fix is to regenerate it locally and commit the result. The separate
-`release-metadata` job (`main` pushes only) just derives and exports the
-deployment identity. The manifest path in that job carries the release version,
-so `scripts/check_release_metadata.py` additionally asserts the workflow still
-points at `docs/benchmarks/v{version}-promotion-manifest.json` for the current
-`pyproject.toml` version — a version bump that forgot the workflow would
-otherwise keep verifying the previous release's manifest and report green about
-a file nothing consumes. What it looks for is a genuine *use* of that path: the
-verifier, `--verify-manifest`, and the path must appear in one command's argv,
-so naming the path in a neighbouring `echo`/`ls`/heredoc does not satisfy the
-gate. It also rejects an `if:`/`continue-on-error:` on the drift job or its only
-verifying step, and an `if:` on any job the drift job transitively `needs:`
-(a skipped dependency skips the drift check). Reproduce the job locally with
-`just verify-manifest`.
-
-To regenerate locally, export the same identity from a clean checkout and run
-the writer by hand:
-
-```sh
-eval "$(uv run python scripts/emit_v013_deployment_metadata.py --shell-export)"
-uv run python scripts/validate_v013_evidence.py --write-manifest --manifest-phase provisional \
-  --phase0-input docs/benchmarks/v0.1.3-phase0-transport-baseline.jsonl \
-  --phase1-input docs/benchmarks/v0.1.3-phase1-ack-evidence.jsonl \
-  --phase2-input docs/benchmarks/v0.1.3-phase2-transport-browser-contract.json \
-  --source-commit "$PIPECAT_SOURCE_COMMIT" \
-  --source-tree-hash "$PIPECAT_SOURCE_TREE_HASH" \
-  --deployed-at-utc "$PIPECAT_DEPLOYED_AT_UTC" \
-  --feature-policy-fingerprint "$PIPECAT_FEATURE_POLICY_FINGERPRINT" \
-  --output docs/benchmarks/v0.1.3-promotion-manifest.json
-```
-
-Add `--manifest-phase final --phase3-input
-docs/benchmarks/v0.1.3-phase3-completion.json` (and optionally
-`--phase4c-input …`) to produce the final, activation-eligible manifest. A
-dirty tree makes the emitter refuse, so a locally-modified checkout cannot
-produce an eligible manifest.
+CI still runs a read-only `promotion-manifest-drift` job
+(`.github/workflows/ci.yml`, on both pull requests and pushes) that invokes
+`validate_v013_evidence.py --verify-manifest
+docs/benchmarks/v0.1.3-promotion-manifest.json` to re-derive every binding in
+the frozen manifest — each `inputs[*].sha256` against the bytes at its
+declared path, the schema hash, `release_version`, `feature_policy_fingerprint`,
+the `phase3_command_digest` provenance binding, and `promotion_eligible`/
+`reason` — and fails if the committed manifest has drifted from the committed
+evidence it describes. There is no writer to regenerate it: if the drift
+check fails, the fix is to revert whatever edited the frozen evidence, not to
+re-run a writer. `scripts/check_release_metadata.py` additionally asserts the
+workflow still points at the versioned manifest path for the current
+`pyproject.toml` version. Reproduce the job locally with `just
+verify-manifest`.
 
 ## Repository layout
 

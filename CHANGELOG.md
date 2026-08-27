@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Query-context narrowing experiment and the runtime promotion-manifest
+  chain it fed: the four experiment scripts (`run_query_context_experiment.py`,
+  `collect_query_context_latency.py`, `analyze_query_context_latency.py`,
+  `query_context_common.py`), both query-context schemas, the phase4c
+  validator path in `scripts/validate_v013_evidence.py`, and
+  `load_promotion_manifest`/`PromotionManifest` (`server/config.py`) plus all
+  of its consumers (`server/app.py`, `server/composition.py`,
+  `scripts/eval_common.py`, `scripts/smoke_conversation.py`), and the
+  `config.toml` manifest key. Operator decision: retire — promote was never
+  demonstrated to have value (`promotion_eligible=false` shipped in v0.1.3)
+  and required the full Appendix A effort, including paid live-provider
+  collection, to even attempt. Late-result disposition is now unconditionally
+  `display_only` (autoplay is structurally unreachable), pinned by a
+  regression test covering both `enable_autoplay_policy` values.
+  `scripts/validate_v013_evidence.py --verify-manifest`, the `justfile`
+  `verify-manifest` recipe, CI's `promotion-manifest-drift` job, and
+  `scripts/check_release_metadata.py`'s manifest-path requirement all
+  survive unchanged: they were already converted to read-only validators of
+  the frozen v0.1.3 `docs/benchmarks/` records by the earlier CI-hardening
+  work, have no writer or runtime consumer left to bind against, and the
+  frozen records themselves are untouched. `enable_autoplay_policy` is
+  retained for `feature_policy_fingerprint` stability only — its behavioural
+  consumer is retired.
+
 ## [0.1.3] - 2026-08-24
 
 ### Added

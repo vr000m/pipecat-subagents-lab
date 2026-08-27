@@ -1,6 +1,6 @@
 # Task: Query-Context Narrowing — Promote or Retire (P1)
 
-**Status**: Not Started
+**Status**: Complete (retired)
 **Component**: evals
 **Assigned to**: Claude
 **Priority**: High
@@ -193,7 +193,7 @@ If the operator chooses invest at Phase 1, the follow-up plan must cover, at min
 - [x] Phase 0: Feasibility pre-flight (no material paid spend)
 - [x] Phase 1: Decision checkpoint (escalation)
 - [x] Phase 2: Retire — fail-closed gate replacement, then full-chain removal
-- [ ] Phase 3: Docs + program closure
+- [x] Phase 3: Docs + program closure
 
 ## Findings
 
@@ -315,3 +315,31 @@ Gate at boundary: 1842 passed + 1 skipped (pre-existing release-finalization
 guard, not an importorskip remnant), ruff format/check clean, mypy clean
 (54 files), `smoke_server.py` passed, `--verify-manifest` OK against the
 committed manifest.
+
+### Phase 3 outcome (2026-08-27)
+
+Docs + program closure landed: CHANGELOG "Removed" entry under [Unreleased];
+README's promotion-manifest/feature-flag sections rewritten to the current
+read-only-drift-check state (`docs/architecture.md` had no stale references —
+verified, no edit needed); program doc rows 20 (`retired`) and 7
+(`fixed c67da7f`) closed, parallelization matrix and Subordinate Plans table
+updated; plans index updated; P2 plan's Phase 3 manifest-extraction bullet
+dropped (with a Findings note there explaining the intentional marker staling
+— P2 is mid-run, so its next `--resume` auto-refreshes the marker).
+
+**Advisory review (opus): 5 Important, 3 Minor — all fixed pre-commit.** The
+substantive cluster: the first draft of the CHANGELOG entry and the program
+matrix row claimed c67da7f removed the justfile recipe /
+`check_release_metadata` path requirement / ci.yml manifest-write step, when
+those had already been converted to read-only drift checks by merged P3
+Phase 2 — root cause was asserting the plan's *predicted* removal scope
+instead of the executed diff; all three docs now state only what c67da7f
+actually removed (runtime loader chain, config.toml key, scripts, schemas,
+write/phase4c validator paths) and name the surviving read-only validators.
+Also fixed: program row 21's stale `config.toml:54` loader citation, the
+superseded P2 bullet's checkbox syntax (now a plain "Dropped (superseded)"
+note), P2's Phase 3 Goal clause, and this plan's Status header (→ Complete).
+
+Note: the Status-header flip and the marker-refresh earlier both edited above
+this plan's review marker; no further conduct runs consume this plan, so the
+final marker staleness is accepted and recorded here rather than re-refreshed.
