@@ -52,7 +52,7 @@ from .speech_scheduler import ROLE_ACK
 
 if TYPE_CHECKING:
     from .config import FeaturePolicy
-    from .pipeline import ConnectionPipeline
+    from .connection_pipeline import ConnectionPipeline
 
 _ACK_ADMISSION_RETRY_DELAY_SECONDS = 0.25
 """Backoff before re-attempting a failed early-ack admission (e.g. the

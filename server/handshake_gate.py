@@ -31,7 +31,7 @@ class CapabilityCarrier(Protocol):
     """The one attribute ``validate_patch_handshake`` needs from a connection.
 
     Both real carriers -- ``connection_arbiter.Connection`` (a ``tuple[str,
-    ...]``) and ``pipeline.ConnectionPipeline`` (a ``frozenset[str]``
+    ...]``) and ``connection_pipeline.ConnectionPipeline`` (a ``frozenset[str]``
     property backed by its ``RuntimeObserver``) -- satisfy this structurally,
     so neither module needs to be imported here just to name the parameter
     type.
