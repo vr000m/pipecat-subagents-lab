@@ -471,8 +471,8 @@ def test_cancel_turn_or_child_removes_only_the_named_childs_speech_and_leaves_th
         # Ack ownership and the sole-child decision are answered from the
         # turn -> delegated-child registry, so this hand-built turn registers
         # its children exactly as a real turn handler would.
-        host._register_turn_work_item("turn-1", "work-1-0")
-        host._register_turn_work_item("turn-1", "work-1-1")
+        host._turn_ack_ledger.register_turn_work_item("turn-1", "work-1-0")
+        host._turn_ack_ledger.register_turn_work_item("turn-1", "work-1-1")
 
         await host.cancel_turn_or_child("turn-1", "work-1-0")
 
@@ -621,7 +621,7 @@ def _late_delivery_context(host: SessionHost, **overrides: object):
         "work_item_id": "work-late-1",
         "origin_epoch": 1,
         "ack_timestamp": None,
-        "accepted_turn_sequence": host._turn_sequence,
+        "accepted_turn_sequence": host._turn_ack_ledger.turn_sequence,
     }
     fields.update(overrides)
     return LateDeliveryContext(**fields)
@@ -775,8 +775,10 @@ def test_commit_late_result_once_same_epoch_newer_turn_forces_display_only() -> 
                 "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
             )
         host, origin = await _connected_host(speakable=True)
-        context = _late_delivery_context(host, accepted_turn_sequence=host._turn_sequence)
-        host._next_turn_id()  # advances _turn_sequence past the captured snapshot
+        context = _late_delivery_context(
+            host, accepted_turn_sequence=host._turn_ack_ledger.turn_sequence
+        )
+        host._turn_ack_ledger.next_turn_id()  # advances _turn_sequence past the captured snapshot
         result = _grounded_result()
 
         await host.commit_late_result_once(

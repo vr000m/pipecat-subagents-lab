@@ -429,7 +429,7 @@ def test_late_multi_intent_child_status_aggregates_under_the_parent_key() -> Non
             work_item_id="work-turn-multi-0",
             origin_epoch=1,
             ack_timestamp=None,
-            accepted_turn_sequence=host._turn_sequence,
+            accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
             parent_work_item_id="work-turn-multi",
         )
         result = GroundedResult(

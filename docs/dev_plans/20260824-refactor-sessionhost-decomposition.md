@@ -1,6 +1,6 @@
 # Task: SessionHost Decomposition (P2)
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: server
 **Assigned to**: Claude
 **Priority**: High
@@ -189,7 +189,7 @@ Dependency direction: new modules import from collaborators, never back into
 - [x] Phase 3: Config/boundary consolidation
 - [x] Phase 4: Ack-latch race — verify, then fix
 - [x] Phase 5: Fire-and-forget helper
-- [ ] Phase 6: Facade collapse
+- [x] Phase 6: Facade collapse
 
 ## Findings
 
@@ -359,3 +359,13 @@ Execution-time inventory (`rg -n 'add_done_callback' server/`): 22 hits across 1
 **Commits:** helper+tests 27a9b20, then one conversion commit per file (9e91ade, c7bb143, 6d05aca, 2c4a74a, 368ac64, 74a0f08, 91db5ef) per the plan's one-commit-each item.
 
 **Gate:** 1878 passed + 1 skipped (baseline 1870 + 8 helper tests), ruff format/check clean, bare mypy clean.
+
+### Phase 6 outcome (2026-08-27): facade collapse + program closure
+
+- Forwarder enumeration: 66 SessionHost members classified. **Removed (10, all pure TurnAckLedger pass-throughs):** `_next_turn_id`, `_turn_sequence`, `_ack_work_item_id`, `_clear_ack_latch`, `_settle_turn_ack`, `_register_turn_work_item`, `_release_all_turn_work_items`, `_release_turn_work_item`, `_ack_turn_for_work_item`, `_emit_early_ack` — every production and test call site rewritten to reach `self._turn_ack_ledger` / `TurnAckLedger` directly (tests/test_pipeline.py ~45 sites + 2 monkeypatch rewires, test_session_host.py ~5, test_work_status.py 1). **Kept-with-reason:** `runner`/`runner_factory`/`validate_handshake_token`/`validate_patch_handshake` (app.py public contract), `on_ack_terminal` (test-pinned sole turn-latch mutator, scheduler-wired), `_dispatch` (bound-method to_thread target + catalogue branch), `_emit_work_status`/`_terminalize_child_work_statuses` (work-status publisher facade, call-site volume), coordinator boundary untouched per Phase 3 re-affirmation. The AD-r10 "~19" over-counted: 10 were pure pass-throughs; the rest carry logic or contract.
+- Line counts: server/pipeline.py 3336 → 3263; SessionHost class span 2812 → 2739. (Original AD-r8 figure: ~2856-line class in a ~3400-line file before Phases 0-6's extractions: turn_epilogue.py, connection_pipeline.py, task_retention.py.)
+- Advisory review (opus): behavior equivalence verified for all 10 removals — the 3 callback-reference wirings bind the same runtime target (ledger assigned once in __init__, never rebound); monkeypatch rewires intercept the identical 3 call paths (grep-complete); no test-predicate weakened; coordinator boundary confirmed untouched. Findings fixed: architecture.md keep-list extended (+`_emit_work_status`/`_terminalize_child_work_statuses`/`_dispatch`) and removal claim scoped to "ledger-facing"; task_retention.py user list corrected; 6 stale test comments/docstrings requalified to `TurnAckLedger.<method>`.
+- Docs: docs/architecture.md gained a `server/` module-layout subsection; AGENTS.md a layout pointer + no-new-forwarders bullet.
+- Program closure (this commit, same-commit rule): P2 Status → Complete; program Subordinate Plans row flipped; provenance rows 1-6, 8-12 closed; docs/dev_plans/README.md updated.
+- Gate: 1878 passed + 1 skipped, ruff format/check clean, bare mypy clean, smoke validation passed.
+- Marker note: the Status-header flip above the review marker intentionally stales it at run end (same accepted pattern as P1's completion flip); recorded here as the run's final contract edit.

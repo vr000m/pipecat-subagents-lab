@@ -46,6 +46,7 @@ from server.speech_lifecycle import (
     SpeechGenerationMarkerFrame,
 )
 from server.speech_scheduler import ROLE_ACK, ROLE_RESULT, ROLE_TIMEOUT_NOTICE
+from server.turn_ack_ledger import TurnAckLedger
 from server.turns import FinalTurnTranscriptProcessor, smart_turn_processor
 from server.work_item_coordinator import LateResult, WorkItemCoordinator
 from server.workers.base import ClarificationContext
@@ -1057,7 +1058,7 @@ def test_late_result_discards_queued_timeout_notice_but_stays_display_only() -> 
                 work_item_id="work-turn-sf",
                 origin_epoch=1,
                 ack_timestamp=None,
-                accepted_turn_sequence=host._turn_sequence,
+                accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
             ),
             LateResult(
                 work_item_id="work-turn-sf",
@@ -1194,7 +1195,7 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
                 work_item_id="work-b",
                 origin_epoch=1,
                 ack_timestamp=None,
-                accepted_turn_sequence=host._turn_sequence,
+                accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
             ),
             LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
         )
@@ -1370,7 +1371,7 @@ def test_late_result_from_replaced_epoch_remains_display_only() -> None:
                 work_item_id="work-old-epoch",
                 origin_epoch=1,
                 ack_timestamp=None,
-                accepted_turn_sequence=host._turn_sequence,
+                accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
             ),
             LateResult(
                 work_item_id="work-old-epoch",
@@ -1420,7 +1421,7 @@ def test_duplicate_late_result_callback_commits_exactly_once_without_speaking() 
             work_item_id="work-late-once",
             origin_epoch=1,
             ack_timestamp=None,
-            accepted_turn_sequence=host._turn_sequence,
+            accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
         )
 
         await host.commit_late_result_once(context, late)
@@ -2327,7 +2328,7 @@ def test_late_worker_error_log_omits_untrusted_exception_text(
                 work_item_id="work-1",
                 origin_epoch=1,
                 ack_timestamp=None,
-                accepted_turn_sequence=host._turn_sequence,
+                accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
             ),
             LateResult(
                 work_item_id="work-1",
@@ -4370,7 +4371,7 @@ def _late_delivery_context(host: SessionHost, **overrides: object) -> LateDelive
         "work_item_id": "work-retained",
         "origin_epoch": 1,
         "ack_timestamp": None,
-        "accepted_turn_sequence": host._turn_sequence,
+        "accepted_turn_sequence": host._turn_ack_ledger.turn_sequence,
     }
     fields.update(overrides)
     return LateDeliveryContext(**fields)
@@ -5640,7 +5641,7 @@ def test_commit_and_speak_no_tts_short_circuit_completes_without_raising() -> No
 
 
 def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
-    """``_handle_pending`` must snapshot ``_turn_sequence`` before its first
+    """``_handle_pending`` must snapshot ``TurnAckLedger._turn_sequence`` before its first
     await (``RunnerSupervisor.register_worker``), matching ``_search_with_timeout``/
     ``_handle_multi_intent``. If a newer turn is accepted during that yield
     and the snapshot were instead taken after it (the bug), the late
@@ -5731,7 +5732,7 @@ def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
         # The snapshot must reflect the sequence at dispatch time (0), not
         # the post-yield value (1) that the newer turn bumped it to.
         assert late_context.accepted_turn_sequence == 0
-        assert host._turn_sequence == 1
+        assert host._turn_ack_ledger.turn_sequence == 1
         assert host._late_result_disposition(late_context, origin=origin) == "display_only"
         await host.shutdown()
 
@@ -6118,7 +6119,7 @@ def test_multi_intent_whole_turn_cancel_between_children_reaches_the_already_ack
 
         captured_cancelled_work: list[str] = []
         call_count = 0
-        original_emit_early_ack = host._emit_early_ack
+        original_emit_early_ack = host._turn_ack_ledger.emit_early_ack
 
         async def racing_emit_early_ack(*args: object, **kwargs: object) -> None:
             nonlocal call_count
@@ -6130,7 +6131,7 @@ def test_multi_intent_whole_turn_cancel_between_children_reaches_the_already_ack
                 cancelled_work, _ = await host.cancel_turn_or_child(None, None, origin=origin)
                 captured_cancelled_work.extend(cancelled_work)
 
-        host._emit_early_ack = racing_emit_early_ack  # type: ignore[method-assign]
+        host._turn_ack_ledger.emit_early_ack = racing_emit_early_ack  # type: ignore[method-assign]
 
         await host._handle_multi_intent(
             _multi_intent_outcome("first item", "second item"),
@@ -6300,8 +6301,8 @@ def test_cancel_turn_or_child_sole_child_check_treats_a_known_only_sibling_as_li
             ack_id=ack_work_item_id,
             turn_id=turn_id,
         )
-        host._register_turn_work_item(turn_id, "work-known-sibling-0")
-        host._register_turn_work_item(turn_id, "work-known-sibling-1")
+        host._turn_ack_ledger.register_turn_work_item(turn_id, "work-known-sibling-0")
+        host._turn_ack_ledger.register_turn_work_item(turn_id, "work-known-sibling-1")
         # Sibling 1 is known (registered) but has no local task, no
         # scheduler entry, and no coordinator-live task -- exactly the
         # ack-to-registration window a multi-intent turn passes through.
@@ -6762,7 +6763,7 @@ def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slo
         # First child: origin has no TTS, so it bails before enqueueing.
         tts = connection.tts
         connection.tts = None
-        await host._emit_early_ack(
+        await host._turn_ack_ledger.emit_early_ack(
             connection, turn_id=turn_id, origin_epoch=connection.epoch, dispatched=False
         )
         connection.tts = tts
@@ -6771,7 +6772,7 @@ def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slo
         # Second child: a search that resolves within one tick, so it also
         # bails before enqueueing.
         fast: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(0))
-        await host._emit_early_ack(
+        await host._turn_ack_ledger.emit_early_ack(
             connection,
             turn_id=turn_id,
             origin_epoch=connection.epoch,
@@ -6784,7 +6785,7 @@ def test_a_child_that_bails_before_enqueueing_does_not_consume_the_turns_ack_slo
         # Third child of the same turn is genuinely slow: it must still get
         # the turn's one ack.
         slow: asyncio.Task[None] = asyncio.create_task(asyncio.Event().wait())
-        await host._emit_early_ack(
+        await host._turn_ack_ledger.emit_early_ack(
             connection,
             turn_id=turn_id,
             origin_epoch=connection.epoch,
@@ -6859,7 +6860,7 @@ def test_explicit_cancel_of_one_child_of_a_multi_child_turn_leaves_the_ack_for_t
         # ownership and the sole-child decision, so this hand-built turn has to
         # register its children exactly as a real turn handler would.
         for index in (0, 1):
-            host._register_turn_work_item(turn_id, f"work-{turn_id}-{index}")
+            host._turn_ack_ledger.register_turn_work_item(turn_id, f"work-{turn_id}-{index}")
 
         coordinator.target = f"work-{turn_id}-0"
         await host._handle_transcript(f"cancel work-{turn_id}-0")
@@ -6949,8 +6950,8 @@ def test_cancel_of_one_coordinator_retained_child_leaves_the_ack_for_a_still_liv
             ack_id=ack_work_item_id,
             turn_id=turn_id,
         )
-        host._register_turn_work_item(turn_id, "work-turn-h-0")
-        host._register_turn_work_item(turn_id, "work-turn-h-1")
+        host._turn_ack_ledger.register_turn_work_item(turn_id, "work-turn-h-0")
+        host._turn_ack_ledger.register_turn_work_item(turn_id, "work-turn-h-1")
 
         await host.cancel_turn_or_child(turn_id, "work-turn-h-0", origin=connection)
 
@@ -7299,7 +7300,7 @@ def test_disabled_early_ack_leaves_no_scheduling_latch_index_or_media_residue(pa
     """Acceptance criterion: with ``enable_early_ack=False``, no ack
     scheduling/metrics/latch/index/media residue occurs on any of the three
     ack-eligible turn shapes -- direct-delegated, pending-continuation, and
-    mixed multi-intent. ``_emit_early_ack`` returns at its very first line
+    mixed multi-intent. ``TurnAckLedger.emit_early_ack`` returns at its very first line
     when the flag is off, so this asserts the turn-scoped latch
     (``host._turn_ack_ledger._ack_emitted_turns``), the scheduler's ack queue/active lease
     (``_ack_items``, matching the enabled-ack tests above) all stay empty
@@ -8052,7 +8053,7 @@ def test_emit_early_ack_rejects_a_search_task_on_an_undispatched_path() -> None:
         origin = await host.connect(connection_handshake(host, 1))
         task: asyncio.Task[None] = asyncio.create_task(asyncio.Event().wait())
         with pytest.raises(ValueError):
-            await host._emit_early_ack(
+            await host._turn_ack_ledger.emit_early_ack(
                 origin,
                 turn_id="turn-x",
                 origin_epoch=origin.epoch,
@@ -8528,7 +8529,7 @@ def test_multi_intent_child_never_returned_by_fan_in_is_reconciled_to_failed() -
 
 def test_cancel_during_the_early_ack_yield_window_reaches_the_dispatched_search() -> None:
     """``_search_with_timeout`` registers the search task, but it is not entered
-    until after ``_emit_early_ack`` awaits a scheduling tick. A cancel arriving
+    until after ``TurnAckLedger.emit_early_ack`` awaits a scheduling tick. A cancel arriving
     inside that yield window unwinds the (tracked) turn task; unless the search
     task is tracked at dispatch it stays untracked and keeps running with its
     result discarded."""
@@ -8567,7 +8568,7 @@ def test_cancel_during_the_early_ack_yield_window_reaches_the_dispatched_search(
         host._dispatch_search_task = recording_dispatch  # type: ignore[method-assign]
 
         tracked_at_ack: list[bool] = []
-        real_emit_early_ack = host._emit_early_ack
+        real_emit_early_ack = host._turn_ack_ledger.emit_early_ack
 
         async def cancelling_emit_early_ack(*args: object, **kwargs: object) -> None:
             tracked_at_ack.append(
@@ -8577,7 +8578,7 @@ def test_cancel_during_the_early_ack_yield_window_reaches_the_dispatched_search(
             host._cancel_work(None)
             await real_emit_early_ack(*args, **kwargs)  # type: ignore[arg-type]
 
-        host._emit_early_ack = cancelling_emit_early_ack  # type: ignore[method-assign]
+        host._turn_ack_ledger.emit_early_ack = cancelling_emit_early_ack  # type: ignore[method-assign]
 
         turn = asyncio.create_task(host._handle_transcript("slow search"))
         with pytest.raises(asyncio.CancelledError):
@@ -8657,7 +8658,7 @@ def test_sole_child_cancel_ignores_another_turns_speech_when_settling_the_ack() 
         turn_id = "turn-a"
         ack_work_item_id = f"ack-{turn_id}"
         host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
-        host._register_turn_work_item(turn_id, "work-turn-a")
+        host._turn_ack_ledger.register_turn_work_item(turn_id, "work-turn-a")
         origin.scheduler.enqueue(
             result_id=None,
             work_item_id=ack_work_item_id,
@@ -9227,12 +9228,12 @@ def test_ack_owner_lookup_is_unambiguous_for_hyphenated_turn_ids() -> None:
         host = SessionHost(runner_factory=LifecycleRunner)
         await host.connect(connection_handshake(host, 1))
         host._turn_ack_ledger._ack_emitted_turns.update({"turn-a", "turn-a-b"})
-        host._register_turn_work_item("turn-a", "work-turn-a")
-        host._register_turn_work_item("turn-a-b", "work-turn-a-b")
+        host._turn_ack_ledger.register_turn_work_item("turn-a", "work-turn-a")
+        host._turn_ack_ledger.register_turn_work_item("turn-a-b", "work-turn-a-b")
 
-        assert host._ack_turn_for_work_item("work-turn-a-b") == "turn-a-b"
-        assert host._ack_turn_for_work_item("work-turn-a") == "turn-a"
-        assert host._ack_turn_for_work_item("work-unknown") is None
+        assert host._turn_ack_ledger.ack_turn_for_work_item("work-turn-a-b") == "turn-a-b"
+        assert host._turn_ack_ledger.ack_turn_for_work_item("work-turn-a") == "turn-a"
+        assert host._turn_ack_ledger.ack_turn_for_work_item("work-unknown") is None
         await host.shutdown()
 
     asyncio.run(run())
@@ -9280,26 +9281,33 @@ def test_ack_work_item_id_accessor_matches_every_call_site() -> None:
             calls.append(spied_turn_id)
             return f"spy-ack-{spied_turn_id}"
 
-        # Patched on TurnAckLedger, not SessionHost: SessionHost._ack_work_item_id
-        # is a thin delegator to TurnAckLedger.ack_work_item_id, and
-        # TurnAckLedger.emit_early_ack calls its own class's accessor
-        # internally, so patching the ledger's is the single interception
-        # point that covers both the emission and cancellation call sites.
+        # Patched on TurnAckLedger at the class level: TurnAckLedger.emit_early_ack
+        # calls TurnAckLedger.ack_work_item_id via its own class's accessor
+        # internally (not through an instance override), so patching the
+        # class attribute is the single interception point that covers both
+        # the emission and cancellation call sites below.
         with patch.object(TurnAckLedger, "ack_work_item_id", staticmethod(spy)):
             # Emission: the enqueued key is the accessor's, not a literal.
-            await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
+            await host._turn_ack_ledger.emit_early_ack(
+                origin, turn_id=turn_id, origin_epoch=1, dispatched=False
+            )
             assert origin.scheduler.has_queue(f"spy-ack-{turn_id}")
             assert origin.scheduler.queued_items(f"spy-ack-{turn_id}")[0].role == ROLE_ACK
 
             # Cancellation: settling the sole delegated child finds that key.
-            host._register_turn_work_item(turn_id, "work-turn-accessor")
+            host._turn_ack_ledger.register_turn_work_item(turn_id, "work-turn-accessor")
             await host.cancel_turn_or_child(turn_id, "work-turn-accessor", origin=origin)
             assert not origin.scheduler.has_queue(f"spy-ack-{turn_id}")
             assert not host._turn_ack_ledger.has_emitted_ack(turn_id)
 
             # A turn handler's post-commit discard reaches the same key.
-            await host._emit_early_ack(origin, turn_id=turn_id, origin_epoch=1, dispatched=False)
-            assert origin.scheduler.discard_queued_ack(host._ack_work_item_id(turn_id)) is not None
+            await host._turn_ack_ledger.emit_early_ack(
+                origin, turn_id=turn_id, origin_epoch=1, dispatched=False
+            )
+            assert (
+                origin.scheduler.discard_queued_ack(TurnAckLedger.ack_work_item_id(turn_id))
+                is not None
+            )
 
         assert calls.count(turn_id) >= 3
         await host.shutdown()
@@ -9320,7 +9328,7 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
         host = _pending_host(_submitted(pending_work_item_ids=("work-turn-pending",)), sink)
         origin = await host.connect(_capable_handshake(host, 1))
         turn_id = "turn-pending"
-        ack_work_item_id = host._ack_work_item_id(turn_id)
+        ack_work_item_id = TurnAckLedger.ack_work_item_id(turn_id)
         host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         origin.scheduler.enqueue(
             result_id=None,
@@ -9348,10 +9356,10 @@ def test_cancel_after_retained_early_return_still_discards_queued_ack() -> None:
 
         # The child is still running, so its ack ownership outlives the handler.
         assert host._turn_ack_ledger.turn_work_items(turn_id) == {"work-turn-pending"}
-        assert host._ack_turn_for_work_item("work-turn-pending") == turn_id
+        assert host._turn_ack_ledger.ack_turn_for_work_item("work-turn-pending") == turn_id
 
         await host.cancel_turn_or_child(
-            host._ack_turn_for_work_item("work-turn-pending"),
+            host._turn_ack_ledger.ack_turn_for_work_item("work-turn-pending"),
             "work-turn-pending",
             origin=origin,
         )
@@ -9378,7 +9386,7 @@ def test_multi_intent_rejection_retracts_an_already_admitted_ack() -> None:
         origin = await host.connect(connection_handshake(host, 1))
         origin.worker = QueueingPipelineWorker()
         turn_id = "turn-fan"
-        ack_work_item_id = host._ack_work_item_id(turn_id)
+        ack_work_item_id = TurnAckLedger.ack_work_item_id(turn_id)
         host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
         origin.scheduler.enqueue(
             result_id=None,
@@ -9445,9 +9453,9 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
         # An unrelated turn holding a live, latched ack. Nothing about
         # cancelling an unowned target may touch it.
         other_turn = "turn-other"
-        other_ack = host._ack_work_item_id(other_turn)
+        other_ack = TurnAckLedger.ack_work_item_id(other_turn)
         host._turn_ack_ledger._ack_emitted_turns.add(other_turn)
-        host._register_turn_work_item(other_turn, "work-turn-other")
+        host._turn_ack_ledger.register_turn_work_item(other_turn, "work-turn-other")
         origin.scheduler.enqueue(
             result_id=None,
             work_item_id=other_ack,
@@ -9466,7 +9474,7 @@ def test_control_cancel_target_with_no_known_ack_owner_does_not_misroute() -> No
             text="orphan answer",
             origin_epoch=1,
         )
-        assert host._ack_turn_for_work_item("work-orphan") is None
+        assert host._turn_ack_ledger.ack_turn_for_work_item("work-orphan") is None
 
         coordinator.target = "work-orphan"
         await host._handle_transcript("cancel work-orphan")
@@ -9600,7 +9608,7 @@ def test_late_result_display_only_still_discards_the_stale_queued_notice() -> No
             work_item_id="work-b",
             origin_epoch=1,
             ack_timestamp=None,
-            accepted_turn_sequence=host._turn_sequence,
+            accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
         )
         assert host._late_result_disposition(late_context, origin=origin) == "display_only"
 
@@ -9641,7 +9649,7 @@ def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_p
         origin = await host.connect(connection_handshake(host, 1))
         scheduler = origin.scheduler
 
-        ack_work_item_id = host._ack_work_item_id("turn-b")
+        ack_work_item_id = TurnAckLedger.ack_work_item_id("turn-b")
         scheduler.enqueue(
             result_id=None,
             work_item_id=ack_work_item_id,
@@ -9653,7 +9661,7 @@ def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_p
             turn_id="turn-b",
         )
         host._turn_ack_ledger._ack_emitted_turns.add("turn-b")
-        host._register_turn_work_item("turn-b", "work-b")
+        host._turn_ack_ledger.register_turn_work_item("turn-b", "work-b")
 
         final = GroundedResult(
             result_id="result-final",
@@ -9669,7 +9677,7 @@ def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_p
                 work_item_id="work-b",
                 origin_epoch=1,
                 ack_timestamp=None,
-                accepted_turn_sequence=host._turn_sequence,
+                accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
             ),
             LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
         )
@@ -9682,7 +9690,7 @@ def test_commit_late_result_once_discards_a_still_queued_ack_on_every_terminal_p
 
 def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
     """Fix 6 regression: if ``coordinator.submit()`` raises after
-    ``_emit_early_ack`` already enqueued this turn's ack, the exception path
+    ``TurnAckLedger.emit_early_ack`` already enqueued this turn's ack, the exception path
     must discard that ack rather than leaving it queued. Before the fix,
     this no-result exception path cleared turn ownership but never touched
     the scheduler's queued ack item."""
@@ -9711,7 +9719,7 @@ def test_pending_submit_failure_discards_the_still_queued_early_ack() -> None:
         tts = FakeTTS()
         host = SessionHost(runner_factory=LifecycleRunner, coordinator=Coordinator(), tts=tts)
         origin = await host.connect(_capable_handshake(host, 1))
-        ack_work_item_id = host._ack_work_item_id("turn-pending")
+        ack_work_item_id = TurnAckLedger.ack_work_item_id("turn-pending")
 
         with pytest.raises(RuntimeError):
             await host._handle_pending(
@@ -9819,7 +9827,7 @@ def test_ack_admission_failure_after_the_turn_settled_does_not_requeue_it() -> N
         origin = await host.connect(connection_handshake(host, 1))
         origin.worker = QueueingPipelineWorker()
         turn_id = "turn-settled"
-        ack_work_item_id = host._ack_work_item_id(turn_id)
+        ack_work_item_id = TurnAckLedger.ack_work_item_id(turn_id)
 
         def enqueue_ack() -> None:
             origin.scheduler.enqueue(
@@ -9837,7 +9845,7 @@ def test_ack_admission_failure_after_the_turn_settled_does_not_requeue_it() -> N
         host._turn_ack_ledger._ack_emitted_turns.add(turn_id)
 
         # The turn reaches its canonical commit and settles the ack.
-        host._settle_turn_ack(origin.scheduler, turn_id)
+        host._turn_ack_ledger.settle_turn_ack(origin.scheduler, turn_id)
         assert _ack_items(origin.scheduler) == []
 
         async def failing_start_next(_work_item_id: str | None = None) -> None:
@@ -10076,7 +10084,7 @@ def test_multi_intent_retracts_an_admitted_ack_when_no_delegated_child_was_accep
         origin.worker = QueueingPipelineWorker()
 
         turn_id = "turn-mixed-capacity"
-        ack_id = host._ack_work_item_id(turn_id)
+        ack_id = TurnAckLedger.ack_work_item_id(turn_id)
         cancelled: list[str] = []
         real_cancel = origin.scheduler.cancel
 
@@ -10430,7 +10438,7 @@ def test_late_commit_after_a_reconnect_does_not_settle_against_the_new_epochs_sc
                 work_item_id="work-retired-epoch",
                 origin_epoch=1,
                 ack_timestamp=None,
-                accepted_turn_sequence=host._turn_sequence,
+                accepted_turn_sequence=host._turn_ack_ledger.turn_sequence,
             ),
             LateResult(
                 work_item_id="work-retired-epoch",
@@ -10459,7 +10467,7 @@ def test_retained_foreground_commit_exception_does_not_sweep_or_release_the_reta
     await left the handler's local at its stale pre-call value (``False``)
     -- sweeping the still-open retained child to ``failed`` via
     `_finalize_turn_exception` and releasing its still-live turn-ack-ledger
-    entry via `_release_all_turn_work_items`, both of which pre-extraction
+    entry via `TurnAckLedger.release_all_turn_work_items`, both of which pre-extraction
     skipped for a retained-and-not-cancelled child."""
 
     async def run() -> None:

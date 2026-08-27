@@ -22,6 +22,50 @@ serialize accepted work through their own mailboxes. Validated router decisions
 are dispatched directly by `WorkItemCoordinator`; the connection
 `BusBridgeProcessor` remains the Pipecat worker-bus boundary for frames.
 
+### `server/` module layout
+
+Post-decomposition (SessionHost Decomposition, P2), `server/pipeline.py` holds
+`SessionHost` and connection/turn orchestration only; extracted collaborators
+live in their own modules, imported by `SessionHost` and never re-exported:
+
+- `server/connection_pipeline.py` — `ConnectionPipeline` (per-connection state:
+  epoch, observer/publisher, speech scheduler, transport references).
+- `server/turn_ack_ledger.py` — `TurnAckLedger` (turn-id sequencing, the ack
+  latch, and the ack-admission retry chain).
+- `server/turn_epilogue.py` — the turn handlers' shared epilogue steps.
+- `server/task_retention.py` — `retain_until_done`, the one fire-and-forget
+  task/future retention helper; a leaf module with no server imports, used by
+  `pipeline.py`, `turn_ack_ledger.py`, `observers.py`, `turns.py`,
+  `work_item_coordinator.py`, `speech_lifecycle.py`, and
+  `speech_scheduler.py`.
+- `server/speech_scheduler.py`, `server/speech_lifecycle.py`,
+  `server/observers.py` — speech queueing/scheduling, generation/lifecycle
+  tracking, and canonical runtime-event projection.
+- `server/work_item_coordinator.py` — the `Coordinator` boundary
+  (`OptionalCoordinator`, `CoordinatorDefaults`, `CoordinatorView`,
+  `coordinator_view`); `SessionHost` reaches the coordinator only through
+  `self._coordinator_view` / `coordinator_view()`, never by direct attribute
+  access, so duck-typed test coordinators stay supported.
+- `server/work_task_ledger.py`, `server/work_status_publisher.py`,
+  `server/worker_projection.py`, `server/runner_supervisor.py`,
+  `server/handshake_gate.py`, `server/recorder_factory.py`,
+  `server/connection_arbiter.py` — the remaining single-purpose collaborators
+  `SessionHost` composes rather than re-implements.
+
+`SessionHost` itself keeps a small set of intentional thin forwarders onto
+these collaborators (`runner`, `runner_factory`, `validate_handshake_token`,
+`validate_patch_handshake`, `on_ack_terminal`) where the method is part of an
+existing external or test-pinned contract, plus three more kept for other
+reasons: `_emit_work_status` and `_terminalize_child_work_statuses` delegate
+to `self._work_status_publisher.emit` / `.terminalize_children` respectively
+and are kept as `SessionHost` methods for call-site volume (dozens of
+sites); `_dispatch` is a near-forwarder onto `coordinator.dispatch` that
+branches on `catalogue is None` and is kept because it is passed as a bound
+method to `asyncio.to_thread`. Every other ledger-facing pass-through
+wrapper found in the Facade collapse phase was removed, with call sites
+updated to reach the collaborator directly (e.g.
+`self._turn_ack_ledger.<method>`).
+
 ### Bus bridge frame exclusions
 
 `CONNECTION_LOCAL_FRAMES` (`server/speech_lifecycle.py`) is the single

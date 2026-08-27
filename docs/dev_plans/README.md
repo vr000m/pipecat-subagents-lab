@@ -8,13 +8,13 @@ status (the v0.1.3 follow-up program's same-commit rule).
 
 | Plan | Status |
 |------|--------|
-| [v0.1.3 follow-up program (super plan)](20260824-design-v013-followup-program.md) | Active — program tracking; provenance rows 13-20 closed, rows 1-6/8-12 open (P2, Not Started), row 7 fixed (P1 retire), row 21 deferred to v0.1.4 |
-| [P2 — SessionHost decomposition](20260824-refactor-sessionhost-decomposition.md) | Not Started |
+| [v0.1.3 follow-up program (super plan)](20260824-design-v013-followup-program.md) | Active — provenance rows 1-20 closed (P1/P2/P3 complete); row 21 deferred to first v0.1.4 release plan |
 
 ## Complete
 
 | Plan | Status |
 |------|--------|
+| [P2 — SessionHost decomposition](20260824-refactor-sessionhost-decomposition.md) | Complete — program rows 1-6, 8-12 closed; SessionHost decomposed across 7 conduct phases |
 | [P1 — Query-context promotion decision](20260824-feature-query-context-promotion.md) | Complete — retired (operator decision); full-chain removal `c67da7f`; program rows 7 and 20 closed |
 | [P3 — Post-release hardening](20260824-chore-post-release-hardening.md) | Complete — program rows 13-19 closed |
 | [Router/worker model eval suite](20260817-feature-router-worker-model-eval-suite.md) | Complete |

@@ -450,8 +450,8 @@ class LateDeliveryContext:
     see ``WorkItemCoordinator.retain_late_task``/``:_search_with_timeout`` --
     so this rides that existing closure rather than adding a parameter to
     the coordinator's callback contract). ``accepted_turn_sequence`` is
-    ``SessionHost._turn_sequence`` as observed at dispatch time; comparing it
-    against the live counter at commit time is how ``commit_late_result_once``
+    ``self._turn_ack_ledger.turn_sequence`` as observed at dispatch time;
+    comparing it against the live counter at commit time is how ``commit_late_result_once``
     detects that a newer semantic turn has since been accepted.
     """
 
@@ -994,13 +994,6 @@ class SessionHost:
         factory = getattr(service, "for_connection", None)
         return factory() if factory is not None else service
 
-    def _next_turn_id(self) -> str:
-        return self._turn_ack_ledger.next_turn_id()
-
-    @property
-    def _turn_sequence(self) -> int:
-        return self._turn_ack_ledger.turn_sequence
-
     @staticmethod
     def _failure_child_outcome(failure: WorkItemFailure) -> WorkItemOutcome:
         """Classify a work-item failure from its structured ``failure_kind``.
@@ -1052,30 +1045,6 @@ class SessionHost:
             self.connection = None
             self.state.active_epoch = None
 
-    @staticmethod
-    def _ack_work_item_id(turn_id: str) -> str:
-        """The one synthetic scheduler key this turn's ack is enqueued under."""
-        return TurnAckLedger.ack_work_item_id(turn_id)
-
-    def _clear_ack_latch(self, turn_id: str) -> None:
-        self._turn_ack_ledger.clear_ack_latch(turn_id)
-
-    def _settle_turn_ack(
-        self, scheduler: Any, turn_id: str, *, cancel_admitted: bool = False
-    ) -> None:
-        """Retract this turn's ack and close its admission-retry chain.
-
-        See ``TurnAckLedger.settle_turn_ack`` for the full rationale.
-        """
-        self._turn_ack_ledger.settle_turn_ack(scheduler, turn_id, cancel_admitted=cancel_admitted)
-
-    def _register_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
-        """Record one delegated child as belonging to ``turn_id``.
-
-        See ``TurnAckLedger.register_turn_work_item`` for the full rationale.
-        """
-        self._turn_ack_ledger.register_turn_work_item(turn_id, work_item_id)
-
     def _begin_delegation(
         self,
         request: DelegationRequest,
@@ -1091,7 +1060,7 @@ class SessionHost:
         order: missing-worker rejection, missing-search rejection,
         ``_project_worker(running)``, child-recorder creation, registration
         in both ``delegated_children`` and the work ledger's known-ids (the
-        latter alongside ``_register_turn_work_item``, before any ack for
+        latter alongside ``TurnAckLedger.register_turn_work_item``, before any ack for
         this item can be admitted), and the ``routing`` status emit.
 
         ``finalize_turn_on_failure`` controls whether a missing-worker/
@@ -1148,7 +1117,7 @@ class SessionHost:
             return None
         child = turn_recorder.new_child(work_item_id=request.work_item_id)
         delegated_children[request.work_item_id] = worker_id
-        self._register_turn_work_item(request.turn_id, request.work_item_id)
+        self._turn_ack_ledger.register_turn_work_item(request.turn_id, request.work_item_id)
         # Registered in the ledger before this item's routing status/ack, so
         # a whole-turn/whole-connection cancel racing in before the ack is
         # admitted still sees this child as known.
@@ -1190,28 +1159,6 @@ class SessionHost:
             origin_epoch=origin_epoch,
         )
 
-    def _release_all_turn_work_items(self, turn_id: str) -> None:
-        """Release every delegated child of ``turn_id`` and settle its ack latch.
-
-        See ``TurnAckLedger.release_all_turn_work_items`` for the full
-        rationale.
-        """
-        self._turn_ack_ledger.release_all_turn_work_items(turn_id)
-
-    def _release_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
-        """Release one delegated child, keeping the turn's ack alive for siblings.
-
-        See ``TurnAckLedger.release_turn_work_item`` for the full rationale.
-        """
-        self._turn_ack_ledger.release_turn_work_item(turn_id, work_item_id)
-
-    def _ack_turn_for_work_item(self, work_item_id: str) -> str | None:
-        """The latched semantic turn that owns ``work_item_id``, if any.
-
-        See ``TurnAckLedger.ack_turn_for_work_item`` for the full rationale.
-        """
-        return self._turn_ack_ledger.ack_turn_for_work_item(work_item_id)
-
     def on_ack_terminal(
         self, identity: GenerationIdentity, reason: PreAdmissionTerminalReason
     ) -> None:
@@ -1220,28 +1167,6 @@ class SessionHost:
         See ``TurnAckLedger.on_ack_terminal`` for the full rationale.
         """
         self._turn_ack_ledger.on_ack_terminal(identity, reason)
-
-    async def _emit_early_ack(
-        self,
-        origin: ConnectionPipeline,
-        *,
-        turn_id: str,
-        origin_epoch: int,
-        dispatched: bool,
-        search_task: asyncio.Task[Any] | None = None,
-    ) -> None:
-        """Enqueue this turn's one delegation-confirmed ack.
-
-        See ``TurnAckLedger.emit_early_ack`` for the full rationale, including
-        the ``dispatched``/``search_task`` contract.
-        """
-        await self._turn_ack_ledger.emit_early_ack(
-            origin,
-            turn_id=turn_id,
-            origin_epoch=origin_epoch,
-            dispatched=dispatched,
-            search_task=search_task,
-        )
 
     async def cancel_turn_or_child(
         self,
@@ -1273,22 +1198,22 @@ class SessionHost:
         control turn, say) would settle *that* turn's ack.
         """
         origin = origin or self.connection
-        ack_work_item_id = self._ack_work_item_id(turn_id) if turn_id is not None else None
+        ack_work_item_id = TurnAckLedger.ack_work_item_id(turn_id) if turn_id is not None else None
         if origin is None:
             if turn_id is not None:
-                self._clear_ack_latch(turn_id)
+                self._turn_ack_ledger.clear_ack_latch(turn_id)
             return (), ()
         scheduler = origin.scheduler
         if child_work_item_id is None:
             cancelled_work = self._cancel_work(None, exclude_work_item_id=exclude_work_item_id)
             cancelled_speech = scheduler.cancel(None)
             if turn_id is not None:
-                self._clear_ack_latch(turn_id)
+                self._turn_ack_ledger.clear_ack_latch(turn_id)
             for item in cancelled_speech:
                 # A whole-turn sweep removes every live ack, including acks
                 # belonging to earlier turns; their latches go with them.
                 if item.role == ROLE_ACK and item.turn_id is not None:
-                    self._clear_ack_latch(item.turn_id)
+                    self._turn_ack_ledger.clear_ack_latch(item.turn_id)
             return cancelled_work, cancelled_speech
         cancelled_work = self._cancel_work(
             child_work_item_id, exclude_work_item_id=exclude_work_item_id
@@ -1322,7 +1247,7 @@ class SessionHost:
         remaining.discard(child_work_item_id)
         if not remaining:
             scheduler.cancel(ack_work_item_id)
-            self._clear_ack_latch(turn_id)
+            self._turn_ack_ledger.clear_ack_latch(turn_id)
         return cancelled_work, cancelled_speech
 
     def _require_coordinator(self) -> Coordinator:
@@ -1372,7 +1297,7 @@ class SessionHost:
         ):
             return transcript
         origin_epoch = origin.epoch
-        turn_id = self._next_turn_id()
+        turn_id = self._turn_ack_ledger.next_turn_id()
         work_item_id = f"work-{turn_id}"
         turn_recorder = self._recorder_factory.new_app_turn_recorder(
             origin_epoch=origin_epoch, turn_id=turn_id
@@ -1466,7 +1391,9 @@ class SessionHost:
                         # ack, or none at all. Falling back to this control
                         # turn's own id would settle an unrelated turn's ack.
                         cancel_turn_id = (
-                            self._ack_turn_for_work_item(target) if target is not None else turn_id
+                            self._turn_ack_ledger.ack_turn_for_work_item(target)
+                            if target is not None
+                            else turn_id
                         )
                         cancelled_work, cancelled_speech = await self.cancel_turn_or_child(
                             cancel_turn_id,
@@ -1597,7 +1524,7 @@ class SessionHost:
                     search, transcript, turn_id=turn_id, origin_epoch=origin_epoch
                 )
                 if search_task is not None:
-                    # Track before the first await below. `_emit_early_ack`
+                    # Track before the first await below. `TurnAckLedger.emit_early_ack`
                     # yields a scheduling tick to the search, and
                     # `_search_with_timeout` only registers the task after
                     # that; a cancel arriving inside the yield window reaches
@@ -1616,9 +1543,9 @@ class SessionHost:
                 # very same turn can still fence the still-queued ack before
                 # it ever reaches the old connection's transport. A refused
                 # dispatch (``search_task is None``) delegates nothing, so it
-                # acknowledges nothing -- see ``_emit_early_ack``'s
+                # acknowledges nothing -- see ``TurnAckLedger.emit_early_ack``'s
                 # ``dispatched`` contract.
-                await self._emit_early_ack(
+                await self._turn_ack_ledger.emit_early_ack(
                     origin,
                     turn_id=turn_id,
                     origin_epoch=origin_epoch,
@@ -1750,10 +1677,10 @@ class SessionHost:
             was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             retained_still_open = child_outcome_label == "retained" and not was_cancelled
             epilogue_ctx = TurnEpilogueContext(
-                settle_turn_ack=self._settle_turn_ack,
+                settle_turn_ack=self._turn_ack_ledger.settle_turn_ack,
                 emit_work_status=self._emit_work_status,
-                release_turn_work_item=self._release_turn_work_item,
-                release_all_turn_work_items=self._release_all_turn_work_items,
+                release_turn_work_item=self._turn_ack_ledger.release_turn_work_item,
+                release_all_turn_work_items=self._turn_ack_ledger.release_all_turn_work_items,
                 worker_projection=self._worker_projection,
             )
             epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
@@ -1799,7 +1726,7 @@ class SessionHost:
             raise
         finally:
             if not retained_still_open:
-                self._release_all_turn_work_items(turn_id)
+                self._turn_ack_ledger.release_all_turn_work_items(turn_id)
 
     async def _handle_pending(
         self,
@@ -1818,7 +1745,7 @@ class SessionHost:
         # Captured before the first await below, which may span other turns
         # being accepted concurrently: this is the turn-sequence snapshot
         # LateDeliveryContext needs to detect a newer-turn arrival.
-        dispatch_turn_sequence = self._turn_sequence
+        dispatch_turn_sequence = self._turn_ack_ledger.turn_sequence
         try:
             pending = getattr(outcome, "pending_dialogue", None)
             owner_id = pending.owner_id if pending is not None else None
@@ -1869,7 +1796,7 @@ class SessionHost:
             # Dispatch happens inside ``coordinator.submit`` below, so there is
             # no handle to inspect here; the plan requires the ack at the
             # delegation decision, not after submission returns.
-            await self._emit_early_ack(
+            await self._turn_ack_ledger.emit_early_ack(
                 origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
             )
             clarification_context = self._worker_projection.clarification_context(
@@ -1989,10 +1916,10 @@ class SessionHost:
             was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             retained_still_open = retained_still_open and not was_cancelled
             epilogue_ctx = TurnEpilogueContext(
-                settle_turn_ack=self._settle_turn_ack,
+                settle_turn_ack=self._turn_ack_ledger.settle_turn_ack,
                 emit_work_status=self._emit_work_status,
-                release_turn_work_item=self._release_turn_work_item,
-                release_all_turn_work_items=self._release_all_turn_work_items,
+                release_turn_work_item=self._turn_ack_ledger.release_turn_work_item,
+                release_all_turn_work_items=self._turn_ack_ledger.release_all_turn_work_items,
                 worker_projection=self._worker_projection,
             )
             epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
@@ -2052,7 +1979,7 @@ class SessionHost:
             raise
         finally:
             if not retained_still_open:
-                self._release_all_turn_work_items(turn_id)
+                self._turn_ack_ledger.release_all_turn_work_items(turn_id)
 
     async def _handle_multi_intent(
         self,
@@ -2076,20 +2003,20 @@ class SessionHost:
         # handler's return; ``commit_late_result_once`` releases each one.
         retained_work_items: set[str] = set()
         # Captured before the first await below (route_envelope/_dispatch/
-        # _emit_early_ack per work item), which may span other turns being
+        # TurnAckLedger.emit_early_ack per work item), which may span other turns being
         # accepted concurrently: this is the turn-sequence snapshot
         # LateDeliveryContext needs to detect a newer-turn arrival.
-        dispatch_turn_sequence = self._turn_sequence
+        dispatch_turn_sequence = self._turn_ack_ledger.turn_sequence
         # Constructed here (before `try`) rather than at its first use point
         # like the single-child shape's context: the `finally` below needs it
         # for `release_fan_out_turn_work_items` even if the body raises
         # before ever reaching the epilogue call, and this is a pure
         # attribute read that cannot itself fail.
         epilogue_ctx = TurnEpilogueContext(
-            settle_turn_ack=self._settle_turn_ack,
+            settle_turn_ack=self._turn_ack_ledger.settle_turn_ack,
             emit_work_status=self._emit_work_status,
-            release_turn_work_item=self._release_turn_work_item,
-            release_all_turn_work_items=self._release_all_turn_work_items,
+            release_turn_work_item=self._turn_ack_ledger.release_turn_work_item,
+            release_all_turn_work_items=self._turn_ack_ledger.release_all_turn_work_items,
         )
         try:
             results: dict[int, Any] = {}
@@ -2218,7 +2145,7 @@ class SessionHost:
                 # Dispatch happens inside ``coordinator.submit`` below; the plan
                 # requires the parent ack at the first eligible child
                 # *decision*, so there is no handle to inspect here.
-                await self._emit_early_ack(
+                await self._turn_ack_ledger.emit_early_ack(
                     origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
                 )
 
@@ -2608,7 +2535,7 @@ class SessionHost:
 
         Split out of ``_search_with_timeout`` so a caller can dispatch the
         search, give it exactly one scheduling tick, and only then decide
-        whether an early ack is still warranted (see ``_emit_early_ack``'s
+        whether an early ack is still warranted (see ``TurnAckLedger.emit_early_ack``'s
         ``search_task`` parameter).
         """
         kwargs: dict[str, Any] = {
@@ -2659,7 +2586,7 @@ class SessionHost:
         # Captured before the foreground wait below, which may span other
         # turns being accepted concurrently: this is the turn-sequence
         # snapshot LateDeliveryContext needs to detect a newer-turn arrival.
-        dispatch_turn_sequence = self._turn_sequence
+        dispatch_turn_sequence = self._turn_ack_ledger.turn_sequence
         # The provisional retained recorder is created here, at dispatch time,
         # before the foreground wait -- not only if it later times out -- so
         # background_ms always starts at work dispatch (Timing Boundaries).
@@ -2712,7 +2639,7 @@ class SessionHost:
     ) -> LateDeliveryContext:
         """Build the immutable context captured at late-task dispatch time.
 
-        ``accepted_turn_sequence`` defaults to the live ``_turn_sequence``
+        ``accepted_turn_sequence`` defaults to the live ``self._turn_ack_ledger.turn_sequence``
         counter, but callers dispatching from a coroutine that may span
         other turns being accepted concurrently pass an explicit snapshot
         taken before any ``await``. ``parent_work_item_id`` is supplied only
@@ -2728,7 +2655,7 @@ class SessionHost:
             accepted_turn_sequence=(
                 accepted_turn_sequence
                 if accepted_turn_sequence is not None
-                else self._turn_sequence
+                else self._turn_ack_ledger.turn_sequence
             ),
         )
 
@@ -3017,10 +2944,10 @@ class SessionHost:
             # foreign scheduler.
             connection = self.connection
             if connection is not None and connection.epoch == origin_epoch:
-                self._settle_turn_ack(connection.scheduler, context.turn_id)
+                self._turn_ack_ledger.settle_turn_ack(connection.scheduler, context.turn_id)
             else:
                 self._turn_ack_ledger.clear_ack_latch(context.turn_id)
-            self._release_turn_work_item(context.turn_id, context.work_item_id)
+            self._turn_ack_ledger.release_turn_work_item(context.turn_id, context.work_item_id)
             if recorder is not None:
                 recorder.finalize(
                     work_outcome=work_outcome,
@@ -3247,7 +3174,7 @@ class SessionHost:
         generation frees the transport lane.
         """
         if origin is not None:
-            self._settle_turn_ack(origin.scheduler, turn_id)
+            self._turn_ack_ledger.settle_turn_ack(origin.scheduler, turn_id)
         # A blind sweep over the whole delegated child set is safe either
         # way: a child that never had a status is skipped on the
         # ``cancelled`` branch (not in ``WORK_STATUS_COLD_START``) and is a
