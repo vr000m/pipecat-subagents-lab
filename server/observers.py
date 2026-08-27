@@ -11,6 +11,7 @@ from typing import Any
 from .contracts import CONTRACT_VERSION, RuntimeSnapshot, resolve_work_status_wire_presence
 from .frames import SnapshotBarrierFlushFrame
 from .session_state import SessionState, StateEvent
+from .task_retention import retain_until_done
 
 _ALWAYS_VISIBLE_KINDS = frozenset(
     {
@@ -184,9 +185,7 @@ class RuntimeObserver:
         # A connection emitter is normally a coroutine scheduled by the
         # transport callback. Do not make state mutation await a network send.
         if inspect.isawaitable(result):
-            task = asyncio.create_task(result)
-            self._emit_tasks.add(task)
-            task.add_done_callback(self._emit_tasks.discard)
+            retain_until_done(asyncio.create_task(result), self._emit_tasks)
 
     def _on_event(self, event: StateEvent) -> None:
         if self._paused:
