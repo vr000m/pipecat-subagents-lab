@@ -34,7 +34,7 @@ ConnectionPipeline`, not `from server.pipeline import ...`). A name
 module — Python has no way to hide it — but is not a supported import path.
 
 - `server/connection_pipeline.py` — `ConnectionPipeline` (per-connection state:
-  epoch, observer/publisher, speech scheduler, transport references).
+  epoch, observer, speech scheduler/lifecycle, transport references).
 - `server/turn_ack_ledger.py` — `TurnAckLedger` (turn-id sequencing, the ack
   latch, and the ack-admission retry chain).
 - `server/turn_epilogue.py` — the turn handlers' shared epilogue steps, in two

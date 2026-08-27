@@ -16,9 +16,12 @@ must never import back from it (see the plan's Architecture & Call Flow
 section). Collaborator types are pulled from their owning modules
 (``contracts``, ``perf_metrics``, ``speech_scheduler``, ``work_status_publisher``,
 plus ``connection_pipeline`` and ``worker_projection`` under ``TYPE_CHECKING``)
-instead. The callable collaborators on ``TurnEpilogueContext`` are declared as
-``Protocol`` call shapes rather than bare ``Callable[..., None]`` so a caller
-that wires the wrong bound method fails at type-check time, not at runtime.
+instead. The multi-keyword callable collaborators on ``TurnEpilogueContext``
+are declared as ``Protocol`` call shapes rather than bare ``Callable[..., None]``
+so a caller that wires the wrong bound method fails at type-check time, not at
+runtime; the two positional release hooks (``release_turn_work_item``,
+``release_all_turn_work_items``) stay bare ``Callable[...]`` since their arity
+already catches a swap.
 
 Sub-step C1 covers the single-child epilogue shape
 (``finalize_single_child_turn``), used by ``_handle_transcript_impl`` and (as
