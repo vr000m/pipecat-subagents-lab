@@ -2827,10 +2827,10 @@ class SessionHost:
         """The sole host-owned atomic API for a coordinator late-result callback.
 
         Commits every valid result exactly once and separately computes the
-        delivery disposition, which is unconditionally display-only
-        (``_late_result_disposition``, retained as a directly-tested
-        regression pin; the autoplay alternative it used to select between
-        was retired).
+        delivery disposition by consulting ``_late_result_disposition``,
+        which is unconditionally display-only (the autoplay alternative it
+        used to select between was retired; the method doubles as a
+        directly-tested regression pin).
 
         Branch precedence is: worker error, then the three structural
         fences -- not a ``GroundedResult``, foreign ``origin_epoch``,
@@ -3046,7 +3046,18 @@ class SessionHost:
                         # the real result has committed and would otherwise
                         # be spoken later.
                         speakable.scheduler.discard_queued_notice(late.work_item_id)
-                        delivery_disposition = "display_only"
+                        # Routed through ``_late_result_disposition`` rather
+                        # than hardcoding the string here, so the
+                        # directly-tested regression pin
+                        # (tests/test_session_host.py::
+                        # test_late_result_disposition_is_unconditionally_display_only)
+                        # guards the disposition this live commit path
+                        # actually records -- a resurrected autoplay branch
+                        # inside the method would surface both in that pin
+                        # and in the behavioral commit-path tests.
+                        delivery_disposition = self._late_result_disposition(
+                            context, origin=speakable
+                        )
                         speech_outcome = "not_applicable"
                     else:
                         delivery_disposition = "display_only"
