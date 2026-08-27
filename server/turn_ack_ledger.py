@@ -49,6 +49,7 @@ from loguru import logger
 
 from .speech_lifecycle import GenerationIdentity, PreAdmissionTerminalReason
 from .speech_scheduler import ROLE_ACK
+from .task_retention import retain_until_done
 
 if TYPE_CHECKING:
     from .config import FeaturePolicy
@@ -580,9 +581,7 @@ class TurnAckLedger:
                     attempt=attempt + 1,
                 )
 
-            retry_task = asyncio.create_task(retry_after_delay())
-            self._ack_admission_tasks.add(retry_task)
-            retry_task.add_done_callback(self._ack_admission_tasks.discard)
+            retain_until_done(asyncio.create_task(retry_after_delay()), self._ack_admission_tasks)
 
         async def admit() -> None:
             current_generation = self._ack_admission_generation.get(turn_id)
@@ -633,9 +632,7 @@ class TurnAckLedger:
                 # _ACK_ADMISSION_MAX_ATTEMPTS.
                 _retry_or_abandon(log_reason="found the transport slot busy", needs_requeue=False)
 
-        task = asyncio.create_task(admit())
-        self._ack_admission_tasks.add(task)
-        task.add_done_callback(self._ack_admission_tasks.discard)
+        retain_until_done(asyncio.create_task(admit()), self._ack_admission_tasks)
 
     def pending_admission_tasks(self) -> tuple[asyncio.Task[Any], ...]:
         """Every currently in-flight ack-admission task, for shutdown sweeps."""
