@@ -14,8 +14,11 @@ to ``idle``. This module holds that logic once, parameterized by an explicit
 Dependency direction: this module is imported by ``server/pipeline.py``, and
 must never import back from it (see the plan's Architecture & Call Flow
 section). Collaborator types are pulled from their owning modules
-(``contracts``, ``perf_metrics``, ``speech_scheduler``, ``work_status_publisher``)
-instead.
+(``contracts``, ``perf_metrics``, ``speech_scheduler``, ``work_status_publisher``,
+plus ``connection_pipeline`` and ``worker_projection`` under ``TYPE_CHECKING``)
+instead. The callable collaborators on ``TurnEpilogueContext`` are declared as
+``Protocol`` call shapes rather than bare ``Callable[..., None]`` so a caller
+that wires the wrong bound method fails at type-check time, not at runtime.
 
 Sub-step C1 covers the single-child epilogue shape
 (``finalize_single_child_turn``), used by ``_handle_transcript_impl`` and (as
@@ -32,9 +35,9 @@ here.
 from __future__ import annotations
 
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import AbstractSet, Any
+from typing import TYPE_CHECKING, AbstractSet, Any, Protocol
 
 from loguru import logger
 
@@ -42,6 +45,67 @@ from .contracts import GroundedResult, TerminalReason, WorkStatusState
 from .perf_metrics import AppTurnRecorder, WorkItemOutcome, WorkItemRecorder
 from .speech_scheduler import ROLE_RESULT, SpeechRole
 from .work_status_publisher import work_status_after_commit_failure, work_status_for_outcome
+
+if TYPE_CHECKING:
+    from .connection_pipeline import ConnectionPipeline
+    from .worker_projection import WorkerProjection
+
+
+class SettleTurnAck(Protocol):
+    """``TurnAckLedger.settle_turn_ack``'s call shape."""
+
+    def __call__(self, scheduler: Any, turn_id: str, *, cancel_admitted: bool = ...) -> None: ...
+
+
+class EmitWorkStatus(Protocol):
+    """``SessionHost._emit_work_status``'s call shape (onto ``WorkStatusPublisher.emit``)."""
+
+    def __call__(
+        self,
+        *,
+        turn_id: str,
+        work_item_id: str,
+        parent_work_item_id: str | None = ...,
+        worker_id: str | None = ...,
+        state: WorkStatusState,
+        origin_epoch: int,
+        terminal_reason: TerminalReason | None = ...,
+    ) -> None: ...
+
+
+class DeriveWorkStatus(Protocol):
+    """The row-3 terminal-status derivation policy a single-child caller picks.
+
+    Satisfied by ``status_omitted_while_retained`` (single-intent) and by
+    ``work_status_publisher.child_work_status_after_dispatch``
+    (pending-dialogue).
+    """
+
+    def __call__(
+        self,
+        outcome_label: str | None,
+        *,
+        cancelled: bool,
+        terminal_kind: str | None = ...,
+    ) -> tuple[WorkStatusState, TerminalReason | None] | None: ...
+
+
+class CommitAndSpeak(Protocol):
+    """``SessionHost._commit_and_speak``'s call shape.
+
+    Both entry points here call it: the single-child shape passes ``role``,
+    the fan-out shape additionally passes ``suppressed_out``.
+    """
+
+    async def __call__(
+        self,
+        result: GroundedResult,
+        origin: ConnectionPipeline,
+        *,
+        role: SpeechRole = ...,
+        require_tts: bool = ...,
+        suppressed_out: set[str] | None = ...,
+    ) -> GroundedResult: ...
 
 
 def status_omitted_while_retained(
@@ -80,11 +144,11 @@ class TurnEpilogueContext:
     for ``_handle_transcript_impl``.
     """
 
-    settle_turn_ack: Callable[..., None]
-    emit_work_status: Callable[..., None]
+    settle_turn_ack: SettleTurnAck
+    emit_work_status: EmitWorkStatus
     release_turn_work_item: Callable[[str, str], None]
     release_all_turn_work_items: Callable[[str], None]
-    worker_projection: Any | None = None
+    worker_projection: WorkerProjection | None = None
 
 
 @dataclass(frozen=True)
@@ -105,10 +169,13 @@ class SingleChildEpilogueOutcome:
 async def finalize_single_child_turn(
     ctx: TurnEpilogueContext,
     *,
-    origin: Any,
+    origin: ConnectionPipeline,
     turn_id: str,
     work_item_id: str,
     origin_epoch: int,
+    # ``worker`` stays ``Any``: ``WorkerProjection.project`` reads it purely
+    # by duck-typed ``metadata`` attribute lookup and types it ``Any`` itself,
+    # so naming a type here would be stricter than the collaborator it feeds.
     worker: Any,
     worker_id: str,
     child: WorkItemRecorder,
@@ -119,13 +186,11 @@ async def finalize_single_child_turn(
     was_cancelled: bool,
     speech_role: SpeechRole = ROLE_RESULT,
     search_ms: float = 0.0,
-    commit_and_speak: Callable[..., Awaitable[GroundedResult]],
+    commit_and_speak: CommitAndSpeak,
     project_idle: bool = False,
     cancel_admitted: bool = False,
     record_commit_ms: bool = True,
-    derive_status: Callable[
-        ..., tuple[WorkStatusState, TerminalReason | None] | None
-    ] = status_omitted_while_retained,
+    derive_status: DeriveWorkStatus = status_omitted_while_retained,
 ) -> SingleChildEpilogueOutcome:
     """Rows 1-7, 9, 11 of the Phase 1 differences table, single-child shape.
 
@@ -236,7 +301,7 @@ async def finalize_single_child_turn(
 async def finalize_fan_out_turn(
     ctx: TurnEpilogueContext,
     *,
-    origin: Any,
+    origin: ConnectionPipeline,
     turn_id: str,
     parent_work_item_id: str,
     turn_recorder: AppTurnRecorder,
@@ -245,7 +310,7 @@ async def finalize_fan_out_turn(
     retained_work_items: AbstractSet[str],
     deferred_status: dict[int, tuple[str, str | None, WorkStatusState, TerminalReason | None]],
     speech_roles: dict[int, SpeechRole],
-    commit_and_speak: Callable[..., Awaitable[GroundedResult]],
+    commit_and_speak: CommitAndSpeak,
 ) -> tuple[GroundedResult, ...]:
     """Rows 2, 4, 5, 7 of the Phase 1 differences table, fan-out shape.
 
