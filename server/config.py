@@ -16,7 +16,6 @@ from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
 from stat import S_ISREG
-from typing import Literal
 from urllib.parse import urlparse
 
 _FALLBACK_RELEASE_VERSION = "0.1.3"
@@ -137,8 +136,6 @@ class Config:
     enable_background_status: bool = True
     enable_autoplay_policy: bool = True
     early_ack_text: str = "One moment while I look into that."
-    promotion_manifest_path: str = "docs/benchmarks/v0.1.3-promotion-manifest.json"
-    phase4c_artifact_path: str | None = None
     release_version: str = _DEFAULT_RELEASE_VERSION
     source_commit: str | None = None
     source_tree_hash: str | None = None
@@ -210,10 +207,6 @@ class Config:
             raise ConfigError("tts_voice_id must not be empty")
         if not self.early_ack_text.strip():
             raise ConfigError("early_ack_text must not be empty")
-        if not self.promotion_manifest_path.strip():
-            raise ConfigError("promotion_manifest_path must not be empty")
-        if self.phase4c_artifact_path is not None and not self.phase4c_artifact_path.strip():
-            raise ConfigError("phase4c_artifact_path must not be empty")
         if not self.release_version.strip():
             raise ConfigError("release_version must not be empty")
         if self.deployed_at_utc is not None:
@@ -338,7 +331,11 @@ def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
 
     Used to bind a promotion manifest to the exact kill-switch state it was
     generated against; a manifest fingerprinted against a different policy
-    combination is stale and `load_promotion_manifest` rejects it.
+    combination is stale. The server-side consumer of this binding
+    (`load_promotion_manifest`) was retired along with the query-context
+    promotion chain, but `scripts/validate_v013_evidence.py --verify-manifest`
+    still re-derives this fingerprint to check the frozen committed v0.1.3
+    manifest for drift.
     """
     canonical = json.dumps(
         {
@@ -355,15 +352,13 @@ def feature_policy_fingerprint(policy: FeaturePolicy) -> str:
 def effective_feature_policy_fingerprint(config: Config) -> str:
     """`feature_policy_fingerprint(FeaturePolicy.from_config(config))`, named.
 
-    ``load_promotion_manifest`` below is the authority: its comparison is the
-    one that decides whether a manifest is stale. Two independent callers --
-    ``scripts/emit_v013_deployment_metadata.py`` (the writer, which stamps
-    this into the release-metadata shell exports) and
-    ``scripts/validate_v013_evidence.py`` (the verifier, which re-derives it
-    to check manifest drift) -- exist to predict that comparison, so all
-    three must resolve this composition identically by construction, not by
-    each happening to spell the same three-call chain the same way.
-    Previously the writer wrapped it in a script-local
+    Two independent callers -- ``scripts/emit_v013_deployment_metadata.py``
+    (the writer, which stamps this into the release-metadata shell exports)
+    and ``scripts/validate_v013_evidence.py`` (the verifier, which
+    re-derives it to check manifest drift against the frozen committed
+    v0.1.3 manifest) -- must resolve this composition identically by
+    construction, not by each happening to spell the same three-call chain
+    the same way. Previously the writer wrapped it in a script-local
     ``feature_policy_fingerprint_value()`` (with a function-local
     ``server.config`` import) while the verifier spelled the same composition
     inline; this is the one home for it, since both the writer and the
@@ -371,29 +366,6 @@ def effective_feature_policy_fingerprint(config: Config) -> str:
     Architecture finding).
     """
     return feature_policy_fingerprint(FeaturePolicy.from_config(config))
-
-
-@dataclass(frozen=True)
-class PromotionManifest:
-    """The immutable, fail-closed verdict `load_promotion_manifest` hands to `SessionHost`.
-
-    `promotion_eligible=True` is the *only* state a policy evaluator may
-    treat as data-driven-tuning-enabled. Every other combination -- missing
-    file, malformed JSON, schema mismatch, wrong/incomplete manifest phase,
-    stale identity binding, or an explicit `promotion_eligible=false` in the
-    manifest itself -- resolves to `promotion_eligible=False` with `reason`
-    set to the precise cause. This loader never raises for a missing or
-    malformed manifest; runtime boot is fail-closed, not fail-fast.
-    """
-
-    promotion_eligible: bool
-    reason: str | None = None
-    manifest_phase: str | None = None
-    source_commit: str | None = None
-    source_tree_hash: str | None = None
-    release_version: str | None = None
-    feature_policy_fingerprint: str | None = None
-    generated_at_utc: str | None = None
 
 
 MANIFEST_REQUIRED_FIELDS = frozenset(
@@ -443,15 +415,6 @@ if not MANIFEST_REQUIRED_PROVISIONAL_INPUTS <= MANIFEST_REQUIRED_FINAL_INPUTS:
     )
 
 
-# Lowercase-only, matching scripts/evidence_common.py's HEX64_RE: every
-# digest this pattern validates is checked against a hashlib `.hexdigest()`
-# output, which is always lowercase. Admitting uppercase here let a
-# correct-but-uppercase digest pass this shape check and then always
-# mismatch at the equality comparison against the lowercase-only digest it
-# is verified against -- a spurious integrity failure instead of an
-# actionable "malformed digest" rejected right here.
-_HEX_HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
-
 # Manifest keys whose value must be a JSON string. `reason` is deliberately
 # excluded: it is required to be present but is null on an eligible manifest.
 MANIFEST_STRING_FIELDS = (
@@ -464,40 +427,6 @@ MANIFEST_STRING_FIELDS = (
     "deployed_at_utc",
     "generated_at_utc",
 )
-
-
-def _unavailable(reason: str) -> PromotionManifest:
-    return PromotionManifest(promotion_eligible=False, reason=reason)
-
-
-def _is_hex_hash(value: object) -> bool:
-    return isinstance(value, str) and _HEX_HASH_PATTERN.fullmatch(value) is not None
-
-
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-"""Anchor for relative evidence/manifest paths: the directory this module's
-package lives in, not a git-repo lookup (`git rev-parse --show-toplevel`) and
-not the process CWD. In a repo checkout this happens to equal the repo root,
-which is where the name `_REPO_ROOT` came from; it was renamed because a
-packaged/standalone install of this server has no git tree at all, and the
-old name implied an assumption this module never actually made. The
-promotion-evidence tree (`docs/benchmarks/...`, `shared/schemas/...`) is
-deliberately excluded from the deployable package (see
-`_schema_hash_matches`), so a packaged install typically won't find these
-paths under `_PACKAGE_ROOT` -- that's expected, and every caller below
-degrades to a display-only fail-closed verdict (`manifest_missing`,
-`manifest_schema_unverifiable`, `phase4c_unresolvable`, ...) rather than
-raising. An operator deploying standalone who still wants promotion evidence
-honoured must point `promotion_manifest_path`/`phase4c_artifact_path` at an
-absolute path; a relative path is only meaningful inside a repo checkout.
-"""
-
-_EVIDENCE_SCHEMA_PATH = _PACKAGE_ROOT / "shared/schemas/v013-evidence.json"
-
-# A manifest-declared evidence input is attacker-steerable (it lives inside the
-# artifact under scrutiny), so it is capped well above any real evidence file
-# to bound the read even once path confinement has already ruled out traversal.
-_MAX_EVIDENCE_INPUT_BYTES = 8 * 1024 * 1024
 
 
 def read_regular_file_no_follow(path: Path, *, max_bytes: int) -> bytes | None:
@@ -536,9 +465,10 @@ def read_regular_file_no_follow(path: Path, *, max_bytes: int) -> bytes | None:
 
     Every failure mode here -- missing path, permission denied, symlinked,
     not a regular file, oversized -- collapses to `None`; callers already
-    treat every evidence-read failure as one fail-closed outcome (e.g.
-    `evidence_unresolvable`/`manifest_missing`/`phase4c_unresolvable`), so
-    there is nothing for a caller to do differently per failure kind.
+    treat every read failure as one fail-closed outcome (e.g.
+    `server/session_state.py`'s retention-config load falling back to
+    `_RETENTION_FALLBACK`), so there is nothing for a caller to do
+    differently per failure kind.
 
     **Deliberately not shared with `scripts/evidence_common.read_bytes_no_follow`,
     which performs the same open/fstat/bounded-read sequence.** Two reasons,
@@ -589,64 +519,6 @@ def read_regular_file_no_follow(path: Path, *, max_bytes: int) -> bytes | None:
         os.close(fd)
 
 
-def _resolve_confined_evidence_path(raw_path: str) -> Path | None:
-    """Resolve a manifest-declared evidence path, confined to the repo tree.
-
-    `raw_path` comes from `manifest["inputs"][phase]["path"]`, a value the
-    artifact under validation declares about itself -- not an operator
-    setting. Accepting it as a runtime read target without containment would
-    be an attacker-steerable arbitrary-file-read primitive (absolute paths,
-    `..` traversal). Returns `None` when the path is absolute or escapes the
-    repo root after resolution.
-
-    Deliberately does *not* also check "is a regular file within the size
-    cap" here: doing that with a `stat()` call and then reading the path
-    separately at the caller is exactly the TOCTOU gap
-    `read_regular_file_no_follow` exists to close, so every caller must
-    route the actual read through that helper, which re-derives both facts
-    from the fd it opens for the read.
-
-    `scripts/evidence_common.confined_evidence_input_path` is the CLI-gate
-    mirror of this function (the `server`/`scripts` split forbids either
-    importing the other -- see `read_regular_file_no_follow`'s docstring).
-    The two must agree on *which declared paths are legal*, or CI reports a
-    manifest clean that this loader then refuses; `tests/test_evidence_common.py`
-    pins them against each other on exactly that.
-    """
-    candidate = Path(raw_path)
-    if candidate.is_absolute():
-        return None
-    resolved = (_PACKAGE_ROOT / candidate).resolve()
-    if not resolved.is_relative_to(_PACKAGE_ROOT):
-        return None
-    return resolved
-
-
-def _schema_hash_matches(declared: str) -> Literal["match", "mismatch", "unverifiable"]:
-    """Recompute the evidence schema digest the manifest declares.
-
-    The writer stamps `schema_hash` from `shared/schemas/v013-evidence.json`;
-    accepting it as "some 64-hex string" let a forged manifest declare an
-    arbitrary schema binding. The evidence schemas are deliberately excluded
-    from the deployable runtime set, so a packaged install may genuinely not
-    ship this file -- but "cannot verify" is not "verified", so it is reported
-    as its own state rather than collapsed into a match, and the caller decides
-    fail-closed.
-
-    Routed through `read_regular_file_no_follow` -- the same guard every
-    other evidence read on this boot path uses -- rather than a plain
-    `read_bytes()`: a FIFO or character device (`/dev/zero`) planted at this
-    predictable, repo-relative path would otherwise block server boot inside
-    the read forever instead of degrading to "unverifiable".
-    """
-    data = read_regular_file_no_follow(_EVIDENCE_SCHEMA_PATH, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
-    if data is None:
-        return "unverifiable"
-    if hashlib.sha256(data).hexdigest() == declared:
-        return "match"
-    return "mismatch"
-
-
 def _parse_utc_timestamp(value: str) -> datetime:
     """Parse an ISO-8601 timestamp into an aware UTC instant.
 
@@ -662,241 +534,6 @@ def _parse_utc_timestamp(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
-
-
-def load_promotion_manifest(config: Config) -> PromotionManifest:
-    """Load and bind-check the promotion manifest at `config.promotion_manifest_path`.
-
-    Fail-closed, not fail-fast: any problem here -- the path missing,
-    unreadable, malformed, schema-invalid, wrongly typed, phase-incomplete,
-    identity-unbound, identity- or fingerprint-mismatched, or stale relative
-    to `config.deployed_at_utc` -- degrades to display-only rather than
-    raising. It never prevents server boot: every unexpected exception raised
-    below is caught here and rendered as `manifest_malformed`, so fail-closed
-    is a structural property of this boundary rather than of each individual
-    check.
-
-    Precedence of the identity binding changed in this release. Previously a
-    `source_commit`, `source_tree_hash`, or `release_version` check was
-    *skipped* when the corresponding `Config` field was falsy, so an
-    unconfigured runtime accepted whatever identity the manifest declared.
-    Now the comparisons are unconditional: an unset `Config` field means the
-    runtime cannot prove the manifest describes this build, which resolves to
-    `identity_unbound` (display-only) rather than silently passing.
-    """
-    try:
-        return _load_promotion_manifest(config)
-    except Exception:  # noqa: BLE001  # fail closed: a malformed manifest must never abort server boot
-        return _unavailable("manifest_malformed")
-
-
-def _load_promotion_manifest(config: Config) -> PromotionManifest:
-    path = Path(config.promotion_manifest_path)
-    if not path.is_absolute():
-        path = _PACKAGE_ROOT / path
-    # Same guard `phase4c_artifact_path` takes, and for the same reason: this
-    # is operator config, and a path that names a device or FIFO would hang or
-    # OOM-kill server boot on read_text(). This is the first evidence read the
-    # boot path takes, so it is the one that must fail closed. Routed through
-    # `read_regular_file_no_follow` (a single open+fstat+read, not a
-    # `stat()`-then-`read_text()` pair) so the type/size decision and the
-    # bytes actually read cannot be split across a TOCTOU window.
-    content = read_regular_file_no_follow(path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES)
-    if content is None:
-        return _unavailable("manifest_missing")
-    try:
-        raw = content.decode("utf-8")
-    except UnicodeDecodeError:
-        return _unavailable("manifest_malformed")
-    try:
-        manifest = json.loads(raw)
-    except json.JSONDecodeError:
-        return _unavailable("manifest_malformed")
-    if not isinstance(manifest, dict):
-        return _unavailable("manifest_malformed")
-
-    missing = MANIFEST_REQUIRED_FIELDS - set(manifest)
-    if missing:
-        return _unavailable("manifest_schema_invalid")
-
-    if any(not isinstance(manifest[name], str) for name in MANIFEST_STRING_FIELDS):
-        return _unavailable("manifest_schema_invalid")
-    if not isinstance(manifest["promotion_eligible"], bool):
-        return _unavailable("manifest_schema_invalid")
-    if manifest["reason"] is not None and not isinstance(manifest["reason"], str):
-        return _unavailable("manifest_schema_invalid")
-    if not isinstance(manifest["inputs"], Mapping):
-        return _unavailable("manifest_schema_invalid")
-    if not _is_hex_hash(manifest["schema_hash"]):
-        return _unavailable("manifest_schema_invalid")
-    # `inputs` was previously accepted as "any mapping". Each entry names an
-    # artifact this manifest claims to be bound to, so each must actually
-    # carry a path and a well-formed digest -- otherwise a forged manifest
-    # with a correct outer identity could declare arbitrary/empty bindings.
-    for entry in manifest["inputs"].values():
-        if not isinstance(entry, Mapping):
-            return _unavailable("manifest_schema_invalid")
-        path_value = entry.get("path")
-        if not isinstance(path_value, str) or not path_value.strip():
-            return _unavailable("manifest_schema_invalid")
-        if not _is_hex_hash(entry.get("sha256")):
-            return _unavailable("manifest_schema_invalid")
-    schema_verdict = _schema_hash_matches(manifest["schema_hash"])
-    if schema_verdict == "unverifiable":
-        return _unavailable("manifest_schema_unverifiable")
-    if schema_verdict == "mismatch":
-        return _unavailable("manifest_schema_hash_mismatch")
-    # `generated_at_utc` is parsed unconditionally: when no `deployed_at_utc`
-    # is configured there is no staleness comparison to force the parse, and a
-    # field whose format was never checked is not a verified field.
-    try:
-        generated_at = _parse_utc_timestamp(manifest["generated_at_utc"])
-    except ValueError:
-        return _unavailable("manifest_schema_invalid")
-
-    manifest_phase = manifest["manifest_phase"]
-    if manifest_phase not in {"provisional", "final"}:
-        return _unavailable("manifest_schema_invalid")
-
-    identity = PromotionManifest(
-        promotion_eligible=False,
-        manifest_phase=manifest_phase,
-        source_commit=manifest["source_commit"],
-        source_tree_hash=manifest["source_tree_hash"],
-        release_version=manifest["release_version"],
-        feature_policy_fingerprint=manifest["feature_policy_fingerprint"],
-        generated_at_utc=manifest["generated_at_utc"],
-    )
-
-    if manifest_phase == "provisional":
-        # A provisional manifest is accepted for diagnostics only; it can
-        # never enable autoplay regardless of the evidence it embeds.
-        return replace(identity, reason="provisional_manifest")
-
-    # manifest_phase == "final": Phase 3 must have stamped its completion
-    # hash, and any declared Phase 4C hash must validate; Phase 2 does not
-    # implement that stamping, so a "final" manifest this loader can see is
-    # necessarily incomplete until Phase 3 lands.
-    if not _is_hex_hash(manifest.get("phase3_completion_hash")):
-        return replace(identity, reason="incomplete_final_manifest")
-    # The Phase 3 completion hash and the Phase 3 input binding are two
-    # records of the same fact; a manifest whose top-level hash disagrees with
-    # (or has no) corresponding `inputs.phase3` entry is internally
-    # inconsistent and must not activate autoplay.
-    phase3_entry = manifest["inputs"].get("phase3")
-    if not isinstance(phase3_entry, Mapping):
-        return replace(identity, reason="incomplete_final_manifest")
-    if phase3_entry.get("sha256") != manifest["phase3_completion_hash"]:
-        return replace(identity, reason="phase3_binding_mismatch")
-    # A *final* manifest attests the whole evidence chain, so every earlier
-    # phase must be bound too; only a provisional manifest may lack them.
-    if not MANIFEST_REQUIRED_FINAL_INPUTS <= set(manifest["inputs"]):
-        return replace(identity, reason="incomplete_final_manifest")
-    # Unlike Phase 4C (byte-verified below), the Phase 0/1/2/3 `inputs`
-    # entries were previously only shape-checked (a non-empty path string, a
-    # well-formed hex digest) -- nothing recomputed the digest against the
-    # actual file on disk, so a `final` manifest's declared evidence hashes
-    # were never actually proven to describe the files they name. Making the
-    # Phase 4C byte-check the rule rather than the exception closes that gap.
-    for _phase_name in MANIFEST_REQUIRED_FINAL_INPUTS:
-        _phase_entry = manifest["inputs"][_phase_name]
-        _phase_path = _resolve_confined_evidence_path(_phase_entry["path"])
-        if _phase_path is None:
-            return replace(identity, reason="evidence_unresolvable")
-        # `read_regular_file_no_follow`, not `_phase_path.read_bytes()`: a
-        # single open+fstat+read closes the TOCTOU window a separate
-        # regular-file/size check followed by a read would leave open.
-        _phase_content = read_regular_file_no_follow(
-            _phase_path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES
-        )
-        if _phase_content is None:
-            return replace(identity, reason="evidence_unresolvable")
-        _actual_phase_hash = hashlib.sha256(_phase_content).hexdigest()
-        if _actual_phase_hash != _phase_entry["sha256"]:
-            return replace(identity, reason="evidence_mismatch")
-
-    # Through the named helper, not the three-call chain spelled inline: this
-    # loader is the authority the writer and the verifier both exist to
-    # predict, so it must resolve the composition by the same construction
-    # they do (round 6 confirm pass 3, Architecture Minor).
-    expected_fingerprint = effective_feature_policy_fingerprint(config)
-    if manifest["feature_policy_fingerprint"] != expected_fingerprint:
-        return replace(identity, reason="policy_fingerprint_mismatch")
-    # Unconditional identity binding: an unset Config field cannot prove the
-    # manifest describes this build, so it is unbound rather than waived.
-    for config_value, manifest_key in (
-        (config.source_commit, "source_commit"),
-        (config.source_tree_hash, "source_tree_hash"),
-        (config.release_version, "release_version"),
-    ):
-        if not config_value:
-            return replace(identity, reason="identity_unbound")
-        if manifest[manifest_key] != config_value:
-            return replace(identity, reason="source_mismatch")
-    deployed_at = config.deployed_at_utc
-    if deployed_at and generated_at < _parse_utc_timestamp(deployed_at):
-        return replace(identity, reason="stale")
-
-    if manifest["promotion_eligible"] is not True:
-        return replace(identity, reason=manifest["reason"] or "not_promotion_eligible")
-
-    # An optional Phase 4C binding: absent, a no-change release is still a
-    # valid final manifest. Present, the declared hash must resolve to a
-    # readable file whose current bytes actually match it -- an unresolvable
-    # or mismatched artifact is treated as stale/foreign, never trusted blindly.
-    phase4c_hash = manifest.get("phase4c_artifact_sha256")
-    if phase4c_hash is None:
-        # Omitting the field entirely must not be indistinguishable from "no
-        # Phase 4C attestation applies" when this deployment explicitly wants
-        # one: if `config.phase4c_artifact_path` is configured, an otherwise
-        # -valid `final` manifest that simply drops the field would silently
-        # skip the byte-verification below rather than being caught as an
-        # incomplete binding. The "both absent" case (no configured path,
-        # no declared hash) is the genuine no-Phase-4C-needed release and
-        # stays eligible.
-        if config.phase4c_artifact_path:
-            return replace(identity, reason="phase4c_binding_missing")
-    else:
-        # Present-but-unusable is a forged binding, not an absent one: `""` or a
-        # malformed digest previously fell through the truthiness test and
-        # skipped every Phase 4C check.
-        if not _is_hex_hash(phase4c_hash):
-            return replace(identity, reason="phase4c_binding_mismatch")
-        phase4c_artifact_path = config.phase4c_artifact_path
-        if not phase4c_artifact_path:
-            return replace(identity, reason="phase4c_unresolvable")
-        phase4c_path = Path(phase4c_artifact_path)
-        if not phase4c_path.is_absolute():
-            phase4c_path = _PACKAGE_ROOT / phase4c_path
-        # phase4c_artifact_path is operator config (env/TOML), not
-        # manifest-declared, so it is not attacker-steerable the way the
-        # phase0-3 `inputs[*].path` entries are -- but it is still an
-        # operator-controllable path read on the server-boot path, and
-        # `read_regular_file_no_follow` applies the same size/regular-file
-        # bound, from one held fd, for exactly that reason: an accidental
-        # device-file or FIFO path would otherwise make `read_bytes()` block
-        # indefinitely (`/dev/zero` never reaches EOF), and a separate
-        # `stat()`-then-`read_bytes()` pair would leave a TOCTOU window
-        # between the check and the read -- hanging or OOM-killing server
-        # boot, or reading through a swapped-in symlink, instead of
-        # degrading to `phase4c_unresolvable` like every other
-        # unreadable-path case here.
-        phase4c_content = read_regular_file_no_follow(
-            phase4c_path, max_bytes=_MAX_EVIDENCE_INPUT_BYTES
-        )
-        if phase4c_content is None:
-            return replace(identity, reason="phase4c_unresolvable")
-        actual_hash = hashlib.sha256(phase4c_content).hexdigest()
-        if actual_hash != phase4c_hash:
-            return replace(identity, reason="phase4c_mismatch")
-        # The declared top-level hash and the `inputs.phase4c` binding are two
-        # records of the same artifact; disagreement means the manifest was
-        # assembled from mismatched parts.
-        phase4c_entry = manifest["inputs"].get("phase4c")
-        if not isinstance(phase4c_entry, Mapping) or phase4c_entry.get("sha256") != phase4c_hash:
-            return replace(identity, reason="phase4c_binding_mismatch")
-
-    return replace(identity, promotion_eligible=True, reason=None)
 
 
 def _registered_policy_labels(kwargs: dict[str, object], field_name: str) -> tuple[str, ...]:
@@ -1602,15 +1239,13 @@ def load_config(
         if env_name in values:
             kwargs[field_name] = _parse_strict_bool(values[env_name], field=env_name)
     # Membership, not truthiness: `__post_init__` rejects an empty
-    # `early_ack_text`/`promotion_manifest_path`/`release_version`, and the
-    # identity fields treat empty as unbound. A walrus-truthiness check
-    # silently swallowed an explicitly-empty operator setting and substituted
-    # the default, so the validation could never fire. This matches the
-    # membership pattern the boolean flags above already use.
+    # `early_ack_text`/`release_version`, and the identity fields treat empty
+    # as unbound. A walrus-truthiness check silently swallowed an
+    # explicitly-empty operator setting and substituted the default, so the
+    # validation could never fire. This matches the membership pattern the
+    # boolean flags above already use.
     for env_name, field_name in (
         ("WEBSEARCH_EARLY_ACK_TEXT", "early_ack_text"),
-        ("WEBSEARCH_PROMOTION_MANIFEST_PATH", "promotion_manifest_path"),
-        ("WEBSEARCH_PHASE4C_ARTIFACT_PATH", "phase4c_artifact_path"),
         ("WEBSEARCH_RELEASE_VERSION", "release_version"),
         ("PIPECAT_SOURCE_COMMIT", "source_commit"),
         ("PIPECAT_SOURCE_TREE_HASH", "source_tree_hash"),
@@ -1744,10 +1379,6 @@ def _load_toml_values(values: dict[str, object], document: Mapping[str, object])
         # promotion manifest's release_version bind check compared against the
         # wrong identity.
         values["WEBSEARCH_RELEASE_VERSION"] = features["release_version"]
-    if "promotion_manifest_path" in features:
-        values["WEBSEARCH_PROMOTION_MANIFEST_PATH"] = features["promotion_manifest_path"]
-    if "phase4c_artifact_path" in features:
-        values["WEBSEARCH_PHASE4C_ARTIFACT_PATH"] = features["phase4c_artifact_path"]
     if "stt_service" in stt:
         values["WEBSEARCH_STT_SERVICE"] = stt["stt_service"]
     if "provider" in stt:

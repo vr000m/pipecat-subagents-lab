@@ -36,7 +36,7 @@ from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.base_worker import WorkerParams
 
 from .composition import build_session_host
-from .config import Config, load_config, load_promotion_manifest
+from .config import Config, load_config
 from .contracts import CONTRACT_VERSION, SnapshotHandshake
 from .frames import SnapshotBarrierFlushFrame
 from .observers import ProjectedEvent, SnapshotBarrier
@@ -743,24 +743,19 @@ def _default_session_host(
     Delegates the registry/router/coordinator/host wiring to
     ``server.composition.build_session_host()`` -- the single composition
     root also used by ``scripts.eval_common.build_session_for_run()`` -- and
-    layers only this call site's own concerns (STT/TTS creation, the
-    promotion manifest load) on top. See ``server/composition.py``'s module
-    docstring for why this used to be two independently-maintained wiring
-    call sites (round 5, Architecture lens finding 1).
+    layers only this call site's own concerns (STT/TTS creation) on top. See
+    ``server/composition.py``'s module docstring for why this used to be two
+    independently-maintained wiring call sites (round 5, Architecture lens
+    finding 1).
     """
     config = load_config()
     stt = create_stt(config)
     tts = create_tts(config)
-    # Resolved once per host, exactly like FeaturePolicy.from_config: a
-    # missing/unreadable/ineligible manifest degrades to display-only rather
-    # than raising, so this never blocks server boot.
-    promotion_manifest = load_promotion_manifest(config)
     return build_session_host(
         config,
         router=router,
         router_responses_factory=router_responses_factory,
         measurement_sink=measurement_sink,
-        promotion_manifest=promotion_manifest,
         stt=stt,
         tts=tts,
     )

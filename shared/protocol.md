@@ -257,11 +257,12 @@ boundary closes; browser SDK transcript callbacks are not authoritative state.
 - `routing-decision.json` defines the internal router-to-dispatch decision.
 - `work-item-event.json` and `interruption-event.json` reserve deferred
   lifecycle contracts and are not emitted by v1.0.
-- `v013-evidence.json`, `v013-query-context-raw.json`,
-  `v013-query-context-post-change-analysis.json`, and
-  `v013-transport-browser-contract.json` are Phase 4 evidence-gate
-  artifacts, validated by `scripts/validate_v013_evidence.py` and
-  siblings; they are internal analysis inputs, not a wire boundary.
+- `v013-evidence.json` and `v013-transport-browser-contract.json` are Phase 4
+  evidence-gate artifacts, validated by `scripts/validate_v013_evidence.py`
+  and siblings; they are internal analysis inputs, not a wire boundary. The
+  query-context-narrowing schemas that used to live alongside these were
+  retired along with the promotion-manifest chain (see
+  docs/dev_plans/20260824-feature-query-context-promotion.md).
 - `work-status-retention.json` defines the shared TTL and max-keys retention
   bounds for the "Progressive work status" section above; `server/session_state.py`
   and `web/src/state.js` both load it rather than hardcoding independently.
@@ -272,24 +273,15 @@ snapshot is sent; old callbacks may append an immutable canonical result tied
 to their originating turn but cannot mutate active state or autoplay.
 
 A retained result is committed exactly once regardless of its delivery
-disposition. When `enable_autoplay_policy` is disabled, every valid,
-still-active-epoch, non-cancelled result on a speakable connection is
-enqueued and spoken (the pre-v0.1.3 behavior, unconditionally). When
-`enable_autoplay_policy` is enabled (the default), `spoken_text` is enqueued
-and follows the normal speech-progress state machine only when *all* of the
-following hold: the loaded promotion manifest is schema-valid *and*
-`promotion_eligible` (schema validity alone never proves promotion-eligible
--- see the v0.1.3 dev plan's Phase 2 evidence-gate predicate), the
-originating epoch is still active, no newer semantic turn has been accepted
-since the result's work was dispatched, and no explicit pause is in effect.
-Any predicate failing -- including cancelled work, an old epoch, a
-disconnected session, a connection without TTS, or evidence that is
-missing/blocked/unavailable-only/malformed/not promotion-eligible -- commits
-the result display-only and never creates a speech attempt. As of v0.1.3's
-initial release, autoplay promotion is expected ineligible (no shipped
-manifest carries complete real provider/model evidence plus verified browser
-audibility), so the policy defaults to display-only in practice even though
-the mechanism itself is on by default.
+disposition. A late result's disposition is now unconditionally
+`display_only`, for both values of `enable_autoplay_policy`: the
+query-context-narrowing promotion experiment that used to gate autoplay for
+a still-active-epoch, non-cancelled, unpaused result was retired without
+ever demonstrating eligibility (`promotion_eligible=false` shipped in
+v0.1.3; see
+docs/dev_plans/20260824-feature-query-context-promotion.md), so autoplay of
+a late result is structurally unreachable. The result is always committed
+display-only and never creates a speech attempt.
 
 ## Verified Pipecat 1.6.0 seam notes
 

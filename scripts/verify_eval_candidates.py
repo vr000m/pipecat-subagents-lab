@@ -398,10 +398,11 @@ def probe_judge(judge_model: str, api_key: str | None) -> ProbeResult:
 
 # _resolve_openai_api_key() hoisted to scripts/eval_common.py's
 # resolve_openai_api_key() (round 9 confirm pass 6, Architecture Minor) -- it
-# had been copied into scripts/run_query_context_experiment.py's live gate,
-# with a comment cross-referencing this one instead of sharing code, and the
-# dev plan describes it as the template a third live path would copy. One
-# definition now backs all of them.
+# had been copied into the query-context experiment's live gate (that
+# script was later retired in full, see
+# docs/dev_plans/20260824-feature-query-context-promotion.md), with a
+# comment cross-referencing this one instead of sharing code. One
+# definition now backs the remaining live paths.
 
 
 def run_verification(*, judge_model: str) -> tuple[list[ProbeResult], float]:

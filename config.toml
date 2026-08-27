@@ -49,12 +49,16 @@ worker_reasoning_effort = "medium"
 # override these values. Defaults below mirror server/config.py.
 enable_early_ack = true
 enable_background_status = true
+# Retained-for-fingerprint-stability: the query-context promotion chain this
+# flag used to gate was retired (see
+# docs/dev_plans/20260824-feature-query-context-promotion.md), so this flag
+# no longer has a behavioural consumer -- late-result disposition is now
+# unconditionally display-only regardless of this value. It survives only
+# because dropping it from feature_policy_fingerprint (server/config.py)
+# would change the fingerprint and break the frozen-manifest drift gate
+# (docs/benchmarks/v0.1.3-promotion-manifest.json).
 enable_autoplay_policy = true
 early_ack_text = "One moment while I look into that."
-promotion_manifest_path = "docs/benchmarks/v0.1.3-promotion-manifest.json"
-# phase4c_artifact_path default is unset; uncomment and set a path to enable
-# manifest verification against the Phase 4C completion artifact's SHA-256.
-# phase4c_artifact_path = "docs/benchmarks/v0.1.3-phase4c-artifact.json"
 
 [tts]
 provider = "local" # local | cartesia

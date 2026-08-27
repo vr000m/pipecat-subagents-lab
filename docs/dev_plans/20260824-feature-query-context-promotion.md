@@ -192,7 +192,7 @@ If the operator chooses invest at Phase 1, the follow-up plan must cover, at min
 
 - [x] Phase 0: Feasibility pre-flight (no material paid spend)
 - [x] Phase 1: Decision checkpoint (escalation)
-- [ ] Phase 2: Retire — fail-closed gate replacement, then full-chain removal
+- [x] Phase 2: Retire — fail-closed gate replacement, then full-chain removal
 - [ ] Phase 3: Docs + program closure
 
 ## Findings
@@ -269,3 +269,49 @@ removal. This decision also satisfies the P2 plan's Phase 2 gate
 ("P1's Phase 1 decision is recorded"): P2 Phase 2 must now wait for this
 plan's retire commit to land (it deletes the `server/pipeline.py:2837` gate
 region P2 rewrites).
+
+### Phase 2 outcome (2026-08-27)
+
+**Retire executed as full-chain removal.** Regression test
+`tests/test_session_host.py::test_late_result_disposition_is_unconditionally_display_only`
+pins the disposition to `"display_only"` under both `enable_autoplay_policy`
+values and regardless of manifest state (note: the code literal is
+`"display_only"`; the plan's `commit_display_only` names the
+committed-as-display-only concept). `_late_result_disposition` is now
+unconditional; the legacy fail-open branch and every promotion predicate are
+gone; the dead autoplay consumer arm in `commit_late_result_once` was
+collapsed too (advisory-review finding). Deleted: the four experiment
+scripts, both query-context schemas, `load_promotion_manifest`/
+`PromotionManifest` and all consumers, the config.toml manifest keys, and
+`tests/test_query_context_latency.py`/`tests/test_v013_phase4c_manifest.py`.
+`docs/benchmarks/` untouched (frozen v0.1.3 records).
+
+**Residual-validator decision (checklist bullet 4): KEEP `--verify-manifest`**
+as a read-only historical drift validator of the frozen committed manifest —
+it remains live in the ci.yml `promotion-manifest-drift` job and the justfile
+recipe (both already converted to read-only by merged P3 Phase 2). The
+`--write-manifest` path and all phase4c validation are deleted;
+`phase4c_artifact_sha256` / `inputs.phase4c` now draw an explicit
+"no longer a supported input" drift rejection rather than silent fall-through.
+
+**Advisory review (opus): 3 Important, 5 Minor — all fixed pre-commit.**
+Important: (1) dead autoplay arm in `commit_late_result_once` collapsed;
+(2) drift-gate negative-path coverage rebuilt writer-free (7 new tests from
+mutated in-memory copies of the committed manifest, plus a
+verify-writes-nothing byte-comparison) and `confined_evidence_input_path`
+rejection tests restored — which surfaced a real gap: empty-string paths were
+not rejected (resolved to the confinement root, a directory); root-caused
+with an explicit empty-path guard in `scripts/evidence_common.py`;
+(3) still-live `test_config.py` coverage restored (release_version plumbing,
+env reach-validation, FeaturePolicy equality; 6 tests). Minor fixes: renamed
+the stale flag-off regression test in `test_app.py`; documented
+`enable_autoplay_policy` in config.toml as retained-for-fingerprint-stability
+only (removing it from `feature_policy_fingerprint` would break the frozen
+drift gate — do not delete the flag); reworded all stale references to the
+deleted writer/loader in the validator, `evidence_common.py`, and ci.yml
+(drift remedy is now "revert the evidence edit; the writer is retired").
+
+Gate at boundary: 1842 passed + 1 skipped (pre-existing release-finalization
+guard, not an importorskip remnant), ruff format/check clean, mypy clean
+(54 files), `smoke_server.py` passed, `--verify-manifest` OK against the
+committed manifest.

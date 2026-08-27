@@ -15,7 +15,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pydantic import ValidationError
 
-from .config import Config, FeaturePolicy, PromotionManifest
+from .config import Config, FeaturePolicy
 from .connection_arbiter import ConnectionArbiter
 from .contracts import (
     GroundedResult,
@@ -605,7 +605,6 @@ class SessionHost:
         measurement_sink: MeasurementSink | None = None,
         config: Config | None = None,
         feature_policy: FeaturePolicy | None = None,
-        promotion_manifest: PromotionManifest | None = None,
     ) -> None:
         self.state = SessionState()
         self.arbiter = ConnectionArbiter(self.state.session_id, self.state.resume_token)
@@ -661,14 +660,6 @@ class SessionHost:
         # kill switch is flipped after construction.
         self._work_status_publisher = WorkStatusPublisher(
             state=self.state, feature_policy=lambda: self.feature_policy
-        )
-        # The immutable evidence-gate verdict handed in by _default_session_host
-        # (via server.config.load_promotion_manifest); missing/None is treated
-        # exactly like a manifest that failed to load -- fail-closed to
-        # display-only, never a boot-time error.
-        self._promotion_manifest = promotion_manifest
-        self._promotion_eligible: bool = bool(
-            promotion_manifest is not None and promotion_manifest.promotion_eligible
         )
         self._runner_supervisor = RunnerSupervisor(runner_factory=runner_factory)
         self.stt, self.tts = stt, tts
@@ -2819,38 +2810,27 @@ class SessionHost:
     def _late_result_disposition(
         self, context: LateDeliveryContext, *, origin: ConnectionPipeline
     ) -> LateDeliveryDisposition:
-        """Autoplay-vs-display-only verdict for one still-committable late result.
+        """Verdict for one still-committable late result: always display-only.
 
-        ``enable_autoplay_policy=False`` is the strict rollback path: every
-        valid, non-cancelled result on its still-active connection is
-        spoken, exactly reproducing pre-v0.1.3 behavior. When the policy is
-        enabled, autoplay requires *all* of: promotion-eligible evidence
-        (schema validity alone is never sufficient -- see
-        ``server.config.load_promotion_manifest``), the originating epoch
-        still active, no newer same-epoch turn accepted since dispatch, and
-        no explicit pause in effect. Any predicate failing degrades to
-        ``"display_only"``; the result was already committed exactly once
-        by the caller regardless of this verdict.
+        The query-context-narrowing promotion experiment that used to gate
+        this decision was retired (never demonstrated eligible in v0.1.3;
+        see docs/dev_plans/20260824-feature-query-context-promotion.md) --
+        autoplay of a late result is now structurally unreachable, including
+        the legacy ``enable_autoplay_policy=False`` rollback path that used
+        to bypass every gate below and return ``"autoplay"`` outright. The
+        result was already committed exactly once by the caller regardless
+        of this verdict.
         """
-        if not self.feature_policy.enable_autoplay_policy:
-            return "autoplay"
-        if not self._promotion_eligible:
-            return "display_only"
-        if context.origin_epoch != origin.epoch:
-            return "display_only"
-        if self._turn_sequence != context.accepted_turn_sequence:
-            return "display_only"
-        if origin.scheduler.paused() is not None:
-            return "display_only"
-        return "autoplay"
+        return "display_only"
 
     async def commit_late_result_once(self, context: LateDeliveryContext, late: LateResult) -> None:
         """The sole host-owned atomic API for a coordinator late-result callback.
 
         Commits every valid result exactly once and separately computes the
-        autoplay-vs-display-only delivery disposition; a valid commit on an
-        otherwise-speakable connection additionally consults
-        ``_late_result_disposition`` before enqueuing speech.
+        delivery disposition, which is unconditionally display-only
+        (``_late_result_disposition``, retained as a directly-tested
+        regression pin; the autoplay alternative it used to select between
+        was retired).
 
         Branch precedence is: worker error, then the three structural
         fences -- not a ``GroundedResult``, foreign ``origin_epoch``,
@@ -3049,55 +3029,25 @@ class SessionHost:
                     work_outcome, commit_outcome = "completed", "committed"
                     result_id = result.result_id
                     if speakable is not None:
-                        # Exactly-once commit is already done above; this
-                        # verdict only decides whether the committed result
-                        # is additionally spoken. A committed-but-not-spoken
-                        # result is still a fully valid, terminal outcome.
-                        policy_disposition = self._late_result_disposition(
-                            context, origin=speakable
-                        )
+                        # Exactly-once commit is already done above; the
+                        # committed-but-not-spoken result is the only
+                        # reachable terminal outcome now that
+                        # ``_late_result_disposition`` is unconditionally
+                        # "display_only" (the query-context-narrowing
+                        # promotion experiment that used to gate an
+                        # "autoplay" alternative here was retired; see
+                        # docs/dev_plans/20260824-feature-query-context-promotion.md).
                         # A retained result supersedes only its own queued
                         # timeout notice, not other same-work queued speech,
                         # and never an utterance already admitted to the
-                        # transport slot. This must run regardless of which
-                        # branch below is taken -- a display-only verdict
-                        # still leaves a still-queued (not yet admitted)
-                        # "taking longer" notice stale once the real result
-                        # has committed, and it would otherwise be spoken
-                        # later.
+                        # transport slot -- this must still run
+                        # unconditionally, since a still-queued (not yet
+                        # admitted) "taking longer" notice goes stale once
+                        # the real result has committed and would otherwise
+                        # be spoken later.
                         speakable.scheduler.discard_queued_notice(late.work_item_id)
-                        if policy_disposition == "display_only":
-                            delivery_disposition = "display_only"
-                            speech_outcome = "not_applicable"
-                        else:
-                            delivery_disposition = "autoplay"
-                            # The canonical result is committing now, so this
-                            # turn's queued ack (if any) is stale as of this
-                            # point -- settle it before admission instead of
-                            # relying on the `finally` block below, which only
-                            # runs after `start_next()` has already had a
-                            # chance to admit the stale ack from the queue.
-                            self._settle_turn_ack(speakable.scheduler, context.turn_id)
-                            try:
-                                speakable.scheduler.enqueue(
-                                    result_id=result.result_id,
-                                    work_item_id=late.work_item_id,
-                                    run_id=f"run-{result.turn_id}",
-                                    text=result.spoken_text,
-                                    origin_epoch=origin_epoch,
-                                    role=ROLE_RESULT,
-                                )
-                            except Exception as exc:  # noqa: BLE001 - preserves existing enqueue-failure re-raise behavior
-                                speech_outcome = "enqueue_failed"
-                                pending_exception = exc
-                            else:
-                                try:
-                                    await speakable.scheduler.start_next(late.work_item_id)
-                                except Exception as exc:  # noqa: BLE001 - preserves existing start-failure re-raise behavior
-                                    speech_outcome = "start_failed"
-                                    pending_exception = exc
-                                else:
-                                    speech_outcome = "queued"
+                        delivery_disposition = "display_only"
+                        speech_outcome = "not_applicable"
                     else:
                         delivery_disposition = "display_only"
         finally:

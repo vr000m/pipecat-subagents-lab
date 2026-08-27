@@ -84,13 +84,20 @@ jobs:
   # This job used to WRITE the manifest with --write-manifest --output
   # docs/benchmarks/v0.1.3-promotion-manifest.json and end there -- no commit,
   # no actions/upload-artifact, no deploy step, and `permissions: contents:
-  # read` so it could not have pushed one anyway. The consumer,
-  # server/config.py's load_promotion_manifest, reads the repo-committed file.
+  # read` so it could not have pushed one anyway. The consumer at the time,
+  # server/config.py's load_promotion_manifest, read the repo-committed file.
   # So the generated manifest went into an ephemeral workspace and was
   # discarded: producer and consumer were never connected, and the job proved
   # nothing (round-3 restart gauntlet, Architecture finding). Worse, it wrote a
   # *provisional* manifest over the path holding a *final* one, so had the
   # write ever been delivered it would have downgraded the committed manifest.
+  # Both the writer (`--write-manifest`) and that runtime consumer
+  # (`load_promotion_manifest`) are now retired along with the rest of the
+  # query-context promotion chain -- see
+  # docs/dev_plans/20260824-feature-query-context-promotion.md -- so the
+  # committed manifest is a frozen v0.1.3 release record with no consumer
+  # left to bind against; `promotion-manifest-drift` below exists purely to
+  # keep that frozen record honest against the evidence it still cites.
   #
   # Verification (see `promotion-manifest-drift`) is the conservative remedy:
   # it proves something real about the file the consumer actually reads (input
@@ -130,11 +137,13 @@ jobs:
   # push-to-main (round-4 confirm pass, Security finding). While this was a
   # step inside that job it only ever ran post-merge, so a pull request
   # editing the manifest or any evidence artifact merged before the gate
-  # protecting the file `load_promotion_manifest` consumes had executed --
-  # and the documented fix for a failure here ("regenerate with
-  # --write-manifest locally and commit") is a human step that cannot happen
-  # after the merge. Its trigger scope is a security property, not a cost
-  # optimisation.
+  # protecting the frozen manifest file had executed -- and there is no
+  # remedy that can run after the merge: the writer (`--write-manifest`) is
+  # retired along with the rest of the query-context promotion chain (see
+  # docs/dev_plans/20260824-feature-query-context-promotion.md), so the only
+  # remedy for a failure here is reverting the evidence/manifest edit, which
+  # is a human step that cannot happen after the merge either. Its trigger
+  # scope is a security property, not a cost optimisation.
   #
   # The verify step is read-only and needs no release-identity env, which is
   # why it can run on the pull_request trigger while the metadata derivation
