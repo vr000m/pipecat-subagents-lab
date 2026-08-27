@@ -32,6 +32,8 @@ from uuid import uuid4
 from pipecat.frames.frames import SystemFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from .task_retention import retain_until_done
+
 
 class GenerationPhase(str, Enum):
     ADMITTED = "admitted"
@@ -792,9 +794,7 @@ class SpeechLifecycleCoordinator:
         except RuntimeError:
             coroutine.close()
             return None
-        self._transition_tasks.add(future)
-        future.add_done_callback(self._transition_tasks.discard)
-        return future
+        return retain_until_done(future, self._transition_tasks)
 
     async def _on_start_timeout(self, token: str) -> None:
         await self._begin_delivery_unknown(token)
