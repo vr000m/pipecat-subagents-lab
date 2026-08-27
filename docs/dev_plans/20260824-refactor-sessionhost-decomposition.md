@@ -188,7 +188,7 @@ Dependency direction: new modules import from collaborators, never back into
 - [x] Phase 2: connect() + ConnectionPipeline extraction
 - [x] Phase 3: Config/boundary consolidation
 - [x] Phase 4: Ack-latch race — verify, then fix
-- [ ] Phase 5: Fire-and-forget helper
+- [x] Phase 5: Fire-and-forget helper
 - [ ] Phase 6: Facade collapse
 
 ## Findings
@@ -341,3 +341,21 @@ Doubles mechanism decision: **Protocol** (reuse of existing `server.work_item_co
 - Regression pin: new deterministic test `tests/test_session_host.py::test_stale_ack_admission_retry_recognizes_a_newer_chain_under_the_same_key` drives the full interleaving (chain A latch → fail → settle → chain B latch+admit → chain A's stale retry fires) and asserts chain A never re-enters start_next and chain B's admitted ack survives.
 - Non-vacuity evidence: with both generation early-return guards temporarily disabled (`if False: return`), the test fails exactly as the round-10 finding describes (stale retry re-enters start_next, exhausts the busy-slot chain, abandons the ack); server/turn_ack_ledger.py then reverted byte-identical (`git diff` empty). No production code changed in the final state.
 - Gate: 1870 passed + 1 skipped (baseline +1 new pin), ruff format/check clean, bare mypy clean.
+
+### Phase 5 inventory & outcome (2026-08-27): fire-and-forget helper
+
+Execution-time inventory (`rg -n 'add_done_callback' server/`): 22 hits across 10 files (no drift from the 2026-08-25 count).
+
+**Converted (13 sites, 7 files → `retain_until_done`):** observers.py:189 `_emit_tasks`; pipeline.py:1039 `_background_shutdowns`; speech_lifecycle.py:796 `_transition_tasks`; speech_scheduler.py:145 `_stop_tasks`, :517 `_advance_tasks`; turn_ack_ledger.py:585/:638 `_ack_admission_tasks` (retry + admit chains); turns.py:92 `_dispatch_tasks`, :151 `_completion_tasks`; work_item_coordinator.py:567 `_owned_tasks`, :592 `_mandatory_tasks`, :597 `_cancelling_tasks` (via `on_done=_consume_task_exception`, preserving discard-then-consume ordering), :1111 `_submit_tasks`.
+
+**Excluded with reason (9 sites, 5 files):** app.py:720 (pure exception-observation, no retention set — "tracked, not fire-and-forget"); pipeline.py:3307 (cancel-then-retrieve idiom, the plan's named exclusion — line drifted from cited ~3421 via earlier phases); runner_supervisor.py:121 (identity-guarded dict cleanup; unconditional discard would evict a newer registration); work_item_coordinator.py:637 and :825 (dual set+ordered-deque retention via `_discard_ordered_task`, plus bespoke handling); :846 (shutdown cancel-then-retrieve sweep); :1113 (`_work_task_cleanup` closure — separate per-work-item dict cleanup registered alongside the converted `_submit_tasks` discard); work_task_ledger.py:84 (nested dict-of-sets with empty-bucket pop); :99 (identity-guarded dict assignment + known/cancelled-ids side effects).
+
+**Grep-zero exit check:** post-conversion `rg -n 'add_done_callback' server/` = 13 hits = 4 in task_retention.py itself (1 docstring + 3 implementation) + the 9 allowlisted exclusions, one-for-one. No hand-rolled add/discard retention idiom remains outside the helper.
+
+**Helper:** `server/task_retention.py::retain_until_done(task, tracking, *, on_done=None)` — leaf module, no server imports; generic over Task/Future (TypeVar bound `asyncio.Future[Any]`); adds before registration exactly as the old sites did; `on_done` runs after the discard. 8 pin tests in tests/test_task_retention.py (retention/discard/exception/on_done-ordering/Future-input/Task-input/idempotent-discard/cancellation-observation).
+
+**Advisory review (opus):** verified per-site behavior equivalence for all 13 conversions (no identity-vs-argument mismatches; callback registration order preserved incl. the :1112 second callback; unobserved-exception semantics unchanged where no observation existed) and the 9 exclusions as genuinely non-plain shapes. Findings resolved: inventory recorded here (Important); cancellation pin test added + one test renamed to match its body (Minors). **Knowingly-accepted non-observable difference (Requirement 9 note):** the old `_adopt_task`/`_track_cancelling_task` closures held a strong ref to the coordinator via `self`; the helper's callbacks reference only the tracking set, so an in-flight task no longer keeps its coordinator alive on its own — accepted because SessionHost strongly holds the coordinator in every production path.
+
+**Commits:** helper+tests 27a9b20, then one conversion commit per file (9e91ade, c7bb143, 6d05aca, 2c4a74a, 368ac64, 74a0f08, 91db5ef) per the plan's one-commit-each item.
+
+**Gate:** 1878 passed + 1 skipped (baseline 1870 + 8 helper tests), ruff format/check clean, bare mypy clean.
