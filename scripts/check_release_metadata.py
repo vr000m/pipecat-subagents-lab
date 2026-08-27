@@ -25,9 +25,11 @@ import yaml
 
 from scripts.evidence_common import REPO_ROOT, EvidenceGateError, read_bytes_no_follow
 
-#: The CI job whose step command this script pins to the current release
-#: version. Named once: the error messages and the lookup must not drift.
+#: The CI job whose step command this script pins to the one historical
+#: promotion manifest that remains in the repository. Named once: the error
+#: messages and the lookup must not drift.
 _MANIFEST_DRIFT_JOB = "promotion-manifest-drift"
+_FROZEN_PROMOTION_MANIFEST = "docs/benchmarks/v0.1.3-promotion-manifest.json"
 
 # The date group requires an actual `YYYY-MM-DD` token, not merely
 # `(\S+)`: this repo's own CHANGELOG.md convention (see every dated heading
@@ -397,21 +399,15 @@ def _conditional_needs_ancestor(jobs: Mapping[str, object], job_name: str) -> st
     return None
 
 
-def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version: str) -> None:
-    """Assert ``.github/workflows/ci.yml``'s ``promotion-manifest-drift`` job
-    still points at the manifest for the CURRENT release version.
+def check_ci_uses_frozen_promotion_manifest(ci_yml_path: Path) -> None:
+    """Assert CI still verifies the frozen v0.1.3 promotion manifest.
 
     ``check_no_hardcoded_version_literals`` above forbids scripts/ from
     hand-maintaining a copy of the version at all, because scripts/ can
-    always derive it dynamically instead. ci.yml cannot: the manifest path
-    (``docs/benchmarks/v{version}-promotion-manifest.json``) names a real,
-    checked-in file, so a literal is the only option and that scan is scoped
-    to ``scripts/*.py`` and never looked at ci.yml (round-5 restart,
-    Architecture finding #11). What this checks instead is that the literal
-    stays in sync with the version pyproject.toml/CHANGELOG.md just agreed
-    on: on a version bump that renames the committed manifest but forgets to
-    update ci.yml (or vice versa), this fails loudly instead of ci.yml
-    silently keeping the previous release's manifest green.
+    always derive it dynamically instead. The historical manifest path is
+    intentionally a literal: it names the one checked-in v0.1.3 record and
+    must remain unchanged when a later release bumps
+    ``pyproject.toml``/``CHANGELOG.md``.
 
     The workflow is PARSED, and the expected path looked for in the
     ``promotion-manifest-drift`` job's own step commands. A whole-file
@@ -510,7 +506,7 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
             "off while this gate stays green"
         )
     steps = job.get("steps")
-    expected = f"docs/benchmarks/v{version}-promotion-manifest.json"
+    expected = _FROZEN_PROMOTION_MANIFEST
     matching = [
         step
         for step in (steps if isinstance(steps, list) else [])
@@ -522,9 +518,7 @@ def check_ci_promotion_manifest_path_matches_version(ci_yml_path: Path, version:
         raise ReleaseMetadataError(
             f"{ci_yml_path}: no `{_MANIFEST_DRIFT_JOB}` step runs "
             f"{_MANIFEST_VERIFIER!r} with {_VERIFY_MANIFEST_FLAG} against {expected!r} -- "
-            "either the release version changed without updating the manifest path here "
-            "(and renaming/regenerating the committed manifest file to match), or the "
-            "step that actually verifies it is gone"
+            "the frozen historical-record check is gone or points at a different file"
         )
     # One step that is neither conditional nor continue-on-error is enough; a
     # *sibling* step may legitimately carry either. Only a roster where every
@@ -568,7 +562,7 @@ def check(
     # callers that only care about pyproject/CHANGELOG agreement omit it and
     # this step is skipped.
     if ci_yml_path is not None:
-        check_ci_promotion_manifest_path_matches_version(ci_yml_path, pyproject_version)
+        check_ci_uses_frozen_promotion_manifest(ci_yml_path)
     return pyproject_version
 
 

@@ -210,9 +210,7 @@ def _qualified_commands_from_steps(steps: list[dict]) -> set[tuple[str, str]]:
 # A job is excluded only when its `if:` explicitly restricts it to the
 # push-to-main event -- i.e. it cannot run on `pull_request` and is
 # therefore not a merge gate a developer needs to reproduce locally before
-# opening a PR. `release-metadata` is the only such job today
-# (`if: github.event_name == 'push' && github.ref == 'refs/heads/main'`);
-# everything else -- including jobs added later with no `if:` at all --
+# opening a PR. Everything else -- including jobs added later with no `if:` at all --
 # defaults to IN scope, which is the fail-safe direction (round-5 restart,
 # Architecture finding #7).
 _PUSH_TO_MAIN_ONLY_MARKER = "event_name == 'push'"
@@ -275,9 +273,10 @@ def test_promotion_manifest_drift_job_is_covered_by_the_parity_check() -> None:
     assert "promotion-manifest-drift" in _pull_request_job_names(data)
 
 
-def test_release_metadata_job_is_excluded_as_push_to_main_only() -> None:
+def test_retired_release_metadata_job_is_absent() -> None:
     data = yaml.safe_load(_CI_YML.read_text())
-    assert "release-metadata" not in _pull_request_job_names(data)
+    assert "release-metadata" not in data["jobs"]
+    assert "emit_v013_deployment_metadata.py" not in _CI_YML.read_text()
 
 
 def test_a_job_with_no_if_defaults_to_in_scope() -> None:

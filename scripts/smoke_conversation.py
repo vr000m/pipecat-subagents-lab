@@ -83,7 +83,7 @@ async def _run_child(
     ack_ordering: bool,
     max_ack_seconds: float,
 ) -> dict[str, Any]:
-    from server.config import load_config, load_promotion_manifest
+    from server.config import load_config
     from server.perf_metrics import CollectingMeasurementSink
 
     sink = CollectingMeasurementSink()
@@ -107,14 +107,6 @@ async def _run_child(
             max_latency_seconds + 15,
         ),
     )
-    # Mirrors server/app.py's own _default_session_host() wiring: without this,
-    # SessionHost._promotion_eligible is permanently False for every host this
-    # helper builds (build_session_for_run()'s promotion_manifest defaults to
-    # None), which silently forces late_delivery_disposition() onto its
-    # "display_only" branch regardless of the real manifest -- this smoke's
-    # ack-ordering scenario is the live acceptance test for that predicate, so
-    # it must see the real disposition, not a hardcoded fallback.
-    promotion_manifest = load_promotion_manifest(tuned)
     # The single-turn and routing-regression scenarios don't exercise speech
     # at all, so they build with TTS disabled; only ack-ordering needs the
     # recording TTS wired in (bound at construction -- see _RecordingTTS's
@@ -122,7 +114,6 @@ async def _run_child(
     host = build_session_for_run(
         tuned,
         measurement_sink=sink,
-        promotion_manifest=promotion_manifest,
         tts=_RecordingTTS() if ack_ordering else None,
     )
     # This smoke isolates the paid semantic path. Browser media and local

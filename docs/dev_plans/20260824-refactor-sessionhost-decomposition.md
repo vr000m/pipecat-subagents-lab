@@ -128,9 +128,9 @@ Dependency direction: new modules import from collaborators, never back into
 **Test files:** tests/test_config.py, tests/test_work_item_coordinator.py, tests/test_work_status.py
 **Test command:** `uv run pytest -q && uv run ruff check . && uv run mypy .`
 **Validation cmd:** `uv run python scripts/smoke_server.py`
-**Goal:** The coordinator-boundary question decided in the open, promotion-manifest logic out of config.py (via whichever P1 branch), and the OWNED_CONFIG_FIELDS + client-eviction items decided rather than deferred a sixth time.
+**Goal:** The coordinator-boundary question decided in the open, and the OWNED_CONFIG_FIELDS + client-eviction items decided rather than deferred a sixth time.
 
-- [ ] Promotion-manifest logic in `config.py`, by P1 outcome (decision recorded before this phase per the Phase 2 gate): **retire** → deleted by P1's landed commit, this bullet drops; **invest** → extract to `server/promotion_manifest.py` (callers update imports, `config.py` re-exports nothing); **blocked/escalated** → hold this bullet, proceed with the rest of the phase. Rebase note: P3 Phase 1 edited `server/config.py:1689-1716` (landed 60e0f36) — land order per program matrix.
+> **Dropped (superseded):** Promotion-manifest logic in `config.py`, by P1 outcome — P1 retired the machinery outright (commit `c67da7f`); `load_promotion_manifest`/`PromotionManifest` and all consumers are deleted, so there is nothing left in `config.py` to extract. This bullet drops. Rebase note: P3 Phase 1 edited `server/config.py:1689-1716` (landed 60e0f36) — land order per program matrix.
 - [ ] Re-litigate the four-declaration boundary pin in the open (Requirement 1): enumerate current call sites for all four declarations; argue collapse from the Phase 0 doubles (roster frozenset + pinning test updated in the same commit) or re-affirm the pin with rationale in Findings. No silent deletion — the "two production-dead" premise was checked and is false.
 - [ ] Decide `_OWNED_CONFIG_FIELDS` strictness (Requirement 5): **if permissive** — pin with rationale comment + pinning test; **if strict** — cite the tests that now enforce strictness via the modernized doubles, and record it as the Requirement 9-sanctioned behavior change.
 - [ ] Verify the client-eviction arrangement (Requirement 8): confirm `shared/work-status-retention.json` + the dual parity tests cover program item 12; record the evidence and close, or name the concrete gap found.
@@ -196,3 +196,20 @@ Dependency direction: new modules import from collaborators, never back into
 ### Review Waivers
 
 (none)
+
+### Phase 3 contract update (2026-08-27)
+
+P1's retire commit (`c67da7f`) deleted `load_promotion_manifest`/
+`PromotionManifest` and all consumers from `server/config.py` outright, so
+Phase 3's "extract promotion-manifest logic to `server/promotion_manifest.py`"
+bullet is dropped as superseded — there is no manifest logic left in
+`config.py` to extract; program row 7 closed as `fixed c67da7f` (machinery
+deleted rather than extracted) rather than via this plan's Phase 3.
+
+This edit intentionally stales this plan's review marker above (last reviewed
+`2026-08-25 @ 55db787a`). This plan is mid-run — Phases 0-1 are already
+completed in its conduct state file — so its next conduct invocation is a
+`--resume`, not an initial run; per conduct's documented resume rule, a
+`--resume` auto-refreshes a stale marker itself, so no manual `/review-plan`
+re-run is needed for this superseded-bullet drop. The marker line itself is
+left untouched here.

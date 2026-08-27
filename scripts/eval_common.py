@@ -49,7 +49,6 @@ from scripts.evidence_common import confined_output_path, write_bytes_no_follow
 from server.composition import build_session_host
 from server.config import (
     Config,
-    PromotionManifest,
     default_reasoning_effort_for_model,
     load_config,
 )
@@ -452,7 +451,6 @@ def build_session_for_run(
     measurement_sink: Any | None = None,
     router_responses_factory: Callable[[], Any] | None = None,
     worker_responses: Any = None,
-    promotion_manifest: PromotionManifest | None = None,
     stt: Any | None = None,
     tts: Any | None = None,
 ) -> SessionHost:
@@ -462,9 +460,8 @@ def build_session_for_run(
     Thin wrapper around ``server.composition.build_session_host()`` -- the
     single composition root also used by ``server.app._default_session_host()``
     (round 5, Architecture lens finding 1) -- see that function's own
-    docstring for the load-bearing rationale (router config-capture, why a
-    post-hoc ``host.config = tuned`` reassignment can't vary it, and the
-    promotion-manifest fail-closed behavior).
+    docstring for the load-bearing rationale (router config-capture and why a
+    post-hoc ``host.config = tuned`` reassignment can't vary it).
 
     Forwards ``router`` (round 9 gauntlet, Architecture lens finding 19) --
     previously silently narrowed out of this wrapper's signature relative to
@@ -483,7 +480,6 @@ def build_session_for_run(
         router_responses_factory=router_responses_factory,
         worker_responses=worker_responses,
         measurement_sink=measurement_sink,
-        promotion_manifest=promotion_manifest,
         stt=stt,
         tts=tts,
     )
@@ -851,10 +847,12 @@ def resolve_openai_api_key() -> str | None:
     -- not a raw ``os.environ["OPENAI_API_KEY"]`` read, which false-negatives
     for an operator whose key only lives in config.toml or an env-file.
 
-    THE shared credential gate: ``scripts/verify_eval_candidates.py`` and
-    ``scripts/run_query_context_experiment.py`` both call this rather than
-    keeping private copies, and a third live path has something to import
-    (round 9 confirm pass 6, Architecture Minor).
+    THE shared credential gate: ``scripts/verify_eval_candidates.py`` calls
+    this rather than keeping a private copy (round 9 confirm pass 6,
+    Architecture Minor). The retired query-context experiment runner was the
+    other caller before its removal (see
+    docs/dev_plans/20260824-feature-query-context-promotion.md); any future
+    live path should import this rather than re-resolving.
     """
     try:
         return load_config().openai_api_key

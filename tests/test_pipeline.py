@@ -26,7 +26,7 @@ import server.app as app_module
 import server.pipeline as pipeline_module
 import server.speech_lifecycle
 from server import work_status_publisher
-from server.config import Config, PromotionManifest
+from server.config import Config
 from server.contracts import GroundedResult, RoutingDecision, WorkerState
 from server.frames import CONNECTION_LOCAL_FRAMES, SnapshotBarrierFlushFrame
 from server.perf_metrics import CollectingMeasurementSink
@@ -916,7 +916,12 @@ def test_natural_clarification_answer_resumes_original_query_on_same_worker() ->
     asyncio.run(run())
 
 
-def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -> None:
+def test_timed_out_pending_search_late_result_commits_display_only_after_active_audio() -> None:
+    """Retire regression: the late result behind a timeout notice always
+    commits (history grows), but -- autoplay being structurally unreachable
+    now -- it is never queued or spoken, regardless of whether the
+    foreground audio has since finished."""
+
     async def run() -> None:
         class SlowWorker(ContinuationResultWorker):
             def __init__(self) -> None:
@@ -962,7 +967,6 @@ def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -
             runner_factory=LifecycleRunner,
             coordinator=coordinator,
             tts=tts,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         coordinator.add_worker_clarification(
             session_id=host.state.session_id,
@@ -992,8 +996,7 @@ def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -
             for progress in host.state.speech.values()
             if progress.result_id == history[-1].result_id
         ]
-        assert len(late_progress) == 1
-        assert late_progress[0].state.value == "queued"
+        assert late_progress == []
         assert sum(isinstance(frame, TTSSpeakFrame) for frame in connection.worker.frames) == 1
 
         assert connection.scheduler.active is not None
@@ -1007,20 +1010,24 @@ def test_timed_out_pending_search_queues_late_speech_once_after_active_audio() -
         spoken_frames = [
             frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
         ]
-        assert len(spoken_frames) == 2
-        assert spoken_frames[-1].text == history[-1].spoken_text
+        assert len(spoken_frames) == 1
         await host.shutdown()
 
     asyncio.run(run())
 
 
-def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None:
+def test_late_result_discards_queued_timeout_notice_but_stays_display_only() -> None:
+    """Retire regression: a still-queued timeout notice is discarded once its
+    real result commits (this runs unconditionally, independent of the
+    late-result disposition), but -- autoplay being structurally
+    unreachable -- the committed final result itself is never queued or
+    spoken."""
+
     async def run() -> None:
         tts = FakeTTS()
         host = SessionHost(
             runner_factory=LifecycleRunner,
             tts=tts,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
@@ -1072,9 +1079,7 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
         assert connection.scheduler.active is not None
         assert connection.scheduler.active.item == active
         assert host.state.speech[stale.utterance_id].state.value == "interrupted"
-        queued = connection.scheduler._queues["work-turn-sf"]
-        assert len(queued) == 1
-        assert queued[0].result_id == final.result_id
+        assert "work-turn-sf" not in connection.scheduler._queues
 
         assert tts.on_event is not None
         assert connection.scheduler.active is not None
@@ -1086,10 +1091,7 @@ def test_late_result_supersedes_queued_timeout_speech_before_it_starts() -> None
         spoken_frames = [
             frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
         ]
-        assert [frame.text for frame in spoken_frames] == [
-            "Helsinki weather",
-            final.spoken_text,
-        ]
+        assert [frame.text for frame in spoken_frames] == ["Helsinki weather"]
         await host.shutdown()
 
     asyncio.run(run())
@@ -1104,8 +1106,12 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
     non-supersedable speech on both sides of its timeout notice, and B's
     final result arrives before A stops. Only B's notice may terminate, B's
     other same-work items must keep their order, another work item's queue
-    must be untouched, the notice-discard and final-enqueue must happen with
-    no ``start_next()`` landing between them, and A must not be interrupted.
+    must be untouched, and A must not be interrupted.
+
+    Retire regression: autoplay is structurally unreachable now, so B's
+    final result is committed display-only -- discarding the stale notice
+    still runs (unconditional), but neither ``enqueue`` nor ``start_next``
+    is ever reached for it.
     """
 
     async def run() -> None:
@@ -1113,7 +1119,6 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
         host = SessionHost(
             runner_factory=LifecycleRunner,
             tts=tts,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
@@ -1204,26 +1209,21 @@ def test_reported_race_final_result_removes_only_bs_own_queued_notice_without_in
             LateResult(work_item_id="work-b", worker_id="worker-search", result=final),
         )
 
-        # No start_next() lands between the notice discard and the final
-        # result's enqueue: the discard and enqueue are adjacent in the call
-        # log, and the only start_next() is the one issued after both.
-        discard_at = call_order.index("discard_queued_notice")
-        enqueue_at = call_order.index("enqueue")
-        assert enqueue_at == discard_at + 1
-        assert "start_next" not in call_order[discard_at:enqueue_at]
+        # The notice is discarded (unconditional), but the final result is
+        # display-only -- neither enqueue nor start_next is ever reached.
+        assert call_order == ["discard_queued_notice"]
 
         # Only B's notice terminates, and it terminates exactly once.
         assert host.state.speech[notice.utterance_id].state.value == "interrupted"
         notice_history = host.state.speech_history(notice.utterance_id)
         assert sum(progress.state.value == "interrupted" for progress in notice_history) == 1
 
-        # B's remaining same-work items retain order, with the final result
-        # appended after them.
+        # B's remaining same-work items retain order; the final result is
+        # never appended (display-only never enqueues it).
         remaining = scheduler._queues["work-b"]
         assert [item.result_id for item in remaining] == [
             before_notice.result_id,
             after_notice.result_id,
-            final.result_id,
         ]
 
         # Another work item's queue is untouched.
@@ -1285,13 +1285,16 @@ def test_late_result_from_replaced_epoch_remains_display_only() -> None:
     asyncio.run(run())
 
 
-def test_duplicate_late_result_callback_commits_and_enqueues_speech_once() -> None:
+def test_duplicate_late_result_callback_commits_exactly_once_without_speaking() -> None:
+    """Retire regression: a late result is always display-only now (autoplay
+    is structurally unreachable), so a duplicate callback for the same
+    result must still commit exactly once and never enqueue speech."""
+
     async def run() -> None:
         tts = FakeTTS()
         host = SessionHost(
             runner_factory=LifecycleRunner,
             tts=tts,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
@@ -1327,15 +1330,13 @@ def test_duplicate_late_result_callback_commits_and_enqueues_speech_once() -> No
             )
             == 1
         )
-        assert (
-            sum(progress.result_id == result.result_id for progress in host.state.speech.values())
-            == 1
+        assert not any(
+            progress.result_id == result.result_id for progress in host.state.speech.values()
         )
         spoken_frames = [
             frame for frame in connection.worker.frames if isinstance(frame, TTSSpeakFrame)
         ]
-        assert len(spoken_frames) == 1
-        assert spoken_frames[0].text == result.spoken_text
+        assert spoken_frames == []
         await host.shutdown()
 
     asyncio.run(run())
@@ -4269,7 +4270,12 @@ def _late_delivery_context(host: SessionHost, **overrides: object) -> LateDelive
     return LateDeliveryContext(**fields)
 
 
-def test_retained_completion_with_speech_emits_completed_committed_queued() -> None:
+def test_retained_completion_emits_completed_committed_display_only() -> None:
+    """Retire regression: a retained work item's late completion always
+    commits, but -- autoplay being structurally unreachable -- the
+    background record's speech axis is ``not_applicable``, never
+    ``queued``."""
+
     async def run() -> None:
         tts = FakeTTS()
         sink = CollectingMeasurementSink()
@@ -4277,7 +4283,6 @@ def test_retained_completion_with_speech_emits_completed_committed_queued() -> N
             runner_factory=LifecycleRunner,
             tts=tts,
             measurement_sink=sink,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         connection = await host.connect(connection_handshake(host, 1))
         connection.worker = QueueingPipelineWorker()
@@ -4309,75 +4314,8 @@ def test_retained_completion_with_speech_emits_completed_committed_queued() -> N
         fields = records[0].fields
         assert fields["work_outcome"] == "completed"
         assert fields["commit_outcome"] == "committed"
-        assert fields["speech_outcome"] == "queued"
+        assert fields["speech_outcome"] == "not_applicable"
         assert fields["work_item_id"] == "work-retained-ok"
-        await host.shutdown()
-
-    asyncio.run(run())
-
-
-def test_retained_late_result_cancelled_during_speech_start_still_emits_background_record() -> None:
-    """A CancelledError delivered during the post-pop
-    ``await origin.scheduler.start_next()`` window inside ``_commit_late_result``
-    must not skip finalization: the recorder was already popped from the
-    registry above that await, so a skipped finalize would both drop the
-    ``work_item_background`` record and remove the shutdown-sweep backstop."""
-
-    async def run() -> None:
-        tts = FakeTTS()
-        sink = CollectingMeasurementSink()
-        host = SessionHost(
-            runner_factory=LifecycleRunner,
-            tts=tts,
-            measurement_sink=sink,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
-        )
-        connection = await host.connect(connection_handshake(host, 1))
-        connection.worker = QueueingPipelineWorker()
-
-        async def raising_start_next(work_item_id: str | None = None) -> object:
-            raise asyncio.CancelledError()
-
-        connection.scheduler.start_next = raising_start_next  # type: ignore[method-assign]
-
-        result = GroundedResult(
-            result_id="result-cancel-during-start",
-            worker_id="worker-search",
-            turn_id="turn-cancel-during-start",
-            text="Complete late answer",
-            spoken_text="Spoken late answer",
-            origin_epoch=1,
-        )
-        _register_dispatch_recorder(
-            host, "work-cancel-during-start", turn_id="turn-cancel-during-start"
-        )
-        late = LateResult(
-            work_item_id="work-cancel-during-start",
-            worker_id="worker-search",
-            result=result,
-            terminal_kind="completed",
-        )
-
-        with pytest.raises(asyncio.CancelledError):
-            await host.commit_late_result_once(
-                _late_delivery_context(
-                    host,
-                    turn_id="turn-cancel-during-start",
-                    work_item_id="work-cancel-during-start",
-                ),
-                late,
-            )
-
-        records = _background_records(sink)
-        assert len(records) == 1
-        fields = records[0].fields
-        assert fields["work_item_id"] == "work-cancel-during-start"
-        assert fields["work_outcome"] == "completed"
-        assert fields["commit_outcome"] == "committed"
-        # start_next raised before it could set "queued"; finalize's own
-        # terminal default fills the still-unset speech axis.
-        assert fields["speech_outcome"] == "cancelled"
-        assert "work-cancel-during-start" not in host._recorder_factory._retained_recorders
         await host.shutdown()
 
     asyncio.run(run())
@@ -5637,7 +5575,6 @@ def test_handle_pending_snapshots_turn_sequence_before_first_await() -> None:
             runner_factory=LifecycleRunner,
             coordinator=coordinator,
             measurement_sink=sink,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         origin = await host.connect(connection_handshake(host, 1))
 
@@ -5783,8 +5720,6 @@ class _FanInRouter:
 def _fan_in_host(
     submitted: object,
     sink: CollectingMeasurementSink,
-    *,
-    promotion_manifest: PromotionManifest | None = None,
 ) -> tuple[SessionHost, object]:
     """A host whose coordinator returns a hand-built ``submit`` outcome, so the
     multi-intent fan-in loops can be driven with mismatched echoes."""
@@ -5805,7 +5740,6 @@ def _fan_in_host(
             runner_factory=LifecycleRunner,
             coordinator=Coordinator(),
             measurement_sink=sink,
-            promotion_manifest=promotion_manifest,
         ),
         worker,
     )
@@ -6352,6 +6286,10 @@ def test_multi_intent_reconciled_unattributed_child_still_honours_a_prior_whole_
 
 
 def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
+    """Retire regression: the stale timeout notice is still discarded once
+    the real result commits (unconditional), but -- autoplay being
+    structurally unreachable -- the late result itself is never queued."""
+
     async def run() -> None:
         sink = CollectingMeasurementSink()
         host, _worker = _fan_in_host(
@@ -6360,7 +6298,6 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
                 pending_work_item_ids=("work-turn-role-1",),
             ),
             sink,
-            promotion_manifest=PromotionManifest(promotion_eligible=True),
         )
         host.tts = FakeTTS()
         origin = await host.connect(connection_handshake(host, 1))
@@ -6397,9 +6334,7 @@ def test_multi_intent_retained_notice_is_removed_before_late_result() -> None:
             ),
         )
 
-        queued = origin.scheduler._queues["work-turn-role-1"]
-        assert [item.text for item in queued] == ["late answer"]
-        assert queued[0].role == ROLE_RESULT
+        assert "work-turn-role-1" not in origin.scheduler._queues
         await host.shutdown()
 
     asyncio.run(run())
@@ -9336,9 +9271,10 @@ def test_late_result_display_only_still_discards_the_stale_queued_notice() -> No
     """
 
     async def run() -> None:
-        # tts=FakeTTS() keeps this connection speakable; no promotion_manifest
-        # means `_promotion_eligible` defaults false, so
-        # `_late_result_disposition` returns "display_only" below.
+        # tts=FakeTTS() keeps this connection speakable; the disposition is
+        # now unconditionally "display_only" (the promotion-manifest chain
+        # that used to gate it was retired), so `_late_result_disposition`
+        # returns "display_only" below regardless of connection state.
         host = SessionHost(runner_factory=LifecycleRunner, tts=FakeTTS())
         origin = await host.connect(connection_handshake(host, 1))
         scheduler = origin.scheduler

@@ -75,83 +75,12 @@ jobs:
             ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
             git /repo --no-banner --redact --config /repo/.gitleaks.toml --log-opts="$scan_range"
 
-  # Guards the v0.1.3 release identity: derives deployment metadata from a
-  # clean release checkout. The manifest drift check that used to live here as
-  # a second step is now its own `promotion-manifest-drift` job below, so it
-  # can run pre-merge; this job stays main-only because deriving release
-  # metadata is only meaningful for a release checkout.
-  #
-  # This job used to WRITE the manifest with --write-manifest --output
-  # docs/benchmarks/v0.1.3-promotion-manifest.json and end there -- no commit,
-  # no actions/upload-artifact, no deploy step, and `permissions: contents:
-  # read` so it could not have pushed one anyway. The consumer,
-  # server/config.py's load_promotion_manifest, reads the repo-committed file.
-  # So the generated manifest went into an ephemeral workspace and was
-  # discarded: producer and consumer were never connected, and the job proved
-  # nothing (round-3 restart gauntlet, Architecture finding). Worse, it wrote a
-  # *provisional* manifest over the path holding a *final* one, so had the
-  # write ever been delivered it would have downgraded the committed manifest.
-  #
-  # Verification (see `promotion-manifest-drift`) is the conservative remedy:
-  # it proves something real about the file the consumer actually reads (input
-  # digests, schema hash, gate outcomes, promotion_eligible/reason) and fails
-  # on drift, without introducing a publish/upload path. Whether and how the
-  # manifest gets published is a release-mechanics decision for an operator,
-  # not something CI should start doing on its own.
-  #
-  # Neither job ever enables autoplay by itself -- a provisional manifest is
-  # always promotion_eligible=false; see docs/dev_plans/
-  # 20260728-feature-early-ack-background-delivery-v0.1.3.md Phase 2.
-  release-metadata:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-        with:
-          enable-cache: true
-          python-version: "3.12"
-
-      - name: Install Python dependencies
-        run: uv sync --frozen
-
-      - name: Derive and export deployment metadata
-        run: uv run python scripts/emit_v013_deployment_metadata.py --shell-export >> "$GITHUB_ENV"
-
-  # Split out of `release-metadata` and deliberately NOT gated on
-  # push-to-main (round-4 confirm pass, Security finding). While this was a
-  # step inside that job it only ever ran post-merge, so a pull request
-  # editing the manifest or any evidence artifact merged before the gate
-  # protecting the file `load_promotion_manifest` consumes had executed --
-  # and the documented fix for a failure here ("regenerate with
-  # --write-manifest locally and commit") is a human step that cannot happen
-  # after the merge. Its trigger scope is a security property, not a cost
-  # optimisation.
-  #
-  # The verify step is read-only and needs no release-identity env, which is
-  # why it can run on the pull_request trigger while the metadata derivation
-  # above stays main-only.
-  #
-  # Fails the job if the committed manifest no longer matches the evidence it
-  # binds -- an edited evidence artifact, a changed evidence schema, an input
-  # that no longer passes its gate, a release_version /
-  # feature_policy_fingerprint the effective config does not resolve, or a
-  # promotion_eligible/reason the current evidence does not support.
-  #
-  # The wall-clock stamps and source-identity fields (deployed_at_utc,
-  # generated_at_utc, source_commit, source_tree_hash) are deliberately NOT
-  # compared: a manifest committed at one commit can never match a
-  # regeneration at a later one, so comparing them would make this job fail on
-  # every push. See _MANIFEST_VOLATILE_FIELDS in
-  # scripts/validate_v013_evidence.py.
+  # The v0.1.3 promotion manifest is a frozen historical release record. This
+  # job is deliberately read-only: it checks the record's evidence digests,
+  # schema binding, gate verdict, and internal stamped identity bindings. It
+  # does not derive anything from the current release/config identity, because
+  # later releases must not make a historical v0.1.3 record fail by changing
+  # their own version or feature policy.
   promotion-manifest-drift:
     needs: test
     runs-on: ubuntu-latest

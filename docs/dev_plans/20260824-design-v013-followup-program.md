@@ -31,7 +31,7 @@ program either **fixed** (commit recorded) or **retired** (reason recorded).
 
 | Plan | File | Status | Review Gates |
 |------|------|--------|--------------|
-| P1 — Query-context promotion decision | `20260824-feature-query-context-promotion.md` | Not Started | none (hand-run reviews) |
+| P1 — Query-context promotion decision | `20260824-feature-query-context-promotion.md` | Complete (retired) | none (hand-run reviews) |
 | P2 — SessionHost decomposition | `20260824-refactor-sessionhost-decomposition.md` | Not Started | full |
 | P3 — Post-release hardening | `20260824-chore-post-release-hardening.md` | Complete (rows 13-19 closed) | none (hand-run reviews) |
 
@@ -56,7 +56,7 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 4 | `SessionHost.connect` — 210 lines, 8 nested closures (AD-r10 figure; 9 by P2's current recount) | AD-r8/r10 | P2 Ph2 | open |
 | 5 | `ConnectionPipeline` should live in its own module (`server/pipeline.py:356`) | AD-r10 | P2 Ph2 | open |
 | 6 | `SessionHost`↔coordinator boundary declared 4× — all four live in production paths (the AD-r10 "two production-dead" claim was disproven in P2's plan review); re-litigation of the pin stays open, in P2 Ph3 | AD-r8/r10 | P2 Ph3 | open |
-| 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | retire → P1 Ph2 (deleted); invest → P2 Ph3 (extracted); P1-blocked → stays open | open |
+| 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | retire → P1 Ph2 (deleted); invest → P2 Ph3 (extracted); P1-blocked → stays open | fixed c67da7f (machinery deleted rather than extracted) |
 | 8 | `_OWNED_CONFIG_FIELDS` permissive default (`server/work_item_coordinator.py:131`) — deferred 5 consecutive rounds | AD-r5/7/8/9/10 | P2 Ph3 | open |
 | 9 | Fire-and-forget task-reference idiom hand-rolled in ~11 sites (P2 review corrected the original "5 classes" count) | AD-r9/r10 | P2 Ph5 | open |
 | 10 | Ack-retry latch sibling re-latch race — verify-first: `_ack_admission_generation` (turn_ack_ledger.py:74-139) may already cover it; P2 Ph4 reproduces before fixing | AD-r10 | P2 Ph4 | open |
@@ -69,8 +69,8 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 17 | Effort-policy labels not cross-validated (typos silently accepted) — premise stale: P3 review verified the validation already exists (`server/config.py:236-259` + tests); P3 Ph3 verifies and retires with citation | ES | P3 Ph3 (verify) | retired: verified — `server/config.py:236-259` + `tests/test_config.py:313`/`:329` (730db3f) |
 | 18 | Env-var coverage gaps: 2 reasoning-effort env vars untested; README stale — premise stale: P3 review verified both vars are tested incl. the empty-string pin (`tests/test_config.py:2019-2030`); P3 Ph3 verifies README against the pinned semantics and retires with citation | ES | P3 Ph3 (verify) | retired: verified — worker var `tests/test_config.py:1955-2132` (empty-string pin `:2019-2030`), router var `:376`; README matches (730db3f) |
 | 19 | Policy-dict wholesale-replacement semantics + effort-display-vs-effective-value + truncated-cell reporting (Phase-2 minors) | ES | P3 Ph3 | fixed 730db3f (effort-display gap fixed with test; policy-dict retired as intended design; truncated-cell retired as not-reproducible) |
-| 20 | Query-context narrowing implemented but `promotion_eligible=false` (`reason=real_stratum_missing`) — no paid evidence ever collected | AD Phase 4 | P1 (all) | open |
-| 21 | `docs/benchmarks/` misnomer: 8 of 9 committed files are v0.1.3 release-gate evidence, not benchmarks — load-bearing (`config.toml:54` loader, ci.yml:174 + `justfile:41` re-hash, `check_release_metadata.py:440` path check) and frozen in place (manifest embeds paths; re-stamping requires `--source-commit` = `740b364`, impossible from later HEAD). Fix forward only: v0.1.4+ evidence lands in `docs/evidence/`, `check_release_metadata.py`'s path pattern updated then. Never delete/move the v0.1.3 artifacts | evidence audit 2026-08-25 | first v0.1.4 release plan (deferred — not P1/P2/P3) | open |
+| 20 | Query-context narrowing implemented but `promotion_eligible=false` (`reason=real_stratum_missing`) — no paid evidence ever collected | AD Phase 4 | P1 (all) | retired: operator decision after feasibility pre-flight — promote required the full Appendix A effort incl. paid collection against an experiment that never demonstrated value (c67da7f) |
+| 21 | `docs/benchmarks/` misnomer: 8 of 9 committed files are v0.1.3 release-gate evidence, not benchmarks — load-bearing for the frozen release record even though the runtime loader is gone: ci.yml's `promotion-manifest-drift` job (read-only drift check), `justfile:40-41`'s `verify-manifest` recipe, and `check_release_metadata.py`'s manifest-path check all still bind against these files, and they're frozen in place (manifest embeds paths; re-stamping requires `--source-commit` = `740b364`, impossible from later HEAD). Fix forward only: v0.1.4+ evidence lands in `docs/evidence/`, `check_release_metadata.py`'s path pattern updated then. Never delete/move the v0.1.3 artifacts | evidence audit 2026-08-25 | first v0.1.4 release plan (deferred — not P1/P2/P3) | open |
 
 When an item closes, replace `open` with `fixed <short-sha>` or `retired: <one-line reason>`.
 
@@ -80,8 +80,8 @@ When an item closes, replace `open` with `fixed <short-sha>` or `retired: <one-l
 
 | Pair | Parallel-safe? | Why |
 |------|----------------|-----|
-| P1 ∥ P3 | **Phases 0-1 yes; retire path no** (corrected 2026-08-25 after the evidence audit). | P1's Phases 0-1 touch its own plan file, this program doc (Phase 1 records the decision and updates row 20 — P3 Phase 3 also edits this doc; mechanical merge, last lander rebases), and one probe. Its *retire* Phase 2 removes the manifest's out-of-server consumers — the ci.yml release-metadata manifest-write step, `justfile:41`, `check_release_metadata.py:429`, `config.toml:54` — overlapping P3 Phase 2 (`scripts/check_release_metadata.py`, `tests/test_justfile_ci_parity.py`). Rule: land P3 Phase 2 before P1's retire commit; whichever lands second rebases. P3's other files (`server/config.py` guard region, `scripts/eval_*.py`) stay disjoint. |
-| P1 ∥ P2 | **No on either path** (corrected 2026-08-24 after P1's plan review — the original "promote is data-only" claim was false). | *Retire* is a full-chain removal of the machinery (pipeline gate → unconditional `commit_display_only`, `load_promotion_manifest`/`PromotionManifest` out of `server/config.py`, `app.py` call, plus the manifest's CI/release-check consumers; the committed manifest and evidence files stay as frozen records — row 21) overlapping P2 Phases 2-3 — land P1's retire commit before P2 Phase 2 starts; P2 Phase 3's manifest-extraction bullet then drops. *Promote* (invest path, separate plan) requires serialization: the manifest's identity binding (`source_commit`/`tree_hash`) means it must be stamped after all concurrent work merges, or re-stamped post-merge. |
+| P1 ∥ P3 | **Resolved — executed in order.** P3 Phase 2 landed before P1's retire commit (`c67da7f`), per rule. | P1's Phases 0-1 touched its own plan file, this program doc (Phase 1 recorded the decision and updated row 20 — P3 Phase 3 also edited this doc; mechanical merge, last lander rebased), and one probe. P1's *retire* Phase 2 removed the `config.toml` manifest key and the runtime loader chain (`load_promotion_manifest`/`PromotionManifest` in `server/config.py` and its consumers) — it did not touch the `justfile` recipe, `check_release_metadata.py`'s manifest-path check, or any ci.yml step, since P3 Phase 2 had already converted those into read-only drift-check machinery beforehand; that machinery survives P1's retire unchanged. P3's other files (`server/config.py` guard region, `scripts/eval_*.py`) stayed disjoint. |
+| P1 ∥ P2 | **Resolved — P1's retire commit (`c67da7f`) landed before P2 Phase 2, per rule.** | *Retire* was a full-chain removal of the machinery (pipeline gate → unconditional `commit_display_only`, `load_promotion_manifest`/`PromotionManifest` out of `server/config.py`, `app.py` call, plus the manifest's CI/release-check consumers; the committed manifest and evidence files stay as frozen records — row 21) overlapping P2 Phases 2-3; P2 Phase 3's manifest-extraction bullet has been dropped accordingly (see P2 plan Findings). The invest path was never exercised (operator chose retire). |
 | P2 ∥ P3 | **Mostly — one same-file caveat.** | P3 Ph1 (TTS half-pair guard) and P2 Ph3 (promotion-manifest extraction) both edit `server/config.py`, in different regions (~1689-1716 vs ~340-470/667-770). Semantically independent; merge conflict is mechanical. Rule: whichever lands second rebases; prefer landing P3 Ph1 first since it's small. Everything else is disjoint. |
 
 **Recommended schedule**: start P1 and P3 immediately in parallel worktrees.
@@ -92,11 +92,12 @@ P3's footprints — but its Phase 2 is gated on P1's Phase 1 decision (retire
 commit must land first on the retire path; P2 plan Phase 2 gate).
 
 **Retire-path landing order** (explicit, since three plans touch shared files):
-P2 Phase 0 anytime → P3 Phase 2 → P1 retire commit → P2 Phase 2 onward.
-Invariant 1 below governs plans **outside** this program; inside it, this order
-and the matrix govern — P1's `server/pipeline.py` gate-region edits and P2
-Phase 1's epilogue work touch different regions of that file, whichever lands
-second rebases.
+P2 Phase 0 anytime → P3 Phase 2 → P1 retire commit → P2 Phase 2 onward. This
+order was followed: P3 Phase 2 landed, then P1's retire commit (`c67da7f`),
+unblocking P2 Phase 2. Invariant 1 below governs plans **outside** this
+program; inside it, this order and the matrix governed — P1's
+`server/pipeline.py` gate-region edits and P2 Phase 1's epilogue work touched
+different regions of that file, whichever landed second rebased.
 
 **Cross-plan invariants**:
 1. No *new* feature plan may touch `SessionHost` until P2 Phases 0-1 have merged — otherwise its review gauntlet re-reports items 1-4 for a third time.
@@ -120,3 +121,4 @@ does not exist today.
 - 2026-08-24: Program created. Backlog snapshot taken from AD rounds 5-10, Restart Gauntlet rounds 4-9 (156 fixes, 0 new quarantines — backlog stable across ~20 total rounds), and eval-suite phase reviews.
 - 2026-08-25: Evidence audit of `docs/benchmarks/` added row 21 and corrected the P1 ∥ P3 matrix row: P1's retire path must remove the manifest's CI/release-check consumers (overlapping P3 Phase 2) while keeping every committed v0.1.3 artifact as a frozen release record. P1 and P3 plans updated in the same pass.
 - 2026-08-25: Codex adversarial review of all four plan docs (20 findings, 2 Critical) fixed across the set. Headlines: P1's retire footprint gained the remaining `PromotionManifest` consumers (`server/composition.py`, `scripts/eval_common.py`, `scripts/smoke_conversation.py`) and the regression test must cover the fail-open `enable_autoplay_policy=False → "autoplay"` branch at `server/pipeline.py:2835`; P2's fire-and-forget inventory recounted (22 hits / 10 files); rows 4/6/7 corrected here; blocked-branch carve-outs, invest handoff, retire-path landing order, and index-creation ownership made explicit.
+- 2026-08-27: P1 complete — operator chose retire (Phase 1 decision) after the Phase 0 feasibility pre-flight found the model available but promote gated behind the full Appendix A effort against an experiment that never demonstrated value; full-chain removal executed in `c67da7f`. Rows 20 and 7 closed; P1 ∥ P2 and P1 ∥ P3 matrix rows and the retire-path landing order marked resolved; P1's row in Subordinate Plans flipped to Complete (retired); P2 plan's Phase 3 manifest-extraction bullet dropped (P2 Findings).
