@@ -1204,6 +1204,24 @@ def test_coordinator_view_prefers_a_conforming_coordinators_own_members() -> Non
     assert view.cancel() == coordinator.cancel()
 
 
+def test_coordinator_view_honours_a_coordinators_own_owned_config_fields() -> None:
+    """``_OWNED_CONFIG_FIELDS`` is permissive, not strict (Requirement 5,
+    Phase 3 of the SessionHost decomposition plan): a coordinator that
+    declares its own ``OWNED_CONFIG_FIELDS``, even a value that disagrees
+    with ``WorkItemCoordinator``'s canonical frozenset, is trusted as-is --
+    ``coordinator_view`` never validates a declared value against the
+    default, it only substitutes the default when the member is absent
+    entirely (see ``test_coordinator_defaults_matches_pipeline_getattr_fallbacks``
+    and the bare-double case above for the absent-member path)."""
+
+    class CustomOwnedFieldsCoordinator:
+        OWNED_CONFIG_FIELDS = frozenset({"multi_intent_wait_timeout_ms"})
+
+    view = coordinator_view(CustomOwnedFieldsCoordinator())
+    assert view.OWNED_CONFIG_FIELDS == frozenset({"multi_intent_wait_timeout_ms"})
+    assert view.OWNED_CONFIG_FIELDS != WorkItemCoordinator.OWNED_CONFIG_FIELDS
+
+
 def test_all_four_coordinator_boundary_declarations_carry_the_same_members() -> None:
     """The four declarations of the coordinator boundary must agree on
     *which* members exist.

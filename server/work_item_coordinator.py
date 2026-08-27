@@ -138,7 +138,33 @@ Read by ``WorkItemCoordinator.OWNED_CONFIG_FIELDS`` (the canonical public
 name), by ``CoordinatorDefaults``, and by ``coordinator_view``'s fallback, so
 the three cannot drift. Declared at module scope because ``CoordinatorDefaults``
 is defined before ``WorkItemCoordinator`` and cannot reference it at class-body
-evaluation time."""
+evaluation time.
+
+Permissive-vs-strict decision (Phase 3 of the SessionHost decomposition
+plan, 2026-08-27): stays **permissive**. ``coordinator_view`` resolves a
+coordinator's ``OWNED_CONFIG_FIELDS`` via ``getattr(coordinator,
+"OWNED_CONFIG_FIELDS", defaults.OWNED_CONFIG_FIELDS)`` -- a coordinator that
+omits the member gets this default (pinned by
+``test_coordinator_defaults_matches_pipeline_getattr_fallbacks`` and the
+``BareCoordinator`` case in
+``test_all_four_coordinator_boundary_declarations_carry_the_same_members``'s
+sibling tests), and a coordinator that *declares* its own value -- even one
+that differs from this default -- is trusted as-is, not validated against
+it (pinned by
+``test_coordinator_view_honours_a_coordinators_own_owned_config_fields``).
+Made strict (rejecting a declared value that disagrees with this frozenset)
+would single out this one optional member for validation the other six
+(``registry``, ``config``, ``live_work_item_ids``, ``start_task``,
+``cancel``, ``shutdown``) do not get, without a consumer that needs it:
+``SessionHost.__init__``'s only use (the config-conflict check above) reads
+whatever the coordinator supplies and excludes exactly those fields from
+comparison -- a coordinator declaring a narrower or wider set is expressing
+which fields *it* overrides, which is information the host has no
+independent way to second-guess. A round-5 attempt to make a related
+Protocol boundary required instead of permissive broke 67 of
+``tests/test_pipeline.py``'s duck-typed doubles and was reverted; the same
+risk applies here since several duck-typed coordinators in ``tests/`` still
+construct without declaring this member at all."""
 
 
 class Coordinator(Protocol):
@@ -260,7 +286,23 @@ edits with nothing catching a missed one -- two such drifts have already
 happened (see ``CoordinatorDefaults.OWNED_CONFIG_FIELDS``' note and
 ``start_task``'s keyword). This frozenset is the single roster all four are
 pinned against by a test, so a member added to three of them fails the suite
-instead of silently taking a fallback in production."""
+instead of silently taking a fallback in production.
+
+Re-litigated in the open (Phase 3 of the SessionHost decomposition plan,
+2026-08-27), not silently re-affirmed: all four declarations were confirmed
+still live in production (``coordinator_view`` called from
+``SessionHost._coordinator_view``, ``server/pipeline.py``; its
+``CoordinatorView`` result read on the dispatch, cancel, and shutdown paths;
+``CoordinatorDefaults`` supplies every fallback ``coordinator_view`` returns;
+``OptionalCoordinator`` is the roster's Protocol leg, pinned by
+``__protocol_attrs__`` in the test above). Phase 0's contract-checked
+``FakeCoordinator`` double conforms to the full ``Coordinator`` Protocol and
+so cannot exercise the getattr-fallback path this roster protects -- but
+``tests/test_work_item_coordinator.py``'s ``BareCoordinator`` is a separate,
+deliberately member-less double kept specifically to exercise it. Its
+survival after the Phase 0 modernization is the evidence the fallback path
+is not production-dead, so the four declarations stay four. Pin re-affirmed;
+no collapse."""
 
 
 class OptionalCoordinator(Protocol):
