@@ -21,9 +21,10 @@ logic -- semantics, including transition/gating/precedence rules, are
 unchanged from the code that previously lived directly on SessionHost and
 at module scope in ``pipeline.py``.
 
-The three derivation helpers are deliberately *public* names
+The derivation helpers are deliberately *public* names
 (``work_status_for_outcome``, ``work_status_after_commit_failure``,
-``child_work_status_after_dispatch``). They carried a leading underscore
+``child_work_status_after_dispatch``, ``status_omitted_while_retained``).
+Three of them carried a leading underscore
 while they lived in ``pipeline.py`` alongside their only callers; once
 ``pipeline.py`` had to import them across a module boundary the underscore
 became a false signal, since this codebase treats it as a hard "do not reach
@@ -118,6 +119,34 @@ def child_work_status_after_dispatch(
     """
     if outcome_label == "retained" and not cancelled:
         return "background", None
+    return work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
+
+
+def status_omitted_while_retained(
+    outcome_label: str | None,
+    *,
+    cancelled: bool,
+    terminal_kind: str | None = None,
+) -> tuple[WorkStatusState, TerminalReason | None] | None:
+    """``child_work_status_after_dispatch``'s sibling: emit *nothing* instead.
+
+    A retained-and-not-cancelled child gets no post-commit status at all: its
+    truthful ``background`` was already emitted at dispatch time and the
+    coordinator terminalizes it when the late result lands. Every other case
+    defers to ``work_status_for_outcome``.
+
+    The two policies are observably different only when
+    ``enable_background_status`` was off when the dispatch-time ``background``
+    emit ran (suppressing it) and back on by the time the commit returns --
+    in that window this policy leaves the child on its stale ``searching``
+    record while ``child_work_status_after_dispatch`` recovers it. The
+    single-intent turn handler has always used this one and the
+    pending-dialogue handler the other, which is why the choice is a
+    parameter (``derive_status`` on ``turn_epilogue.finalize_single_child_turn``)
+    rather than a branch.
+    """
+    if outcome_label == "retained" and not cancelled:
+        return None
     return work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
 
 

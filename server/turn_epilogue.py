@@ -44,7 +44,7 @@ from loguru import logger
 from .contracts import GroundedResult, TerminalReason, WorkStatusState
 from .perf_metrics import AppTurnRecorder, WorkItemOutcome, WorkItemRecorder
 from .speech_scheduler import ROLE_RESULT, SpeechRole
-from .work_status_publisher import work_status_after_commit_failure, work_status_for_outcome
+from .work_status_publisher import status_omitted_while_retained, work_status_after_commit_failure
 
 if TYPE_CHECKING:
     from .connection_pipeline import ConnectionPipeline
@@ -76,8 +76,10 @@ class EmitWorkStatus(Protocol):
 class DeriveWorkStatus(Protocol):
     """The row-3 terminal-status derivation policy a single-child caller picks.
 
-    Satisfied by ``status_omitted_while_retained`` (single-intent) and by
-    ``work_status_publisher.child_work_status_after_dispatch``
+    Satisfied by the two sibling policies that live together in
+    ``work_status_publisher`` (this codebase's home for outcome -> status
+    derivation): ``status_omitted_while_retained`` (single-intent, the
+    default below) and ``child_work_status_after_dispatch``
     (pending-dialogue).
     """
 
@@ -106,32 +108,6 @@ class CommitAndSpeak(Protocol):
         require_tts: bool = ...,
         suppressed_out: set[str] | None = ...,
     ) -> GroundedResult: ...
-
-
-def status_omitted_while_retained(
-    outcome_label: str | None,
-    *,
-    cancelled: bool,
-    terminal_kind: str | None = None,
-) -> tuple[WorkStatusState, TerminalReason | None] | None:
-    """Row-3 derivation policy used by the single-intent turn handler.
-
-    A retained-and-not-cancelled child gets *no* post-commit status at all:
-    its truthful ``background`` was already emitted at dispatch time and the
-    coordinator terminalizes it when the late result lands. Every other case
-    defers to ``work_status_for_outcome``.
-
-    This is deliberately **not** ``child_work_status_after_dispatch`` (which
-    re-derives ``("background", None)`` for the same case). The two policies
-    are observably different only when ``enable_background_status`` was off
-    at dispatch time and back on by the time the commit returns -- the
-    pending-dialogue handler keeps the re-deriving policy it had before the
-    epilogue was extracted, which is why this is a parameter rather than a
-    hardcoded branch (see ``finalize_single_child_turn``'s ``derive_status``).
-    """
-    if outcome_label == "retained" and not cancelled:
-        return None
-    return work_status_for_outcome(outcome_label, cancelled=cancelled, terminal_kind=terminal_kind)
 
 
 @dataclass(frozen=True)
