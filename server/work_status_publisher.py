@@ -23,13 +23,14 @@ at module scope in ``pipeline.py``.
 
 The derivation helpers are deliberately *public* names
 (``work_status_for_outcome``, ``work_status_after_commit_failure``,
-``child_work_status_after_dispatch``, ``status_omitted_while_retained``).
-Three of them carried a leading underscore
+``child_work_status_after_dispatch``, ``status_omitted_while_retained``,
+``late_commit_work_status``). Three of them carried a leading underscore
 while they lived in ``pipeline.py`` alongside their only callers; once
 ``pipeline.py`` had to import them across a module boundary the underscore
 became a false signal, since this codebase treats it as a hard "do not reach
 in" marker elsewhere (cf. ``SpeechScheduler``'s "callers must not inspect
-``_queues`` directly" contract). They are a deliberate shared derivation used
+``_queues`` directly" contract). They are public because each crosses a
+module boundary to reach its caller(s), not because every member is shared
 by both the foreground turn handlers and the late-commit path.
 """
 
