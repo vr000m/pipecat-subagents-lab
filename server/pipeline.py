@@ -70,6 +70,7 @@ from .speech_scheduler import (
     SpeechRole,
     SpeechScheduler,
 )
+from .task_retention import retain_until_done
 from .turn_ack_ledger import TurnAckLedger
 from .turn_epilogue import (
     SingleChildEpilogueOutcome,
@@ -1035,9 +1036,7 @@ class SessionHost:
         worker-failure handler) route through here rather than reaching into
         ``_background_shutdowns``.
         """
-        self._background_shutdowns.add(task)
-        task.add_done_callback(self._background_shutdowns.discard)
-        return task
+        return retain_until_done(task, self._background_shutdowns)
 
     def abort_connection(self, pipeline: ConnectionPipeline, *, reconnect: bool = True) -> None:
         """Fence a promoted connection whose transport setup did not complete.
