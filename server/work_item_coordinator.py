@@ -18,6 +18,7 @@ from .config import Config
 from .contracts import RoutingDecision
 from .registry import WorkerRegistry
 from .router import Router, WorkerCatalogue, validate_decision
+from .task_retention import retain_until_done
 
 _SEPARATE_REQUEST_VERBS = (
     r"search|find|look\s+up|check|show\s+me|tell\s+me|get|open|create|write|summarize"
@@ -559,12 +560,7 @@ class WorkItemCoordinator:
             return True
         if not force and not self._has_background_capacity():
             return False
-        self._owned_tasks.add(task)
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            self._owned_tasks.discard(completed_task)
-
-        task.add_done_callback(completed)
+        retain_until_done(task, self._owned_tasks)
         return True
 
     def start_task(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None:
@@ -593,19 +589,12 @@ class WorkItemCoordinator:
         task = asyncio.create_task(operation)
         self._adopt_task(task, force=True)
         if mandatory:
-            self._mandatory_tasks.add(task)
-            task.add_done_callback(self._mandatory_tasks.discard)
+            retain_until_done(task, self._mandatory_tasks)
         return task
 
     def _track_cancelling_task(self, task: asyncio.Task[Any]) -> None:
         self._adopt_task(task, force=True)
-        self._cancelling_tasks.add(task)
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            self._cancelling_tasks.discard(completed_task)
-            self._consume_task_exception(completed_task)
-
-        task.add_done_callback(completed)
+        retain_until_done(task, self._cancelling_tasks, on_done=self._consume_task_exception)
         task.cancel()
 
     @staticmethod
@@ -1120,8 +1109,7 @@ class WorkItemCoordinator:
                     continue
                 indexed_tasks.append((index, task))
                 self._work_tasks[work[index].work_item_id] = task
-                self._submit_tasks.add(task)
-                task.add_done_callback(self._submit_tasks.discard)
+                retain_until_done(task, self._submit_tasks)
                 task.add_done_callback(self._work_task_cleanup(work[index].work_item_id))
             tasks = [task for _, task in indexed_tasks]
             try:
