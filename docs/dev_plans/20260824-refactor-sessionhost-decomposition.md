@@ -187,7 +187,7 @@ Dependency direction: new modules import from collaborators, never back into
 - [x] Phase 1: Shared turn-epilogue abstraction
 - [x] Phase 2: connect() + ConnectionPipeline extraction
 - [x] Phase 3: Config/boundary consolidation
-- [ ] Phase 4: Ack-latch race — verify, then fix
+- [x] Phase 4: Ack-latch race — verify, then fix
 - [ ] Phase 5: Fire-and-forget helper
 - [ ] Phase 6: Facade collapse
 
@@ -333,3 +333,11 @@ Doubles mechanism decision: **Protocol** (reuse of existing `server.work_item_co
 - **Requirement 8 — VERIFIED, program item 12 closed, no gap.** `shared/work-status-retention.json` is the single numeric source, loaded by server/session_state.py (`_RETENTION_CONFIG_PATH`:43) and web/src/state.js (import :1, consumed ~:180); dual parity pins: `tests/test_session_state.py::test_retention_constants_match_the_shared_config_file` (+ `::test_retention_fallback_matches_shared_config` guarding the packaged-install fallback) and web/test/state.test.js "retention constants match the shared config file". No new work.
 - Promotion-manifest bullet: dropped as superseded (P1 retire c67da7f) — server/config.py and server/contracts.py read, verified clean, untouched.
 - Test-writer audit: all three decisions enforced by tests that fail on silent revert; no gaps, no tests added. Gate: 1869 passed + 1 skipped, ruff format/check clean, bare mypy clean, smoke validation passed. Warning: plan's Test command says `mypy .`; gate ran bare `mypy` (established substitution — `mypy .` collides on tests/ bare imports, per Phase 0 note).
+
+### Phase 4 outcome (2026-08-27): ack-latch race — ALREADY-FIXED, Requirement 7 / program item 10 closed
+
+- Characterization: the round-10 quarantined interleaving (20260728-feature-early-ack-background-delivery-v0.1.3.md:731, logic #23) — a stale admission-retry chain's belated timer re-entering `start_next` after a later sibling re-latches the same turn under the identical `ack_work_item_id` — is caught by the existing `_ack_admission_generation` mechanism: each admission chain claims a strictly-increasing ledger-wide generation (`_claim_ack_admission_generation`, turn_ack_ledger.py ~:126-149), and both `_retry_or_abandon` (~:498-522) and `admit()` (~:588-608) compare their captured generation against the live entry and bail when superseded — exactly the documented event order.
+- Provenance: the mechanism was added specifically for this finding in commit 390b764, which post-dates round 10's terminal cap — quarantined at round 10, fixed in a later confirm round.
+- Regression pin: new deterministic test `tests/test_session_host.py::test_stale_ack_admission_retry_recognizes_a_newer_chain_under_the_same_key` drives the full interleaving (chain A latch → fail → settle → chain B latch+admit → chain A's stale retry fires) and asserts chain A never re-enters start_next and chain B's admitted ack survives.
+- Non-vacuity evidence: with both generation early-return guards temporarily disabled (`if False: return`), the test fails exactly as the round-10 finding describes (stale retry re-enters start_next, exhausts the busy-slot chain, abandons the ack); server/turn_ack_ledger.py then reverted byte-identical (`git diff` empty). No production code changed in the final state.
+- Gate: 1870 passed + 1 skipped (baseline +1 new pin), ruff format/check clean, bare mypy clean.
