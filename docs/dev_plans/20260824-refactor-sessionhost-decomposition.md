@@ -389,3 +389,17 @@ Execution-time inventory (`rg -n 'add_done_callback' server/`): 22 hits across 1
 - Program closure (this commit, same-commit rule): P2 Status → Complete; program Subordinate Plans row flipped; provenance rows 1-6, 8-12 closed; docs/dev_plans/README.md updated.
 - Gate: 1878 passed + 1 skipped, ruff format/check clean, bare mypy clean, smoke validation passed.
 - Marker note: the Status-header flip above the review marker intentionally stales it at run end (same accepted pattern as P1's completion flip); recorded here as the run's final contract edit.
+
+### Post-completion review gauntlet (2026-08-27/28, `skein:review-gauntlet`, 6 rounds)
+
+Auto-chained by conduct (`Review Gates: full`). Target `branch:refactor/sessionhost-decomposition`; gates per round: adversarial Codex review, deep-review (5 lenses), security-review. Finding trajectory 7 → 5 → 1 → 0 → 2 → 0. Five fix commits landed after Phase 6 closure:
+
+- `a214c57` — the one real behavioral finding (codex + logic + architecture converged): `_handle_pending`'s post-commit `background` re-emit for retained children was dropped by the Phase 1 epilogue extraction; live only when `enable_background_status` toggles off→on mid-turn. Restored as an explicit `derive_status` policy parameter (matching the existing per-caller variance knobs) + fail-first pin test `test_pending_retained_child_recovers_background_when_the_status_gate_reopens`. Recorded above in "Phase 1 row-3 correction".
+- `f158272` — CHANGELOG `[Unreleased]` P2 entry (docs lens finding).
+- `ad1c126` — `TurnEpilogueContext` collaborators typed as Protocol call shapes (`SettleTurnAck`, `EmitWorkStatus`, `CommitAndSpeak`, `DeriveWorkStatus`); annotation-only, zero runtime change (verified by round-2 security pass).
+- `423ca75` — `work_status_publisher` docstring enumeration completed (`late_commit_work_status` added).
+- `8e925c2` — narrowed docstring/doc overclaims (Protocol wording in `turn_epilogue.py`; dropped nonexistent "publisher" from architecture.md's ConnectionPipeline bullet).
+
+Quarantined as plan-recorded design (never fixed, per Guardrail 1): the 32 Phase-0 test accessors; the Phase-2 `_connect_*`-on-SessionHost shape; the Phase-6 `host._turn_ack_ledger` test reach-through; the single shared `TurnEpilogueContext`.
+
+Terminal ledger decision: `non-converge` — a stall-counter artifact (round 6's clean confirm pass tied, rather than beat, the epoch minimum of 0). All three gates approved with zero findings in round 6; operator accepted the state as converged and proceeded to `/update-docs`. Final gate at `8e925c2`: 1879 passed + 1 skipped, ruff format/check clean, bare mypy clean.
