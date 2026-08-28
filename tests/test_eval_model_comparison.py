@@ -2938,6 +2938,10 @@ class TestJudgeScoringSemantics:
         pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
         recorder: list[Any] = []
         verdict = JudgeVerdict(verdict="yes", reason="ok", raw_response="")
+        # Bracket the run rather than recomputing "today" once afterwards: the
+        # helper's own datetime.now(UTC) call and this test's could otherwise
+        # straddle UTC midnight and disagree by a day.
+        date_before = datetime.now(UTC).date().isoformat()
         _run_cell(
             monkeypatch,
             pair=pair,
@@ -2945,9 +2949,11 @@ class TestJudgeScoringSemantics:
             verdicts=[verdict],
             judge_recorder=recorder,
         )
+        date_after = datetime.now(UTC).date().isoformat()
         (criterion,) = recorder[0].evaluated_criteria
-        today = datetime.now(UTC).date().isoformat()
-        assert criterion.startswith(f"Today's date is {today}.")
+        assert any(
+            criterion.startswith(f"Today's date is {day}.") for day in {date_before, date_after}
+        )
         assert criterion.endswith("Criterion: names a temperature")
 
     def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
