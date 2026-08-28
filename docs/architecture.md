@@ -15,12 +15,15 @@ reference.
 | Browser connection | `PipelineWorker.run()` task | Small WebRTC input/output, VAD, Smart Turn aggregation, transcript dispatch, bus bridge, TTS, and RTVI |
 | Browser | Plain JavaScript RTVI client | Microphone controls, remote audio, and rendering validated server projections |
 
-Pipecat 1.8.0 does not provide the originally planned
-`LLMContextWorker` module. Durable application workers therefore subclass the
-available `BaseWorker`, participate in the process-lifetime `WorkerRunner`, and
-serialize accepted work through their own mailboxes. Validated router decisions
-are dispatched directly by `WorkItemCoordinator`; the connection
-`BusBridgeProcessor` remains the Pipecat worker-bus boundary for frames.
+Pipecat 1.8.0 provides `LLMContextWorker` at
+`pipecat.workers.llm.llm_context_worker`. The lab deliberately does not adopt
+that context-owning LLM worker: durable application workers use the bus-only
+`BaseWorker` seam because their context history, direct provider calls, and
+causal mailboxes are application-owned. They participate in the process-lifetime
+`WorkerRunner` and serialize accepted work through those mailboxes. Validated
+router decisions are dispatched directly by `WorkItemCoordinator`; the
+connection `BusBridgeProcessor` remains the Pipecat worker-bus boundary for
+frames.
 
 ### `server/` module layout
 

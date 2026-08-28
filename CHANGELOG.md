@@ -11,10 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Pipecat upgraded `1.6.0` → `1.8.0`. The lab's conditional worker seams are
-  unchanged in 1.8.0 (`LLMContextWorker` still absent, so the pinned
-  `BaseWorker` fallback path stays live; `WorkerRunner.add_workers` still
-  present). Upstream's `EvalJudge` reworked its `JUDGE_SYSTEM_INSTRUCTION`
+- Pipecat upgraded `1.6.0` → `1.8.0`. Pipecat 1.8.0 exports
+  `LLMContextWorker` at `pipecat.workers.llm.llm_context_worker`; the lab
+  deliberately stays on the bus-only `BaseWorker` seam because its context
+  history, direct provider calls, and causal mailbox are application-owned.
+  `WorkerRunner.add_workers` remains present. Upstream's `EvalJudge` reworked
+  its `JUDGE_SYSTEM_INSTRUCTION`
   around stricter "continue" semantics for not-yet-answered replies;
   `evaluate()`/`JUDGE_ASK_TEMPLATE` are unchanged, so the eval runner's
   criterion-slot date wrap below still applies as-is.

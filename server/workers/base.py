@@ -9,10 +9,12 @@ from typing import Any
 
 from loguru import logger
 
-try:  # Pipecat versions with distributed worker support can provide this class.
-    from pipecat.processors.frameworks.llm_context import LLMContextWorker as _NativeWorker
-except ImportError:  # pragma: no cover - exercised by the pinned 1.8.0 fallback runtime
-    from pipecat.workers.base_worker import BaseWorker as _NativeWorker
+# Pipecat 1.8.0 exports ``LLMContextWorker`` from
+# ``pipecat.workers.llm.llm_context_worker``, but this application deliberately
+# uses the bus-only ``BaseWorker`` seam. Its context history, direct provider
+# calls, and causal mailbox are application-owned, so adopting the native LLM
+# context/aggregator worker would add a lifecycle seam this worker does not use.
+from pipecat.workers.base_worker import BaseWorker as _NativeWorker
 
 
 @dataclass(frozen=True)
