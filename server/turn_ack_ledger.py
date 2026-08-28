@@ -49,10 +49,11 @@ from loguru import logger
 
 from .speech_lifecycle import GenerationIdentity, PreAdmissionTerminalReason
 from .speech_scheduler import ROLE_ACK
+from .task_retention import retain_until_done
 
 if TYPE_CHECKING:
     from .config import FeaturePolicy
-    from .pipeline import ConnectionPipeline
+    from .connection_pipeline import ConnectionPipeline
 
 _ACK_ADMISSION_RETRY_DELAY_SECONDS = 0.25
 """Backoff before re-attempting a failed early-ack admission (e.g. the
@@ -173,6 +174,38 @@ class TurnAckLedger:
 
     def clear_ack_latch(self, turn_id: str) -> None:
         self._ack_emitted_turns.discard(turn_id)
+
+    def has_emitted_ack(self, turn_id: str) -> bool:
+        """Whether ``turn_id`` currently holds the one-ack-per-turn latch.
+
+        Public read for tests that previously asserted
+        ``turn_id in ledger._ack_emitted_turns`` directly.
+        """
+        return turn_id in self._ack_emitted_turns
+
+    def emitted_ack_turns(self) -> frozenset[str]:
+        """Every turn id currently holding the ack latch.
+
+        Public read for tests that previously asserted
+        ``ledger._ack_emitted_turns == set()`` (or enumerated it) directly.
+        """
+        return frozenset(self._ack_emitted_turns)
+
+    def admission_generation(self, turn_id: str) -> int | None:
+        """The current admission-retry generation for ``turn_id``, if any.
+
+        Public read for tests that previously read
+        ``ledger._ack_admission_generation.get(turn_id)`` directly.
+        """
+        return self._ack_admission_generation.get(turn_id)
+
+    def admission_generation_count(self) -> int:
+        """How many turns currently hold an admission-retry generation.
+
+        Public read for tests that previously asserted
+        ``len(ledger._ack_admission_generation) == ...`` directly.
+        """
+        return len(self._ack_admission_generation)
 
     def settle_turn_ack(
         self, scheduler: Any, turn_id: str, *, cancel_admitted: bool = False
@@ -548,9 +581,7 @@ class TurnAckLedger:
                     attempt=attempt + 1,
                 )
 
-            retry_task = asyncio.create_task(retry_after_delay())
-            self._ack_admission_tasks.add(retry_task)
-            retry_task.add_done_callback(self._ack_admission_tasks.discard)
+            retain_until_done(asyncio.create_task(retry_after_delay()), self._ack_admission_tasks)
 
         async def admit() -> None:
             current_generation = self._ack_admission_generation.get(turn_id)
@@ -601,9 +632,7 @@ class TurnAckLedger:
                 # _ACK_ADMISSION_MAX_ATTEMPTS.
                 _retry_or_abandon(log_reason="found the transport slot busy", needs_requeue=False)
 
-        task = asyncio.create_task(admit())
-        self._ack_admission_tasks.add(task)
-        task.add_done_callback(self._ack_admission_tasks.discard)
+        retain_until_done(asyncio.create_task(admit()), self._ack_admission_tasks)
 
     def pending_admission_tasks(self) -> tuple[asyncio.Task[Any], ...]:
         """Every currently in-flight ack-admission task, for shutdown sweeps."""

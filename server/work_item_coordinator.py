@@ -18,6 +18,7 @@ from .config import Config
 from .contracts import RoutingDecision
 from .registry import WorkerRegistry
 from .router import Router, WorkerCatalogue, validate_decision
+from .task_retention import retain_until_done
 
 _SEPARATE_REQUEST_VERBS = (
     r"search|find|look\s+up|check|show\s+me|tell\s+me|get|open|create|write|summarize"
@@ -138,7 +139,33 @@ Read by ``WorkItemCoordinator.OWNED_CONFIG_FIELDS`` (the canonical public
 name), by ``CoordinatorDefaults``, and by ``coordinator_view``'s fallback, so
 the three cannot drift. Declared at module scope because ``CoordinatorDefaults``
 is defined before ``WorkItemCoordinator`` and cannot reference it at class-body
-evaluation time."""
+evaluation time.
+
+Permissive-vs-strict decision (Phase 3 of the SessionHost decomposition
+plan, 2026-08-27): stays **permissive**. ``coordinator_view`` resolves a
+coordinator's ``OWNED_CONFIG_FIELDS`` via ``getattr(coordinator,
+"OWNED_CONFIG_FIELDS", defaults.OWNED_CONFIG_FIELDS)`` -- a coordinator that
+omits the member gets this default (pinned by
+``test_coordinator_defaults_matches_pipeline_getattr_fallbacks`` and the
+``BareCoordinator`` case in
+``test_all_four_coordinator_boundary_declarations_carry_the_same_members``'s
+sibling tests), and a coordinator that *declares* its own value -- even one
+that differs from this default -- is trusted as-is, not validated against
+it (pinned by
+``test_coordinator_view_honours_a_coordinators_own_owned_config_fields``).
+Made strict (rejecting a declared value that disagrees with this frozenset)
+would single out this one optional member for validation the other six
+(``registry``, ``config``, ``live_work_item_ids``, ``start_task``,
+``cancel``, ``shutdown``) do not get, without a consumer that needs it:
+``SessionHost.__init__``'s only use (the config-conflict check above) reads
+whatever the coordinator supplies and excludes exactly those fields from
+comparison -- a coordinator declaring a narrower or wider set is expressing
+which fields *it* overrides, which is information the host has no
+independent way to second-guess. A round-5 attempt to make a related
+Protocol boundary required instead of permissive broke 67 of
+``tests/test_pipeline.py``'s duck-typed doubles and was reverted; the same
+risk applies here since several duck-typed coordinators in ``tests/`` still
+construct without declaring this member at all."""
 
 
 class Coordinator(Protocol):
@@ -260,7 +287,23 @@ edits with nothing catching a missed one -- two such drifts have already
 happened (see ``CoordinatorDefaults.OWNED_CONFIG_FIELDS``' note and
 ``start_task``'s keyword). This frozenset is the single roster all four are
 pinned against by a test, so a member added to three of them fails the suite
-instead of silently taking a fallback in production."""
+instead of silently taking a fallback in production.
+
+Re-litigated in the open (Phase 3 of the SessionHost decomposition plan,
+2026-08-27), not silently re-affirmed: all four declarations were confirmed
+still live in production (``coordinator_view`` called from
+``SessionHost._coordinator_view``, ``server/pipeline.py``; its
+``CoordinatorView`` result read on the dispatch, cancel, and shutdown paths;
+``CoordinatorDefaults`` supplies every fallback ``coordinator_view`` returns;
+``OptionalCoordinator`` is the roster's Protocol leg, pinned by
+``__protocol_attrs__`` in the test above). Phase 0's contract-checked
+``FakeCoordinator`` double conforms to the full ``Coordinator`` Protocol and
+so cannot exercise the getattr-fallback path this roster protects -- but
+``tests/test_work_item_coordinator.py``'s ``BareCoordinator`` is a separate,
+deliberately member-less double kept specifically to exercise it. Its
+survival after the Phase 0 modernization is the evidence the fallback path
+is not production-dead, so the four declarations stay four. Pin re-affirmed;
+no collapse."""
 
 
 class OptionalCoordinator(Protocol):
@@ -517,12 +560,7 @@ class WorkItemCoordinator:
             return True
         if not force and not self._has_background_capacity():
             return False
-        self._owned_tasks.add(task)
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            self._owned_tasks.discard(completed_task)
-
-        task.add_done_callback(completed)
+        retain_until_done(task, self._owned_tasks)
         return True
 
     def start_task(self, operation: Any, *, mandatory: bool = False) -> asyncio.Task[Any] | None:
@@ -551,19 +589,12 @@ class WorkItemCoordinator:
         task = asyncio.create_task(operation)
         self._adopt_task(task, force=True)
         if mandatory:
-            self._mandatory_tasks.add(task)
-            task.add_done_callback(self._mandatory_tasks.discard)
+            retain_until_done(task, self._mandatory_tasks)
         return task
 
     def _track_cancelling_task(self, task: asyncio.Task[Any]) -> None:
         self._adopt_task(task, force=True)
-        self._cancelling_tasks.add(task)
-
-        def completed(completed_task: asyncio.Task[Any]) -> None:
-            self._cancelling_tasks.discard(completed_task)
-            self._consume_task_exception(completed_task)
-
-        task.add_done_callback(completed)
+        retain_until_done(task, self._cancelling_tasks, on_done=self._consume_task_exception)
         task.cancel()
 
     @staticmethod
@@ -610,6 +641,87 @@ class WorkItemCoordinator:
         results = tuple(self._late_results)
         self._late_results.clear()
         return results
+
+    def has_background_capacity(self) -> bool:
+        """Whether another non-mandatory background task can be admitted right now.
+
+        Public read for tests that previously called
+        ``coordinator._has_background_capacity()`` directly.
+        """
+        return self._has_background_capacity()
+
+    @property
+    def late_task_count(self) -> int:
+        """How many timed-out tasks are currently retained.
+
+        Public read for tests that previously asserted
+        ``len(coordinator._late_tasks) == ...`` directly.
+        """
+        return len(self._late_tasks)
+
+    def is_late_task(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently tracked as a retained late task.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._late_tasks`` directly.
+        """
+        return task in self._late_tasks
+
+    def is_cancelling_task(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently tracked as a cancellation-in-flight task.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._cancelling_tasks`` directly.
+        """
+        return task in self._cancelling_tasks
+
+    def is_background_task_ordered(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently in the background-completion order.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._background_task_order`` directly.
+        """
+        return task in self._background_task_order
+
+    def has_mandatory_tasks(self) -> bool:
+        """Whether any mandatory (budget-exempt) task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._mandatory_tasks`` (truthiness) directly.
+        """
+        return bool(self._mandatory_tasks)
+
+    def has_pending_submission_tasks(self) -> bool:
+        """Whether any multi-intent submission task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._submission_tasks == set()`` directly.
+        """
+        return bool(self._submission_tasks)
+
+    def is_submission_task(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is currently tracked as a submission task.
+
+        Public read for tests that previously asserted
+        ``task in coordinator._submission_tasks`` (or its negation) directly.
+        """
+        return task in self._submission_tasks
+
+    def has_pending_submit_tasks(self) -> bool:
+        """Whether any per-item submit task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._submit_tasks == set()`` directly.
+        """
+        return bool(self._submit_tasks)
+
+    def has_pending_provider_tasks(self) -> bool:
+        """Whether any provider task is currently tracked.
+
+        Public read for tests that previously asserted
+        ``coordinator._provider_tasks == set()`` directly.
+        """
+        return bool(self._provider_tasks)
 
     def retain_late_task(
         self,
@@ -997,8 +1109,7 @@ class WorkItemCoordinator:
                     continue
                 indexed_tasks.append((index, task))
                 self._work_tasks[work[index].work_item_id] = task
-                self._submit_tasks.add(task)
-                task.add_done_callback(self._submit_tasks.discard)
+                retain_until_done(task, self._submit_tasks)
                 task.add_done_callback(self._work_task_cleanup(work[index].work_item_id))
             tasks = [task for _, task in indexed_tasks]
             try:

@@ -32,7 +32,7 @@ program either **fixed** (commit recorded) or **retired** (reason recorded).
 | Plan | File | Status | Review Gates |
 |------|------|--------|--------------|
 | P1 — Query-context promotion decision | `20260824-feature-query-context-promotion.md` | Complete (retired) | none (hand-run reviews) |
-| P2 — SessionHost decomposition | `20260824-refactor-sessionhost-decomposition.md` | Not Started | full |
+| P2 — SessionHost decomposition | `20260824-refactor-sessionhost-decomposition.md` | Complete (rows 1-6, 8-12 closed) | full |
 | P3 — Post-release hardening | `20260824-chore-post-release-hardening.md` | Complete (rows 13-19 closed) | none (hand-run reviews) |
 
 Child-plan completion updates this table and the provenance map below in the
@@ -50,18 +50,18 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 
 | # | Item | Origin | Owner | Resolution |
 |---|------|--------|-------|------------|
-| 1 | `SessionHost` god-class (~2856 lines, `server/pipeline.py:594`), decomposition so far facade-only | AD-r8/r10 | P2 Ph1-2,6 | open |
-| 2 | ~19 one-line pass-through forwarders left by prior extractions | AD-r10 | P2 Ph6 | open |
-| 3 | Three ~250-600-line turn handlers duplicating epilogue logic | AD-r8/r10 | P2 Ph1 | open |
-| 4 | `SessionHost.connect` — 210 lines, 8 nested closures (AD-r10 figure; 9 by P2's current recount) | AD-r8/r10 | P2 Ph2 | open |
-| 5 | `ConnectionPipeline` should live in its own module (`server/pipeline.py:356`) | AD-r10 | P2 Ph2 | open |
-| 6 | `SessionHost`↔coordinator boundary declared 4× — all four live in production paths (the AD-r10 "two production-dead" claim was disproven in P2's plan review); re-litigation of the pin stays open, in P2 Ph3 | AD-r8/r10 | P2 Ph3 | open |
+| 1 | `SessionHost` god-class (~2856 lines, `server/pipeline.py:594`), decomposition so far facade-only | AD-r8/r10 | P2 Ph1-2,6 | fixed — decomposed across P2 Ph0-6: turn_epilogue.py (ca981bb), connection_pipeline.py (56b5d70), connect() decomposition (877003e), task_retention.py (27a9b20), forwarder collapse (P2 Ph6 boundary commit) |
+| 2 | ~19 one-line pass-through forwarders left by prior extractions | AD-r10 | P2 Ph6 | fixed — 10 pure pass-throughs removed, remainder kept-with-recorded-reason (P2 Ph6 boundary commit; \"~19\" over-counted) |
+| 3 | Three ~250-600-line turn handlers duplicating epilogue logic | AD-r8/r10 | P2 Ph1 | fixed ca981bb (shared turn-epilogue abstraction, characterization-table-backed) |
+| 4 | `SessionHost.connect` — 210 lines, 8 nested closures (AD-r10 figure; 9 by P2's current recount) | AD-r8/r10 | P2 Ph2 | fixed 877003e (9 closures → _connect_* methods, late-binding holder, zero behavior change) |
+| 5 | `ConnectionPipeline` should live in its own module (`server/pipeline.py:356`) | AD-r10 | P2 Ph2 | fixed 56b5d70 (moved verbatim, no re-export) |
+| 6 | `SessionHost`↔coordinator boundary declared 4× — all four live in production paths (the AD-r10 "two production-dead" claim was disproven in P2's plan review); re-litigation of the pin stays open, in P2 Ph3 | AD-r8/r10 | P2 Ph3 | retired: pin RE-AFFIRMED in the open — all four live in production, BareCoordinator proves getattr-fallback live; rationale recorded (f32e0b2) |
 | 7 | ~400 lines of promotion-manifest logic belong outside `server/config.py` | AD-r10 | retire → P1 Ph2 (deleted); invest → P2 Ph3 (extracted); P1-blocked → stays open | fixed c67da7f (machinery deleted rather than extracted) |
-| 8 | `_OWNED_CONFIG_FIELDS` permissive default (`server/work_item_coordinator.py:131`) — deferred 5 consecutive rounds | AD-r5/7/8/9/10 | P2 Ph3 | open |
-| 9 | Fire-and-forget task-reference idiom hand-rolled in ~11 sites (P2 review corrected the original "5 classes" count) | AD-r9/r10 | P2 Ph5 | open |
-| 10 | Ack-retry latch sibling re-latch race — verify-first: `_ack_admission_generation` (turn_ack_ledger.py:74-139) may already cover it; P2 Ph4 reproduces before fixing | AD-r10 | P2 Ph4 | open |
-| 11 | ~60 duck-typed `Coordinator` test doubles + 56 test call sites reading extracted collaborators — blocked every in-gauntlet structural attempt | AD-r5/r8/r10 | P2 Ph0 | open |
-| 12 | Client re-implements server's work-status eviction policy — P2 review found the "pin" option already implemented (`shared/work-status-retention.json` + dual parity tests); P2 Ph3 verifies and documents | AD-r10 | P2 Ph3 (verify) | open |
+| 8 | `_OWNED_CONFIG_FIELDS` permissive default (`server/work_item_coordinator.py:131`) — deferred 5 consecutive rounds | AD-r5/7/8/9/10 | P2 Ph3 | retired: PERMISSIVE pinned with rationale comment + non-vacuous honored-own-value test (f32e0b2) — 6th-round deferral ended |
+| 9 | Fire-and-forget task-reference idiom hand-rolled in ~11 sites (P2 review corrected the original "5 classes" count) | AD-r9/r10 | P2 Ph5 | fixed 27a9b20..91db5ef — retain_until_done helper; 13 sites converted, 9 excluded with recorded reasons, grep-zero exit check (d1fa8c1) |
+| 10 | Ack-retry latch sibling re-latch race — verify-first: `_ack_admission_generation` (turn_ack_ledger.py:74-139) may already cover it; P2 Ph4 reproduces before fixing | AD-r10 | P2 Ph4 | retired: already-fixed by _ack_admission_generation (390b764, post-round-10); deterministic reproduction pin with demonstrated non-vacuity (8474933) |
+| 11 | ~60 duck-typed `Coordinator` test doubles + 56 test call sites reading extracted collaborators — blocked every in-gauntlet structural attempt | AD-r5/r8/r10 | P2 Ph0 | fixed b1f6921 (+review-fix commits) — FakeCoordinator Protocol doubles, 43 migrated, ~138 private-read call sites moved to public accessors, assertion parity verified |
+| 12 | Client re-implements server's work-status eviction policy — P2 review found the "pin" option already implemented (`shared/work-status-retention.json` + dual parity tests); P2 Ph3 verifies and documents | AD-r10 | P2 Ph3 (verify) | retired: verified — shared/work-status-retention.json + dual parity tests (Python tests/test_session_state.py, JS web/test/state.test.js); no gap (f32e0b2) |
 | 13 | TTS half-pair guard hand-written, not registry-driven (`server/config.py:1676-1708`) | RG-r9 | P3 Ph1 | fixed 60e0f36 |
 | 14 | `check_release_metadata.py` manifest-verify false-negative on indirect shell invocation (fail-closed, not live in ci.yml) | RG-r9 | P3 Ph2 | fixed 0f3da39 |
 | 15 | ci.yml drift-gate class structurally open-ended (YAML-intent parsing vs observed-behavior assertion) | RG-r9 | P3 Ph2 | fixed 8e2090c |
@@ -121,4 +121,5 @@ does not exist today.
 - 2026-08-24: Program created. Backlog snapshot taken from AD rounds 5-10, Restart Gauntlet rounds 4-9 (156 fixes, 0 new quarantines — backlog stable across ~20 total rounds), and eval-suite phase reviews.
 - 2026-08-25: Evidence audit of `docs/benchmarks/` added row 21 and corrected the P1 ∥ P3 matrix row: P1's retire path must remove the manifest's CI/release-check consumers (overlapping P3 Phase 2) while keeping every committed v0.1.3 artifact as a frozen release record. P1 and P3 plans updated in the same pass.
 - 2026-08-25: Codex adversarial review of all four plan docs (20 findings, 2 Critical) fixed across the set. Headlines: P1's retire footprint gained the remaining `PromotionManifest` consumers (`server/composition.py`, `scripts/eval_common.py`, `scripts/smoke_conversation.py`) and the regression test must cover the fail-open `enable_autoplay_policy=False → "autoplay"` branch at `server/pipeline.py:2835`; P2's fire-and-forget inventory recounted (22 hits / 10 files); rows 4/6/7 corrected here; blocked-branch carve-outs, invest handoff, retire-path landing order, and index-creation ownership made explicit.
+- 2026-08-27: P2 complete — all 7 phases executed via /skein:conduct (Ph0 b1f6921, Ph1 ca981bb, Ph2 877003e, Ph3 f32e0b2, Ph4 8474933, Ph5 d1fa8c1, Ph6 this commit). Rows 1-6, 8-12 closed (5 fixed, 4 retired-with-evidence + row 2 fixed); Subordinate Plans row flipped to Complete. Row 21 remains the program's only open row (deferred to first v0.1.4 release plan).
 - 2026-08-27: P1 complete — operator chose retire (Phase 1 decision) after the Phase 0 feasibility pre-flight found the model available but promote gated behind the full Appendix A effort against an experiment that never demonstrated value; full-chain removal executed in `c67da7f`. Rows 20 and 7 closed; P1 ∥ P2 and P1 ∥ P3 matrix rows and the retire-path landing order marked resolved; P1's row in Subordinate Plans flipped to Complete (retired); P2 plan's Phase 3 manifest-extraction bullet dropped (P2 Findings).

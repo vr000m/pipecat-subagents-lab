@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import time
 from collections.abc import Callable, Mapping
@@ -17,6 +18,7 @@ from pydantic import ValidationError
 
 from .config import Config, FeaturePolicy
 from .connection_arbiter import ConnectionArbiter
+from .connection_pipeline import ConnectionPipeline
 from .contracts import (
     GroundedResult,
     RoutingDecision,
@@ -68,7 +70,15 @@ from .speech_scheduler import (
     SpeechRole,
     SpeechScheduler,
 )
+from .task_retention import retain_until_done
 from .turn_ack_ledger import TurnAckLedger
+from .turn_epilogue import (
+    SingleChildEpilogueOutcome,
+    TurnEpilogueContext,
+    finalize_fan_out_turn,
+    finalize_single_child_turn,
+    release_fan_out_turn_work_items,
+)
 from .work_item_coordinator import (
     FAILURE_KINDS,
     Coordinator,
@@ -81,7 +91,6 @@ from .work_status_publisher import (
     WorkStatusPublisher,
     child_work_status_after_dispatch,
     late_commit_work_status,
-    work_status_after_commit_failure,
     work_status_for_outcome,
 )
 from .work_task_ledger import WorkTaskLedger
@@ -352,103 +361,6 @@ def build_pipeline(*, transport: Any, stt: Any, tts: Any) -> LabPipeline:
     )
 
 
-@dataclass
-class ConnectionPipeline:
-    epoch: int
-    observer: RuntimeObserver
-    scheduler: SpeechScheduler
-    lifecycle: SpeechLifecycleCoordinator | None = None
-    stt: Any | None = None
-    tts: Any | None = None
-    transport: Any | None = None
-    worker: Any | None = None
-    worker_task: asyncio.Task[Any] | None = None
-    output_teardown: Callable[[], Any] | None = None
-    on_transcript: Callable[[str], Any] | None = None
-    active: bool = True
-
-    @property
-    def capabilities(self) -> frozenset[str]:
-        """Normalized capability set bound immutably to this connection's
-        promoted epoch (Phase 3).
-
-        Read straight off the ``RuntimeObserver`` constructed from the
-        promoted ``Connection``'s set, so entitlement lives in exactly one
-        place: a mirrored copy here could drift from the set the observer
-        actually filters with.
-        """
-        return self.observer.capabilities
-
-    @property
-    def supports_work_status(self) -> bool:
-        """Whether this connection negotiated the ``work_status_v1`` capability.
-
-        Delegates to the ``RuntimeObserver`` rather than testing
-        ``capabilities`` directly, so the single capability-gate predicate in
-        ``resolve_work_status_wire_presence`` stays the sole arbiter of
-        entitlement (Phase 3).
-        """
-        return self.observer.supports_work_status
-
-    def deactivate(self, *, reconnect: bool = True) -> None:
-        self.active = False
-        # full_stop=True: deactivate() always means this connection is being
-        # retired for good (shutdown or reconnect-promotion), so its queued
-        # and paused speech items must be swept regardless of `reconnect`'s
-        # value -- not just on a genuine reconnect (server/speech_scheduler.py
-        # SpeechScheduler.interrupt docstring).
-        self.scheduler.interrupt(epoch=self.epoch, reconnect=reconnect, full_stop=True)
-
-    async def shutdown(self, *, reason: str = "connection replaced", reconnect: bool) -> None:
-        """Fence this connection and stop its Pipecat worker, if attached.
-
-        Always forces scheduler cleanup, even if something upstream (e.g. a
-        failed output teardown) already set ``active = False`` directly
-        without releasing the scheduler's active lease.
-
-        ``reconnect`` is an explicit, caller-supplied classification -- not
-        inferred from ``reason``. ``reason`` is a free-text diagnostic string
-        with no stable set of reconnect-implying values (e.g. "connection
-        replaced during setup" is just as much a reconnect as "connection
-        replaced", but would not match an exact-string check); inferring
-        ``reconnect`` from it silently mis-classifies any call site whose
-        wording doesn't match exactly, dropping a still-active utterance's
-        origin-epoch fencing (see ``SpeechScheduler.interrupt``).
-        """
-        self.deactivate(reconnect=reconnect)
-        if self.worker is not None:
-            cancel = getattr(self.worker, "cancel", None)
-            if cancel is not None:
-                try:
-                    result = cancel(reason=reason)
-                    if hasattr(result, "__await__"):
-                        await result
-                except Exception:  # noqa: BLE001  # intentional catch-all: worker cancellation failures must not block connection teardown
-                    logger.debug(f"worker cancel raised during shutdown for {reason}")
-            self.worker = None
-        if self.worker_task is not None:
-            self.worker_task.cancel()
-            try:
-                await self.worker_task
-            except BaseException:  # noqa: BLE001  # intentional catch-all: awaiting a cancelled task can raise CancelledError/other BaseException; teardown must proceed regardless
-                logger.debug("worker task raised while awaiting cancellation during shutdown")
-            finally:
-                self.worker_task = None
-        self.observer.unsubscribe()
-        for service in (self.stt, self.tts):
-            cleanup = getattr(service, "cleanup", None)
-            if cleanup is None:
-                continue
-            try:
-                result = cleanup()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:  # noqa: BLE001  # intentional catch-all: a single service's cleanup failure must not block teardown of the other services
-                logger.debug(f"{service} cleanup raised during shutdown")
-        if self.lifecycle is not None:
-            self.lifecycle.connection_closed()
-
-
 SearchExecutionStatus = Literal["completed", "retained", "capacity_rejected", "retention_rejected"]
 
 # Every degraded/placeholder response `text=` this module ever sends --
@@ -538,8 +450,8 @@ class LateDeliveryContext:
     see ``WorkItemCoordinator.retain_late_task``/``:_search_with_timeout`` --
     so this rides that existing closure rather than adding a parameter to
     the coordinator's callback contract). ``accepted_turn_sequence`` is
-    ``SessionHost._turn_sequence`` as observed at dispatch time; comparing it
-    against the live counter at commit time is how ``commit_late_result_once``
+    ``self._turn_ack_ledger.turn_sequence`` as observed at dispatch time;
+    comparing it against the live counter at commit time is how ``commit_late_result_once``
     detects that a newer semantic turn has since been accepted.
     """
 
@@ -589,6 +501,25 @@ class DelegatedChild:
     search: Callable[..., Any]
     child: WorkItemRecorder
     retained_recorder: RetainedRecorder | None = None
+
+
+@dataclass
+class _PendingConnectionPipeline:
+    """Mutable forward-reference to the ``ConnectionPipeline`` a ``connect()``
+    call is still constructing.
+
+    ``SessionHost.connect()`` builds several callbacks (speech queue/stop,
+    lifecycle terminal/cleanup/teardown, transport-acceptance) that must be
+    handed to the ``SpeechLifecycleCoordinator``/``SpeechScheduler``
+    constructors *before* the ``ConnectionPipeline`` they close over exists.
+    A plain parameter cannot carry a value that does not exist yet; this
+    holder is passed explicitly instead of letting the callbacks implicitly
+    capture a `connect()`-local variable, while still resolving to the same
+    object once ``connect()`` finishes constructing it -- preserving the
+    original closures' late-binding read of that not-yet-assigned local.
+    """
+
+    pipeline: ConnectionPipeline | None = None
 
 
 class SessionHost:
@@ -763,135 +694,40 @@ class SessionHost:
         old_connection = self.connection
         # Publish the new authority before awaiting any old transport cleanup.
         self.state.active_epoch = connection.epoch
-        pipeline: ConnectionPipeline
         connection_stt = self._connection_service(self.stt)
         connection_tts = self._connection_service(self.tts)
 
-        async def queue_speech(item: Any) -> None:
-            if (
-                connection_tts is None
-                or self.connection is not pipeline
-                or not pipeline.active
-                or item.origin_epoch != pipeline.epoch
-                or not self.accepts(pipeline.epoch)
-            ):
-                raise RuntimeError("speech target is not the active TTS connection")
-            if pipeline.worker is None:
-                raise RuntimeError("active connection has no Pipecat worker for TTS")
-            lease = pipeline.scheduler.active
-            if pipeline.lifecycle is not None and lease is not None:
-                await pipeline.worker.queue_frame(
-                    SpeechGenerationMarkerFrame(
-                        token=lease.token,
-                        utterance_id=item.utterance_id,
-                        work_item_id=item.work_item_id,
-                        origin_epoch=item.origin_epoch,
-                    )
-                )
-            frame_factory = getattr(connection_tts, "correlated_speak_frame", None)
-            frame = (
-                frame_factory(
-                    item.text,
-                    correlation_id=item.utterance_id,
-                    append_to_context=False,
-                )
-                if frame_factory is not None
-                else TTSSpeakFrame(text=item.text, append_to_context=False)
-            )
-            await pipeline.worker.queue_frame(frame)
+        # `pending` stands in for the `pipeline` local that the pre-extraction
+        # closures forward-referenced: the speech/lifecycle callbacks below
+        # are constructed (and registered on `lifecycle`/the scheduler)
+        # *before* the ConnectionPipeline they operate on exists. Passing
+        # `pipeline` itself is impossible at that point, so the callbacks
+        # take this mutable holder as an explicit parameter and read
+        # `pending.pipeline` at call time -- preserving the original
+        # closures' late-binding read of the not-yet-assigned `pipeline`
+        # variable, now made explicit instead of implicit.
+        pending = _PendingConnectionPipeline()
 
-        async def stop_speech(item: Any) -> None:
-            if connection_tts is None or self.connection is not pipeline or pipeline.worker is None:
-                return
-            token = pipeline.lifecycle.slot_token if pipeline.lifecycle is not None else None
-            generation = (
-                pipeline.lifecycle.generation_for_token(token)
-                if pipeline.lifecycle is not None and token is not None
-                else None
-            )
-            if item is not None and (
-                generation is None or generation.identity.utterance_id != item.utterance_id
-            ):
-                token = None
-            await pipeline.worker.queue_frame(InterruptionFrame())
-            if token is not None:
-                await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
-
-        def schedule_pipeline_shutdown(reason: str) -> None:
-            self.track_background_shutdown(
-                asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
-            )
-
-        async def on_lifecycle_terminal(
-            token: str, identity: GenerationIdentity, disposition: DeliveryDisposition
-        ) -> None:
-            del token
-            if self.connection is not pipeline:
-                return
-            if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
-                pipeline.scheduler.delivery_unknown(identity.utterance_id)
-            if pipeline.active and pipeline.scheduler.active is None:
-                await pipeline.scheduler.start_next()
-
-        async def dispatch_lifecycle_cleanup(token: str, identity: GenerationIdentity) -> None:
-            del token, identity
-            await stop_speech(None)
-
-        async def dispatch_lifecycle_teardown(token: str, identity: GenerationIdentity) -> None:
-            del identity
-            # Fence this connection before any await or fallback. If the
-            # physical output barrier is unavailable/fails, shutdown still
-            # prevents another generation from entering this lane.
-            pipeline.active = False
-            teardown = pipeline.output_teardown
-            if teardown is None:
-                logger.error("speech output teardown unavailable; shutting down the speech lane")
-                schedule_pipeline_shutdown("speech output teardown failed")
-                return
-
-            # SmallWebRTCConnection.disconnect() does not return until its
-            # tracks and peer connection have been closed, so no fieldless
-            # stop from this lane can arrive after teardown_complete().
-            try:
-                result = teardown()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:  # noqa: BLE001  # fail closed: never acknowledge an unconfirmed output teardown
-                logger.exception("speech output teardown failed; retaining the lifecycle barrier")
-                schedule_pipeline_shutdown("speech output teardown failed")
-                return
-
-            if pipeline.lifecycle is not None:
-                await pipeline.lifecycle.teardown_complete(token)
-            schedule_pipeline_shutdown("speech output teardown")
-
-        def transport_acceptable() -> bool:
-            return self.connection is pipeline and pipeline.active
-
-        connection_config = self.config
-        # Every connection constructs one SpeechLifecycleCoordinator,
-        # including when connection_tts is None: the no-TTS/unavailable-
-        # transport cases are decided by pre_admission_disposition() rather
-        # than by never constructing a coordinator at all.
-        lifecycle = SpeechLifecycleCoordinator(
-            clock=MonotonicClock(),
-            timers=EventLoopTimerScheduler(),
-            speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
-            speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
-            on_terminal=on_lifecycle_terminal,
-            dispatch_cleanup=dispatch_lifecycle_cleanup,
-            dispatch_teardown=dispatch_lifecycle_teardown,
-            tts_available=connection_tts is not None,
-            transport_acceptance=transport_acceptable,
-        )
-
+        lifecycle = self._build_connection_lifecycle(connection_tts=connection_tts, pending=pending)
         pipeline = ConnectionPipeline(
             connection.epoch,
             RuntimeObserver(self.state, connection.epoch, frozenset(connection.capabilities)),
             SpeechScheduler(
                 self.state,
-                speak=queue_speech if connection_tts is not None else None,
-                stop=stop_speech if connection_tts is not None else None,
+                speak=(
+                    functools.partial(
+                        self._connect_queue_speech, connection_tts=connection_tts, pending=pending
+                    )
+                    if connection_tts is not None
+                    else None
+                ),
+                stop=(
+                    functools.partial(
+                        self._connect_stop_speech, connection_tts=connection_tts, pending=pending
+                    )
+                    if connection_tts is not None
+                    else None
+                ),
                 lifecycle=lifecycle,
                 on_ack_terminal=self.on_ack_terminal,
             ),
@@ -899,62 +735,250 @@ class SessionHost:
             stt=connection_stt,
             tts=connection_tts,
         )
-        if connection_stt is not None and self.coordinator is not None:
-
-            async def on_final(text: str) -> Any:
-                if self.connection is not pipeline or not pipeline.active:
-                    return None
-                return await self._handle_transcript(text, origin=pipeline)
-
-            pipeline.on_transcript = on_final
-        if connection_tts is not None and hasattr(connection_tts, "on_event"):
-
-            async def on_tts_event(event: str, context_id: str) -> Any:
-                callback_result = None
-                if self._tts_on_event is not None:
-                    callback_result = self._tts_on_event(event, context_id)
-                    if inspect.isawaitable(callback_result):
-                        callback_result = await callback_result
-                current = self.connection is pipeline and pipeline.active
-                has_lifecycle = pipeline.lifecycle is not None
-                if event == "synthesis_started" and current:
-                    pipeline.scheduler.provider_started(context_id)
-                elif event == "synthesis_ended" and current:
-                    pipeline.scheduler.provider_synthesis_ended(context_id)
-                    # Non-terminal: the real TTSStoppedFrame observed by
-                    # TransportSpeechLifecycleProcessor arms the coordinator's
-                    # drain deadline. Without a coordinator, fall back to the
-                    # old conservative immediate release so later utterances
-                    # cannot be starved.
-                    if not has_lifecycle:
-                        pipeline.scheduler.provider_delivery_unknown(context_id)
-                elif event == "delivery_completed" and current:
-                    # Same has_lifecycle gate as synthesis_ended above: with a
-                    # coordinator installed, only its own token-bearing
-                    # transport/tombstone barriers may release the slot.
-                    if not has_lifecycle:
-                        pipeline.scheduler.provider_delivery_completed(context_id)
-                elif event == "delivery_unknown" and current:
-                    lifecycle = pipeline.lifecycle
-                    token = (
-                        lifecycle.token_for_context(context_id) if lifecycle is not None else None
-                    )
-                    if lifecycle is not None and token is not None:
-                        await lifecycle.provider_error(token)
-                    else:
-                        pipeline.scheduler.provider_delivery_unknown(context_id)
-                if (
-                    not has_lifecycle
-                    and event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
-                    and self.connection is pipeline
-                    and pipeline.active
-                    and pipeline.scheduler.active is None
-                ):
-                    await pipeline.scheduler.start_next()
-                return callback_result
-
-            connection_tts.on_event = on_tts_event
+        # From here on, `pipeline` exists: the forward-referencing callbacks
+        # above resolve `pending.pipeline` to it the first time any of them
+        # actually runs (always after this assignment, since none of the
+        # constructors above invoke their callbacks synchronously).
+        pending.pipeline = pipeline
+        self._wire_connection_transcript_and_tts(
+            pipeline, connection_stt=connection_stt, connection_tts=connection_tts
+        )
         self.connection = pipeline
+        self._retire_old_connection(old_connection)
+        await self._runner_supervisor.register_persistent_workers(lambda: self.registry.workers)
+        return pipeline
+
+    def _build_connection_lifecycle(
+        self, *, connection_tts: Any | None, pending: _PendingConnectionPipeline
+    ) -> SpeechLifecycleCoordinator:
+        connection_config = self.config
+        # Every connection constructs one SpeechLifecycleCoordinator,
+        # including when connection_tts is None: the no-TTS/unavailable-
+        # transport cases are decided by pre_admission_disposition() rather
+        # than by never constructing a coordinator at all.
+        return SpeechLifecycleCoordinator(
+            clock=MonotonicClock(),
+            timers=EventLoopTimerScheduler(),
+            speech_start_timeout_seconds=connection_config.speech_start_timeout_seconds,
+            speech_transport_grace_seconds=connection_config.speech_transport_grace_seconds,
+            on_terminal=functools.partial(self._connect_on_lifecycle_terminal, pending=pending),
+            dispatch_cleanup=functools.partial(
+                self._connect_dispatch_lifecycle_cleanup,
+                connection_tts=connection_tts,
+                pending=pending,
+            ),
+            dispatch_teardown=functools.partial(
+                self._connect_dispatch_lifecycle_teardown, pending=pending
+            ),
+            tts_available=connection_tts is not None,
+            transport_acceptance=functools.partial(
+                self._connect_transport_acceptable, pending=pending
+            ),
+        )
+
+    async def _connect_queue_speech(
+        self, item: Any, *, connection_tts: Any | None, pending: _PendingConnectionPipeline
+    ) -> None:
+        pipeline = pending.pipeline
+        if (
+            connection_tts is None
+            or pipeline is None
+            or self.connection is not pipeline
+            or not pipeline.active
+            or item.origin_epoch != pipeline.epoch
+            or not self.accepts(pipeline.epoch)
+        ):
+            raise RuntimeError("speech target is not the active TTS connection")
+        if pipeline.worker is None:
+            raise RuntimeError("active connection has no Pipecat worker for TTS")
+        lease = pipeline.scheduler.active
+        if pipeline.lifecycle is not None and lease is not None:
+            await pipeline.worker.queue_frame(
+                SpeechGenerationMarkerFrame(
+                    token=lease.token,
+                    utterance_id=item.utterance_id,
+                    work_item_id=item.work_item_id,
+                    origin_epoch=item.origin_epoch,
+                )
+            )
+        frame_factory = getattr(connection_tts, "correlated_speak_frame", None)
+        frame = (
+            frame_factory(
+                item.text,
+                correlation_id=item.utterance_id,
+                append_to_context=False,
+            )
+            if frame_factory is not None
+            else TTSSpeakFrame(text=item.text, append_to_context=False)
+        )
+        await pipeline.worker.queue_frame(frame)
+
+    async def _connect_stop_speech(
+        self, item: Any, *, connection_tts: Any | None, pending: _PendingConnectionPipeline
+    ) -> None:
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before stopping speech"
+        if connection_tts is None or self.connection is not pipeline or pipeline.worker is None:
+            return
+        token = pipeline.lifecycle.slot_token if pipeline.lifecycle is not None else None
+        generation = (
+            pipeline.lifecycle.generation_for_token(token)
+            if pipeline.lifecycle is not None and token is not None
+            else None
+        )
+        if item is not None and (
+            generation is None or generation.identity.utterance_id != item.utterance_id
+        ):
+            token = None
+        await pipeline.worker.queue_frame(InterruptionFrame())
+        if token is not None:
+            await pipeline.worker.queue_frame(SpeechGenerationFlushAckFrame(token=token))
+
+    def _connect_schedule_pipeline_shutdown(
+        self, reason: str, *, pending: _PendingConnectionPipeline
+    ) -> None:
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before scheduling shutdown"
+        self.track_background_shutdown(
+            asyncio.create_task(pipeline.shutdown(reason=reason, reconnect=False))
+        )
+
+    async def _connect_on_lifecycle_terminal(
+        self,
+        token: str,
+        identity: GenerationIdentity,
+        disposition: DeliveryDisposition,
+        *,
+        pending: _PendingConnectionPipeline,
+    ) -> None:
+        del token
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before lifecycle terminal"
+        if self.connection is not pipeline:
+            return
+        if disposition == DeliveryDisposition.DELIVERY_UNKNOWN:
+            pipeline.scheduler.delivery_unknown(identity.utterance_id)
+        if pipeline.active and pipeline.scheduler.active is None:
+            await pipeline.scheduler.start_next()
+
+    async def _connect_dispatch_lifecycle_cleanup(
+        self,
+        token: str,
+        identity: GenerationIdentity,
+        *,
+        connection_tts: Any | None,
+        pending: _PendingConnectionPipeline,
+    ) -> None:
+        del token, identity
+        await self._connect_stop_speech(None, connection_tts=connection_tts, pending=pending)
+
+    async def _connect_dispatch_lifecycle_teardown(
+        self, token: str, identity: GenerationIdentity, *, pending: _PendingConnectionPipeline
+    ) -> None:
+        del identity
+        pipeline = pending.pipeline
+        assert pipeline is not None, "pending.pipeline must be set before lifecycle teardown"
+        # Fence this connection before any await or fallback. If the
+        # physical output barrier is unavailable/fails, shutdown still
+        # prevents another generation from entering this lane.
+        pipeline.active = False
+        teardown = pipeline.output_teardown
+        if teardown is None:
+            logger.error("speech output teardown unavailable; shutting down the speech lane")
+            self._connect_schedule_pipeline_shutdown(
+                "speech output teardown failed", pending=pending
+            )
+            return
+
+        # SmallWebRTCConnection.disconnect() does not return until its
+        # tracks and peer connection have been closed, so no fieldless
+        # stop from this lane can arrive after teardown_complete().
+        try:
+            result = teardown()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001  # fail closed: never acknowledge an unconfirmed output teardown
+            logger.exception("speech output teardown failed; retaining the lifecycle barrier")
+            self._connect_schedule_pipeline_shutdown(
+                "speech output teardown failed", pending=pending
+            )
+            return
+
+        if pipeline.lifecycle is not None:
+            await pipeline.lifecycle.teardown_complete(token)
+        self._connect_schedule_pipeline_shutdown("speech output teardown", pending=pending)
+
+    def _connect_transport_acceptable(self, *, pending: _PendingConnectionPipeline) -> bool:
+        pipeline = pending.pipeline
+        assert pipeline is not None, (
+            "pending.pipeline must be set before transport acceptance check"
+        )
+        return self.connection is pipeline and pipeline.active
+
+    async def _connect_on_final(self, text: str, *, pipeline: ConnectionPipeline) -> Any:
+        if self.connection is not pipeline or not pipeline.active:
+            return None
+        return await self._handle_transcript(text, origin=pipeline)
+
+    async def _connect_on_tts_event(
+        self, event: str, context_id: str, *, pipeline: ConnectionPipeline
+    ) -> Any:
+        callback_result = None
+        if self._tts_on_event is not None:
+            callback_result = self._tts_on_event(event, context_id)
+            if inspect.isawaitable(callback_result):
+                callback_result = await callback_result
+        current = self.connection is pipeline and pipeline.active
+        has_lifecycle = pipeline.lifecycle is not None
+        if event == "synthesis_started" and current:
+            pipeline.scheduler.provider_started(context_id)
+        elif event == "synthesis_ended" and current:
+            pipeline.scheduler.provider_synthesis_ended(context_id)
+            # Non-terminal: the real TTSStoppedFrame observed by
+            # TransportSpeechLifecycleProcessor arms the coordinator's
+            # drain deadline. Without a coordinator, fall back to the
+            # old conservative immediate release so later utterances
+            # cannot be starved.
+            if not has_lifecycle:
+                pipeline.scheduler.provider_delivery_unknown(context_id)
+        elif event == "delivery_completed" and current:
+            # Same has_lifecycle gate as synthesis_ended above: with a
+            # coordinator installed, only its own token-bearing
+            # transport/tombstone barriers may release the slot.
+            if not has_lifecycle:
+                pipeline.scheduler.provider_delivery_completed(context_id)
+        elif event == "delivery_unknown" and current:
+            lifecycle = pipeline.lifecycle
+            token = lifecycle.token_for_context(context_id) if lifecycle is not None else None
+            if lifecycle is not None and token is not None:
+                await lifecycle.provider_error(token)
+            else:
+                pipeline.scheduler.provider_delivery_unknown(context_id)
+        if (
+            not has_lifecycle
+            and event in {"synthesis_ended", "delivery_completed", "delivery_unknown"}
+            and self.connection is pipeline
+            and pipeline.active
+            and pipeline.scheduler.active is None
+        ):
+            await pipeline.scheduler.start_next()
+        return callback_result
+
+    def _wire_connection_transcript_and_tts(
+        self,
+        pipeline: ConnectionPipeline,
+        *,
+        connection_stt: Any | None,
+        connection_tts: Any | None,
+    ) -> None:
+        if connection_stt is not None and self.coordinator is not None:
+            pipeline.on_transcript = functools.partial(self._connect_on_final, pipeline=pipeline)
+        if connection_tts is not None and hasattr(connection_tts, "on_event"):
+            connection_tts.on_event = functools.partial(
+                self._connect_on_tts_event, pipeline=pipeline
+            )
+
+    def _retire_old_connection(self, old_connection: ConnectionPipeline | None) -> None:
         if old_connection is not None:
             old_connection.deactivate()
             self.track_background_shutdown(
@@ -962,8 +986,6 @@ class SessionHost:
                     old_connection.shutdown(reason="connection replaced", reconnect=True)
                 )
             )
-        await self._runner_supervisor.register_persistent_workers(lambda: self.registry.workers)
-        return pipeline
 
     @staticmethod
     def _connection_service(service: Any | None) -> Any | None:
@@ -971,13 +993,6 @@ class SessionHost:
             return None
         factory = getattr(service, "for_connection", None)
         return factory() if factory is not None else service
-
-    def _next_turn_id(self) -> str:
-        return self._turn_ack_ledger.next_turn_id()
-
-    @property
-    def _turn_sequence(self) -> int:
-        return self._turn_ack_ledger.turn_sequence
 
     @staticmethod
     def _failure_child_outcome(failure: WorkItemFailure) -> WorkItemOutcome:
@@ -1014,9 +1029,7 @@ class SessionHost:
         worker-failure handler) route through here rather than reaching into
         ``_background_shutdowns``.
         """
-        self._background_shutdowns.add(task)
-        task.add_done_callback(self._background_shutdowns.discard)
-        return task
+        return retain_until_done(task, self._background_shutdowns)
 
     def abort_connection(self, pipeline: ConnectionPipeline, *, reconnect: bool = True) -> None:
         """Fence a promoted connection whose transport setup did not complete.
@@ -1031,30 +1044,6 @@ class SessionHost:
             pipeline.deactivate(reconnect=reconnect)
             self.connection = None
             self.state.active_epoch = None
-
-    @staticmethod
-    def _ack_work_item_id(turn_id: str) -> str:
-        """The one synthetic scheduler key this turn's ack is enqueued under."""
-        return TurnAckLedger.ack_work_item_id(turn_id)
-
-    def _clear_ack_latch(self, turn_id: str) -> None:
-        self._turn_ack_ledger.clear_ack_latch(turn_id)
-
-    def _settle_turn_ack(
-        self, scheduler: Any, turn_id: str, *, cancel_admitted: bool = False
-    ) -> None:
-        """Retract this turn's ack and close its admission-retry chain.
-
-        See ``TurnAckLedger.settle_turn_ack`` for the full rationale.
-        """
-        self._turn_ack_ledger.settle_turn_ack(scheduler, turn_id, cancel_admitted=cancel_admitted)
-
-    def _register_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
-        """Record one delegated child as belonging to ``turn_id``.
-
-        See ``TurnAckLedger.register_turn_work_item`` for the full rationale.
-        """
-        self._turn_ack_ledger.register_turn_work_item(turn_id, work_item_id)
 
     def _begin_delegation(
         self,
@@ -1071,7 +1060,7 @@ class SessionHost:
         order: missing-worker rejection, missing-search rejection,
         ``_project_worker(running)``, child-recorder creation, registration
         in both ``delegated_children`` and the work ledger's known-ids (the
-        latter alongside ``_register_turn_work_item``, before any ack for
+        latter alongside ``TurnAckLedger.register_turn_work_item``, before any ack for
         this item can be admitted), and the ``routing`` status emit.
 
         ``finalize_turn_on_failure`` controls whether a missing-worker/
@@ -1128,7 +1117,7 @@ class SessionHost:
             return None
         child = turn_recorder.new_child(work_item_id=request.work_item_id)
         delegated_children[request.work_item_id] = worker_id
-        self._register_turn_work_item(request.turn_id, request.work_item_id)
+        self._turn_ack_ledger.register_turn_work_item(request.turn_id, request.work_item_id)
         # Registered in the ledger before this item's routing status/ack, so
         # a whole-turn/whole-connection cancel racing in before the ack is
         # admitted still sees this child as known.
@@ -1170,28 +1159,6 @@ class SessionHost:
             origin_epoch=origin_epoch,
         )
 
-    def _release_all_turn_work_items(self, turn_id: str) -> None:
-        """Release every delegated child of ``turn_id`` and settle its ack latch.
-
-        See ``TurnAckLedger.release_all_turn_work_items`` for the full
-        rationale.
-        """
-        self._turn_ack_ledger.release_all_turn_work_items(turn_id)
-
-    def _release_turn_work_item(self, turn_id: str, work_item_id: str) -> None:
-        """Release one delegated child, keeping the turn's ack alive for siblings.
-
-        See ``TurnAckLedger.release_turn_work_item`` for the full rationale.
-        """
-        self._turn_ack_ledger.release_turn_work_item(turn_id, work_item_id)
-
-    def _ack_turn_for_work_item(self, work_item_id: str) -> str | None:
-        """The latched semantic turn that owns ``work_item_id``, if any.
-
-        See ``TurnAckLedger.ack_turn_for_work_item`` for the full rationale.
-        """
-        return self._turn_ack_ledger.ack_turn_for_work_item(work_item_id)
-
     def on_ack_terminal(
         self, identity: GenerationIdentity, reason: PreAdmissionTerminalReason
     ) -> None:
@@ -1200,28 +1167,6 @@ class SessionHost:
         See ``TurnAckLedger.on_ack_terminal`` for the full rationale.
         """
         self._turn_ack_ledger.on_ack_terminal(identity, reason)
-
-    async def _emit_early_ack(
-        self,
-        origin: ConnectionPipeline,
-        *,
-        turn_id: str,
-        origin_epoch: int,
-        dispatched: bool,
-        search_task: asyncio.Task[Any] | None = None,
-    ) -> None:
-        """Enqueue this turn's one delegation-confirmed ack.
-
-        See ``TurnAckLedger.emit_early_ack`` for the full rationale, including
-        the ``dispatched``/``search_task`` contract.
-        """
-        await self._turn_ack_ledger.emit_early_ack(
-            origin,
-            turn_id=turn_id,
-            origin_epoch=origin_epoch,
-            dispatched=dispatched,
-            search_task=search_task,
-        )
 
     async def cancel_turn_or_child(
         self,
@@ -1253,22 +1198,22 @@ class SessionHost:
         control turn, say) would settle *that* turn's ack.
         """
         origin = origin or self.connection
-        ack_work_item_id = self._ack_work_item_id(turn_id) if turn_id is not None else None
+        ack_work_item_id = TurnAckLedger.ack_work_item_id(turn_id) if turn_id is not None else None
         if origin is None:
             if turn_id is not None:
-                self._clear_ack_latch(turn_id)
+                self._turn_ack_ledger.clear_ack_latch(turn_id)
             return (), ()
         scheduler = origin.scheduler
         if child_work_item_id is None:
             cancelled_work = self._cancel_work(None, exclude_work_item_id=exclude_work_item_id)
             cancelled_speech = scheduler.cancel(None)
             if turn_id is not None:
-                self._clear_ack_latch(turn_id)
+                self._turn_ack_ledger.clear_ack_latch(turn_id)
             for item in cancelled_speech:
                 # A whole-turn sweep removes every live ack, including acks
                 # belonging to earlier turns; their latches go with them.
                 if item.role == ROLE_ACK and item.turn_id is not None:
-                    self._clear_ack_latch(item.turn_id)
+                    self._turn_ack_ledger.clear_ack_latch(item.turn_id)
             return cancelled_work, cancelled_speech
         cancelled_work = self._cancel_work(
             child_work_item_id, exclude_work_item_id=exclude_work_item_id
@@ -1302,7 +1247,7 @@ class SessionHost:
         remaining.discard(child_work_item_id)
         if not remaining:
             scheduler.cancel(ack_work_item_id)
-            self._clear_ack_latch(turn_id)
+            self._turn_ack_ledger.clear_ack_latch(turn_id)
         return cancelled_work, cancelled_speech
 
     def _require_coordinator(self) -> Coordinator:
@@ -1352,7 +1297,7 @@ class SessionHost:
         ):
             return transcript
         origin_epoch = origin.epoch
-        turn_id = self._next_turn_id()
+        turn_id = self._turn_ack_ledger.next_turn_id()
         work_item_id = f"work-{turn_id}"
         turn_recorder = self._recorder_factory.new_app_turn_recorder(
             origin_epoch=origin_epoch, turn_id=turn_id
@@ -1446,7 +1391,9 @@ class SessionHost:
                         # ack, or none at all. Falling back to this control
                         # turn's own id would settle an unrelated turn's ack.
                         cancel_turn_id = (
-                            self._ack_turn_for_work_item(target) if target is not None else turn_id
+                            self._turn_ack_ledger.ack_turn_for_work_item(target)
+                            if target is not None
+                            else turn_id
                         )
                         cancelled_work, cancelled_speech = await self.cancel_turn_or_child(
                             cancel_turn_id,
@@ -1577,7 +1524,7 @@ class SessionHost:
                     search, transcript, turn_id=turn_id, origin_epoch=origin_epoch
                 )
                 if search_task is not None:
-                    # Track before the first await below. `_emit_early_ack`
+                    # Track before the first await below. `TurnAckLedger.emit_early_ack`
                     # yields a scheduling tick to the search, and
                     # `_search_with_timeout` only registers the task after
                     # that; a cancel arriving inside the yield window reaches
@@ -1596,9 +1543,9 @@ class SessionHost:
                 # very same turn can still fence the still-queued ack before
                 # it ever reaches the old connection's transport. A refused
                 # dispatch (``search_task is None``) delegates nothing, so it
-                # acknowledges nothing -- see ``_emit_early_ack``'s
+                # acknowledges nothing -- see ``TurnAckLedger.emit_early_ack``'s
                 # ``dispatched`` contract.
-                await self._emit_early_ack(
+                await self._turn_ack_ledger.emit_early_ack(
                     origin,
                     turn_id=turn_id,
                     origin_epoch=origin_epoch,
@@ -1720,70 +1667,43 @@ class SessionHost:
                     origin_epoch=origin_epoch,
                 )
                 child_outcome_label = "failed"
-            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
-            commit_started = time.perf_counter()
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            self._settle_turn_ack(origin.scheduler, turn_id)
-            # A retained child is not terminal: its truthful `background`
-            # status was already emitted above and the coordinator terminalizes
-            # it when the late result lands. Only an actual cancellation
-            # settles it here.
+            # Computed -- and assigned to this handler's own `retained_still_open`
+            # local -- *before* the epilogue's commit/speak await below, not
+            # derived from its return: the `except`/`finally` epilogue further
+            # down reads this same local across that await, and must see the
+            # correct value even if the commit raises or the turn is cancelled
+            # mid-await (pre-extraction: 8875fdc:server/pipeline.py:1740).
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             retained_still_open = child_outcome_label == "retained" and not was_cancelled
-            derived = (
-                None
-                if retained_still_open
-                else work_status_for_outcome(
-                    child_outcome_label,
-                    cancelled=was_cancelled,
-                    terminal_kind=child_outcome_label,
-                )
+            epilogue_ctx = TurnEpilogueContext(
+                settle_turn_ack=self._turn_ack_ledger.settle_turn_ack,
+                emit_work_status=self._emit_work_status,
+                release_turn_work_item=self._turn_ack_ledger.release_turn_work_item,
+                release_all_turn_work_items=self._turn_ack_ledger.release_all_turn_work_items,
+                worker_projection=self._worker_projection,
             )
-            # Terminal status is emitted only *after* the canonical commit
-            # succeeds. Emitting `result_ready` first would tell a capable
-            # client the result was committed and display-ready even when the
-            # commit then raised or the turn was cancelled before it ran; a
-            # commit failure settles the child to `failed` instead.
-            try:
-                committed = await self._commit_and_speak(result, origin, role=speech_role)
-            except Exception:
-                failure_status = work_status_after_commit_failure(derived)
-                if failure_status is not None:
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state=failure_status[0],
-                        origin_epoch=origin_epoch,
-                        terminal_reason=failure_status[1],
-                    )
-                raise
-            if derived is not None:
-                status_state, status_reason = derived
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=work_item_id,
-                    worker_id=worker_id,
-                    state=status_state,
-                    origin_epoch=origin_epoch,
-                    terminal_reason=status_reason,
-                )
-            commit_ms = (time.perf_counter() - commit_started) * 1000
-            child.finalize(
-                outcome=child_outcome_label,
-                app_worker_id=worker_id,
-                result_id=result.result_id,
-                search_ms=search_ms,
-                commit_ms=commit_ms,
-            )
-            turn_recorder.record_commit(commit_ms)
-            turn_recorder.finalize()
-            self._worker_projection.project(
-                worker,
+            epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
+                epilogue_ctx,
+                origin=origin,
+                turn_id=turn_id,
+                work_item_id=work_item_id,
                 origin_epoch=origin_epoch,
-                status="idle",
-                latest_result_id=None if was_cancelled else result.result_id,
+                worker=worker,
+                worker_id=worker_id,
+                child=child,
+                turn_recorder=turn_recorder,
+                result=result,
+                child_outcome_label=child_outcome_label,
+                retained_still_open=retained_still_open,
+                was_cancelled=was_cancelled,
+                speech_role=speech_role,
+                search_ms=search_ms,
+                commit_and_speak=self._commit_and_speak,
+                project_idle=True,
             )
-            return committed
+            retained_still_open = epilogue_outcome.retained_still_open
+            return epilogue_outcome.result
         except asyncio.CancelledError:
             self._finalize_turn_exception(
                 cancelled=True,
@@ -1806,7 +1726,7 @@ class SessionHost:
             raise
         finally:
             if not retained_still_open:
-                self._release_all_turn_work_items(turn_id)
+                self._turn_ack_ledger.release_all_turn_work_items(turn_id)
 
     async def _handle_pending(
         self,
@@ -1825,7 +1745,7 @@ class SessionHost:
         # Captured before the first await below, which may span other turns
         # being accepted concurrently: this is the turn-sequence snapshot
         # LateDeliveryContext needs to detect a newer-turn arrival.
-        dispatch_turn_sequence = self._turn_sequence
+        dispatch_turn_sequence = self._turn_ack_ledger.turn_sequence
         try:
             pending = getattr(outcome, "pending_dialogue", None)
             owner_id = pending.owner_id if pending is not None else None
@@ -1876,7 +1796,7 @@ class SessionHost:
             # Dispatch happens inside ``coordinator.submit`` below, so there is
             # no handle to inspect here; the plan requires the ack at the
             # delegation decision, not after submission returns.
-            await self._emit_early_ack(
+            await self._turn_ack_ledger.emit_early_ack(
                 origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
             )
             clarification_context = self._worker_projection.clarification_context(
@@ -1985,54 +1905,67 @@ class SessionHost:
                 child_outcome_label = failure_outcome
                 child.finalize(outcome=failure_outcome, app_worker_id=worker_id)
             speech_role = _speech_role_for_child_outcome(child_outcome_label)
-            # This turn's ack was enqueued at the delegation *decision*, before
-            # coordinator.submit could report whether the work was accepted at
-            # all. Nothing committed and nothing is still running here, so the
-            # ack promises a result that is never coming; retract it even if it
-            # already reached the transport (the multi-intent path's own
-            # "nothing accepted" branch does the same).
-            self._settle_turn_ack(
-                origin.scheduler,
-                turn_id,
-                cancel_admitted=not submitted.results and not submitted.pending_work_item_ids,
-            )
-            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             # A cancelled child is settled here and now, so its ack ownership
             # does not have to survive for a late result that will not speak.
+            # Assigned to this handler's own `retained_still_open` local --
+            # not derived from the epilogue's return -- *before* the epilogue's
+            # commit/speak await below: the `except`/`finally` epilogue further
+            # down reads this same local across that await, and must see the
+            # correct value even if the commit raises or the turn is cancelled
+            # mid-await (pre-extraction: 8875fdc:server/pipeline.py:2011).
+            was_cancelled = work_item_id in self._work_ledger.cancelled_ids
             retained_still_open = retained_still_open and not was_cancelled
-            derived = child_work_status_after_dispatch(
-                child_outcome_label,
-                cancelled=was_cancelled,
-                terminal_kind=child_outcome_label,
+            epilogue_ctx = TurnEpilogueContext(
+                settle_turn_ack=self._turn_ack_ledger.settle_turn_ack,
+                emit_work_status=self._emit_work_status,
+                release_turn_work_item=self._turn_ack_ledger.release_turn_work_item,
+                release_all_turn_work_items=self._turn_ack_ledger.release_all_turn_work_items,
+                worker_projection=self._worker_projection,
             )
-            # Terminal status only after the canonical commit succeeds; see the
-            # matching comment in the single-intent path.
-            try:
-                committed = await self._commit_and_speak(result, origin, role=speech_role)
-            except Exception:
-                failure_status = work_status_after_commit_failure(derived)
-                if failure_status is not None:
-                    self._emit_work_status(
-                        turn_id=turn_id,
-                        work_item_id=work_item_id,
-                        worker_id=worker_id,
-                        state=failure_status[0],
-                        origin_epoch=origin_epoch,
-                        terminal_reason=failure_status[1],
-                    )
-                raise
-            if derived is not None:
-                status_state, status_reason = derived
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=work_item_id,
-                    worker_id=worker_id,
-                    state=status_state,
-                    origin_epoch=origin_epoch,
-                    terminal_reason=status_reason,
-                )
-            turn_recorder.finalize()
-            return committed
+            epilogue_outcome: SingleChildEpilogueOutcome = await finalize_single_child_turn(
+                epilogue_ctx,
+                origin=origin,
+                turn_id=turn_id,
+                work_item_id=work_item_id,
+                origin_epoch=origin_epoch,
+                worker=worker,
+                worker_id=worker_id,
+                child=child,
+                turn_recorder=turn_recorder,
+                result=result,
+                child_outcome_label=child_outcome_label,
+                retained_still_open=retained_still_open,
+                was_cancelled=was_cancelled,
+                speech_role=speech_role,
+                commit_and_speak=self._commit_and_speak,
+                # This turn's ack was enqueued at the delegation *decision*,
+                # before coordinator.submit could report whether the work was
+                # accepted at all. Nothing committed and nothing is still
+                # running here, so the ack promises a result that is never
+                # coming; retract it even if it already reached the transport
+                # (the multi-intent path's own "nothing accepted" branch does
+                # the same).
+                cancel_admitted=not submitted.results and not submitted.pending_work_item_ids,
+                # Unlike the single-intent path, pending-dialogue never
+                # projects the worker back to `idle` (row 9 of the Phase 1
+                # differences table).
+                project_idle=False,
+                # Pre-extraction, `_handle_pending` never recorded a commit
+                # duration against `app_turn_foreground` (Finding 3) -- only
+                # the single-intent handler did.
+                record_commit_ms=False,
+                # Row 3's variance: pending-dialogue re-derives the retained
+                # child's status through `child_work_status_after_dispatch`
+                # (republishing `background` after the commit), where
+                # single-intent emits nothing. The two differ only when
+                # `enable_background_status` was off for the dispatch-time
+                # `background` emit above and back on by the time the commit
+                # returns -- pre-extraction, this path recovered the child
+                # from its stale `searching` record there.
+                derive_status=child_work_status_after_dispatch,
+            )
+            retained_still_open = epilogue_outcome.retained_still_open
+            return epilogue_outcome.result
         except asyncio.CancelledError:
             self._finalize_turn_exception(
                 cancelled=True,
@@ -2055,7 +1988,7 @@ class SessionHost:
             raise
         finally:
             if not retained_still_open:
-                self._release_all_turn_work_items(turn_id)
+                self._turn_ack_ledger.release_all_turn_work_items(turn_id)
 
     async def _handle_multi_intent(
         self,
@@ -2079,10 +2012,21 @@ class SessionHost:
         # handler's return; ``commit_late_result_once`` releases each one.
         retained_work_items: set[str] = set()
         # Captured before the first await below (route_envelope/_dispatch/
-        # _emit_early_ack per work item), which may span other turns being
+        # TurnAckLedger.emit_early_ack per work item), which may span other turns being
         # accepted concurrently: this is the turn-sequence snapshot
         # LateDeliveryContext needs to detect a newer-turn arrival.
-        dispatch_turn_sequence = self._turn_sequence
+        dispatch_turn_sequence = self._turn_ack_ledger.turn_sequence
+        # Constructed here (before `try`) rather than at its first use point
+        # like the single-child shape's context: the `finally` below needs it
+        # for `release_fan_out_turn_work_items` even if the body raises
+        # before ever reaching the epilogue call, and this is a pure
+        # attribute read that cannot itself fail.
+        epilogue_ctx = TurnEpilogueContext(
+            settle_turn_ack=self._turn_ack_ledger.settle_turn_ack,
+            emit_work_status=self._emit_work_status,
+            release_turn_work_item=self._turn_ack_ledger.release_turn_work_item,
+            release_all_turn_work_items=self._turn_ack_ledger.release_all_turn_work_items,
+        )
         try:
             results: dict[int, Any] = {}
             runnable: list[tuple[str, str]] = []
@@ -2210,7 +2154,7 @@ class SessionHost:
                 # Dispatch happens inside ``coordinator.submit`` below; the plan
                 # requires the parent ack at the first eligible child
                 # *decision*, so there is no handle to inspect here.
-                await self._emit_early_ack(
+                await self._turn_ack_ledger.emit_early_ack(
                     origin, turn_id=turn_id, origin_epoch=origin.epoch, dispatched=False
                 )
 
@@ -2534,108 +2478,25 @@ class SessionHost:
                 # `shared/protocol.md` already documents for reconnect
                 # snapshot terminal records, which is a larger, separately
                 # scoped change.
-            if not attributed_indexes and not retained_work_items:
-                # No *delegated* child was accepted or retained: every one was
-                # rejected before dispatch or never accounted for by the
-                # coordinator. The ack was enqueued at the delegation decision
-                # and promises a search result that is never coming, so retract
-                # it in whatever state it is in -- a plain queued-ack discard
-                # cannot reach one already admitted to the transport.
-                #
-                # The test is deliberately ``attributed_indexes``, not
-                # ``results``: a mixed multi-intent turn whose direct half
-                # produced a result and whose delegated half was
-                # capacity-rejected has a non-empty ``results`` while nothing
-                # was delegated at all, which left the false-progress ack
-                # speakable. ``attributed_indexes`` holds exactly the runnable
-                # (delegated) indexes the coordinator accounted for in some
-                # fan-in bucket -- result, pending, or failure -- so it is the
-                # accepted/retained-delegated-work signal this decision needs.
-                # ``retained_work_items`` is a subset of it and is kept only to
-                # state the "still running" half of the condition explicitly.
-                self._settle_turn_ack(origin.scheduler, turn_id, cancel_admitted=True)
-            else:
-                self._settle_turn_ack(origin.scheduler, turn_id)
-            committed = []
-            commit_exceptions: list[Exception] = []
-            for index in sorted(results):
-                # _commit_and_speak durably commits state before it ever
-                # attempts to speak, so a speak-time failure on one item must
-                # not abort the loop and drop already-computed sibling
-                # results; each item is isolated and the first failure is
-                # re-raised only after every item has been committed.
-                #
-                # Each item's terminal work-status is emitted only after its
-                # own commit returns, so `result_ready` is never published for
-                # a result whose commit raised.
-                #
-                # `deferred_status` was derived above from the cancel set as it
-                # stood *before* this loop. A cancel landing between then and
-                # this await makes _commit_and_speak silently skip the commit
-                # and return normally, so the pre-derived status has to be
-                # downgraded to the outcome that actually happened rather than
-                # published as-is.
-                suppressed: set[str] = set()
-                try:
-                    committed.append(
-                        await self._commit_and_speak(
-                            results[index],
-                            origin,
-                            role=speech_roles.get(index, ROLE_RESULT),
-                            suppressed_out=suppressed,
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001  # isolate one item's speak failure from its siblings; re-raised below once all items are committed
-                    logger.exception(
-                        f"multi-intent commit for {turn_id}: item {index} failed after its "
-                        f"state was already committed; continuing with remaining items"
-                    )
-                    committed.append(results[index])
-                    commit_exceptions.append(exc)
-                    pending_status = deferred_status.pop(index, None)
-                    if pending_status is not None:
-                        failed_item_id, failed_worker_id, _state, _reason = pending_status
-                        self._emit_work_status(
-                            turn_id=turn_id,
-                            work_item_id=failed_item_id,
-                            parent_work_item_id=parent_work_item_id,
-                            worker_id=failed_worker_id,
-                            state="failed",
-                            origin_epoch=origin_epoch,
-                        )
-                else:
-                    pending_status = deferred_status.pop(index, None)
-                    if pending_status is not None:
-                        item_id, item_worker_id, status_state, status_reason = pending_status
-                        if item_id in suppressed:
-                            status_state, status_reason = "cancelled", None
-                        self._emit_work_status(
-                            turn_id=turn_id,
-                            work_item_id=item_id,
-                            parent_work_item_id=parent_work_item_id,
-                            worker_id=item_worker_id,
-                            state=status_state,
-                            origin_epoch=origin_epoch,
-                            terminal_reason=status_reason,
-                        )
-            # A deferred status whose index never reached the commit loop (its
-            # result was dropped from `results` between derivation and commit)
-            # still has to terminalize rather than strand the parent.
-            for item_id, item_worker_id, status_state, status_reason in deferred_status.values():
-                self._emit_work_status(
-                    turn_id=turn_id,
-                    work_item_id=item_id,
-                    parent_work_item_id=parent_work_item_id,
-                    worker_id=item_worker_id,
-                    state=status_state,
-                    origin_epoch=origin_epoch,
-                    terminal_reason=status_reason,
-                )
-            deferred_status.clear()
-            if commit_exceptions:
-                raise commit_exceptions[0]
-            turn_recorder.finalize()
-            return tuple(committed)
+            # Rows 2, 4, 5, 7 of the Phase 1 differences table: ack settle,
+            # per-item commit loop with per-item failure isolation, per-item
+            # (plus final-sweep) status emission, and end-of-happy-path
+            # `turn_recorder.finalize()`. No worker-idle projection (row 9,
+            # absent for this handler) and no early-exit variant (row 8 stays
+            # in the fan-in loops above, which built every input below).
+            return await finalize_fan_out_turn(
+                epilogue_ctx,
+                origin=origin,
+                turn_id=turn_id,
+                parent_work_item_id=parent_work_item_id,
+                turn_recorder=turn_recorder,
+                results=results,
+                attributed_indexes=attributed_indexes,
+                retained_work_items=retained_work_items,
+                deferred_status=deferred_status,
+                speech_roles=speech_roles,
+                commit_and_speak=self._commit_and_speak,
+            )
         except asyncio.CancelledError:
             self._finalize_turn_exception(
                 cancelled=True,
@@ -2663,12 +2524,12 @@ class SessionHost:
             )
             raise
         finally:
-            if retained_work_items:
-                for item_work_item_id in delegated_children:
-                    if item_work_item_id not in retained_work_items:
-                        self._release_turn_work_item(turn_id, item_work_item_id)
-            else:
-                self._release_all_turn_work_items(turn_id)
+            release_fan_out_turn_work_items(
+                epilogue_ctx,
+                turn_id=turn_id,
+                delegated_children=delegated_children,
+                retained_work_items=retained_work_items,
+            )
 
     def _dispatch_search_task(
         self,
@@ -2683,7 +2544,7 @@ class SessionHost:
 
         Split out of ``_search_with_timeout`` so a caller can dispatch the
         search, give it exactly one scheduling tick, and only then decide
-        whether an early ack is still warranted (see ``_emit_early_ack``'s
+        whether an early ack is still warranted (see ``TurnAckLedger.emit_early_ack``'s
         ``search_task`` parameter).
         """
         kwargs: dict[str, Any] = {
@@ -2734,7 +2595,7 @@ class SessionHost:
         # Captured before the foreground wait below, which may span other
         # turns being accepted concurrently: this is the turn-sequence
         # snapshot LateDeliveryContext needs to detect a newer-turn arrival.
-        dispatch_turn_sequence = self._turn_sequence
+        dispatch_turn_sequence = self._turn_ack_ledger.turn_sequence
         # The provisional retained recorder is created here, at dispatch time,
         # before the foreground wait -- not only if it later times out -- so
         # background_ms always starts at work dispatch (Timing Boundaries).
@@ -2787,7 +2648,7 @@ class SessionHost:
     ) -> LateDeliveryContext:
         """Build the immutable context captured at late-task dispatch time.
 
-        ``accepted_turn_sequence`` defaults to the live ``_turn_sequence``
+        ``accepted_turn_sequence`` defaults to the live ``self._turn_ack_ledger.turn_sequence``
         counter, but callers dispatching from a coroutine that may span
         other turns being accepted concurrently pass an explicit snapshot
         taken before any ``await``. ``parent_work_item_id`` is supplied only
@@ -2803,7 +2664,7 @@ class SessionHost:
             accepted_turn_sequence=(
                 accepted_turn_sequence
                 if accepted_turn_sequence is not None
-                else self._turn_sequence
+                else self._turn_ack_ledger.turn_sequence
             ),
         )
 
@@ -3092,10 +2953,10 @@ class SessionHost:
             # foreign scheduler.
             connection = self.connection
             if connection is not None and connection.epoch == origin_epoch:
-                self._settle_turn_ack(connection.scheduler, context.turn_id)
+                self._turn_ack_ledger.settle_turn_ack(connection.scheduler, context.turn_id)
             else:
                 self._turn_ack_ledger.clear_ack_latch(context.turn_id)
-            self._release_turn_work_item(context.turn_id, context.work_item_id)
+            self._turn_ack_ledger.release_turn_work_item(context.turn_id, context.work_item_id)
             if recorder is not None:
                 recorder.finalize(
                     work_outcome=work_outcome,
@@ -3322,7 +3183,7 @@ class SessionHost:
         generation frees the transport lane.
         """
         if origin is not None:
-            self._settle_turn_ack(origin.scheduler, turn_id)
+            self._turn_ack_ledger.settle_turn_ack(origin.scheduler, turn_id)
         # A blind sweep over the whole delegated child set is safe either
         # way: a child that never had a status is skipped on the
         # ``cancelled`` branch (not in ``WORK_STATUS_COLD_START``) and is a

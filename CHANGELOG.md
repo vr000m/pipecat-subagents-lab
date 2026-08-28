@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `SessionHost` decomposition (internal; no wire, config, or behavior
+  change). Three slices left `server/pipeline.py` as their own modules:
+  `server/turn_epilogue.py` (the epilogue the three turn handlers
+  duplicated — ack settlement, terminal work-status derivation and emission
+  around the canonical commit, recorder finalization, work-item release, with
+  each per-handler variance an explicit parameter),
+  `server/connection_pipeline.py` (`ConnectionPipeline`, moved with no
+  re-export from `pipeline.py`), and `server/task_retention.py`
+  (`retain_until_done`, one fire-and-forget retention idiom replacing 13
+  hand-rolled `add_done_callback` add/discard sites across 7 modules; 9
+  non-plain sites stay hand-rolled with recorded reasons). `connect()` lost
+  its 9 nested closures for named `_connect_*` steps, and 10 pure
+  `TurnAckLedger` pass-through forwarders were removed from `SessionHost` in
+  favour of reaching the ledger directly. `server/pipeline.py` 3336 → 3263
+  lines; the `SessionHost` class 2812 → 2739. Tests gained a shared
+  contract-checked coordinator double (`tests/_doubles.py`) and public read
+  accessors on the extracted collaborators, replacing duck-typed fakes and
+  private-attribute reads.
+
 ### Removed
 
 - Query-context narrowing experiment and the runtime promotion-manifest

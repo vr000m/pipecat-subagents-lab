@@ -6,6 +6,13 @@
 - Keep browser clients Bun-based and use plain JavaScript unless a framework is explicitly approved; defer Electron packaging to a separately reviewed plan.
 - Treat Python-to-client RTVI message shapes as versioned contracts and document them under `shared/`.
 - Never commit API keys, credentials, secret files, or values loaded from `~/.secrets/ai.env`.
+- `server/pipeline.py` holds `SessionHost` and connection/turn orchestration
+  only; extracted collaborators (connection pipeline, turn-ack ledger, turn
+  epilogue, fire-and-forget task retention, speech scheduling/lifecycle,
+  observers, the coordinator boundary, and more) live in their own modules —
+  see `docs/architecture.md`'s "`server/` module layout" for the current set.
+  Reach a collaborator directly rather than adding a new pass-through
+  forwarder on `SessionHost`.
 
 ## Workflow
 

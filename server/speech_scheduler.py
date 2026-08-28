@@ -21,6 +21,7 @@ from .speech_lifecycle import (
     PreAdmissionTerminalReason,
     SpeechLifecycleCoordinator,
 )
+from .task_retention import retain_until_done
 
 SpeechRole = Literal["result", "timeout_notice", "ack"]
 ROLE_RESULT: SpeechRole = "result"
@@ -141,8 +142,7 @@ class SpeechScheduler:
                 task = asyncio.ensure_future(outcome)
             except RuntimeError:
                 return
-            self._stop_tasks.add(task)
-            task.add_done_callback(self._stop_tasks.discard)
+            retain_until_done(task, self._stop_tasks)
 
     async def wait_for_stops(self) -> None:
         """Wait until every stop signal scheduled so far has reached the pipeline."""
@@ -172,6 +172,71 @@ class SpeechScheduler:
         internals encapsulated per this class's private-_queues contract.
         """
         return tuple(item.role for queue in self._queues.values() for item in queue)
+
+    def has_queue(self, work_item_id: str) -> bool:
+        """Whether ``work_item_id`` currently has a queue entry at all.
+
+        Public read for tests that previously asserted
+        ``work_item_id in scheduler._queues`` directly.
+        """
+        return work_item_id in self._queues
+
+    def queued_items(self, work_item_id: str) -> tuple[SpeechItem, ...]:
+        """The queued (not yet active) items for ``work_item_id``, in order.
+
+        Public read for tests that previously indexed
+        ``scheduler._queues[work_item_id]`` directly.
+        """
+        return tuple(self._queues.get(work_item_id, ()))
+
+    def all_queued_items(self) -> tuple[SpeechItem, ...]:
+        """Every currently queued (not yet active) speech item, across all queues.
+
+        Public read for tests that previously iterated
+        ``scheduler._queues.values()`` directly.
+        """
+        return tuple(item for queue in self._queues.values() for item in queue)
+
+    def has_any_queue(self) -> bool:
+        """Whether any queue key exists at all, regardless of emptiness.
+
+        Public read for tests that previously asserted
+        ``scheduler._queues == {}`` directly.
+        """
+        return bool(self._queues)
+
+    def advance_task_count(self) -> int:
+        """Number of in-flight deferred queue-advance tasks.
+
+        Public read for tests that previously asserted
+        ``len(scheduler._advance_tasks) == N`` or
+        ``scheduler._advance_tasks == set()`` directly.
+        """
+        return len(self._advance_tasks)
+
+    def advance_tasks(self) -> tuple[asyncio.Future[Any], ...]:
+        """Every in-flight deferred queue-advance task, as an immutable snapshot.
+
+        Public read for tests that previously did
+        ``next(iter(scheduler._advance_tasks))`` directly.
+        """
+        return tuple(self._advance_tasks)
+
+    def has_any_paused(self) -> bool:
+        """Whether any work item currently has a paused speech item.
+
+        Public read for tests that previously asserted
+        ``scheduler._paused == {}`` directly.
+        """
+        return bool(self._paused)
+
+    def has_provider_contexts(self) -> bool:
+        """Whether any provider-context handoff is currently tracked.
+
+        Public read for tests that previously asserted
+        ``scheduler._provider_contexts == {}`` directly.
+        """
+        return bool(self._provider_contexts)
 
     def paused(self, work_item_id: str | None = None) -> SpeechItem | None:
         if work_item_id is not None:
@@ -448,8 +513,7 @@ class SpeechScheduler:
             task = asyncio.ensure_future(advance())
         except RuntimeError:  # no running loop: nothing to advance onto
             return
-        self._advance_tasks.add(task)
-        task.add_done_callback(self._advance_tasks.discard)
+        retain_until_done(task, self._advance_tasks)
 
     def _discard_from_queue(self, item: SpeechItem) -> None:
         queue = self._queues.get(item.work_item_id)

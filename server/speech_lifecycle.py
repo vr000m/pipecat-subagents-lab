@@ -32,6 +32,8 @@ from uuid import uuid4
 from pipecat.frames.frames import SystemFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from .task_retention import retain_until_done
+
 
 class GenerationPhase(str, Enum):
     ADMITTED = "admitted"
@@ -202,6 +204,15 @@ class EventLoopTimerScheduler:
     def __init__(self, clock: Clock | None = None) -> None:
         self._clock: Clock = clock or MonotonicClock()
 
+    @property
+    def clock(self) -> Clock:
+        """The clock this scheduler computes delays against.
+
+        Public read for callers that previously read ``self._clock``
+        directly (e.g. ``uses_event_loop_timers_with_clock``).
+        """
+        return self._clock
+
     def call_at(self, when: float, callback: Callable[[], Any]) -> TimerHandle:
         loop = asyncio.get_event_loop()
         delay = max(0.0, when - self._clock.now())
@@ -322,6 +333,77 @@ class SpeechLifecycleCoordinator:
 
     def token_for_context(self, context_id: str) -> str | None:
         return self._context_tokens.get(context_id)
+
+    @property
+    def teardown_count(self) -> int:
+        """How many teardowns have completed so far.
+
+        Public read for tests that previously asserted
+        ``coordinator._teardown_generation == ...`` directly.
+        """
+        return self._teardown_generation
+
+    def is_tombstoned(self, context_id: str) -> bool:
+        """Whether ``context_id`` has been permanently retired.
+
+        Public read for tests that previously asserted
+        ``context_id in coordinator._context_tombstones`` directly.
+        """
+        return context_id in self._context_tombstones
+
+    def tombstoned_context_ids(self) -> tuple[str, ...]:
+        """Every tombstoned context id, oldest first.
+
+        Public read for tests that previously enumerated
+        ``coordinator._context_tombstones`` directly.
+        """
+        return tuple(self._context_tombstones)
+
+    @property
+    def context_token_count(self) -> int:
+        """How many contexts currently have a live generation token.
+
+        Public read for tests that previously asserted
+        ``len(coordinator._context_tokens) == ...`` directly.
+        """
+        return len(self._context_tokens)
+
+    @property
+    def pending_transition_count(self) -> int:
+        """How many internal transitions are currently in flight.
+
+        Public read for tests that previously asserted
+        ``coordinator._transition_tasks == set()`` (or its length) directly.
+        """
+        return len(self._transition_tasks)
+
+    def has_pending_transition(self, future: asyncio.Future[Any]) -> bool:
+        """Whether ``future`` is one of the in-flight internal transitions.
+
+        Public read for tests that previously asserted
+        ``future in coordinator._transition_tasks`` directly.
+        """
+        return future in self._transition_tasks
+
+    @property
+    def timer_handle_count(self) -> int:
+        """How many timer handles are currently armed.
+
+        Public read for tests that previously asserted
+        ``coordinator._timer_handles == {}`` directly.
+        """
+        return len(self._timer_handles)
+
+    def uses_event_loop_timers_with_clock(self, clock: Clock) -> bool:
+        """Whether this coordinator's timer scheduler is an
+        ``EventLoopTimerScheduler`` sharing ``clock``.
+
+        Public read for tests that previously asserted
+        ``isinstance(coordinator._timers, EventLoopTimerScheduler)`` and
+        ``coordinator._timers._clock is clock`` directly.
+        """
+        timers = self._timers
+        return isinstance(timers, EventLoopTimerScheduler) and timers.clock is clock
 
     # -- admission and TTS handoff --
 
@@ -712,9 +794,7 @@ class SpeechLifecycleCoordinator:
         except RuntimeError:
             coroutine.close()
             return None
-        self._transition_tasks.add(future)
-        future.add_done_callback(self._transition_tasks.discard)
-        return future
+        return retain_until_done(future, self._transition_tasks)
 
     async def _on_start_timeout(self, token: str) -> None:
         await self._begin_delivery_unknown(token)

@@ -325,8 +325,8 @@ class TestSnapshotBarrierOrdering:
                 )
             # Failing closed means the observer is usable again, not paused
             # forever behind an undeliverable barrier.
-            assert observer._paused is False
-            assert observer._buffer == []
+            assert observer.is_paused is False
+            assert observer.buffered_event_count == 0
             # A later event still reaches the client.
             state.set_worker(
                 WorkerState(
@@ -368,8 +368,8 @@ class TestSnapshotBarrierOrdering:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert observer._paused is False
-            assert observer._buffer == []
+            assert observer.is_paused is False
+            assert observer.buffered_event_count == 0
 
         run(body)
 
@@ -432,7 +432,7 @@ class TestSnapshotBarrierOrdering:
                     flush_writer=self._fake_writer([]),
                     snapshot_writer=failing_snapshot,
                 )
-            assert observer._paused is False
+            assert observer.is_paused is False
             # The aborted install must not have installed the watermark.
             assert observer.projected_sequence == 0
 
@@ -462,11 +462,11 @@ def test_unsubscribe_clears_pause_and_buffer_so_resubscribe_is_not_mute() -> Non
             origin_epoch=1,
         )
     )
-    assert observer._buffer, "precondition: the paused observer buffered the event"
+    assert observer.buffered_event_count > 0, "precondition: the paused observer buffered the event"
 
     observer.unsubscribe()
-    assert observer._paused is False
-    assert observer._buffer == []
+    assert observer.is_paused is False
+    assert observer.buffered_event_count == 0
 
     delivered: list[object] = []
     observer.subscribe(delivered.append)

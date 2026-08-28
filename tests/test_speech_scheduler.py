@@ -183,7 +183,7 @@ def test_scheduler_stop_is_task_local_when_other_work_is_queued() -> None:
         scheduler.interrupt()
 
         assert scheduler.state.speech[task_one.utterance_id].state == DeliveryState.INTERRUPTED
-        assert scheduler._queues["work-2"][0].utterance_id == task_two.utterance_id
+        assert scheduler.queued_items("work-2")[0].utterance_id == task_two.utterance_id
 
     asyncio.run(run())
 
@@ -215,7 +215,7 @@ def test_discard_queued_notice_removes_only_timeout_notice_role_and_preserves_or
     discarded = scheduler.discard_queued_notice("work-b")
 
     assert discarded == (notice,)
-    assert scheduler._queues["work-b"] == [before, after]
+    assert scheduler.queued_items("work-b") == (before, after)
     assert scheduler.state.speech[notice.utterance_id].state == DeliveryState.INTERRUPTED
     assert scheduler.state.speech[before.utterance_id].state != DeliveryState.INTERRUPTED
     assert scheduler.state.speech[after.utterance_id].state != DeliveryState.INTERRUPTED
@@ -228,7 +228,7 @@ def test_discard_queued_notice_is_a_noop_when_no_notice_is_queued() -> None:
     discarded = scheduler.discard_queued_notice("work-b")
 
     assert discarded == ()
-    assert scheduler._queues["work-b"] == [item]
+    assert scheduler.queued_items("work-b") == (item,)
 
 
 def test_discard_queued_notice_is_a_noop_for_an_unknown_work_item() -> None:
@@ -251,7 +251,7 @@ def test_discard_queued_notice_does_not_touch_other_work_item_queues() -> None:
     discarded = scheduler.discard_queued_notice("work-b")
 
     assert discarded == (notice,)
-    assert scheduler._queues["work-other"] == [other]
+    assert scheduler.queued_items("work-other") == (other,)
 
 
 def test_discard_queued_notice_cannot_remove_a_notice_already_admitted_to_the_transport_slot() -> (
@@ -389,7 +389,7 @@ def test_reconnect_terminally_cancels_active_and_queued_old_epoch_items() -> Non
     assert (
         scheduler.state.speech[first.utterance_id].state == DeliveryState.INTERRUPTED_BY_RECONNECT
     )
-    assert scheduler._queues == {}
+    assert not scheduler.has_any_queue()
     assert (
         scheduler.state.speech[second.utterance_id].state == DeliveryState.INTERRUPTED_BY_RECONNECT
     )
@@ -430,8 +430,8 @@ def test_full_stop_terminalizes_active_queued_and_paused_items_without_reconnect
     assert scheduler.state.speech[active.utterance_id].state == DeliveryState.INTERRUPTED
     assert scheduler.state.speech[queued.utterance_id].state == DeliveryState.INTERRUPTED
     assert scheduler.state.speech[paused.utterance_id].state == DeliveryState.INTERRUPTED
-    assert scheduler._queues == {}
-    assert scheduler._paused == {}
+    assert not scheduler.has_any_queue()
+    assert not scheduler.has_any_paused()
 
 
 def test_full_stop_without_reconnect_still_emits_when_active_epoch_already_advanced() -> None:
@@ -665,7 +665,7 @@ def test_resume_of_a_paused_ack_drops_it_and_notifies_ack_terminal_instead_of_re
 
     assert resumed is None
     assert scheduler.paused("ack-turn-1") is None
-    assert scheduler._queues.get("ack-turn-1") in (None, [])
+    assert scheduler.queued_items("ack-turn-1") == ()
     assert len(terminal_calls) == 1
     identity, _reason = terminal_calls[0]
     assert identity.role == ROLE_ACK
@@ -680,8 +680,8 @@ def test_discard_queued_ack_removes_only_the_named_ack_and_leaves_other_queues_u
     discarded = scheduler.discard_queued_ack(ack.ack_id)
 
     assert discarded is not None
-    assert "ack-turn-1" not in scheduler._queues
-    assert scheduler._queues["work-other"] == [other]
+    assert not scheduler.has_queue("ack-turn-1")
+    assert scheduler.queued_items("work-other") == (other,)
 
 
 def test_discard_queued_ack_cannot_remove_an_admitted_ack() -> None:
@@ -713,7 +713,7 @@ def test_normal_admission_clears_the_ack_queue_key() -> None:
         assert admitted is not None and admitted.ack_id == ack.ack_id
         scheduler.delivery_unknown(admitted.utterance_id)
 
-    assert scheduler._queues == {}
+    assert not scheduler.has_any_queue()
 
 
 def test_cancel_with_the_ack_work_item_id_removes_only_the_parent_ack() -> None:
@@ -727,8 +727,8 @@ def test_cancel_with_the_ack_work_item_id_removes_only_the_parent_ack() -> None:
     cancelled = scheduler.cancel("work-1-0")
 
     assert [item.utterance_id for item in cancelled] == [child.utterance_id]
-    assert "ack-turn-1" in scheduler._queues
-    assert scheduler._queues["ack-turn-1"] == [ack]
+    assert scheduler.has_queue("ack-turn-1")
+    assert scheduler.queued_items("ack-turn-1") == (ack,)
 
 
 def test_ack_admission_and_completion_do_not_block_a_ready_result_from_committing() -> None:
@@ -748,7 +748,7 @@ def test_ack_admission_and_completion_do_not_block_a_ready_result_from_committin
         result_id="result-1-0",
         text="the real answer",
     )
-    assert result.utterance_id in {item.utterance_id for item in scheduler._queues["work-1-0"]}
+    assert result.utterance_id in {item.utterance_id for item in scheduler.queued_items("work-1-0")}
 
     scheduler.delivery_completed(admitted_ack.utterance_id)
     assert scheduler.active is None
@@ -766,7 +766,7 @@ def test_start_next_drops_the_queue_key_once_its_last_item_is_admitted() -> None
     admitted = asyncio.run(scheduler.start_next())
 
     assert admitted is not None
-    assert "work-1-0" not in scheduler._queues
+    assert not scheduler.has_queue("work-1-0")
     assert scheduler.pending_work_item_ids() == frozenset()
 
 
@@ -795,7 +795,7 @@ def test_no_tts_result_never_occupies_the_slot_waiting_for_the_start_timeout() -
     assert asyncio.run(scheduler.start_next("work-1")) is None
     assert lifecycle.occupied is False
     assert scheduler.active is None
-    assert lifecycle._timer_handles == {}
+    assert lifecycle.timer_handle_count == 0
     assert scheduler.state.speech[first.utterance_id].state == DeliveryState.DELIVERY_UNKNOWN
     assert scheduler.pending_work_item_ids() == frozenset({"work-2"})
 
@@ -920,8 +920,8 @@ def test_full_stop_cancels_a_pending_queue_advance_task() -> None:
             pass
 
         # The deferred re-probe task is scheduled but has not run yet.
-        assert len(scheduler._advance_tasks) == 1
-        pending_task = next(iter(scheduler._advance_tasks))
+        assert scheduler.advance_task_count() == 1
+        pending_task = scheduler.advance_tasks()[0]
         assert not pending_task.done()
 
         scheduler.interrupt(full_stop=True)
@@ -930,7 +930,7 @@ def test_full_stop_cancels_a_pending_queue_advance_task() -> None:
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert pending_task.cancelled()
-        assert scheduler._advance_tasks == set()
+        assert scheduler.advance_task_count() == 0
 
     asyncio.run(run())
 
@@ -971,8 +971,8 @@ def test_full_stop_does_not_resurrect_an_advance_task_that_is_already_running() 
 
         # Let the deferred re-probe task actually run: it should admit
         # work-2 and suspend inside speak(), not merely sit pending.
-        assert len(scheduler._advance_tasks) == 1
-        running_task = next(iter(scheduler._advance_tasks))
+        assert scheduler.advance_task_count() == 1
+        running_task = scheduler.advance_tasks()[0]
         await asyncio.wait_for(entered_speak.wait(), timeout=1)
         assert not running_task.done()
         assert scheduler.active is not None
@@ -984,7 +984,7 @@ def test_full_stop_does_not_resurrect_an_advance_task_that_is_already_running() 
         # advance()'s exception handlers to completion.
         await asyncio.wait_for(running_task, timeout=1)
 
-        assert scheduler._advance_tasks == set(), (
+        assert scheduler.advance_task_count() == 0, (
             "start_next's own failure-cleanup path re-scheduled a fresh "
             "advance task after full_stop's sweep already ran"
         )
@@ -1019,7 +1019,7 @@ def test_submission_failure_leaves_its_own_work_item_key_for_its_owner_to_retry(
 
         assert scheduler.active is None
         assert scheduler.pending_work_item_ids() == frozenset({"work-1"})
-        assert scheduler._queues["work-1"][0].utterance_id == retry.utterance_id
+        assert scheduler.queued_items("work-1")[0].utterance_id == retry.utterance_id
 
     asyncio.run(run())
 

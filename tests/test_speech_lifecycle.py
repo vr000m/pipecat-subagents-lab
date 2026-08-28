@@ -448,7 +448,7 @@ def test_missing_post_tts_ack_escalates_to_verified_connection_teardown() -> Non
         assert teardown_calls == [generation.token]
         assert generation.terminalized is True
         assert coordinator.occupied is False
-        assert coordinator._teardown_generation == 1
+        assert coordinator.teardown_count == 1
 
     run(body)
 
@@ -886,9 +886,9 @@ def test_terminalized_generation_is_reaped_from_internal_dicts() -> None:
         await coordinator.on_transport_bot_stopped()
 
         assert generation.terminalized is True
-        assert generation.token not in coordinator._generations
-        assert "utt-1" not in coordinator._context_tokens
-        assert "utt-1" in coordinator._context_tombstones
+        assert coordinator.generation_for_token(generation.token) is None
+        assert coordinator.token_for_context("utt-1") is None
+        assert coordinator.is_tombstoned("utt-1")
         assert coordinator.generation_for_token(generation.token) is None
         assert coordinator.token_for_context("utt-1") is None
         assert coordinator.drop_stale_frame("utt-1") is True
@@ -909,14 +909,14 @@ def test_context_tombstones_are_bounded_and_connection_shutdown_clears_them() ->
             assert coordinator.on_tts_stopped(utterance_id) is True
             await coordinator.on_transport_bot_stopped()
 
-        assert list(coordinator._context_tombstones) == ["utt-2", "utt-3"]
-        assert len(coordinator._context_tokens) == 0
+        assert coordinator.tombstoned_context_ids() == ("utt-2", "utt-3")
+        assert coordinator.context_token_count == 0
         assert coordinator.drop_stale_frame("utt-3") is True
 
         coordinator.connection_closed()
 
-        assert coordinator._context_tombstones == {}
-        assert coordinator._context_tokens == {}
+        assert coordinator.tombstoned_context_ids() == ()
+        assert coordinator.context_token_count == 0
         assert coordinator.try_admit(identity("work-2", "utt-after-close")) is None
 
     run(body)
@@ -1628,7 +1628,7 @@ def test_pre_admission_disposition_is_terminal_for_a_result_when_no_tts_lane_exi
 
     assert getattr(disposition, "reason", None) == PreAdmissionTerminalReason.NO_TTS
     assert coordinator.occupied is False
-    assert coordinator._timer_handles == {}
+    assert coordinator.timer_handle_count == 0
 
 
 def test_pre_admission_disposition_still_admits_a_result_when_transport_is_unacceptable() -> None:
@@ -1679,7 +1679,7 @@ def test_coordinator_constructed_with_no_tts_never_arms_the_start_timeout() -> N
 
     coordinator.pre_admission_disposition(ack_identity)
 
-    assert coordinator._timer_handles == {}
+    assert coordinator.timer_handle_count == 0
 
 
 def test_dispatch_callbacks_are_no_ops_when_constructed_without_tts() -> None:
@@ -1742,18 +1742,18 @@ def test_schedule_retains_a_strong_reference_to_every_in_flight_transition() -> 
         future = coordinator._schedule(slow_transition())
         await started.wait()
 
-        assert future in coordinator._transition_tasks
+        assert coordinator.has_pending_transition(future)
         # The set is the only strong reference: dropping the local one must
         # not make the transition collectable.
         del future
-        assert len(coordinator._transition_tasks) == 1
+        assert coordinator.pending_transition_count == 1
 
         release.set()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         # The done-callback drains the set, so retention is bounded by
         # in-flight transitions, not by connection lifetime.
-        assert coordinator._transition_tasks == set()
+        assert coordinator.pending_transition_count == 0
 
     asyncio.run(run())
 
@@ -1767,7 +1767,7 @@ def test_schedule_without_a_running_loop_still_closes_the_coroutine() -> None:
         return None
 
     assert coordinator._schedule(never_runs()) is None
-    assert coordinator._transition_tasks == set()
+    assert coordinator.pending_transition_count == 0
 
 
 def test_connection_closed_cancels_and_clears_in_flight_transitions() -> None:
@@ -1799,11 +1799,11 @@ def test_connection_closed_cancels_and_clears_in_flight_transitions() -> None:
         future = coordinator._schedule(slow_transition())
         assert future is not None
         await started.wait()
-        assert future in coordinator._transition_tasks
+        assert coordinator.has_pending_transition(future)
 
         coordinator.connection_closed()
 
-        assert coordinator._transition_tasks == set()
+        assert coordinator.pending_transition_count == 0
         await asyncio.sleep(0)
         assert future.cancelled()
         assert resumed == []
@@ -1846,8 +1846,7 @@ def test_coordinator_default_scheduler_shares_the_injected_clock() -> None:
     clock = ManualTimerScheduler(start=0.0)
     coordinator = SpeechLifecycleCoordinator(clock=clock)
 
-    assert isinstance(coordinator._timers, EventLoopTimerScheduler)
-    assert coordinator._timers._clock is clock
+    assert coordinator.uses_event_loop_timers_with_clock(clock)
 
 
 def test_mark_handed_to_tts_refuses_a_tombstoned_generation() -> None:

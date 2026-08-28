@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from _doubles import FakeCoordinator
 
 from server.contracts import DeliveryState, GroundedResult, WorkerState
 from server.perf_metrics import CollectingMeasurementSink
@@ -227,7 +228,7 @@ def test_shutdown_finalizes_retained_recorders_only_after_coordinator_shutdown_r
     async def run() -> None:
         order: list[str] = []
 
-        class SlowShutdownCoordinator:
+        class SlowShutdownCoordinator(FakeCoordinator):
             async def shutdown(self) -> None:
                 order.append("coordinator-shutdown-start")
                 await asyncio.sleep(0.02)
@@ -470,14 +471,14 @@ def test_cancel_turn_or_child_removes_only_the_named_childs_speech_and_leaves_th
         # Ack ownership and the sole-child decision are answered from the
         # turn -> delegated-child registry, so this hand-built turn registers
         # its children exactly as a real turn handler would.
-        host._register_turn_work_item("turn-1", "work-1-0")
-        host._register_turn_work_item("turn-1", "work-1-1")
+        host._turn_ack_ledger.register_turn_work_item("turn-1", "work-1-0")
+        host._turn_ack_ledger.register_turn_work_item("turn-1", "work-1-1")
 
         await host.cancel_turn_or_child("turn-1", "work-1-0")
 
-        assert ack_work_item_id in origin.scheduler._queues
-        assert "work-1-0" not in origin.scheduler._queues
-        assert "work-1-1" in origin.scheduler._queues
+        assert origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-1-0")
+        assert origin.scheduler.has_queue("work-1-1")
         await host.shutdown()
 
     asyncio.run(run())
@@ -511,8 +512,8 @@ def test_cancel_turn_or_child_whole_turn_removes_the_parent_ack_and_every_child_
 
         await host.cancel_turn_or_child("turn-2", None)
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert "work-2-0" not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-2-0")
         await host.shutdown()
 
     asyncio.run(run())
@@ -550,8 +551,8 @@ def test_cancel_turn_or_child_sole_delegated_child_removes_both_ack_and_child_at
 
         await host.cancel_turn_or_child("turn-3", "work-3-0")
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert "work-3-0" not in origin.scheduler._queues
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-3-0")
         await host.shutdown()
 
     asyncio.run(run())
@@ -620,7 +621,7 @@ def _late_delivery_context(host: SessionHost, **overrides: object):
         "work_item_id": "work-late-1",
         "origin_epoch": 1,
         "ack_timestamp": None,
-        "accepted_turn_sequence": host._turn_sequence,
+        "accepted_turn_sequence": host._turn_ack_ledger.turn_sequence,
     }
     fields.update(overrides)
     return LateDeliveryContext(**fields)
@@ -774,8 +775,10 @@ def test_commit_late_result_once_same_epoch_newer_turn_forces_display_only() -> 
                 "commit_late_result_once not yet implemented (Phase 2 concurrent implementer)"
             )
         host, origin = await _connected_host(speakable=True)
-        context = _late_delivery_context(host, accepted_turn_sequence=host._turn_sequence)
-        host._next_turn_id()  # advances _turn_sequence past the captured snapshot
+        context = _late_delivery_context(
+            host, accepted_turn_sequence=host._turn_ack_ledger.turn_sequence
+        )
+        host._turn_ack_ledger.next_turn_id()  # advances _turn_sequence past the captured snapshot
         result = _grounded_result()
 
         await host.commit_late_result_once(
@@ -1086,9 +1089,141 @@ def test_sole_child_cancel_still_removes_the_ack_after_an_earlier_item_was_drain
 
         await host.cancel_turn_or_child(turn_id, "work-5-0")
 
-        assert ack_work_item_id not in origin.scheduler._queues
-        assert "work-5-0" not in origin.scheduler._queues
-        assert turn_id not in host._turn_ack_ledger._ack_emitted_turns
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+        assert not origin.scheduler.has_queue("work-5-0")
+        assert not host._turn_ack_ledger.has_emitted_ack(turn_id)
+        await host.shutdown()
+
+    asyncio.run(run())
+
+
+def test_stale_ack_admission_retry_recognizes_a_newer_chain_under_the_same_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduction of the round-10 quarantined interleaving (Known
+    Follow-ups, Review Gauntlet Round 10, logic #23 --
+    docs/dev_plans/20260728-feature-early-ack-background-delivery-v0.1.3.md:731):
+    ``ack_work_item_id`` is derived from ``turn_id`` alone, so a later
+    eligible multi-intent sibling that re-latches the same turn after an
+    earlier admission chain abandoned starts a brand-new chain under the
+    identical scheduler key. The round-10 finding worried that a stale
+    chain's belated retry -- already scheduled when the turn re-latches --
+    would see the new chain's live latch and wrongly treat that as proof its
+    own admission is still current, letting it re-enter ``start_next`` for a
+    key a different chain now owns (a duplicate ack under ``ack-{turn_id}``).
+
+    This is a regression *pin*, not a fix: ``_ack_admission_generation``
+    (``turn_ack_ledger.py`` ~126-149) already closes this exact gap. It
+    shipped in commit 390b764 ("turn_ack_ledger.py: a per-chain generation
+    counter stops a stale ack-admission retry from re-entering start_next
+    after a later sibling starts a fresh chain under the same
+    ack_work_item_id"), which post-dates round 10's terminal cap --
+    ``_retry_or_abandon``'s generation check (~498-522) bails out silently,
+    before touching the newer chain's queued item or latch, whenever its own
+    generation has been superseded. Confirmed non-vacuous by temporarily
+    deleting that early-return locally: this test fails (chain A re-enters
+    ``start_next`` a third time and clobbers chain B's admitted ack) without
+    it, and passes with it restored -- see the phase report for the diff
+    used to demonstrate this."""
+    import server.turn_ack_ledger as turn_ack_ledger_module
+
+    monkeypatch.setattr(turn_ack_ledger_module, "_ACK_ADMISSION_RETRY_DELAY_SECONDS", 0.05)
+
+    async def run() -> None:
+        host = SessionHost(tts=object())
+        origin = await host.connect(
+            {
+                "session_id": host.state.session_id,
+                "resume_token": host.state.resume_token,
+                "proposed_epoch": 1,
+                "snapshot_sequence": 0,
+            }
+        )
+        origin.worker = _FakeLateResultWorker()
+        ledger = host._turn_ack_ledger
+        turn_id = "turn-superseded"
+        ack_work_item_id = f"ack-{turn_id}"
+
+        # One instrumented start_next for the whole test: records every call,
+        # real or stale, so a stale chain quietly re-entering start_next
+        # after being superseded is directly observable as a third recorded
+        # call. Only the first call fails (chain A's lone attempt); every
+        # later call -- chain B's, and chain A's stale retry if the
+        # generation check were absent -- goes through to the real scheduler.
+        real_start_next = origin.scheduler.start_next
+        start_next_calls: list[str | None] = []
+
+        async def instrumented_start_next(work_item_id: str | None = None):
+            start_next_calls.append(work_item_id)
+            if len(start_next_calls) == 1:
+                raise RuntimeError("worker not attached yet")
+            return await real_start_next(work_item_id)
+
+        origin.scheduler.start_next = instrumented_start_next  # type: ignore[method-assign]
+
+        def enqueue_ack() -> None:
+            origin.scheduler.enqueue(
+                result_id=None,
+                work_item_id=ack_work_item_id,
+                run_id=f"run-{ack_work_item_id}",
+                text="One moment.",
+                origin_epoch=origin.epoch,
+                role="ack",
+                ack_id=ack_work_item_id,
+                turn_id=turn_id,
+            )
+
+        # Chain A: latch, enqueue, schedule admission. Its first attempt
+        # fails and schedules a delayed retry (attempt 2) that has not fired
+        # yet.
+        ledger._ack_emitted_turns.add(turn_id)
+        enqueue_ack()
+        ledger._schedule_ack_admission(
+            origin, ack_work_item_id, enqueue_ack, turn_id=turn_id, origin_epoch=origin.epoch
+        )
+        for _ in range(200):
+            if start_next_calls:
+                break
+            await asyncio.sleep(0.005)
+        assert len(start_next_calls) == 1, "chain A's first admission attempt must have run"
+        assert ledger.has_emitted_ack(turn_id), "attempt 1 of 4 must not abandon yet"
+
+        # While chain A's delayed retry is still pending, the turn settles
+        # for real (its owning handler's cleanup) and a later eligible
+        # sibling of the *same* turn re-latches and starts chain B under the
+        # identical key -- the documented interleaving.
+        ledger.settle_turn_ack(origin.scheduler, turn_id)
+        assert not ledger.has_emitted_ack(turn_id)
+        assert not origin.scheduler.has_queue(ack_work_item_id)
+
+        ledger._ack_emitted_turns.add(turn_id)
+        enqueue_ack()
+        ledger._schedule_ack_admission(
+            origin, ack_work_item_id, enqueue_ack, turn_id=turn_id, origin_epoch=origin.epoch
+        )
+        for _ in range(200):
+            if len(start_next_calls) >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert len(start_next_calls) == 2, "chain B's own first admission attempt must have run"
+        active = origin.scheduler.active
+        assert active is not None and active.item.work_item_id == ack_work_item_id
+        chain_b_utterance_id = active.item.utterance_id
+
+        # Let chain A's stale retry timer fire. Before the generation check
+        # existed, it would see the latch live again (chain B re-set it) and
+        # call start_next a second time for the same key, clobbering chain
+        # B's just-admitted ack. With it, chain A must recognize it has been
+        # superseded and drop out without calling start_next at all.
+        await asyncio.sleep(0.15)
+
+        assert len(start_next_calls) == 2, (
+            "chain A must not re-enter start_next once its generation has been superseded"
+        )
+        active = origin.scheduler.active
+        assert active is not None and active.item.utterance_id == chain_b_utterance_id, (
+            "chain B's admitted ack must survive undisturbed by chain A's stale retry"
+        )
         await host.shutdown()
 
     asyncio.run(run())
