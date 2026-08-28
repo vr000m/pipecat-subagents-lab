@@ -1616,12 +1616,17 @@ def _judge_criterion_with_date(criterion: str) -> str:
     twice on the sol-low single-turn-default cell (2026-08-20 and 2026-08-28
     reports), where the judge rejected a genuinely current release date as
     "inconsistent with current date".
+
+    No "Criterion:" label of our own here: the return value is substituted
+    into pipecat's ``JUDGE_ASK_TEMPLATE`` (pipecat/evals/judge.py), which
+    already renders it as ``"Criterion: {criterion}"`` — adding a second label
+    would nest one inside the other in the prompt the judge actually sees.
     """
     today = datetime.now(UTC).date().isoformat()
     return (
         f"Today's date is {today}. Judge only the following criterion; do not "
         f"fail the reply because a date, version, or event it mentions is more "
-        f"recent than your training data. Criterion: {criterion}"
+        f"recent than your training data. {criterion}"
     )
 
 

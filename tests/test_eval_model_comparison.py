@@ -2954,7 +2954,11 @@ class TestJudgeScoringSemantics:
         assert any(
             criterion.startswith(f"Today's date is {day}.") for day in {date_before, date_after}
         )
-        assert criterion.endswith("Criterion: names a temperature")
+        assert criterion.endswith(" names a temperature")
+        # No label of our own: pipecat's JUDGE_ASK_TEMPLATE renders this value
+        # as "Criterion: {criterion}", so a "Criterion:" here would double up
+        # in the prompt the judge actually sees.
+        assert "Criterion:" not in criterion
 
     def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
         self, monkeypatch: pytest.MonkeyPatch
