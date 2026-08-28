@@ -18,8 +18,6 @@ from pathlib import Path
 from stat import S_ISREG
 from urllib.parse import urlparse
 
-_FALLBACK_RELEASE_VERSION = "0.1.3"
-
 
 def _reasoning_effort_literal_values() -> frozenset[str]:
     """Derive the valid ``reasoning.effort`` values from the installed OpenAI
@@ -51,18 +49,31 @@ def _reasoning_effort_literal_values() -> frozenset[str]:
 _VALID_REASONING_EFFORTS = _reasoning_effort_literal_values()
 
 
-def _installed_release_version() -> str:
-    """The packaged project version, or a pinned literal when unavailable.
+def _source_release_version() -> str:
+    """Read the release version from the source checkout's canonical metadata."""
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    try:
+        with pyproject_path.open("rb") as handle:
+            value = tomllib.load(handle)["project"]["version"]
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"could not read project version from {pyproject_path}") from exc
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"project version in {pyproject_path} must be a non-empty string")
+    return value
 
-    A non-installed checkout (no distribution metadata) still has to boot, so
-    the lookup is best-effort rather than fatal. Keeping this derived from
-    package metadata avoids a second hand-maintained copy of the version that
-    can silently drift from ``pyproject.toml``.
+
+def _installed_release_version() -> str:
+    """Resolve the packaged version, using source metadata outside an install.
+
+    A non-installed checkout has no distribution metadata, so it falls back to
+    the version in ``pyproject.toml`` rather than maintaining a second literal
+    that can silently drift from the release. If neither canonical source can
+    be read, fail loudly instead of publishing a misleading release identity.
     """
     try:
         return _package_version("pipecat-subagents-lab")
     except PackageNotFoundError:
-        return _FALLBACK_RELEASE_VERSION
+        return _source_release_version()
 
 
 _DEFAULT_RELEASE_VERSION = _installed_release_version()

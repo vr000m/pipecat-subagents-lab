@@ -798,6 +798,19 @@ def test_release_version_default_matches_the_packaged_project_version() -> None:
     assert Config().release_version == declared
 
 
+def test_missing_package_metadata_falls_back_to_pyproject_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server.config as config_module
+
+    def package_version_missing(_name: str) -> str:
+        raise config_module.PackageNotFoundError("test package metadata is absent")
+
+    monkeypatch.setattr(config_module, "_package_version", package_version_missing)
+
+    assert config_module._installed_release_version() == "1.0.1"
+
+
 def test_feature_policy_from_config_compares_by_value_across_distinct_configs() -> None:
     """`FeaturePolicy` is a frozen dataclass with structural equality; two
     field-equal `Config` objects must resolve to equal policies."""
