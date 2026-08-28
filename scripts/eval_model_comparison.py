@@ -1636,7 +1636,7 @@ def _judge_criterion_with_date(criterion: str) -> str:
     into pipecat's ``JUDGE_ASK_TEMPLATE`` (pipecat/evals/judge.py), which
     already renders it as ``"Criterion: {criterion}"`` — adding a second label
     would nest one inside the other in the prompt the judge actually sees.
-    That template slot is also the only channel pipecat 1.6.0 exposes:
+    That template slot is also the only channel pipecat 1.8.0 exposes:
     ``EvalJudge`` takes no extra system context (``JUDGE_SYSTEM_INSTRUCTION``
     is a hardcoded module constant), so the date rides in the criterion text.
     The right long-term home is an upstream ``EvalJudge`` hook for system-level
@@ -2132,7 +2132,7 @@ async def run_cell(
                     # here (round 5 added one; round 7 gauntlet, Logic lens finding
                     # 9 removed it): pipecat's own `_parse_verdict` unconditionally
                     # coerces any out-of-enum value to "no" before ever returning a
-                    # JudgeVerdict (verified against the installed pipecat==1.6.0
+                    # JudgeVerdict (verified against the installed pipecat==1.8.0
                     # source), so that comparison can never be true -- dead code
                     # that read as a real safety net. `JudgeVerdict.raw_response`
                     # does exist, but distinguishing "genuinely judged no" from

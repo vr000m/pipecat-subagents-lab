@@ -520,7 +520,7 @@ rg 'PERF_METRIC event=user_bot_latency'
 rg 'PERF_METRIC event=work_item_foreground' | rg 'turn_id="turn-7"'
 ```
 
-Framework-owned events come from Pipecat 1.6.0 observers attached to each
+Framework-owned events come from Pipecat 1.8.0 observers attached to each
 browser connection's `PipelineWorker` — one `StartupTimingObserver`, one
 `UserBotLatencyObserver`, and handlers on the worker's own default
 `turn_tracking_observer` (no duplicate turn tracker is created):

@@ -283,7 +283,7 @@ docs/dev_plans/20260824-feature-query-context-promotion.md), so autoplay of
 a late result is structurally unreachable. The result is always committed
 display-only and never creates a speech attempt.
 
-## Verified Pipecat 1.6.0 seam notes
+## Verified Pipecat 1.8.0 seam notes
 
 The pinned package does not expose the planned `LLMContextWorker` module.
 `PipelineWorker(..., bridged=...)`, `BusBridgeProcessor(bus, worker_name,

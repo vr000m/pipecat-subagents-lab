@@ -15,7 +15,7 @@ reference.
 | Browser connection | `PipelineWorker.run()` task | Small WebRTC input/output, VAD, Smart Turn aggregation, transcript dispatch, bus bridge, TTS, and RTVI |
 | Browser | Plain JavaScript RTVI client | Microphone controls, remote audio, and rendering validated server projections |
 
-Pipecat 1.6.0 does not provide the originally planned
+Pipecat 1.8.0 does not provide the originally planned
 `LLMContextWorker` module. Durable application workers therefore subclass the
 available `BaseWorker`, participate in the process-lifetime `WorkerRunner`, and
 serialize accepted work through their own mailboxes. Validated router decisions

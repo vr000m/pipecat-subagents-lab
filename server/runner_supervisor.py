@@ -76,7 +76,7 @@ class RunnerSupervisor:
     async def register_persistent_workers(self, workers: Callable[[], Iterable[Any]]) -> None:
         """Register durable contexts with the runner when the API can accept them.
 
-        Pipecat 1.6.0 does not expose the planned ``LLMContextWorker`` module;
+        Pipecat 1.8.0 does not expose the planned ``LLMContextWorker`` module;
         the lab's ContextWorker uses the pinned BaseWorker bus lifecycle instead.
         Test registries and runners without ``add_workers`` are left untouched.
         """
