@@ -1607,6 +1607,24 @@ def _sanitize_for_judge(text: str, *, max_len: int = 4000) -> str:
     return strip_control_chars(text)[:max_len]
 
 
+def _judge_criterion_with_date(criterion: str) -> str:
+    """Prefixes the judge criterion with the actual current date and an
+    instruction to judge only the stated criterion. The judge LLM does not
+    know today's date: a live reply that (correctly) cites a release or event
+    later than the judge's training data otherwise reads to it as an
+    impossible "future" claim and draws a spurious verdict="no" — observed
+    twice on the sol-low single-turn-default cell (2026-08-20 and 2026-08-28
+    reports), where the judge rejected a genuinely current release date as
+    "inconsistent with current date".
+    """
+    today = datetime.now(UTC).date().isoformat()
+    return (
+        f"Today's date is {today}. Judge only the following criterion; do not "
+        f"fail the reply because a date, version, or event it mentions is more "
+        f"recent than your training data. Criterion: {criterion}"
+    )
+
+
 def _connect_handshake(host: Any) -> dict[str, Any]:
     return {
         "session_id": host.state.session_id,
@@ -2063,7 +2081,7 @@ async def run_cell(
             if turn.judge_criterion:
                 try:
                     verdict = await asyncio.wait_for(
-                        judge.evaluate(turn.judge_criterion),
+                        judge.evaluate(_judge_criterion_with_date(turn.judge_criterion)),
                         timeout=_JUDGE_EVALUATE_TIMEOUT_SECONDS,
                     )
                 except TimeoutError:

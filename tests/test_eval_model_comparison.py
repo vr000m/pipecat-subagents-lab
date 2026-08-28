@@ -259,6 +259,7 @@ def _make_stub_judge_class(verdicts: list[Any], recorder: list[Any] | None) -> t
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.user_messages: list[str] = []
             self.assistant_messages: list[str] = []
+            self.evaluated_criteria: list[str] = []
             self.init_kwargs = _kwargs
             if recorder is not None:
                 recorder.append(self)
@@ -269,7 +270,8 @@ def _make_stub_judge_class(verdicts: list[Any], recorder: list[Any] | None) -> t
         def add_assistant_message(self, text: str) -> None:
             self.assistant_messages.append(text)
 
-        async def evaluate(self, _criterion: str) -> Any:
+        async def evaluate(self, criterion: str) -> Any:
+            self.evaluated_criteria.append(criterion)
             if not verdicts:
                 raise AssertionError("evaluate() called with no canned verdict queued")
             return verdicts.pop(0)
@@ -2919,6 +2921,34 @@ class TestJudgeScoringSemantics:
         judge = recorder[0]
         assert judge.assistant_messages == ["display projection"]
         assert "spoken projection" not in judge.assistant_messages
+
+    def test_judge_criterion_is_wrapped_with_the_current_date(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The judge LLM does not know today's date, so a live reply citing a
+        release newer than its training data reads to it as a "future" claim
+        and draws a spurious verdict="no" (observed on the sol-low
+        single-turn-default cell in the 2026-08-20 and 2026-08-28 reports).
+        Every criterion must reach ``evaluate()`` prefixed with the actual
+        current date and the judge-only-the-criterion instruction."""
+        from datetime import UTC, datetime
+
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        verdict = JudgeVerdict(verdict="yes", reason="ok", raw_response="")
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+            judge_recorder=recorder,
+        )
+        (criterion,) = recorder[0].evaluated_criteria
+        today = datetime.now(UTC).date().isoformat()
+        assert criterion.startswith(f"Today's date is {today}.")
+        assert criterion.endswith("Criterion: names a temperature")
 
     def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
         self, monkeypatch: pytest.MonkeyPatch
