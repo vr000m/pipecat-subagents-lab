@@ -2950,15 +2950,21 @@ class TestJudgeScoringSemantics:
             judge_recorder=recorder,
         )
         date_after = datetime.now(UTC).date().isoformat()
+        assert len(recorder[0].evaluated_criteria) == 1
         (criterion,) = recorder[0].evaluated_criteria
-        assert any(
-            criterion.startswith(f"Today's date is {day}.") for day in {date_before, date_after}
-        )
-        assert criterion.endswith(" names a temperature")
-        # No label of our own: pipecat's JUDGE_ASK_TEMPLATE renders this value
-        # as "Criterion: {criterion}", so a "Criterion:" here would double up
-        # in the prompt the judge actually sees.
-        assert "Criterion:" not in criterion
+        # Exact match, not startswith/endswith: the middle instruction is the
+        # load-bearing content of the fix, and equality also pins the absence
+        # of a second "Criterion:" label (pipecat's JUDGE_ASK_TEMPLATE renders
+        # this value as "Criterion: {criterion}", so a label of our own would
+        # double up in the prompt the judge actually sees). Two accepted
+        # values because the helper's own clock call may straddle UTC
+        # midnight relative to the brackets above.
+        assert criterion in {
+            f"Today's date is {day}. Judge only the following criterion; do not "
+            f"fail the reply because a date, version, or event it mentions is "
+            f"more recent than your training data. names a temperature"
+            for day in {date_before, date_after}
+        }
 
     def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
         self, monkeypatch: pytest.MonkeyPatch
