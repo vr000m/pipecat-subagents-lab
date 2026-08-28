@@ -1617,17 +1617,33 @@ def _judge_criterion_with_date(criterion: str) -> str:
     reports), where the judge rejected a genuinely current release date as
     "inconsistent with current date".
 
+    Two clauses, each earning its place, and no recency-leniency directive:
+
+    - The date anchor dissolves the "impossible future claim" failure (the
+      judge called a yesterday's-date release "future" only because it had no
+      idea what day it was).
+    - "Judge only the stated criterion" curbs criterion over-reach: a live
+      date-only probe (report ``eval-report-20260828T074622Z-c82163b3``) drew
+      verdict=no with the judge grading "accurately stating the latest
+      release" when the criterion asks only for *a* stated version number and
+      no refusal.
+    - An earlier draft also added "do not fail the reply because a
+      date/version/event is more recent than your training data"; dropped
+      because that blanket clause would equally suppress any criterion
+      written to catch fabricated future-dated claims.
+
     No "Criterion:" label of our own here: the return value is substituted
     into pipecat's ``JUDGE_ASK_TEMPLATE`` (pipecat/evals/judge.py), which
     already renders it as ``"Criterion: {criterion}"`` — adding a second label
     would nest one inside the other in the prompt the judge actually sees.
+    That template slot is also the only channel pipecat 1.6.0 exposes:
+    ``EvalJudge`` takes no extra system context (``JUDGE_SYSTEM_INSTRUCTION``
+    is a hardcoded module constant), so the date rides in the criterion text.
+    The right long-term home is an upstream ``EvalJudge`` hook for system-level
+    context, next to its existing homophone-leniency instruction.
     """
     today = datetime.now(UTC).date().isoformat()
-    return (
-        f"Today's date is {today}. Judge only the following criterion; do not "
-        f"fail the reply because a date, version, or event it mentions is more "
-        f"recent than your training data. {criterion}"
-    )
+    return f"Today's date is {today}. Judge only the following criterion, exactly as stated. {criterion}"
 
 
 def _connect_handshake(host: Any) -> dict[str, Any]:

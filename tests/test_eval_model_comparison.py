@@ -2930,7 +2930,9 @@ class TestJudgeScoringSemantics:
         and draws a spurious verdict="no" (observed on the sol-low
         single-turn-default cell in the 2026-08-20 and 2026-08-28 reports).
         Every criterion must reach ``evaluate()`` prefixed with the actual
-        current date and the judge-only-the-criterion instruction."""
+        current date and the judge-only-the-stated-criterion instruction — but
+        no blanket recency-leniency directive (see the helper's docstring for
+        why each clause is or isn't there)."""
         from datetime import UTC, datetime
 
         from pipecat.evals.judge import JudgeVerdict
@@ -2952,17 +2954,16 @@ class TestJudgeScoringSemantics:
         date_after = datetime.now(UTC).date().isoformat()
         assert len(recorder[0].evaluated_criteria) == 1
         (criterion,) = recorder[0].evaluated_criteria
-        # Exact match, not startswith/endswith: the middle instruction is the
-        # load-bearing content of the fix, and equality also pins the absence
-        # of a second "Criterion:" label (pipecat's JUDGE_ASK_TEMPLATE renders
-        # this value as "Criterion: {criterion}", so a label of our own would
-        # double up in the prompt the judge actually sees). Two accepted
-        # values because the helper's own clock call may straddle UTC
-        # midnight relative to the brackets above.
+        # Exact match, not startswith/endswith: equality pins the full wrapped
+        # string, including the absence of a second "Criterion:" label
+        # (pipecat's JUDGE_ASK_TEMPLATE renders this value as
+        # "Criterion: {criterion}", so a label of our own would double up in
+        # the prompt the judge actually sees). Two accepted values because the
+        # helper's own clock call may straddle UTC midnight relative to the
+        # brackets above.
         assert criterion in {
-            f"Today's date is {day}. Judge only the following criterion; do not "
-            f"fail the reply because a date, version, or event it mentions is "
-            f"more recent than your training data. names a temperature"
+            f"Today's date is {day}. Judge only the following criterion, exactly as stated. "
+            f"names a temperature"
             for day in {date_before, date_after}
         }
 
