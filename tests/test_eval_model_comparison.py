@@ -2962,10 +2962,87 @@ class TestJudgeScoringSemantics:
         # helper's own clock call may straddle UTC midnight relative to the
         # brackets above.
         assert criterion in {
-            f"Today's date is {day}. Judge only the following criterion, exactly as stated. "
+            f"Today's date is {day}; this is the anchor date. "
+            "Dates on or before the anchor date are NOT future dates. "
+            "Claims not mentioned in the transcript must be ignored and must not be penalized. "
+            "Judge only the following criterion, exactly as stated. "
             f"names a temperature"
             for day in {date_before, date_after}
         }
+
+    def test_date_guidance_reaches_provider_shaped_judge_calls_repeatedly(self) -> None:
+        """The date boundary must survive EvalJudge's real prompt assembly.
+
+        This uses the installed Pipecat ``EvalJudge`` and records the exact
+        Chat Completions-shaped request that its service boundary would send.
+        A fresh judge per iteration bypasses EvalJudge's result cache, so the
+        provider-shaped request is exercised repeatedly rather than only
+        testing the helper's return string once.
+        """
+        from pipecat.evals.judge import JUDGE_ASK_TEMPLATE, EvalJudge
+
+        class _RecordingJudgeService:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            async def run_inference(
+                self,
+                context: Any,
+                max_tokens: int | None = None,
+                system_instruction: str | None = None,
+            ) -> str:
+                messages: list[dict[str, str]] = []
+                if system_instruction is not None:
+                    messages.append({"role": "system", "content": system_instruction})
+                messages.extend(context.get_messages())
+                self.requests.append(
+                    eval_runner.build_judge_request_kwargs(
+                        "gpt-5-mini",
+                        messages=messages,
+                        max_completion_tokens=max_tokens or eval_runner.JUDGE_MAX_TOKENS,
+                    )
+                )
+                return '{"verdict":"yes","reason":"criterion satisfied"}'
+
+        async def exercise_repeatedly() -> None:
+            for _ in range(100):
+                service = _RecordingJudgeService()
+                judge = EvalJudge(service, max_tokens=eval_runner.JUDGE_MAX_TOKENS)
+                judge.add_user_message("What was the latest Pipecat release?")
+                judge.add_assistant_message(
+                    "Pipecat 1.8.0 was released on 2026-08-27, according to the reply."
+                )
+                criterion = eval_runner._judge_criterion_with_date(
+                    "states a release version without refusing to answer"
+                )
+
+                verdict = await judge.evaluate(criterion)
+
+                assert verdict.verdict == "yes"
+                assert len(service.requests) == 1
+                request = service.requests[0]
+                assert set(request) == {
+                    "model",
+                    "messages",
+                    "max_completion_tokens",
+                    "reasoning_effort",
+                }
+                assert request["model"] == "gpt-5-mini"
+                messages = request["messages"]
+                assert isinstance(messages, list)
+                assert messages[-1] == {
+                    "role": "user",
+                    "content": JUDGE_ASK_TEMPLATE.format(criterion=criterion),
+                }
+                provider_prompt = messages[-1]["content"]
+                assert "Dates on or before the anchor date are NOT future dates." in provider_prompt
+                assert (
+                    "Claims not mentioned in the transcript must be ignored and must not be "
+                    "penalized."
+                ) in provider_prompt
+                assert "Judge only the following criterion, exactly as stated." in provider_prompt
+
+        asyncio.run(exercise_repeatedly())
 
     def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
         self, monkeypatch: pytest.MonkeyPatch

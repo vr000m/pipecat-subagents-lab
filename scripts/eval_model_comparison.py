@@ -1609,19 +1609,23 @@ def _sanitize_for_judge(text: str, *, max_len: int = 4000) -> str:
 
 def _judge_criterion_with_date(criterion: str) -> str:
     """Prefixes the judge criterion with the actual current date and an
-    instruction to judge only the stated criterion. The judge LLM does not
-    know today's date: a live reply that (correctly) cites a release or event
-    later than the judge's training data otherwise reads to it as an
-    impossible "future" claim and draws a spurious verdict="no" — observed
-    twice on the sol-low single-turn-default cell (2026-08-20 and 2026-08-28
-    reports), where the judge rejected a genuinely current release date as
-    "inconsistent with current date".
+    explicit date/transcript boundaries, and an instruction to judge only the
+    stated criterion. The judge LLM does not know today's date: a live reply
+    that (correctly) cites a release or event later than the judge's training
+    data otherwise reads to it as an impossible "future" claim and draws a
+    spurious verdict="no" — observed twice on the sol-low single-turn-default
+    cell (2026-08-20 and 2026-08-28 reports), where the judge rejected a
+    genuinely current release date as "inconsistent with current date".
 
-    Two clauses, each earning its place, and no recency-leniency directive:
+    Each clause earns its place, and there is no recency-leniency directive:
 
     - The date anchor dissolves the "impossible future claim" failure (the
       judge called a yesterday's-date release "future" only because it had no
-      idea what day it was).
+      idea what day it was). The boundary explicitly says that dates on or
+      before the anchor are not future dates.
+    - Claims not mentioned in the transcript are explicitly out of scope and
+      must not be penalized; this prevents the judge from inventing omissions
+      that the conversation never asked it to evaluate.
     - "Judge only the stated criterion" curbs criterion over-reach: a live
       date-only probe (report ``eval-report-20260828T074622Z-c82163b3``) drew
       verdict=no with the judge grading "accurately stating the latest
@@ -1643,7 +1647,13 @@ def _judge_criterion_with_date(criterion: str) -> str:
     context, next to its existing homophone-leniency instruction.
     """
     today = datetime.now(UTC).date().isoformat()
-    return f"Today's date is {today}. Judge only the following criterion, exactly as stated. {criterion}"
+    return (
+        f"Today's date is {today}; this is the anchor date. "
+        "Dates on or before the anchor date are NOT future dates. "
+        "Claims not mentioned in the transcript must be ignored and must not be penalized. "
+        "Judge only the following criterion, exactly as stated. "
+        f"{criterion}"
+    )
 
 
 def _connect_handshake(host: Any) -> dict[str, Any]:
