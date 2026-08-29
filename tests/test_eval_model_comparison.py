@@ -259,6 +259,7 @@ def _make_stub_judge_class(verdicts: list[Any], recorder: list[Any] | None) -> t
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.user_messages: list[str] = []
             self.assistant_messages: list[str] = []
+            self.evaluated_criteria: list[str] = []
             self.init_kwargs = _kwargs
             if recorder is not None:
                 recorder.append(self)
@@ -269,7 +270,8 @@ def _make_stub_judge_class(verdicts: list[Any], recorder: list[Any] | None) -> t
         def add_assistant_message(self, text: str) -> None:
             self.assistant_messages.append(text)
 
-        async def evaluate(self, _criterion: str) -> Any:
+        async def evaluate(self, criterion: str) -> Any:
+            self.evaluated_criteria.append(criterion)
             if not verdicts:
                 raise AssertionError("evaluate() called with no canned verdict queued")
             return verdicts.pop(0)
@@ -2919,6 +2921,128 @@ class TestJudgeScoringSemantics:
         judge = recorder[0]
         assert judge.assistant_messages == ["display projection"]
         assert "spoken projection" not in judge.assistant_messages
+
+    def test_judge_criterion_is_wrapped_with_the_current_date(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The judge LLM does not know today's date, so a live reply citing a
+        release newer than its training data reads to it as a "future" claim
+        and draws a spurious verdict="no" (observed on the sol-low
+        single-turn-default cell in the 2026-08-20 and 2026-08-28 reports).
+        Every criterion must reach ``evaluate()`` prefixed with the actual
+        current date and the judge-only-the-stated-criterion instruction — but
+        no blanket recency-leniency directive (see the helper's docstring for
+        why each clause is or isn't there)."""
+        from datetime import UTC, datetime
+
+        from pipecat.evals.judge import JudgeVerdict
+
+        pair = eval_runner.RunPair(eval_runner.ROUTER_BASELINE, eval_runner.WORKER_BASELINE)
+        recorder: list[Any] = []
+        verdict = JudgeVerdict(verdict="yes", reason="ok", raw_response="")
+        # Bracket the run rather than recomputing "today" once afterwards: the
+        # helper's own datetime.now(UTC) call and this test's could otherwise
+        # straddle UTC midnight and disagree by a day.
+        date_before = datetime.now(UTC).date().isoformat()
+        _run_cell(
+            monkeypatch,
+            pair=pair,
+            turns=(Turn(query="weather in Riga?", judge_criterion="names a temperature"),),
+            verdicts=[verdict],
+            judge_recorder=recorder,
+        )
+        date_after = datetime.now(UTC).date().isoformat()
+        assert len(recorder[0].evaluated_criteria) == 1
+        (criterion,) = recorder[0].evaluated_criteria
+        # Exact match, not startswith/endswith: equality pins the full wrapped
+        # string, including the absence of a second "Criterion:" label
+        # (pipecat's JUDGE_ASK_TEMPLATE renders this value as
+        # "Criterion: {criterion}", so a label of our own would double up in
+        # the prompt the judge actually sees). Two accepted values because the
+        # helper's own clock call may straddle UTC midnight relative to the
+        # brackets above.
+        assert criterion in {
+            f"Today's date is {day}; this is the anchor date. "
+            "Dates on or before the anchor date are NOT future dates. "
+            "Claims not mentioned in the transcript must be ignored and must not be penalized. "
+            "Judge only the following criterion, exactly as stated. "
+            f"names a temperature"
+            for day in {date_before, date_after}
+        }
+
+    def test_date_guidance_reaches_provider_shaped_judge_calls_repeatedly(self) -> None:
+        """The date boundary must survive EvalJudge's real prompt assembly.
+
+        This uses the installed Pipecat ``EvalJudge`` and records the exact
+        Chat Completions-shaped request that its service boundary would send.
+        A fresh judge per iteration bypasses EvalJudge's result cache, so the
+        provider-shaped request is exercised repeatedly rather than only
+        testing the helper's return string once.
+        """
+        from pipecat.evals.judge import JUDGE_ASK_TEMPLATE, EvalJudge
+
+        class _RecordingJudgeService:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            async def run_inference(
+                self,
+                context: Any,
+                max_tokens: int | None = None,
+                system_instruction: str | None = None,
+            ) -> str:
+                messages: list[dict[str, str]] = []
+                if system_instruction is not None:
+                    messages.append({"role": "system", "content": system_instruction})
+                messages.extend(context.get_messages())
+                self.requests.append(
+                    eval_runner.build_judge_request_kwargs(
+                        "gpt-5-mini",
+                        messages=messages,
+                        max_completion_tokens=max_tokens or eval_runner.JUDGE_MAX_TOKENS,
+                    )
+                )
+                return '{"verdict":"yes","reason":"criterion satisfied"}'
+
+        async def exercise_repeatedly() -> None:
+            for _ in range(100):
+                service = _RecordingJudgeService()
+                judge = EvalJudge(service, max_tokens=eval_runner.JUDGE_MAX_TOKENS)
+                judge.add_user_message("What was the latest Pipecat release?")
+                judge.add_assistant_message(
+                    "Pipecat 1.8.0 was released on 2026-08-27, according to the reply."
+                )
+                criterion = eval_runner._judge_criterion_with_date(
+                    "states a release version without refusing to answer"
+                )
+
+                verdict = await judge.evaluate(criterion)
+
+                assert verdict.verdict == "yes"
+                assert len(service.requests) == 1
+                request = service.requests[0]
+                assert set(request) == {
+                    "model",
+                    "messages",
+                    "max_completion_tokens",
+                    "reasoning_effort",
+                }
+                assert request["model"] == "gpt-5-mini"
+                messages = request["messages"]
+                assert isinstance(messages, list)
+                assert messages[-1] == {
+                    "role": "user",
+                    "content": JUDGE_ASK_TEMPLATE.format(criterion=criterion),
+                }
+                provider_prompt = messages[-1]["content"]
+                assert "Dates on or before the anchor date are NOT future dates." in provider_prompt
+                assert (
+                    "Claims not mentioned in the transcript must be ignored and must not be "
+                    "penalized."
+                ) in provider_prompt
+                assert "Judge only the following criterion, exactly as stated." in provider_prompt
+
+        asyncio.run(exercise_repeatedly())
 
     def test_judge_max_tokens_comes_from_eval_common_judge_max_tokens(
         self, monkeypatch: pytest.MonkeyPatch

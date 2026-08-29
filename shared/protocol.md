@@ -283,14 +283,18 @@ docs/dev_plans/20260824-feature-query-context-promotion.md), so autoplay of
 a late result is structurally unreachable. The result is always committed
 display-only and never creates a speech attempt.
 
-## Verified Pipecat 1.6.0 seam notes
+## Verified Pipecat 1.8.0 seam notes
 
-The pinned package does not expose the planned `LLMContextWorker` module.
-`PipelineWorker(..., bridged=...)`, `BusBridgeProcessor(bus, worker_name,
-target_task, bridge)`, and `RTVIServerMessageFrame(data)` remain available.
-`RTVIServerMessageFrame` carries its arbitrary payload in `data`. The pinned
-`WorkerRunner` constructor has no `auto_end` parameter. The durable session host
-owns the process-lifetime runner, while every accepted browser connection owns
-and awaits its real `PipelineWorker` lifecycle task. Replacement cancels the
-prior connection worker, and epoch-aware publishers, observers, and session
-state reject stale callbacks before they can mutate or emit active state.
+The pinned package exports `LLMContextWorker` at
+`pipecat.workers.llm.llm_context_worker`; the older
+`pipecat.processors.frameworks.llm_context` path is absent. The lab deliberately
+stays on the bus-only `BaseWorker` seam because application code owns context
+history, direct provider calls, and causal mailboxes. `PipelineWorker(...,
+bridged=...)`, `BusBridgeProcessor(bus, worker_name, target_task, bridge)`, and
+`RTVIServerMessageFrame(data)` remain available. `RTVIServerMessageFrame` carries
+its arbitrary payload in `data`. The pinned `WorkerRunner` constructor has no
+`auto_end` parameter. The durable session host owns the process-lifetime runner,
+while every accepted browser connection owns and awaits its real
+`PipelineWorker` lifecycle task. Replacement cancels the prior connection
+worker, and epoch-aware publishers, observers, and session state reject stale
+callbacks before they can mutate or emit active state.

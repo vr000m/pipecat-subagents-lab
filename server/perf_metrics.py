@@ -3,7 +3,7 @@
 Every record is one physical console line: ``PERF_METRIC event=<name> schema=1
 key=value ...``. This module owns the closed event registry, the safe
 formatter that rejects anything outside that registry, the injectable
-measurement sink protocol, the Pipecat 1.6.0 observer callback factories
+measurement sink protocol, the Pipecat 1.8.0 observer callback factories
 that translate framework timing reports into records, and the application
 recorders (``AppTurnRecorder``, ``WorkItemRecorder``, ``RetainedRecorder``)
 that translate application-turn and retained-work timing into the same
@@ -516,7 +516,7 @@ def _safe_emit(sink: MeasurementSink, event: str, fields: Mapping[str, Any]) -> 
 
 
 # --------------------------------------------------------------------------
-# Connection context and Pipecat 1.6.0 observer callback factories
+# Connection context and Pipecat 1.8.0 observer callback factories
 # --------------------------------------------------------------------------
 
 

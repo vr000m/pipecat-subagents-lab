@@ -2,13 +2,13 @@
 
 Covers docs/dev_plans/20260727-feature-latency-observability.md's Performance
 Event Registry, Measurement Sink Contract, and Timing Boundaries sections, plus
-the exact locked Pipecat 1.6.0 observer facts the plan requires verifying
+the exact locked Pipecat 1.8.0 observer facts the plan requires verifying
 before implementation ("Verify the selected observer imports...").
 
 Two kinds of coverage live in this file:
 
 - Pipecat-only "verified starting facts" tests that pin the exact installed
-  pipecat-ai==1.6.0 observer import paths, constructor signatures, callback
+  pipecat-ai==1.8.0 observer import paths, constructor signatures, callback
   event names and payload units, the default turn tracker, ``enable_metrics``,
   and Small WebRTC's SFU-only ``bot_connected_secs`` field. These fail loudly
   if the locked artifact disagrees with the plan, per the plan's own gating
@@ -158,7 +158,7 @@ def test_every_registry_enum_field_is_bound_to_its_intended_vocabulary() -> None
 
 
 # ---------------------------------------------------------------------------
-# Verified Starting Facts: exact locked Pipecat 1.6.0 observer contract.
+# Verified Starting Facts: exact locked Pipecat 1.8.0 observer contract.
 # These tests gate every subsequent observer-wiring test per the plan's
 # Phase 1 sequencing.
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ def test_user_bot_latency_observer_events_and_units() -> None:
         assert event_name in observer._event_handlers
 
     # LatencyBreakdown carries duration_secs (not ms) fields, matching the
-    # plan's "every Pipecat 1.6.0 observer payload ... is expressed in
+    # plan's "every Pipecat 1.8.0 observer payload ... is expressed in
     # seconds" claim.
     breakdown = LatencyBreakdown(
         ttfb=[TTFBBreakdownMetrics(processor="tts-1", start_time=0.0, duration_secs=0.42)],
@@ -222,7 +222,12 @@ def test_startup_timing_observer_reports_seconds_and_processor_count() -> None:
         start_time=0.0,
         total_duration_secs=0.284,
         processor_timings=[
-            ProcessorStartupTiming(processor_name="stt", start_offset_secs=0.0, duration_secs=0.284)
+            ProcessorStartupTiming(
+                processor_name="stt",
+                start_offset_secs=0.0,
+                duration_secs=0.284,
+                setup_duration_secs=0.284,
+            )
         ],
     )
     assert report.total_duration_secs == pytest.approx(0.284)
@@ -238,7 +243,7 @@ def test_small_webrtc_transport_never_emits_bot_connected_frame() -> None:
 
     StartupTimingObserver only sets bot_connected_secs from BotConnectedFrame,
     which only Daily/LiveKit/Tavus/HeyGen transports push (verified against
-    the locked pipecat-ai==1.6.0 source). ``transport_ready`` must therefore
+    the locked pipecat-ai==1.8.0 source). ``transport_ready`` must therefore
     omit ``bot_connected_ms`` under this app's Small WebRTC transport rather
     than zero-fill it.
     """
@@ -815,7 +820,10 @@ class TestObserverCallbackFactories:
             total_duration_secs=0.2841,
             processor_timings=[
                 ProcessorStartupTiming(
-                    processor_name="stt", start_offset_secs=0.0, duration_secs=0.2841
+                    processor_name="stt",
+                    start_offset_secs=0.0,
+                    duration_secs=0.2841,
+                    setup_duration_secs=0.2841,
                 )
             ],
         )

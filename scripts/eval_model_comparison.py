@@ -1607,6 +1607,55 @@ def _sanitize_for_judge(text: str, *, max_len: int = 4000) -> str:
     return strip_control_chars(text)[:max_len]
 
 
+def _judge_criterion_with_date(criterion: str) -> str:
+    """Prefixes the judge criterion with the actual current date and an
+    explicit date/transcript boundaries, and an instruction to judge only the
+    stated criterion. The judge LLM does not know today's date: a live reply
+    that (correctly) cites a release or event later than the judge's training
+    data otherwise reads to it as an impossible "future" claim and draws a
+    spurious verdict="no" — observed twice on the sol-low single-turn-default
+    cell (2026-08-20 and 2026-08-28 reports), where the judge rejected a
+    genuinely current release date as "inconsistent with current date".
+
+    Each clause earns its place, and there is no recency-leniency directive:
+
+    - The date anchor dissolves the "impossible future claim" failure (the
+      judge called a yesterday's-date release "future" only because it had no
+      idea what day it was). The boundary explicitly says that dates on or
+      before the anchor are not future dates.
+    - Claims not mentioned in the transcript are explicitly out of scope and
+      must not be penalized; this prevents the judge from inventing omissions
+      that the conversation never asked it to evaluate.
+    - "Judge only the stated criterion" curbs criterion over-reach: a live
+      date-only probe (report ``eval-report-20260828T074622Z-c82163b3``) drew
+      verdict=no with the judge grading "accurately stating the latest
+      release" when the criterion asks only for *a* stated version number and
+      no refusal.
+    - An earlier draft also added "do not fail the reply because a
+      date/version/event is more recent than your training data"; dropped
+      because that blanket clause would equally suppress any criterion
+      written to catch fabricated future-dated claims.
+
+    No "Criterion:" label of our own here: the return value is substituted
+    into pipecat's ``JUDGE_ASK_TEMPLATE`` (pipecat/evals/judge.py), which
+    already renders it as ``"Criterion: {criterion}"`` — adding a second label
+    would nest one inside the other in the prompt the judge actually sees.
+    That template slot is also the only channel pipecat 1.8.0 exposes:
+    ``EvalJudge`` takes no extra system context (``JUDGE_SYSTEM_INSTRUCTION``
+    is a hardcoded module constant), so the date rides in the criterion text.
+    The right long-term home is an upstream ``EvalJudge`` hook for system-level
+    context, next to its existing homophone-leniency instruction.
+    """
+    today = datetime.now(UTC).date().isoformat()
+    return (
+        f"Today's date is {today}; this is the anchor date. "
+        "Dates on or before the anchor date are NOT future dates. "
+        "Claims not mentioned in the transcript must be ignored and must not be penalized. "
+        "Judge only the following criterion, exactly as stated. "
+        f"{criterion}"
+    )
+
+
 def _connect_handshake(host: Any) -> dict[str, Any]:
     return {
         "session_id": host.state.session_id,
@@ -2063,7 +2112,7 @@ async def run_cell(
             if turn.judge_criterion:
                 try:
                     verdict = await asyncio.wait_for(
-                        judge.evaluate(turn.judge_criterion),
+                        judge.evaluate(_judge_criterion_with_date(turn.judge_criterion)),
                         timeout=_JUDGE_EVALUATE_TIMEOUT_SECONDS,
                     )
                 except TimeoutError:
@@ -2093,7 +2142,7 @@ async def run_cell(
                     # here (round 5 added one; round 7 gauntlet, Logic lens finding
                     # 9 removed it): pipecat's own `_parse_verdict` unconditionally
                     # coerces any out-of-enum value to "no" before ever returning a
-                    # JudgeVerdict (verified against the installed pipecat==1.6.0
+                    # JudgeVerdict (verified against the installed pipecat==1.8.0
                     # source), so that comparison can never be true -- dead code
                     # that read as a real safety net. `JudgeVerdict.raw_response`
                     # does exist, but distinguishing "genuinely judged no" from

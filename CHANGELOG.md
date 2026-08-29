@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-28
+
 ### Changed
+
+- Pipecat upgraded `1.6.0` → `1.8.0`. Pipecat 1.8.0 exports
+  `LLMContextWorker` at `pipecat.workers.llm.llm_context_worker`; the lab
+  deliberately stays on the bus-only `BaseWorker` seam because its context
+  history, direct provider calls, and causal mailbox are application-owned.
+  `WorkerRunner.add_workers` remains present. Upstream's `EvalJudge` reworked
+  its `JUDGE_SYSTEM_INSTRUCTION`
+  around stricter "continue" semantics for not-yet-answered replies;
+  `evaluate()`/`JUDGE_ASK_TEMPLATE` are unchanged, so the eval runner's
+  criterion-slot date wrap below still applies as-is.
+- Eval judge criteria are now wrapped with the current date and a
+  judge-only-the-stated-criterion instruction
+  (`scripts/eval_model_comparison.py::_judge_criterion_with_date`). The judge
+  LLM does not know today's date, so live replies correctly citing releases
+  newer than its training data were drawing spurious `verdict=no` ("future"
+  claims) — observed twice on the `baseline/sol-low` single-turn cell. A
+  blanket recency-leniency directive was considered and dropped (it would
+  also suppress criteria written to catch fabricated future-dated claims);
+  each retained clause is justified by a live probe in the helper's
+  docstring.
 
 - `SessionHost` decomposition (internal; no wire, config, or behavior
   change). Three slices left `server/pipeline.py` as their own modules:
