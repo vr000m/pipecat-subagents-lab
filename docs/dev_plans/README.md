@@ -12,7 +12,7 @@ status (the v0.1.3 follow-up program's same-commit rule).
 
 | Plan | Status |
 |------|--------|
-| [v0.1.3 follow-up program (super plan)](20260824-design-v013-followup-program.md) | Complete — closed 2026-08-28; rows 1-20 fixed/retired, row 21 `deferred: v0.1.4` (first v0.1.4 release plan inherits it) |
+| [v0.1.3 follow-up program (super plan)](20260824-design-v013-followup-program.md) | Complete — closed 2026-08-28; row 21 fixed at v0.1.4 (2026-08-29), all 21 rows fixed/retired |
 | [P2 — SessionHost decomposition](20260824-refactor-sessionhost-decomposition.md) | Complete — program rows 1-6, 8-12 closed; SessionHost decomposed across 7 conduct phases |
 | [P1 — Query-context promotion decision](20260824-feature-query-context-promotion.md) | Complete — retired (operator decision); full-chain removal `c67da7f`; program rows 7 and 20 closed |
 | [P3 — Post-release hardening](20260824-chore-post-release-hardening.md) | Complete — program rows 13-19 closed |

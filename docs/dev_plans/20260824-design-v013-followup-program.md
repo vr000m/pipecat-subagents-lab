@@ -1,6 +1,6 @@
 # Task: v0.1.3 Follow-up Program (super plan — tracking only, NOT conductable)
 
-**Status**: Complete — closed 2026-08-28 (rows 1-20 fixed/retired; row 21 deferred: v0.1.4)
+**Status**: Complete — closed 2026-08-28; row 21 subsequently fixed at v0.1.4 (2026-08-29), so all 21 rows now read fixed/retired
 **Component**: program
 **Assigned to**: Claude + Varun
 **Priority**: High
@@ -70,7 +70,7 @@ Origin key: **AD-rN** = ack-delivery plan (`20260728-feature-early-ack-backgroun
 | 18 | Env-var coverage gaps: 2 reasoning-effort env vars untested; README stale — premise stale: P3 review verified both vars are tested incl. the empty-string pin (`tests/test_config.py:2019-2030`); P3 Ph3 verifies README against the pinned semantics and retires with citation | ES | P3 Ph3 (verify) | retired: verified — worker var `tests/test_config.py:1955-2132` (empty-string pin `:2019-2030`), router var `:376`; README matches (730db3f) |
 | 19 | Policy-dict wholesale-replacement semantics + effort-display-vs-effective-value + truncated-cell reporting (Phase-2 minors) | ES | P3 Ph3 | fixed 730db3f (effort-display gap fixed with test; policy-dict retired as intended design; truncated-cell retired as not-reproducible) |
 | 20 | Query-context narrowing implemented but `promotion_eligible=false` (`reason=real_stratum_missing`) — no paid evidence ever collected | AD Phase 4 | P1 (all) | retired: operator decision after feasibility pre-flight — promote required the full Appendix A effort incl. paid collection against an experiment that never demonstrated value (c67da7f) |
-| 21 | `docs/benchmarks/` misnomer: 8 of 9 committed files are v0.1.3 release-gate evidence, not benchmarks — load-bearing for the frozen release record even though the runtime loader is gone: ci.yml's `promotion-manifest-drift` job (read-only drift check), `justfile:40-41`'s `verify-manifest` recipe, and `check_release_metadata.py`'s manifest-path check all still bind against these files, and they're frozen in place (manifest embeds paths; re-stamping requires `--source-commit` = `740b364`, impossible from later HEAD). Fix forward only: v0.1.4+ evidence lands in `docs/evidence/`, `check_release_metadata.py`'s path pattern updated then. Never delete/move the v0.1.3 artifacts | evidence audit 2026-08-25 | first v0.1.4 release plan (deferred — not P1/P2/P3) | deferred: v0.1.4 |
+| 21 | `docs/benchmarks/` misnomer: 8 of 9 committed files are v0.1.3 release-gate evidence, not benchmarks — load-bearing for the frozen release record even though the runtime loader is gone: ci.yml's `promotion-manifest-drift` job (read-only drift check), `justfile:40-41`'s `verify-manifest` recipe, and `check_release_metadata.py`'s manifest-path check all still bind against these files, and they're frozen in place (manifest embeds paths; re-stamping requires `--source-commit` = `740b364`, impossible from later HEAD). Fix forward only: v0.1.4+ evidence lands in `docs/evidence/`, `check_release_metadata.py`'s path pattern updated then. Never delete/move the v0.1.3 artifacts | evidence audit 2026-08-25 | first v0.1.4 release plan (deferred — not P1/P2/P3) | fixed: v0.1.4 (`docs/evidence/` created with the split documented; the path-pattern update was superseded by P1's retire — see 2026-08-29 finding) |
 
 When an item closes, replace `open` with `fixed <short-sha>` or `retired: <one-line reason>`.
 
@@ -124,3 +124,13 @@ does not exist today.
 - 2026-08-27: P2 complete — all 7 phases executed via /skein:conduct (Ph0 b1f6921, Ph1 ca981bb, Ph2 877003e, Ph3 f32e0b2, Ph4 8474933, Ph5 d1fa8c1, Ph6 this commit). Rows 1-6, 8-12 closed (5 fixed, 4 retired-with-evidence + row 2 fixed); Subordinate Plans row flipped to Complete. Row 21 remains the program's only open row (deferred to first v0.1.4 release plan).
 - 2026-08-27: P1 complete — operator chose retire (Phase 1 decision) after the Phase 0 feasibility pre-flight found the model available but promote gated behind the full Appendix A effort against an experiment that never demonstrated value; full-chain removal executed in `c67da7f`. Rows 20 and 7 closed; P1 ∥ P2 and P1 ∥ P3 matrix rows and the retire-path landing order marked resolved; P1's row in Subordinate Plans flipped to Complete (retired); P2 plan's Phase 3 manifest-extraction bullet dropped (P2 Findings).
 - 2026-08-28: Program closed. Exit criterion met: rows 1-20 all read fixed/retired, all child plan status headers read Complete, and `docs/dev_plans/README.md` reflects the final states. Row 21 flipped from `open` to `deferred: v0.1.4` per the exit criterion's carve-out — the first v0.1.4 release plan inherits its three requirements (land new evidence in `docs/evidence/`, update `check_release_metadata.py`'s path pattern, never delete/move the frozen v0.1.3 artifacts in `docs/benchmarks/`).
+- 2026-08-29: Row 21 closed at v0.1.4 (the release its deferral named; a
+  briefly-merged 1.0.1 version number was corrected back to 0.1.4 in the same
+  PR). `docs/evidence/README.md` created as the v0.1.4+ evidence home and
+  documents the benchmarks/evidence split. Of the row's three requirements,
+  two landed as written (new directory; frozen artifacts untouched) and the
+  third — updating `check_release_metadata.py`'s path pattern — is
+  **superseded**: P1's retire (`c67da7f`) removed the machinery that produced
+  release evidence, so the script's only remaining benchmarks binding is the
+  frozen v0.1.3 historical pin (`_FROZEN_PROMOTION_MANIFEST`), which stays by
+  design. Every provenance row now reads fixed or retired.
