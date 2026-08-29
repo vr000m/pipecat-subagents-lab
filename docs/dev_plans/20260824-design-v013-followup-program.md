@@ -106,6 +106,13 @@ different regions of that file, whichever landed second rebased.
 
 ## Exit Criterion
 
+> **Met, then exceeded.** The criterion below is the as-written construction
+> (kept verbatim as the historical contract): it was satisfied on 2026-08-28
+> (rows 1-20 closed, child plans Complete, index created and current), and on
+> 2026-08-29 row 21 — which this text allows to close as `deferred: v0.1.4` —
+> was instead closed as `fixed: v0.1.4` (see Findings). Nothing remains open
+> or deferred.
+
 The program closes when every provenance-map row **1-20** reads `fixed` or
 `retired` (row 21 is deferred by construction to the first v0.1.4 release plan
 — it closes as `deferred: v0.1.4` here and does not block program exit; rows a
