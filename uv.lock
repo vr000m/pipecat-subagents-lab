@@ -1717,7 +1717,7 @@ wheels = [
 
 [[package]]
 name = "pipecat-subagents-lab"
-version = "1.0.1"
+version = "0.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "pipecat-ai", extra = ["deepgram", "runner", "webrtc"] },

@@ -808,7 +808,7 @@ def test_missing_package_metadata_falls_back_to_pyproject_version(
 
     monkeypatch.setattr(config_module, "_package_version", package_version_missing)
 
-    assert config_module._installed_release_version() == "1.0.1"
+    assert config_module._installed_release_version() == "0.1.4"
 
 
 def test_feature_policy_from_config_compares_by_value_across_distinct_configs() -> None:

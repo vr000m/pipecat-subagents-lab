@@ -1,6 +1,6 @@
 [project]
 name = "pipecat-subagents-lab"
-version = "1.0.1"
+version = "0.1.4"
 description = "Browser-first Pipecat web-search subagent laboratory"
 license = "BSD-2-Clause"
 license-files = ["LICENSE"]
